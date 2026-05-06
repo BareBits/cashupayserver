@@ -2349,7 +2349,7 @@ $isWp = Urls::isWordPress();
                     <div class="balance-label">Total Balance</div>
                     <div class="balance-amount" id="balance-amount">---</div>
                     <div class="balance-unit" id="balance-unit">sats</div>
-                    <div class="balance-fiat" id="balance-fiat" style="display:none; margin-top:0.5rem; color:#a0aec0; font-size:1rem;"></div>
+                    <div class="balance-fiat" id="balance-fiat" style="display:none; margin-top:0.5rem; color:#000; font-size:1rem;"></div>
                     <div class="balance-actions">
                         <button class="balance-btn" id="btn-withdraw">
                             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -2734,8 +2734,13 @@ $isWp = Urls::isWordPress();
             <div id="request-form">
                 <div class="form-group">
                     <label class="form-label" id="request-amount-label">Amount</label>
-                    <input type="number" class="form-input" id="request-amount"
-                           placeholder="100" min="1" step="1">
+                    <div style="display:flex; gap:0.5rem;">
+                        <input type="number" class="form-input" id="request-amount"
+                               placeholder="100" min="1" step="1" style="flex:1;">
+                        <select class="form-input" id="request-currency"
+                                onchange="updateRequestAmountConstraints()"
+                                style="width:auto; flex:0;"></select>
+                    </div>
                 </div>
 
                 <div class="form-group">
@@ -3642,6 +3647,7 @@ $isWp = Urls::isWordPress();
 
         // API base URL for Greenfield API calls
         let API_BASE_URL = <?= json_encode(Urls::api()) ?>;
+        const SUPPORTED_CURRENCIES = <?= json_encode(Config::getSupportedDisplayCurrencies()) ?>;
 
         // Lightning routing fee buffer (same as auto-melt uses)
         const LN_FEE_BUFFER_PERCENT = 2; // 2%
@@ -4162,29 +4168,50 @@ $isWp = Urls::isWordPress();
             });
         }
 
-        // Update amount input based on selected store's mint unit
-        function updateAmountInputForStore(mintUnit) {
-            const amountLabel = document.getElementById('request-amount-label');
-            const amountInput = document.getElementById('request-amount');
-            const unit = (mintUnit || 'sat').toUpperCase();
+        // Rebuild the Request modal's currency <select> for a given store.
+        // Mint unit is always offered (so the merchant can request in the
+        // store's native unit), plus all supported display currencies.
+        function rebuildRequestCurrencyOptions(mintUnit, defaultCurrency) {
+            const sel = document.getElementById('request-currency');
+            sel.innerHTML = '';
+            const seen = new Set();
+            const add = (code) => {
+                const norm = code.toLowerCase() === 'sats' ? 'sat' : code;
+                const key = norm.toLowerCase();
+                if (seen.has(key)) return;
+                seen.add(key);
+                const opt = document.createElement('option');
+                opt.value = norm;
+                opt.textContent = norm.toUpperCase();
+                sel.appendChild(opt);
+            };
+            add(mintUnit || 'sat');
+            SUPPORTED_CURRENCIES.forEach(add);
+            sel.value = defaultCurrency || mintUnit || 'sat';
+        }
 
-            amountLabel.textContent = `Amount (${unit})`;
+        function updateRequestAmountConstraints() {
+            const cur = document.getElementById('request-currency').value || 'sat';
+            const isFiat = !['SAT', 'SATS', 'MSAT', 'BTC'].includes(cur.toUpperCase());
+            const a = document.getElementById('request-amount');
+            if (isFiat) { a.placeholder = '1.00'; a.min = '0.01'; a.step = '0.01'; }
+            else        { a.placeholder = '100';  a.min = '1';    a.step = '1';    }
+        }
 
-            if (mintUnit === 'sat' || mintUnit === 'msat') {
-                amountInput.placeholder = '100';
-                amountInput.min = '1';
-                amountInput.step = '1';
-            } else {
-                amountInput.placeholder = '1.00';
-                amountInput.min = '0.01';
-                amountInput.step = '0.01';
-            }
+        // Configure the Request modal for the currently-selected store.
+        function updateAmountInputForStore(store) {
+            const mintUnit = (typeof store === 'string') ? store : (store?.mint_unit || 'sat');
+            const defaultCurrency = (typeof store === 'string') ? mintUnit : (store?.default_currency || mintUnit);
+            document.getElementById('request-amount-label').textContent = 'Amount';
+            rebuildRequestCurrencyOptions(mintUnit, defaultCurrency);
+            updateRequestAmountConstraints();
         }
 
         async function handleGenerateRequest() {
             const storeId = currentStoreId;
             const amount = parseFloat(document.getElementById('request-amount').value);
             const memo = document.getElementById('request-memo').value;
+            const currency = document.getElementById('request-currency').value || 'sat';
 
             if (!storeId) {
                 showToast('Please select a store first', 'error');
@@ -4194,8 +4221,8 @@ $isWp = Urls::isWordPress();
             // Get store info from dashboardData
             const store = dashboardData?.stores?.find(s => s.id === storeId);
             const apiKey = store?.internalApiKey;
-            const mintUnit = store?.mint_unit || 'sat';
-            const minAmount = (mintUnit === 'sat' || mintUnit === 'msat') ? 1 : 0.01;
+            const isFiatRequest = !['SAT', 'SATS', 'MSAT', 'BTC'].includes(currency.toUpperCase());
+            const minAmount = isFiatRequest ? 0.01 : 1;
 
             if (!amount || amount < minAmount) {
                 showToast('Please enter an amount', 'error');
@@ -4208,12 +4235,13 @@ $isWp = Urls::isWordPress();
             }
 
             try {
-                // Use Greenfield API to create invoice
+                // Use Greenfield API to create invoice. The server converts the
+                // requested currency to the mint's unit at quote time.
                 const apiUrl = API_BASE_URL + '/api/v1/stores/' + encodeURIComponent(storeId) + '/invoices';
 
                 const invoiceData = {
                     amount: amount,
-                    currency: mintUnit,
+                    currency: currency,
                     checkout: {
                         redirectURL: window.location.href.split('?')[0], // Return to admin
                         redirectAutomatically: true
@@ -5003,10 +5031,10 @@ $isWp = Urls::isWordPress();
                 document.getElementById('request-amount').value = '';
                 document.getElementById('request-memo').value = '';
 
-                // Get current store's mint unit and update amount input
+                // Configure currency selector + amount constraints from the
+                // store's default currency (falls back to mint unit).
                 const store = dashboardData?.stores?.find(s => s.id === currentStoreId);
-                const mintUnit = store?.mint_unit || 'sat';
-                updateAmountInputForStore(mintUnit);
+                updateAmountInputForStore(store);
             }
 
             document.getElementById(id).classList.add('visible');
