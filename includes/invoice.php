@@ -107,6 +107,7 @@ class Invoice {
             'exchange_rate' => $exchangeRate,
             'quote_id' => $quote->quote,
             'bolt11' => $quote->request,
+            'mint_url' => $usedMintUrl,
             'metadata' => $metadata ? json_encode($metadata) : null,
             'checkout_config' => $checkout ? json_encode($checkout) : null,
             'created_at' => $now,
@@ -232,8 +233,8 @@ class Invoice {
                 // Update last_polled_at before polling (so we don't re-poll on failure)
                 Database::update('invoices', ['last_polled_at' => $now], 'id = ?', [$invoice['id']]);
 
-                // Get wallet for this invoice's store
-                $wallet = self::getWalletForStore($invoice['store_id']);
+                // Get wallet for the exact mint that issued this invoice's quote
+                $wallet = self::getWalletForStore($invoice['store_id'], $invoice['mint_url'] ?? null);
 
                 // Check quote status
                 $quoteStatus = $wallet->checkMintQuote($invoice['quote_id']);
@@ -441,7 +442,7 @@ class Invoice {
         }
 
         try {
-            $wallet = self::getWalletForStore($invoice['store_id']);
+            $wallet = self::getWalletForStore($invoice['store_id'], $invoice['mint_url'] ?? null);
             $quoteStatus = $wallet->checkMintQuote($invoice['quote_id']);
 
             error_log("CashuPayServer: Quote {$invoice['quote_id']} state: {$quoteStatus->state}");
@@ -504,7 +505,7 @@ class Invoice {
 
         foreach ($stuck as $invoice) {
             try {
-                $wallet = self::getWalletForStore($invoice['store_id']);
+                $wallet = self::getWalletForStore($invoice['store_id'], $invoice['mint_url'] ?? null);
                 if ($wallet->hasStorage() && $invoice['quote_id']) {
                     $proofs = $wallet->getStorage()->getProofsByQuoteId($invoice['quote_id']);
                     if (!empty($proofs)) {

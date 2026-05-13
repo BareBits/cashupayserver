@@ -220,6 +220,7 @@ HTACCESS;
             exchange_rate REAL,
             quote_id TEXT,
             bolt11 TEXT,
+            mint_url TEXT,
             metadata TEXT,
             checkout_config TEXT,
             created_at INTEGER NOT NULL,
@@ -278,8 +279,32 @@ HTACCESS;
 
         $pdo->exec($schema);
 
+        self::runMigrations($pdo);
+
         // Initialize wallet storage schema (for cashu-wallet-php library)
         WalletStorage::initializeSchema($pdo);
+    }
+
+    /**
+     * Apply idempotent schema migrations for existing databases.
+     */
+    private static function runMigrations(\PDO $pdo): void {
+        if (!self::columnExists($pdo, 'invoices', 'mint_url')) {
+            $pdo->exec("ALTER TABLE invoices ADD COLUMN mint_url TEXT");
+        }
+        if (!self::columnExists($pdo, 'invoices', 'last_polled_at')) {
+            $pdo->exec("ALTER TABLE invoices ADD COLUMN last_polled_at INTEGER DEFAULT NULL");
+        }
+    }
+
+    private static function columnExists(\PDO $pdo, string $table, string $column): bool {
+        $stmt = $pdo->query("PRAGMA table_info(" . $table . ")");
+        foreach ($stmt->fetchAll(\PDO::FETCH_ASSOC) as $row) {
+            if (($row['name'] ?? null) === $column) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
