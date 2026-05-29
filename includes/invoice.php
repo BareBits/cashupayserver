@@ -445,7 +445,7 @@ class Invoice {
      */
     public static function pollSingleQuote(string $invoiceId): void {
         $invoice = self::getById($invoiceId);
-        if (!$invoice || !$invoice['quote_id']) {
+        if (!$invoice) {
             return;
         }
 
@@ -454,7 +454,30 @@ class Invoice {
             return;
         }
 
-        // Check expiration (only for New invoices)
+        // Best-effort on-chain poll first — if the invoice has an on-chain
+        // address, this can transition state independent of any Cashu quote.
+        if (!empty($invoice['onchain_address'])) {
+            try {
+                OnchainPayments::pollInvoice($invoiceId);
+                $invoice = self::getById($invoiceId);
+                if (!$invoice || !in_array($invoice['status'], ['New', 'Processing'])) {
+                    return;
+                }
+            } catch (Throwable $e) {
+                error_log("on-chain poll failed for {$invoiceId}: " . $e->getMessage());
+            }
+        }
+
+        // No Cashu quote means nothing more to do here.
+        if (empty($invoice['quote_id'])) {
+            // Check expiration on on-chain-only invoices.
+            if ($invoice['status'] === 'New' && $invoice['expiration_time'] < time()) {
+                self::updateStatus($invoice['id'], 'Expired');
+            }
+            return;
+        }
+
+        // Check expiration (only for New invoices) for the Cashu side.
         if ($invoice['status'] === 'New' && $invoice['expiration_time'] < time()) {
             self::updateStatus($invoice['id'], 'Expired');
             return;
