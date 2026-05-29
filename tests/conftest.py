@@ -31,6 +31,7 @@ from fixtures.lnd import (  # noqa: E402
     start_lnd,
     stop_lnd,
 )
+from fixtures.lnurlp_server import LnurlpServer, start_lnurlp_server, stop_lnurlp_server  # noqa: E402
 from fixtures.nutshell import MintHandle, start_mint, stop_mint  # noqa: E402
 from fixtures.payserver import PayserverHandle, start_payserver, stop_payserver  # noqa: E402
 from fixtures.setup_helpers import run_setup_wizard  # noqa: E402
@@ -106,6 +107,27 @@ def webhook_sink() -> Iterator[WebhookSink]:
     stop_webhook_sink(sink)
 
 
+@pytest.fixture
+def lnurlp_server(lnd_payer: LndHandle) -> Iterator[LnurlpServer]:
+    """Mock LNURL-pay endpoint backed by lnd_payer for auto-melt tests."""
+    s = start_lnurlp_server(lnd_payer)
+    yield s
+    stop_lnurlp_server(s)
+
+
+@pytest.fixture
+def payserver_with_lnurlp(lnurlp_server: LnurlpServer) -> Iterator[PayserverHandle]:
+    """payserver fixture variant that points cashu-wallet-php at the local
+    LNURL-pay mock. Used by auto-melt tests."""
+    workdir = SESSION_TMP / f"payserver-{uuid.uuid4().hex[:8]}"
+    handle = start_payserver(
+        workdir,
+        extra_env={"CASHU_LNURL_URL_TEMPLATE": lnurlp_server.url_template},
+    )
+    yield handle
+    stop_payserver(handle)
+
+
 # ---- composite fixtures: payserver with setup-wizard already walked ----
 
 
@@ -122,14 +144,7 @@ class ConfiguredPayserver:
     greenfield: GreenfieldClient
 
 
-@pytest.fixture
-def configured(payserver: PayserverHandle, mint: MintHandle) -> ConfiguredPayserver:
-    """Run the setup wizard, log in as admin, mint an API key.
-
-    Most tests should depend on this and skip the boilerplate; tests that
-    specifically exercise the setup flow should depend on `payserver` and
-    `mint` directly instead.
-    """
+def _configure(payserver: PayserverHandle, mint: MintHandle) -> ConfiguredPayserver:
     run_setup_wizard(
         payserver.url,
         admin_password=DEFAULT_ADMIN_PASSWORD,
@@ -153,3 +168,17 @@ def configured(payserver: PayserverHandle, mint: MintHandle) -> ConfiguredPayser
         api_token=token,
         greenfield=GreenfieldClient(payserver.url, token),
     )
+
+
+@pytest.fixture
+def configured(payserver: PayserverHandle, mint: MintHandle) -> ConfiguredPayserver:
+    """Setup-wizard-walked payserver + admin client + API key + Greenfield client."""
+    return _configure(payserver, mint)
+
+
+@pytest.fixture
+def configured_with_lnurlp(
+    payserver_with_lnurlp: PayserverHandle, mint: MintHandle
+) -> ConfiguredPayserver:
+    """Same as `configured` but uses the LNURL-mock-aware payserver."""
+    return _configure(payserver_with_lnurlp, mint)

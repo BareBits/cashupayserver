@@ -97,7 +97,7 @@ def _ensure_php() -> str:
     return str(binaries.ensure(binaries.PHP)["php"])
 
 
-def start_payserver(workdir: Path) -> PayserverHandle:
+def start_payserver(workdir: Path, *, extra_env: dict[str, str] | None = None) -> PayserverHandle:
     php = _ensure_php()
     workdir.mkdir(parents=True, exist_ok=True)
     data_dir = workdir / "data"
@@ -119,6 +119,8 @@ def start_payserver(workdir: Path) -> PayserverHandle:
 
     env = os.environ.copy()
     env["CASHUPAY_DATA_DIR"] = str(data_dir)
+    if extra_env:
+        env.update(extra_env)
 
     log = (workdir / "php-server.log").open("ab")
     proc = subprocess.Popen(

@@ -18,6 +18,19 @@ if [ ! -f "${REPO_ROOT}/cashu-wallet-php/CashuWallet.php" ]; then
   (cd "${REPO_ROOT}" && git submodule update --init --recursive)
 fi
 
+# 1a. Apply the LNURL-pay URL override patch to cashu-wallet-php so the
+#     auto-melt tests can point the resolver at a local mock server. The patch
+#     adds a CASHU_LNURL_URL_TEMPLATE env honor that no-ops in production. We
+#     intentionally don't commit this to the submodule — it's a tests-only shim
+#     that should eventually land upstream.
+LNURL_PATCH="${TESTS_DIR}/scripts/cashu-wallet-php-lnurl-override.patch"
+if [ -f "${LNURL_PATCH}" ]; then
+  if (cd "${REPO_ROOT}/cashu-wallet-php" && git apply --check "${LNURL_PATCH}" 2>/dev/null); then
+    echo "[run-tests] applying LNURL override patch to cashu-wallet-php"
+    (cd "${REPO_ROOT}/cashu-wallet-php" && git apply "${LNURL_PATCH}")
+  fi
+fi
+
 # 2. Test venv
 VENV="${TESTS_DIR}/.venv"
 if [ ! -d "${VENV}" ]; then
