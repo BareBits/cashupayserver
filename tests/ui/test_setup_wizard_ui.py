@@ -48,6 +48,10 @@ def test_setup_wizard_completes_in_browser(
     page.check("#seed_confirmed")
     page.click("button[type=submit]")
 
+    # Step 8: optional on-chain Bitcoin step — skip it.
+    page.wait_for_selector("button:has-text('Skip for now')")
+    page.click("button:has-text('Skip for now')")
+
     # Step 7: completion. Either a "Go to admin" link or admin redirect.
     # The setup_complete config flag should now be set.
     import sqlite3

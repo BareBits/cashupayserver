@@ -83,6 +83,15 @@ def run_setup_wizard(
     )
     _assert_step_ok(r, "step 6b (confirm seed)")
 
+    # Step 8: optional on-chain step — skip to complete setup.
+    r = s.post(
+        setup,
+        data={"step": "8", "onchain_action": "skip"},
+        timeout=15,
+        allow_redirects=False,
+    )
+    _assert_step_ok(r, "step 8 (skip on-chain)")
+
     return SetupResult(
         admin_password=admin_password,
         store_name=store_name,
