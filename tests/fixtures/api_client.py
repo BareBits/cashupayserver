@@ -156,7 +156,16 @@ class GreenfieldClient:
     def _post(self, path: str, body: Any) -> Any:
         r = self.s.post(f"{self.base_url}{path}", json=body, timeout=30)
         self._raise(r, "POST", path)
-        return r.json() if r.content else None
+        if not r.content:
+            return None
+        try:
+            return r.json()
+        except Exception:
+            raise RuntimeError(
+                f"Greenfield POST {path} returned non-JSON body "
+                f"(status={r.status_code}, content-type={r.headers.get('Content-Type')}): "
+                f"{r.text[:400]!r}"
+            )
 
     def _delete(self, path: str) -> None:
         r = self.s.delete(f"{self.base_url}{path}", timeout=30)

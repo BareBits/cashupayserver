@@ -195,16 +195,18 @@ final class BitcoindRpcProvider implements BlockchainProvider {
 
     private function ensureWatchAddress(string $address): void {
         try {
-            // Try importing as a watch-only descriptor. Idempotent: Bitcoin Core
-            // returns success=false for already-known descriptors but doesn't throw.
-            $descIn = ['desc' => "addr({$address})", 'timestamp' => 0, 'label' => 'cashupay'];
-            // descriptor needs a checksum
+            // timestamp='now' avoids a full rescan: cashupayserver only cares
+            // about payments made AFTER the address is allocated for an
+            // invoice, and full rescans are slow on real mainnet wallets.
+            $descIn = ['desc' => "addr({$address})", 'timestamp' => 'now', 'label' => 'cashupay'];
             $info = $this->rpc('getdescriptorinfo', [$descIn['desc']]);
             $descIn['desc'] = $info['descriptor'];
             $this->rpc('importdescriptors', [[$descIn]]);
         } catch (Throwable $e) {
-            // Ignore; some node configs disallow importdescriptors, in which
-            // case the caller will still see whatever the wallet already tracks.
+            // Some node configs may disallow importdescriptors (no watch-only
+            // wallet available); log so operators can diagnose, but don't
+            // crash — the caller will still see whatever the wallet tracks.
+            error_log("BitcoindRpcProvider::ensureWatchAddress({$address}): " . $e->getMessage());
         }
     }
 

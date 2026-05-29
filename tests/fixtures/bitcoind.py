@@ -35,6 +35,11 @@ class BitcoindHandle:
     bitcoind_exe: Path
     bitcoin_cli_exe: Path
     miner_address: str | None = None
+    # Bitcoin Core 28 requires per-wallet RPC URLs when multiple wallets are
+    # loaded. Tests that add additional wallets (e.g. the on-chain fixture's
+    # watch-only wallet) should leave default_wallet pointing at "miner" so
+    # that the fixture's send/mine helpers keep working unchanged.
+    default_wallet: str = "miner"
 
     @property
     def rpc_url(self) -> str:
@@ -44,13 +49,34 @@ class BitcoindHandle:
     def zmq_block_url(self) -> str:
         return f"tcp://127.0.0.1:{self.zmq_block_port}"
 
+    # Wallet-scoped RPCs need a /wallet/<name> URL once multiple wallets are
+    # loaded; the unscoped URL gets a -19 'Wallet file not specified' error
+    # from Bitcoin Core. listed here so the rpc() dispatcher knows when to add
+    # the path segment for the default wallet.
+    _WALLET_METHODS = frozenset({
+        "sendtoaddress", "getnewaddress", "getbalance", "getbalances",
+        "listunspent", "listtransactions", "listreceivedbyaddress",
+        "gettransaction", "createwallet", "loadwallet", "unloadwallet",
+        "getwalletinfo", "walletpassphrase", "walletcreatefundedpsbt",
+        "importdescriptors", "getdescriptorinfo", "deriveaddresses",
+    })
+
     def rpc(self, method: str, *params: Any) -> Any:
+        # createwallet/loadwallet/unloadwallet/getdescriptorinfo/deriveaddresses
+        # are not actually per-wallet but work fine at the base URL too.
+        wallet_scoped = method in {
+            "sendtoaddress", "getnewaddress", "getbalance", "getbalances",
+            "listunspent", "listtransactions", "listreceivedbyaddress",
+            "gettransaction", "getwalletinfo", "walletpassphrase",
+            "walletcreatefundedpsbt", "importdescriptors",
+        }
+        path = f"/wallet/{self.default_wallet}" if wallet_scoped else ""
         body = json.dumps(
             {"jsonrpc": "1.0", "id": "tests", "method": method, "params": list(params)}
         ).encode()
         auth = b64encode(f"{RPC_USER}:{RPC_PASSWORD}".encode()).decode()
         req = urllib.request.Request(
-            f"http://127.0.0.1:{self.rpc_port}/",
+            f"http://127.0.0.1:{self.rpc_port}{path}",
             data=body,
             headers={"Authorization": f"Basic {auth}", "Content-Type": "application/json"},
         )

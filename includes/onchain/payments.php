@@ -19,7 +19,7 @@ class OnchainPayments {
      * @return array{address:string, index:int}|null  null if store has no xpub configured
      */
     public static function allocateAddress(string $storeId): ?array {
-        $pdo = Database::getConnection();
+        $pdo = Database::getInstance();
         $pdo->beginTransaction();
         try {
             $stmt = $pdo->prepare(

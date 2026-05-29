@@ -18,9 +18,23 @@ require_once __DIR__ . '/../../vendor/autoload.php';
 use BitWasp\Bitcoin\Address\ScriptHashAddress;
 use BitWasp\Bitcoin\Address\SegwitAddress;
 use BitWasp\Bitcoin\Key\Factory\HierarchicalKeyFactory;
+use BitWasp\Bitcoin\Network\Network;
 use BitWasp\Bitcoin\Network\NetworkFactory;
+use BitWasp\Bitcoin\Network\Networks\BitcoinRegtest as BitwaspBitcoinRegtest;
 use BitWasp\Bitcoin\Script\ScriptFactory;
 use BitWasp\Bitcoin\Script\WitnessProgram;
+
+/**
+ * bitwasp's built-in BitcoinRegtest reports 'tb' as its bech32 HRP because it
+ * extends BitcoinTestnet and doesn't override the prefix. Bitcoin Core uses
+ * 'bcrt' for regtest; we subclass to match so derived regtest addresses match
+ * `bitcoin-cli getnewaddress` output.
+ */
+final class CashupayBitcoinRegtest extends BitwaspBitcoinRegtest {
+    protected $bech32PrefixMap = [
+        Network::BECH32_PREFIX_SEGWIT => 'bcrt',
+    ];
+}
 
 class OnchainWallet {
     /**
@@ -201,7 +215,7 @@ class OnchainWallet {
             case 'mainnet': return NetworkFactory::bitcoin();
             case 'testnet':
             case 'signet':  return NetworkFactory::bitcoinTestnet();
-            case 'regtest': return NetworkFactory::bitcoinRegtest();
+            case 'regtest': return new CashupayBitcoinRegtest();
             default: throw new InvalidArgumentException("Unsupported network: {$network}");
         }
     }
