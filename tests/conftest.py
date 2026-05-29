@@ -24,6 +24,7 @@ if str(TESTS_DIR) not in sys.path:
 
 from fixtures import binaries  # noqa: E402
 from fixtures.api_client import AdminClient, GreenfieldClient  # noqa: E402
+from fixtures.browser import browser, page, playwright_instance  # noqa: E402,F401
 from fixtures.bitcoind import BitcoindHandle, start_bitcoind, stop_bitcoind  # noqa: E402
 from fixtures.lnd import (  # noqa: E402
     LndHandle,

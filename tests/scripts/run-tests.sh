@@ -44,12 +44,17 @@ pip install --quiet -r "${TESTS_DIR}/requirements.txt"
 
 # 3. PHP is downloaded on first use by the binary manager — no host PHP needed.
 
-# 4. Playwright browser (only needed for UI tests; install is best-effort,
-#    skip with SKIP_PLAYWRIGHT=1 or if you're only running e2e/wordpress tests).
+# 4. Playwright Chromium (only needed for UI tests; install lands under
+#    tests/bin/playwright-browsers/ so it caches across runs and survives
+#    `tests/.venv` recreation). Skip with SKIP_PLAYWRIGHT=1 or when running
+#    only e2e/wordpress tests.
 export PLAYWRIGHT_BROWSERS_PATH="${TESTS_DIR}/bin/playwright-browsers"
 if [ -z "${SKIP_PLAYWRIGHT:-}" ]; then
-  if ! playwright install chromium >/dev/null 2>&1; then
-    echo "[run-tests] warning: playwright install chromium failed; UI tests will be skipped" >&2
+  if ! find "${PLAYWRIGHT_BROWSERS_PATH}" -name 'headless_shell' -o -name 'chrome' 2>/dev/null | grep -q .; then
+    echo "[run-tests] downloading playwright chromium (one-time)"
+    if ! playwright install chromium; then
+      echo "[run-tests] warning: playwright install chromium failed; UI tests will be skipped" >&2
+    fi
   fi
 fi
 
