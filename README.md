@@ -44,6 +44,7 @@ Cashu Mint ──► Lightning Network
 - **BTCPay-compatible API** - WooCommerce and other BTCPay plugins work by changing one URL.
 - **No accounts or KYC** - Your store talks to the mint's public API directly.
 - **Pure Lightning experience** - Customers see a normal Lightning invoice.
+- **On-chain Bitcoin payments** - Accept direct Bitcoin transactions alongside Lightning. Funds go straight to *your* wallet (xpub-derived addresses) — never to the mint. See [docs/onchain.md](docs/onchain.md).
 - **Auto-withdrawal** - Optionally send funds directly to your Lightning address.
 - **Open source (MIT)** - Read every line of code. Fork it, audit it yourself.
 
