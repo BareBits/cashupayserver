@@ -94,6 +94,18 @@ WP_CLI = FileSpec(
     env_override="CASHUPAY_TEST_WP_CLI",
 )
 
+# Composer is needed at test-setup time to populate vendor/ for the on-chain
+# payment support. We pin a recent stable release so behavior is reproducible
+# even if the user has a different system Composer.
+COMPOSER = FileSpec(
+    name="composer",
+    version="2.8.5",
+    url="https://github.com/composer/composer/releases/download/2.8.5/composer.phar",
+    sha256="9cef18212e222351aeb476b81de7b2a5383f775336474467bf5c7ccfe84ab0cc",
+    filename="composer.phar",
+    env_override="CASHUPAY_TEST_COMPOSER",
+)
+
 
 def ensure_file(spec: FileSpec) -> Path:
     """Download a single file (e.g. wp-cli.phar) into tests/bin/<name>-<version>/."""

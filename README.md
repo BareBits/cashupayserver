@@ -60,8 +60,12 @@ CashuPayServer sits between custodial payment gateways and full self-hosting:
 ## Requirements
 
 - PHP 8.0 or higher
-- Extensions: `curl`, `json`, `sqlite3`, `gmp`
+- Extensions: `curl`, `json`, `sqlite3`, `gmp`, `mbstring`
 - Apache with mod_rewrite, nginx, or any PHP-capable web server
+
+For on-chain Bitcoin payment support, the release zip ships with the required
+PHP libraries (bitwasp/bitcoin et al.) under `vendor/`. Composer is only needed
+if you're building from source (see Development below).
 
 ## Installation
 
@@ -175,7 +179,17 @@ The simplest way to run CashuPayServer locally:
 ```bash
 git clone --recurse-submodules https://github.com/jooray/cashupayserver.git
 cd cashupayserver
+# Install PHP dependencies (bitwasp/bitcoin for on-chain payment support).
+# Composer is only needed for development and at build time — the deploy zip
+# bundles vendor/ so end users don't need Composer on their hosting.
+php composer.phar install --no-dev --ignore-platform-reqs   # or: composer install ...
 php -S localhost:8000 router.php
+```
+
+If `composer.phar` isn't checked in, fetch it once with:
+
+```bash
+curl -sS https://getcomposer.org/installer | php
 ```
 
 Open http://localhost:8000 in your browser.
