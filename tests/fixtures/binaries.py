@@ -73,6 +73,60 @@ PHP = BinarySpec(
 ALL_SPECS = (BITCOIND, LND, PHP)
 
 
+# ---------- single-file downloads (not tarballs) ----------
+
+@dataclass(frozen=True)
+class FileSpec:
+    name: str
+    version: str
+    url: str
+    sha256: str
+    filename: str  # final filename inside tests/bin/<name>-<version>/
+    env_override: str
+
+
+WP_CLI = FileSpec(
+    name="wp-cli",
+    version="2.12.0",
+    url="https://github.com/wp-cli/wp-cli/releases/download/v2.12.0/wp-cli-2.12.0.phar",
+    sha256="ce34ddd838f7351d6759068d09793f26755463b4a4610a5a5c0a97b68220d85c",
+    filename="wp-cli.phar",
+    env_override="CASHUPAY_TEST_WP_CLI",
+)
+
+
+def ensure_file(spec: FileSpec) -> Path:
+    """Download a single file (e.g. wp-cli.phar) into tests/bin/<name>-<version>/."""
+    override = os.environ.get(spec.env_override)
+    if override:
+        p = Path(override)
+        if not p.is_file():
+            raise RuntimeError(f"{spec.env_override}={override} is not a file")
+        return p
+
+    install_dir = BIN_DIR / f"{spec.name}-{spec.version}"
+    target = install_dir / spec.filename
+    if target.is_file() and _sha256_file(target) == spec.sha256:
+        return target
+
+    install_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[binaries] downloading {spec.name} {spec.version} ...", file=sys.stderr)
+    req = urllib.request.Request(spec.url, headers={"User-Agent": "cashupayserver-tests/1.0"})
+    with tempfile.NamedTemporaryFile(dir=install_dir, delete=False, suffix=".partial") as tmp:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            shutil.copyfileobj(resp, tmp)
+        tmp_path = Path(tmp.name)
+    actual = _sha256_file(tmp_path)
+    if actual != spec.sha256:
+        tmp_path.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"checksum mismatch for {spec.name} {spec.version}: "
+            f"expected {spec.sha256}, got {actual}"
+        )
+    tmp_path.replace(target)
+    return target
+
+
 def _sha256_file(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as f:

@@ -37,6 +37,7 @@ from fixtures.nutshell import MintHandle, start_mint, stop_mint  # noqa: E402
 from fixtures.payserver import PayserverHandle, start_payserver, stop_payserver  # noqa: E402
 from fixtures.setup_helpers import run_setup_wizard  # noqa: E402
 from fixtures.webhook_sink import WebhookSink, start_webhook_sink, stop_webhook_sink  # noqa: E402
+from fixtures.wordpress import WordPressHandle, start_wordpress, stop_wordpress  # noqa: E402
 
 DEFAULT_ADMIN_PASSWORD = "test-admin-pw-1234"
 DEFAULT_STORE_NAME = "Test Store"
@@ -114,6 +115,16 @@ def lnurlp_server(lnd_payer: LndHandle) -> Iterator[LnurlpServer]:
     s = start_lnurlp_server(lnd_payer)
     yield s
     stop_lnurlp_server(s)
+
+
+@pytest.fixture
+def wordpress(request) -> Iterator[WordPressHandle]:
+    """Fresh WordPress install with the cashupay plugin activated.
+    Function-scoped — each test gets its own WP root + SQLite DB."""
+    workdir = SESSION_TMP / f"wp-{uuid.uuid4().hex[:8]}"
+    handle = start_wordpress(workdir)
+    yield handle
+    stop_wordpress(handle)
 
 
 @pytest.fixture

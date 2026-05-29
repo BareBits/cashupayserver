@@ -67,10 +67,10 @@ class LndHandle:
             return None
         return resp.json()
 
-    def wait_ready(self, timeout_s: float = 90.0) -> None:
-        """LND has multiple startup phases; getinfo can return before the gRPC
-        server is fully unlocked. Wait until both getinfo and a 'real' RPC
-        (listpeers) succeed."""
+    def wait_ready(self, timeout_s: float = 120.0) -> None:
+        """LND has several startup phases; getinfo can return before the gRPC
+        sub-servers (wallet, peer, router) are up. We poll three RPCs that
+        hit different subservers and only succeed once everything's online."""
         deadline = time.monotonic() + timeout_s
         last: Exception | None = None
         while time.monotonic() < deadline:
@@ -82,6 +82,8 @@ class LndHandle:
                 # listpeers fails with code 2 'server still starting' until the
                 # subservers are up.
                 self._request("GET", "/v1/peers", timeout=3)
+                # newaddress (wallet sub-server) is the last to come online.
+                self._request("GET", "/v1/newaddress?type=0", timeout=3)
                 return
             except Exception as e:
                 last = e
@@ -110,12 +112,24 @@ class LndHandle:
 
     def connect_peer(self, pubkey: str, host: str) -> None:
         body = {"addr": {"pubkey": pubkey, "host": host}, "perm": True}
-        try:
-            self._request("POST", "/v1/peers", json_body=body, timeout=10)
-        except RuntimeError as e:
-            if "already connected" in str(e):
+        # The peer sub-server is occasionally still starting up even after
+        # wait_ready() returns. Retry briefly on 'server still starting'.
+        last_err: Exception | None = None
+        for _ in range(15):
+            try:
+                self._request("POST", "/v1/peers", json_body=body, timeout=10)
                 return
-            raise
+            except RuntimeError as e:
+                msg = str(e)
+                if "already connected" in msg:
+                    return
+                if "still in the process of starting" in msg:
+                    last_err = e
+                    time.sleep(0.5)
+                    continue
+                raise
+        if last_err:
+            raise last_err
 
     def list_peers(self) -> list[dict[str, Any]]:
         return self._request("GET", "/v1/peers").get("peers", [])
