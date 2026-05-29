@@ -11,6 +11,7 @@ import shutil
 import sys
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
 
@@ -22,6 +23,7 @@ if str(TESTS_DIR) not in sys.path:
     sys.path.insert(0, str(TESTS_DIR))
 
 from fixtures import binaries  # noqa: E402
+from fixtures.api_client import AdminClient, GreenfieldClient  # noqa: E402
 from fixtures.bitcoind import BitcoindHandle, start_bitcoind, stop_bitcoind  # noqa: E402
 from fixtures.lnd import (  # noqa: E402
     LndHandle,
@@ -31,7 +33,11 @@ from fixtures.lnd import (  # noqa: E402
 )
 from fixtures.nutshell import MintHandle, start_mint, stop_mint  # noqa: E402
 from fixtures.payserver import PayserverHandle, start_payserver, stop_payserver  # noqa: E402
+from fixtures.setup_helpers import run_setup_wizard  # noqa: E402
 from fixtures.webhook_sink import WebhookSink, start_webhook_sink, stop_webhook_sink  # noqa: E402
+
+DEFAULT_ADMIN_PASSWORD = "test-admin-pw-1234"
+DEFAULT_STORE_NAME = "Test Store"
 
 SESSION_TMP = TESTS_DIR / ".tmp"
 
@@ -98,3 +104,52 @@ def webhook_sink() -> Iterator[WebhookSink]:
     sink = start_webhook_sink()
     yield sink
     stop_webhook_sink(sink)
+
+
+# ---- composite fixtures: payserver with setup-wizard already walked ----
+
+
+@dataclass
+class ConfiguredPayserver:
+    """A payserver instance with the install wizard already completed.
+    Holds the handles every test usually wants in one place."""
+
+    handle: PayserverHandle
+    admin: AdminClient
+    store_id: str
+    admin_password: str
+    api_token: str
+    greenfield: GreenfieldClient
+
+
+@pytest.fixture
+def configured(payserver: PayserverHandle, mint: MintHandle) -> ConfiguredPayserver:
+    """Run the setup wizard, log in as admin, mint an API key.
+
+    Most tests should depend on this and skip the boilerplate; tests that
+    specifically exercise the setup flow should depend on `payserver` and
+    `mint` directly instead.
+    """
+    run_setup_wizard(
+        payserver.url,
+        admin_password=DEFAULT_ADMIN_PASSWORD,
+        store_name=DEFAULT_STORE_NAME,
+        mint_url=mint.url,
+        mint_unit="sat",
+    )
+    admin = AdminClient(payserver.url)
+    admin.login(DEFAULT_ADMIN_PASSWORD)
+    stores = admin.list_stores()
+    assert stores, "setup wizard should have created a store"
+    store_id = stores[0]["id"]
+    key = admin.create_api_key(store_id, label="e2e")
+    token = key.get("key") or key.get("apiKey") or key.get("token")
+    assert token, f"expected api key in response, got {key}"
+    return ConfiguredPayserver(
+        handle=payserver,
+        admin=admin,
+        store_id=store_id,
+        admin_password=DEFAULT_ADMIN_PASSWORD,
+        api_token=token,
+        greenfield=GreenfieldClient(payserver.url, token),
+    )

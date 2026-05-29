@@ -9,11 +9,13 @@ from __future__ import annotations
 import os
 import shutil
 import signal
+import sqlite3
 import subprocess
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import requests
 
@@ -66,6 +68,30 @@ class PayserverHandle:
     def session(self) -> requests.Session:
         return requests.Session()
 
+    @property
+    def db_path(self) -> Path:
+        return self.data_dir / "cashupay.sqlite"
+
+    @contextmanager
+    def db(self) -> Iterator[sqlite3.Connection]:
+        """Open the SQLite DB for direct inspection or test-only mutation.
+        Use sparingly — most assertions should go through the HTTP API."""
+        conn = sqlite3.connect(self.db_path, isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+        finally:
+            conn.close()
+
+    def trigger_cron(self, *, internal_key: str | None = None) -> requests.Response:
+        """Hit cron.php. If `internal_key` is None we rely on the install
+        having no `cron_key` set, which is true for the test wizard."""
+        if internal_key is not None:
+            params = {"internal": "1", "key": internal_key}
+        else:
+            params = {}
+        return requests.get(f"{self.url}/cron.php", params=params, timeout=30)
+
 
 def _ensure_php() -> str:
     return str(binaries.ensure(binaries.PHP)["php"])
@@ -76,6 +102,13 @@ def start_payserver(workdir: Path) -> PayserverHandle:
     workdir.mkdir(parents=True, exist_ok=True)
     data_dir = workdir / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
+
+    # includes/security.php caches rate-limit + lockout counters at
+    # <repo-root>/data/cache/ irrespective of CASHUPAY_DATA_DIR. Without this
+    # wipe, state (especially login lockouts) bleeds across tests.
+    shared_cache = REPO_ROOT / "data" / "cache"
+    if shared_cache.exists():
+        shutil.rmtree(shared_cache, ignore_errors=True)
 
     router_wrapper = workdir / "router-wrapper.php"
     router_wrapper.write_text(
