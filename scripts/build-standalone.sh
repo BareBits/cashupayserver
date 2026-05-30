@@ -10,6 +10,16 @@ rm -rf build/cashupayserver build/cashupayserver.zip
 
 mkdir -p "$BUILD_DIR"
 
+# Install Composer dependencies for the on-chain Bitcoin payment support
+# (bitwasp/bitcoin and friends). The lockfile pins exact versions; we use
+# --ignore-platform-reqs because a transitive dep (lastguest/murmurhash) has
+# a stale PHP 7 pin even though it runs fine on PHP 8.
+if [ ! -f composer.phar ]; then
+    PHP_BIN="${PHP_BIN:-php}"
+    curl -sS https://getcomposer.org/installer | "$PHP_BIN" -- --quiet --install-dir=. --filename=composer.phar
+fi
+"${PHP_BIN:-php}" composer.phar install --no-progress --no-dev --optimize-autoloader --ignore-platform-reqs
+
 # Build mint-discovery bundle first
 if [ -d "mint-discovery" ]; then
     cd mint-discovery && npm install --silent && npm run build --silent && cd ..
@@ -18,6 +28,7 @@ fi
 
 # Copy core files
 cp -r includes/ "$BUILD_DIR/includes/"
+cp -r vendor/ "$BUILD_DIR/vendor/"
 cp -r assets/ "$BUILD_DIR/assets/"
 cp -r api-keys/ "$BUILD_DIR/api-keys/"
 cp admin.php setup.php api.php payment.php receive.php cron.php router.php index.php "$BUILD_DIR/"

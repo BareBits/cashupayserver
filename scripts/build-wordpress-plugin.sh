@@ -19,8 +19,16 @@ cp "$BUILD_DIR/wordpress/cashupay.php" "$BUILD_DIR/cashupay.php"
 # Copy uninstall.php to plugin root (WordPress expects it there)
 cp "$BUILD_DIR/wordpress/uninstall.php" "$BUILD_DIR/uninstall.php"
 
+# Install Composer dependencies (bitwasp/bitcoin etc.) before bundling.
+if [ ! -f composer.phar ]; then
+    PHP_BIN="${PHP_BIN:-php}"
+    curl -sS https://getcomposer.org/installer | "$PHP_BIN" -- --quiet --install-dir=. --filename=composer.phar
+fi
+"${PHP_BIN:-php}" composer.phar install --no-progress --no-dev --optimize-autoloader --ignore-platform-reqs
+
 # Copy shared core
 cp -r includes/ "$BUILD_DIR/includes/"
+cp -r vendor/ "$BUILD_DIR/vendor/"
 cp admin.php setup.php api.php payment.php receive.php cron.php "$BUILD_DIR/"
 cp -r api-keys/ "$BUILD_DIR/api-keys/"
 

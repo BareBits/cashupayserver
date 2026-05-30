@@ -34,6 +34,7 @@ from fixtures.lnd import (  # noqa: E402
 )
 from fixtures.lnurlp_server import LnurlpServer, start_lnurlp_server, stop_lnurlp_server  # noqa: E402
 from fixtures.nutshell import MintHandle, start_mint, stop_mint  # noqa: E402
+from fixtures.onchain import OnchainContext, make_onchain_context  # noqa: E402,F401
 from fixtures.payserver import PayserverHandle, start_payserver, stop_payserver  # noqa: E402
 from fixtures.setup_helpers import run_setup_wizard  # noqa: E402
 from fixtures.webhook_sink import WebhookSink, start_webhook_sink, stop_webhook_sink  # noqa: E402
@@ -107,6 +108,21 @@ def webhook_sink() -> Iterator[WebhookSink]:
     sink = start_webhook_sink()
     yield sink
     stop_webhook_sink(sink)
+
+
+@pytest.fixture
+def onchain(bitcoind: BitcoindHandle) -> Iterator[OnchainContext]:
+    """A fresh watch-only wallet per test (so derivation indexes from the
+    shared tpub don't collide across tests) + helpers for funding."""
+    name = f"cashupay-watch-{uuid.uuid4().hex[:8]}"
+    ctx = make_onchain_context(bitcoind, name)
+    yield ctx
+    # Best-effort: unload the wallet so bitcoind doesn't accumulate them
+    # across a long session run.
+    try:
+        bitcoind.rpc("unloadwallet", name)
+    except Exception:
+        pass
 
 
 @pytest.fixture

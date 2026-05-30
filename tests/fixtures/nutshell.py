@@ -103,8 +103,12 @@ def start_mint(workdir: Path, lnd_mint: LndHandle) -> MintHandle:
             "MINT_INFO_NAME": "test-mint",
             "MINT_INFO_DESCRIPTION": "regtest mint for CashuPayServer tests",
             "MINT_INFO_CONTACT": "[]",
-            "MINT_MAX_PEG_IN": "100000",
-            "MINT_MAX_PEG_OUT": "100000",
+            # Bumped so the iterate.py dev script can pre-fund a customer
+            # Cashu wallet with 1 BTC (= 100,000,000 sats). The default 100k
+            # is fine for the test suite but caps single mint/melt quotes —
+            # raise above 2 BTC so even oversized iteration amounts pass.
+            "MINT_MAX_PEG_IN": "200000000",
+            "MINT_MAX_PEG_OUT": "200000000",
             "MINT_INPUT_FEE_PPK": "0",
             "DEBUG": "false",
             "LOG_LEVEL": "INFO",

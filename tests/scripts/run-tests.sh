@@ -18,6 +18,26 @@ if [ ! -f "${REPO_ROOT}/cashu-wallet-php/CashuWallet.php" ]; then
   (cd "${REPO_ROOT}" && git submodule update --init --recursive)
 fi
 
+# 1b. Composer vendor/ for on-chain Bitcoin support (bitwasp/bitcoin et al).
+#     Uses the static PHP binary the fixture manager downloaded, plus a pinned
+#     composer.phar. --ignore-platform-reqs sidesteps a stale PHP 7 pin in a
+#     transitive dep (lastguest/murmurhash) that still runs fine on PHP 8.
+if [ ! -d "${REPO_ROOT}/vendor" ] && [ -f "${REPO_ROOT}/composer.json" ]; then
+  python3 - "${TESTS_DIR}" "${REPO_ROOT}" <<'PYEOF'
+import subprocess, sys
+sys.path.insert(0, sys.argv[1])
+from fixtures import binaries
+php = binaries.ensure(binaries.PHP)["php"]
+composer = binaries.ensure_file(binaries.COMPOSER)
+print(f"[run-tests] installing composer dependencies into {sys.argv[2]}/vendor", flush=True)
+subprocess.run(
+    [str(php), str(composer), "install", "--no-progress", "--no-dev",
+     "--optimize-autoloader", "--ignore-platform-reqs"],
+    cwd=sys.argv[2], check=True,
+)
+PYEOF
+fi
+
 # 1a. Apply the LNURL-pay URL override patch to cashu-wallet-php so the
 #     auto-melt tests can point the resolver at a local mock server. The patch
 #     adds a CASHU_LNURL_URL_TEMPLATE env honor that no-ops in production. We
