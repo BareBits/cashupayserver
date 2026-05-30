@@ -287,6 +287,87 @@ def open_dual_channels(bitcoind: BitcoindHandle, lnd_payer: LndHandle, lnd_mint:
     _wait_for_channels_active(lnd_mint, expected=2)
 
 
+def open_extra_channel(
+    bitcoind: BitcoindHandle,
+    funder: LndHandle,
+    target: LndHandle,
+    *,
+    capacity_sat: int,
+    push_sat: int = 0,
+) -> None:
+    """Open one additional channel beyond `open_dual_channels`. Tops up the
+    funder's on-chain balance first so it can cover the channel funding tx.
+    Used by the iterate.py dev script when it needs much more outbound than
+    the standard 5M sat push gives — e.g. to mint a 1 BTC Cashu token.
+    """
+    # Need ~capacity + change + fee in funder's on-chain wallet. Send a bit
+    # more than capacity to leave headroom.
+    btc_to_fund = (capacity_sat + 200_000) / 100_000_000
+    addr = funder.new_address()
+    bitcoind.send_to_address(addr, btc_to_fund)
+    bitcoind.mine(6)
+
+    # Wait for the funder to see the UTXO AND finish syncing to the new tip.
+    # LND distinguishes between "I see the balance" and "I have processed every
+    # block up to tip"; channel opens require the latter, so we poll both.
+    deadline = time.monotonic() + 60
+    needed = capacity_sat + 50_000
+    target_height = bitcoind.block_count()
+    while time.monotonic() < deadline:
+        try:
+            info = funder.get_info()
+            synced = bool(info.get("synced_to_chain"))
+            height = int(info.get("block_height", 0))
+            if synced and height >= target_height and funder.wallet_balance_sat() >= needed:
+                break
+        except Exception:
+            pass
+        time.sleep(0.5)
+    else:
+        raise TimeoutError(
+            f"LND {funder.name} didn't reach synced_to_chain=true at height "
+            f">= {target_height} with balance >= {needed} sat after 60s"
+        )
+
+    funder.open_channel(target.pubkey, capacity_sat, push_sat)
+    bitcoind.mine(6)
+
+    # Wait for the new channel to activate (in addition to any pre-existing).
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline:
+        active = [c for c in funder.list_channels() if c.get("active")]
+        if any(int(c.get("capacity", "0")) >= capacity_sat - 1000 for c in active):
+            break
+        time.sleep(0.5)
+    else:
+        raise TimeoutError(
+            f"extra {capacity_sat} sat channel from {funder.name} to {target.name} did not activate"
+        )
+
+    # LND marks the channel active before broadcasting its channel_announcement
+    # to the routing graph; until that announcement lands, the funder's router
+    # doesn't know about the new outbound capacity and immediate payments fail
+    # with "insufficient_balance". Wait for the channel to show up in the
+    # router's view via describegraph (~1-2s after activation, but variable).
+    deadline = time.monotonic() + 30
+    new_chan_seen = False
+    while time.monotonic() < deadline:
+        try:
+            graph = funder._request("GET", "/v1/graph")
+            for e in graph.get("edges", []):
+                if int(e.get("capacity", "0")) >= capacity_sat - 1000:
+                    new_chan_seen = True
+                    break
+        except Exception:
+            pass
+        if new_chan_seen:
+            return
+        time.sleep(0.3)
+    # Don't fail hard — the active check passed, so payments will eventually
+    # work once gossip catches up. Just log and return.
+    print(f"[lnd] warning: extra channel active but not in routing graph after 30s")
+
+
 def _wait_for_peer(node: LndHandle, peer_pubkey: str, timeout_s: float = 15.0) -> None:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
