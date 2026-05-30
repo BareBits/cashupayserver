@@ -24,9 +24,10 @@ def test_payment_page_renders_qr_and_polls_to_settled(
 
     page.goto(f"{configured.handle.url}/payment?id={invoice_id}")
 
-    # The QR canvas / SVG renders into #qr-code; wait for it to populate.
+    # The QR canvas renders into #qr-lightning (and #qr-onchain when both
+    # methods are configured); wait for the Lightning QR specifically.
     page.wait_for_function(
-        "() => { const el = document.getElementById('qr-code'); return el && el.childElementCount > 0; }"
+        "() => { const el = document.getElementById('qr-lightning'); return el && el.childElementCount > 0; }"
     )
 
     # The pending state ("Waiting for payment") should be visible.
