@@ -1576,6 +1576,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 // Serve the SPA HTML
 $baseUrl = Config::getBaseUrl();
 $isWp = Urls::isWordPress();
+$isLoggedIn = Auth::isLoggedIn();
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -1656,7 +1657,7 @@ $isWp = Urls::isWordPress();
         }
 
         .pin-dots {
-            display: flex;
+            display: none;
             gap: 1rem;
             margin-bottom: 2rem;
         }
@@ -1685,7 +1686,7 @@ $isWp = Urls::isWordPress();
         }
 
         .pin-pad {
-            display: grid;
+            display: none;
             grid-template-columns: repeat(3, 1fr);
             gap: 1rem;
             max-width: 280px;
@@ -2438,10 +2439,10 @@ $isWp = Urls::isWordPress();
 </head>
 <body>
     <!-- Lock Screen -->
-    <div class="lock-screen" id="lock-screen">
+    <div class="lock-screen<?= $isLoggedIn ? ' hidden' : '' ?>" id="lock-screen">
         <div class="lock-logo">&#9889;</div>
         <div class="lock-title">CashuPayServer</div>
-        <div class="lock-subtitle">Enter PIN to unlock</div>
+        <div class="lock-subtitle"><?= $isLoggedIn ? 'Enter PIN to unlock' : 'Enter your password' ?></div>
 
         <div class="pin-dots" id="pin-dots">
             <div class="pin-dot"></div>
@@ -3088,6 +3089,9 @@ $isWp = Urls::isWordPress();
     <script>
         // WordPress mode - skip lock screen
         const isWordPressMode = <?= Urls::isWordPress() ? 'true' : 'false' ?>;
+        // PHP session state, used to skip the password prompt on reload when
+        // the server still considers us logged in.
+        const phpLoggedIn = <?= $isLoggedIn ? 'true' : 'false' ?>;
         const adminUrl = <?= json_encode(Urls::admin()) ?>;
         const setupUrl = <?= json_encode(Urls::setup()) ?>;
 
@@ -3170,25 +3174,21 @@ $isWp = Urls::isWordPress();
                 return;
             }
 
-            const storedAuth = localStorage.getItem(STORAGE_AUTH);
-            const storedPin = localStorage.getItem(STORAGE_PIN);
-
-            if (storedAuth === 'true') {
-                // Check if we have a PIN set
+            if (phpLoggedIn) {
+                const storedPin = localStorage.getItem(STORAGE_PIN);
                 if (storedPin) {
+                    // Session valid, PIN configured — require PIN to unlock UI
+                    document.getElementById('pin-pad').style.display = 'grid';
+                    document.getElementById('pin-dots').style.display = 'flex';
+                    document.querySelector('.lock-subtitle').textContent = 'Enter PIN to unlock';
                     showLockScreen();
                 } else {
-                    // No PIN, show password entry
-                    document.getElementById('pin-pad').style.display = 'none';
-                    document.getElementById('pin-dots').style.display = 'none';
-                    document.querySelector('.lock-subtitle').textContent = 'Enter your password';
-                    showLockScreen();
+                    // Session valid, no PIN — skip lock entirely
+                    showApp();
                 }
             } else {
-                // Not authenticated, show password entry
-                document.getElementById('pin-pad').style.display = 'none';
-                document.getElementById('pin-dots').style.display = 'none';
-                document.querySelector('.lock-subtitle').textContent = 'Enter your password';
+                // No server session — password lock; PHP already rendered
+                // the lock screen visible with the correct subtitle.
                 showLockScreen();
             }
         }
@@ -4894,12 +4894,15 @@ $isWp = Urls::isWordPress();
                 dot.classList.remove('filled');
             });
 
-            // Check if PIN is set
             const storedPin = localStorage.getItem(STORAGE_PIN);
             if (storedPin) {
                 document.getElementById('pin-pad').style.display = 'grid';
                 document.getElementById('pin-dots').style.display = 'flex';
                 document.querySelector('.lock-subtitle').textContent = 'Enter PIN to unlock';
+            } else {
+                document.getElementById('pin-pad').style.display = 'none';
+                document.getElementById('pin-dots').style.display = 'none';
+                document.querySelector('.lock-subtitle').textContent = 'Enter your password';
             }
         }
 
