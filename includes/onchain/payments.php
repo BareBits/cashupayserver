@@ -23,8 +23,7 @@ class OnchainPayments {
         $pdo->beginTransaction();
         try {
             $stmt = $pdo->prepare(
-                "SELECT onchain_xpub, onchain_address_type, onchain_network
-                 FROM stores WHERE id = ?"
+                "SELECT * FROM stores WHERE id = ?"
             );
             $stmt->execute([$storeId]);
             $row = $stmt->fetch(PDO::FETCH_ASSOC);
@@ -64,8 +63,22 @@ class OnchainPayments {
                 $row['onchain_network'] ?: 'mainnet',
                 $index
             );
+
+            // Capture the chain tip at allocation time. The poller compares
+            // each observation's block_height against this to discard payments
+            // that existed on a re-used address BEFORE the invoice was created.
+            // Provider call is best-effort: if it fails, we just leave the
+            // tip NULL and skip filtering (old behavior).
+            $tip = null;
+            try {
+                $provider = OnchainProviderFactory::forStore($row);
+                $tip = $provider->currentTipHeight();
+            } catch (Throwable $_) {
+                // Logged on the first real poll; no need to spam here.
+            }
+
             $pdo->commit();
-            return ['address' => $address, 'index' => $index];
+            return ['address' => $address, 'index' => $index, 'tip_height' => $tip];
         } catch (Throwable $e) {
             $pdo->rollBack();
             throw $e;
@@ -101,6 +114,19 @@ class OnchainPayments {
 
         $minConfs = (int)($store['onchain_min_confs'] ?? 1);
         $now = time();
+
+        // Filter out historical UTXOs on a re-used address — any tx confirmed
+        // strictly before the invoice was created. onchain_created_tip_height
+        // is the chain tip at allocation time; an observation with
+        // block_height < that height was mined before the invoice existed.
+        // Mempool observations (block_height === null) are always kept.
+        // Legacy invoices without a recorded tip skip the filter.
+        $createdTip = $invoice['onchain_created_tip_height'] ?? null;
+        if ($createdTip !== null) {
+            $observations = array_values(array_filter($observations, function ($obs) use ($createdTip) {
+                return $obs->blockHeight === null || $obs->blockHeight >= (int)$createdTip;
+            }));
+        }
 
         // Upsert observations into onchain_payments.
         foreach ($observations as $obs) {

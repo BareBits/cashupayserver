@@ -90,11 +90,13 @@ class Invoice {
         $onchainAddress = null;
         $onchainIndex = null;
         $onchainAmountSat = null;
+        $onchainCreatedTipHeight = null;
         if ($onchainConfigured) {
             $allocation = OnchainPayments::allocateAddress($storeId);
             if ($allocation !== null) {
                 $onchainAddress = $allocation['address'];
                 $onchainIndex = $allocation['index'];
+                $onchainCreatedTipHeight = $allocation['tip_height'] ?? null;
                 $onchainAmountSat = ExchangeRates::convertToSats((string)$amount, $currency, 'sat');
             }
         }
@@ -123,6 +125,7 @@ class Invoice {
             'onchain_address' => $onchainAddress,
             'onchain_address_index' => $onchainIndex,
             'onchain_amount_sat' => $onchainAmountSat,
+            'onchain_created_tip_height' => $onchainCreatedTipHeight,
             'metadata' => $metadata ? json_encode($metadata) : null,
             'checkout_config' => $checkout ? json_encode($checkout) : null,
             'created_at' => $now,

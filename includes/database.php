@@ -339,6 +339,12 @@ HTACCESS;
         if (!self::columnExists($pdo, 'invoices', 'onchain_first_seen_at')) {
             $pdo->exec("ALTER TABLE invoices ADD COLUMN onchain_first_seen_at INTEGER DEFAULT NULL");
         }
+        // Chain tip height at invoice creation. Used by the poller to discard
+        // historical UTXOs on a re-used address (txs confirmed BEFORE the
+        // invoice existed). NULL on legacy rows → no filtering applied.
+        if (!self::columnExists($pdo, 'invoices', 'onchain_created_tip_height')) {
+            $pdo->exec("ALTER TABLE invoices ADD COLUMN onchain_created_tip_height INTEGER DEFAULT NULL");
+        }
 
         if (!self::tableExists($pdo, 'onchain_xpub_state')) {
             $pdo->exec("
