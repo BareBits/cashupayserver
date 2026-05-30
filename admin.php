@@ -138,11 +138,11 @@ if (isset($_GET['api'])) {
                 'threshold' => (int)($store['auto_melt_threshold'] ?? 2000),
             ];
 
-            // On-chain Bitcoin payment settings (xpub masked for display).
+            // On-chain Bitcoin payment settings.
             $onchainXpub = $store['onchain_xpub'] ?? '';
             $onchain = [
                 'enabled' => $onchainXpub !== '',
-                'xpubMasked' => $onchainXpub === '' ? '' : substr($onchainXpub, 0, 8) . '…' . substr($onchainXpub, -6),
+                'xpub' => $onchainXpub,
                 'network' => $store['onchain_network'] ?? 'mainnet',
                 'addressType' => $store['onchain_address_type'] ?? 'P2WPKH',
                 'minConfs' => (int)($store['onchain_min_confs'] ?? 1),
@@ -812,25 +812,40 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 );
                 $xpubChanged = $existing && ($existing['onchain_xpub'] ?? null) !== $xpub;
 
+                // The admin form exposes only a provider URL, not a provider
+                // kind. Force the kind to Esplora here — bitcoind-RPC is only
+                // used by the dev fixtures, which seed the column directly.
+                // Without this, a row left over from a fixture stays stuck on
+                // 'bitcoind-rpc' even after the user clears the URL, and every
+                // poll throws "bitcoind provider requires onchain_provider_url".
                 $update = [
                     'onchain_xpub' => $xpub,
                     'onchain_network' => $network,
                     'onchain_address_type' => $type,
                     'onchain_min_confs' => $minConfs,
                     'onchain_confirm_timeout_sec' => $confirmTimeoutSec,
+                    'onchain_provider' => 'esplora',
                     'onchain_provider_url' => $providerUrl ?: null,
                 ];
-                // If the xpub changed, reset the derivation counter so the new
-                // wallet's addresses start at index 0 (matches what the user's
-                // signing wallet will display).
+                // If the xpub changed, sync the displayed counter from the
+                // per-xpub state table — re-adding a previously used xpub
+                // resumes from where it left off; a fresh xpub starts at 0.
+                $resumedIndex = null;
                 if ($xpubChanged) {
-                    $update['onchain_next_index'] = 0;
+                    $xpubHash = hash('sha256', $xpub);
+                    $row = Database::fetchOne(
+                        "SELECT next_index FROM onchain_xpub_state WHERE xpub_hash = ?",
+                        [$xpubHash]
+                    );
+                    $resumedIndex = $row ? (int)$row['next_index'] : 0;
+                    $update['onchain_next_index'] = $resumedIndex;
                 }
                 Database::update('stores', $update, 'id = ?', [$storeId]);
                 echo json_encode([
                     'success' => true,
                     'warnings' => $check['warnings'],
-                    'xpubReset' => $xpubChanged,
+                    'xpubChanged' => $xpubChanged,
+                    'resumedIndex' => $resumedIndex,
                 ]);
             } catch (Exception $e) {
                 http_response_code(400);
@@ -2596,13 +2611,17 @@ $isWp = Urls::isWordPress();
                                     <option value="regtest">regtest</option>
                                 </select>
                             </div>
-                            <div class="form-group">
+                            <div class="form-group" id="onchain-address-type-row">
                                 <label class="form-label">Address type</label>
                                 <select class="form-input" id="onchain-address-type">
                                     <option value="P2WPKH">P2WPKH (native segwit, recommended)</option>
                                     <option value="P2SH-P2WPKH">P2SH-P2WPKH (wrapped segwit)</option>
                                 </select>
+                                <p class="form-help" id="onchain-address-type-help">
+                                    The xpub prefix above doesn’t pin a script type — pick the one your wallet uses.
+                                </p>
                             </div>
+                            <p class="form-help" id="onchain-address-type-inferred" style="display:none;"></p>
                             <div class="form-group">
                                 <label class="form-label">Required confirmations (0 = accept zero-conf)</label>
                                 <input type="number" class="form-input" id="onchain-min-confs" min="0" max="100" value="1">
@@ -2987,6 +3006,19 @@ $isWp = Urls::isWordPress();
     <!-- Toast -->
     <div class="toast" id="toast"></div>
 
+    <!-- On-chain save confirm (replaces native confirm() which Chrome will
+         silently suppress if the user once ticked "Prevent additional dialogs"). -->
+    <div class="modal-overlay" id="modal-onchain-confirm">
+        <div class="modal">
+            <div class="modal-handle"></div>
+            <div class="modal-title" id="modal-onchain-confirm-title">Confirm change</div>
+            <p style="color: var(--text-secondary); margin-bottom: 1rem;" id="modal-onchain-confirm-body">
+            </p>
+            <button class="btn btn-full" id="btn-onchain-confirm-yes">Continue</button>
+            <button class="btn btn-secondary btn-full" style="margin-top: 0.5rem;" id="btn-onchain-confirm-no">Cancel</button>
+        </div>
+    </div>
+
     <!-- Mint Discovery Modal -->
     <div id="mint-discovery-modal" class="modal" style="display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.7); z-index: 1100; justify-content: center; align-items: center;">
         <div class="modal-content" style="max-width: 700px; max-height: 85vh; overflow: hidden; display: flex; flex-direction: column; background: var(--card-bg); border-radius: 12px; padding: 1.5rem;">
@@ -3299,6 +3331,7 @@ $isWp = Urls::isWordPress();
             document.getElementById('btn-validate-onchain').addEventListener('click', validateOnchainXpub);
             document.getElementById('btn-test-onchain').addEventListener('click', testOnchainCurrent);
             document.getElementById('btn-save-onchain').addEventListener('click', saveOnchain);
+            document.getElementById('onchain-xpub').addEventListener('input', applyOnchainAddressTypeVisibility);
             document.getElementById('btn-save-exchange-settings').addEventListener('click', saveExchangeSettings);
             document.getElementById('btn-set-pin').addEventListener('click', () => openModal('modal-pin-setup'));
             document.getElementById('btn-save-pin').addEventListener('click', savePin);
@@ -4477,6 +4510,39 @@ $isWp = Urls::isWordPress();
             }
         }
 
+        // SLIP-0132 prefix → address type. xpub/tpub are ambiguous (legacy
+        // P2PKH per the spec, but reused for native/wrapped segwit by many
+        // wallets), so we leave the dropdown visible in that case.
+        function inferOnchainTypeFromXpub(s) {
+            const head = (s || '').trim().slice(0, 4).toLowerCase();
+            if (head === 'zpub' || head === 'vpub') return {type: 'P2WPKH', prefix: head};
+            if (head === 'ypub' || head === 'upub') return {type: 'P2SH-P2WPKH', prefix: head};
+            return null; // xpub/tpub or unrecognized → user picks
+        }
+
+        function applyOnchainAddressTypeVisibility() {
+            const row = document.getElementById('onchain-address-type-row');
+            const inferredLine = document.getElementById('onchain-address-type-inferred');
+            const select = document.getElementById('onchain-address-type');
+            const typed = document.getElementById('onchain-xpub').value.trim();
+            // Prefer the pasted xpub; if blank, fall back to the configured one.
+            let inferred = typed ? inferOnchainTypeFromXpub(typed) : null;
+            if (!inferred && !typed && dashboardData?.onchain?.enabled) {
+                inferred = inferOnchainTypeFromXpub(dashboardData.onchain.xpub || '');
+            }
+            if (inferred) {
+                select.value = inferred.type;
+                row.style.display = 'none';
+                inferredLine.style.display = 'block';
+                inferredLine.textContent =
+                    'Address type: ' + inferred.type +
+                    ' (auto-detected from ' + inferred.prefix + ' prefix)';
+            } else {
+                row.style.display = '';
+                inferredLine.style.display = 'none';
+            }
+        }
+
         function renderOnchainDashboard() {
             if (!dashboardData?.onchain) return;
             const oc = dashboardData.onchain;
@@ -4489,12 +4555,15 @@ $isWp = Urls::isWordPress();
             const meta = document.getElementById('onchain-xpub-meta');
             const xpubInput = document.getElementById('onchain-xpub');
             if (oc.enabled) {
-                meta.textContent = 'Currently configured: ' + (oc.xpubMasked || '(set)') + ' — paste a new xpub to replace it.';
+                meta.innerHTML = 'Currently configured: <code style="word-break:break-all; font-size:0.8rem;">'
+                    + escapeHtml(oc.xpub || '(set)')
+                    + '</code><br>Paste a new xpub above to replace it.';
                 xpubInput.placeholder = '(unchanged — paste new xpub to replace)';
             } else {
                 meta.textContent = '';
                 xpubInput.placeholder = 'xpub... or zpub... or vpub...';
             }
+            applyOnchainAddressTypeVisibility();
         }
 
         async function validateOnchainXpub() {
@@ -4545,8 +4614,40 @@ $isWp = Urls::isWordPress();
             box.innerHTML = 'Current next address (m/0/' + data.index + '): <code>' + data.address + '</code>';
         }
 
+        // In-page confirm modal — Chrome can suppress native confirm() per-tab
+        // if the user once ticked "Prevent additional dialogs", which silently
+        // breaks saveOnchain. Returns a Promise that resolves true/false.
+        function confirmOnchain(title, body) {
+            return new Promise(resolve => {
+                document.getElementById('modal-onchain-confirm-title').textContent = title;
+                document.getElementById('modal-onchain-confirm-body').textContent = body;
+                const yes = document.getElementById('btn-onchain-confirm-yes');
+                const no = document.getElementById('btn-onchain-confirm-no');
+                const cleanup = answer => {
+                    yes.onclick = null;
+                    no.onclick = null;
+                    closeModal('modal-onchain-confirm');
+                    resolve(answer);
+                };
+                yes.onclick = () => cleanup(true);
+                no.onclick = () => cleanup(false);
+                openModal('modal-onchain-confirm');
+            });
+        }
+
         async function saveOnchain() {
-            if (!currentStoreId) { showToast('No store selected', 'error'); return; }
+            const box = document.getElementById('onchain-validation-box');
+            const showInline = (text, ok) => {
+                box.style.display = 'block';
+                box.style.background = ok ? 'rgba(72, 187, 120, 0.1)' : 'rgba(245, 101, 101, 0.15)';
+                box.style.border = '1px solid ' + (ok ? 'rgba(72, 187, 120, 0.3)' : 'rgba(245, 101, 101, 0.3)');
+                box.innerHTML = text;
+            };
+            if (!currentStoreId) {
+                showInline('<strong>No store selected.</strong> Pick a store from the dropdown at the top of the page first.', false);
+                showToast('No store selected', 'error');
+                return;
+            }
             const xpub = document.getElementById('onchain-xpub').value.trim();
             const network = document.getElementById('onchain-network').value;
             const type = document.getElementById('onchain-address-type').value;
@@ -4554,18 +4655,39 @@ $isWp = Urls::isWordPress();
             const timeout = document.getElementById('onchain-confirm-timeout').value;
             const providerUrl = document.getElementById('onchain-provider-url').value.trim();
             if (xpub === '' && dashboardData?.onchain?.enabled) {
-                if (!confirm('Empty xpub will disable on-chain payments for this store. Continue?')) return;
+                const ok = await confirmOnchain(
+                    'Disable on-chain payments?',
+                    'Saving with an empty xpub will disable on-chain payments for this store.'
+                );
+                if (!ok) { showInline('<strong>Cancelled.</strong> No changes saved.', false); return; }
             } else if (xpub !== '' && dashboardData?.onchain?.enabled) {
-                if (!confirm('Replacing the xpub will reset the address derivation counter to 0. Continue?')) return;
+                const ok = await confirmOnchain(
+                    'Switch to a different xpub?',
+                    'Replace the currently configured xpub with the one you just pasted.'
+                );
+                if (!ok) { showInline('<strong>Cancelled.</strong> No changes saved.', false); return; }
             }
             const body = `action=save_onchain&store_id=${encodeURIComponent(currentStoreId)}&xpub=${encodeURIComponent(xpub)}&network=${network}&address_type=${type}&min_confs=${minConfs}&confirm_timeout_sec=${timeout}&provider_url=${encodeURIComponent(providerUrl)}`;
+            // Mirror the result inline next to the Save button — the global
+            // toast sits above the mobile bottom-nav and is easy to miss.
             const r = await postWithCsrf(adminUrl, body);
             const data = await r.json();
             if (r.ok) {
-                showToast('On-chain settings saved' + (data.disabled ? ' (disabled)' : '') + (data.xpubReset ? ' (counter reset)' : ''), 'success');
+                let suffix = '';
+                if (data.disabled) {
+                    suffix = ' (on-chain disabled)';
+                } else if (data.xpubChanged) {
+                    suffix = data.resumedIndex > 0
+                        ? ' — resumed at index ' + data.resumedIndex
+                        : ' — new xpub starts at index 0';
+                }
+                showInline('<strong>&#10003; Saved' + suffix + '.</strong>', true);
+                showToast('On-chain settings saved' + (data.disabled ? ' (disabled)' : ''), 'success');
                 loadDashboard();
             } else {
-                showToast(data.error || 'Failed to save', 'error');
+                const err = data.error || 'Failed to save';
+                showInline('<strong>Save failed:</strong> ' + err, false);
+                showToast(err, 'error');
             }
         }
 
