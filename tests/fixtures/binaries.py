@@ -70,6 +70,28 @@ PHP = BinarySpec(
     env_override="CASHUPAY_TEST_PHP",
 )
 
+FULCRUM = BinarySpec(
+    name="fulcrum",
+    version="2.1.1",
+    url="https://github.com/cculianu/Fulcrum/releases/download/v2.1.1/Fulcrum-2.1.1-x86_64-linux.tar.gz",
+    sha256="6056b97d63ee9ec5b056521ca26586b027f3dd57d00875d4950d8e77ec3f442b",
+    archive_root="Fulcrum-2.1.1-x86_64-linux",
+    executables=("Fulcrum",),
+    env_override="CASHUPAY_TEST_FULCRUM",
+)
+
+# Node.js portable LTS. Ships npm in the same tarball; used to build/run the
+# self-hosted cashu.me wallet for the dev iterate.py script.
+NODEJS = BinarySpec(
+    name="nodejs",
+    version="20.20.2",
+    url="https://nodejs.org/dist/latest-v20.x/node-v20.20.2-linux-x64.tar.xz",
+    sha256="df770b2a6f130ed8627c9782c988fda9669fa23898329a61a871e32f965e007d",
+    archive_root="node-v20.20.2-linux-x64",
+    executables=("bin/node", "bin/npm", "bin/npx"),
+    env_override="CASHUPAY_TEST_NODEJS",
+)
+
 ALL_SPECS = (BITCOIND, LND, PHP)
 
 
@@ -106,6 +128,18 @@ COMPOSER = FileSpec(
     env_override="CASHUPAY_TEST_COMPOSER",
 )
 
+# Electrum desktop wallet (Linux AppImage). Used by the dev iterate.py script
+# as the on-chain + Lightning customer wallet for manual invoice payment.
+# AppImages are single self-contained executables — no extraction needed.
+ELECTRUM = FileSpec(
+    name="electrum",
+    version="4.7.2",
+    url="https://download.electrum.org/4.7.2/electrum-4.7.2-x86_64.AppImage",
+    sha256="cf775fb74a182ca53041b513b49b5ffb414610057c2b6d43037f1c4e77e5065a",
+    filename="electrum.AppImage",
+    env_override="CASHUPAY_TEST_ELECTRUM",
+)
+
 
 def ensure_file(spec: FileSpec) -> Path:
     """Download a single file (e.g. wp-cli.phar) into tests/bin/<name>-<version>/."""
@@ -136,6 +170,9 @@ def ensure_file(spec: FileSpec) -> Path:
             f"expected {spec.sha256}, got {actual}"
         )
     tmp_path.replace(target)
+    # FileSpec targets are always meant to be executable (CLI phar/AppImage),
+    # so make sure the bit is set even if the source server didn't.
+    target.chmod(0o755)
     return target
 
 
@@ -192,7 +229,9 @@ def _extract(spec: BinarySpec, archive: Path) -> None:
     if install.exists():
         shutil.rmtree(install)
     install.mkdir(parents=True, exist_ok=True)
-    with tarfile.open(archive, "r:gz") as tf:
+    # tarfile.open with mode "r:*" auto-detects gzip/bzip2/xz, so we can handle
+    # any of the three with the same code path.
+    with tarfile.open(archive, "r:*") as tf:
         if spec.archive_root:
             prefix = spec.archive_root.rstrip("/") + "/"
             for member in tf.getmembers():
