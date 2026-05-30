@@ -23,7 +23,7 @@ class OnchainPayments {
         $pdo->beginTransaction();
         try {
             $stmt = $pdo->prepare(
-                "SELECT onchain_xpub, onchain_address_type, onchain_network, onchain_next_index
+                "SELECT onchain_xpub, onchain_address_type, onchain_network
                  FROM stores WHERE id = ?"
             );
             $stmt->execute([$storeId]);
@@ -32,12 +32,31 @@ class OnchainPayments {
                 $pdo->commit();
                 return null;
             }
-            $index = (int)$row['onchain_next_index'];
 
-            // Increment FIRST so a crash during derivation never gives two
-            // invoices the same address.
-            $upd = $pdo->prepare("UPDATE stores SET onchain_next_index = ? WHERE id = ?");
-            $upd->execute([$index + 1, $storeId]);
+            // Counter is keyed by xpub, not by store, so two stores sharing
+            // the same xpub never derive the same address, and re-pasting a
+            // previously used xpub resumes from where it left off.
+            $xpubHash = hash('sha256', $row['onchain_xpub']);
+            $now = time();
+            $pdo->prepare(
+                "INSERT INTO onchain_xpub_state (xpub_hash, next_index, updated_at)
+                 VALUES (?, 0, ?) ON CONFLICT(xpub_hash) DO NOTHING"
+            )->execute([$xpubHash, $now]);
+            $sel = $pdo->prepare(
+                "SELECT next_index FROM onchain_xpub_state WHERE xpub_hash = ?"
+            );
+            $sel->execute([$xpubHash]);
+            $index = (int)$sel->fetchColumn();
+            $pdo->prepare(
+                "UPDATE onchain_xpub_state SET next_index = next_index + 1, updated_at = ?
+                  WHERE xpub_hash = ?"
+            )->execute([$now, $xpubHash]);
+
+            // Mirror the index back to the stores row too, for backwards-
+            // compat reporting (admin dashboard surfaces it as nextIndex).
+            $pdo->prepare(
+                "UPDATE stores SET onchain_next_index = ? WHERE id = ?"
+            )->execute([$index + 1, $storeId]);
 
             $address = OnchainWallet::deriveAddress(
                 $row['onchain_xpub'],

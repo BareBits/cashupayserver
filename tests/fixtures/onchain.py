@@ -143,6 +143,7 @@ def configure_store_for_onchain(
     `start_index` lets each test pick a unique derivation offset so the
     addresses don't collide with sibling tests (which all share TEST_TPUB).
     """
+    import hashlib, time as _time
     conn = sqlite3.connect(db_path, isolation_level=None)
     try:
         conn.execute(
@@ -160,6 +161,17 @@ def configure_store_for_onchain(
             """,
             (xpub, network, address_type, min_confs, confirm_timeout_sec,
              provider_url, start_index, store_id),
+        )
+        # The runtime allocator keys off onchain_xpub_state, not the column on
+        # stores. Seed the per-xpub counter so each test gets fresh, non-
+        # colliding addresses regardless of which other test ran first.
+        xpub_hash = hashlib.sha256(xpub.encode()).hexdigest()
+        now = int(_time.time())
+        conn.execute(
+            "INSERT INTO onchain_xpub_state (xpub_hash, next_index, updated_at) "
+            "VALUES (?, ?, ?) ON CONFLICT(xpub_hash) DO UPDATE SET next_index = excluded.next_index, "
+            "updated_at = excluded.updated_at",
+            (xpub_hash, start_index, now),
         )
     finally:
         conn.close()

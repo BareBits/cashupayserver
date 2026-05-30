@@ -340,6 +340,16 @@ HTACCESS;
             $pdo->exec("ALTER TABLE invoices ADD COLUMN onchain_first_seen_at INTEGER DEFAULT NULL");
         }
 
+        if (!self::tableExists($pdo, 'onchain_xpub_state')) {
+            $pdo->exec("
+                CREATE TABLE onchain_xpub_state (
+                    xpub_hash TEXT PRIMARY KEY,
+                    next_index INTEGER NOT NULL DEFAULT 0,
+                    updated_at INTEGER NOT NULL DEFAULT 0
+                );
+            ");
+        }
+
         if (!self::tableExists($pdo, 'onchain_payments')) {
             $pdo->exec("
                 CREATE TABLE onchain_payments (
