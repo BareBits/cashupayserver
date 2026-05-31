@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "mints": [
+    {
+      "url": "https://mint.example.com"
+    },
+    {
+      "url": "https://other-mint.example.com"
+    },
+    {
+      "url": "https://compromised-mint.example.com",
+      "disabled": true,
+      "reason": "Operator key reported compromised on 2026-04-15 — do not route funds through this mint."
+    }
+  ]
+}

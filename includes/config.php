@@ -271,12 +271,18 @@ class Config {
 
     /**
      * Update store settings
+     *
+     * Changing mint_url through this method implicitly marks
+     * primary_mint_source='manual' unless the caller passes the column
+     * explicitly. The trusted-mints code path uses the explicit value to mark
+     * its auto-populated primaries differently so they can later be replaced.
      */
     public static function updateStore(string $storeId, array $data): void {
         $allowed = [
             'name', 'mint_url', 'mint_unit', 'seed_phrase',
             'exchange_fee_percent', 'price_provider_primary', 'price_provider_secondary',
             'default_currency',
+            'primary_mint_source',
             // On-chain Bitcoin payment settings
             'onchain_xpub', 'onchain_network', 'onchain_address_type',
             'onchain_next_index', 'onchain_min_confs', 'onchain_confirm_timeout_sec',
@@ -284,9 +290,23 @@ class Config {
         ];
         $updateData = array_intersect_key($data, array_flip($allowed));
 
+        if (array_key_exists('mint_url', $updateData) && !array_key_exists('primary_mint_source', $updateData)) {
+            $updateData['primary_mint_source'] = 'manual';
+        }
+
         if (!empty($updateData)) {
             Database::update('stores', $updateData, 'id = ?', [$storeId]);
         }
+    }
+
+    /**
+     * Get the source of the store's currently configured primary mint URL.
+     * One of: 'manual' (admin entered), 'trusted_list' (auto-populated from
+     * the trusted-mints URL), or 'setup' (left empty during initial setup).
+     */
+    public static function getStorePrimaryMintSource(string $storeId): string {
+        $store = self::getStore($storeId);
+        return $store['primary_mint_source'] ?? 'manual';
     }
 
     // ========================================================================
@@ -320,26 +340,35 @@ class Config {
     }
 
     /**
-     * Get all mint URLs (primary + backups) for a store
+     * Get all mint URLs (primary + backups) for a store, filtered through the
+     * reliability gate. Mints with disabled_pending_success, permanently_disabled,
+     * or trusted_list_disabled are excluded — including the primary, which
+     * cleanly falls through to the highest-priority eligible backup.
      */
     public static function getStoreAllMintUrls(string $storeId): array {
-        $primary = self::getStoreMintUrl($storeId);
-        if (!$primary) {
-            return [];
-        }
+        require_once __DIR__ . '/mint_reliability.php';
 
+        $primary = self::getStoreMintUrl($storeId);
         $unit = self::getStoreMintUnit($storeId);
         $backups = self::getStoreEnabledMints($storeId, $unit);
 
-        // Primary first, then backups (excluding primary if it's in backups)
-        $allMints = [$primary];
+        $candidates = [];
+        if ($primary) {
+            $candidates[] = $primary;
+        }
         foreach ($backups as $backup) {
-            if (rtrim($backup, '/') !== rtrim($primary, '/')) {
-                $allMints[] = $backup;
+            if (!$primary || rtrim($backup, '/') !== rtrim($primary, '/')) {
+                $candidates[] = $backup;
             }
         }
 
-        return $allMints;
+        $result = [];
+        foreach ($candidates as $mintUrl) {
+            if (MintReliability::isAvailableForNewInvoices($mintUrl)) {
+                $result[] = $mintUrl;
+            }
+        }
+        return $result;
     }
 
     /**

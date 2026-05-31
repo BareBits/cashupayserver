@@ -38,8 +38,16 @@ function handleCreateStore(array $auth, array $params, array $body): void {
     Database::insert('stores', [
         'id' => $storeId,
         'name' => $name,
+        'primary_mint_source' => 'setup',
         'created_at' => $now,
     ]);
+
+    require_once __DIR__ . '/../trusted_mints.php';
+    try {
+        TrustedMints::applyToNewStore($storeId);
+    } catch (Exception $e) {
+        error_log("TrustedMints::applyToNewStore failed in API createStore: " . $e->getMessage());
+    }
 
     jsonResponse([
         'id' => $storeId,

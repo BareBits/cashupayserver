@@ -64,6 +64,7 @@ class Invoice {
             $amountInMintUnit = ExchangeRates::convertToMintUnit(
                 $amount, $currency, $mintUnit, $exchangeFee, $primaryProvider, $secondaryProvider
             );
+            require_once __DIR__ . '/mint_reliability.php';
             $allMints = Config::getStoreAllMintUrls($storeId);
             $lastError = null;
             foreach ($allMints as $tryMintUrl) {
@@ -71,10 +72,13 @@ class Invoice {
                     $wallet = self::getWalletForStore($storeId, $tryMintUrl);
                     $quote = $wallet->requestMintQuote($amountInMintUnit);
                     $usedMintUrl = $tryMintUrl;
+                    MintReliability::recordQuoteSuccess($tryMintUrl, $storeId);
                     break;
                 } catch (Exception $e) {
                     $lastError = $e;
                     error_log("Mint quote failed for $tryMintUrl: " . $e->getMessage());
+                    $kind = MintReliability::classifyException($e, 'requestMintQuote');
+                    MintReliability::recordQuoteFailure($tryMintUrl, $storeId, $kind, $e->getMessage());
                     continue;
                 }
             }

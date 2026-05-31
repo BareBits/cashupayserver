@@ -86,18 +86,23 @@ class Database {
             $hasUsers = self::$instance
                 ->query("SELECT name FROM sqlite_master WHERE type='table' AND name='users'")
                 ->fetch() !== false;
+            $hasReliability = self::$instance
+                ->query("SELECT name FROM sqlite_master WHERE type='table' AND name='mint_reliability'")
+                ->fetch() !== false;
 
-            if ($hasConfig && !$hasUsers) {
-                self::$instance->exec("
-                    CREATE TABLE IF NOT EXISTS users (
-                        id              TEXT PRIMARY KEY,
-                        username        TEXT NOT NULL UNIQUE COLLATE NOCASE,
-                        password_hash   TEXT NOT NULL,
-                        pin_hash        TEXT DEFAULT NULL,
-                        role            TEXT NOT NULL CHECK (role IN ('admin','user')),
-                        created_at      INTEGER NOT NULL
-                    );
-                ");
+            if ($hasConfig && (!$hasUsers || !$hasReliability)) {
+                if (!$hasUsers) {
+                    self::$instance->exec("
+                        CREATE TABLE IF NOT EXISTS users (
+                            id              TEXT PRIMARY KEY,
+                            username        TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                            password_hash   TEXT NOT NULL,
+                            pin_hash        TEXT DEFAULT NULL,
+                            role            TEXT NOT NULL CHECK (role IN ('admin','user')),
+                            created_at      INTEGER NOT NULL
+                        );
+                    ");
+                }
                 self::runMigrations(self::$instance);
             }
         }
@@ -309,6 +314,53 @@ HTACCESS;
             UNIQUE(store_id, mint_url)
         );
 
+        -- Mint reliability tracking (global, keyed by mint_url). Holds the
+        -- lifetime + transient state flags used to decide whether a mint is
+        -- eligible for new invoices. Successful withdraws clear
+        -- disabled_pending_success; permanently_disabled and trusted_list_disabled
+        -- only clear via admin action / trusted list refresh respectively.
+        CREATE TABLE IF NOT EXISTS mint_reliability (
+            mint_url TEXT PRIMARY KEY,
+            total_failures INTEGER NOT NULL DEFAULT 0,
+            consecutive_failures INTEGER NOT NULL DEFAULT 0,
+            disabled_pending_success INTEGER NOT NULL DEFAULT 0,
+            permanently_disabled INTEGER NOT NULL DEFAULT 0,
+            trusted_list_disabled INTEGER NOT NULL DEFAULT 0,
+            trusted_list_disabled_reason TEXT,
+            last_failure_at INTEGER,
+            last_failure_kind TEXT,
+            last_failure_message TEXT,
+            last_success_at INTEGER,
+            updated_at INTEGER NOT NULL
+        );
+
+        -- Per-mint event log: failures + every state-change decision. UI surfaces
+        -- this as the diagnostic view. Capped at 1000 rows per mint_url (oldest
+        -- pruned on insert).
+        CREATE TABLE IF NOT EXISTS mint_event_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            mint_url TEXT NOT NULL,
+            timestamp INTEGER NOT NULL,
+            event_type TEXT NOT NULL,
+            failure_type TEXT,
+            store_id TEXT,
+            address TEXT,
+            details TEXT
+        );
+
+        -- Open suspect rows for LIGHTNING_WALLET_ERROR pending verification.
+        -- Resolved by another mint succeeding/failing at the same address (#1)
+        -- or by protocol introspection (#2). Repeated same-pair failures bump
+        -- last_seen_at rather than inserting a new row.
+        CREATE TABLE IF NOT EXISTS mint_suspect (
+            mint_url TEXT NOT NULL,
+            address TEXT NOT NULL,
+            store_id TEXT,
+            opened_at INTEGER NOT NULL,
+            last_seen_at INTEGER NOT NULL,
+            PRIMARY KEY (mint_url, address)
+        );
+
         -- Indexes for performance
         CREATE INDEX IF NOT EXISTS idx_invoices_store ON invoices(store_id);
         CREATE INDEX IF NOT EXISTS idx_invoices_status ON invoices(status);
@@ -317,6 +369,9 @@ HTACCESS;
         CREATE INDEX IF NOT EXISTS idx_webhooks_store ON webhooks(store_id);
         CREATE INDEX IF NOT EXISTS idx_store_mints_store ON store_mints(store_id);
         CREATE INDEX IF NOT EXISTS idx_store_mints_priority ON store_mints(store_id, priority);
+        CREATE INDEX IF NOT EXISTS idx_mint_event_log_mint ON mint_event_log(mint_url, timestamp DESC);
+        CREATE INDEX IF NOT EXISTS idx_mint_event_log_address ON mint_event_log(address) WHERE address IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_mint_suspect_address ON mint_suspect(address);
         ";
 
         $pdo->exec($schema);
@@ -415,6 +470,68 @@ HTACCESS;
         }
         if (!self::indexExists($pdo, 'idx_invoices_onchain_address')) {
             $pdo->exec("CREATE INDEX idx_invoices_onchain_address ON invoices(onchain_address) WHERE onchain_address IS NOT NULL;");
+        }
+
+        // Mint reliability tracking + trusted mints feature: tables and the
+        // primary_mint_source column distinguishing admin-set vs auto-populated
+        // primary mints. See includes/mint_reliability.php and
+        // includes/trusted_mints.php for the consumers.
+        if (!self::columnExists($pdo, 'stores', 'primary_mint_source')) {
+            // Existing rows: presume admin set the primary explicitly.
+            $pdo->exec("ALTER TABLE stores ADD COLUMN primary_mint_source TEXT NOT NULL DEFAULT 'manual'");
+        }
+        if (!self::tableExists($pdo, 'mint_reliability')) {
+            $pdo->exec("
+                CREATE TABLE mint_reliability (
+                    mint_url TEXT PRIMARY KEY,
+                    total_failures INTEGER NOT NULL DEFAULT 0,
+                    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                    disabled_pending_success INTEGER NOT NULL DEFAULT 0,
+                    permanently_disabled INTEGER NOT NULL DEFAULT 0,
+                    trusted_list_disabled INTEGER NOT NULL DEFAULT 0,
+                    trusted_list_disabled_reason TEXT,
+                    last_failure_at INTEGER,
+                    last_failure_kind TEXT,
+                    last_failure_message TEXT,
+                    last_success_at INTEGER,
+                    updated_at INTEGER NOT NULL
+                );
+            ");
+        }
+        if (!self::tableExists($pdo, 'mint_event_log')) {
+            $pdo->exec("
+                CREATE TABLE mint_event_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    mint_url TEXT NOT NULL,
+                    timestamp INTEGER NOT NULL,
+                    event_type TEXT NOT NULL,
+                    failure_type TEXT,
+                    store_id TEXT,
+                    address TEXT,
+                    details TEXT
+                );
+            ");
+        }
+        if (!self::indexExists($pdo, 'idx_mint_event_log_mint')) {
+            $pdo->exec("CREATE INDEX idx_mint_event_log_mint ON mint_event_log(mint_url, timestamp DESC);");
+        }
+        if (!self::indexExists($pdo, 'idx_mint_event_log_address')) {
+            $pdo->exec("CREATE INDEX idx_mint_event_log_address ON mint_event_log(address) WHERE address IS NOT NULL;");
+        }
+        if (!self::tableExists($pdo, 'mint_suspect')) {
+            $pdo->exec("
+                CREATE TABLE mint_suspect (
+                    mint_url TEXT NOT NULL,
+                    address TEXT NOT NULL,
+                    store_id TEXT,
+                    opened_at INTEGER NOT NULL,
+                    last_seen_at INTEGER NOT NULL,
+                    PRIMARY KEY (mint_url, address)
+                );
+            ");
+        }
+        if (!self::indexExists($pdo, 'idx_mint_suspect_address')) {
+            $pdo->exec("CREATE INDEX idx_mint_suspect_address ON mint_suspect(address);");
         }
 
         // Multi-user migration: existing installs have a single admin password

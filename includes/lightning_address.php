@@ -11,6 +11,7 @@ require_once __DIR__ . '/database.php';
 require_once __DIR__ . '/config.php';
 require_once __DIR__ . '/invoice.php';
 require_once __DIR__ . '/rates.php';
+require_once __DIR__ . '/mint_reliability.php';
 require_once __DIR__ . '/../cashu-wallet-php/CashuWallet.php';
 
 use Cashu\Wallet;
@@ -54,47 +55,107 @@ class LightningAddress {
      * @param string|null $comment Optional comment
      */
     public static function meltToAddress(string $storeId, string $address, int $amountSats, ?string $comment = null): array {
-        // Get invoice from Lightning address (via library)
-        $bolt11 = CashuLightningAddress::getInvoice($address, $amountSats, $comment);
+        // The reliability tracker needs to know which mint we're talking to;
+        // grab it up front so failures in any stage can be attributed correctly.
+        $mintUrl = Config::getStoreMintUrl($storeId);
+        $wallet = null;
+        $meltQuoteId = null;
 
-        // Get wallet for this store
-        $wallet = Invoice::getWalletInstance($storeId);
-
-        // Request melt quote
-        $meltQuote = $wallet->requestMeltQuote($bolt11);
-
-        $totalNeeded = $meltQuote->amount + $meltQuote->feeReserve;
-
-        // Get unspent proofs for this store
-        $proofs = Invoice::getUnspentProofs($storeId);
-        $balance = Wallet::sumProofs($proofs);
-
-        $mintUnit = Config::getStoreMintUnit($storeId);
-
-        if ($balance < $totalNeeded) {
-            throw new Exception("Insufficient balance. Have: {$balance} {$mintUnit}, Need: {$totalNeeded} {$mintUnit}");
-        }
-
-        // Select proofs
-        $selectedProofs = Wallet::selectProofs($proofs, $totalNeeded);
-
-        // Execute melt
-        $result = $wallet->melt($meltQuote->quote, $selectedProofs);
-
-        if (!$result['paid']) {
-            if ($result['pending'] ?? false) {
-                throw new Exception("Lightning payment pending - proofs marked as pending for recovery");
+        try {
+            // LNURL resolution / Lightning Address invoice request: failures
+            // here are wallet-side (LNURL host down, bad address, etc.).
+            try {
+                $bolt11 = CashuLightningAddress::getInvoice($address, $amountSats, $comment);
+            } catch (Exception $e) {
+                self::recordMeltFailure($mintUrl, $address, $storeId, $e, 'getInvoice', null, null);
+                throw $e;
             }
-            throw new Exception("Lightning payment failed");
-        }
 
-        return [
-            'success' => true,
-            'preimage' => $result['preimage'],
-            'amountPaid' => $meltQuote->amount,
-            'fee' => $meltQuote->feeReserve - Wallet::sumProofs($result['change'] ?? []),
-            'changeAmount' => Wallet::sumProofs($result['change'] ?? []),
-        ];
+            try {
+                $wallet = Invoice::getWalletInstance($storeId);
+            } catch (Exception $e) {
+                self::recordMeltFailure($mintUrl, $address, $storeId, $e, 'requestMeltQuote', null, null);
+                throw $e;
+            }
+
+            try {
+                $meltQuote = $wallet->requestMeltQuote($bolt11);
+                $meltQuoteId = $meltQuote->quote ?? null;
+            } catch (Exception $e) {
+                self::recordMeltFailure($mintUrl, $address, $storeId, $e, 'requestMeltQuote', null, $wallet);
+                throw $e;
+            }
+
+            $totalNeeded = $meltQuote->amount + $meltQuote->feeReserve;
+            $proofs = Invoice::getUnspentProofs($storeId);
+            $balance = Wallet::sumProofs($proofs);
+            $mintUnit = Config::getStoreMintUnit($storeId);
+
+            if ($balance < $totalNeeded) {
+                // Pre-flight; not a mint or wallet fault — see MintReliability.
+                throw new Exception("Insufficient balance. Have: {$balance} {$mintUnit}, Need: {$totalNeeded} {$mintUnit}");
+            }
+
+            $selectedProofs = Wallet::selectProofs($proofs, $totalNeeded);
+
+            try {
+                $result = $wallet->melt($meltQuote->quote, $selectedProofs);
+            } catch (Exception $e) {
+                self::recordMeltFailure($mintUrl, $address, $storeId, $e, 'melt', $meltQuoteId, $wallet);
+                throw $e;
+            }
+
+            if (!$result['paid']) {
+                $msg = ($result['pending'] ?? false)
+                    ? 'Lightning payment pending - proofs marked as pending for recovery'
+                    : 'Lightning payment failed';
+                $e = new Exception($msg);
+                self::recordMeltFailure($mintUrl, $address, $storeId, $e, 'melt', $meltQuoteId, $wallet);
+                throw $e;
+            }
+
+            if ($mintUrl !== null && $mintUrl !== '') {
+                MintReliability::recordWithdrawSuccess($mintUrl, $address, $storeId);
+            }
+
+            return [
+                'success' => true,
+                'preimage' => $result['preimage'],
+                'amountPaid' => $meltQuote->amount,
+                'fee' => $meltQuote->feeReserve - Wallet::sumProofs($result['change'] ?? []),
+                'changeAmount' => Wallet::sumProofs($result['change'] ?? []),
+            ];
+        } catch (Exception $e) {
+            throw $e;
+        }
+    }
+
+    /**
+     * Classify and record a meltToAddress failure against the reliability
+     * tracker. INSUFFICIENT_BALANCE is filtered out inside MintReliability.
+     */
+    private static function recordMeltFailure(
+        ?string $mintUrl,
+        string $address,
+        string $storeId,
+        Exception $e,
+        string $stage,
+        ?string $meltQuoteId,
+        $wallet
+    ): void {
+        if ($mintUrl === null || $mintUrl === '') {
+            return;
+        }
+        $kind = MintReliability::classifyException($e, $stage);
+        MintReliability::recordWithdrawFailure(
+            $mintUrl,
+            $address,
+            $storeId,
+            $kind,
+            $e->getMessage(),
+            $meltQuoteId,
+            $wallet
+        );
     }
 
     /**

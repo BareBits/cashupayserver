@@ -19,6 +19,7 @@ require_once __DIR__ . '/includes/lightning_address.php';
 require_once __DIR__ . '/includes/security.php';
 require_once __DIR__ . '/includes/background.php';
 require_once __DIR__ . '/includes/onchain/payments.php';
+require_once __DIR__ . '/includes/trusted_mints.php';
 
 // Check if setup is complete
 if (!Database::isInitialized() || !Config::isSetupComplete()) {
@@ -223,6 +224,26 @@ try {
     }
 } catch (Exception $e) {
     $results['tasks']['cleanup_webhooks'] = 'error: ' . $e->getMessage();
+}
+
+// Task 11: Refresh trusted mints list (default 24h interval).
+try {
+    if (TrustedMints::getUrl() !== null) {
+        $refreshed = TrustedMints::refresh();
+        if ($refreshed) {
+            TrustedMints::applyToAllStores();
+            $err = TrustedMints::getLastError();
+            $results['tasks']['trusted_mints'] = $err === null
+                ? 'refreshed + applied'
+                : 'refreshed with error: ' . $err;
+        } else {
+            $results['tasks']['trusted_mints'] = 'skipped (not due yet)';
+        }
+    } else {
+        $results['tasks']['trusted_mints'] = 'skipped (no URL configured)';
+    }
+} catch (Exception $e) {
+    $results['tasks']['trusted_mints'] = 'error: ' . $e->getMessage();
 }
 
 echo json_encode($results, JSON_PRETTY_PRINT);
