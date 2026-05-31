@@ -50,6 +50,18 @@ class MintReliability {
     // Per-mint cap on event log rows; oldest pruned on insert.
     const EVENT_LOG_CAP_PER_MINT = 1000;
 
+    // How long after a MINT_UNREACHABLE failure to wait before re-including the
+    // mint in the candidate list for new invoices. Closes the "zero-balance
+    // mint gated by a quote failure has no way to be re-tested" hole — without
+    // this, such mints stay disabled until an admin clicks Re-enable.
+    //
+    // Deliberately NOT applied to LIGHTNING_WALLET_ERROR: that gate exists
+    // because withdraw failed and we don't want more funds added to the mint;
+    // a successful quote doesn't prove the LNURL recovered, so the gate must
+    // wait on the agreed resolution paths (cross-mint differential, protocol
+    // introspection, successful melt, or admin action).
+    const MINT_UNREACHABLE_RETRY_INTERVAL_SEC = 3600;
+
     /**
      * Classify a Throwable into one of the KIND_* constants.
      *
@@ -126,19 +138,46 @@ class MintReliability {
         );
     }
 
-    /** True iff the mint can be used to issue new invoices. */
+    /**
+     * True iff the mint can be used to issue new invoices.
+     *
+     * A mint gated only by `disabled_pending_success` is re-admitted to the
+     * candidate list after MINT_UNREACHABLE_RETRY_INTERVAL_SEC has elapsed —
+     * but only when the gate was set by a MINT_UNREACHABLE failure. This is
+     * the recovery path for the zero-balance-mint case: if invoice creation
+     * gated the mint and there's no balance to drive an auto-melt success,
+     * the mint would otherwise stay disabled forever. If the retry succeeds,
+     * `recordQuoteSuccess` clears the gate; if it fails, `recordQuoteFailure`
+     * re-stamps `last_failure_at` and the mint is gated for another interval
+     * (and the lifetime counter ticks up toward the permanent-disable cap).
+     *
+     * Other gates are unaffected:
+     *   - permanently_disabled / trusted_list_disabled always block;
+     *   - a `disabled_pending_success` gate from LIGHTNING_WALLET_ERROR is
+     *     NOT auto-cleared on interval — see the rationale on the
+     *     MINT_UNREACHABLE_RETRY_INTERVAL_SEC constant.
+     */
     public static function isAvailableForNewInvoices(string $mintUrl): bool {
         $row = Database::fetchOne(
-            "SELECT disabled_pending_success, permanently_disabled, trusted_list_disabled
+            "SELECT disabled_pending_success, permanently_disabled,
+                    trusted_list_disabled, last_failure_at, last_failure_kind
              FROM mint_reliability WHERE mint_url = ?",
             [$mintUrl]
         );
         if ($row === null) {
             return true; // unknown mint → assume healthy
         }
-        return !(int)$row['disabled_pending_success']
-            && !(int)$row['permanently_disabled']
-            && !(int)$row['trusted_list_disabled'];
+        if ((int)$row['permanently_disabled'] || (int)$row['trusted_list_disabled']) {
+            return false;
+        }
+        if (!(int)$row['disabled_pending_success']) {
+            return true;
+        }
+        if ($row['last_failure_kind'] !== self::KIND_MINT_UNREACHABLE) {
+            return false;
+        }
+        $lastFailureAt = $row['last_failure_at'] !== null ? (int)$row['last_failure_at'] : 0;
+        return (Database::timestamp() - $lastFailureAt) >= self::MINT_UNREACHABLE_RETRY_INTERVAL_SEC;
     }
 
     /**
