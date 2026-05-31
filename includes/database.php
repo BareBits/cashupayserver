@@ -550,6 +550,71 @@ HTACCESS;
                 $stmt->execute([self::generateId('user'), $legacy, time()]);
             }
         }
+
+        // Modified MIT dev fee + per-store hosting fee. Revenue tracked in sats
+        // from this migration timestamp forward (pre-existing invoices are not
+        // backfilled). melts table is the source of truth for fee-paid totals
+        // and the future stats dashboard.
+        if (!self::columnExists($pdo, 'stores', 'hosting_fee_percent')) {
+            $pdo->exec("ALTER TABLE stores ADD COLUMN hosting_fee_percent REAL NOT NULL DEFAULT 0");
+        }
+        if (!self::columnExists($pdo, 'stores', 'hosting_fee_destination')) {
+            $pdo->exec("ALTER TABLE stores ADD COLUMN hosting_fee_destination TEXT");
+        }
+        if (!self::tableExists($pdo, 'melts')) {
+            $pdo->exec("
+                CREATE TABLE melts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    store_id TEXT NOT NULL,
+                    amount_sats INTEGER NOT NULL,
+                    network_fee_sats INTEGER NOT NULL DEFAULT 0,
+                    destination TEXT NOT NULL,
+                    preimage TEXT,
+                    note TEXT,
+                    created_at INTEGER NOT NULL,
+                    FOREIGN KEY (store_id) REFERENCES stores(id) ON DELETE CASCADE
+                );
+            ");
+        }
+        if (!self::indexExists($pdo, 'idx_melts_store_note')) {
+            $pdo->exec("CREATE INDEX idx_melts_store_note ON melts(store_id, note);");
+        }
+        if (!self::indexExists($pdo, 'idx_melts_created')) {
+            $pdo->exec("CREATE INDEX idx_melts_created ON melts(created_at);");
+        }
+
+        // Seed deployment_id once from env CASHUPAY_DEPLOYMENT_ID or 'ANONYMOUS'.
+        $depRow = $pdo->query("SELECT value FROM config WHERE key = 'deployment_id'")->fetchColumn();
+        if ($depRow === false) {
+            $envDep = getenv('CASHUPAY_DEPLOYMENT_ID');
+            $value = ($envDep !== false && $envDep !== '') ? $envDep : 'ANONYMOUS';
+            $now = time();
+            $stmt = $pdo->prepare(
+                "INSERT INTO config (key, value, created_at, updated_at) VALUES ('deployment_id', ?, ?, ?)"
+            );
+            $stmt->execute([json_encode($value), $now, $now]);
+        }
+        // Stamp the migration timestamp once so dev fee math only sees revenue
+        // accrued from this point forward.
+        $startRow = $pdo->query("SELECT value FROM config WHERE key = 'fee_tracking_start_at'")->fetchColumn();
+        if ($startRow === false) {
+            $now = time();
+            $stmt = $pdo->prepare(
+                "INSERT INTO config (key, value, created_at, updated_at) VALUES ('fee_tracking_start_at', ?, ?, ?)"
+            );
+            $stmt->execute([json_encode($now), $now, $now]);
+        }
+        // installed_at anchors the cron-staleness warning: fresh deployments
+        // (< 24h since first migration) don't see the warning, giving the
+        // operator a grace period to set the cron entry up.
+        $installedRow = $pdo->query("SELECT value FROM config WHERE key = 'installed_at'")->fetchColumn();
+        if ($installedRow === false) {
+            $now = time();
+            $stmt = $pdo->prepare(
+                "INSERT INTO config (key, value, created_at, updated_at) VALUES ('installed_at', ?, ?, ?)"
+            );
+            $stmt->execute([json_encode($now), $now, $now]);
+        }
     }
 
     private static function columnExists(\PDO $pdo, string $table, string $column): bool {

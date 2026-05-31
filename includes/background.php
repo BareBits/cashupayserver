@@ -68,6 +68,62 @@ class Background {
         return (time() - $lastSync) > 300; // 5 minutes
     }
 
+    // ========================================================================
+    // External-cron staleness detection
+    //
+    // External cron (the operator's `* * * * * curl /cron.php` entry) is
+    // optional but recommended — it makes invoice polling, fee settlement,
+    // and auto-melt much more responsive than the opportunistic admin /
+    // checkout triggers we fall back to. cron.php stamps
+    // `last_external_cron_at` on every non-internal invocation; the dashboard
+    // checks the gap here. Fresh installs are grandfathered for 24h so
+    // operators don't see the warning before they've had a chance to set
+    // cron up.
+    // ========================================================================
+
+    public const CRON_STALE_THRESHOLD_SECS = 86400;
+
+    /**
+     * Return the cron-staleness warning state for the dashboard, or null
+     * if the warning should not be shown (fresh install, recent external
+     * cron run, or the operator has dismissed it since the last real run).
+     */
+    public static function cronStaleWarning(): ?array {
+        $now = time();
+        $installedAt = (int) Config::get('installed_at', 0);
+        if ($installedAt === 0 || ($now - $installedAt) < self::CRON_STALE_THRESHOLD_SECS) {
+            return null;
+        }
+
+        $lastExternal = (int) Config::get('last_external_cron_at', 0);
+        if ($lastExternal > 0 && ($now - $lastExternal) < self::CRON_STALE_THRESHOLD_SECS) {
+            return null;
+        }
+
+        // Dismissal is sticky only until the next real external cron run —
+        // i.e. once a fresh `last_external_cron_at` arrives that is newer
+        // than `cron_warning_dismissed_at`, the dismissal is implicitly
+        // cleared and the warning can fire again on the next stale window.
+        $dismissedAt = (int) Config::get('cron_warning_dismissed_at', 0);
+        if ($dismissedAt > 0 && $dismissedAt >= $lastExternal) {
+            return null;
+        }
+
+        return [
+            'lastExternalCronAt' => $lastExternal > 0 ? $lastExternal : null,
+            'thresholdSecs' => self::CRON_STALE_THRESHOLD_SECS,
+        ];
+    }
+
+    /**
+     * Record the operator's dismissal of the stale-cron warning. The
+     * dismissal expires automatically when the next external cron call
+     * lands (see cronStaleWarning()).
+     */
+    public static function dismissCronWarning(): void {
+        Config::set('cron_warning_dismissed_at', time());
+    }
+
     /**
      * Mark proof sync as completed
      */

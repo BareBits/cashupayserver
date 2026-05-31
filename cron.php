@@ -16,6 +16,7 @@ require_once __DIR__ . '/includes/database.php';
 require_once __DIR__ . '/includes/config.php';
 require_once __DIR__ . '/includes/invoice.php';
 require_once __DIR__ . '/includes/lightning_address.php';
+require_once __DIR__ . '/includes/dev_fee.php';
 require_once __DIR__ . '/includes/security.php';
 require_once __DIR__ . '/includes/background.php';
 require_once __DIR__ . '/includes/onchain/payments.php';
@@ -52,6 +53,14 @@ if ($isInternal) {
     }
 }
 
+// Stamp the last *external* cron run so the dashboard can warn admins when
+// the operator's environment isn't actually invoking cron.php on a schedule.
+// Internal self-requests do not count, otherwise opportunistic admin/checkout
+// triggers would mask the missing cron entry indefinitely.
+if (!$isInternal) {
+    Config::set('last_external_cron_at', time());
+}
+
 // Set content type
 header('Content-Type: application/json');
 
@@ -66,6 +75,19 @@ try {
     $results['tasks']['poll_quotes'] = 'success';
 } catch (Exception $e) {
     $results['tasks']['poll_quotes'] = 'error: ' . $e->getMessage();
+}
+
+// Task 1b: Settle dev / hosting / upstream-dev fees for every store. Runs
+// BEFORE auto-melt so the fee math sees revenue that may otherwise drain in
+// this same cron pass. Per-fee failures are caught inside settleStore() so a
+// single broken LNURL never blocks the rest of the cron.
+try {
+    $feeResults = DevFee::settleAllStores();
+    $results['tasks']['settle_fees'] = count($feeResults) > 0
+        ? ['stores_processed' => count($feeResults)]
+        : 'skipped';
+} catch (Exception $e) {
+    $results['tasks']['settle_fees'] = 'error: ' . $e->getMessage();
 }
 
 // Task 2: Check auto-melt
