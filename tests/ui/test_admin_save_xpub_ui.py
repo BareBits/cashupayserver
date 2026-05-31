@@ -152,6 +152,9 @@ def test_save_new_xpub_replacing_existing(configured: ConfiguredPayserver, page)
     page.select_option("#onchain-address-type", "P2WPKH")
 
     page.click("#btn-save-onchain")
+    # saveOnchain now uses an in-page modal, not native confirm(); the dialog hook above is kept as a fallback.
+    page.wait_for_selector("#modal-onchain-confirm.visible")
+    page.click("#btn-onchain-confirm-yes")
     page.wait_for_timeout(3000)  # give the POST + toast + dashboard reload time
 
     # --- step 4: read final DB state
