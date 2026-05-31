@@ -604,6 +604,17 @@ HTACCESS;
             );
             $stmt->execute([json_encode($now), $now, $now]);
         }
+        // installed_at anchors the cron-staleness warning: fresh deployments
+        // (< 24h since first migration) don't see the warning, giving the
+        // operator a grace period to set the cron entry up.
+        $installedRow = $pdo->query("SELECT value FROM config WHERE key = 'installed_at'")->fetchColumn();
+        if ($installedRow === false) {
+            $now = time();
+            $stmt = $pdo->prepare(
+                "INSERT INTO config (key, value, created_at, updated_at) VALUES ('installed_at', ?, ?, ?)"
+            );
+            $stmt->execute([json_encode($now), $now, $now]);
+        }
     }
 
     private static function columnExists(\PDO $pdo, string $table, string $column): bool {

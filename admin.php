@@ -221,7 +221,31 @@ if (isset($_GET['api'])) {
                         'disabledCount' => count($disabled),
                     ];
                 })(),
+                'cronStaleWarning' => Background::cronStaleWarning(),
             ]);
+            break;
+
+        case 'cron_url':
+            // Surfaces the operator-facing cron URL with key. Lazily generates
+            // a cron_key on first call so existing installs that never set one
+            // up don't need a manual config step.
+            Auth::requireAdmin();
+            $key = Config::get('cron_key');
+            if (!$key) {
+                $key = bin2hex(random_bytes(16));
+                Config::set('cron_key', $key);
+            }
+            $url = Urls::cron() . '?key=' . urlencode($key);
+            echo json_encode([
+                'url' => $url,
+                'crontab' => '* * * * * curl -fsS ' . $url . ' > /dev/null',
+            ]);
+            break;
+
+        case 'dismiss_cron_warning':
+            Auth::requireAdmin();
+            Background::dismissCronWarning();
+            echo json_encode(['success' => true]);
             break;
 
         case 'invoices':
@@ -2838,6 +2862,15 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                     <span id="reliability-banner-text" style="flex: 1;"></span>
                     <a href="#" data-view="settings" class="btn btn-secondary" style="padding: 0.25rem 0.75rem; font-size: 0.8rem;">Open settings</a>
                 </div>
+                <div id="cron-stale-banner" class="hidden" style="background: rgba(247, 147, 26, 0.12); border: 1px solid rgba(247, 147, 26, 0.4); border-radius: 8px; padding: 0.75rem 1rem; margin-bottom: 1rem; font-size: 0.9rem; display: flex; align-items: flex-start; gap: 0.75rem;" data-admin-only="true">
+                    <span style="flex-shrink: 0; font-size: 1.1rem; line-height: 1.2;">⚡</span>
+                    <span style="flex: 1;">
+                        <strong style="display: block; margin-bottom: 0.15rem;">Heads up — no external cron in 24h+</strong>
+                        <span style="color: var(--text-secondary); font-size: 0.85rem;">Not required, but a one-line cron entry makes payment confirmations, auto-withdrawals, and fee settlements much faster.</span>
+                    </span>
+                    <a href="#" data-view="settings" class="btn btn-secondary" style="padding: 0.25rem 0.75rem; font-size: 0.8rem; flex-shrink: 0;">Settings · Copy cron URL</a>
+                    <button id="btn-dismiss-cron-stale" aria-label="Dismiss" style="background: transparent; border: 0; color: var(--text-secondary); cursor: pointer; font-size: 1.2rem; line-height: 1; padding: 0 0.25rem; flex-shrink: 0;">×</button>
+                </div>
                 <div class="balance-card">
                     <div class="balance-label">Total Balance</div>
                     <div class="balance-amount" id="balance-amount">---</div>
@@ -3159,6 +3192,33 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                                 Save
                             </button>
                         </div>
+                    </div>
+                </div>
+
+                <!--
+                    Cron URL — surfaces the operator-facing curl command so an
+                    admin can set up a system cron entry. The key is auto-
+                    generated lazily by the cron-url admin action; the
+                    same key authenticates `?key=...` in cron.php. Optional —
+                    background tasks also fire opportunistically from admin
+                    page-loads (5-min gate) and checkout views.
+                -->
+                <div class="card" data-admin-only="true" id="card-cron-url">
+                    <div class="card-header">
+                        <div class="card-title">Cron URL</div>
+                    </div>
+                    <div class="card-body">
+                        <p style="font-size: 0.85rem; color: var(--text-secondary); margin: 0 0 0.75rem 0;">
+                            Optional but recommended. Adding this URL to your hosting's system cron
+                            (every minute) makes invoice polling, auto-withdrawal, and fee settlement
+                            run on a tight, predictable schedule. Without it, background tasks fire
+                            opportunistically when an admin or customer loads a page.
+                        </p>
+                        <div class="form-group">
+                            <label class="form-label">Suggested crontab entry</label>
+                            <code id="cron-url-display" style="display: block; background: rgba(0,0,0,0.2); padding: 0.75rem; border-radius: 8px; font-size: 0.85rem; word-break: break-all; user-select: all;">Loading…</code>
+                        </div>
+                        <button class="btn btn-secondary btn-full" id="btn-copy-cron-url">Copy</button>
                     </div>
                 </div>
                 <?php endif; ?>
@@ -3912,6 +3972,10 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
             document.getElementById('onchain-xpub').addEventListener('input', applyOnchainAddressTypeVisibility);
             document.getElementById('btn-save-exchange-settings').addEventListener('click', saveExchangeSettings);
             document.getElementById('btn-save-hosting-fee').addEventListener('click', saveHostingFee);
+            const copyCronBtn = document.getElementById('btn-copy-cron-url');
+            if (copyCronBtn) copyCronBtn.addEventListener('click', copyCronUrl);
+            const dismissCronBtn = document.getElementById('btn-dismiss-cron-stale');
+            if (dismissCronBtn) dismissCronBtn.addEventListener('click', dismissCronStaleBanner);
             document.getElementById('btn-set-pin').addEventListener('click', () => openModal('modal-pin-setup'));
             document.getElementById('btn-save-pin').addEventListener('click', savePin);
             document.getElementById('btn-logout').addEventListener('click', logout);
@@ -4022,6 +4086,7 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                     renderUsersCard();
                     loadReliabilityCard();
                     loadTrustedMintsCard();
+                    loadCronUrl();
                 }
             }
         }
@@ -4446,6 +4511,7 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
 
                 // Reliability banner / settings cards.
                 updateReliabilityBanner(dashboardData.reliability);
+                updateCronStaleBanner(dashboardData.cronStaleWarning || null);
 
             } catch (e) {
                 console.error(e);
@@ -6267,6 +6333,55 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                 loadReliabilityCard();
             } catch (e) {
                 showToast('Refresh request failed', 'error');
+            }
+        }
+
+        function updateCronStaleBanner(state) {
+            const banner = document.getElementById('cron-stale-banner');
+            if (!banner) return;
+            if (state) {
+                banner.classList.remove('hidden');
+            } else {
+                banner.classList.add('hidden');
+            }
+        }
+
+        async function dismissCronStaleBanner() {
+            const banner = document.getElementById('cron-stale-banner');
+            if (banner) banner.classList.add('hidden');
+            try {
+                await postWithCsrf(adminUrl, 'action=dismiss_cron_warning');
+            } catch (e) {
+                // No-op; banner will reappear on next dashboard load if dismissal didn't persist.
+            }
+        }
+
+        // Settings page: fetch the suggested crontab entry and render it. Lazily
+        // generates a cron_key server-side on first call.
+        async function loadCronUrl() {
+            const code = document.getElementById('cron-url-display');
+            if (!code) return;
+            try {
+                const response = await fetch(adminUrl + '?action=cron_url');
+                const data = await response.json();
+                if (data && data.crontab) {
+                    code.textContent = data.crontab;
+                } else {
+                    code.textContent = 'Unable to load cron URL';
+                }
+            } catch (e) {
+                code.textContent = 'Unable to load cron URL';
+            }
+        }
+
+        async function copyCronUrl() {
+            const code = document.getElementById('cron-url-display');
+            if (!code) return;
+            try {
+                await navigator.clipboard.writeText(code.textContent);
+                showToast('Cron entry copied to clipboard', 'success');
+            } catch (e) {
+                showToast('Copy failed — select the text manually', 'error');
             }
         }
 

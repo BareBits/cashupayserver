@@ -143,6 +143,19 @@ After installation, configure WooCommerce to use CashuPayServer:
    - Click **Connect to BTCPay** to start the pairing flow
 3. Save and test with a small purchase
 
+### Recommended: Configure system cron
+
+CashuPayServer's background tasks — invoice polling, auto-withdrawal, and
+fee settlement — run on a tight schedule when your hosting environment
+invokes `cron.php` once a minute. Without it, the same tasks still fire
+opportunistically when an admin or customer loads a page, but with
+multi-minute latency.
+
+Open **Settings** in the admin UI to copy the suggested entry, then add it
+to your system crontab (or your host's cron panel). The admin dashboard
+will show a one-time dismissable banner if external cron hasn't been
+detected in over 24 hours.
+
 ## Security
 
 ### Database Protection

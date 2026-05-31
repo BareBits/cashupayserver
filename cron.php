@@ -53,6 +53,14 @@ if ($isInternal) {
     }
 }
 
+// Stamp the last *external* cron run so the dashboard can warn admins when
+// the operator's environment isn't actually invoking cron.php on a schedule.
+// Internal self-requests do not count, otherwise opportunistic admin/checkout
+// triggers would mask the missing cron entry indefinitely.
+if (!$isInternal) {
+    Config::set('last_external_cron_at', time());
+}
+
 // Set content type
 header('Content-Type: application/json');
 
