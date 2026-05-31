@@ -126,6 +126,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 break;
 
             case 2: // Password setup
+                // Re-entry guard: refuse to overwrite an existing admin if
+                // setup_complete was cleared (backup restore, manual purge,
+                // partial corruption). Audit finding #3.
+                $existingAdmin = Database::fetchOne(
+                    "SELECT id FROM users WHERE role = 'admin' LIMIT 1"
+                );
+                if ($existingAdmin !== null) {
+                    http_response_code(403);
+                    throw new Exception(
+                        'An admin account already exists. Setup cannot be repeated.'
+                        . ' Sign in and change credentials from the admin panel.'
+                    );
+                }
+
                 $password = $_POST['password'] ?? '';
                 $confirm = $_POST['confirm_password'] ?? '';
 
