@@ -55,22 +55,35 @@ $success = false;
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $action = $_POST['action'] ?? '';
 
+    // CSRF: every POST on this endpoint is state-changing (login mints a
+    // session; approve mints an API key with caller-requested permissions;
+    // deny redirects the user). Forms below carry the per-session token.
+    $submittedToken = $_POST['csrf_token'] ?? '';
+    if (!Auth::validateCsrfToken($submittedToken)) {
+        http_response_code(403);
+        // Render via the same template as other failures so the user gets
+        // a recoverable page (reload mints a new token).
+        $error = 'Session expired or invalid request. Please try again.';
+        $action = '';
+    }
+
     if ($action === 'login') {
+        $username = trim($_POST['username'] ?? '');
         $password = $_POST['password'] ?? '';
         $clientIp = Security::getClientIp();
 
         if (Security::isLockedOut($clientIp)) {
             $error = 'Too many failed attempts. Please try again later.';
-        } elseif (Auth::login($password)) {
+        } elseif ($username !== '' && Auth::login($username, $password)) {
             Security::clearLoginAttempts($clientIp);
             // Redirect to same page to show approval form
             header('Location: ' . $_SERVER['REQUEST_URI']);
             exit;
         } else {
             Security::recordFailedLogin($clientIp);
-            $error = 'Invalid password';
+            $error = 'Invalid username or password';
         }
-    } elseif ($action === 'approve' && Auth::isLoggedIn()) {
+    } elseif ($action === 'approve' && Auth::isAdmin()) {
         // Get selected store and permissions
         $selectedStoreId = $_POST['store_id'] ?? null;
         $approvedPermissions = $_POST['approved_permissions'] ?? $permissions;
@@ -446,10 +459,18 @@ $baseUrl = Config::getBaseUrl();
 
             <form method="POST">
                 <input type="hidden" name="action" value="login">
+                <input type="hidden" name="csrf_token" value="<?= htmlspecialchars(Auth::generateCsrfToken()) ?>">
 
                 <div class="form-group">
-                    <label for="password">Admin Password</label>
-                    <input type="password" id="password" name="password" required autofocus>
+                    <label for="username">Username</label>
+                    <input type="text" id="username" name="username" value="admin" required autofocus
+                           autocomplete="username">
+                </div>
+
+                <div class="form-group">
+                    <label for="password">Password</label>
+                    <input type="password" id="password" name="password" required
+                           autocomplete="current-password">
                 </div>
 
                 <button type="submit" class="btn btn-primary">Sign In</button>
@@ -458,6 +479,7 @@ $baseUrl = Config::getBaseUrl();
             <?php if ($redirect): ?>
                 <form method="POST" style="margin-top: 0.5rem;">
                     <input type="hidden" name="action" value="deny">
+                    <input type="hidden" name="csrf_token" value="<?= htmlspecialchars(Auth::generateCsrfToken()) ?>">
                     <button type="submit" class="btn btn-secondary">Cancel</button>
                 </form>
             <?php endif; ?>
@@ -499,6 +521,7 @@ $baseUrl = Config::getBaseUrl();
             <?php else: ?>
                 <form method="POST">
                     <input type="hidden" name="action" value="approve">
+                    <input type="hidden" name="csrf_token" value="<?= htmlspecialchars(Auth::generateCsrfToken()) ?>">
 
                     <div class="form-group">
                         <label for="store_id">Select Store</label>
@@ -543,6 +566,7 @@ $baseUrl = Config::getBaseUrl();
 
                 <form method="POST" style="margin-top: 0;">
                     <input type="hidden" name="action" value="deny">
+                    <input type="hidden" name="csrf_token" value="<?= htmlspecialchars(Auth::generateCsrfToken()) ?>">
                     <button type="submit" class="btn btn-danger">Deny</button>
                 </form>
 

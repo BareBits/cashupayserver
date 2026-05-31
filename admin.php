@@ -264,6 +264,7 @@ if (isset($_GET['api'])) {
             break;
 
         case 'export_info':
+            Auth::requireAdmin();
             $storeId = $_GET['store_id'] ?? null;
             if (!$storeId || !Config::isStoreConfigured($storeId)) {
                 echo json_encode(['available' => 0, 'error' => 'Store not configured']);
@@ -360,6 +361,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     // Login doesn't require existing session or CSRF (first request)
     if ($action === 'login') {
+        $username = trim($_POST['username'] ?? '');
         $password = $_POST['password'] ?? '';
         $clientIp = Security::getClientIp();
 
@@ -371,8 +373,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             exit;
         }
 
-        if (Auth::login($password)) {
+        if ($username !== '' && Auth::login($username, $password)) {
             Security::clearLoginAttempts($clientIp);
+            $user = Auth::currentUser();
 
             // C1: Trigger background sync on login
             if (Background::shouldSync()) {
@@ -388,12 +391,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             echo json_encode([
                 'success' => true,
                 'securityWarning' => $securityWarning,
-                'csrfToken' => Auth::generateCsrfToken()
+                'csrfToken' => Auth::generateCsrfToken(),
+                'user' => [
+                    'username' => $user['username'] ?? null,
+                    'role'     => $user['role'] ?? null,
+                    'hasPin'   => (bool)($user['has_pin'] ?? false),
+                ],
             ]);
         } else {
             Security::recordFailedLogin($clientIp);
             http_response_code(401);
-            echo json_encode(['error' => 'Invalid password']);
+            echo json_encode(['error' => 'Invalid username or password']);
         }
         exit;
     }
@@ -421,6 +429,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
 
         case 'save_url_mode':
+            Auth::requireAdmin();
             $mode = $_POST['mode'] ?? 'router';
             if (in_array($mode, ['direct', 'router'])) {
                 Config::set('url_mode', $mode);
@@ -436,6 +445,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
 
         case 'create_store':
+            Auth::requireAdmin();
             try {
                 $name = trim($_POST['name'] ?? 'New Store');
                 $mintUrl = $_POST['mint_url'] ?? null;
@@ -505,6 +515,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
 
         case 'update_store':
+            Auth::requireAdmin();
             try {
                 $storeId = $_POST['store_id'] ?? '';
                 if (!$storeId) {
@@ -576,11 +587,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
 
         case 'generate_seed':
+            Auth::requireAdmin();
             require_once __DIR__ . '/cashu-wallet-php/CashuWallet.php';
             echo json_encode(['seedPhrase' => \Cashu\Mnemonic::generate()]);
             break;
 
         case 'validate_seed':
+            Auth::requireAdmin();
             try {
                 $seedPhrase = $_POST['seed_phrase'] ?? '';
                 if (empty($seedPhrase)) {
@@ -609,12 +622,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
 
         case 'delete_store':
+            Auth::requireAdmin();
             $storeId = $_POST['store_id'] ?? '';
             Database::delete('stores', 'id = ?', [$storeId]);
             echo json_encode(['success' => true]);
             break;
 
         case 'create_api_key':
+            Auth::requireAdmin();
             $storeId = $_POST['store_id'] ?? '';
             $label = $_POST['label'] ?? 'API Key';
             $apiKey = Auth::createApiKey($storeId, $label);
@@ -622,6 +637,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
 
         case 'delete_api_key':
+            Auth::requireAdmin();
             $keyId = $_POST['key_id'] ?? '';
             Auth::deleteApiKey($keyId);
             echo json_encode(['success' => true]);
@@ -779,6 +795,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
 
         case 'save_onchain':
+            Auth::requireAdmin();
             // Persist a store's on-chain Bitcoin payment configuration.
             try {
                 $storeId = $_POST['store_id'] ?? '';
@@ -854,6 +871,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
 
         case 'validate_onchain_xpub':
+            Auth::requireAdmin();
             // Used by the admin store-settings form to validate + preview
             // addresses before saving. Mirrors setup.php's validate_xpub action
             // so the same JS can drive either context.
@@ -887,6 +905,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
 
         case 'test_onchain_xpub':
+            Auth::requireAdmin();
             // "Test xpub" button: derive the address at the current
             // onchain_next_index without consuming it, so the user can
             // confirm derivation matches their signing wallet.
@@ -916,6 +935,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
 
         case 'save_auto_melt':
+            Auth::requireAdmin();
             try {
                 $storeId = $_POST['store_id'] ?? '';
                 $address = $_POST['address'] ?? '';
@@ -945,6 +965,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
 
         case 'manual_melt':
+            Auth::requireAdmin();
             try {
                 $storeId = $_POST['store_id'] ?? '';
                 $destination = $_POST['address'] ?? '';
@@ -1177,6 +1198,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
 
         case 'export_token':
+            Auth::requireAdmin();
             // OFFLINE-FIRST EXPORT: Minimize mint contact, maximize reliability
             //
             // Flow:
@@ -1476,6 +1498,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
 
         case 'add_backup_mint':
+            Auth::requireAdmin();
             try {
                 $storeId = $_POST['store_id'] ?? '';
                 $mintUrl = $_POST['mint_url'] ?? '';
@@ -1508,6 +1531,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
 
         case 'update_backup_mint':
+            Auth::requireAdmin();
             try {
                 $id = (int)($_POST['id'] ?? 0);
                 $enabled = isset($_POST['enabled']) ? (int)$_POST['enabled'] : null;
@@ -1526,6 +1550,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
 
         case 'remove_backup_mint':
+            Auth::requireAdmin();
             try {
                 $id = (int)($_POST['id'] ?? 0);
                 Config::removeStoreBackupMint($id);
@@ -1566,6 +1591,148 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
             break;
 
+        // ===== User management (admin-only) =====
+        case 'list_users':
+            Auth::requireAdmin();
+            echo json_encode(['users' => Auth::listUsers()]);
+            break;
+
+        case 'create_user':
+            Auth::requireAdmin();
+            try {
+                $username = trim($_POST['username'] ?? '');
+                $password = $_POST['password'] ?? '';
+                $role = $_POST['role'] ?? Auth::ROLE_USER;
+                $userId = Auth::createUser($username, $password, $role);
+                echo json_encode(['success' => true, 'id' => $userId]);
+            } catch (\InvalidArgumentException $e) {
+                http_response_code(400);
+                echo json_encode(['error' => $e->getMessage()]);
+            } catch (\RuntimeException $e) {
+                http_response_code(409);
+                echo json_encode(['error' => $e->getMessage()]);
+            }
+            break;
+
+        case 'delete_user':
+            Auth::requireAdmin();
+            try {
+                $userId = $_POST['user_id'] ?? '';
+                $self = Auth::currentUser();
+                if ($self && $self['id'] === $userId) {
+                    throw new \RuntimeException('You cannot delete your own account');
+                }
+                Auth::deleteUser($userId);
+                echo json_encode(['success' => true]);
+            } catch (\RuntimeException $e) {
+                http_response_code(400);
+                echo json_encode(['error' => $e->getMessage()]);
+            }
+            break;
+
+        case 'reset_password':
+            // Admin resets another user's password.
+            Auth::requireAdmin();
+            try {
+                $userId = $_POST['user_id'] ?? '';
+                $newPassword = $_POST['new_password'] ?? '';
+                Auth::changePassword($userId, $newPassword);
+                echo json_encode(['success' => true]);
+            } catch (\InvalidArgumentException $e) {
+                http_response_code(400);
+                echo json_encode(['error' => $e->getMessage()]);
+            } catch (\RuntimeException $e) {
+                http_response_code(404);
+                echo json_encode(['error' => $e->getMessage()]);
+            }
+            break;
+
+        case 'reset_user_pin':
+            // Admin resets (or clears) another user's PIN.
+            Auth::requireAdmin();
+            try {
+                $userId = $_POST['user_id'] ?? '';
+                $pin = $_POST['pin'] ?? '';
+                Auth::setPin($userId, $pin === '' ? null : $pin);
+                echo json_encode(['success' => true]);
+            } catch (\InvalidArgumentException $e) {
+                http_response_code(400);
+                echo json_encode(['error' => $e->getMessage()]);
+            } catch (\RuntimeException $e) {
+                http_response_code(404);
+                echo json_encode(['error' => $e->getMessage()]);
+            }
+            break;
+
+        // ===== Self-service (any logged-in user) =====
+        case 'change_own_password':
+            try {
+                $self = Auth::currentUser();
+                if (!$self) {
+                    http_response_code(401);
+                    echo json_encode(['error' => 'Not authenticated']);
+                    break;
+                }
+                $current = $_POST['current_password'] ?? '';
+                $new     = $_POST['new_password'] ?? '';
+
+                // Re-verify the current password to defeat session-hijack
+                // attempts where the attacker doesn't know the current pass.
+                $row = Database::fetchOne(
+                    "SELECT password_hash FROM users WHERE id = ?",
+                    [$self['id']]
+                );
+                if (!$row || !password_verify($current, $row['password_hash'])) {
+                    http_response_code(401);
+                    echo json_encode(['error' => 'Current password is incorrect']);
+                    break;
+                }
+                Auth::changePassword($self['id'], $new);
+                echo json_encode(['success' => true]);
+            } catch (\InvalidArgumentException $e) {
+                http_response_code(400);
+                echo json_encode(['error' => $e->getMessage()]);
+            }
+            break;
+
+        case 'set_own_pin':
+            try {
+                $self = Auth::currentUser();
+                if (!$self) {
+                    http_response_code(401);
+                    echo json_encode(['error' => 'Not authenticated']);
+                    break;
+                }
+                $pin = $_POST['pin'] ?? '';
+                Auth::setPin($self['id'], $pin === '' ? null : $pin);
+                echo json_encode(['success' => true]);
+            } catch (\InvalidArgumentException $e) {
+                http_response_code(400);
+                echo json_encode(['error' => $e->getMessage()]);
+            }
+            break;
+
+        case 'verify_pin':
+            // Lock-screen unlock: returns success/failure for the current
+            // user's PIN. Uses the same IP-based lockout as login.
+            $clientIp = Security::getClientIp();
+            if (Security::isLockedOut($clientIp)) {
+                $remaining = Security::getLockoutRemaining($clientIp);
+                http_response_code(429);
+                echo json_encode(['error' => "Too many failed attempts. Try again in {$remaining} seconds."]);
+                break;
+            }
+            $pin = $_POST['pin'] ?? '';
+            if (Auth::verifyPin($pin)) {
+                Security::clearLoginAttempts($clientIp);
+                echo json_encode(['success' => true]);
+            } else {
+                Security::recordFailedLogin($clientIp);
+                http_response_code(401);
+                echo json_encode(['error' => 'Incorrect PIN']);
+            }
+            break;
+
         default:
             http_response_code(400);
             echo json_encode(['error' => 'Unknown action']);
@@ -1577,6 +1744,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 $baseUrl = Config::getBaseUrl();
 $isWp = Urls::isWordPress();
 $isLoggedIn = Auth::isLoggedIn();
+$currentUser = Auth::currentUser();   // null when WordPress mode or not logged in
+$currentRole = $currentUser['role'] ?? ($isLoggedIn ? Auth::ROLE_ADMIN : null);
+$currentHasPin = (bool)($currentUser['has_pin'] ?? false);
+$currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -1889,6 +2060,50 @@ $isLoggedIn = Auth::isLoggedIn();
             background: var(--bg-card-hover);
         }
 
+        /* User dropdown menu (top-right account control) */
+        .user-menu {
+            position: relative;
+        }
+
+        .user-menu-panel {
+            position: absolute;
+            top: calc(100% + 0.5rem);
+            right: 0;
+            min-width: 180px;
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 0.5rem;
+            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+            z-index: 200;
+        }
+
+        .user-menu-username {
+            padding: 0.5rem 0.75rem;
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+            border-bottom: 1px solid var(--border);
+            margin-bottom: 0.25rem;
+            word-break: break-all;
+        }
+
+        .user-menu-item {
+            display: block;
+            width: 100%;
+            padding: 0.5rem 0.75rem;
+            background: transparent;
+            border: none;
+            color: var(--text-primary);
+            text-align: left;
+            font-size: 0.9rem;
+            border-radius: 6px;
+            cursor: pointer;
+        }
+
+        .user-menu-item:hover {
+            background: var(--bg-card-hover);
+        }
+
         /* Navigation */
         .nav {
             position: fixed;
@@ -1946,6 +2161,13 @@ $isLoggedIn = Auth::isLoggedIn();
 
         .view.active {
             display: block;
+        }
+
+        /* Generic visibility helper — used by the Users / PIN settings UI
+           so JS can toggle whole cards/buttons by classList. Lock-screen has
+           its own .lock-screen.hidden rule above; this is the catch-all. */
+        .hidden {
+            display: none !important;
         }
 
         /* Balance Card */
@@ -2467,7 +2689,10 @@ $isLoggedIn = Auth::isLoggedIn();
         </div>
 
         <div class="password-fallback" id="password-fallback">
-            <input type="password" id="password-input" placeholder="Or enter password">
+            <input type="text" id="username-input" placeholder="Username"
+                   value="admin" autocomplete="username">
+            <input type="password" id="password-input" placeholder="Password"
+                   autocomplete="current-password">
             <button class="btn btn-full" id="password-submit">Unlock</button>
         </div>
     </div>
@@ -2494,6 +2719,20 @@ $isLoggedIn = Auth::isLoggedIn();
                         <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path>
                     </svg>
                 </button>
+                <?php if (!Urls::isWordPress()): ?>
+                <div class="user-menu" id="user-menu">
+                    <button class="icon-btn" id="user-btn" title="Account">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path>
+                            <circle cx="12" cy="7" r="4"></circle>
+                        </svg>
+                    </button>
+                    <div class="user-menu-panel hidden" id="user-menu-panel" role="menu">
+                        <div class="user-menu-username" id="user-menu-username"></div>
+                        <button class="user-menu-item" id="user-menu-logout" role="menuitem">Log out</button>
+                    </div>
+                </div>
+                <?php endif; ?>
                 <button class="icon-btn" id="lock-btn" title="Lock">
                     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                         <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
@@ -2759,7 +2998,7 @@ $isLoggedIn = Auth::isLoggedIn();
             <!-- Settings View (Global) -->
             <div class="view" id="view-settings">
                 <?php if (!Urls::isWordPress()): ?>
-                <div class="card">
+                <div class="card" data-admin-only="true">
                     <div class="card-header">
                         <div class="card-title">Server URL Mode</div>
                     </div>
@@ -2806,6 +3045,44 @@ $isLoggedIn = Auth::isLoggedIn();
                 </div>
                 <?php endif; ?>
 
+                <!-- My Account card: own password + own PIN, available to every logged-in user -->
+                <?php if (!Urls::isWordPress()): ?>
+                <div class="card" id="card-my-account">
+                    <div class="card-header">
+                        <div class="card-title">My Account</div>
+                    </div>
+                    <div class="card-body">
+                        <div style="margin-bottom: 0.75rem;">
+                            <span style="color: var(--text-secondary);">Signed in as</span>
+                            <strong id="my-username" style="margin-left: 0.25rem;"></strong>
+                            <span style="margin-left: 0.5rem; padding: 0.125rem 0.5rem; border-radius: 999px; font-size: 0.75rem; background: rgba(247,147,26,0.2);" id="my-role-badge"></span>
+                        </div>
+                        <button class="btn btn-secondary btn-full" id="btn-change-own-password" style="margin-bottom: 0.5rem;">
+                            Change my password
+                        </button>
+                        <button class="btn btn-secondary btn-full" id="btn-set-pin" style="margin-bottom: 0.5rem;">
+                            <span id="btn-set-pin-label">Set PIN</span>
+                        </button>
+                        <button class="btn btn-secondary btn-full hidden" id="btn-clear-own-pin" style="margin-bottom: 0.5rem;">
+                            Remove my PIN
+                        </button>
+                        <button class="btn btn-danger btn-full" id="btn-logout">
+                            Logout
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Users card: admin-only -->
+                <div class="card hidden" id="card-users" data-admin-only="true">
+                    <div class="card-header">
+                        <div class="card-title">Users</div>
+                        <button class="btn" id="btn-add-user" style="padding: 0.25rem 0.75rem; font-size: 0.85rem;">Add user</button>
+                    </div>
+                    <div class="card-body">
+                        <div id="users-list"></div>
+                    </div>
+                </div>
+                <?php else: ?>
                 <div class="card">
                     <div class="card-header">
                         <div class="card-title">Security</div>
@@ -2819,6 +3096,7 @@ $isLoggedIn = Auth::isLoggedIn();
                         </button>
                     </div>
                 </div>
+                <?php endif; ?>
 
                 <div style="text-align: center; padding: 1.5rem 0; color: var(--text-muted); font-size: 0.8rem;">
                     CashuPayServer v<?= CASHUPAY_VERSION ?> &middot;
@@ -2991,6 +3269,93 @@ $isLoggedIn = Auth::isLoggedIn();
         </div>
     </div>
 
+    <!-- Change My Password modal -->
+    <div class="modal-overlay" id="modal-change-password">
+        <div class="modal">
+            <div class="modal-handle"></div>
+            <div class="modal-title">Change my password</div>
+            <p style="color: var(--text-secondary); margin-bottom: 1rem;">
+                Re-enter your current password to confirm, then set a new one (min 8 characters).
+            </p>
+            <div class="form-group">
+                <input type="password" class="form-input" id="cp-current"
+                       placeholder="Current password" autocomplete="current-password">
+            </div>
+            <div class="form-group">
+                <input type="password" class="form-input" id="cp-new"
+                       placeholder="New password" autocomplete="new-password">
+            </div>
+            <div class="form-group">
+                <input type="password" class="form-input" id="cp-confirm"
+                       placeholder="Confirm new password" autocomplete="new-password">
+            </div>
+            <button class="btn btn-full" id="btn-confirm-change-password">Update password</button>
+            <button class="btn btn-secondary btn-full" style="margin-top: 0.5rem;"
+                    onclick="closeModal('modal-change-password')">Cancel</button>
+        </div>
+    </div>
+
+    <!-- Add User modal (admin) -->
+    <div class="modal-overlay" id="modal-add-user">
+        <div class="modal">
+            <div class="modal-handle"></div>
+            <div class="modal-title">Add user</div>
+            <div class="form-group">
+                <input type="text" class="form-input" id="au-username"
+                       placeholder="Username (3-32 chars, letters/digits/_-)" autocomplete="off">
+            </div>
+            <div class="form-group">
+                <input type="password" class="form-input" id="au-password"
+                       placeholder="Initial password (min 8)" autocomplete="new-password">
+            </div>
+            <div class="form-group">
+                <label class="form-label">Role</label>
+                <select id="au-role" class="form-input">
+                    <option value="user">User (read + create invoices)</option>
+                    <option value="admin">Admin (full access)</option>
+                </select>
+            </div>
+            <button class="btn btn-full" id="btn-confirm-add-user">Create user</button>
+            <button class="btn btn-secondary btn-full" style="margin-top: 0.5rem;"
+                    onclick="closeModal('modal-add-user')">Cancel</button>
+        </div>
+    </div>
+
+    <!-- Reset another user's password (admin) -->
+    <div class="modal-overlay" id="modal-reset-user-password">
+        <div class="modal">
+            <div class="modal-handle"></div>
+            <div class="modal-title">Reset password for <span id="rup-username"></span></div>
+            <input type="hidden" id="rup-user-id">
+            <div class="form-group">
+                <input type="password" class="form-input" id="rup-new"
+                       placeholder="New password (min 8)" autocomplete="new-password">
+            </div>
+            <button class="btn btn-full" id="btn-confirm-reset-user-password">Reset password</button>
+            <button class="btn btn-secondary btn-full" style="margin-top: 0.5rem;"
+                    onclick="closeModal('modal-reset-user-password')">Cancel</button>
+        </div>
+    </div>
+
+    <!-- Reset another user's PIN (admin) -->
+    <div class="modal-overlay" id="modal-reset-user-pin">
+        <div class="modal">
+            <div class="modal-handle"></div>
+            <div class="modal-title">Reset PIN for <span id="rupin-username"></span></div>
+            <input type="hidden" id="rupin-user-id">
+            <p style="color: var(--text-secondary); margin-bottom: 1rem;">
+                Enter a new 4-digit PIN, or leave blank to remove the user's PIN.
+            </p>
+            <div class="form-group">
+                <input type="password" class="form-input" id="rupin-new"
+                       placeholder="New PIN (4 digits, or empty to clear)" maxlength="4" pattern="[0-9]{4}">
+            </div>
+            <button class="btn btn-full" id="btn-confirm-reset-user-pin">Save</button>
+            <button class="btn btn-secondary btn-full" style="margin-top: 0.5rem;"
+                    onclick="closeModal('modal-reset-user-pin')">Cancel</button>
+        </div>
+    </div>
+
     <div class="modal-overlay" id="modal-pin-setup">
         <div class="modal">
             <div class="modal-handle"></div>
@@ -3092,6 +3457,14 @@ $isLoggedIn = Auth::isLoggedIn();
         // PHP session state, used to skip the password prompt on reload when
         // the server still considers us logged in.
         const phpLoggedIn = <?= $isLoggedIn ? 'true' : 'false' ?>;
+        // Server-rendered identity used by the lock screen and the Settings
+        // visibility logic. Source of truth — JS no longer keeps PIN state
+        // in localStorage.
+        const phpUser = {
+            username: <?= json_encode($currentUsername) ?>,
+            role:     <?= json_encode($currentRole) ?>,
+            hasPin:   <?= $currentHasPin ? 'true' : 'false' ?>,
+        };
         const adminUrl = <?= json_encode(Urls::admin()) ?>;
         const setupUrl = <?= json_encode(Urls::setup()) ?>;
 
@@ -3175,8 +3548,7 @@ $isLoggedIn = Auth::isLoggedIn();
             }
 
             if (phpLoggedIn) {
-                const storedPin = localStorage.getItem(STORAGE_PIN);
-                if (storedPin) {
+                if (phpUser.hasPin) {
                     // Session valid, PIN configured — require PIN to unlock UI
                     document.getElementById('pin-pad').style.display = 'grid';
                     document.getElementById('pin-dots').style.display = 'flex';
@@ -3204,6 +3576,17 @@ $isLoggedIn = Auth::isLoggedIn();
             isAuthenticated = true;
             localStorage.setItem(STORAGE_AUTH, 'true');
 
+            // One-time migration from the old client-side PIN. If the user
+            // had a localStorage PIN before upgrade, drop it and prompt to
+            // re-set from Settings (the new PIN lives server-side).
+            try {
+                const legacyPin = localStorage.getItem(STORAGE_PIN);
+                if (legacyPin && !phpUser.hasPin) {
+                    localStorage.removeItem(STORAGE_PIN);
+                    showToast('Your PIN moved to the server — please re-set it from Settings.', 'warning');
+                }
+            } catch (_) {}
+
             // Check for store_created parameter from setup.php redirect
             const urlParams = new URLSearchParams(window.location.search);
             const createdStoreId = urlParams.get('store_created');
@@ -3225,8 +3608,10 @@ $isLoggedIn = Auth::isLoggedIn();
             }
         }
 
-        // PIN handling
-        function handlePinInput(key) {
+        // PIN handling — server-side verification (replaces the older
+        // localStorage comparison so PINs can be reset/cleared by admin
+        // and so a stale localStorage entry can't unlock a dead session).
+        async function handlePinInput(key) {
             const dots = document.querySelectorAll('.pin-dot');
 
             if (key === 'back') {
@@ -3235,27 +3620,36 @@ $isLoggedIn = Auth::isLoggedIn();
                 pin += key;
             }
 
-            // Update dots
             dots.forEach((dot, i) => {
                 dot.classList.toggle('filled', i < pin.length);
                 dot.classList.remove('error');
             });
 
-            // Check PIN when complete
             if (pin.length === 4) {
-                const storedPin = localStorage.getItem(STORAGE_PIN);
-                if (pin === storedPin) {
-                    showApp();
-                } else {
-                    // Wrong PIN
-                    dots.forEach(dot => dot.classList.add('error'));
-                    setTimeout(() => {
-                        pin = '';
-                        dots.forEach(dot => {
-                            dot.classList.remove('filled', 'error');
-                        });
-                    }, 500);
+                const attempted = pin;
+                try {
+                    const res = await fetch(adminUrl, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/x-www-form-urlencoded',
+                            'X-CSRF-Token': document.querySelector('meta[name="csrf-token"]').content,
+                        },
+                        body: `action=verify_pin&pin=${encodeURIComponent(attempted)}`,
+                    });
+                    if (res.ok) {
+                        showApp();
+                        return;
+                    }
+                } catch (_) {
+                    // network error -> treated same as wrong PIN
                 }
+                dots.forEach(dot => dot.classList.add('error'));
+                setTimeout(() => {
+                    pin = '';
+                    dots.forEach(dot => {
+                        dot.classList.remove('filled', 'error');
+                    });
+                }, 500);
             }
         }
 
@@ -3271,12 +3665,17 @@ $isLoggedIn = Auth::isLoggedIn();
 
             // Password login
             document.getElementById('password-submit').addEventListener('click', async () => {
+                const username = document.getElementById('username-input').value.trim();
                 const password = document.getElementById('password-input').value;
+                if (!username) {
+                    showToast('Username is required', 'error');
+                    return;
+                }
                 try {
                     const response = await fetch(adminUrl, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                        body: `action=login&password=${encodeURIComponent(password)}`
+                        body: `action=login&username=${encodeURIComponent(username)}&password=${encodeURIComponent(password)}`
                     });
 
                     if (response.ok) {
@@ -3290,19 +3689,29 @@ $isLoggedIn = Auth::isLoggedIn();
                             }
                         }
 
+                        // Hydrate phpUser from the login response so the
+                        // Settings UI knows who we are without a reload.
+                        if (data.user) {
+                            phpUser.username = data.user.username || phpUser.username;
+                            phpUser.role     = data.user.role     || phpUser.role;
+                            phpUser.hasPin   = !!data.user.hasPin;
+                        }
+
                         showApp();
                     } else {
-                        showToast('Invalid password', 'error');
+                        showToast('Invalid username or password', 'error');
                     }
                 } catch (e) {
                     showToast('Login failed', 'error');
                 }
             });
 
-            document.getElementById('password-input').addEventListener('keypress', (e) => {
-                if (e.key === 'Enter') {
-                    document.getElementById('password-submit').click();
-                }
+            ['username-input', 'password-input'].forEach(id => {
+                document.getElementById(id).addEventListener('keypress', (e) => {
+                    if (e.key === 'Enter') {
+                        document.getElementById('password-submit').click();
+                    }
+                });
             });
 
             // Navigation
@@ -3319,10 +3728,17 @@ $isLoggedIn = Auth::isLoggedIn();
             // Header buttons
             document.getElementById('refresh-btn').addEventListener('click', loadDashboard);
             document.getElementById('lock-btn').addEventListener('click', lock);
+            setupUserMenu();
 
             // Balance actions
-            document.getElementById('btn-withdraw').addEventListener('click', () => openModal('modal-withdraw'));
-            document.getElementById('btn-export').addEventListener('click', () => openModal('modal-export'));
+            document.getElementById('btn-withdraw').addEventListener('click', () => {
+                if (!ensureAdmin('Only admins can withdraw funds.')) return;
+                openModal('modal-withdraw');
+            });
+            document.getElementById('btn-export').addEventListener('click', () => {
+                if (!ensureAdmin('Only admins can export a Cashu token.')) return;
+                openModal('modal-export');
+            });
             document.getElementById('btn-request').addEventListener('click', () => openModal('modal-request'));
             document.getElementById('btn-new-invoice').addEventListener('click', () => openModal('modal-request'));
 
@@ -3347,6 +3763,21 @@ $isLoggedIn = Auth::isLoggedIn();
             document.getElementById('btn-set-pin').addEventListener('click', () => openModal('modal-pin-setup'));
             document.getElementById('btn-save-pin').addEventListener('click', savePin);
             document.getElementById('btn-logout').addEventListener('click', logout);
+
+            // My Account + Users (standalone only — WordPress uses WP for user management)
+            const btnChangePass = document.getElementById('btn-change-own-password');
+            if (btnChangePass) {
+                btnChangePass.addEventListener('click', () => openModal('modal-change-password'));
+                document.getElementById('btn-confirm-change-password').addEventListener('click', changeOwnPassword);
+                document.getElementById('btn-clear-own-pin').addEventListener('click', clearOwnPin);
+            }
+            const btnAddUser = document.getElementById('btn-add-user');
+            if (btnAddUser) {
+                btnAddUser.addEventListener('click', () => openModal('modal-add-user'));
+                document.getElementById('btn-confirm-add-user').addEventListener('click', addUser);
+                document.getElementById('btn-confirm-reset-user-password').addEventListener('click', confirmResetUserPassword);
+                document.getElementById('btn-confirm-reset-user-pin').addEventListener('click', confirmResetUserPin);
+            }
 
             // URL Mode settings (standalone only)
             if (document.getElementById('btn-detect-url-mode')) {
@@ -3415,6 +3846,229 @@ $isLoggedIn = Auth::isLoggedIn();
 
             if (view === 'invoices') loadInvoices();
             if (view === 'stores') loadStoreSettings();
+            if (view === 'settings') {
+                renderAccountCard();
+                if (phpUser.role === 'admin') renderUsersCard();
+            }
+        }
+
+        // Client-side admin guard for buttons whose modals shouldn't even
+        // open for non-admins. Server-side gates still enforce the actual
+        // action — this just stops the modal from flashing up and prompting
+        // for input the request will be rejected for.
+        function ensureAdmin(message) {
+            if (phpUser.role === 'admin') return true;
+            showToast(message || 'Admin role required', 'error');
+            return false;
+        }
+
+        // Header user dropdown: shows the current username, opens/closes on
+        // user-btn click, closes on outside click or Escape, hosts the
+        // Logout entry. No-op in WordPress mode (the markup is omitted).
+        function setupUserMenu() {
+            const btn = document.getElementById('user-btn');
+            if (!btn) return;
+            const panel = document.getElementById('user-menu-panel');
+            const usernameEl = document.getElementById('user-menu-username');
+
+            const close = () => panel.classList.add('hidden');
+            const toggle = (e) => {
+                e.stopPropagation();
+                // Re-read phpUser here — listeners are wired in DOMContentLoaded
+                // before the password POST hydrates phpUser, so a one-shot set
+                // at setup time would show an empty username.
+                usernameEl.textContent = phpUser.username || '';
+                panel.classList.toggle('hidden');
+            };
+            btn.addEventListener('click', toggle);
+            document.addEventListener('click', (e) => {
+                if (!panel.classList.contains('hidden')
+                    && !e.target.closest('#user-menu')) {
+                    close();
+                }
+            });
+            document.addEventListener('keydown', (e) => {
+                if (e.key === 'Escape') close();
+            });
+            document.getElementById('user-menu-logout').addEventListener('click', () => {
+                close();
+                logout();
+            });
+        }
+
+        // ===== My Account + Users (Settings) =====
+
+        function renderAccountCard() {
+            const u = phpUser;
+            const usernameEl = document.getElementById('my-username');
+            const badgeEl = document.getElementById('my-role-badge');
+            if (usernameEl) usernameEl.textContent = u.username || '';
+            if (badgeEl) badgeEl.textContent = u.role === 'admin' ? 'admin' : 'user';
+
+            const setLabel = document.getElementById('btn-set-pin-label');
+            const clearBtn = document.getElementById('btn-clear-own-pin');
+            if (setLabel) setLabel.textContent = u.hasPin ? 'Change my PIN' : 'Set my PIN';
+            if (clearBtn) clearBtn.classList.toggle('hidden', !u.hasPin);
+        }
+
+        async function renderUsersCard() {
+            const card = document.getElementById('card-users');
+            if (!card) return;
+            card.classList.remove('hidden');
+
+            const container = document.getElementById('users-list');
+            container.innerHTML = '<div class="empty-state"><p>Loading...</p></div>';
+            try {
+                const response = await postWithCsrf(adminUrl, 'action=list_users');
+                const data = await response.json();
+                if (!response.ok || !data.users || data.users.length === 0) {
+                    container.innerHTML = '<div class="empty-state"><p>No users yet</p></div>';
+                    return;
+                }
+                container.innerHTML = data.users.map(u => `
+                    <div class="list-item">
+                        <div class="list-content">
+                            <div class="list-title">
+                                ${escapeHtml(u.username)}
+                                <span style="margin-left: 0.5rem; padding: 0.125rem 0.5rem; border-radius: 999px; font-size: 0.7rem; background: rgba(247,147,26,0.2);">${escapeHtml(u.role)}</span>
+                                ${u.has_pin ? '<span style="margin-left: 0.5rem; font-size: 0.75rem; color: var(--text-secondary);">PIN</span>' : ''}
+                            </div>
+                        </div>
+                        <div style="display: flex; gap: 0.25rem;">
+                            <button class="btn btn-secondary" style="padding: 0.25rem 0.5rem; font-size: 0.75rem;"
+                                    onclick="openResetUserPassword('${escapeAttr(u.id)}','${escapeAttr(u.username)}')">Reset password</button>
+                            <button class="btn btn-secondary" style="padding: 0.25rem 0.5rem; font-size: 0.75rem;"
+                                    onclick="openResetUserPin('${escapeAttr(u.id)}','${escapeAttr(u.username)}')">Reset PIN</button>
+                            ${u.username === phpUser.username ? '' : `<button class="btn btn-danger" style="padding: 0.25rem 0.5rem; font-size: 0.75rem;" onclick="deleteUserById('${escapeAttr(u.id)}','${escapeAttr(u.username)}')">Delete</button>`}
+                        </div>
+                    </div>
+                `).join('');
+            } catch (e) {
+                container.innerHTML = '<div class="empty-state"><p>Failed to load users</p></div>';
+            }
+        }
+
+        function escapeAttr(s) {
+            return String(s).replace(/[&<>"']/g, c => ({
+                '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+            }[c]));
+        }
+
+        async function changeOwnPassword() {
+            const current = document.getElementById('cp-current').value;
+            const next = document.getElementById('cp-new').value;
+            const confirm = document.getElementById('cp-confirm').value;
+            if (next.length < 8) {
+                showToast('New password must be at least 8 characters', 'error');
+                return;
+            }
+            if (next !== confirm) {
+                showToast('Passwords do not match', 'error');
+                return;
+            }
+            try {
+                const response = await postWithCsrf(adminUrl,
+                    `action=change_own_password&current_password=${encodeURIComponent(current)}&new_password=${encodeURIComponent(next)}`);
+                const res = await response.json();
+                if (response.ok && res.success) {
+                    showToast('Password updated', 'success');
+                    closeModal('modal-change-password');
+                    ['cp-current','cp-new','cp-confirm'].forEach(id => document.getElementById(id).value = '');
+                } else {
+                    showToast(res.error || 'Failed to update password', 'error');
+                }
+            } catch (e) {
+                showToast(e.message || 'Failed to update password', 'error');
+            }
+        }
+
+        async function addUser() {
+            const username = document.getElementById('au-username').value.trim();
+            const password = document.getElementById('au-password').value;
+            const role = document.getElementById('au-role').value;
+            try {
+                const response = await postWithCsrf(adminUrl,
+                    `action=create_user&username=${encodeURIComponent(username)}&password=${encodeURIComponent(password)}&role=${encodeURIComponent(role)}`);
+                const res = await response.json();
+                if (response.ok && res.success) {
+                    showToast('User created', 'success');
+                    closeModal('modal-add-user');
+                    ['au-username','au-password'].forEach(id => document.getElementById(id).value = '');
+                    renderUsersCard();
+                } else {
+                    showToast(res.error || 'Failed to create user', 'error');
+                }
+            } catch (e) {
+                showToast(e.message || 'Failed to create user', 'error');
+            }
+        }
+
+        function openResetUserPassword(userId, username) {
+            document.getElementById('rup-user-id').value = userId;
+            document.getElementById('rup-username').textContent = username;
+            document.getElementById('rup-new').value = '';
+            openModal('modal-reset-user-password');
+        }
+
+        async function confirmResetUserPassword() {
+            const userId = document.getElementById('rup-user-id').value;
+            const next = document.getElementById('rup-new').value;
+            try {
+                const response = await postWithCsrf(adminUrl,
+                    `action=reset_password&user_id=${encodeURIComponent(userId)}&new_password=${encodeURIComponent(next)}`);
+                const res = await response.json();
+                if (response.ok && res.success) {
+                    showToast('Password reset', 'success');
+                    closeModal('modal-reset-user-password');
+                } else {
+                    showToast(res.error || 'Failed to reset password', 'error');
+                }
+            } catch (e) {
+                showToast(e.message || 'Failed to reset password', 'error');
+            }
+        }
+
+        function openResetUserPin(userId, username) {
+            document.getElementById('rupin-user-id').value = userId;
+            document.getElementById('rupin-username').textContent = username;
+            document.getElementById('rupin-new').value = '';
+            openModal('modal-reset-user-pin');
+        }
+
+        async function confirmResetUserPin() {
+            const userId = document.getElementById('rupin-user-id').value;
+            const pin = document.getElementById('rupin-new').value;
+            try {
+                const response = await postWithCsrf(adminUrl,
+                    `action=reset_user_pin&user_id=${encodeURIComponent(userId)}&pin=${encodeURIComponent(pin)}`);
+                const res = await response.json();
+                if (response.ok && res.success) {
+                    showToast(pin === '' ? 'PIN removed' : 'PIN reset', 'success');
+                    closeModal('modal-reset-user-pin');
+                    renderUsersCard();
+                } else {
+                    showToast(res.error || 'Failed to reset PIN', 'error');
+                }
+            } catch (e) {
+                showToast(e.message || 'Failed to reset PIN', 'error');
+            }
+        }
+
+        async function deleteUserById(userId, username) {
+            if (!confirm(`Delete user "${username}"? This cannot be undone.`)) return;
+            try {
+                const response = await postWithCsrf(adminUrl,
+                    `action=delete_user&user_id=${encodeURIComponent(userId)}`);
+                const res = await response.json();
+                if (response.ok && res.success) {
+                    showToast('User deleted', 'success');
+                    renderUsersCard();
+                } else {
+                    showToast(res.error || 'Failed to delete user', 'error');
+                }
+            } catch (e) {
+                showToast(e.message || 'Failed to delete user', 'error');
+            }
         }
 
         // Track currently selected store
@@ -3741,10 +4395,10 @@ $isLoggedIn = Auth::isLoggedIn();
                     <div class="list-item">
                         <div class="list-icon" style="background: rgba(247, 147, 26, 0.2);">🔑</div>
                         <div class="list-content">
-                            <div class="list-title">${key.label || 'API Key'}</div>
-                            <div class="list-subtitle">ID: ${key.id.substring(0, 8)}...</div>
+                            <div class="list-title">${escapeHtml(key.label || 'API Key')}</div>
+                            <div class="list-subtitle">ID: ${escapeHtml(key.id.substring(0, 8))}...</div>
                         </div>
-                        <button class="btn btn-secondary" style="padding: 0.25rem 0.5rem; font-size: 0.75rem;" onclick="deleteApiKeyFromSettings('${key.id}')">Delete</button>
+                        <button class="btn btn-secondary" style="padding: 0.25rem 0.5rem; font-size: 0.75rem;" onclick="deleteApiKeyFromSettings('${encodeURIComponent(key.id)}')">Delete</button>
                     </div>
                 `).join('');
             } catch (e) {
@@ -4859,7 +5513,7 @@ $isLoggedIn = Auth::isLoggedIn();
             }
         }
 
-        function savePin() {
+        async function savePin() {
             const newPin = document.getElementById('new-pin').value;
             const confirmPin = document.getElementById('confirm-pin').value;
 
@@ -4873,9 +5527,40 @@ $isLoggedIn = Auth::isLoggedIn();
                 return;
             }
 
-            localStorage.setItem(STORAGE_PIN, newPin);
-            showToast('PIN saved!', 'success');
-            closeModal('modal-pin-setup');
+            try {
+                const response = await postWithCsrf(adminUrl,
+                    `action=set_own_pin&pin=${encodeURIComponent(newPin)}`);
+                const res = await response.json();
+                if (response.ok && res.success) {
+                    phpUser.hasPin = true;
+                    showToast('PIN saved!', 'success');
+                    closeModal('modal-pin-setup');
+                    document.getElementById('new-pin').value = '';
+                    document.getElementById('confirm-pin').value = '';
+                    renderAccountCard();
+                } else {
+                    showToast(res.error || 'Failed to save PIN', 'error');
+                }
+            } catch (e) {
+                showToast('Failed to save PIN', 'error');
+            }
+        }
+
+        async function clearOwnPin() {
+            if (!confirm('Remove your PIN? You will only need your password to unlock.')) return;
+            try {
+                const response = await postWithCsrf(adminUrl, 'action=set_own_pin&pin=');
+                const res = await response.json();
+                if (response.ok && res.success) {
+                    phpUser.hasPin = false;
+                    showToast('PIN removed', 'success');
+                    renderAccountCard();
+                } else {
+                    showToast(res.error || 'Failed to remove PIN', 'error');
+                }
+            } catch (e) {
+                showToast('Failed to remove PIN', 'error');
+            }
         }
 
         async function logout() {
@@ -4894,8 +5579,7 @@ $isLoggedIn = Auth::isLoggedIn();
                 dot.classList.remove('filled');
             });
 
-            const storedPin = localStorage.getItem(STORAGE_PIN);
-            if (storedPin) {
+            if (phpUser.hasPin) {
                 document.getElementById('pin-pad').style.display = 'grid';
                 document.getElementById('pin-dots').style.display = 'flex';
                 document.querySelector('.lock-subtitle').textContent = 'Enter PIN to unlock';

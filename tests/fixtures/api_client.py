@@ -23,8 +23,12 @@ class AdminClient:
     def _admin_url(self) -> str:
         return f"{self.base_url}/admin"
 
-    def login(self, password: str) -> None:
-        r = self.s.post(self._admin_url, data={"action": "login", "password": password}, timeout=15)
+    def login(self, password: str, username: str = "admin") -> dict[str, Any]:
+        r = self.s.post(
+            self._admin_url,
+            data={"action": "login", "username": username, "password": password},
+            timeout=15,
+        )
         r.raise_for_status()
         body = r.json()
         if not body.get("success"):
@@ -33,6 +37,7 @@ class AdminClient:
         if not self.csrf_token:
             # Fall back to scraping from a subsequent GET if the login response didn't include it
             self._refresh_csrf()
+        return body
 
     def _refresh_csrf(self) -> None:
         r = self.s.get(self._admin_url, timeout=15)
