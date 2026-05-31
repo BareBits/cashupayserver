@@ -190,9 +190,10 @@ class LightningAddress {
                 $isFiatMint = !in_array($mintUnit, ['sat', 'sats', 'msat']);
 
                 if ($balance >= $store['auto_melt_threshold']) {
-                    // Calculate donation (in mint units)
-                    $donationAmount = Donation::calculateAmount($balance);
-                    $meltAmountInMintUnit = $balance - $donationAmount;
+                    // Fees (upstream dev / dev / hosting) are settled separately
+                    // on the cron fee-settlement tick; auto-melt just empties the
+                    // post-fee balance to the operator's Lightning address.
+                    $meltAmountInMintUnit = $balance;
 
                     if ($meltAmountInMintUnit < 1) {
                         continue;
@@ -230,10 +231,27 @@ class LightningAddress {
                             'CashuPayServer auto-withdrawal'
                         );
 
-                        // Send donation if configured (in mint units)
-                        if ($donationAmount > 0) {
-                            Donation::sendToDonationSink($store['id'], $donationAmount);
+                        // Record successful melt for fee-base accounting + future stats.
+                        // Network fee converted to sats for fiat mints so the dev-fee
+                        // base shrinks honestly regardless of mint unit.
+                        $networkFeeSats = (int)($result['fee'] ?? 0);
+                        if ($isFiatMint && $networkFeeSats > 0) {
+                            $networkFeeSats = ExchangeRates::convertMintUnitToSats(
+                                $networkFeeSats,
+                                $mintUnit,
+                                $store['price_provider_primary'] ?? null,
+                                $store['price_provider_secondary'] ?? null
+                            );
                         }
+                        require_once __DIR__ . '/dev_fee.php';
+                        MeltLog::record(
+                            $store['id'],
+                            $meltAmountSats,
+                            $networkFeeSats,
+                            $store['auto_melt_address'],
+                            $result['preimage'] ?? null,
+                            null
+                        );
 
                         $results[] = [
                             'store_id' => $store['id'],
@@ -241,7 +259,6 @@ class LightningAddress {
                             'amount' => $meltAmountSats,
                             'amountMintUnit' => $meltAmountInMintUnit,
                             'mintUnit' => $mintUnit,
-                            'donation' => $donationAmount,
                             'success' => true,
                         ];
 
@@ -428,16 +445,23 @@ class LightningAddress {
 }
 
 /**
- * Donation Class - Send tokens to the donation sink
+ * UpstreamDevFee — pay the original CashuPayServer author via the existing
+ * cypherpunk.today donation sink (Cashu-token POST mechanism).
+ *
+ * Previously this fee was charged on every withdrawal as an opt-out
+ * "donation". It is now charged on the periodic fee-settlement cron tick
+ * (see DevFee::settleStore) once ≥ 1000 sats are owed, and the sats paid
+ * count as a network cost when computing the Modified MIT dev fee base.
  */
-class Donation {
+class UpstreamDevFee {
     /**
-     * Send tokens to the donation sink
+     * Send tokens to the upstream dev fee sink
      *
      * @param string $storeId Store ID for wallet access
-     * @param int $amount Amount to donate
+     * @param int $amount Amount in mint units (NOT sats — caller should convert
+     *                    if the store mint is fiat-denominated)
      */
-    public static function sendToDonationSink(string $storeId, int $amount): array {
+    public static function sendToSink(string $storeId, int $amount): array {
         if ($amount < 1) {
             return ['success' => false, 'token' => null, 'error' => 'Amount too small'];
         }
@@ -469,7 +493,7 @@ class Donation {
 
                     $proofs = $validProofs;
                 } catch (\Cashu\CashuException $e) {
-                    error_log("Donation checkProofState failed: " . $e->getMessage());
+                    error_log("UpstreamDevFee checkProofState failed: " . $e->getMessage());
                 }
             }
 
@@ -479,45 +503,45 @@ class Donation {
             $totalNeeded = $amount + $fee;
 
             if ($balance < $totalNeeded) {
-                return ['success' => false, 'token' => null, 'error' => 'Insufficient balance for donation'];
+                return ['success' => false, 'token' => null, 'error' => 'Insufficient balance for upstream dev fee'];
             }
 
             if ($fee > $amount) {
-                return ['success' => false, 'token' => null, 'error' => 'Fee exceeds donation amount'];
+                return ['success' => false, 'token' => null, 'error' => 'Fee exceeds upstream dev fee amount'];
             }
 
             $result = $wallet->split($proofs, $amount);
-            $donationProofs = $result['send'];
+            $feeProofs = $result['send'];
 
-            // Mark donation proofs as SPENT immediately - they're sent to the sink and gone from our wallet
+            // Mark proofs as SPENT immediately - they're sent to the sink and gone from our wallet
             // Using PENDING causes race conditions: the mint may report different states depending on
             // when the sink processes the token, causing "proofs are pending" errors on exports
-            $donationSecrets = array_map(fn($p) => $p->secret, $donationProofs);
-            $wallet->getStorage()->updateProofsState($donationSecrets, ProofState::SPENT);
+            $feeSecrets = array_map(fn($p) => $p->secret, $feeProofs);
+            $wallet->getStorage()->updateProofsState($feeSecrets, ProofState::SPENT);
 
-            $token = $wallet->serializeToken($donationProofs);
+            $token = $wallet->serializeToken($feeProofs);
 
             self::postTokenToSink($token);
 
             return ['success' => true, 'token' => $token, 'error' => null];
 
         } catch (Exception $e) {
-            error_log("Donation error: " . $e->getMessage());
+            error_log("UpstreamDevFee error: " . $e->getMessage());
             return ['success' => false, 'token' => null, 'error' => $e->getMessage()];
         }
     }
 
     /**
-     * POST token to donation sink (fire and forget)
+     * POST token to upstream dev fee sink (fire and forget)
      */
     public static function postTokenToSink(string $token): void {
-        if (!defined('CASHUPAY_DONATION_SINK_URL')) {
-            error_log("Donation sink URL not configured");
+        if (!defined('CASHUPAY_UPSTREAM_DEV_FEE_SINK_URL')) {
+            error_log("Upstream dev fee sink URL not configured");
             return;
         }
 
         try {
-            $ch = curl_init(CASHUPAY_DONATION_SINK_URL);
+            $ch = curl_init(CASHUPAY_UPSTREAM_DEV_FEE_SINK_URL);
             curl_setopt_array($ch, [
                 CURLOPT_POST => true,
                 CURLOPT_POSTFIELDS => json_encode(['token' => $token]),
@@ -532,36 +556,29 @@ class Donation {
             $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
 
             if (curl_errno($ch)) {
-                error_log("Donation sink POST failed: " . curl_error($ch));
+                error_log("Upstream dev fee sink POST failed: " . curl_error($ch));
             } elseif ($httpCode >= 400) {
-                error_log("Donation sink returned HTTP {$httpCode}: {$response}");
+                error_log("Upstream dev fee sink returned HTTP {$httpCode}: {$response}");
             } else {
-                error_log("Donation sent successfully to sink");
+                error_log("Upstream dev fee sent successfully to sink");
             }
 
         } catch (Exception $e) {
-            error_log("Donation sink error: " . $e->getMessage());
+            error_log("Upstream dev fee sink error: " . $e->getMessage());
         }
     }
 
     /**
-     * Calculate donation amount from a given withdrawal amount
+     * Calculate upstream dev fee amount from a given base amount (in sats).
+     * Floor-rounded; minimum 1 sat when the base is > 0.
      */
-    public static function calculateAmount(int $amount): int {
-        if (!defined('CASHUPAY_DONATION_PERCENT')) {
+    public static function calculateAmount(int $baseSats): int {
+        if (!defined('CASHUPAY_UPSTREAM_DEV_FEE_PERCENT')) {
             return 0;
         }
-        $donationAmount = max(1, (int)floor($amount * CASHUPAY_DONATION_PERCENT / 100));
-        return min($donationAmount, (int)floor($amount * 0.1));
-    }
-
-    /**
-     * Calculate max withdrawal amount when donation is enabled
-     */
-    public static function calculateMaxWithdrawal(int $balance): int {
-        if (!defined('CASHUPAY_DONATION_PERCENT') || CASHUPAY_DONATION_PERCENT <= 0) {
-            return $balance;
+        if ($baseSats < 1) {
+            return 0;
         }
-        return (int)floor($balance / (1 + CASHUPAY_DONATION_PERCENT / 100));
+        return (int)floor($baseSats * CASHUPAY_UPSTREAM_DEV_FEE_PERCENT / 100);
     }
 }

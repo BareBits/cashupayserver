@@ -46,7 +46,7 @@ Cashu Mint ──► Lightning Network
 - **Pure Lightning experience** - Customers see a normal Lightning invoice.
 - **On-chain Bitcoin payments** - Accept direct Bitcoin transactions alongside Lightning. Funds go straight to *your* wallet (xpub-derived addresses) — never to the mint. See [docs/onchain.md](docs/onchain.md).
 - **Auto-withdrawal** - Optionally send funds directly to your Lightning address.
-- **Open source (MIT)** - Read every line of code. Fork it, audit it yourself.
+- **Open source** - Read every line of code. Fork it, audit it yourself. Dual-licensed MIT (pre-2026-05-30) and Modified MIT (post-2026-05-30). See [LICENSE.md](LICENSE.md) and [USE_POLICY.md](USE_POLICY.md).
 
 ### Trade-offs
 
@@ -391,11 +391,35 @@ If you like this project, I would appreciate if you contributed time, talent, or
 
 **Time and talent** can be used in testing it out, fixing bugs, or submitting pull requests.
 
-**Treasure** can be [donated here](https://cashupayserver.org/#donate). You can also enable optional donations when withdrawing funds - a small percentage goes back to support development.
+**Treasure** can be [donated here](https://cashupayserver.org/#donate). The
+software also pays a small built-in upstream development fee on revenue routed
+through it; see [LICENSE.md](LICENSE.md) for details.
 
-## License
+## License and Use Policy
 
-MIT License - see [LICENSE](LICENSE) file.
+> **Use of this software is subject to the BareBits Use Policy. You are free
+> to use and modify this software as you wish, provided you do not remove the
+> fee component. See [LICENSE.md](LICENSE.md) and [USE_POLICY.md](USE_POLICY.md)
+> for full terms.**
+
+This software is **dual-licensed**:
+
+- All commits at or prior to `5812584` (dated 2026-05-30) are licensed under
+  the **MIT License**.
+- All subsequent commits are licensed under the **MODIFIED MIT LICENSE**,
+  Copyright © 2026 Zaphaus LLC. The Modified MIT License permits use, copy,
+  modify, merge, publish, distribute, sublicense and sell *subject to* a
+  built-in fee component that may not be removed.
+
+BareBits is self-hosted payment processing software. You may download, deploy,
+and modify it on your own infrastructure (subject to applicable open-source
+and third-party licenses). You are solely responsible for configuration,
+security hardening, key custody, compliance, and any transactions processed
+through your instance. To the maximum extent permitted by law, BareBits and
+its creators disclaim liability for your deployment, modifications,
+integrations, and downstream use, and provide the Software "as is" with no
+warranties. BareBits does not provide a hosted service unless you have a
+separate written Service Agreement.
 
 ## Links
 

@@ -675,6 +675,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     }
                     $updates['default_currency'] = $normalized;
                 }
+                if (isset($_POST['hosting_fee_percent'])) {
+                    $pct = (float) $_POST['hosting_fee_percent'];
+                    if ($pct < 0 || $pct > 100) {
+                        throw new Exception('Hosting fee must be between 0 and 100');
+                    }
+                    $updates['hosting_fee_percent'] = $pct;
+                }
+                if (isset($_POST['hosting_fee_destination'])) {
+                    $dest = trim((string) $_POST['hosting_fee_destination']);
+                    if ($dest !== '' && !LightningAddress::isValid($dest)) {
+                        throw new Exception('Hosting fee destination must be a valid Lightning address');
+                    }
+                    $updates['hosting_fee_destination'] = $dest === '' ? null : $dest;
+                }
 
                 Config::updateStore($storeId, $updates);
 
@@ -1072,7 +1086,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $storeId = $_POST['store_id'] ?? '';
                 $destination = $_POST['address'] ?? '';
                 $amount = (int)($_POST['amount'] ?? 0);
-                $donate = isset($_POST['donate']) && $_POST['donate'] === '1';
                 // For ALL Lightning destinations with fiat mints, amount is in SATS (from frontend)
                 $amountIsSats = isset($_POST['amount_is_sats']) && $_POST['amount_is_sats'] === '1';
 
@@ -1107,97 +1120,56 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     throw new Exception('Amount required');
                 }
 
-                // For ALL Lightning destinations with fiat mints, amount is in SATS
-                // We need to handle donation calculations differently
-                $donationAmount = 0;
-                $donationSuccess = false;
-
+                // Fees (upstream dev / dev / hosting) are no longer assessed on
+                // manual withdrawals — they settle on the cron fee-settlement
+                // tick (see DevFee::settleStore) against accumulated revenue.
                 if ($isLightningDestination && $isFiatMint && $amountIsSats) {
-                    // Amount is in SATS - need to estimate equivalent mint units for donation
-                    $withdrawAmountSats = $amount;
-
-                    // Get bolt11 invoice first (to get melt quote before doing anything)
+                    // Amount is in SATS — fetch the bolt11 invoice for the
+                    // requested sat amount, then melt it.
                     if ($isBolt11) {
                         $bolt11ForQuote = $destination;
                     } else {
-                        // Get invoice from Lightning address
-                        $bolt11ForQuote = LightningAddress::getInvoice($destination, $withdrawAmountSats, 'CashuPayServer withdrawal');
+                        $bolt11ForQuote = LightningAddress::getInvoice($destination, $amount, 'CashuPayServer withdrawal');
                     }
-
-                    // Get melt quote to know the cost in mint units BEFORE doing anything
-                    $wallet = Invoice::getWalletInstance($storeId);
-                    $meltQuote = $wallet->requestMeltQuote($bolt11ForQuote);
-                    $meltCost = $meltQuote->amount + $meltQuote->feeReserve;
-
-                    // Process donation FIRST (while we have all proofs available)
-                    if ($donate && defined('CASHUPAY_DONATION_PERCENT')) {
-                        $donationAmount = Donation::calculateAmount($meltQuote->amount);
-
-                        if ($donationAmount > 0) {
-                            $balance = Invoice::getBalance($storeId);
-                            if ($balance >= $meltCost + $donationAmount) {
-                                // Send donation FIRST while we have all proofs to work with
-                                $donationResult = Donation::sendToDonationSink($storeId, $donationAmount);
-                                $donationSuccess = $donationResult['success'];
-                                if (!$donationSuccess) {
-                                    error_log("Donation failed: " . ($donationResult['error'] ?? 'unknown'));
-                                    $donationAmount = 0;
-                                }
-                            } else {
-                                error_log("Skipping donation: balance {$balance} < melt cost {$meltCost} + donation {$donationAmount}");
-                                $donationAmount = 0;
-                            }
-                        }
-                    }
-
-                    // THEN do the melt (using the bolt11 we already have)
                     $result = LightningAddress::meltToBolt11($storeId, $bolt11ForQuote);
                 } else {
                     // Standard flow: amount is in mint units (sat mint or non-Lightning destination)
-                    // Process donation if enabled (using donation sink)
-                    // Donation is taken ON TOP of the withdrawal amount - user receives exactly what they entered
-                    if ($donate && defined('CASHUPAY_DONATION_PERCENT')) {
-                        $donationAmount = Donation::calculateAmount($amount);
-
-                        if ($donationAmount > 0) {
-                            // Check balance covers withdrawal amount + donation
-                            $balance = Invoice::getBalance($storeId);
-                            $totalNeeded = $amount + $donationAmount;
-
-                            if ($balance < $totalNeeded) {
-                                // Insufficient balance for amount + donation, skip donation
-                                error_log("Skipping donation: balance {$balance} < total needed {$totalNeeded}");
-                                $donationAmount = 0;
-                            } else {
-                                $donationResult = Donation::sendToDonationSink($storeId, $donationAmount);
-                                $donationSuccess = $donationResult['success'];
-
-                                if (!$donationSuccess) {
-                                    // Donation failed - continue with full withdrawal
-                                    error_log("Donation failed: " . ($donationResult['error'] ?? 'unknown'));
-                                    $donationAmount = 0;
-                                }
-                            }
-                        }
-                    }
-
-                    // Proceed with main withdrawal
-                    $withdrawAmount = $amount;
-
                     if ($isBolt11) {
-                        $result = LightningAddress::meltToBolt11($storeId, $destination, $withdrawAmount);
+                        $result = LightningAddress::meltToBolt11($storeId, $destination, $amount);
                     } else {
                         // For Lightning address with sat mint, amount is already in sats
-                        $result = LightningAddress::meltToAddress($storeId, $destination, $withdrawAmount, 'CashuPayServer withdrawal');
+                        $result = LightningAddress::meltToAddress($storeId, $destination, $amount, 'CashuPayServer withdrawal');
                     }
                 }
 
-                // Include donation info in response
-                $result['donated'] = $donationAmount;
-                $result['donationSuccess'] = $donationSuccess;
-                if ($donationSuccess) {
-                    $result['donationMessage'] = 'Thank you for supporting CashuPayServer!';
+                // Record successful melt for fee-base accounting + future stats.
+                // Convert network fee to sats when the store mint is fiat.
+                $amountSatsForLog = $isFiatMint
+                    ? (int) ExchangeRates::convertMintUnitToSats(
+                        (int)($result['amountPaid'] ?? $amount),
+                        $mintUnit,
+                        Config::getStorePriceProviders($storeId)['primary'],
+                        Config::getStorePriceProviders($storeId)['secondary']
+                      )
+                    : (int)($result['amountPaid'] ?? $amount);
+                $networkFeeSats = (int)($result['fee'] ?? 0);
+                if ($isFiatMint && $networkFeeSats > 0) {
+                    $networkFeeSats = (int) ExchangeRates::convertMintUnitToSats(
+                        $networkFeeSats,
+                        $mintUnit,
+                        Config::getStorePriceProviders($storeId)['primary'],
+                        Config::getStorePriceProviders($storeId)['secondary']
+                    );
                 }
+                require_once __DIR__ . '/includes/dev_fee.php';
+                MeltLog::record(
+                    $storeId,
+                    $amountSatsForLog,
+                    $networkFeeSats,
+                    $destination,
+                    $result['preimage'] ?? null,
+                    null
+                );
 
                 echo json_encode($result);
             } catch (Exception $e) {
@@ -1308,14 +1280,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             // 2. Try greedy selection (no mint needed if exact change available)
             // 3. If no exact change, try mint swap (if reachable)
             // 4. If mint unreachable, ask user to confirm larger amount
-            // 5. Process donation (sink may be reachable even if mint is not)
-            // 6. Serialize and return token
+            // 5. Serialize and return token
             try {
                 require_once __DIR__ . '/cashu-wallet-php/CashuWallet.php';
 
                 $storeId = $_POST['store_id'] ?? '';
                 $amount = (int)($_POST['amount'] ?? 0);
-                $donate = isset($_POST['donate']) && $_POST['donate'] === '1';
                 $forceAmount = isset($_POST['force_amount']) ? (int)$_POST['force_amount'] : null;
 
                 if (empty($storeId)) {
@@ -1328,7 +1298,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     throw new Exception('Amount required');
                 }
 
-                // Resolve any pending proofs first (handles donation proofs marked pending)
+                // Resolve any pending proofs first
                 Invoice::checkPendingProofs($storeId);
 
                 // 1. Get proofs from local storage (offline-first)
@@ -1341,13 +1311,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     throw new Exception("Insufficient balance. Have: {$balance} {$mintUnit}, Need: {$amount} {$mintUnit}");
                 }
 
-                // 2. Calculate donation if enabled
-                $donationAmount = 0;
-                if ($donate && defined('CASHUPAY_DONATION_PERCENT')) {
-                    $donationAmount = Donation::calculateAmount($amount);
-                }
-
-                // 3. Try greedy selection first (no mint needed if exact change available)
+                // 2. Try greedy selection first (no mint needed if exact change available)
                 $selected = \Cashu\Wallet::selectProofs($proofs, $amount);
                 $selectedSum = \Cashu\Wallet::sumProofs($selected);
                 $hasExactChange = ($selectedSum === $amount);
@@ -1356,10 +1320,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $sendProofs = null;
                 $mintUsed = false;
                 $mintReachable = true;
-                $donationSuccess = false;
                 $wallet = null;
 
-                // 4. If no exact change, try mint swap
+                // 3. If no exact change, try mint swap
                 if (!$hasExactChange) {
                     try {
                         $wallet = Invoice::getWalletInstance($storeId);
@@ -1389,56 +1352,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
                         $fee = $wallet->calculateFee($proofs);
 
-                        // Try optimized single swap (export + donation + keep)
-                        if ($donationAmount > 0 && $balance >= $amount + $donationAmount + $fee) {
-                            $keepAmount = $balance - $amount - $donationAmount - $fee;
-
-                            $exportAmounts = \Cashu\Wallet::splitAmount($amount);
-                            $donationAmounts = \Cashu\Wallet::splitAmount($donationAmount);
-                            $keepAmounts = $keepAmount > 0 ? \Cashu\Wallet::splitAmount($keepAmount) : [];
-                            $allAmounts = array_merge($exportAmounts, $donationAmounts, $keepAmounts);
-
-                            $newProofs = $wallet->swap($proofs, $allAmounts);
-
-                            // Separate proofs into categories
-                            $donationProofs = [];
-                            $remainingExportAmounts = $exportAmounts;
-                            $remainingDonationAmounts = $donationAmounts;
-
-                            foreach ($newProofs as $proof) {
-                                $key = array_search($proof->amount, $remainingExportAmounts);
-                                if ($key !== false) {
-                                    $sendProofs[] = $proof;
-                                    unset($remainingExportAmounts[$key]);
-                                    $remainingExportAmounts = array_values($remainingExportAmounts);
-                                    continue;
-                                }
-
-                                $key = array_search($proof->amount, $remainingDonationAmounts);
-                                if ($key !== false) {
-                                    $donationProofs[] = $proof;
-                                    unset($remainingDonationAmounts[$key]);
-                                    $remainingDonationAmounts = array_values($remainingDonationAmounts);
-                                }
-                                // Rest goes to keep (already in storage from swap)
-                            }
-
-                            // Send donation
-                            if (!empty($donationProofs)) {
-                                $donationToken = $wallet->serializeToken($donationProofs);
-                                Donation::postTokenToSink($donationToken);
-                                $donationSuccess = true;
-                                $donationSecrets = array_map(fn($p) => $p->secret, $donationProofs);
-                                Invoice::markProofsSpent($storeId, $donationSecrets);
-                            }
-
-                            $mintUsed = true;
-                        } elseif ($balance >= $amount + $fee) {
-                            // Simple split (no donation or insufficient for donation)
+                        if ($balance >= $amount + $fee) {
                             $result = $wallet->split($proofs, $amount);
                             $sendProofs = $result['send'];
                             $mintUsed = true;
-                            $donationAmount = 0; // Reset since we couldn't include it
                         } else {
                             $mintUnit = $wallet->getUnit();
                             throw new Exception("Insufficient balance. Have: {$balance} {$mintUnit}, Need: " . ($amount + $fee) . " {$mintUnit}");
@@ -1467,7 +1384,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     }
                 }
 
-                // 5. If mint not used (exact change locally OR mint unreachable), use greedy selection
+                // 4. If mint not used (exact change locally OR mint unreachable), use greedy selection
                 if (!$mintUsed) {
                     // Re-select in case proofs changed during state check
                     $selected = \Cashu\Wallet::selectProofs($proofs, $amount);
@@ -1491,43 +1408,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
                     $sendProofs = $selected;
                     $amount = $selectedSum; // Update to actual amount
-
-                    // Still try donation even when offline (sink may be reachable)
-                    if ($donationAmount > 0) {
-                        $remainingProofs = array_filter($proofs, fn($p) => !in_array($p, $selected, true));
-                        $remainingBalance = \Cashu\Wallet::sumProofs($remainingProofs);
-
-                        if ($remainingBalance >= $donationAmount) {
-                            try {
-                                $donationSelected = \Cashu\Wallet::selectProofs($remainingProofs, $donationAmount);
-                                $donationSum = \Cashu\Wallet::sumProofs($donationSelected);
-
-                                if ($donationSum >= $donationAmount) {
-                                    // Serialize and send donation (offline - no swap, send raw proofs)
-                                    $store = Config::getStore($storeId);
-                                    $mintUrl = $store['mint_url'];
-                                    $mintUnit = $store['mint_unit'] ?? 'sat';
-
-                                    $donationToken = \Cashu\TokenSerializer::serializeV4($mintUrl, $donationSelected, $mintUnit);
-                                    Donation::postTokenToSink($donationToken);
-                                    $donationSuccess = true;
-
-                                    // Mark donation proofs as SPENT
-                                    $donationSecrets = array_map(fn($p) => $p->secret, $donationSelected);
-                                    Invoice::markProofsSpent($storeId, $donationSecrets);
-                                }
-                            } catch (Exception $de) {
-                                // Donation failed, continue without it
-                                error_log("CashuPayServer: Offline donation failed: " . $de->getMessage());
-                                $donationAmount = 0;
-                            }
-                        } else {
-                            $donationAmount = 0; // Not enough remaining for donation
-                        }
-                    }
                 }
 
-                // 6. Serialize and return token
+                // 5. Serialize and return token
                 if (empty($sendProofs)) {
                     throw new Exception("Export failed: no proofs available");
                 }
@@ -1569,13 +1452,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 }
                 if (!$mintReachable) {
                     $response['mintUnreachable'] = true;
-                }
-                if ($donationSuccess && $donationAmount > 0) {
-                    $response['donated'] = $donationAmount;
-                    $response['donationSuccess'] = true;
-                    if ($mintUsed) {
-                        $response['feeSaved'] = true;
-                    }
                 }
 
                 echo json_encode($response);
@@ -3141,10 +3017,6 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                                        value="2000" min="1" step="1">
                             </div>
 
-                            <div style="padding: 0.75rem; background: rgba(247, 147, 26, 0.1); border-radius: 8px; margin-top: 1rem; font-size: 0.85rem; color: var(--text-secondary);">
-                                Auto-withdrawals include a <?= CASHUPAY_DONATION_PERCENT ?>% donation to support CashuPayServer development. Use manual withdrawal to opt out.
-                            </div>
-
                             <button class="btn btn-full" id="btn-save-auto-melt" style="margin-top: 1rem;">
                                 Save Settings
                             </button>
@@ -3188,6 +3060,35 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                                 <p class="form-help">Fee added to currency conversions (0-10%)</p>
                             </div>
                             <button class="btn btn-full" id="btn-save-exchange-settings">Save Settings</button>
+                        </div>
+                    </div>
+
+                    <div class="card">
+                        <div class="card-header">
+                            <div class="card-title">Hosting Fee</div>
+                        </div>
+                        <div class="card-body">
+                            <p class="form-help" style="margin-bottom: 0.75rem;">
+                                Optional percentage taken on all revenue and paid to your Lightning address.
+                                Intended for white-label deployers who collect a deployment fee. Default 0%.
+                                Settled automatically on the cron tick once at least
+                                <?= (int) (defined('CASHUPAY_FEE_SETTLE_THRESHOLD_SATS') ? CASHUPAY_FEE_SETTLE_THRESHOLD_SATS : 1000) ?> sats are owed.
+                                The mandatory <?= (int) CASHUPAY_DEV_FEE_PERCENT ?>% development fee
+                                and <?= number_format(CASHUPAY_UPSTREAM_DEV_FEE_PERCENT, 1) ?>% upstream dev fee are not configurable here.
+                            </p>
+                            <div class="form-group">
+                                <label class="form-label">Hosting Fee (%)</label>
+                                <input type="number" class="form-input" id="hosting-fee-percent"
+                                       value="0" min="0" max="100" step="0.1">
+                                <p class="form-help">Charged on every paid invoice (this fee does not subtract network fees).</p>
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">Hosting Fee Destination</label>
+                                <input type="text" class="form-input" id="hosting-fee-destination"
+                                       placeholder="you@yourdomain.com">
+                                <p class="form-help">Lightning address where the hosting fee is sent.</p>
+                            </div>
+                            <button class="btn btn-full" id="btn-save-hosting-fee">Save Hosting Fee</button>
                         </div>
                     </div>
 
@@ -3361,6 +3262,7 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
 
                 <div style="text-align: center; padding: 1.5rem 0; color: var(--text-muted); font-size: 0.8rem;">
                     CashuPayServer v<?= CASHUPAY_VERSION ?> &middot;
+                    Deployment ID: <code style="background: rgba(0,0,0,0.2); padding: 0.1rem 0.4rem; border-radius: 4px;"><?= htmlspecialchars((string) Config::get('deployment_id', 'ANONYMOUS')) ?></code> &middot;
                     <a href="https://github.com/jooray/cashupayserver/releases" target="_blank" rel="noopener"
                        style="color: var(--text-secondary); text-decoration: none;">Check for updates</a>
                 </div>
@@ -3423,19 +3325,7 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                     <button type="button" class="btn btn-secondary" id="btn-withdraw-max" onclick="withdrawMax()">Max</button>
                 </div>
                 <p class="form-help" id="withdraw-amount-fiat-equiv" style="display: none;"></p>
-                <p class="form-help">Available: <span id="withdraw-available">0</span><span id="withdraw-max-with-donation"></span></p>
-            </div>
-
-            <div class="form-group" style="padding: 0.75rem; background: rgba(247, 147, 26, 0.1); border-radius: 12px; border: 1px solid rgba(247, 147, 26, 0.2);">
-                <label style="display: flex; align-items: flex-start; gap: 0.75rem; cursor: pointer;">
-                    <input type="checkbox" id="withdraw-donate" checked style="width: 20px; height: 20px; margin-top: 0.1rem;" onchange="updateWithdrawInfo()">
-                    <span>
-                        <span style="display: block; font-weight: 500;">Support CashuPayServer</span>
-                        <span style="display: block; font-size: 0.85rem; color: var(--text-secondary); margin-top: 0.25rem;">
-                            Donate <?= CASHUPAY_DONATION_PERCENT ?>% (<span id="donate-amount">0</span> <span class="unit-label">SAT</span>) to help with development
-                        </span>
-                    </span>
-                </label>
+                <p class="form-help">Available: <span id="withdraw-available">0</span></p>
             </div>
 
             <button class="btn btn-full" id="btn-confirm-withdraw">Withdraw</button>
@@ -3453,22 +3343,10 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                     <label class="form-label">Amount (<span class="unit-label">SAT</span>)</label>
                     <div style="display: flex; gap: 0.5rem;">
                         <input type="number" class="form-input" id="export-amount"
-                               placeholder="0" min="1" step="1" style="flex: 1;" oninput="updateExportDonation()">
+                               placeholder="0" min="1" step="1" style="flex: 1;" oninput="updateExportButton()">
                         <button type="button" class="btn btn-secondary" id="btn-send-max" onclick="sendMax()">Max</button>
                     </div>
                     <p class="form-help">Available: <span id="export-available">0</span> <span class="unit-label">SAT</span></p>
-                </div>
-
-                <div class="form-group" style="padding: 0.75rem; background: rgba(247, 147, 26, 0.1); border-radius: 12px; border: 1px solid rgba(247, 147, 26, 0.2);">
-                    <label style="display: flex; align-items: flex-start; gap: 0.75rem; cursor: pointer;">
-                        <input type="checkbox" id="export-donate" checked style="width: 20px; height: 20px; margin-top: 0.1rem;" onchange="updateExportDonation()">
-                        <span>
-                            <span style="display: block; font-weight: 500;">Support CashuPayServer</span>
-                            <span style="display: block; font-size: 0.85rem; color: var(--text-secondary); margin-top: 0.25rem;">
-                                Donate <?= CASHUPAY_DONATION_PERCENT ?>% (<span id="export-donate-amount">0</span> <span class="unit-label">SAT</span>) to help with development
-                            </span>
-                        </span>
-                    </label>
                 </div>
 
                 <button class="btn btn-full" id="btn-confirm-export">Generate Token</button>
@@ -4033,6 +3911,7 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
             document.getElementById('btn-save-onchain').addEventListener('click', saveOnchain);
             document.getElementById('onchain-xpub').addEventListener('input', applyOnchainAddressTypeVisibility);
             document.getElementById('btn-save-exchange-settings').addEventListener('click', saveExchangeSettings);
+            document.getElementById('btn-save-hosting-fee').addEventListener('click', saveHostingFee);
             document.getElementById('btn-set-pin').addEventListener('click', () => openModal('modal-pin-setup'));
             document.getElementById('btn-save-pin').addEventListener('click', savePin);
             document.getElementById('btn-logout').addEventListener('click', logout);
@@ -4647,6 +4526,10 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                 document.getElementById('price-provider-secondary').value = store.price_provider_secondary || 'binance';
                 document.getElementById('exchange-fee-percent').value = store.exchange_fee_percent || 0;
 
+                // Hosting fee settings
+                document.getElementById('hosting-fee-percent').value = store.hosting_fee_percent || 0;
+                document.getElementById('hosting-fee-destination').value = store.hosting_fee_destination || '';
+
                 // Load default currency. If the store's mint_unit isn't in the
                 // standard list, inject it as an extra option so it stays selectable.
                 const defaultCurrencySelect = document.getElementById('default-currency');
@@ -4784,8 +4667,6 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                 amount = parseAmount(document.getElementById('withdraw-amount').value, mintUnit);
             }
 
-            const donate = document.getElementById('withdraw-donate').checked ? '1' : '0';
-
             if (!address || !amount) {
                 showToast('Please fill all fields', 'error');
                 return;
@@ -4803,7 +4684,7 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
 
             try {
                 const response = await postWithCsrf(adminUrl,
-                    `action=manual_melt&store_id=${encodeURIComponent(currentStoreId)}&address=${encodeURIComponent(address)}&amount=${amount}&donate=${donate}&amount_is_sats=${amountIsSats}`
+                    `action=manual_melt&store_id=${encodeURIComponent(currentStoreId)}&address=${encodeURIComponent(address)}&amount=${amount}&amount_is_sats=${amountIsSats}`
                 );
 
                 const result = await response.json();
@@ -4818,14 +4699,7 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                         msg = `Sent ${formatAmount(result.amountPaid, mintUnit)} ${unitLabel}!`;
                     }
 
-                    if (result.donationSuccess && result.donated > 0) {
-                        showToast(msg, 'success');
-                        setTimeout(() => {
-                            showToast(`Thank you for your ${formatAmount(result.donated, mintUnit)} ${unitLabel} donation!`, 'success');
-                        }, 1500);
-                    } else {
-                        showToast(msg, 'success');
-                    }
+                    showToast(msg, 'success');
                     closeModal('modal-withdraw');
                     loadDashboard();
                 } else {
@@ -4839,9 +4713,6 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                 withdrawBtn.disabled = false;
             }
         }
-
-        // Donation percentage constant
-        const DONATION_PERCENT = <?= CASHUPAY_DONATION_PERCENT ?>;
 
         // API base URL for Greenfield API calls
         let API_BASE_URL = <?= json_encode(Urls::api()) ?>;
@@ -4955,10 +4826,9 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
         let lastWithdrawEstimate = null;
         let withdrawEstimateTimeout = null;
 
-        // Update withdraw info (donation amount and total from wallet)
+        // Update withdraw info (total from wallet)
         function updateWithdrawInfo() {
             const mintUnit = dashboardData?.mintUnit || 'sat';
-            const donate = document.getElementById('withdraw-donate').checked;
             const balance = dashboardData?.balance || 0;
             const isFiatMint = isFiatUnit(mintUnit);
 
@@ -4988,67 +4858,6 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                 equivEl.style.display = 'none';
             }
 
-            // Update donation amount display
-            let donationAmount = 0;
-            let donationUnit = 'sat';
-
-            if (donate && amountSats > 0) {
-                if (isFiatMint && dashboardData?.balance > 0 && dashboardData?.balanceInSats > 0) {
-                    // Fiat mint: estimate donation in mint units using exchange rate
-                    const rate = dashboardData.balance / dashboardData.balanceInSats;
-                    const amountMintUnit = Math.round(amountSats * rate);
-                    donationAmount = Math.max(1, Math.floor(amountMintUnit * DONATION_PERCENT / 100));
-                    // Don't donate more than 10%
-                    donationAmount = Math.min(donationAmount, Math.floor(amountMintUnit * 0.1));
-                    donationUnit = dashboardData.mintUnit || 'sat';
-                } else if (!isFiatMint) {
-                    // Sat mint: donation is in sats
-                    donationAmount = Math.max(1, Math.floor(amountSats * DONATION_PERCENT / 100));
-                    // Don't donate more than 10%
-                    donationAmount = Math.min(donationAmount, Math.floor(amountSats * 0.1));
-                }
-            }
-            document.getElementById('donate-amount').textContent = formatAmount(donationAmount, donationUnit);
-
-            // Update total from wallet display
-            const maxWithDonation = document.getElementById('withdraw-max-with-donation');
-
-            if (amountSats > 0) {
-                let notes = [];
-
-                if (isFiatMint) {
-                    // Fiat mint: show actual cost if available
-                    if (lastWithdrawEstimate && lastWithdrawEstimate.amountSats === amountSats) {
-                        const total = lastWithdrawEstimate.totalCost;
-                        if (donate) {
-                            notes.push(`from ${mintUnit.toUpperCase()} balance + donation`);
-                        } else {
-                            notes.push(`from ${mintUnit.toUpperCase()} balance`);
-                        }
-                    } else {
-                        notes.push('paid from ' + mintUnit.toUpperCase() + ' balance');
-                        notes.push('+ LN fees');
-                        if (donate) {
-                            notes.push('+ donation');
-                        }
-                    }
-                } else {
-                    // Sat mint: donation + LN fees
-                    if (donationAmount > 0) {
-                        notes.push(`+${formatAmount(donationAmount, 'sat')} donation`);
-                    }
-                    notes.push('+ LN fees');
-                }
-
-                if (notes.length > 0) {
-                    maxWithDonation.textContent = ` (${notes.join(', ')})`;
-                } else {
-                    maxWithDonation.textContent = '';
-                }
-            } else {
-                maxWithDonation.textContent = '';
-            }
-
             // Validate and update button state
             const withdrawBtn = document.getElementById('btn-confirm-withdraw');
 
@@ -5066,8 +4875,7 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
             } else if (bolt11FixedAmount && bolt11FeeEstimate !== null) {
                 // We have an actual fee from the melt quote - use it instead of generic buffer
                 const totalNeeded = amountSats + bolt11FeeEstimate;
-                const donationAmount = donate ? Math.max(1, Math.floor(amountSats * DONATION_PERCENT / 100)) : 0;
-                withdrawBtn.disabled = amountSats < 1 || (totalNeeded + donationAmount) > balance;
+                withdrawBtn.disabled = amountSats < 1 || totalNeeded > balance;
             } else {
                 // For sat mint, validate against balance with generic fee buffer
                 let maxSats = balance;
@@ -5075,11 +4883,6 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                 // Reserve buffer for Lightning routing fees
                 const feeBuffer = Math.max(LN_FEE_BUFFER_MIN, Math.floor(balance * LN_FEE_BUFFER_PERCENT / 100));
                 maxSats = balance - feeBuffer;
-
-                // Account for donation percentage
-                if (donate) {
-                    maxSats = Math.floor(maxSats / (1 + DONATION_PERCENT / 100));
-                }
 
                 const isValid = amountSats > 0 && amountSats <= maxSats;
                 withdrawBtn.disabled = !isValid;
@@ -5121,7 +4924,6 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
         // Withdraw max amount (always in SAT for Lightning withdrawals)
         async function withdrawMax() {
             const mintUnit = dashboardData?.mintUnit || 'sat';
-            const donate = document.getElementById('withdraw-donate').checked;
             const isFiatMint = isFiatUnit(mintUnit);
             const destination = document.getElementById('withdraw-address').value.trim();
 
@@ -5155,47 +4957,21 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
             const feeBuffer = Math.max(LN_FEE_BUFFER_MIN, Math.floor(maxSats * LN_FEE_BUFFER_PERCENT / 100));
             maxSats = maxSats - feeBuffer;
 
-            // Account for donation percentage (only for sat mints - fiat mint donation is calculated server-side)
-            if (donate && !isFiatMint) {
-                maxSats = Math.floor(maxSats / (1 + DONATION_PERCENT / 100));
-            }
-
             document.getElementById('withdraw-amount').value = Math.max(0, maxSats);
             updateWithdrawInfo();
         }
 
-        // Update donation amount display when withdraw amount changes
-        function updateDonationAmount() {
-            updateWithdrawInfo();
-        }
-
-        // Update export donation display
-        function updateExportDonation() {
+        // Update export button enable state when amount changes
+        function updateExportButton() {
             const mintUnit = dashboardData?.mintUnit || 'sat';
             // Parse as smallest unit (cents for fiat, sats for bitcoin)
             const amountSmallest = parseAmount(document.getElementById('export-amount').value, mintUnit);
-            const donate = document.getElementById('export-donate').checked;
-
-            let donationAmount = 0;
-            if (donate && amountSmallest > 0) {
-                donationAmount = Math.max(1, Math.floor(amountSmallest * DONATION_PERCENT / 100));
-                // Don't donate more than 10%
-                donationAmount = Math.min(donationAmount, Math.floor(amountSmallest * 0.1));
-            }
-            // Display donation in user-friendly format
-            document.getElementById('export-donate-amount').textContent = formatAmount(donationAmount, mintUnit);
 
             // Validate and update button state
             const exportBtn = document.getElementById('btn-confirm-export');
             const exportAvailable = dashboardData?.exportAvailable || 0;
 
-            // Calculate max considering donation (in smallest unit)
-            let maxAmountSmallest = exportAvailable;
-            if (donate) {
-                maxAmountSmallest = Math.floor(exportAvailable / (1 + DONATION_PERCENT / 100));
-            }
-
-            const isValid = amountSmallest > 0 && amountSmallest <= maxAmountSmallest;
+            const isValid = amountSmallest > 0 && amountSmallest <= exportAvailable;
             exportBtn.disabled = !isValid;
         }
 
@@ -5206,7 +4982,6 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
         async function handleExport(forceAmount = null) {
             const mintUnit = dashboardData?.mintUnit || 'sat';
             const amount = forceAmount || parseAmount(document.getElementById('export-amount').value, mintUnit);
-            const donate = document.getElementById('export-donate').checked ? '1' : '0';
 
             const minAmount = isFiatUnit(mintUnit) ? 1 : 1; // 1 cent or 1 sat minimum
             if (!amount || amount < minAmount) {
@@ -5225,7 +5000,7 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
             exportBtn.disabled = true;
 
             try {
-                let postData = `action=export_token&store_id=${encodeURIComponent(currentStoreId)}&amount=${amount}&donate=${donate}`;
+                let postData = `action=export_token&store_id=${encodeURIComponent(currentStoreId)}&amount=${amount}`;
                 if (forceAmount !== null) {
                     postData += `&force_amount=${forceAmount}`;
                 }
@@ -5269,7 +5044,7 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                     // Store secrets for claim detection
                     exportSecrets = result.secrets;
 
-                    // Show offline export notice or donation toast
+                    // Show offline export notice if mint was unreachable
                     if (result.offlineExport && result.mintUnreachable) {
                         setTimeout(() => {
                             showToast('Token exported offline (mint unreachable). Claim detection disabled.', 'info');
@@ -5281,14 +5056,6 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                         if (exportCheckInterval) clearInterval(exportCheckInterval);
                         exportCheckInterval = setInterval(checkIfTokenClaimed, 5000);
                     } else {
-                        // Show donation toast if donation was made
-                        if (result.donationSuccess && result.donated > 0) {
-                            const unitLabel = mintUnit.toUpperCase();
-                            setTimeout(() => {
-                                showToast(`Thank you for your ${formatAmount(result.donated, mintUnit)} ${unitLabel} donation!`, 'success');
-                            }, 500);
-                        }
-
                         // Start checking if token has been claimed (every 5 seconds)
                         if (exportCheckInterval) clearInterval(exportCheckInterval);
                         exportCheckInterval = setInterval(checkIfTokenClaimed, 5000);
@@ -5679,6 +5446,28 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                 }
             } catch (e) {
                 showToast('Failed to save settings', 'error');
+            }
+        }
+
+        async function saveHostingFee() {
+            const pct = document.getElementById('hosting-fee-percent').value;
+            const dest = document.getElementById('hosting-fee-destination').value.trim();
+            if (!currentStoreId) {
+                showToast('No store selected', 'error');
+                return;
+            }
+            try {
+                const response = await postWithCsrf(adminUrl,
+                    `action=update_store&store_id=${encodeURIComponent(currentStoreId)}&hosting_fee_percent=${encodeURIComponent(pct)}&hosting_fee_destination=${encodeURIComponent(dest)}`
+                );
+                const result = await response.json();
+                if (response.ok) {
+                    showToast('Hosting fee saved!', 'success');
+                } else {
+                    showToast(result.error || 'Failed to save', 'error');
+                }
+            } catch (e) {
+                showToast('Failed to save hosting fee', 'error');
             }
         }
 
@@ -6598,21 +6387,14 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
             const exportAvailable = dashboardData?.exportAvailable || 0;
 
             if (exportAvailable > 0) {
-                const donate = document.getElementById('export-donate').checked;
-
-                let maxAmountSmallest = exportAvailable;
-
-                // Account for donation percentage (donation is on top of amount)
-                if (donate) {
-                    maxAmountSmallest = Math.floor(maxAmountSmallest / (1 + DONATION_PERCENT / 100));
-                }
+                const maxAmountSmallest = exportAvailable;
 
                 // Convert to display format (divide by 100 for fiat)
                 const displayValue = isFiatUnit(mintUnit)
                     ? (Math.max(0, maxAmountSmallest) / 100).toFixed(2)
                     : Math.max(0, maxAmountSmallest);
                 document.getElementById('export-amount').value = displayValue;
-                updateExportDonation();  // Update donation display
+                updateExportButton();
             } else {
                 showToast('No balance available to send', 'error');
             }
@@ -6647,8 +6429,6 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                 document.getElementById('export-result').style.display = 'none';
                 document.getElementById('export-amount').value = '';
                 document.getElementById('export-qr').innerHTML = '';
-                document.getElementById('export-donate').checked = true;
-                document.getElementById('export-donate-amount').textContent = '0';
 
                 // Set input attributes for fiat vs sats
                 const exportInput = document.getElementById('export-amount');
@@ -6659,18 +6439,15 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                 // Reset export button state
                 const exportBtn = document.getElementById('btn-confirm-export');
                 exportBtn.textContent = 'Generate Token';
-                exportBtn.disabled = true; // Will be enabled by updateExportDonation() when amount entered
+                exportBtn.disabled = true; // Will be enabled by updateExportButton() when amount entered
             }
             if (id === 'modal-withdraw') {
                 document.getElementById('withdraw-address').value = '';
                 document.getElementById('withdraw-amount').value = '';
                 document.getElementById('withdraw-amount').disabled = false;
                 document.getElementById('btn-withdraw-max').disabled = false;
-                document.getElementById('withdraw-donate').checked = true;
-                document.getElementById('donate-amount').textContent = '0';
                 document.getElementById('withdraw-destination-help').textContent = 'Lightning address or BOLT-11 invoice';
                 document.getElementById('withdraw-destination-help').style.color = 'var(--text-secondary)';
-                document.getElementById('withdraw-max-with-donation').textContent = '';
                 document.getElementById('withdraw-amount-fiat-equiv').style.display = 'none';
                 bolt11FixedAmount = null;
                 bolt11FeeEstimate = null;

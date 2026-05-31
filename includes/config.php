@@ -10,9 +10,13 @@ require_once __DIR__ . '/database.php';
 // Version
 define('CASHUPAY_VERSION', '0.1-alpha');
 
-// Donation settings for supporting CashuPayServer development
-define('CASHUPAY_DONATION_PERCENT', 1); // 1% donation
-define('CASHUPAY_DONATION_SINK_URL', 'https://cypherpunk.today/donation-sink/donation-sink.php');
+// Upstream dev fee — paid to the original CashuPayServer author via the
+// existing cypherpunk.today donation sink. Triggered on the periodic fee
+// settlement cron tick (see includes/dev_fee.php) when ≥ 1000 sats are owed.
+// Counts as a network cost when computing the Zaphaus LLC development fee
+// base, so the upstream fee never "stacks" on top of the dev fee.
+define('CASHUPAY_UPSTREAM_DEV_FEE_PERCENT', 0.5);
+define('CASHUPAY_UPSTREAM_DEV_FEE_SINK_URL', 'https://cypherpunk.today/donation-sink/donation-sink.php');
 
 class Config {
     private static array $cache = [];
@@ -283,6 +287,8 @@ class Config {
             'exchange_fee_percent', 'price_provider_primary', 'price_provider_secondary',
             'default_currency',
             'primary_mint_source',
+            // Hosting fee (per-store) — see includes/dev_fee.php
+            'hosting_fee_percent', 'hosting_fee_destination',
             // On-chain Bitcoin payment settings
             'onchain_xpub', 'onchain_network', 'onchain_address_type',
             'onchain_next_index', 'onchain_min_confs', 'onchain_confirm_timeout_sec',
