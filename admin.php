@@ -2060,6 +2060,50 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
             background: var(--bg-card-hover);
         }
 
+        /* User dropdown menu (top-right account control) */
+        .user-menu {
+            position: relative;
+        }
+
+        .user-menu-panel {
+            position: absolute;
+            top: calc(100% + 0.5rem);
+            right: 0;
+            min-width: 180px;
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 0.5rem;
+            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+            z-index: 200;
+        }
+
+        .user-menu-username {
+            padding: 0.5rem 0.75rem;
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+            border-bottom: 1px solid var(--border);
+            margin-bottom: 0.25rem;
+            word-break: break-all;
+        }
+
+        .user-menu-item {
+            display: block;
+            width: 100%;
+            padding: 0.5rem 0.75rem;
+            background: transparent;
+            border: none;
+            color: var(--text-primary);
+            text-align: left;
+            font-size: 0.9rem;
+            border-radius: 6px;
+            cursor: pointer;
+        }
+
+        .user-menu-item:hover {
+            background: var(--bg-card-hover);
+        }
+
         /* Navigation */
         .nav {
             position: fixed;
@@ -2675,6 +2719,20 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                         <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path>
                     </svg>
                 </button>
+                <?php if (!Urls::isWordPress()): ?>
+                <div class="user-menu" id="user-menu">
+                    <button class="icon-btn" id="user-btn" title="Account">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path>
+                            <circle cx="12" cy="7" r="4"></circle>
+                        </svg>
+                    </button>
+                    <div class="user-menu-panel hidden" id="user-menu-panel" role="menu">
+                        <div class="user-menu-username" id="user-menu-username"></div>
+                        <button class="user-menu-item" id="user-menu-logout" role="menuitem">Log out</button>
+                    </div>
+                </div>
+                <?php endif; ?>
                 <button class="icon-btn" id="lock-btn" title="Lock">
                     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                         <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
@@ -3670,10 +3728,17 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
             // Header buttons
             document.getElementById('refresh-btn').addEventListener('click', loadDashboard);
             document.getElementById('lock-btn').addEventListener('click', lock);
+            setupUserMenu();
 
             // Balance actions
-            document.getElementById('btn-withdraw').addEventListener('click', () => openModal('modal-withdraw'));
-            document.getElementById('btn-export').addEventListener('click', () => openModal('modal-export'));
+            document.getElementById('btn-withdraw').addEventListener('click', () => {
+                if (!ensureAdmin('Only admins can withdraw funds.')) return;
+                openModal('modal-withdraw');
+            });
+            document.getElementById('btn-export').addEventListener('click', () => {
+                if (!ensureAdmin('Only admins can export a Cashu token.')) return;
+                openModal('modal-export');
+            });
             document.getElementById('btn-request').addEventListener('click', () => openModal('modal-request'));
             document.getElementById('btn-new-invoice').addEventListener('click', () => openModal('modal-request'));
 
@@ -3785,6 +3850,50 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                 renderAccountCard();
                 if (phpUser.role === 'admin') renderUsersCard();
             }
+        }
+
+        // Client-side admin guard for buttons whose modals shouldn't even
+        // open for non-admins. Server-side gates still enforce the actual
+        // action — this just stops the modal from flashing up and prompting
+        // for input the request will be rejected for.
+        function ensureAdmin(message) {
+            if (phpUser.role === 'admin') return true;
+            showToast(message || 'Admin role required', 'error');
+            return false;
+        }
+
+        // Header user dropdown: shows the current username, opens/closes on
+        // user-btn click, closes on outside click or Escape, hosts the
+        // Logout entry. No-op in WordPress mode (the markup is omitted).
+        function setupUserMenu() {
+            const btn = document.getElementById('user-btn');
+            if (!btn) return;
+            const panel = document.getElementById('user-menu-panel');
+            const usernameEl = document.getElementById('user-menu-username');
+
+            const close = () => panel.classList.add('hidden');
+            const toggle = (e) => {
+                e.stopPropagation();
+                // Re-read phpUser here — listeners are wired in DOMContentLoaded
+                // before the password POST hydrates phpUser, so a one-shot set
+                // at setup time would show an empty username.
+                usernameEl.textContent = phpUser.username || '';
+                panel.classList.toggle('hidden');
+            };
+            btn.addEventListener('click', toggle);
+            document.addEventListener('click', (e) => {
+                if (!panel.classList.contains('hidden')
+                    && !e.target.closest('#user-menu')) {
+                    close();
+                }
+            });
+            document.addEventListener('keydown', (e) => {
+                if (e.key === 'Escape') close();
+            });
+            document.getElementById('user-menu-logout').addEventListener('click', () => {
+                close();
+                logout();
+            });
         }
 
         // ===== My Account + Users (Settings) =====
