@@ -213,6 +213,14 @@ if (isset($_GET['api'])) {
                 'stores' => $stores,
                 'autoMelt' => $autoMelt,
                 'onchain' => $onchain,
+                'reliability' => (function() {
+                    require_once __DIR__ . '/includes/mint_reliability.php';
+                    $disabled = MintReliability::listDisabledMints();
+                    return [
+                        'hasStaleSuspect' => MintReliability::hasStaleSuspect(24 * 3600),
+                        'disabledCount' => count($disabled),
+                    ];
+                })(),
             ]);
             break;
 
@@ -344,6 +352,89 @@ if (isset($_GET['api'])) {
             $wallet = Invoice::getWalletInstance($storeId);
             $rows = $wallet->getStorage()->getProofs(ProofState::UNSPENT);
             echo json_encode($rows);
+            break;
+
+        // ===== Mint reliability + trusted-mints (admin-only) =====
+        case 'list_disabled_mints':
+            Auth::requireAdmin();
+            require_once __DIR__ . '/includes/mint_reliability.php';
+            $rows = MintReliability::listDisabledMints();
+            $out = [];
+            foreach ($rows as $r) {
+                $out[] = [
+                    'mintUrl' => $r['mint_url'],
+                    'totalFailures' => (int)$r['total_failures'],
+                    'consecutiveFailures' => (int)$r['consecutive_failures'],
+                    'disabledPendingSuccess' => (int)$r['disabled_pending_success'] === 1,
+                    'permanentlyDisabled' => (int)$r['permanently_disabled'] === 1,
+                    'trustedListDisabled' => (int)$r['trusted_list_disabled'] === 1,
+                    'trustedListDisabledReason' => $r['trusted_list_disabled_reason'],
+                    'lastFailureAt' => $r['last_failure_at'] !== null ? (int)$r['last_failure_at'] : null,
+                    'lastFailureKind' => $r['last_failure_kind'],
+                    'lastFailureMessage' => $r['last_failure_message'],
+                    'lastSuccessAt' => $r['last_success_at'] !== null ? (int)$r['last_success_at'] : null,
+                ];
+            }
+            echo json_encode(['mints' => $out]);
+            break;
+
+        case 'get_mint_diagnostic':
+            Auth::requireAdmin();
+            require_once __DIR__ . '/includes/mint_reliability.php';
+            $mintUrl = $_GET['mint_url'] ?? '';
+            if ($mintUrl === '') {
+                http_response_code(400);
+                echo json_encode(['error' => 'mint_url required']);
+                break;
+            }
+            $limit = max(1, min(500, (int)($_GET['limit'] ?? 200)));
+            $eventType = $_GET['event_type'] ?? null;
+            $sinceTs = isset($_GET['since']) && $_GET['since'] !== '' ? (int)$_GET['since'] : null;
+            $untilTs = isset($_GET['until']) && $_GET['until'] !== '' ? (int)$_GET['until'] : null;
+            $record = MintReliability::ensureRecord($mintUrl);
+            $events = MintReliability::getEventLog($mintUrl, $limit, $eventType, $sinceTs, $untilTs);
+            $eventsOut = [];
+            foreach ($events as $e) {
+                $eventsOut[] = [
+                    'timestamp' => (int)$e['timestamp'],
+                    'eventType' => $e['event_type'],
+                    'failureType' => $e['failure_type'],
+                    'storeId' => $e['store_id'],
+                    'address' => $e['address'],
+                    'details' => $e['details'],
+                ];
+            }
+            echo json_encode([
+                'mintUrl' => $mintUrl,
+                'status' => [
+                    'totalFailures' => (int)$record['total_failures'],
+                    'consecutiveFailures' => (int)$record['consecutive_failures'],
+                    'disabledPendingSuccess' => (int)$record['disabled_pending_success'] === 1,
+                    'permanentlyDisabled' => (int)$record['permanently_disabled'] === 1,
+                    'trustedListDisabled' => (int)$record['trusted_list_disabled'] === 1,
+                    'trustedListDisabledReason' => $record['trusted_list_disabled_reason'],
+                    'lastFailureAt' => $record['last_failure_at'] !== null ? (int)$record['last_failure_at'] : null,
+                    'lastFailureKind' => $record['last_failure_kind'],
+                    'lastFailureMessage' => $record['last_failure_message'],
+                    'lastSuccessAt' => $record['last_success_at'] !== null ? (int)$record['last_success_at'] : null,
+                ],
+                'events' => $eventsOut,
+            ]);
+            break;
+
+        case 'get_trusted_mints_settings':
+            Auth::requireAdmin();
+            require_once __DIR__ . '/includes/trusted_mints.php';
+            echo json_encode([
+                'url' => TrustedMints::getUrl(),
+                'urlFromEnv' => TrustedMints::isUrlFromEnv(),
+                'refreshMinutes' => TrustedMints::getRefreshMinutes(),
+                'refreshFromEnv' => TrustedMints::isRefreshIntervalFromEnv(),
+                'lastFetchAt' => TrustedMints::getLastFetchAt(),
+                'lastOkAt' => TrustedMints::getLastOkAt(),
+                'lastError' => TrustedMints::getLastError(),
+                'cached' => TrustedMints::getCachedList(),
+            ]);
             break;
 
         default:
@@ -490,6 +581,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 }
 
                 $storeId = Database::generateId('store');
+                // primary_mint_source: 'manual' when the admin enters a mint URL
+                // here, otherwise 'setup' so the trusted-list applier can fill
+                // it in.
                 Database::insert('stores', [
                     'id' => $storeId,
                     'name' => $name,
@@ -499,8 +593,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'exchange_fee_percent' => $exchangeFee,
                     'price_provider_primary' => $primaryProvider,
                     'price_provider_secondary' => $secondaryProvider,
+                    'primary_mint_source' => !empty($mintUrl) ? 'manual' : 'setup',
                     'created_at' => Database::timestamp(),
                 ]);
+
+                require_once __DIR__ . '/includes/trusted_mints.php';
+                try {
+                    TrustedMints::applyToNewStore($storeId);
+                } catch (Exception $e) {
+                    error_log("TrustedMints::applyToNewStore failed in admin create_store: " . $e->getMessage());
+                }
 
                 echo json_encode([
                     'id' => $storeId,
@@ -1569,6 +1671,113 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 }
                 $result = Config::testMintConnection($mintUrl);
                 echo json_encode($result);
+            } catch (Exception $e) {
+                http_response_code(400);
+                echo json_encode(['error' => $e->getMessage()]);
+            }
+            break;
+
+        // ===== Mint reliability admin actions =====
+        case 'admin_reenable_mint':
+            Auth::requireAdmin();
+            try {
+                require_once __DIR__ . '/includes/mint_reliability.php';
+                $mintUrl = $_POST['mint_url'] ?? '';
+                if ($mintUrl === '') {
+                    throw new Exception('mint_url required');
+                }
+                MintReliability::adminReenable($mintUrl, $_SESSION['username'] ?? null);
+                echo json_encode(['success' => true]);
+            } catch (Exception $e) {
+                http_response_code(400);
+                echo json_encode(['error' => $e->getMessage()]);
+            }
+            break;
+
+        case 'admin_mark_mint_bad':
+            Auth::requireAdmin();
+            try {
+                require_once __DIR__ . '/includes/mint_reliability.php';
+                $mintUrl = $_POST['mint_url'] ?? '';
+                if ($mintUrl === '') {
+                    throw new Exception('mint_url required');
+                }
+                MintReliability::adminConfirmedBad($mintUrl, $_SESSION['username'] ?? null);
+                echo json_encode(['success' => true]);
+            } catch (Exception $e) {
+                http_response_code(400);
+                echo json_encode(['error' => $e->getMessage()]);
+            }
+            break;
+
+        case 'reset_mint_counters':
+            Auth::requireAdmin();
+            try {
+                require_once __DIR__ . '/includes/mint_reliability.php';
+                $mintUrl = $_POST['mint_url'] ?? '';
+                if ($mintUrl === '') {
+                    throw new Exception('mint_url required');
+                }
+                MintReliability::resetCounters($mintUrl, $_SESSION['username'] ?? null);
+                echo json_encode(['success' => true]);
+            } catch (Exception $e) {
+                http_response_code(400);
+                echo json_encode(['error' => $e->getMessage()]);
+            }
+            break;
+
+        case 'reset_all_mint_counters':
+            Auth::requireAdmin();
+            try {
+                require_once __DIR__ . '/includes/mint_reliability.php';
+                MintReliability::resetAllCounters($_SESSION['username'] ?? null);
+                echo json_encode(['success' => true]);
+            } catch (Exception $e) {
+                http_response_code(400);
+                echo json_encode(['error' => $e->getMessage()]);
+            }
+            break;
+
+        // ===== Trusted mints settings =====
+        case 'save_trusted_mints_settings':
+            Auth::requireAdmin();
+            try {
+                require_once __DIR__ . '/includes/trusted_mints.php';
+                $url = trim($_POST['url'] ?? '');
+                $minutes = (int)($_POST['refresh_minutes'] ?? 0);
+                if ($url !== '' && !preg_match('#^https?://#i', $url)) {
+                    throw new Exception('URL must start with http:// or https://');
+                }
+                if ($url === '') {
+                    Config::delete(TrustedMints::CONFIG_URL_KEY);
+                } else {
+                    Config::set(TrustedMints::CONFIG_URL_KEY, $url);
+                }
+                if ($minutes > 0) {
+                    Config::set(TrustedMints::CONFIG_INTERVAL_KEY, $minutes);
+                }
+                echo json_encode(['success' => true]);
+            } catch (Exception $e) {
+                http_response_code(400);
+                echo json_encode(['error' => $e->getMessage()]);
+            }
+            break;
+
+        case 'refresh_trusted_mints':
+            Auth::requireAdmin();
+            try {
+                require_once __DIR__ . '/includes/trusted_mints.php';
+                $refreshed = TrustedMints::refresh(true);
+                if ($refreshed) {
+                    TrustedMints::applyToAllStores();
+                }
+                echo json_encode([
+                    'success' => true,
+                    'refreshed' => $refreshed,
+                    'lastError' => TrustedMints::getLastError(),
+                    'lastOkAt' => TrustedMints::getLastOkAt(),
+                    'cached' => TrustedMints::getCachedList(),
+                ]);
             } catch (Exception $e) {
                 http_response_code(400);
                 echo json_encode(['error' => $e->getMessage()]);
@@ -2745,6 +2954,14 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
         <main class="main">
             <!-- Dashboard View -->
             <div class="view active" id="view-dashboard">
+                <div id="reliability-banner" class="hidden" style="background: rgba(220, 53, 69, 0.15); border: 1px solid rgba(220, 53, 69, 0.5); border-radius: 8px; padding: 0.75rem 1rem; margin-bottom: 1rem; font-size: 0.9rem; display: flex; align-items: center; gap: 0.75rem;" data-admin-only="true">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="flex-shrink: 0;">
+                        <path d="M12 9v4M12 17h.01"></path>
+                        <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path>
+                    </svg>
+                    <span id="reliability-banner-text" style="flex: 1;"></span>
+                    <a href="#" data-view="settings" class="btn btn-secondary" style="padding: 0.25rem 0.75rem; font-size: 0.8rem;">Open settings</a>
+                </div>
                 <div class="balance-card">
                     <div class="balance-label">Total Balance</div>
                     <div class="balance-amount" id="balance-amount">---</div>
@@ -3098,6 +3315,50 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                 </div>
                 <?php endif; ?>
 
+                <!-- Mint Reliability card: admin-only -->
+                <div class="card hidden" id="card-mint-reliability" data-admin-only="true">
+                    <div class="card-header">
+                        <div class="card-title">Mint Reliability</div>
+                        <button class="btn btn-secondary" id="btn-reset-all-mint-counters" style="padding: 0.25rem 0.75rem; font-size: 0.8rem;">Reset all counters</button>
+                    </div>
+                    <div class="card-body">
+                        <p style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 0.75rem;">
+                            Mints that are currently being skipped for new invoices because of failures or trusted-list blacklisting. Auto-melt will keep attempting withdrawals from disabled mints so funds aren't stranded.
+                        </p>
+                        <div id="disabled-mints-list">
+                            <p style="color: var(--text-secondary); font-size: 0.85rem;">Loading…</p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Trusted Mints card: admin-only -->
+                <div class="card hidden" id="card-trusted-mints" data-admin-only="true">
+                    <div class="card-header">
+                        <div class="card-title">Trusted Mints</div>
+                    </div>
+                    <div class="card-body">
+                        <p style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 0.75rem;">
+                            Pull a JSON list of trusted mints from a URL and apply it to every store. See <code>docs/trusted-mints.md</code> for the schema.
+                        </p>
+                        <div class="form-group">
+                            <label class="form-label" for="trusted-mints-url">List URL</label>
+                            <input type="url" id="trusted-mints-url" class="form-input" placeholder="https://example.com/trusted-mints.json">
+                            <p class="form-help" id="trusted-mints-url-help"></p>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label" for="trusted-mints-refresh">Refresh interval (minutes)</label>
+                            <input type="number" id="trusted-mints-refresh" class="form-input" min="1" placeholder="1440">
+                            <p class="form-help" id="trusted-mints-refresh-help">Default 1440 (24h).</p>
+                        </div>
+                        <div style="display: flex; gap: 0.5rem;">
+                            <button class="btn" id="btn-save-trusted-mints" style="flex: 1;">Save</button>
+                            <button class="btn btn-secondary" id="btn-refresh-trusted-mints" style="flex: 1;">Refresh now</button>
+                        </div>
+                        <div id="trusted-mints-status" style="margin-top: 0.75rem; font-size: 0.85rem; color: var(--text-secondary);"></div>
+                        <div id="trusted-mints-cached" style="margin-top: 0.75rem;"></div>
+                    </div>
+                </div>
+
                 <div style="text-align: center; padding: 1.5rem 0; color: var(--text-muted); font-size: 0.8rem;">
                     CashuPayServer v<?= CASHUPAY_VERSION ?> &middot;
                     <a href="https://github.com/jooray/cashupayserver/releases" target="_blank" rel="noopener"
@@ -3266,6 +3527,18 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
             <div class="modal-handle"></div>
             <div class="modal-title" id="store-modal-title">Store Details</div>
             <div id="store-modal-content"></div>
+        </div>
+    </div>
+
+    <!-- Mint Diagnostic modal -->
+    <div class="modal-overlay" id="modal-mint-diagnostic">
+        <div class="modal" style="max-width: 720px;">
+            <div class="modal-handle"></div>
+            <div class="modal-title" id="mint-diagnostic-title">Mint Diagnostic</div>
+            <div id="mint-diagnostic-content">
+                <div class="loading"><div class="spinner"></div></div>
+            </div>
+            <button class="btn btn-secondary btn-full" style="margin-top: 0.75rem;" onclick="closeModal('modal-mint-diagnostic')">Close</button>
         </div>
     </div>
 
@@ -3810,6 +4083,24 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                 }
             });
 
+            // Mint reliability + trusted mints wiring (admin-only cards).
+            const btnResetAll = document.getElementById('btn-reset-all-mint-counters');
+            if (btnResetAll) btnResetAll.addEventListener('click', resetAllMintCounters);
+            const btnSaveTm = document.getElementById('btn-save-trusted-mints');
+            if (btnSaveTm) btnSaveTm.addEventListener('click', saveTrustedMintsSettings);
+            const btnRefreshTm = document.getElementById('btn-refresh-trusted-mints');
+            if (btnRefreshTm) btnRefreshTm.addEventListener('click', refreshTrustedMintsNow);
+
+            // "Open settings" link in the reliability banner.
+            document.querySelectorAll('[data-view]').forEach(el => {
+                if (el.tagName === 'A') {
+                    el.addEventListener('click', (e) => {
+                        e.preventDefault();
+                        switchView(el.dataset.view);
+                    });
+                }
+            });
+
             // Modal close on overlay click
             document.querySelectorAll('.modal-overlay').forEach(overlay => {
                 overlay.addEventListener('click', (e) => {
@@ -3848,7 +4139,11 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
             if (view === 'stores') loadStoreSettings();
             if (view === 'settings') {
                 renderAccountCard();
-                if (phpUser.role === 'admin') renderUsersCard();
+                if (phpUser.role === 'admin') {
+                    renderUsersCard();
+                    loadReliabilityCard();
+                    loadTrustedMintsCard();
+                }
             }
         }
 
@@ -4269,6 +4564,9 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
 
                 // Render recent invoices
                 renderInvoices('recent-invoices', dashboardData.invoices || []);
+
+                // Reliability banner / settings cards.
+                updateReliabilityBanner(dashboardData.reliability);
 
             } catch (e) {
                 console.error(e);
@@ -5802,6 +6100,7 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                             <span style="color: var(--text-secondary); font-size: 0.85rem;">Primary Mint:</span>
                             <code style="display: block; background: rgba(0,0,0,0.3); padding: 0.5rem; border-radius: 4px; font-size: 0.75rem; word-break: break-all; margin-top: 0.25rem;">
                                 ${escapeHtml(mintUrl)}
+                                ${mintUrl ? mintDiagnosticIcon(mintUrl) : ''}
                             </code>
                         </div>
                         <div>
@@ -5822,6 +6121,7 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                                     <div style="display: flex; justify-content: space-between; align-items: center; padding: 0.5rem; background: rgba(0,0,0,0.2); border-radius: 4px; margin-bottom: 0.5rem;">
                                         <div style="flex: 1; overflow: hidden;">
                                             <code style="font-size: 0.7rem; word-break: break-all;">${escapeHtml(m.mint_url)}</code>
+                                            ${mintDiagnosticIcon(m.mint_url)}
                                             <span style="opacity: 0.6; font-size: 0.75rem; margin-left: 0.5rem;">(${m.unit.toUpperCase()})</span>
                                         </div>
                                         <button class="btn btn-danger" style="padding: 0.2rem 0.4rem; font-size: 0.7rem; margin-left: 0.5rem;"
@@ -5925,6 +6225,278 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                 showStoreDetails(storeId, storeName);
             } catch (e) {
                 showToast('Failed to remove backup mint', 'error');
+            }
+        }
+
+        // -------- Mint reliability + trusted-mints UI --------
+
+        function mintDiagnosticIcon(mintUrl) {
+            if (!mintUrl) return '';
+            const safe = String(mintUrl).replace(/'/g, "\\'");
+            return `<button type="button" title="Show mint diagnostic"
+                style="background: none; border: none; cursor: pointer; padding: 0 0.35rem; color: var(--text-secondary); font-size: 0.9rem; line-height: 1;"
+                onclick="event.stopPropagation(); openMintDiagnostic('${safe}')">&#9432;</button>`;
+        }
+
+        function fmtTimestamp(ts) {
+            if (!ts) return 'never';
+            try {
+                return new Date(ts * 1000).toLocaleString();
+            } catch (e) {
+                return String(ts);
+            }
+        }
+
+        async function openMintDiagnostic(mintUrl) {
+            document.getElementById('mint-diagnostic-title').textContent = 'Mint Diagnostic';
+            document.getElementById('mint-diagnostic-content').innerHTML =
+                '<div class="loading"><div class="spinner"></div></div>';
+            openModal('modal-mint-diagnostic');
+            try {
+                const r = await fetch(adminUrl + '?api=get_mint_diagnostic&mint_url=' +
+                    encodeURIComponent(mintUrl), { credentials: 'same-origin' });
+                if (!r.ok) {
+                    throw new Error('HTTP ' + r.status);
+                }
+                const data = await r.json();
+                renderMintDiagnostic(data);
+            } catch (e) {
+                document.getElementById('mint-diagnostic-content').innerHTML =
+                    '<p style="color: var(--danger);">Failed to load diagnostic: ' + escapeHtml(e.message) + '</p>';
+            }
+        }
+
+        function renderMintDiagnostic(data) {
+            const s = data.status || {};
+            const states = [];
+            if (s.permanentlyDisabled) states.push('permanently disabled');
+            if (s.disabledPendingSuccess) states.push('disabled until next success');
+            if (s.trustedListDisabled) states.push('disabled by trusted list' + (s.trustedListDisabledReason ? ': ' + s.trustedListDisabledReason : ''));
+            const stateLabel = states.length ? states.join(', ') : 'available';
+
+            const eventsHtml = (data.events || []).map(e => {
+                const detailsRaw = e.details || '';
+                return `<tr>
+                    <td style="white-space: nowrap; vertical-align: top;">${escapeHtml(fmtTimestamp(e.timestamp))}</td>
+                    <td style="vertical-align: top;"><code style="font-size: 0.75rem;">${escapeHtml(e.eventType)}</code></td>
+                    <td style="vertical-align: top;">${e.failureType ? '<code style="font-size: 0.75rem;">' + escapeHtml(e.failureType) + '</code>' : ''}</td>
+                    <td style="vertical-align: top;">${escapeHtml(e.address || '')}</td>
+                    <td style="vertical-align: top; word-break: break-word; font-size: 0.75rem;">${escapeHtml(detailsRaw)}</td>
+                </tr>`;
+            }).join('');
+
+            const body = `
+                <div style="margin-bottom: 1rem;">
+                    <code style="display: block; background: rgba(0,0,0,0.3); padding: 0.5rem; border-radius: 4px; font-size: 0.75rem; word-break: break-all;">${escapeHtml(data.mintUrl)}</code>
+                </div>
+                <div style="display: grid; grid-template-columns: auto 1fr; gap: 0.25rem 1rem; font-size: 0.85rem; margin-bottom: 1rem;">
+                    <span style="color: var(--text-secondary);">Last success</span><span>${escapeHtml(fmtTimestamp(s.lastSuccessAt))}</span>
+                    <span style="color: var(--text-secondary);">Last failure</span><span>${escapeHtml(fmtTimestamp(s.lastFailureAt))}${s.lastFailureKind ? ' &mdash; <code style="font-size: 0.75rem;">' + escapeHtml(s.lastFailureKind) + '</code>' : ''}</span>
+                    <span style="color: var(--text-secondary);">Lifetime failures</span><span>${s.totalFailures || 0}</span>
+                    <span style="color: var(--text-secondary);">Consecutive</span><span>${s.consecutiveFailures || 0}</span>
+                    <span style="color: var(--text-secondary);">Status</span><span>${escapeHtml(stateLabel)}</span>
+                </div>
+                <div style="display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 1rem;">
+                    <button class="btn btn-secondary" style="font-size: 0.8rem;" onclick="adminReenableMint('${String(data.mintUrl).replace(/'/g, "\\'")}')">Re-enable</button>
+                    <button class="btn btn-danger" style="font-size: 0.8rem;" onclick="adminMarkMintBad('${String(data.mintUrl).replace(/'/g, "\\'")}')">Mark confirmed bad</button>
+                    <button class="btn btn-secondary" style="font-size: 0.8rem;" onclick="resetMintCounters('${String(data.mintUrl).replace(/'/g, "\\'")}')">Reset counters</button>
+                </div>
+                <div style="max-height: 360px; overflow: auto; border: 1px solid var(--border); border-radius: 6px;">
+                    <table style="width: 100%; border-collapse: collapse; font-size: 0.85rem;">
+                        <thead>
+                            <tr style="background: rgba(0,0,0,0.3); position: sticky; top: 0;">
+                                <th style="text-align: left; padding: 0.4rem 0.6rem;">Time</th>
+                                <th style="text-align: left; padding: 0.4rem 0.6rem;">Event</th>
+                                <th style="text-align: left; padding: 0.4rem 0.6rem;">Kind</th>
+                                <th style="text-align: left; padding: 0.4rem 0.6rem;">Address</th>
+                                <th style="text-align: left; padding: 0.4rem 0.6rem;">Details</th>
+                            </tr>
+                        </thead>
+                        <tbody>${eventsHtml || '<tr><td colspan="5" style="padding: 1rem; text-align: center; color: var(--text-secondary);">No events recorded.</td></tr>'}</tbody>
+                    </table>
+                </div>
+            `;
+            document.getElementById('mint-diagnostic-content').innerHTML = body;
+        }
+
+        async function adminReenableMint(mintUrl) {
+            if (!confirm('Re-enable this mint and reset its counters?')) return;
+            try {
+                await postWithCsrf(adminUrl, 'action=admin_reenable_mint&mint_url=' + encodeURIComponent(mintUrl));
+                showToast('Mint re-enabled', 'success');
+                openMintDiagnostic(mintUrl);
+                loadReliabilityCard();
+            } catch (e) {
+                showToast('Failed to re-enable mint', 'error');
+            }
+        }
+
+        async function adminMarkMintBad(mintUrl) {
+            if (!confirm('Mark this mint as confirmed bad? This counts as one strike and may trigger permanent disable.')) return;
+            try {
+                await postWithCsrf(adminUrl, 'action=admin_mark_mint_bad&mint_url=' + encodeURIComponent(mintUrl));
+                showToast('Mint marked as confirmed bad', 'success');
+                openMintDiagnostic(mintUrl);
+                loadReliabilityCard();
+            } catch (e) {
+                showToast('Failed to mark mint as bad', 'error');
+            }
+        }
+
+        async function resetMintCounters(mintUrl) {
+            if (!confirm('Reset all counters for this mint?')) return;
+            try {
+                await postWithCsrf(adminUrl, 'action=reset_mint_counters&mint_url=' + encodeURIComponent(mintUrl));
+                showToast('Counters reset', 'success');
+                openMintDiagnostic(mintUrl);
+                loadReliabilityCard();
+            } catch (e) {
+                showToast('Failed to reset counters', 'error');
+            }
+        }
+
+        async function loadReliabilityCard() {
+            const card = document.getElementById('card-mint-reliability');
+            if (!card) return;
+            try {
+                const r = await fetch(adminUrl + '?api=list_disabled_mints', { credentials: 'same-origin' });
+                if (!r.ok) { card.classList.add('hidden'); return; }
+                const data = await r.json();
+                const container = document.getElementById('disabled-mints-list');
+                if (!data.mints || data.mints.length === 0) {
+                    container.innerHTML = '<p style="color: var(--text-secondary); font-size: 0.85rem;">No mints currently disabled.</p>';
+                } else {
+                    container.innerHTML = data.mints.map(m => {
+                        const flags = [];
+                        if (m.permanentlyDisabled) flags.push('permanent');
+                        if (m.disabledPendingSuccess) flags.push('pending success');
+                        if (m.trustedListDisabled) flags.push('trusted-list' + (m.trustedListDisabledReason ? ': ' + m.trustedListDisabledReason : ''));
+                        const safe = String(m.mintUrl).replace(/'/g, "\\'");
+                        return `
+                            <div style="padding: 0.6rem; background: rgba(0,0,0,0.2); border-radius: 6px; margin-bottom: 0.5rem;">
+                                <div style="display: flex; align-items: center; justify-content: space-between; gap: 0.5rem;">
+                                    <code style="font-size: 0.75rem; word-break: break-all; flex: 1;">${escapeHtml(m.mintUrl)}</code>
+                                    ${mintDiagnosticIcon(m.mintUrl)}
+                                </div>
+                                <div style="font-size: 0.75rem; color: var(--text-secondary); margin-top: 0.25rem;">
+                                    ${escapeHtml(flags.join(' • '))} &middot; lifetime ${m.totalFailures}${m.lastFailureKind ? ' &middot; last: ' + escapeHtml(m.lastFailureKind) : ''}
+                                </div>
+                                <div style="display: flex; gap: 0.4rem; margin-top: 0.4rem; flex-wrap: wrap;">
+                                    <button class="btn btn-secondary" style="font-size: 0.75rem; padding: 0.2rem 0.5rem;" onclick="adminReenableMint('${safe}')">Re-enable</button>
+                                    <button class="btn btn-danger" style="font-size: 0.75rem; padding: 0.2rem 0.5rem;" onclick="adminMarkMintBad('${safe}')">Confirmed bad</button>
+                                    <button class="btn btn-secondary" style="font-size: 0.75rem; padding: 0.2rem 0.5rem;" onclick="openMintDiagnostic('${safe}')">Diagnostic</button>
+                                </div>
+                            </div>
+                        `;
+                    }).join('');
+                }
+                card.classList.remove('hidden');
+            } catch (e) {
+                // Non-admin or transient — leave card hidden.
+                card.classList.add('hidden');
+            }
+        }
+
+        async function resetAllMintCounters() {
+            if (!confirm('Reset counters for ALL mints?')) return;
+            try {
+                await postWithCsrf(adminUrl, 'action=reset_all_mint_counters');
+                showToast('All counters reset', 'success');
+                loadReliabilityCard();
+            } catch (e) {
+                showToast('Failed to reset counters', 'error');
+            }
+        }
+
+        async function loadTrustedMintsCard() {
+            const card = document.getElementById('card-trusted-mints');
+            if (!card) return;
+            try {
+                const r = await fetch(adminUrl + '?api=get_trusted_mints_settings', { credentials: 'same-origin' });
+                if (!r.ok) { card.classList.add('hidden'); return; }
+                const data = await r.json();
+                const urlEl = document.getElementById('trusted-mints-url');
+                const intEl = document.getElementById('trusted-mints-refresh');
+                urlEl.value = data.url || '';
+                urlEl.disabled = !!data.urlFromEnv;
+                document.getElementById('trusted-mints-url-help').textContent =
+                    data.urlFromEnv ? 'Set by CASHUPAY_TRUSTED_MINTS_URL — value is read-only here.' : '';
+                intEl.value = data.refreshMinutes || '';
+                intEl.disabled = !!data.refreshFromEnv;
+                document.getElementById('trusted-mints-refresh-help').textContent =
+                    data.refreshFromEnv ? 'Set by CASHUPAY_TRUSTED_MINTS_REFRESH_MINUTES.' : 'Default 1440 (24h).';
+
+                const status = document.getElementById('trusted-mints-status');
+                if (data.lastError) {
+                    status.innerHTML = '<span style="color: var(--danger);">Last refresh failed: ' + escapeHtml(data.lastError) + '</span>';
+                } else if (data.lastOkAt) {
+                    status.textContent = 'Last successful fetch: ' + fmtTimestamp(data.lastOkAt);
+                } else if (data.url) {
+                    status.textContent = 'Not fetched yet.';
+                } else {
+                    status.textContent = '';
+                }
+
+                const cached = document.getElementById('trusted-mints-cached');
+                if (data.cached && data.cached.mints) {
+                    cached.innerHTML = '<details><summary style="cursor: pointer; font-size: 0.85rem; color: var(--text-secondary);">Cached list (' + data.cached.mints.length + ' entries)</summary>' +
+                        '<pre style="background: rgba(0,0,0,0.3); padding: 0.5rem; border-radius: 4px; font-size: 0.75rem; max-height: 240px; overflow: auto;">' +
+                        escapeHtml(JSON.stringify(data.cached, null, 2)) + '</pre></details>';
+                } else {
+                    cached.innerHTML = '';
+                }
+                card.classList.remove('hidden');
+            } catch (e) {
+                card.classList.add('hidden');
+            }
+        }
+
+        async function saveTrustedMintsSettings() {
+            const url = document.getElementById('trusted-mints-url').value.trim();
+            const minutes = document.getElementById('trusted-mints-refresh').value;
+            try {
+                await postWithCsrf(adminUrl,
+                    'action=save_trusted_mints_settings&url=' + encodeURIComponent(url) +
+                    '&refresh_minutes=' + encodeURIComponent(minutes));
+                showToast('Trusted mints settings saved', 'success');
+                loadTrustedMintsCard();
+            } catch (e) {
+                showToast('Failed to save: ' + e.message, 'error');
+            }
+        }
+
+        async function refreshTrustedMintsNow() {
+            try {
+                const r = await postWithCsrf(adminUrl, 'action=refresh_trusted_mints');
+                const data = await r.json();
+                if (data.lastError) {
+                    showToast('Refresh failed: ' + data.lastError, 'error');
+                } else {
+                    showToast('Trusted list refreshed', 'success');
+                }
+                loadTrustedMintsCard();
+                loadReliabilityCard();
+            } catch (e) {
+                showToast('Refresh request failed', 'error');
+            }
+        }
+
+        function updateReliabilityBanner(reliability) {
+            const banner = document.getElementById('reliability-banner');
+            const text = document.getElementById('reliability-banner-text');
+            if (!banner || !text || !reliability) return;
+            if (reliability.hasStaleSuspect || reliability.disabledCount > 0) {
+                const parts = [];
+                if (reliability.disabledCount > 0) {
+                    parts.push(reliability.disabledCount + ' mint' + (reliability.disabledCount === 1 ? '' : 's') + ' currently disabled');
+                }
+                if (reliability.hasStaleSuspect) {
+                    parts.push('one or more withdraw failures unresolved for over 24h');
+                }
+                text.textContent = parts.join(' — ') + '. Review in Settings.';
+                banner.classList.remove('hidden');
+            } else {
+                banner.classList.add('hidden');
             }
         }
 

@@ -167,13 +167,23 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     throw new Exception('A store with this name already exists.');
                 }
 
-                // Create store with just a name (mint and seed will be added in later steps)
+                // Create store with just a name (mint and seed will be added in later steps).
+                // primary_mint_source='setup' marks this store as un-configured so the
+                // trusted-list applier can auto-populate the primary if a list is set.
                 $storeId = Database::generateId('store');
                 Database::insert('stores', [
                     'id' => $storeId,
                     'name' => $storeName,
+                    'primary_mint_source' => 'setup',
                     'created_at' => Database::timestamp(),
                 ]);
+
+                require_once __DIR__ . '/includes/trusted_mints.php';
+                try {
+                    TrustedMints::applyToNewStore($storeId);
+                } catch (Exception $e) {
+                    error_log("TrustedMints::applyToNewStore failed in setup: " . $e->getMessage());
+                }
 
                 $_SESSION['setup_store_id'] = $storeId;
                 $step = 5;

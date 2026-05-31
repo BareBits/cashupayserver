@@ -16,7 +16,6 @@ vendor/**
 composer.phar
 tests/bin/**
 tests/.tmp/**
-tests/scripts/iterate.py
 tests/.venv/**
 tests/.venv-nutshell/**
 tests/.pytest_cache/**
