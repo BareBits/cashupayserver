@@ -360,6 +360,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     // Login doesn't require existing session or CSRF (first request)
     if ($action === 'login') {
+        $username = trim($_POST['username'] ?? '');
         $password = $_POST['password'] ?? '';
         $clientIp = Security::getClientIp();
 
@@ -371,8 +372,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             exit;
         }
 
-        if (Auth::login($password)) {
+        if ($username !== '' && Auth::login($username, $password)) {
             Security::clearLoginAttempts($clientIp);
+            $user = Auth::currentUser();
 
             // C1: Trigger background sync on login
             if (Background::shouldSync()) {
@@ -388,12 +390,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             echo json_encode([
                 'success' => true,
                 'securityWarning' => $securityWarning,
-                'csrfToken' => Auth::generateCsrfToken()
+                'csrfToken' => Auth::generateCsrfToken(),
+                'user' => [
+                    'username' => $user['username'] ?? null,
+                    'role'     => $user['role'] ?? null,
+                    'hasPin'   => (bool)($user['has_pin'] ?? false),
+                ],
             ]);
         } else {
             Security::recordFailedLogin($clientIp);
             http_response_code(401);
-            echo json_encode(['error' => 'Invalid password']);
+            echo json_encode(['error' => 'Invalid username or password']);
         }
         exit;
     }
@@ -2467,7 +2474,10 @@ $isLoggedIn = Auth::isLoggedIn();
         </div>
 
         <div class="password-fallback" id="password-fallback">
-            <input type="password" id="password-input" placeholder="Or enter password">
+            <input type="text" id="username-input" placeholder="Username"
+                   value="admin" autocomplete="username">
+            <input type="password" id="password-input" placeholder="Password"
+                   autocomplete="current-password">
             <button class="btn btn-full" id="password-submit">Unlock</button>
         </div>
     </div>
@@ -3271,12 +3281,17 @@ $isLoggedIn = Auth::isLoggedIn();
 
             // Password login
             document.getElementById('password-submit').addEventListener('click', async () => {
+                const username = document.getElementById('username-input').value.trim();
                 const password = document.getElementById('password-input').value;
+                if (!username) {
+                    showToast('Username is required', 'error');
+                    return;
+                }
                 try {
                     const response = await fetch(adminUrl, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                        body: `action=login&password=${encodeURIComponent(password)}`
+                        body: `action=login&username=${encodeURIComponent(username)}&password=${encodeURIComponent(password)}`
                     });
 
                     if (response.ok) {
@@ -3292,17 +3307,19 @@ $isLoggedIn = Auth::isLoggedIn();
 
                         showApp();
                     } else {
-                        showToast('Invalid password', 'error');
+                        showToast('Invalid username or password', 'error');
                     }
                 } catch (e) {
                     showToast('Login failed', 'error');
                 }
             });
 
-            document.getElementById('password-input').addEventListener('keypress', (e) => {
-                if (e.key === 'Enter') {
-                    document.getElementById('password-submit').click();
-                }
+            ['username-input', 'password-input'].forEach(id => {
+                document.getElementById(id).addEventListener('keypress', (e) => {
+                    if (e.key === 'Enter') {
+                        document.getElementById('password-submit').click();
+                    }
+                });
             });
 
             // Navigation
@@ -3741,10 +3758,10 @@ $isLoggedIn = Auth::isLoggedIn();
                     <div class="list-item">
                         <div class="list-icon" style="background: rgba(247, 147, 26, 0.2);">🔑</div>
                         <div class="list-content">
-                            <div class="list-title">${key.label || 'API Key'}</div>
-                            <div class="list-subtitle">ID: ${key.id.substring(0, 8)}...</div>
+                            <div class="list-title">${escapeHtml(key.label || 'API Key')}</div>
+                            <div class="list-subtitle">ID: ${escapeHtml(key.id.substring(0, 8))}...</div>
                         </div>
-                        <button class="btn btn-secondary" style="padding: 0.25rem 0.5rem; font-size: 0.75rem;" onclick="deleteApiKeyFromSettings('${key.id}')">Delete</button>
+                        <button class="btn btn-secondary" style="padding: 0.25rem 0.5rem; font-size: 0.75rem;" onclick="deleteApiKeyFromSettings('${encodeURIComponent(key.id)}')">Delete</button>
                     </div>
                 `).join('');
             } catch (e) {

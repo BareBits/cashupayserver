@@ -68,11 +68,38 @@ class Database {
     }
 
     /**
-     * Get PDO instance (singleton)
+     * Get PDO instance (singleton).
+     *
+     * On first connection per process, if the schema is already initialized
+     * (config table exists) but a newer-than-original migration target is
+     * missing (the users table, added by the multi-user feature), run the
+     * idempotent migrations. This catches upgrade-from-pre-multi-user
+     * installs where setup.php (and therefore initialize()) never runs again.
      */
     public static function getInstance(): PDO {
         if (self::$instance === null) {
             self::$instance = self::connect();
+
+            $hasConfig = self::$instance
+                ->query("SELECT name FROM sqlite_master WHERE type='table' AND name='config'")
+                ->fetch() !== false;
+            $hasUsers = self::$instance
+                ->query("SELECT name FROM sqlite_master WHERE type='table' AND name='users'")
+                ->fetch() !== false;
+
+            if ($hasConfig && !$hasUsers) {
+                self::$instance->exec("
+                    CREATE TABLE IF NOT EXISTS users (
+                        id              TEXT PRIMARY KEY,
+                        username        TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                        password_hash   TEXT NOT NULL,
+                        pin_hash        TEXT DEFAULT NULL,
+                        role            TEXT NOT NULL CHECK (role IN ('admin','user')),
+                        created_at      INTEGER NOT NULL
+                    );
+                ");
+                self::runMigrations(self::$instance);
+            }
         }
         return self::$instance;
     }
@@ -256,6 +283,19 @@ HTACCESS;
             FOREIGN KEY (webhook_id) REFERENCES webhooks(id) ON DELETE CASCADE
         );
 
+        -- Users: web-admin identities. Single 'admin' role gates fund moves
+        -- and store/config changes; 'user' role can view + create invoices.
+        -- Migrated from the legacy single config.admin_password_hash slot —
+        -- see runMigrations().
+        CREATE TABLE IF NOT EXISTS users (
+            id              TEXT PRIMARY KEY,
+            username        TEXT NOT NULL UNIQUE COLLATE NOCASE,
+            password_hash   TEXT NOT NULL,
+            pin_hash        TEXT DEFAULT NULL,
+            role            TEXT NOT NULL CHECK (role IN ('admin','user')),
+            created_at      INTEGER NOT NULL
+        );
+
         -- Per-store backup mints for failover
         CREATE TABLE IF NOT EXISTS store_mints (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -375,6 +415,23 @@ HTACCESS;
         }
         if (!self::indexExists($pdo, 'idx_invoices_onchain_address')) {
             $pdo->exec("CREATE INDEX idx_invoices_onchain_address ON invoices(onchain_address) WHERE onchain_address IS NOT NULL;");
+        }
+
+        // Multi-user migration: existing installs have a single admin password
+        // stored in config.admin_password_hash. Copy it into the new users
+        // table as the 'admin' user the first time we see an empty users table
+        // alongside a populated legacy slot.
+        $userCount = (int)$pdo->query("SELECT COUNT(*) FROM users")->fetchColumn();
+        if ($userCount === 0) {
+            $legacy = $pdo->query("SELECT value FROM config WHERE key = 'admin_password_hash'")
+                ->fetchColumn();
+            if ($legacy) {
+                $stmt = $pdo->prepare(
+                    "INSERT INTO users (id, username, password_hash, role, created_at)
+                     VALUES (?, 'admin', ?, 'admin', ?)"
+                );
+                $stmt->execute([self::generateId('user'), $legacy, time()]);
+            }
         }
     }
 

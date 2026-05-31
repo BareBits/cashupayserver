@@ -7,6 +7,7 @@ Importing the fixtures module also forces binary download on first run.
 """
 from __future__ import annotations
 
+import os
 import shutil
 import sys
 import time
@@ -21,6 +22,13 @@ import pytest
 TESTS_DIR = Path(__file__).resolve().parent
 if str(TESTS_DIR) not in sys.path:
     sys.path.insert(0, str(TESTS_DIR))
+
+# Point Playwright at the bundled browser cache (mirrors run-tests.sh) so
+# direct `pytest` invocations work without needing PLAYWRIGHT_BROWSERS_PATH
+# in the environment.
+_PW_DEFAULT_CACHE = TESTS_DIR / "bin" / "playwright-browsers"
+if _PW_DEFAULT_CACHE.exists():
+    os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(_PW_DEFAULT_CACHE))
 
 from fixtures import binaries  # noqa: E402
 from fixtures.api_client import AdminClient, GreenfieldClient  # noqa: E402
