@@ -264,6 +264,7 @@ if (isset($_GET['api'])) {
             break;
 
         case 'export_info':
+            Auth::requireAdmin();
             $storeId = $_GET['store_id'] ?? null;
             if (!$storeId || !Config::isStoreConfigured($storeId)) {
                 echo json_encode(['available' => 0, 'error' => 'Store not configured']);
@@ -428,6 +429,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
 
         case 'save_url_mode':
+            Auth::requireAdmin();
             $mode = $_POST['mode'] ?? 'router';
             if (in_array($mode, ['direct', 'router'])) {
                 Config::set('url_mode', $mode);
@@ -443,6 +445,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
 
         case 'create_store':
+            Auth::requireAdmin();
             try {
                 $name = trim($_POST['name'] ?? 'New Store');
                 $mintUrl = $_POST['mint_url'] ?? null;
@@ -512,6 +515,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
 
         case 'update_store':
+            Auth::requireAdmin();
             try {
                 $storeId = $_POST['store_id'] ?? '';
                 if (!$storeId) {
@@ -583,11 +587,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
 
         case 'generate_seed':
+            Auth::requireAdmin();
             require_once __DIR__ . '/cashu-wallet-php/CashuWallet.php';
             echo json_encode(['seedPhrase' => \Cashu\Mnemonic::generate()]);
             break;
 
         case 'validate_seed':
+            Auth::requireAdmin();
             try {
                 $seedPhrase = $_POST['seed_phrase'] ?? '';
                 if (empty($seedPhrase)) {
@@ -616,12 +622,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
 
         case 'delete_store':
+            Auth::requireAdmin();
             $storeId = $_POST['store_id'] ?? '';
             Database::delete('stores', 'id = ?', [$storeId]);
             echo json_encode(['success' => true]);
             break;
 
         case 'create_api_key':
+            Auth::requireAdmin();
             $storeId = $_POST['store_id'] ?? '';
             $label = $_POST['label'] ?? 'API Key';
             $apiKey = Auth::createApiKey($storeId, $label);
@@ -629,6 +637,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
 
         case 'delete_api_key':
+            Auth::requireAdmin();
             $keyId = $_POST['key_id'] ?? '';
             Auth::deleteApiKey($keyId);
             echo json_encode(['success' => true]);
@@ -786,6 +795,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
 
         case 'save_onchain':
+            Auth::requireAdmin();
             // Persist a store's on-chain Bitcoin payment configuration.
             try {
                 $storeId = $_POST['store_id'] ?? '';
@@ -861,6 +871,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
 
         case 'validate_onchain_xpub':
+            Auth::requireAdmin();
             // Used by the admin store-settings form to validate + preview
             // addresses before saving. Mirrors setup.php's validate_xpub action
             // so the same JS can drive either context.
@@ -894,6 +905,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
 
         case 'test_onchain_xpub':
+            Auth::requireAdmin();
             // "Test xpub" button: derive the address at the current
             // onchain_next_index without consuming it, so the user can
             // confirm derivation matches their signing wallet.
@@ -923,6 +935,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
 
         case 'save_auto_melt':
+            Auth::requireAdmin();
             try {
                 $storeId = $_POST['store_id'] ?? '';
                 $address = $_POST['address'] ?? '';
@@ -952,6 +965,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
 
         case 'manual_melt':
+            Auth::requireAdmin();
             try {
                 $storeId = $_POST['store_id'] ?? '';
                 $destination = $_POST['address'] ?? '';
@@ -1184,6 +1198,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
 
         case 'export_token':
+            Auth::requireAdmin();
             // OFFLINE-FIRST EXPORT: Minimize mint contact, maximize reliability
             //
             // Flow:
@@ -1483,6 +1498,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
 
         case 'add_backup_mint':
+            Auth::requireAdmin();
             try {
                 $storeId = $_POST['store_id'] ?? '';
                 $mintUrl = $_POST['mint_url'] ?? '';
@@ -1515,6 +1531,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
 
         case 'update_backup_mint':
+            Auth::requireAdmin();
             try {
                 $id = (int)($_POST['id'] ?? 0);
                 $enabled = isset($_POST['enabled']) ? (int)$_POST['enabled'] : null;
@@ -1533,6 +1550,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
 
         case 'remove_backup_mint':
+            Auth::requireAdmin();
             try {
                 $id = (int)($_POST['id'] ?? 0);
                 Config::removeStoreBackupMint($id);
@@ -1570,6 +1588,148 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             } catch (Exception $e) {
                 http_response_code(400);
                 echo json_encode(['error' => $e->getMessage()]);
+            }
+            break;
+
+        // ===== User management (admin-only) =====
+        case 'list_users':
+            Auth::requireAdmin();
+            echo json_encode(['users' => Auth::listUsers()]);
+            break;
+
+        case 'create_user':
+            Auth::requireAdmin();
+            try {
+                $username = trim($_POST['username'] ?? '');
+                $password = $_POST['password'] ?? '';
+                $role = $_POST['role'] ?? Auth::ROLE_USER;
+                $userId = Auth::createUser($username, $password, $role);
+                echo json_encode(['success' => true, 'id' => $userId]);
+            } catch (\InvalidArgumentException $e) {
+                http_response_code(400);
+                echo json_encode(['error' => $e->getMessage()]);
+            } catch (\RuntimeException $e) {
+                http_response_code(409);
+                echo json_encode(['error' => $e->getMessage()]);
+            }
+            break;
+
+        case 'delete_user':
+            Auth::requireAdmin();
+            try {
+                $userId = $_POST['user_id'] ?? '';
+                $self = Auth::currentUser();
+                if ($self && $self['id'] === $userId) {
+                    throw new \RuntimeException('You cannot delete your own account');
+                }
+                Auth::deleteUser($userId);
+                echo json_encode(['success' => true]);
+            } catch (\RuntimeException $e) {
+                http_response_code(400);
+                echo json_encode(['error' => $e->getMessage()]);
+            }
+            break;
+
+        case 'reset_password':
+            // Admin resets another user's password.
+            Auth::requireAdmin();
+            try {
+                $userId = $_POST['user_id'] ?? '';
+                $newPassword = $_POST['new_password'] ?? '';
+                Auth::changePassword($userId, $newPassword);
+                echo json_encode(['success' => true]);
+            } catch (\InvalidArgumentException $e) {
+                http_response_code(400);
+                echo json_encode(['error' => $e->getMessage()]);
+            } catch (\RuntimeException $e) {
+                http_response_code(404);
+                echo json_encode(['error' => $e->getMessage()]);
+            }
+            break;
+
+        case 'reset_user_pin':
+            // Admin resets (or clears) another user's PIN.
+            Auth::requireAdmin();
+            try {
+                $userId = $_POST['user_id'] ?? '';
+                $pin = $_POST['pin'] ?? '';
+                Auth::setPin($userId, $pin === '' ? null : $pin);
+                echo json_encode(['success' => true]);
+            } catch (\InvalidArgumentException $e) {
+                http_response_code(400);
+                echo json_encode(['error' => $e->getMessage()]);
+            } catch (\RuntimeException $e) {
+                http_response_code(404);
+                echo json_encode(['error' => $e->getMessage()]);
+            }
+            break;
+
+        // ===== Self-service (any logged-in user) =====
+        case 'change_own_password':
+            try {
+                $self = Auth::currentUser();
+                if (!$self) {
+                    http_response_code(401);
+                    echo json_encode(['error' => 'Not authenticated']);
+                    break;
+                }
+                $current = $_POST['current_password'] ?? '';
+                $new     = $_POST['new_password'] ?? '';
+
+                // Re-verify the current password to defeat session-hijack
+                // attempts where the attacker doesn't know the current pass.
+                $row = Database::fetchOne(
+                    "SELECT password_hash FROM users WHERE id = ?",
+                    [$self['id']]
+                );
+                if (!$row || !password_verify($current, $row['password_hash'])) {
+                    http_response_code(401);
+                    echo json_encode(['error' => 'Current password is incorrect']);
+                    break;
+                }
+                Auth::changePassword($self['id'], $new);
+                echo json_encode(['success' => true]);
+            } catch (\InvalidArgumentException $e) {
+                http_response_code(400);
+                echo json_encode(['error' => $e->getMessage()]);
+            }
+            break;
+
+        case 'set_own_pin':
+            try {
+                $self = Auth::currentUser();
+                if (!$self) {
+                    http_response_code(401);
+                    echo json_encode(['error' => 'Not authenticated']);
+                    break;
+                }
+                $pin = $_POST['pin'] ?? '';
+                Auth::setPin($self['id'], $pin === '' ? null : $pin);
+                echo json_encode(['success' => true]);
+            } catch (\InvalidArgumentException $e) {
+                http_response_code(400);
+                echo json_encode(['error' => $e->getMessage()]);
+            }
+            break;
+
+        case 'verify_pin':
+            // Lock-screen unlock: returns success/failure for the current
+            // user's PIN. Uses the same IP-based lockout as login.
+            $clientIp = Security::getClientIp();
+            if (Security::isLockedOut($clientIp)) {
+                $remaining = Security::getLockoutRemaining($clientIp);
+                http_response_code(429);
+                echo json_encode(['error' => "Too many failed attempts. Try again in {$remaining} seconds."]);
+                break;
+            }
+            $pin = $_POST['pin'] ?? '';
+            if (Auth::verifyPin($pin)) {
+                Security::clearLoginAttempts($clientIp);
+                echo json_encode(['success' => true]);
+            } else {
+                Security::recordFailedLogin($clientIp);
+                http_response_code(401);
+                echo json_encode(['error' => 'Incorrect PIN']);
             }
             break;
 
