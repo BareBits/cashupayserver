@@ -4,6 +4,7 @@
  */
 
 require_once __DIR__ . '/../invoice.php';
+require_once __DIR__ . '/../security.php';
 
 /**
  * Create a new invoice
@@ -25,13 +26,24 @@ function handleCreateInvoice(array $auth, array $params, array $body): void {
         errorResponse('validation-error', 'Amount is required');
     }
 
+    // Reject non-http(s) redirectURL: payment.php renders it into an <a href>
+    // and (when redirectAutomatically is set) assigns it to window.location.
+    // Allowing javascript: / data: would be a stored-XSS sink in the customer's
+    // browser at the merchant's origin.
+    $checkout = $body['checkout'] ?? null;
+    if (is_array($checkout) && isset($checkout['redirectURL']) && $checkout['redirectURL'] !== '' && $checkout['redirectURL'] !== null) {
+        if (Security::sanitizeUrl((string)$checkout['redirectURL']) === null) {
+            errorResponse('validation-error', 'checkout.redirectURL must be an http or https URL');
+        }
+    }
+
     // Create invoice
     try {
         $invoice = Invoice::create($storeId, [
             'amount' => $amount,
             'currency' => strtoupper($currency),
             'metadata' => $body['metadata'] ?? null,
-            'checkout' => $body['checkout'] ?? null,
+            'checkout' => $checkout,
         ]);
 
         jsonResponse(Invoice::formatForApi($invoice), 200);
