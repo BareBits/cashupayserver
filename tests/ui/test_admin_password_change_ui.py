@@ -21,7 +21,7 @@ def _login(page, base_url: str, username: str, password: str) -> None:
 def test_user_changes_own_password(configured: ConfiguredPayserver, page) -> None:
     _login(page, configured.handle.url, "admin", configured.admin_password)
 
-    page.click('[data-view="settings"]')
+    page.click('.nav-item[data-view="settings"]')
     page.wait_for_selector("#view-settings.active")
     page.click("#btn-change-own-password")
     page.wait_for_selector("#modal-change-password.visible")
@@ -49,7 +49,7 @@ def test_change_password_rejects_mismatched_confirm(
     configured: ConfiguredPayserver, page,
 ) -> None:
     _login(page, configured.handle.url, "admin", configured.admin_password)
-    page.click('[data-view="settings"]')
+    page.click('.nav-item[data-view="settings"]')
     page.click("#btn-change-own-password")
     page.wait_for_selector("#modal-change-password.visible")
     page.fill("#cp-current", configured.admin_password)
