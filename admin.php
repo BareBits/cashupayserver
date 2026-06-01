@@ -15,6 +15,7 @@ require_once __DIR__ . '/includes/security.php';
 require_once __DIR__ . '/includes/urls.php';
 // Defines CASHUPAY_DEV_FEE_PERCENT etc. consumed by the Hosting Fee card copy.
 require_once __DIR__ . '/includes/dev_fee.php';
+require_once __DIR__ . '/includes/stats.php';
 
 use Cashu\ProofState;
 
@@ -286,6 +287,120 @@ if (isset($_GET['api'])) {
             $stores = Database::fetchAll("SELECT * FROM stores ORDER BY created_at DESC");
             echo json_encode($stores);
             break;
+
+        case 'stats_summary':
+            Auth::requireAdmin();
+            $storeId = (string)($_GET['store_id'] ?? Stats::ALL_STORES);
+            $range   = (string)($_GET['range']    ?? 'all');
+            echo json_encode(Stats::summary($storeId, $range));
+            break;
+
+        case 'stats_chart':
+            Auth::requireAdmin();
+            $storeId = (string)($_GET['store_id'] ?? Stats::ALL_STORES);
+            $range   = (string)($_GET['range']    ?? 'all');
+            $type    = (string)($_GET['type']     ?? 'revenue');
+            if (!in_array($type, ['revenue', 'count', 'fees'], true)) {
+                http_response_code(400);
+                echo json_encode(['error' => 'invalid chart type']);
+                break;
+            }
+            echo json_encode(Stats::chart($storeId, $range, $type));
+            break;
+
+        case 'stats_payouts':
+            Auth::requireAdmin();
+            $storeId = (string)($_GET['store_id'] ?? Stats::ALL_STORES);
+            $range   = (string)($_GET['range']    ?? 'all');
+            $page    = max(1, (int)($_GET['page'] ?? 1));
+            echo json_encode(Stats::payouts($storeId, $range, $page));
+            break;
+
+        case 'stats_fee_payments':
+            Auth::requireAdmin();
+            $storeId = (string)($_GET['store_id'] ?? Stats::ALL_STORES);
+            $range   = (string)($_GET['range']    ?? 'all');
+            $page    = max(1, (int)($_GET['page'] ?? 1));
+            echo json_encode(Stats::feePayments($storeId, $range, $page));
+            break;
+
+        case 'export_invoices_csv':
+        case 'export_payouts_csv':
+        case 'export_fee_payments_csv':
+        case 'export_combined_csv':
+        case 'export_all_invoices_csv':
+            Auth::requireAdmin();
+            $storeId = (string)($_GET['store_id'] ?? Stats::ALL_STORES);
+            $range   = (string)($_GET['range']    ?? 'all');
+
+            // Filename hint reflects the action + a timestamp; not stored on disk.
+            $stamp = date('Ymd-His');
+            $filenameMap = [
+                'export_invoices_csv'       => "invoices-{$stamp}.csv",
+                'export_payouts_csv'        => "payouts-{$stamp}.csv",
+                'export_fee_payments_csv'   => "fee-payments-{$stamp}.csv",
+                'export_combined_csv'       => "combined-{$stamp}.csv",
+                'export_all_invoices_csv'   => "all-invoices-{$stamp}.csv",
+            ];
+            header('Content-Type: text/csv; charset=utf-8');
+            header('Content-Disposition: attachment; filename="' . $filenameMap[$action] . '"');
+            header('Cache-Control: no-store');
+
+            $out = fopen('php://output', 'w');
+
+            $writeHeader = function (array $row) use ($out) {
+                fputcsv($out, array_keys($row));
+            };
+            $writeRow = function (array $row) use ($out) {
+                fputcsv($out, array_values($row));
+            };
+
+            if ($action === 'export_invoices_csv' || $action === 'export_all_invoices_csv') {
+                $rangeArg = $action === 'export_all_invoices_csv' ? null : $range;
+                $headerWritten = false;
+                foreach (Stats::streamInvoices($storeId, $rangeArg, true) as $row) {
+                    if (!$headerWritten) { $writeHeader($row); $headerWritten = true; }
+                    $writeRow($row);
+                }
+            } elseif ($action === 'export_payouts_csv') {
+                $headerWritten = false;
+                foreach (Stats::streamMelts($storeId, $range, 'payout') as $row) {
+                    if (!$headerWritten) { $writeHeader($row); $headerWritten = true; }
+                    $writeRow($row);
+                }
+            } elseif ($action === 'export_fee_payments_csv') {
+                $headerWritten = false;
+                foreach (Stats::streamMelts($storeId, $range, 'fee') as $row) {
+                    if (!$headerWritten) { $writeHeader($row); $headerWritten = true; }
+                    $writeRow($row);
+                }
+            } else { // export_combined_csv
+                // Unified rows. Header is the union of invoices + melts
+                // columns with a leading `source` discriminator. Rows from a
+                // table leave the other table's columns blank.
+                $columns = Stats::combinedColumns();
+                fputcsv($out, $columns);
+                $emit = function (string $source, array $row) use ($out, $columns, $writeRow) {
+                    $merged = ['source' => $source];
+                    foreach ($columns as $col) {
+                        if ($col === 'source') continue;
+                        $merged[$col] = $row[$col] ?? '';
+                    }
+                    $writeRow($merged);
+                };
+                foreach (Stats::streamInvoices($storeId, $range, true) as $row) {
+                    $emit('invoice', $row);
+                }
+                foreach (Stats::streamMelts($storeId, $range, 'payout') as $row) {
+                    $emit('payout', $row);
+                }
+                foreach (Stats::streamMelts($storeId, $range, 'fee') as $row) {
+                    $emit('fee_payment', $row);
+                }
+            }
+
+            fclose($out);
+            exit;
 
         case 'api_keys':
             $storeId = $_GET['store_id'] ?? null;
@@ -2768,6 +2883,64 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                 margin: auto;
             }
         }
+
+        /* Stats dashboard */
+        .stats-stat-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: baseline;
+            padding: 0.35rem 0;
+            gap: 1rem;
+        }
+        .stats-stat-label {
+            color: var(--text-secondary);
+            font-size: 0.9rem;
+        }
+        .stats-stat-value {
+            font-weight: 600;
+            text-align: right;
+            white-space: nowrap;
+        }
+        .stats-stat-fiat {
+            color: var(--text-secondary);
+            font-weight: normal;
+            margin-left: 0.35rem;
+            font-size: 0.85em;
+        }
+        .stats-range-btn.active,
+        .stats-unit-btn.active {
+            background: var(--accent);
+            color: #000;
+            border-color: var(--accent);
+        }
+        .stats-amount-abbr {
+            text-decoration: underline dotted;
+            cursor: help;
+        }
+        .stats-table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        .stats-table th,
+        .stats-table td {
+            text-align: left;
+            padding: 0.5rem 0.75rem;
+            border-bottom: 1px solid var(--border);
+            font-size: 0.9rem;
+        }
+        .stats-table th {
+            color: var(--text-secondary);
+            font-weight: 600;
+            font-size: 0.8rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+        .stats-table td.truncate {
+            max-width: 240px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
     </style>
 </head>
 <body>
@@ -2915,7 +3088,10 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                 <div class="card">
                     <div class="card-header">
                         <div class="card-title">All Invoices</div>
-                        <button class="btn" id="btn-new-invoice">+ New Invoice</button>
+                        <div style="display: flex; gap: 0.5rem;">
+                            <button class="btn btn-secondary" id="btn-export-invoices-csv">Export CSV</button>
+                            <button class="btn" id="btn-new-invoice">+ New Invoice</button>
+                        </div>
                     </div>
                     <div id="all-invoices">
                         <div class="loading"><div class="spinner"></div></div>
@@ -3329,6 +3505,144 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                        style="color: var(--text-secondary); text-decoration: none;">Check for updates</a>
                 </div>
             </div>
+
+            <!-- Stats Dashboard View (admin-only) -->
+            <div class="view" id="view-stats">
+                <div class="card">
+                    <div class="card-body" style="display: flex; flex-wrap: wrap; gap: 1rem; align-items: flex-end;">
+                        <div class="form-group" style="flex: 1 1 200px; margin: 0;">
+                            <label class="form-label" for="stats-store-selector">Store</label>
+                            <select id="stats-store-selector" class="form-input">
+                                <option value="__all__">All stores</option>
+                            </select>
+                        </div>
+                        <div class="form-group" style="flex: 2 1 320px; margin: 0;">
+                            <label class="form-label">Date range</label>
+                            <div id="stats-range-buttons" style="display: flex; gap: 0.25rem; flex-wrap: wrap;">
+                                <button type="button" class="btn btn-secondary stats-range-btn active" data-range="all" style="flex: 1; min-width: 70px;">All time</button>
+                                <button type="button" class="btn btn-secondary stats-range-btn" data-range="6m" style="flex: 1; min-width: 70px;">6 months</button>
+                                <button type="button" class="btn btn-secondary stats-range-btn" data-range="1m" style="flex: 1; min-width: 70px;">1 month</button>
+                                <button type="button" class="btn btn-secondary stats-range-btn" data-range="1w" style="flex: 1; min-width: 70px;">1 week</button>
+                            </div>
+                        </div>
+                        <div class="form-group" style="flex: 0 0 160px; margin: 0;">
+                            <label class="form-label">Unit</label>
+                            <div id="stats-unit-buttons" style="display: flex; gap: 0.25rem;">
+                                <button type="button" class="btn btn-secondary stats-unit-btn active" data-unit="sat" style="flex: 1;">Sats</button>
+                                <button type="button" class="btn btn-secondary stats-unit-btn" data-unit="btc" style="flex: 1;">BTC</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Financials -->
+                <div class="card">
+                    <div class="card-header"><div class="card-title">Financials</div></div>
+                    <div class="card-body">
+                        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1rem;">
+                            <div>
+                                <div class="stats-stat-row"><span class="stats-stat-label">Total revenue</span><span class="stats-stat-value" id="stats-revenue">—</span></div>
+                                <div class="stats-stat-row"><span class="stats-stat-label">Total invoices</span><span class="stats-stat-value" id="stats-invoice-count">—</span></div>
+                                <div class="stats-stat-row"><span class="stats-stat-label">Total fees paid</span><span class="stats-stat-value" id="stats-total-fees">—</span></div>
+                                <div class="stats-stat-row"><span class="stats-stat-label">Total profit</span><span class="stats-stat-value" id="stats-profit">—</span></div>
+                            </div>
+                            <div>
+                                <div style="display: flex; justify-content: flex-end; margin-bottom: 0.5rem;">
+                                    <select id="stats-financial-chart-type" class="form-input" style="width: auto;">
+                                        <option value="revenue">Revenue by source</option>
+                                        <option value="count">Count by source</option>
+                                    </select>
+                                </div>
+                                <div style="position: relative; height: 240px;">
+                                    <canvas id="stats-financial-chart"></canvas>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Fees -->
+                <div class="card">
+                    <div class="card-header"><div class="card-title">Fees</div></div>
+                    <div class="card-body">
+                        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1rem;">
+                            <div>
+                                <div class="stats-stat-row" title="Donated to upstream development (cypherpunk.today). 0.5% of (revenue − network costs).">
+                                    <span class="stats-stat-label">Upstream dev fee</span><span class="stats-stat-value" id="stats-fee-upstream-paid">—</span>
+                                </div>
+                                <div class="stats-stat-row" title="Dev fee from your deployment configuration. 2% of (revenue − network costs − upstream paid).">
+                                    <span class="stats-stat-label">Dev fee</span><span class="stats-stat-value" id="stats-fee-dev-paid">—</span>
+                                </div>
+                                <div class="stats-stat-row" title="Hosting / referral / deployment fee, configured per-store and paid to the hosting destination.">
+                                    <span class="stats-stat-label">Hosting fee</span><span class="stats-stat-value" id="stats-fee-hosting-paid">—</span>
+                                </div>
+                                <div class="stats-stat-row" title="Lightning routing fees and on-chain miner fees consumed by user payouts and fee settlements (sum of melts.network_fee_sats).">
+                                    <span class="stats-stat-label">Network fees</span><span class="stats-stat-value" id="stats-fee-network-paid">—</span>
+                                </div>
+                                <hr style="border: 0; border-top: 1px solid var(--border); margin: 0.5rem 0;">
+                                <div class="stats-stat-row"><span class="stats-stat-label">Total fees owed</span><span class="stats-stat-value" id="stats-fees-owed">—</span></div>
+                                <div class="stats-stat-row"><span class="stats-stat-label">Total fees paid</span><span class="stats-stat-value" id="stats-fees-paid">—</span></div>
+                                <div class="stats-stat-row" title="Total fees paid divided by total revenue, expressed as a percentage. Uses fees that actually settled, not amounts still owed.">
+                                    <span class="stats-stat-label">Effective fee % (paid &divide; revenue)</span>
+                                    <span class="stats-stat-value" id="stats-effective-fee">—</span>
+                                </div>
+                            </div>
+                            <div>
+                                <div style="position: relative; height: 240px;">
+                                    <canvas id="stats-fee-chart"></canvas>
+                                </div>
+                            </div>
+                        </div>
+                        <div style="margin-top: 1.5rem; padding: 1rem; border: 1px solid var(--border); border-radius: 8px; text-align: center;">
+                            <div style="display: flex; gap: 0.75rem; align-items: center; justify-content: center; flex-wrap: wrap; margin-bottom: 0.5rem;">
+                                <span style="color: var(--text-secondary); font-size: 0.9rem;">Compare against credit card fee of</span>
+                                <select id="stats-cc-rate" class="form-input" style="width: auto; padding: 0.25rem 0.5rem;">
+                                    <option value="2">2%</option>
+                                    <option value="5" selected>5%</option>
+                                    <option value="10">10%</option>
+                                </select>
+                            </div>
+                            <div style="font-size: 2.25rem; font-weight: bold; color: var(--accent);" id="stats-cc-saved">—</div>
+                            <div style="color: var(--text-secondary); font-size: 0.9rem; margin-top: 0.25rem;">saved vs credit cards</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Recent payouts -->
+                <div class="card">
+                    <div class="card-header">
+                        <div class="card-title">Recent payouts</div>
+                        <button type="button" class="btn btn-secondary" id="btn-export-payouts-csv">Export CSV</button>
+                    </div>
+                    <div class="card-body">
+                        <div id="stats-payouts-table"><div class="loading"><div class="spinner"></div></div></div>
+                        <div id="stats-payouts-pagination" style="display: flex; justify-content: space-between; align-items: center; margin-top: 1rem;"></div>
+                    </div>
+                </div>
+
+                <!-- Recent fee payments -->
+                <div class="card">
+                    <div class="card-header">
+                        <div class="card-title">Recent fee payments</div>
+                        <button type="button" class="btn btn-secondary" id="btn-export-fee-payments-csv">Export CSV</button>
+                    </div>
+                    <div class="card-body">
+                        <div id="stats-fee-payments-table"><div class="loading"><div class="spinner"></div></div></div>
+                        <div id="stats-fee-payments-pagination" style="display: flex; justify-content: space-between; align-items: center; margin-top: 1rem;"></div>
+                    </div>
+                </div>
+
+                <!-- Combined export -->
+                <div class="card">
+                    <div class="card-header"><div class="card-title">Export</div></div>
+                    <div class="card-body">
+                        <p style="color: var(--text-secondary); font-size: 0.9rem; margin-bottom: 0.75rem;">
+                            Download a combined CSV containing all paid invoices, payouts, and fee payments for the current filter.
+                        </p>
+                        <button type="button" class="btn" id="btn-export-combined-csv">Download combined CSV</button>
+                    </div>
+                </div>
+            </div>
         </main>
 
         <!-- Navigation -->
@@ -3355,6 +3669,14 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                     <path d="M9 22V12h6v10"></path>
                 </svg>
                 Store
+            </button>
+            <button class="nav-item hidden" data-view="stats" data-admin-only="true" id="nav-stats">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <line x1="18" y1="20" x2="18" y2="10"></line>
+                    <line x1="12" y1="20" x2="12" y2="4"></line>
+                    <line x1="6" y1="20" x2="6" y2="14"></line>
+                </svg>
+                Stats
             </button>
             <button class="nav-item" data-view="settings">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -3664,6 +3986,7 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
         window.bcur = { UR, UREncoder };
     </script>
     <script src="<?= htmlspecialchars(Urls::assets('js/')) ?>animated-qr.js?v=4"></script>
+    <script src="<?= htmlspecialchars(Urls::assets('js/')) ?>chart.min.js"></script>
     <script>
         // WordPress mode - skip lock screen
         const isWordPressMode = <?= Urls::isWordPress() ? 'true' : 'false' ?>;
@@ -3751,6 +4074,7 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
         document.addEventListener('DOMContentLoaded', () => {
             checkAuth();
             setupEventListeners();
+            setupStatsListeners();
         });
 
         // Check authentication state
@@ -3788,6 +4112,11 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
             document.getElementById('app').classList.add('visible');
             isAuthenticated = true;
             localStorage.setItem(STORAGE_AUTH, 'true');
+
+            if (phpUser.role === 'admin') {
+                const navStats = document.getElementById('nav-stats');
+                if (navStats) navStats.classList.remove('hidden');
+            }
 
             // One-time migration from the old client-side PIN. If the user
             // had a localStorage PIN before upgrade, drop it and prompt to
@@ -4058,6 +4387,10 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
 
         // View switching
         function switchView(view) {
+            if (view === 'stats' && phpUser.role !== 'admin') {
+                showToast('Admin role required', 'error');
+                return;
+            }
             document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
             document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
 
@@ -4068,13 +4401,15 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                 dashboard: 'Dashboard',
                 invoices: 'Invoices',
                 stores: 'Store Settings',
-                settings: 'Settings'
+                settings: 'Settings',
+                stats: 'Stats Dashboard'
             };
             document.getElementById('header-text').textContent = titles[view];
 
-            // Show/hide store selector based on view (hide on global settings)
+            // Show/hide store selector based on view (hide on global settings
+            // and on the stats page, which has its own per-page selector).
             const storeSelector = document.getElementById('header-store-selector');
-            if (view === 'settings') {
+            if (view === 'settings' || view === 'stats') {
                 storeSelector.style.display = 'none';
             } else {
                 storeSelector.style.display = 'flex';
@@ -4082,6 +4417,7 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
 
             if (view === 'invoices') loadInvoices();
             if (view === 'stores') loadStoreSettings();
+            if (view === 'stats') loadStats();
             if (view === 'settings') {
                 renderAccountCard();
                 if (phpUser.role === 'admin') {
@@ -4534,6 +4870,361 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                 showToast('Failed to load invoices', 'error');
             }
         }
+
+        // ===== Stats Dashboard =====
+        const statsState = {
+            storeId: '__all__',
+            range: 'all',
+            unit: 'sat',
+            financialChartType: 'revenue',
+            ccRate: 5,
+            payoutsPage: 1,
+            feePaymentsPage: 1,
+            summary: null,
+            charts: { financial: null, fee: null },
+            // Bumped on every filter change so in-flight responses from a
+            // prior filter selection can be discarded when they resolve out
+            // of order.
+            loadToken: 0,
+        };
+
+        // Sats >= 1,000,000 shown as e.g. "1.25M" with the exact number in the
+        // tooltip. Uses an underlined span (.stats-amount-abbr) for affordance.
+        function formatSatsAbbr(sats) {
+            const n = Math.floor(Number(sats) || 0);
+            if (n >= 1_000_000) {
+                const m = (n / 1_000_000).toFixed(2);
+                const exact = n.toLocaleString();
+                return `<span class="stats-amount-abbr" title="${exact} sats">${m}M</span>`;
+            }
+            return n.toLocaleString();
+        }
+
+        // 1 BTC = 100,000,000 sats. Trim trailing zeros, but keep at least one
+        // digit after the decimal so it's visually obvious that it's BTC.
+        function formatBtcTrim(sats) {
+            const n = Math.floor(Number(sats) || 0);
+            if (n === 0) return '0';
+            const btc = (n / 100_000_000).toFixed(8);
+            const trimmed = btc.replace(/0+$/, '').replace(/\.$/, '');
+            return trimmed === '' ? '0' : trimmed;
+        }
+
+        // Combined display: "<amount> sats (<fiat>)" or "<amount> BTC (<fiat>)".
+        // Returns an HTML string.
+        function formatStatsAmount(sats, opts = {}) {
+            const unit = statsState.unit;
+            const summary = statsState.summary || {};
+            const currency = opts.currency || summary.currency || 'USD';
+            const btcPrice = (opts.btcPrice !== undefined) ? opts.btcPrice : summary.btc_price;
+
+            let primary;
+            if (unit === 'btc') {
+                primary = `${formatBtcTrim(sats)} BTC`;
+            } else {
+                primary = `${formatSatsAbbr(sats)} sats`;
+            }
+
+            if (btcPrice && Number(sats) > 0) {
+                const fiat = (Number(sats) / 100_000_000) * Number(btcPrice);
+                const formattedFiat = fiat.toLocaleString(undefined, {
+                    style: 'currency',
+                    currency: currency,
+                    maximumFractionDigits: fiat >= 100 ? 0 : 2,
+                });
+                return `${primary} <span class="stats-stat-fiat">(${formattedFiat})</span>`;
+            }
+            return primary;
+        }
+
+        async function loadStats() {
+            await loadStatsStores();
+            const token = ++statsState.loadToken;
+            await Promise.all([
+                refreshStatsSummary(token),
+                refreshStatsChart('financial', token),
+                refreshStatsChart('fee', token),
+                refreshPayouts(token),
+                refreshFeePayments(token),
+            ]);
+        }
+
+        async function loadStatsStores() {
+            try {
+                const r = await fetch(adminUrl + '?api=stores');
+                const stores = await r.json();
+                const sel = document.getElementById('stats-store-selector');
+                // Preserve current selection if it still exists in the list.
+                const current = sel.value || statsState.storeId;
+                sel.innerHTML = '<option value="__all__">All stores</option>'
+                    + stores.map(s => `<option value="${s.id}">${escapeHtml(s.name || s.id)}</option>`).join('');
+                if ([...sel.options].some(o => o.value === current)) {
+                    sel.value = current;
+                    statsState.storeId = current;
+                }
+            } catch (_) {
+                // Selector falls back to "All stores"; summary still works.
+            }
+        }
+
+        function statsQuery(extra = {}) {
+            const p = new URLSearchParams({
+                store_id: statsState.storeId,
+                range: statsState.range,
+                ...extra,
+            });
+            return p.toString();
+        }
+
+        async function refreshStatsSummary(token = statsState.loadToken) {
+            try {
+                const r = await fetch(adminUrl + '?api=stats_summary&' + statsQuery());
+                const s = await r.json();
+                if (token !== statsState.loadToken) return;
+                statsState.summary = s;
+                renderStatsSummary(s);
+            } catch (e) {
+                showToast('Failed to load stats summary', 'error');
+            }
+        }
+
+        function renderStatsSummary(s) {
+            document.getElementById('stats-revenue').innerHTML = formatStatsAmount(s.revenue_sats);
+            document.getElementById('stats-invoice-count').textContent = (s.invoice_count || 0).toLocaleString();
+            document.getElementById('stats-total-fees').innerHTML = formatStatsAmount(s.fees_paid.total);
+            document.getElementById('stats-profit').innerHTML = formatStatsAmount(s.profit_sats);
+
+            document.getElementById('stats-fee-upstream-paid').innerHTML = formatStatsAmount(s.fees_paid.upstream);
+            document.getElementById('stats-fee-dev-paid').innerHTML = formatStatsAmount(s.fees_paid.dev);
+            document.getElementById('stats-fee-hosting-paid').innerHTML = formatStatsAmount(s.fees_paid.hosting);
+            document.getElementById('stats-fee-network-paid').innerHTML = formatStatsAmount(s.fees_paid.network);
+            document.getElementById('stats-fees-owed').innerHTML = formatStatsAmount(s.fees_owed.total);
+            document.getElementById('stats-fees-paid').innerHTML = formatStatsAmount(s.fees_paid.total);
+
+            const pct = (s.effective_fee_pct || 0).toFixed(2);
+            document.getElementById('stats-effective-fee').textContent = `${pct}%`;
+
+            renderCcSaved();
+        }
+
+        function renderCcSaved() {
+            const s = statsState.summary;
+            if (!s) return;
+            const cc = (statsState.ccRate / 100) * (s.revenue_sats || 0);
+            const actual = s.fees_paid.total || 0;
+            if (cc <= 0) {
+                document.getElementById('stats-cc-saved').textContent = '—';
+                return;
+            }
+            const savedSats = Math.max(0, cc - actual);
+            const pct = (savedSats / cc) * 100;
+            document.getElementById('stats-cc-saved').innerHTML =
+                `${pct.toFixed(1)}% ` +
+                `<span style="font-size: 0.5em; color: var(--text-secondary); font-weight: normal; margin-left: 0.5rem;">${formatStatsAmount(savedSats)}</span>`;
+        }
+
+        async function refreshStatsChart(which, token = statsState.loadToken) {
+            const type = which === 'financial' ? statsState.financialChartType : 'fees';
+            try {
+                const r = await fetch(adminUrl + '?api=stats_chart&' + statsQuery({ type }));
+                const data = await r.json();
+                if (token !== statsState.loadToken) return;
+                renderStatsChart(which, data);
+            } catch (_) {}
+        }
+
+        function renderStatsChart(which, data) {
+            const canvasId = which === 'financial' ? 'stats-financial-chart' : 'stats-fee-chart';
+            const canvas = document.getElementById(canvasId);
+            if (!canvas || typeof Chart === 'undefined') return;
+
+            // Tear down any prior chart so a re-render doesn't leak event
+            // listeners / overlapping tooltips on the same canvas.
+            if (statsState.charts[which]) {
+                statsState.charts[which].destroy();
+                statsState.charts[which] = null;
+            }
+
+            const palette = ['#f7931a', '#3b82f6', '#10b981', '#a855f7', '#ef4444'];
+            const colors = data.labels.map((_, i) => palette[i % palette.length]);
+            const totalSats = data.data.reduce((acc, n) => acc + Number(n || 0), 0);
+
+            statsState.charts[which] = new Chart(canvas.getContext('2d'), {
+                type: 'pie',
+                data: {
+                    labels: data.labels,
+                    datasets: [{
+                        data: data.data,
+                        backgroundColor: colors,
+                        borderColor: 'rgba(0,0,0,0.2)',
+                        borderWidth: 1,
+                    }],
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: { position: 'bottom', labels: { color: '#fff' } },
+                        tooltip: {
+                            callbacks: {
+                                label: (ctx) => {
+                                    const v = Number(ctx.raw || 0);
+                                    const isCount = which === 'financial' && statsState.financialChartType === 'count';
+                                    const valStr = isCount
+                                        ? v.toLocaleString()
+                                        : (v >= 1_000_000 ? `${(v / 1_000_000).toFixed(2)}M (${v.toLocaleString()})` : v.toLocaleString());
+                                    const pct = totalSats > 0 ? ((v / totalSats) * 100).toFixed(1) : '0';
+                                    return `${ctx.label}: ${valStr} (${pct}%)`;
+                                },
+                            },
+                        },
+                    },
+                },
+            });
+        }
+
+        async function refreshPayouts(token = statsState.loadToken) {
+            try {
+                const r = await fetch(adminUrl + '?api=stats_payouts&' + statsQuery({ page: statsState.payoutsPage }));
+                const data = await r.json();
+                if (token !== statsState.loadToken) return;
+                renderMeltTable('stats-payouts-table', 'stats-payouts-pagination', data, 'payouts');
+            } catch (_) {}
+        }
+
+        async function refreshFeePayments(token = statsState.loadToken) {
+            try {
+                const r = await fetch(adminUrl + '?api=stats_fee_payments&' + statsQuery({ page: statsState.feePaymentsPage }));
+                const data = await r.json();
+                if (token !== statsState.loadToken) return;
+                renderMeltTable('stats-fee-payments-table', 'stats-fee-payments-pagination', data, 'fees');
+            } catch (_) {}
+        }
+
+        function renderMeltTable(tableElId, pagerElId, data, kind) {
+            const tableEl = document.getElementById(tableElId);
+            const pagerEl = document.getElementById(pagerElId);
+            if (!data || !data.rows || data.rows.length === 0) {
+                tableEl.innerHTML = '<p style="color: var(--text-secondary); padding: 1rem 0;">No records in this date range.</p>';
+                pagerEl.innerHTML = '';
+                return;
+            }
+
+            const showType = kind === 'fees';
+            const header = `
+                <table class="stats-table">
+                    <thead><tr>
+                        <th>Date</th>
+                        <th>Destination</th>
+                        ${showType ? '<th>Type</th>' : ''}
+                        <th style="text-align:right">Amount</th>
+                        <th style="text-align:right">Network fee</th>
+                    </tr></thead>
+                    <tbody>
+            `;
+            const noteLabel = (note) => {
+                if (note === 'UPSTREAM_DEV_FEE') return 'Upstream dev';
+                if (note === 'DEV_FEE') return 'Dev';
+                if (note === 'HOSTING_FEE') return 'Hosting';
+                return note || '';
+            };
+            const rows = data.rows.map(row => `
+                <tr>
+                    <td>${new Date(row.created_at * 1000).toLocaleString()}</td>
+                    <td class="truncate" title="${escapeHtml(row.destination || '')}">${escapeHtml(row.destination || '')}</td>
+                    ${showType ? `<td>${escapeHtml(noteLabel(row.note))}</td>` : ''}
+                    <td style="text-align:right">${formatStatsAmount(row.amount_sats)}</td>
+                    <td style="text-align:right">${formatStatsAmount(row.network_fee_sats)}</td>
+                </tr>
+            `).join('');
+            tableEl.innerHTML = header + rows + '</tbody></table>';
+
+            const pageStateKey = (kind === 'fees') ? 'feePaymentsPage' : 'payoutsPage';
+            const onChange = (kind === 'fees') ? refreshFeePayments : refreshPayouts;
+            const page = data.page;
+            const pages = Math.max(1, data.pages);
+            pagerEl.innerHTML = `
+                <div>Page ${page} of ${pages} (${data.total} total)</div>
+                <div style="display: flex; gap: 0.5rem;">
+                    <button class="btn btn-secondary" ${page <= 1 ? 'disabled' : ''} id="${tableElId}-prev">Prev</button>
+                    <button class="btn btn-secondary" ${page >= pages ? 'disabled' : ''} id="${tableElId}-next">Next</button>
+                </div>
+            `;
+            const prev = document.getElementById(`${tableElId}-prev`);
+            const next = document.getElementById(`${tableElId}-next`);
+            if (prev) prev.addEventListener('click', () => { statsState[pageStateKey] = Math.max(1, page - 1); onChange(); });
+            if (next) next.addEventListener('click', () => { statsState[pageStateKey] = page + 1; onChange(); });
+        }
+
+        function downloadCsv(action) {
+            const params = new URLSearchParams({
+                api: action,
+                store_id: statsState.storeId,
+                range: statsState.range,
+            });
+            window.location.href = adminUrl + '?' + params.toString();
+        }
+
+        function setupStatsListeners() {
+            const sel = document.getElementById('stats-store-selector');
+            if (!sel) return; // page not rendered (non-admin)
+
+            sel.addEventListener('change', () => {
+                statsState.storeId = sel.value;
+                statsState.payoutsPage = 1;
+                statsState.feePaymentsPage = 1;
+                loadStats();
+            });
+
+            document.querySelectorAll('.stats-range-btn').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    document.querySelectorAll('.stats-range-btn').forEach(b => b.classList.remove('active'));
+                    btn.classList.add('active');
+                    statsState.range = btn.dataset.range;
+                    statsState.payoutsPage = 1;
+                    statsState.feePaymentsPage = 1;
+                    loadStats();
+                });
+            });
+
+            document.querySelectorAll('.stats-unit-btn').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    document.querySelectorAll('.stats-unit-btn').forEach(b => b.classList.remove('active'));
+                    btn.classList.add('active');
+                    statsState.unit = btn.dataset.unit;
+                    // Unit change is display-only; re-render from cached summary.
+                    if (statsState.summary) renderStatsSummary(statsState.summary);
+                    const token = ++statsState.loadToken;
+                    refreshPayouts(token);
+                    refreshFeePayments(token);
+                });
+            });
+
+            document.getElementById('stats-financial-chart-type').addEventListener('change', (e) => {
+                statsState.financialChartType = e.target.value;
+                refreshStatsChart('financial');
+            });
+
+            document.getElementById('stats-cc-rate').addEventListener('change', (e) => {
+                statsState.ccRate = parseFloat(e.target.value);
+                renderCcSaved();
+            });
+
+            document.getElementById('btn-export-payouts-csv').addEventListener('click', () => downloadCsv('export_payouts_csv'));
+            document.getElementById('btn-export-fee-payments-csv').addEventListener('click', () => downloadCsv('export_fee_payments_csv'));
+            document.getElementById('btn-export-combined-csv').addEventListener('click', () => downloadCsv('export_combined_csv'));
+
+            const invoicesExportBtn = document.getElementById('btn-export-invoices-csv');
+            if (invoicesExportBtn) {
+                invoicesExportBtn.addEventListener('click', () => {
+                    const params = new URLSearchParams({ api: 'export_all_invoices_csv' });
+                    if (currentStoreId) params.set('store_id', currentStoreId);
+                    window.location.href = adminUrl + '?' + params.toString();
+                });
+            }
+        }
+
+        // ===== End Stats Dashboard =====
 
         async function loadStoreSettings() {
             const contentEl = document.getElementById('store-settings-content');

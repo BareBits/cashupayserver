@@ -17,7 +17,7 @@ Config::set('fee_tracking_start_at', 0);
 Database::insert('invoices', [
     'id' => 'inv_1',
     'store_id' => $store,
-    'status' => 'paid',
+    'status' => 'Settled',
     'amount' => '500000',
     'currency' => 'sat',
     'amount_sats' => 500000,

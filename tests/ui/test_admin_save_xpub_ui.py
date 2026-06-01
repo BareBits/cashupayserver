@@ -152,8 +152,11 @@ def test_save_new_xpub_replacing_existing(configured: ConfiguredPayserver, page)
     page.select_option("#onchain-address-type", "P2WPKH")
 
     page.click("#btn-save-onchain")
-    # saveOnchain now uses an in-page modal, not native confirm(); the dialog hook above is kept as a fallback.
-    page.wait_for_selector("#modal-onchain-confirm.visible")
+    # saveOnchain() prompts a "Switch to a different xpub?" in-page modal
+    # (not native confirm() — Chrome can suppress that per-tab, which was the
+    # original silent-save bug this test was written to reproduce). Click
+    # the modal's Continue button so the POST actually fires.
+    page.wait_for_selector("#modal-onchain-confirm.visible", state="visible")
     page.click("#btn-onchain-confirm-yes")
     page.wait_for_timeout(3000)  # give the POST + toast + dashboard reload time
 
