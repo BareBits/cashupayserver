@@ -13,6 +13,8 @@ require_once __DIR__ . '/includes/lightning_address.php';
 require_once __DIR__ . '/includes/background.php';
 require_once __DIR__ . '/includes/security.php';
 require_once __DIR__ . '/includes/urls.php';
+// Defines CASHUPAY_DEV_FEE_PERCENT etc. consumed by the Hosting Fee card copy.
+require_once __DIR__ . '/includes/dev_fee.php';
 require_once __DIR__ . '/includes/stats.php';
 
 use Cashu\ProofState;
@@ -3033,7 +3035,7 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                         <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path>
                     </svg>
                     <span id="reliability-banner-text" style="flex: 1;"></span>
-                    <a href="#" data-view="settings" class="btn btn-secondary" style="padding: 0.25rem 0.75rem; font-size: 0.8rem;">Open settings</a>
+                    <a href="#" class="btn btn-secondary js-goto-settings" style="padding: 0.25rem 0.75rem; font-size: 0.8rem;">Open settings</a>
                 </div>
                 <div id="cron-stale-banner" class="hidden" style="background: rgba(247, 147, 26, 0.12); border: 1px solid rgba(247, 147, 26, 0.4); border-radius: 8px; padding: 0.75rem 1rem; margin-bottom: 1rem; font-size: 0.9rem; display: flex; align-items: flex-start; gap: 0.75rem;" data-admin-only="true">
                     <span style="flex-shrink: 0; font-size: 1.1rem; line-height: 1.2;">⚡</span>
@@ -3041,7 +3043,7 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                         <strong style="display: block; margin-bottom: 0.15rem;">Heads up — no external cron in 24h+</strong>
                         <span style="color: var(--text-secondary); font-size: 0.85rem;">Not required, but a one-line cron entry makes payment confirmations, auto-withdrawals, and fee settlements much faster.</span>
                     </span>
-                    <a href="#" data-view="settings" class="btn btn-secondary" style="padding: 0.25rem 0.75rem; font-size: 0.8rem; flex-shrink: 0;">Settings · Copy cron URL</a>
+                    <a href="#" class="btn btn-secondary js-goto-settings" style="padding: 0.25rem 0.75rem; font-size: 0.8rem; flex-shrink: 0;">Settings · Copy cron URL</a>
                     <button id="btn-dismiss-cron-stale" aria-label="Dismiss" style="background: transparent; border: 0; color: var(--text-secondary); cursor: pointer; font-size: 1.2rem; line-height: 1; padding: 0 0.25rem; flex-shrink: 0;">×</button>
                 </div>
                 <div class="balance-card">
@@ -4363,14 +4365,14 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
             const btnRefreshTm = document.getElementById('btn-refresh-trusted-mints');
             if (btnRefreshTm) btnRefreshTm.addEventListener('click', refreshTrustedMintsNow);
 
-            // "Open settings" link in the reliability banner.
-            document.querySelectorAll('[data-view]').forEach(el => {
-                if (el.tagName === 'A') {
-                    el.addEventListener('click', (e) => {
-                        e.preventDefault();
-                        switchView(el.dataset.view);
-                    });
-                }
+            // Banner "Open settings" links — kept on a dedicated class instead
+            // of sharing data-view="settings" with the sidebar nav button, so
+            // tests can target the nav unambiguously.
+            document.querySelectorAll('.js-goto-settings').forEach(el => {
+                el.addEventListener('click', (e) => {
+                    e.preventDefault();
+                    switchView('settings');
+                });
             });
 
             // Modal close on overlay click
