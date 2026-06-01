@@ -36,7 +36,7 @@ $baseUrl = Config::getBaseUrl();
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>CashuPayServer</title>
+    <title>Barebits Lite</title>
     <style>
         * {
             margin: 0;
@@ -95,7 +95,7 @@ $baseUrl = Config::getBaseUrl();
 <body>
     <div class="container">
         <div class="logo">&#9889;</div>
-        <h1>CashuPayServer</h1>
+        <h1>Barebits Lite</h1>
         <p class="tagline">Lightning payments with Cashu ecash</p>
         <a href="<?= htmlspecialchars(Urls::admin()) ?>" class="btn">Admin Login</a>
         <div class="footer">

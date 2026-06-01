@@ -28,7 +28,7 @@ if (!Database::isInitialized() || !Config::isSetupComplete()) {
     http_response_code(503);
     echo json_encode([
         'code' => 'service-unavailable',
-        'message' => 'CashuPayServer setup not complete'
+        'message' => 'Barebits Lite setup not complete'
     ]);
     exit;
 }

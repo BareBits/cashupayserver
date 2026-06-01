@@ -228,7 +228,7 @@ class LightningAddress {
                             $store['id'],
                             $store['auto_melt_address'],
                             $meltAmountSats,
-                            'CashuPayServer auto-withdrawal'
+                            'Barebits Lite auto-withdrawal'
                         );
 
                         // Record successful melt for fee-base accounting + future stats.
