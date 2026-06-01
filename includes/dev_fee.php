@@ -189,7 +189,7 @@ class DevFee {
         $revenue = (int) Database::fetchOne(
             "SELECT COALESCE(SUM(amount_sats), 0) AS s
              FROM invoices
-             WHERE store_id = ? AND status = 'paid'
+             WHERE store_id = ? AND status = 'Settled'
                AND amount_sats IS NOT NULL
                AND created_at >= ?",
             [$storeId, $start]

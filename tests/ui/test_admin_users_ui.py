@@ -24,7 +24,7 @@ def _login(page, base_url: str, username: str, password: str) -> None:
 
 
 def _open_settings(page) -> None:
-    page.click('[data-view="settings"]')
+    page.click('.nav-item[data-view="settings"]')
     page.wait_for_selector("#view-settings.active")
 
 
