@@ -268,7 +268,7 @@ $baseUrl = Config::getBaseUrl();
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Authorize <?= htmlspecialchars($applicationName) ?> - CashuPayServer</title>
+    <title>Authorize <?= htmlspecialchars($applicationName) ?> - Barebits Lite</title>
     <style>
         * {
             margin: 0;
@@ -477,7 +477,7 @@ $baseUrl = Config::getBaseUrl();
             <h1>Sign In</h1>
             <p class="subtitle">
                 <span class="app-name"><?= htmlspecialchars($applicationName) ?></span>
-                wants to connect to your CashuPayServer
+                wants to connect to your Barebits Lite
             </p>
 
             <?php if ($error): ?>
@@ -531,7 +531,7 @@ $baseUrl = Config::getBaseUrl();
             <h1>Authorize Application</h1>
             <p class="subtitle">
                 <span class="app-name"><?= htmlspecialchars($applicationName) ?></span>
-                is requesting access to your CashuPayServer
+                is requesting access to your Barebits Lite
             </p>
 
             <?php if ($error): ?>

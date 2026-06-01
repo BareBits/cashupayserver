@@ -1270,7 +1270,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     if ($isBolt11) {
                         $bolt11ForQuote = $destination;
                     } else {
-                        $bolt11ForQuote = LightningAddress::getInvoice($destination, $amount, 'CashuPayServer withdrawal');
+                        $bolt11ForQuote = LightningAddress::getInvoice($destination, $amount, 'Barebits Lite withdrawal');
                     }
                     $result = LightningAddress::meltToBolt11($storeId, $bolt11ForQuote);
                 } else {
@@ -1279,7 +1279,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         $result = LightningAddress::meltToBolt11($storeId, $destination, $amount);
                     } else {
                         // For Lightning address with sat mint, amount is already in sats
-                        $result = LightningAddress::meltToAddress($storeId, $destination, $amount, 'CashuPayServer withdrawal');
+                        $result = LightningAddress::meltToAddress($storeId, $destination, $amount, 'Barebits Lite withdrawal');
                     }
                 }
 
@@ -1983,9 +1983,9 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
     <meta name="theme-color" content="#0f0f23">
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-    <meta name="apple-mobile-web-app-title" content="CashuPay">
+    <meta name="apple-mobile-web-app-title" content="Barebits Lite">
     <meta name="csrf-token" content="<?= htmlspecialchars(Auth::generateCsrfToken()) ?>">
-    <title>CashuPayServer Admin</title>
+    <title>Barebits Lite Admin</title>
     <?php if (!$isWp): ?><link rel="manifest" href="manifest.json"><?php endif; ?>
     <link rel="apple-touch-icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect fill='%230f0f23' width='100' height='100' rx='20'/><text x='50' y='70' font-size='60' text-anchor='middle'>⚡</text></svg>">
     <style>
@@ -2947,7 +2947,7 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
     <!-- Lock Screen -->
     <div class="lock-screen<?= $isLoggedIn ? ' hidden' : '' ?>" id="lock-screen">
         <div class="lock-logo">&#9889;</div>
-        <div class="lock-title">CashuPayServer</div>
+        <div class="lock-title">Barebits Lite</div>
         <div class="lock-subtitle"><?= $isLoggedIn ? 'Enter PIN to unlock' : 'Enter your password' ?></div>
 
         <div class="pin-dots" id="pin-dots">
@@ -3499,7 +3499,7 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                 </div>
 
                 <div style="text-align: center; padding: 1.5rem 0; color: var(--text-muted); font-size: 0.8rem;">
-                    CashuPayServer v<?= CASHUPAY_VERSION ?> &middot;
+                    Barebits Lite v<?= CASHUPAY_VERSION ?> &middot;
                     Deployment ID: <code style="background: rgba(0,0,0,0.2); padding: 0.1rem 0.4rem; border-radius: 4px;"><?= htmlspecialchars((string) Config::get('deployment_id', 'ANONYMOUS')) ?></code> &middot;
                     <a href="https://github.com/jooray/cashupayserver/releases" target="_blank" rel="noopener"
                        style="color: var(--text-secondary); text-decoration: none;">Check for updates</a>
