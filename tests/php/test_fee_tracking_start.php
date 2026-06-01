@@ -19,7 +19,7 @@ Config::set('fee_tracking_start_at', $cutoff);
 Database::insert('invoices', [
     'id' => 'old',
     'store_id' => $store,
-    'status' => 'paid',
+    'status' => 'Settled',
     'amount' => '1000000',
     'currency' => 'sat',
     'amount_sats' => 1_000_000,
@@ -34,7 +34,7 @@ assert_eq(0, $o['revenue'], 'pre-cutoff invoices excluded');
 Database::insert('invoices', [
     'id' => 'new',
     'store_id' => $store,
-    'status' => 'paid',
+    'status' => 'Settled',
     'amount' => '500000',
     'currency' => 'sat',
     'amount_sats' => 500_000,
@@ -50,7 +50,7 @@ assert_eq(500_000, $o['revenue'], 'post-cutoff invoices counted');
 Database::insert('invoices', [
     'id' => 'edge',
     'store_id' => $store,
-    'status' => 'paid',
+    'status' => 'Settled',
     'amount' => '1000',
     'currency' => 'sat',
     'amount_sats' => 1000,

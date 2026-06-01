@@ -24,7 +24,7 @@ function paid_invoice(string $storeId, int $sats, int $createdAt): void {
     Database::insert('invoices', [
         'id' => 'inv_' . bin2hex(random_bytes(4)),
         'store_id' => $storeId,
-        'status' => 'paid',
+        'status' => 'Settled',
         'amount' => (string) $sats,
         'currency' => 'sat',
         'amount_sats' => $sats,
