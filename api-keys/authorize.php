@@ -40,7 +40,14 @@ if (!empty($parsedQuery['permissions'])) {
     $permissions = (array)$_GET['permissions'];
 }
 $applicationName = $_GET['applicationName'] ?? 'Unknown Application';
-$redirect = $_GET['redirect'] ?? null;
+$rawRedirect = $_GET['redirect'] ?? null;
+// Only accept http(s) URLs — $redirect is later used as a Location header,
+// as an auto-submit <form action="...">, and is shown to the user as the
+// final destination. javascript: / data: / non-URL values would XSS or
+// phish the admin who just signed in to approve the pairing request.
+$redirect = ($rawRedirect !== null && $rawRedirect !== '')
+    ? Security::sanitizeUrl((string)$rawRedirect)
+    : null;
 $applicationIdentifier = $_GET['applicationIdentifier'] ?? null;
 $selectiveStores = isset($_GET['selectiveStores']) && $_GET['selectiveStores'] === 'true';
 $strict = !isset($_GET['strict']) || $_GET['strict'] !== 'false';
@@ -76,8 +83,28 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $error = 'Too many failed attempts. Please try again later.';
         } elseif ($username !== '' && Auth::login($username, $password)) {
             Security::clearLoginAttempts($clientIp);
-            // Redirect to same page to show approval form
-            header('Location: ' . $_SERVER['REQUEST_URI']);
+            // Redirect back to the same endpoint to render the approval form.
+            // Use only the path portion of REQUEST_URI (parse_url strips any
+            // attacker-supplied //host or fragment) and rebuild the query
+            // string from validated params — this keeps protocol-relative
+            // bounces like //evil.com out of the Location header.
+            $safePath = parse_url($_SERVER['REQUEST_URI'] ?? '', PHP_URL_PATH);
+            if (!is_string($safePath) || $safePath === '' || $safePath[0] !== '/') {
+                $safePath = '/api-keys/authorize';
+            }
+            $queryParts = ['applicationName=' . rawurlencode($applicationName)];
+            if ($redirect !== null) {
+                $queryParts[] = 'redirect=' . rawurlencode($redirect);
+            }
+            if ($applicationIdentifier !== null) {
+                $queryParts[] = 'applicationIdentifier=' . rawurlencode((string)$applicationIdentifier);
+            }
+            $queryParts[] = 'selectiveStores=' . ($selectiveStores ? 'true' : 'false');
+            $queryParts[] = 'strict=' . ($strict ? 'true' : 'false');
+            foreach ($permissions as $perm) {
+                $queryParts[] = 'permissions=' . rawurlencode((string)$perm);
+            }
+            header('Location: ' . $safePath . '?' . implode('&', $queryParts));
             exit;
         } else {
             Security::recordFailedLogin($clientIp);

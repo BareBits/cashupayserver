@@ -1464,18 +1464,32 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                         if (!data.valid) {
                             box.style.background = 'rgba(245, 101, 101, 0.15)';
                             box.style.border = '1px solid rgba(245, 101, 101, 0.3)';
-                            box.innerHTML = '<strong>Invalid:</strong> ' + (data.error || 'unknown error');
+                            box.innerHTML = '';
+                            const strong = document.createElement('strong');
+                            strong.textContent = 'Invalid: ';
+                            box.appendChild(strong);
+                            box.appendChild(document.createTextNode(data.error || 'unknown error'));
                             saveBtn.disabled = true;
                             return;
                         }
-                        let html = '<strong>Valid.</strong> Verify these match your wallet\'s first 3 receive addresses:<br>';
-                        html += '<pre style="margin:0.5rem 0 0; font-size:0.85rem;">' + data.preview.map((a, i) => 'm/0/' + i + ' = ' + a).join('\n') + '</pre>';
+                        box.innerHTML = '';
+                        const validStrong = document.createElement('strong');
+                        validStrong.textContent = 'Valid. ';
+                        box.appendChild(validStrong);
+                        box.appendChild(document.createTextNode('Verify these match your wallet\'s first 3 receive addresses:'));
+                        box.appendChild(document.createElement('br'));
+                        const pre = document.createElement('pre');
+                        pre.style.cssText = 'margin:0.5rem 0 0; font-size:0.85rem;';
+                        pre.textContent = (data.preview || []).map((a, i) => 'm/0/' + i + ' = ' + a).join('\n');
+                        box.appendChild(pre);
                         (data.warnings || []).forEach(w => {
-                            html += '<div style="margin-top:0.5rem; color:#f6ad55;">&#9888; ' + w + '</div>';
+                            const warn = document.createElement('div');
+                            warn.style.cssText = 'margin-top:0.5rem; color:#f6ad55;';
+                            warn.textContent = '⚠ ' + w;
+                            box.appendChild(warn);
                         });
                         box.style.background = 'rgba(72, 187, 120, 0.1)';
                         box.style.border = '1px solid rgba(72, 187, 120, 0.3)';
-                        box.innerHTML = html;
                         saveBtn.disabled = false;
                     });
                 })();
@@ -1922,6 +1936,15 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
         return div.innerHTML;
     }
 
+    // Escape a value for use inside an HTML attribute. textContent->innerHTML
+    // does not escape " or ', so a Nostr-published mint URL containing " could
+    // otherwise break out of the attribute and inject markup.
+    function escapeAttr(text) {
+        return String(text == null ? '' : text).replace(/[&<>"']/g, function(c) {
+            return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+        });
+    }
+
     function filterMintList() {
         renderMintList();
     }
@@ -1966,11 +1989,16 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                 '<div style="font-size: 0.8rem; color: #a0aec0; margin-bottom: 0.75rem;">' +
                     (units.length > 0 ? units.map(function(u) { return u.toUpperCase(); }).join(' \u2022 ') : 'Unknown units') +
                 '</div>' +
-                '<button type="button" class="btn" style="width: 100%;" onclick="selectDiscoveredMint(\'' + escapeHtml(m.url) + '\')">Select</button>' +
+                '<button type="button" class="btn select-discovered-mint" data-mint-url="' + escapeAttr(m.url) + '" style="width: 100%;">Select</button>' +
             '</div>';
         }).join('');
 
         listEl.innerHTML = html;
+        listEl.querySelectorAll('button.select-discovered-mint').forEach(function(btn) {
+            btn.addEventListener('click', function() {
+                selectDiscoveredMint(btn.dataset.mintUrl);
+            });
+        });
 
         var statusEl = document.getElementById('mint-discovery-status');
         statusEl.textContent = 'Showing ' + filtered.length + ' of ' + discoveredMints.length + ' mints';

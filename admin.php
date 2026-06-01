@@ -4383,6 +4383,24 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                     }
                 });
             });
+
+            // Delegated handler for mint-reliability buttons rendered via
+            // innerHTML in dynamic lists (mintDiagnosticIcon + diagnostic
+            // modal + admin mint cards). Keeps the mint URL out of inline
+            // JS — it lives only in a data-mint-url attribute (escapeAttr'd).
+            document.addEventListener('click', (e) => {
+                const btn = e.target.closest('[data-mint-action]');
+                if (!btn) return;
+                const url = btn.dataset.mintUrl;
+                if (!url) return;
+                e.stopPropagation();
+                switch (btn.dataset.mintAction) {
+                    case 'diagnostic':  openMintDiagnostic(url); break;
+                    case 'reenable':    adminReenableMint(url); break;
+                    case 'mark-bad':    adminMarkMintBad(url); break;
+                    case 'reset':       resetMintCounters(url); break;
+                }
+            });
         }
 
         // View switching
@@ -4512,14 +4530,23 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                             </div>
                         </div>
                         <div style="display: flex; gap: 0.25rem;">
-                            <button class="btn btn-secondary" style="padding: 0.25rem 0.5rem; font-size: 0.75rem;"
-                                    onclick="openResetUserPassword('${escapeAttr(u.id)}','${escapeAttr(u.username)}')">Reset password</button>
-                            <button class="btn btn-secondary" style="padding: 0.25rem 0.5rem; font-size: 0.75rem;"
-                                    onclick="openResetUserPin('${escapeAttr(u.id)}','${escapeAttr(u.username)}')">Reset PIN</button>
-                            ${u.username === phpUser.username ? '' : `<button class="btn btn-danger" style="padding: 0.25rem 0.5rem; font-size: 0.75rem;" onclick="deleteUserById('${escapeAttr(u.id)}','${escapeAttr(u.username)}')">Delete</button>`}
+                            <button class="btn btn-secondary user-action" data-user-action="reset-password" data-user-id="${escapeAttr(u.id)}" data-username="${escapeAttr(u.username)}" style="padding: 0.25rem 0.5rem; font-size: 0.75rem;">Reset password</button>
+                            <button class="btn btn-secondary user-action" data-user-action="reset-pin" data-user-id="${escapeAttr(u.id)}" data-username="${escapeAttr(u.username)}" style="padding: 0.25rem 0.5rem; font-size: 0.75rem;">Reset PIN</button>
+                            ${u.username === phpUser.username ? '' : `<button class="btn btn-danger user-action" data-user-action="delete" data-user-id="${escapeAttr(u.id)}" data-username="${escapeAttr(u.username)}" style="padding: 0.25rem 0.5rem; font-size: 0.75rem;">Delete</button>`}
                         </div>
                     </div>
                 `).join('');
+                container.querySelectorAll('button.user-action').forEach(btn => {
+                    btn.addEventListener('click', () => {
+                        const id = btn.dataset.userId;
+                        const name = btn.dataset.username;
+                        switch (btn.dataset.userAction) {
+                            case 'reset-password': openResetUserPassword(id, name); break;
+                            case 'reset-pin':      openResetUserPin(id, name); break;
+                            case 'delete':         deleteUserById(id, name); break;
+                        }
+                    });
+                });
             } catch (e) {
                 container.innerHTML = '<div class="empty-state"><p>Failed to load users</p></div>';
             }
@@ -5336,11 +5363,14 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                         <div class="list-icon" style="background: rgba(247, 147, 26, 0.2);">🔑</div>
                         <div class="list-content">
                             <div class="list-title">${escapeHtml(key.label || 'API Key')}</div>
-                            <div class="list-subtitle">ID: ${escapeHtml(key.id.substring(0, 8))}...</div>
+                            <div class="list-subtitle">ID: ${escapeHtml(String(key.id).substring(0, 8))}...</div>
                         </div>
-                        <button class="btn btn-secondary" style="padding: 0.25rem 0.5rem; font-size: 0.75rem;" onclick="deleteApiKeyFromSettings('${encodeURIComponent(key.id)}')">Delete</button>
+                        <button class="btn btn-secondary delete-api-key-from-settings" data-api-key-id="${escapeAttr(key.id)}" style="padding: 0.25rem 0.5rem; font-size: 0.75rem;">Delete</button>
                     </div>
                 `).join('');
+                container.querySelectorAll('button.delete-api-key-from-settings').forEach(btn => {
+                    btn.addEventListener('click', () => deleteApiKeyFromSettings(btn.dataset.apiKeyId));
+                });
             } catch (e) {
                 container.innerHTML = '<div class="empty-state"><p>Failed to load API keys</p></div>';
             }
@@ -5381,26 +5411,6 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                     </div>
                 `;
             }).join('');
-        }
-
-        function renderStores(stores) {
-            // Legacy function - no longer used for store list view
-            // Kept for compatibility if needed elsewhere
-            const container = document.getElementById('stores-list');
-            if (!container) return;
-
-            container.innerHTML = stores.map(store => `
-                <div class="list-item" onclick="showStoreDetails('${store.id}', '${store.name}')">
-                    <div class="list-icon" style="background: rgba(247, 147, 26, 0.2);">🏪</div>
-                    <div class="list-content">
-                        <div class="list-title">${store.name}</div>
-                        <div class="list-subtitle">${store.id}</div>
-                    </div>
-                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <polyline points="9 18 15 12 9 6"></polyline>
-                    </svg>
-                </div>
-            `).join('');
         }
 
         // Actions
@@ -6074,15 +6084,31 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
             if (!data.valid) {
                 box.style.background = 'rgba(245, 101, 101, 0.15)';
                 box.style.border = '1px solid rgba(245, 101, 101, 0.3)';
-                box.innerHTML = '<strong>Invalid:</strong> ' + (data.error || 'unknown');
+                box.innerHTML = '';
+                const strong = document.createElement('strong');
+                strong.textContent = 'Invalid: ';
+                box.appendChild(strong);
+                box.appendChild(document.createTextNode(data.error || 'unknown'));
                 return;
             }
-            let html = '<strong>Valid.</strong> Verify these match your wallet\'s first 3 receive addresses:<br><pre style="margin:0.5rem 0 0; font-size:0.85rem;">'
-                     + data.preview.map((a, i) => 'm/0/' + i + ' = ' + a).join('\n') + '</pre>';
-            (data.warnings || []).forEach(w => { html += '<div style="margin-top:0.5rem; color:#f6ad55;">&#9888; ' + w + '</div>'; });
+            box.innerHTML = '';
+            const validStrong = document.createElement('strong');
+            validStrong.textContent = 'Valid. ';
+            box.appendChild(validStrong);
+            box.appendChild(document.createTextNode('Verify these match your wallet\'s first 3 receive addresses:'));
+            box.appendChild(document.createElement('br'));
+            const pre = document.createElement('pre');
+            pre.style.cssText = 'margin:0.5rem 0 0; font-size:0.85rem;';
+            pre.textContent = (data.preview || []).map((a, i) => 'm/0/' + i + ' = ' + a).join('\n');
+            box.appendChild(pre);
+            (data.warnings || []).forEach(w => {
+                const warn = document.createElement('div');
+                warn.style.cssText = 'margin-top:0.5rem; color:#f6ad55;';
+                warn.textContent = '⚠ ' + w;
+                box.appendChild(warn);
+            });
             box.style.background = 'rgba(72, 187, 120, 0.1)';
             box.style.border = '1px solid rgba(72, 187, 120, 0.3)';
-            box.innerHTML = html;
         }
 
         async function testOnchainCurrent() {
@@ -6591,12 +6617,15 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                         <h4 style="margin: 0 0 0.25rem 0; font-size: 1rem;">${escapeHtml(name)}</h4>
                         <p style="font-size: 0.8rem; color: var(--text-secondary); margin: 0 0 0.5rem 0; word-break: break-all;">${escapeHtml(m.url)}</p>
                         <div style="font-size: 0.8rem; color: var(--text-secondary); margin-bottom: 0.75rem;">
-                            ${units.length > 0 ? units.map(u => u.toUpperCase()).join(' \u2022 ') : 'Unknown units'}
+                            ${units.length > 0 ? units.map(u => escapeHtml(u.toUpperCase())).join(' \u2022 ') : 'Unknown units'}
                         </div>
-                        <button type="button" class="btn btn-full" style="font-size: 0.85rem;" onclick="selectDiscoveredMint('${escapeHtml(m.url)}')">Select</button>
+                        <button type="button" class="btn btn-full select-discovered-mint" data-mint-url="${escapeAttr(m.url)}" style="font-size: 0.85rem;">Select</button>
                     </div>
                 `;
             }).join('');
+            listEl.querySelectorAll('button.select-discovered-mint').forEach(btn => {
+                btn.addEventListener('click', () => selectDiscoveredMint(btn.dataset.mintUrl));
+            });
 
             const statusEl = document.getElementById('mint-discovery-status');
             statusEl.textContent = `Showing ${filtered.length} of ${discoveredMints.length} mints`;
@@ -6637,9 +6666,14 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
             });
             const pairingUrl = serverUrl + '/api-keys/authorize?' + pairingParams.toString();
 
+            // All references to the store-scoped values (id/name) are placed
+            // into data-* attributes; click handlers are wired up below. That
+            // keeps untrusted strings out of inline JS contexts.
+            const sId = escapeAttr(storeId);
+            const sName = escapeAttr(storeName);
             const content = `
                 <div class="card-body" style="max-height: 70vh; overflow-y: auto;">
-                    <p style="color: var(--text-secondary); margin-bottom: 1rem;">Store ID: ${storeId}</p>
+                    <p style="color: var(--text-secondary); margin-bottom: 1rem;">Store ID: ${escapeHtml(storeId)}</p>
 
                     <!-- Mint Configuration -->
                     <div style="background: var(--card-bg); border: 1px solid var(--border); border-radius: 8px; padding: 1rem; margin-bottom: 1.5rem;">
@@ -6653,7 +6687,7 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                         </div>
                         <div>
                             <span style="color: var(--text-secondary); font-size: 0.85rem;">Unit:</span>
-                            <span style="font-weight: 500; margin-left: 0.5rem;">${mintUnit}</span>
+                            <span style="font-weight: 500; margin-left: 0.5rem;">${escapeHtml(mintUnit)}</span>
                         </div>
                     </div>
 
@@ -6670,10 +6704,9 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                                         <div style="flex: 1; overflow: hidden;">
                                             <code style="font-size: 0.7rem; word-break: break-all;">${escapeHtml(m.mint_url)}</code>
                                             ${mintDiagnosticIcon(m.mint_url)}
-                                            <span style="opacity: 0.6; font-size: 0.75rem; margin-left: 0.5rem;">(${m.unit.toUpperCase()})</span>
+                                            <span style="opacity: 0.6; font-size: 0.75rem; margin-left: 0.5rem;">(${escapeHtml(String(m.unit).toUpperCase())})</span>
                                         </div>
-                                        <button class="btn btn-danger" style="padding: 0.2rem 0.4rem; font-size: 0.7rem; margin-left: 0.5rem;"
-                                                onclick="removeBackupMint(${m.id}, '${storeId}', '${escapeHtml(storeName)}')">Remove</button>
+                                        <button class="btn btn-danger store-action" data-store-action="remove-backup-mint" data-mint-id="${escapeAttr(m.id)}" data-store-id="${sId}" data-store-name="${sName}" style="padding: 0.2rem 0.4rem; font-size: 0.7rem; margin-left: 0.5rem;">Remove</button>
                                     </div>
                                 `).join('')
                             }
@@ -6681,14 +6714,14 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                         <div id="add-backup-mint-form" style="display: none; margin-top: 0.75rem; padding-top: 0.75rem; border-top: 1px solid var(--border);">
                             <div style="display: flex; gap: 0.5rem; margin-bottom: 0.5rem;">
                                 <input type="url" id="backup-mint-url" class="form-input" placeholder="https://mint.example.com" style="flex: 1; font-size: 0.85rem;">
-                                <button class="btn btn-secondary" style="font-size: 0.8rem; white-space: nowrap;" onclick="openBackupMintDiscovery('${storeId}', '${escapeHtml(storeName)}')">Discover</button>
+                                <button class="btn btn-secondary store-action" data-store-action="discover-backup-mint" data-store-id="${sId}" data-store-name="${sName}" style="font-size: 0.8rem; white-space: nowrap;">Discover</button>
                             </div>
                             <div style="display: flex; gap: 0.5rem;">
-                                <button class="btn btn-full" style="font-size: 0.8rem;" onclick="addBackupMint('${storeId}', '${escapeHtml(storeName)}')">Add</button>
-                                <button class="btn btn-secondary" style="font-size: 0.8rem;" onclick="document.getElementById('add-backup-mint-form').style.display='none'">Cancel</button>
+                                <button class="btn btn-full store-action" data-store-action="add-backup-mint" data-store-id="${sId}" data-store-name="${sName}" style="font-size: 0.8rem;">Add</button>
+                                <button class="btn btn-secondary store-action" data-store-action="cancel-add-backup-mint" style="font-size: 0.8rem;">Cancel</button>
                             </div>
                         </div>
-                        <button class="btn btn-secondary btn-full" style="margin-top: 0.5rem; font-size: 0.85rem;" onclick="document.getElementById('add-backup-mint-form').style.display='block'">
+                        <button class="btn btn-secondary btn-full store-action" data-store-action="show-add-backup-mint" style="margin-top: 0.5rem; font-size: 0.85rem;">
                             + Add Backup Mint
                         </button>
                     </div>
@@ -6705,7 +6738,7 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                         <p style="font-size: 0.8rem; color: var(--text-secondary); margin-bottom: 0.5rem;">
                             Most plugins (WooCommerce, etc.) will redirect here to pair automatically.
                         </p>
-                        <a href="${escapeHtml(pairingUrl)}" class="btn" style="display: inline-block; font-size: 0.8rem; padding: 0.4rem 0.75rem;">
+                        <a href="${escapeAttr(pairingUrl)}" class="btn" style="display: inline-block; font-size: 0.8rem; padding: 0.4rem 0.75rem;">
                             Test Pairing Flow
                         </a>
                     </div>
@@ -6715,23 +6748,56 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                         keys.map(k => `
                             <div style="display: flex; justify-content: space-between; align-items: center; padding: 0.5rem 0; border-bottom: 1px solid var(--border);">
                                 <span>${escapeHtml(k.label) || 'API Key'}</span>
-                                ${k.label === 'Internal (Dashboard)' ? '' : `<button class="btn btn-danger" style="padding: 0.25rem 0.5rem; font-size: 0.75rem;"
-                                        onclick="deleteApiKey('${k.id}', '${storeId}')">Delete</button>`}
+                                ${k.label === 'Internal (Dashboard)' ? '' : `<button class="btn btn-danger store-action" data-store-action="delete-api-key" data-api-key-id="${escapeAttr(k.id)}" data-store-id="${sId}" style="padding: 0.25rem 0.5rem; font-size: 0.75rem;">Delete</button>`}
                             </div>
                         `).join('')
                     }
 
-                    <button class="btn btn-full" style="margin-top: 1rem;" onclick="createApiKey('${storeId}')">
+                    <button class="btn btn-full store-action" data-store-action="create-api-key" data-store-id="${sId}" style="margin-top: 1rem;">
                         + Create API Key Manually
                     </button>
 
-                    <button class="btn btn-danger btn-full" style="margin-top: 0.5rem;" onclick="deleteStore('${storeId}')">
+                    <button class="btn btn-danger btn-full store-action" data-store-action="delete-store" data-store-id="${sId}" style="margin-top: 0.5rem;">
                         Delete Store
                     </button>
                 </div>
             `;
 
-            document.getElementById('store-modal-content').innerHTML = content;
+            const modalContent = document.getElementById('store-modal-content');
+            modalContent.innerHTML = content;
+            modalContent.querySelectorAll('.store-action').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    const action = btn.dataset.storeAction;
+                    const sid = btn.dataset.storeId;
+                    const sname = btn.dataset.storeName;
+                    switch (action) {
+                        case 'remove-backup-mint':
+                            removeBackupMint(Number(btn.dataset.mintId), sid, sname);
+                            break;
+                        case 'discover-backup-mint':
+                            openBackupMintDiscovery(sid, sname);
+                            break;
+                        case 'add-backup-mint':
+                            addBackupMint(sid, sname);
+                            break;
+                        case 'cancel-add-backup-mint':
+                            document.getElementById('add-backup-mint-form').style.display = 'none';
+                            break;
+                        case 'show-add-backup-mint':
+                            document.getElementById('add-backup-mint-form').style.display = 'block';
+                            break;
+                        case 'delete-api-key':
+                            deleteApiKey(btn.dataset.apiKeyId, sid);
+                            break;
+                        case 'create-api-key':
+                            createApiKey(sid);
+                            break;
+                        case 'delete-store':
+                            deleteStore(sid);
+                            break;
+                    }
+                });
+            });
             openModal('modal-store');
         }
 
@@ -6748,7 +6814,7 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
 
             try {
                 const response = await postWithCsrf(adminUrl,
-                    `action=add_backup_mint&store_id=${storeId}&mint_url=${encodeURIComponent(mintUrl)}&unit=${unit}`
+                    `action=add_backup_mint&store_id=${encodeURIComponent(storeId)}&mint_url=${encodeURIComponent(mintUrl)}&unit=${encodeURIComponent(unit)}`
                 );
 
                 const result = await response.json();
@@ -6780,10 +6846,9 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
 
         function mintDiagnosticIcon(mintUrl) {
             if (!mintUrl) return '';
-            const safe = String(mintUrl).replace(/'/g, "\\'");
             return `<button type="button" title="Show mint diagnostic"
-                style="background: none; border: none; cursor: pointer; padding: 0 0.35rem; color: var(--text-secondary); font-size: 0.9rem; line-height: 1;"
-                onclick="event.stopPropagation(); openMintDiagnostic('${safe}')">&#9432;</button>`;
+                data-mint-action="diagnostic" data-mint-url="${escapeAttr(mintUrl)}"
+                style="background: none; border: none; cursor: pointer; padding: 0 0.35rem; color: var(--text-secondary); font-size: 0.9rem; line-height: 1;">&#9432;</button>`;
         }
 
         function fmtTimestamp(ts) {
@@ -6845,9 +6910,9 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                     <span style="color: var(--text-secondary);">Status</span><span>${escapeHtml(stateLabel)}</span>
                 </div>
                 <div style="display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 1rem;">
-                    <button class="btn btn-secondary" style="font-size: 0.8rem;" onclick="adminReenableMint('${String(data.mintUrl).replace(/'/g, "\\'")}')">Re-enable</button>
-                    <button class="btn btn-danger" style="font-size: 0.8rem;" onclick="adminMarkMintBad('${String(data.mintUrl).replace(/'/g, "\\'")}')">Mark confirmed bad</button>
-                    <button class="btn btn-secondary" style="font-size: 0.8rem;" onclick="resetMintCounters('${String(data.mintUrl).replace(/'/g, "\\'")}')">Reset counters</button>
+                    <button class="btn btn-secondary" data-mint-action="reenable" data-mint-url="${escapeAttr(data.mintUrl)}" style="font-size: 0.8rem;">Re-enable</button>
+                    <button class="btn btn-danger" data-mint-action="mark-bad" data-mint-url="${escapeAttr(data.mintUrl)}" style="font-size: 0.8rem;">Mark confirmed bad</button>
+                    <button class="btn btn-secondary" data-mint-action="reset" data-mint-url="${escapeAttr(data.mintUrl)}" style="font-size: 0.8rem;">Reset counters</button>
                 </div>
                 <div style="max-height: 360px; overflow: auto; border: 1px solid var(--border); border-radius: 6px;">
                     <table style="width: 100%; border-collapse: collapse; font-size: 0.85rem;">
@@ -6919,7 +6984,7 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                         if (m.permanentlyDisabled) flags.push('permanent');
                         if (m.disabledPendingSuccess) flags.push('pending success');
                         if (m.trustedListDisabled) flags.push('trusted-list' + (m.trustedListDisabledReason ? ': ' + m.trustedListDisabledReason : ''));
-                        const safe = String(m.mintUrl).replace(/'/g, "\\'");
+                        const urlAttr = escapeAttr(m.mintUrl);
                         return `
                             <div style="padding: 0.6rem; background: rgba(0,0,0,0.2); border-radius: 6px; margin-bottom: 0.5rem;">
                                 <div style="display: flex; align-items: center; justify-content: space-between; gap: 0.5rem;">
@@ -6927,12 +6992,12 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                                     ${mintDiagnosticIcon(m.mintUrl)}
                                 </div>
                                 <div style="font-size: 0.75rem; color: var(--text-secondary); margin-top: 0.25rem;">
-                                    ${escapeHtml(flags.join(' • '))} &middot; lifetime ${m.totalFailures}${m.lastFailureKind ? ' &middot; last: ' + escapeHtml(m.lastFailureKind) : ''}
+                                    ${escapeHtml(flags.join(' • '))} &middot; lifetime ${Number(m.totalFailures) || 0}${m.lastFailureKind ? ' &middot; last: ' + escapeHtml(m.lastFailureKind) : ''}
                                 </div>
                                 <div style="display: flex; gap: 0.4rem; margin-top: 0.4rem; flex-wrap: wrap;">
-                                    <button class="btn btn-secondary" style="font-size: 0.75rem; padding: 0.2rem 0.5rem;" onclick="adminReenableMint('${safe}')">Re-enable</button>
-                                    <button class="btn btn-danger" style="font-size: 0.75rem; padding: 0.2rem 0.5rem;" onclick="adminMarkMintBad('${safe}')">Confirmed bad</button>
-                                    <button class="btn btn-secondary" style="font-size: 0.75rem; padding: 0.2rem 0.5rem;" onclick="openMintDiagnostic('${safe}')">Diagnostic</button>
+                                    <button class="btn btn-secondary" data-mint-action="reenable" data-mint-url="${urlAttr}" style="font-size: 0.75rem; padding: 0.2rem 0.5rem;">Re-enable</button>
+                                    <button class="btn btn-danger" data-mint-action="mark-bad" data-mint-url="${urlAttr}" style="font-size: 0.75rem; padding: 0.2rem 0.5rem;">Confirmed bad</button>
+                                    <button class="btn btn-secondary" data-mint-action="diagnostic" data-mint-url="${urlAttr}" style="font-size: 0.75rem; padding: 0.2rem 0.5rem;">Diagnostic</button>
                                 </div>
                             </div>
                         `;
@@ -7099,14 +7164,19 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
 
         function createApiKey(storeId) {
             document.getElementById('modal-apikey-title').textContent = 'Create API Key';
-            document.getElementById('modal-apikey-content').innerHTML = `
+            const modalContent = document.getElementById('modal-apikey-content');
+            modalContent.innerHTML = `
                 <div class="form-group">
                     <label class="form-label">Label (optional)</label>
                     <input type="text" class="form-input" id="apikey-label" placeholder="My API Key">
                 </div>
-                <button class="btn btn-full" onclick="submitCreateApiKey('${storeId}')">Create Key</button>
-                <button class="btn btn-secondary btn-full" style="margin-top: 0.5rem;" onclick="closeModal('modal-apikey')">Cancel</button>
+                <button class="btn btn-full" data-apikey-action="submit-create" data-store-id="${escapeAttr(storeId)}">Create Key</button>
+                <button class="btn btn-secondary btn-full" data-apikey-action="cancel" style="margin-top: 0.5rem;">Cancel</button>
             `;
+            modalContent.querySelector('[data-apikey-action="submit-create"]').addEventListener('click', (e) => {
+                submitCreateApiKey(e.currentTarget.dataset.storeId);
+            });
+            modalContent.querySelector('[data-apikey-action="cancel"]').addEventListener('click', () => closeModal('modal-apikey'));
             openModal('modal-apikey');
             document.getElementById('apikey-label').focus();
         }
@@ -7115,7 +7185,7 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
             const label = document.getElementById('apikey-label').value || 'API Key';
 
             const response = await postWithCsrf(adminUrl,
-                `action=create_api_key&store_id=${storeId}&label=${encodeURIComponent(label)}`
+                `action=create_api_key&store_id=${encodeURIComponent(storeId)}&label=${encodeURIComponent(label)}`
             );
 
             const result = await response.json();
@@ -7129,12 +7199,15 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
 
         function showApiKeyResult(key, storeId) {
             document.getElementById('modal-apikey-title').textContent = 'API Key Created';
-            document.getElementById('modal-apikey-content').innerHTML = `
+            const modalContent = document.getElementById('modal-apikey-content');
+            modalContent.innerHTML = `
                 <p style="color: var(--text-secondary); margin-bottom: 1rem;">Save this key now - it won't be shown again!</p>
-                <div class="token-display" style="user-select: all; cursor: text;">${key}</div>
-                <button class="btn btn-full" onclick="copyApiKey('${key}')">Copy to Clipboard</button>
-                <button class="btn btn-secondary btn-full" style="margin-top: 0.5rem;" onclick="closeApiKeyModal('${storeId}')">Close</button>
+                <div class="token-display" style="user-select: all; cursor: text;">${escapeHtml(key)}</div>
+                <button class="btn btn-full" data-apikey-action="copy">Copy to Clipboard</button>
+                <button class="btn btn-secondary btn-full" data-apikey-action="close" style="margin-top: 0.5rem;">Close</button>
             `;
+            modalContent.querySelector('[data-apikey-action="copy"]').addEventListener('click', () => copyApiKey(key));
+            modalContent.querySelector('[data-apikey-action="close"]').addEventListener('click', () => closeApiKeyModal(storeId));
         }
 
         function copyApiKey(key) {
@@ -7159,7 +7232,7 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
         async function deleteApiKey(keyId, storeId) {
             if (!confirm('Delete this API key?')) return;
 
-            await postWithCsrf(adminUrl, `action=delete_api_key&key_id=${keyId}`);
+            await postWithCsrf(adminUrl, `action=delete_api_key&key_id=${encodeURIComponent(keyId)}`);
 
             const store = dashboardData?.stores?.find(s => s.id === storeId);
             if (store) showStoreDetails(storeId, store.name);
@@ -7168,14 +7241,16 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
         async function deleteApiKeyFromSettings(keyId) {
             if (!confirm('Delete this API key?')) return;
 
-            await postWithCsrf(adminUrl, `action=delete_api_key&key_id=${keyId}`);
+            // keyId now arrives raw (caller previously double-encoded via
+            // encodeURIComponent and the body was sent verbatim).
+            await postWithCsrf(adminUrl, `action=delete_api_key&key_id=${encodeURIComponent(keyId)}`);
             loadStoreApiKeys();
         }
 
         async function deleteStore(storeId) {
             if (!confirm('Delete this store and all its data? This action cannot be undone.')) return;
 
-            await postWithCsrf(adminUrl, `action=delete_store&store_id=${storeId}`);
+            await postWithCsrf(adminUrl, `action=delete_store&store_id=${encodeURIComponent(storeId)}`);
 
             closeModal('modal-store');
             // Clear current store selection
