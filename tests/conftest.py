@@ -32,6 +32,7 @@ if _PW_DEFAULT_CACHE.exists():
 
 from fixtures import binaries  # noqa: E402
 from fixtures.api_client import AdminClient, GreenfieldClient  # noqa: E402
+from fixtures.boltz_regtest import boltz_regtest  # noqa: E402,F401 — pytest fixture
 from fixtures.browser import browser, page, playwright_instance  # noqa: E402,F401
 from fixtures.bitcoind import BitcoindHandle, start_bitcoind, stop_bitcoind  # noqa: E402
 from fixtures.lnd import (  # noqa: E402
