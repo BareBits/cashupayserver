@@ -3416,6 +3416,7 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                 <div class="card">
                     <div class="card-header"><div class="card-title">Fees</div></div>
                     <div class="card-body">
+                        <div id="stats-free-trial-banner" class="hidden" style="margin-bottom: 1rem; padding: 0.75rem 1rem; border-radius: 8px; font-size: 0.9rem; line-height: 1.4;"></div>
                         <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1rem;">
                             <div>
                                 <div class="stats-stat-row" title="Donated to upstream development (cypherpunk.today). 0.5% of (revenue − network costs).">
@@ -4754,7 +4755,58 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
             const pct = (s.effective_fee_pct || 0).toFixed(2);
             document.getElementById('stats-effective-fee').textContent = `${pct}%`;
 
+            renderFreeTrialBanner(s.free_trial);
             renderCcSaved();
+        }
+
+        // Render the free-trial banner above the Fees rows. Three states:
+        //   - not configured → hidden
+        //   - active → green banner with expiry conditions + progress
+        //   - expired → muted banner naming the expiry reason + date
+        // Stats are deployment-wide; the trial doesn't filter by store.
+        function renderFreeTrialBanner(ft) {
+            const el = document.getElementById('stats-free-trial-banner');
+            if (!el || !ft || !ft.configured) {
+                if (el) el.className = 'hidden';
+                return;
+            }
+
+            const fmtSats = (n) => Number(n || 0).toLocaleString() + ' sats';
+            const fmtDate = (ts) => {
+                if (!ts) return null;
+                try { return new Date(ts * 1000).toLocaleDateString(); }
+                catch (_) { return null; }
+            };
+
+            if (ft.active) {
+                const conds = [];
+                if (ft.until_ts) {
+                    conds.push(`until <strong>${fmtDate(ft.until_ts)}</strong>`);
+                }
+                if (ft.revenue_cap_sats) {
+                    conds.push(
+                        `until <strong>${fmtSats(ft.revenue_cap_sats)}</strong> revenue ` +
+                        `(${fmtSats(ft.revenue_during_trial_sats)} so far)`
+                    );
+                }
+                const joiner = conds.length > 1 ? ' or ' : '';
+                el.style.background = 'rgba(16, 185, 129, 0.12)';
+                el.style.border = '1px solid rgba(16, 185, 129, 0.4)';
+                el.style.color = 'inherit';
+                el.innerHTML = `<strong>Free trial active</strong> — no upstream, dev, or hosting fees will be charged ${conds.join(joiner)}. Network fees (Lightning routing) still apply.`;
+                el.classList.remove('hidden');
+            } else if (ft.expired_at) {
+                const reasonLabel = ft.expired_reason === 'revenue'
+                    ? 'revenue cap reached'
+                    : 'end date reached';
+                el.style.background = 'rgba(148, 163, 184, 0.12)';
+                el.style.border = '1px solid rgba(148, 163, 184, 0.4)';
+                el.style.color = 'var(--text-secondary)';
+                el.innerHTML = `Free trial ended on <strong>${fmtDate(ft.expired_at)}</strong> (${reasonLabel}). Fees apply to revenue from that point on.`;
+                el.classList.remove('hidden');
+            } else {
+                el.className = 'hidden';
+            }
         }
 
         function renderCcSaved() {

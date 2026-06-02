@@ -20,6 +20,12 @@ require_once __DIR__ . '/../cashu-wallet-php/CashuWallet.php';
 if (file_exists(__DIR__ . '/config.local.php')) {
     require_once __DIR__ . '/config.local.php';
 }
+// Load operator deployment-time settings (free trial, etc.) from the
+// project-root user_config.php. Constants defined there take precedence
+// over equivalent env vars — see Database::settingValue().
+if (file_exists(__DIR__ . '/../user_config.php')) {
+    require_once __DIR__ . '/../user_config.php';
+}
 
 use Cashu\WalletStorage;
 
@@ -614,6 +620,44 @@ HTACCESS;
             $stmt->execute([json_encode($now), $now, $now]);
         }
 
+        // Free-trial seeding (deployment-time). Operator sets either
+        // CASHUPAY_FREE_TRIAL_UNTIL (ISO 8601 date or unix seconds) and/or
+        // CASHUPAY_FREE_TRIAL_REVENUE_SATS (integer sat cap). If both are set
+        // the trial expires on whichever condition fires first (OR). Both
+        // missing or both already-expired-at-seed-time → no trial. Seeded
+        // once; immutable from the admin UI (matches deployment_id).
+        $trialSeededRow = $pdo->query("SELECT value FROM config WHERE key = 'free_trial_seeded'")->fetchColumn();
+        if ($trialSeededRow === false) {
+            $now = time();
+            $untilTs = self::parseFreeTrialUntilEnv(self::settingValue('CASHUPAY_FREE_TRIAL_UNTIL'));
+            $capSats = self::parseFreeTrialCapEnv(self::settingValue('CASHUPAY_FREE_TRIAL_REVENUE_SATS'));
+
+            // Already-past date or non-positive cap → behave as no trial.
+            $untilActive = ($untilTs !== null && $untilTs > $now);
+            $capActive = ($capSats !== null && $capSats > 0);
+
+            if ($untilActive || $capActive) {
+                $insert = $pdo->prepare(
+                    "INSERT INTO config (key, value, created_at, updated_at) VALUES (?, ?, ?, ?)"
+                );
+                if ($untilActive) {
+                    $insert->execute(['free_trial_until_ts', json_encode($untilTs), $now, $now]);
+                }
+                if ($capActive) {
+                    $insert->execute(['free_trial_revenue_cap_sats', json_encode($capSats), $now, $now]);
+                }
+                $insert->execute(['free_trial_started_at', json_encode($now), $now, $now]);
+            } elseif ($untilTs !== null || $capSats !== null) {
+                error_log("CASHUPAY: free-trial env present but already-expired at seed time; treating as no trial");
+            }
+
+            // Mark seeded either way so we don't re-evaluate the env on every
+            // subsequent migration run.
+            $pdo->prepare(
+                "INSERT INTO config (key, value, created_at, updated_at) VALUES ('free_trial_seeded', ?, ?, ?)"
+            )->execute([json_encode(true), $now, $now]);
+        }
+
         // Drop the legacy users.pin_hash column (PIN feature removed). Uses
         // the SQLite table-rebuild dance for compatibility with SQLite < 3.35.
         if (self::columnExists($pdo, 'users', 'pin_hash')) {
@@ -659,6 +703,51 @@ HTACCESS;
         );
         $stmt->execute([$name]);
         return $stmt->fetchColumn() !== false;
+    }
+
+    /**
+     * Read a deployment-time setting, preferring a PHP constant defined in
+     * user_config.php over the env var of the same name. Returns the raw
+     * string or `false` when neither source has a value (mirroring
+     * getenv()'s convention so the parse helpers below stay drop-in).
+     */
+    private static function settingValue(string $name) {
+        if (defined($name)) {
+            $v = constant($name);
+            if ($v === null) return false;
+            return (string) $v;
+        }
+        return getenv($name);
+    }
+
+    /**
+     * Parse CASHUPAY_FREE_TRIAL_UNTIL into a unix timestamp. Accepts an
+     * integer-as-string (unix seconds) or any strtotime-parseable date.
+     * Returns null when the env var is missing or unparseable.
+     */
+    private static function parseFreeTrialUntilEnv($raw): ?int {
+        if ($raw === false || $raw === '' || $raw === null) return null;
+        $raw = trim((string)$raw);
+        if (ctype_digit($raw)) return (int)$raw;
+        $ts = strtotime($raw);
+        if ($ts === false) {
+            error_log("CASHUPAY: CASHUPAY_FREE_TRIAL_UNTIL='{$raw}' is not a valid date; ignoring");
+            return null;
+        }
+        return (int)$ts;
+    }
+
+    /**
+     * Parse CASHUPAY_FREE_TRIAL_REVENUE_SATS into a positive integer sat cap.
+     */
+    private static function parseFreeTrialCapEnv($raw): ?int {
+        if ($raw === false || $raw === '' || $raw === null) return null;
+        $raw = trim((string)$raw);
+        if (!ctype_digit($raw)) {
+            error_log("CASHUPAY: CASHUPAY_FREE_TRIAL_REVENUE_SATS='{$raw}' is not a non-negative integer; ignoring");
+            return null;
+        }
+        return (int)$raw;
     }
 
     /**

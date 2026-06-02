@@ -36,6 +36,7 @@ require_once __DIR__ . '/config.php';
 require_once __DIR__ . '/invoice.php';
 require_once __DIR__ . '/rates.php';
 require_once __DIR__ . '/lightning_address.php';
+require_once __DIR__ . '/free_trial.php';
 require_once __DIR__ . '/../cashu-wallet-php/CashuWallet.php';
 
 use Cashu\Wallet;
@@ -179,8 +180,18 @@ class DevFee {
     /**
      * Pure aggregation: compute revenue / network cost / paid totals and
      * how much is owed for each fee type. All values in sats.
+     *
+     * Honors the deployment-wide free trial: while [[free_trial_active]] is
+     * true, every owed value is forced to zero. Settlement gates on owed >=
+     * threshold, so zero-owed means cron won't pay anything either.
      */
     public static function computeOwed(string $storeId): array {
+        // Lazy expiry: an inert deployment that has no cron at all still
+        // gets its trial flipped the moment anyone opens the dashboard or
+        // hits an admin endpoint that asks for fee math. Cheap no-op once
+        // the trial has either expired or was never configured.
+        FreeTrial::expireIfNeeded();
+
         $start = (int) Config::get('fee_tracking_start_at', 0);
 
         // Revenue: sum of paid invoices' sat value created after the
@@ -215,6 +226,13 @@ class DevFee {
 
         $hostingOwed = max(0, (int) floor($revenue * $hostingPct / 100) - $hostingPaid);
 
+        $trialActive = FreeTrial::isActive();
+        if ($trialActive) {
+            $upstreamOwed = 0;
+            $devOwed = 0;
+            $hostingOwed = 0;
+        }
+
         return [
             'revenue' => $revenue,
             'network_cost' => $networkCost,
@@ -224,6 +242,7 @@ class DevFee {
             'upstream_owed' => $upstreamOwed,
             'dev_owed' => $devOwed,
             'hosting_owed' => $hostingOwed,
+            'trial_active' => $trialActive,
         ];
     }
 

@@ -12,6 +12,7 @@
 require_once __DIR__ . '/database.php';
 require_once __DIR__ . '/config.php';
 require_once __DIR__ . '/dev_fee.php';
+require_once __DIR__ . '/free_trial.php';
 require_once __DIR__ . '/rates.php';
 
 class Stats {
@@ -184,6 +185,7 @@ class Stats {
             'fees_owed' => $owed,
             'profit_sats' => $profit,
             'effective_fee_pct' => $effectiveFeePct,
+            'free_trial' => FreeTrial::status(),
         ];
     }
 
