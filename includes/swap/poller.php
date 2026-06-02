@@ -35,13 +35,17 @@ final class SwapPoller {
         $now = time();
         $pdo = Database::getInstance();
         $placeholders = implode(',', array_fill(0, count(self::TERMINAL_STATUSES), '?'));
+        // $minInterval is not user input — inline it instead of binding, to
+        // avoid a PDO+SQLite quirk where integer parameters bound through an
+        // execute() array get coerced to TEXT and break numeric comparisons.
+        $mi = (int)$minInterval;
         $params = self::TERMINAL_STATUSES;
-        array_push($params, $now, $minInterval, $batchLimit);
+        array_push($params, $now, $batchLimit);
 
         $rows = $pdo->prepare(
             "SELECT * FROM swap_attempts
              WHERE status NOT IN ({$placeholders})
-             AND (last_polled_at IS NULL OR (? - last_polled_at) >= ?)
+             AND (last_polled_at IS NULL OR (CAST(? AS INTEGER) - last_polled_at) >= {$mi})
              ORDER BY
                  CASE WHEN last_polled_at IS NULL THEN 0 ELSE 1 END,
                  last_polled_at ASC
@@ -58,9 +62,9 @@ final class SwapPoller {
                 "UPDATE swap_attempts
                     SET last_polled_at = ?, updated_at = ?
                   WHERE id = ?
-                    AND (last_polled_at IS NULL OR (? - last_polled_at) >= ?)"
+                    AND (last_polled_at IS NULL OR (CAST(? AS INTEGER) - last_polled_at) >= {$mi})"
             );
-            $upd->execute([$now, $now, $row['id'], $now, $minInterval]);
+            $upd->execute([$now, $now, $row['id'], $now]);
             if ($upd->rowCount() !== 1) {
                 continue; // another poller has this row
             }

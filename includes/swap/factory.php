@@ -14,10 +14,27 @@ require_once __DIR__ . '/boltz_provider.php';
 require_once __DIR__ . '/config.php';
 
 final class SwapProviderFactory {
-    private const REGISTRY = [
+    /**
+     * Default registry. Tests may override via {@see setRegistry()} to inject
+     * mock providers; pass `null` to reset.
+     */
+    private const DEFAULT_REGISTRY = [
         'zeus'  => ZeusSwapProvider::class,
         'boltz' => BoltzSwapProvider::class,
     ];
+    private static ?array $registryOverride = null;
+
+    /**
+     * Test seam: override the provider registry. Each value may be either a
+     * class name (instantiated on demand) or a pre-built SwapProvider instance.
+     */
+    public static function setRegistry(?array $registry): void {
+        self::$registryOverride = $registry;
+    }
+
+    private static function registry(): array {
+        return self::$registryOverride ?? self::DEFAULT_REGISTRY;
+    }
 
     /**
      * Build all configured providers in preference order. Unknown names in
@@ -28,11 +45,11 @@ final class SwapProviderFactory {
      */
     public static function orderedForSite(): array {
         $out = [];
+        $reg = self::registry();
         foreach (SwapsConfig::providerOrder() as $name) {
-            $cls = self::REGISTRY[$name] ?? null;
-            if ($cls) {
-                $out[] = new $cls();
-            }
+            $entry = $reg[$name] ?? null;
+            if ($entry === null) continue;
+            $out[] = is_object($entry) ? $entry : new $entry();
         }
         return $out;
     }
@@ -41,8 +58,9 @@ final class SwapProviderFactory {
      * Build a single provider by name. Returns null for unknown names.
      */
     public static function byName(string $name): ?SwapProvider {
-        $cls = self::REGISTRY[strtolower($name)] ?? null;
-        return $cls ? new $cls() : null;
+        $entry = self::registry()[strtolower($name)] ?? null;
+        if ($entry === null) return null;
+        return is_object($entry) ? $entry : new $entry();
     }
 
     /**
@@ -52,6 +70,6 @@ final class SwapProviderFactory {
      * @return string[]
      */
     public static function knownProviderNames(): array {
-        return array_keys(self::REGISTRY);
+        return array_keys(self::registry());
     }
 }
