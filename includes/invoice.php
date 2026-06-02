@@ -10,6 +10,7 @@ require_once __DIR__ . '/database.php';
 require_once __DIR__ . '/config.php';
 require_once __DIR__ . '/rates.php';
 require_once __DIR__ . '/webhook_sender.php';
+require_once __DIR__ . '/notification_sender.php';
 require_once __DIR__ . '/urls.php';
 require_once __DIR__ . '/../cashu-wallet-php/CashuWallet.php';
 require_once __DIR__ . '/onchain/payments.php';
@@ -199,6 +200,9 @@ class Invoice {
 
         if ($eventType && $invoice) {
             WebhookSender::fireEvent($invoice['store_id'], $eventType, $invoice);
+            if ($status === 'Settled') {
+                NotificationSender::queueInvoicePaid($invoice);
+            }
         }
     }
 
@@ -299,6 +303,7 @@ class Invoice {
             Database::commit();
 
             self::flushWebhookQueue();
+            NotificationSender::queueInvoicePaid($updatedInvoice);
         } catch (Exception $e) {
             Database::rollback();
             self::clearWebhookQueue();
@@ -526,6 +531,7 @@ class Invoice {
 
                     $updatedInvoice = self::getById($invoice['id']);
                     WebhookSender::fireEvent($invoice['store_id'], 'InvoiceSettled', $updatedInvoice);
+                    NotificationSender::queueInvoicePaid($updatedInvoice);
                     return;
                 } catch (Exception $e) {
                     Database::rollback();
@@ -563,6 +569,7 @@ class Invoice {
 
                         $updatedInvoice = self::getById($invoice['id']);
                         WebhookSender::fireEvent($invoice['store_id'], 'InvoiceSettled', $updatedInvoice);
+                        NotificationSender::queueInvoicePaid($updatedInvoice);
 
                         error_log("CashuPayServer: Recovered orphaned invoice {$invoice['id']}");
                     }

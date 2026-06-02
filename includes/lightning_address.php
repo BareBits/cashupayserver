@@ -12,6 +12,7 @@ require_once __DIR__ . '/config.php';
 require_once __DIR__ . '/invoice.php';
 require_once __DIR__ . '/rates.php';
 require_once __DIR__ . '/mint_reliability.php';
+require_once __DIR__ . '/notification_sender.php';
 require_once __DIR__ . '/../cashu-wallet-php/CashuWallet.php';
 
 use Cashu\Wallet;
@@ -262,11 +263,23 @@ class LightningAddress {
                             'success' => true,
                         ];
 
+                        NotificationSender::queueAutoWithdrawSuccess(
+                            $store['id'],
+                            $meltAmountSats,
+                            $store['auto_melt_address']
+                        );
+
                         error_log("Auto-melt: Sent {$meltAmountSats} sats (~{$meltAmountInMintUnit} {$mintUnit}) from store {$store['name']} to {$store['auto_melt_address']}");
                     } catch (Exception $meltError) {
                         // Melt operation failed (mint unreachable, insufficient funds, etc.)
                         // Log and continue - don't crash the entire admin page load
                         error_log("Auto-melt operation failed for store {$store['id']}: " . $meltError->getMessage());
+                        NotificationSender::queueAutoWithdrawFailure(
+                            $store['id'],
+                            $store['auto_melt_address'],
+                            $meltError->getMessage(),
+                            $meltAmountSats
+                        );
                         $results[] = [
                             'store_id' => $store['id'],
                             'store_name' => $store['name'],
@@ -277,6 +290,16 @@ class LightningAddress {
                 }
             } catch (Exception $e) {
                 error_log("Auto-melt check failed for store {$store['id']}: " . $e->getMessage());
+                // Pre-flight failure (balance lookup, etc.) — still notify so
+                // operators see that auto-withdrawal is wedged.
+                if (!empty($store['auto_melt_address'])) {
+                    NotificationSender::queueAutoWithdrawFailure(
+                        $store['id'],
+                        $store['auto_melt_address'],
+                        $e->getMessage(),
+                        null
+                    );
+                }
                 $results[] = [
                     'store_id' => $store['id'],
                     'store_name' => $store['name'],

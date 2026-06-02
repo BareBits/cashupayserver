@@ -142,6 +142,11 @@ if (isset($_GET['api'])) {
                 'threshold' => (int)($store['auto_melt_threshold'] ?? 2000),
             ];
 
+            $storeNotifications = [
+                'enabled' => (bool)($store['notifications_enabled'] ?? 0),
+                'email' => $store['notification_email'] ?? '',
+            ];
+
             // On-chain Bitcoin payment settings.
             $onchainXpub = $store['onchain_xpub'] ?? '';
             $onchain = [
@@ -216,6 +221,7 @@ if (isset($_GET['api'])) {
                 'invoices' => array_map([Invoice::class, 'formatForApi'], $recentInvoices),
                 'stores' => $stores,
                 'autoMelt' => $autoMelt,
+                'notifications' => $storeNotifications,
                 'onchain' => $onchain,
                 'reliability' => (function() {
                     require_once __DIR__ . '/includes/mint_reliability.php';
@@ -1270,6 +1276,91 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
                 echo json_encode(['success' => true]);
             } catch (Exception $e) {
+                http_response_code(400);
+                echo json_encode(['error' => $e->getMessage()]);
+            }
+            break;
+
+        case 'save_store_notifications':
+            Auth::requireAdmin();
+            try {
+                $storeId = $_POST['store_id'] ?? '';
+                $enabled = ($_POST['enabled'] ?? '0') === '1' ? 1 : 0;
+                $email = trim((string)($_POST['email'] ?? ''));
+
+                if (empty($storeId)) {
+                    throw new Exception('Store ID required');
+                }
+                if ($email !== '' && !filter_var($email, FILTER_VALIDATE_EMAIL)) {
+                    throw new Exception('Invalid email address');
+                }
+
+                Database::update('stores', [
+                    'notifications_enabled' => $enabled,
+                    'notification_email' => $email !== '' ? $email : null,
+                ], 'id = ?', [$storeId]);
+
+                echo json_encode(['success' => true]);
+            } catch (Exception $e) {
+                http_response_code(400);
+                echo json_encode(['error' => $e->getMessage()]);
+            }
+            break;
+
+        case 'get_notifications_settings':
+            Auth::requireAdmin();
+            require_once __DIR__ . '/includes/email_sender.php';
+            require_once __DIR__ . '/includes/notification_sender.php';
+            echo json_encode([
+                'enabled' => Config::get('notifications_enabled', false) === true,
+                'invoicePaidEnabled' => Config::get('notifications_invoice_paid_enabled', false) === true,
+                'autoWithdrawEnabled' => Config::get('notifications_auto_withdraw_enabled', false) === true,
+                'toEmail' => (string)Config::get('notifications_to_email', ''),
+                'smtpConfigured' => EmailSender::isSmtpConfigured(),
+                'pendingQueueCount' => NotificationSender::pendingCount(),
+            ]);
+            break;
+
+        case 'save_notifications_settings':
+            Auth::requireAdmin();
+            try {
+                $enabled = ($_POST['enabled'] ?? '0') === '1';
+                $invoicePaidEnabled = ($_POST['invoice_paid_enabled'] ?? '0') === '1';
+                $autoWithdrawEnabled = ($_POST['auto_withdraw_enabled'] ?? '0') === '1';
+                $toEmail = trim((string)($_POST['to_email'] ?? ''));
+
+                if ($toEmail !== '' && !filter_var($toEmail, FILTER_VALIDATE_EMAIL)) {
+                    throw new Exception('Invalid email address');
+                }
+
+                Config::set('notifications_enabled', $enabled);
+                Config::set('notifications_invoice_paid_enabled', $invoicePaidEnabled);
+                Config::set('notifications_auto_withdraw_enabled', $autoWithdrawEnabled);
+                Config::set('notifications_to_email', $toEmail);
+
+                echo json_encode(['success' => true]);
+            } catch (Exception $e) {
+                http_response_code(400);
+                echo json_encode(['error' => $e->getMessage()]);
+            }
+            break;
+
+        case 'send_test_notification':
+            Auth::requireAdmin();
+            require_once __DIR__ . '/includes/email_sender.php';
+            try {
+                $to = trim((string)($_POST['to'] ?? Config::get('notifications_to_email', '')));
+                if ($to === '' || !filter_var($to, FILTER_VALIDATE_EMAIL)) {
+                    throw new Exception('Provide a valid recipient email');
+                }
+                EmailSender::send(
+                    $to,
+                    'CashuPayServer test email',
+                    "This is a test email from CashuPayServer.\n\n"
+                    . "If you received this, SMTP delivery is working.\n"
+                );
+                echo json_encode(['success' => true]);
+            } catch (Throwable $e) {
                 http_response_code(400);
                 echo json_encode(['error' => $e->getMessage()]);
             }
@@ -3132,6 +3223,38 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
 
                     <div class="card">
                         <div class="card-header">
+                            <div class="card-title">Email Notifications</div>
+                        </div>
+                        <div class="card-body">
+                            <p style="font-size: 0.85rem; color: var(--text-secondary); margin: 0 0 0.75rem 0;">
+                                Send notification emails for this store's events (invoice paid,
+                                auto-withdrawal). Requires site-wide notifications to be enabled
+                                in the Settings page.
+                            </p>
+
+                            <div class="toggle-container">
+                                <span>Enable notifications for this store</span>
+                                <label class="toggle">
+                                    <input type="checkbox" id="store-notifications-enabled">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
+
+                            <div class="form-group" style="margin-top: 1rem;">
+                                <label class="form-label">Notification email</label>
+                                <input type="email" class="form-input" id="store-notification-email"
+                                       placeholder="leave blank to use the site-wide address">
+                                <p class="form-help">If blank, the site-wide notification address from Settings is used.</p>
+                            </div>
+
+                            <button class="btn btn-full" id="btn-save-store-notifications" style="margin-top: 0.5rem;">
+                                Save notification settings
+                            </button>
+                        </div>
+                    </div>
+
+                    <div class="card">
+                        <div class="card-header">
                             <div class="card-title">Exchange Rate Settings</div>
                         </div>
                         <div class="card-body">
@@ -3337,6 +3460,74 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                     </div>
                 </div>
                 <?php endif; ?>
+
+                <!--
+                    Email notifications — site-wide master switch + per-type
+                    toggles + default "to" address. Per-store opt-in lives in
+                    the store-settings card; the master switch here gates
+                    everything.
+                -->
+                <div class="card" data-admin-only="true" id="card-notifications">
+                    <div class="card-header">
+                        <div class="card-title">Email Notifications</div>
+                    </div>
+                    <div class="card-body">
+                        <p style="font-size: 0.85rem; color: var(--text-secondary); margin: 0 0 0.75rem 0;">
+                            Send notification emails for selected events. SMTP credentials
+                            are read from <code>user_config.php</code>; without them, the
+                            sender falls back to PHP's <code>mail()</code> function.
+                        </p>
+                        <div id="notifications-smtp-warning" class="hidden" style="background: rgba(247,147,26,0.15); border: 1px solid rgba(247,147,26,0.4); padding: 0.6rem; border-radius: 6px; font-size: 0.85rem; margin-bottom: 0.75rem;">
+                            No SMTP host configured in <code>user_config.php</code>. The
+                            server will fall back to PHP <code>mail()</code>, which only
+                            works if a local MTA is installed.
+                        </div>
+
+                        <div class="toggle-container">
+                            <span><strong>Enable email notifications</strong> (master switch)</span>
+                            <label class="toggle">
+                                <input type="checkbox" id="notifications-enabled">
+                                <span class="toggle-slider"></span>
+                            </label>
+                        </div>
+
+                        <div style="margin-top: 1rem; padding: 0.75rem; background: rgba(0,0,0,0.2); border-radius: 8px;">
+                            <div style="font-weight: 500; margin-bottom: 0.5rem;">Notify on:</div>
+                            <div class="toggle-container">
+                                <span>Invoice paid</span>
+                                <label class="toggle">
+                                    <input type="checkbox" id="notifications-invoice-paid">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
+                            <div class="toggle-container" style="margin-top: 0.5rem;">
+                                <span>Auto-withdrawal (success &amp; failure)</span>
+                                <label class="toggle">
+                                    <input type="checkbox" id="notifications-auto-withdraw">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
+                        </div>
+
+                        <div class="form-group" style="margin-top: 1rem;">
+                            <label class="form-label">Site-wide notification email</label>
+                            <input type="email" class="form-input" id="notifications-to-email"
+                                   placeholder="ops@example.com">
+                            <p class="form-help">Default recipient. Stores can override this individually in their settings.</p>
+                        </div>
+
+                        <button class="btn btn-full" id="btn-save-notifications" style="margin-bottom: 0.5rem;">
+                            Save notification settings
+                        </button>
+
+                        <div style="display: flex; gap: 0.5rem; align-items: center; margin-top: 0.5rem;">
+                            <input type="email" class="form-input" id="notifications-test-email"
+                                   placeholder="test@example.com" style="flex: 1;">
+                            <button class="btn btn-secondary" id="btn-send-test-notification">Send test</button>
+                        </div>
+                        <p class="form-help" id="notifications-pending" style="margin-top: 0.5rem;"></p>
+                    </div>
+                </div>
 
                 <!-- My Account card: own password + logout, available to every logged-in user -->
                 <?php if (!Urls::isWordPress()): ?>
@@ -4113,6 +4304,12 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
 
             // Settings
             document.getElementById('btn-save-auto-melt').addEventListener('click', saveAutoMelt);
+            const saveStoreNotifsBtn = document.getElementById('btn-save-store-notifications');
+            if (saveStoreNotifsBtn) saveStoreNotifsBtn.addEventListener('click', saveStoreNotifications);
+            const saveNotifsBtn = document.getElementById('btn-save-notifications');
+            if (saveNotifsBtn) saveNotifsBtn.addEventListener('click', saveNotificationSettings);
+            const testNotifsBtn = document.getElementById('btn-send-test-notification');
+            if (testNotifsBtn) testNotifsBtn.addEventListener('click', sendTestNotification);
             document.getElementById('btn-validate-onchain').addEventListener('click', validateOnchainXpub);
             document.getElementById('btn-test-onchain').addEventListener('click', testOnchainCurrent);
             document.getElementById('btn-save-onchain').addEventListener('click', saveOnchain);
@@ -4260,6 +4457,7 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                     loadTrustedMintsCard();
                     loadCronUrl();
                     loadAutoUpdateCard();
+                    loadNotificationSettings();
                 }
             }
         }
@@ -5173,6 +5371,14 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                         thresholdInput.step = '1';
                         thresholdInput.min = '1';
                     }
+                }
+
+                // Load per-store notification settings
+                if (dashboardData && dashboardData.notifications) {
+                    const enabledEl = document.getElementById('store-notifications-enabled');
+                    const emailEl = document.getElementById('store-notification-email');
+                    if (enabledEl) enabledEl.checked = !!dashboardData.notifications.enabled;
+                    if (emailEl) emailEl.value = dashboardData.notifications.email || '';
                 }
 
                 // Load exchange rate settings from store data
@@ -6099,6 +6305,91 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                 }
             } catch (e) {
                 showToast('Failed to save settings', 'error');
+            }
+        }
+
+        async function saveStoreNotifications() {
+            if (!currentStoreId) {
+                showToast('No store selected', 'error');
+                return;
+            }
+            const enabled = document.getElementById('store-notifications-enabled').checked ? '1' : '0';
+            const email = document.getElementById('store-notification-email').value.trim();
+            try {
+                const response = await postWithCsrf(adminUrl,
+                    `action=save_store_notifications&store_id=${encodeURIComponent(currentStoreId)}&enabled=${enabled}&email=${encodeURIComponent(email)}`
+                );
+                const result = await response.json();
+                if (response.ok) {
+                    showToast('Notification settings saved!', 'success');
+                } else {
+                    showToast(result.error || 'Failed to save', 'error');
+                }
+            } catch (e) {
+                showToast('Failed to save notification settings', 'error');
+            }
+        }
+
+        async function loadNotificationSettings() {
+            try {
+                const response = await fetch(`${adminUrl}?action=get_notifications_settings`);
+                if (!response.ok) return;
+                const data = await response.json();
+                document.getElementById('notifications-enabled').checked = !!data.enabled;
+                document.getElementById('notifications-invoice-paid').checked = !!data.invoicePaidEnabled;
+                document.getElementById('notifications-auto-withdraw').checked = !!data.autoWithdrawEnabled;
+                document.getElementById('notifications-to-email').value = data.toEmail || '';
+                document.getElementById('notifications-smtp-warning').classList.toggle('hidden', !!data.smtpConfigured);
+                const pending = document.getElementById('notifications-pending');
+                if (pending) {
+                    pending.textContent = data.pendingQueueCount > 0
+                        ? `${data.pendingQueueCount} email(s) waiting to be sent on the next cron tick.`
+                        : '';
+                }
+            } catch (e) {
+                console.error('Failed to load notification settings', e);
+            }
+        }
+
+        async function saveNotificationSettings() {
+            const enabled = document.getElementById('notifications-enabled').checked ? '1' : '0';
+            const invoicePaid = document.getElementById('notifications-invoice-paid').checked ? '1' : '0';
+            const autoWithdraw = document.getElementById('notifications-auto-withdraw').checked ? '1' : '0';
+            const toEmail = document.getElementById('notifications-to-email').value.trim();
+            try {
+                const response = await postWithCsrf(adminUrl,
+                    `action=save_notifications_settings&enabled=${enabled}&invoice_paid_enabled=${invoicePaid}&auto_withdraw_enabled=${autoWithdraw}&to_email=${encodeURIComponent(toEmail)}`
+                );
+                const result = await response.json();
+                if (response.ok) {
+                    showToast('Notification settings saved!', 'success');
+                } else {
+                    showToast(result.error || 'Failed to save', 'error');
+                }
+            } catch (e) {
+                showToast('Failed to save notification settings', 'error');
+            }
+        }
+
+        async function sendTestNotification() {
+            const to = document.getElementById('notifications-test-email').value.trim()
+                || document.getElementById('notifications-to-email').value.trim();
+            if (!to) {
+                showToast('Enter a recipient email', 'error');
+                return;
+            }
+            try {
+                const response = await postWithCsrf(adminUrl,
+                    `action=send_test_notification&to=${encodeURIComponent(to)}`
+                );
+                const result = await response.json();
+                if (response.ok) {
+                    showToast('Test email sent', 'success');
+                } else {
+                    showToast(result.error || 'Failed to send', 'error');
+                }
+            } catch (e) {
+                showToast('Failed to send test email', 'error');
             }
         }
 

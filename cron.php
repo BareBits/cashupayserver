@@ -23,6 +23,7 @@ require_once __DIR__ . '/includes/background.php';
 require_once __DIR__ . '/includes/onchain/payments.php';
 require_once __DIR__ . '/includes/trusted_mints.php';
 require_once __DIR__ . '/includes/updater.php';
+require_once __DIR__ . '/includes/notification_sender.php';
 
 // Check if setup is complete
 if (!Database::isInitialized() || !Config::isSetupComplete()) {
@@ -287,6 +288,15 @@ if (!$isInternal) {
     } catch (Throwable $e) {
         $results['tasks']['updater'] = 'error: ' . $e->getMessage();
     }
+}
+
+// Task 13: Drain queued notification emails. Runs on every tick so backlogs
+// from a temporarily-unreachable SMTP server self-heal on the next cron pass.
+try {
+    $drain = NotificationSender::drainQueue();
+    $results['tasks']['notifications'] = "sent: {$drain['sent']}, failed: {$drain['failed']}";
+} catch (Throwable $e) {
+    $results['tasks']['notifications'] = 'error: ' . $e->getMessage();
 }
 
 echo json_encode($results, JSON_PRETTY_PRINT);

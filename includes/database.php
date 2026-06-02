@@ -658,6 +658,46 @@ HTACCESS;
             )->execute([json_encode(true), $now, $now]);
         }
 
+        // Email notifications: per-store opt-in + override "to" address.
+        // Site-wide defaults live in the config table; tables below buffer
+        // outbound mail (drained by cron) and dedupe identical auto-withdraw
+        // failures within 48h (see includes/notification_sender.php).
+        if (!self::columnExists($pdo, 'stores', 'notifications_enabled')) {
+            $pdo->exec("ALTER TABLE stores ADD COLUMN notifications_enabled INTEGER NOT NULL DEFAULT 0");
+        }
+        if (!self::columnExists($pdo, 'stores', 'notification_email')) {
+            $pdo->exec("ALTER TABLE stores ADD COLUMN notification_email TEXT DEFAULT NULL");
+        }
+        if (!self::tableExists($pdo, 'notification_queue')) {
+            $pdo->exec("
+                CREATE TABLE notification_queue (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    store_id TEXT,
+                    event_type TEXT NOT NULL,
+                    to_email TEXT NOT NULL,
+                    subject TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    dedupe_key TEXT,
+                    created_at INTEGER NOT NULL,
+                    sent_at INTEGER,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT
+                );
+            ");
+            $pdo->exec("CREATE INDEX idx_notification_queue_pending ON notification_queue(sent_at) WHERE sent_at IS NULL;");
+        }
+        if (!self::tableExists($pdo, 'notification_log')) {
+            $pdo->exec("
+                CREATE TABLE notification_log (
+                    store_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    dedupe_key TEXT NOT NULL,
+                    sent_at INTEGER NOT NULL,
+                    PRIMARY KEY (store_id, event_type, dedupe_key)
+                );
+            ");
+        }
+
         // Drop the legacy users.pin_hash column (PIN feature removed). Uses
         // the SQLite table-rebuild dance for compatibility with SQLite < 3.35.
         if (self::columnExists($pdo, 'users', 'pin_hash')) {
