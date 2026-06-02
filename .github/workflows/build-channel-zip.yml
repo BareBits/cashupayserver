@@ -1,0 +1,73 @@
+name: Build channel zip
+
+# Builds the deployable standalone zip on every push to main or testing,
+# then publishes it as the single asset on a moving-tag release
+# (channel-main / channel-testing). The PHP auto-updater on deployed
+# servers fetches the zip from that release.
+
+on:
+  push:
+    branches:
+      - main
+      - testing
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-channel-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Use HTTPS for SSH-form submodule URLs
+        run: |
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
+
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.1"
+          extensions: curl, json, gmp, mbstring, sqlite3, zip
+          coverage: none
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Build standalone zip
+        env:
+          COMMIT_SHA: ${{ github.sha }}
+          CHANNEL: ${{ github.ref_name }}
+        run: |
+          ./scripts/build-standalone.sh
+
+      - name: Determine moving release tag
+        id: tag
+        run: echo "tag=channel-${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish moving-tag release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: "Channel: ${{ github.ref_name }}"
+          body: |
+            Auto-built from ${{ github.ref_name }}@${{ github.sha }}.
+
+            This is a moving release. The deployed auto-updater pulls
+            `cashupayserver.zip` from here. Do not link humans to it.
+          prerelease: ${{ github.ref_name == 'testing' }}
+          make_latest: "false"
+          files: |
+            build/cashupayserver.zip
+            build/cashupayserver/BUILD_INFO

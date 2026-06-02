@@ -16,6 +16,7 @@ require_once __DIR__ . '/includes/urls.php';
 // Defines CASHUPAY_DEV_FEE_PERCENT etc. consumed by the Hosting Fee card copy.
 require_once __DIR__ . '/includes/dev_fee.php';
 require_once __DIR__ . '/includes/stats.php';
+require_once __DIR__ . '/includes/updater.php';
 
 use Cashu\ProofState;
 
@@ -254,6 +255,23 @@ if (isset($_GET['api'])) {
         case 'upgrade_banner':
             Auth::requireAdmin();
             echo json_encode(['state' => Stats::upgradeBannerState()]);
+            break;
+
+        case 'update_status':
+            Auth::requireAdmin();
+            $info = Updater::getLocalBuildInfo();
+            $last = Config::get('updater_last_update');
+            $dismissed = (bool)Config::get('updater_banner_dismissed', true);
+            echo json_encode([
+                'channel' => Updater::getChannel(),
+                'current_version' => $info['VERSION'] ?? CASHUPAY_VERSION,
+                'current_sha' => $info['COMMIT_SHA'] ?? '',
+                'last_update' => $last,
+                'banner_dismissed' => $dismissed,
+                'backups' => Updater::listBackups(),
+                'htaccess_new_exists' => is_file(__DIR__ . '/.htaccess.new'),
+                'notification_email' => Config::get('admin_notification_email', ''),
+            ]);
             break;
 
         case 'invoices':
@@ -684,6 +702,44 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 http_response_code(400);
                 echo json_encode(['error' => 'Invalid mode']);
             }
+            break;
+
+        case 'save_update_channel':
+            Auth::requireAdmin();
+            $channel = (string)($_POST['channel'] ?? '');
+            if (!in_array($channel, ['main', 'testing'], true)) {
+                http_response_code(400);
+                echo json_encode(['error' => 'Invalid channel']);
+                break;
+            }
+            Updater::setChannel($channel);
+            // Optional notification email. Empty string clears it.
+            if (array_key_exists('email', $_POST)) {
+                $email = trim((string)$_POST['email']);
+                if ($email === '' || filter_var($email, FILTER_VALIDATE_EMAIL)) {
+                    Config::set('admin_notification_email', $email);
+                } else {
+                    http_response_code(400);
+                    echo json_encode(['error' => 'Invalid email']);
+                    break;
+                }
+            }
+            // Forget the cached last-check so the next cron tick re-evaluates
+            // against the newly chosen channel immediately.
+            Config::set('updater_last_check', 0);
+            echo json_encode(['success' => true, 'channel' => Updater::getChannel()]);
+            break;
+
+        case 'rollback_update':
+            Auth::requireAdmin();
+            $ok = Updater::rollbackToMostRecent();
+            echo json_encode(['success' => $ok]);
+            break;
+
+        case 'dismiss_update_banner':
+            Auth::requireAdmin();
+            Config::set('updater_banner_dismissed', true);
+            echo json_encode(['success' => true]);
             break;
 
         case 'create_store':
@@ -3251,6 +3307,52 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                         <button class="btn btn-secondary btn-full" id="btn-copy-cron-url">Copy</button>
                     </div>
                 </div>
+
+                <!--
+                    Auto-update — channel selector + last-update info + rollback.
+                    The cron tick (Task 12 in cron.php) fetches the latest
+                    cashupayserver.zip built by CI for the chosen channel and
+                    overlays it on the install. data/ and user_config.php are
+                    preserved. .htaccess is only overwritten if untouched.
+                    Skipped entirely in WordPress mode.
+                -->
+                <div class="card" data-admin-only="true" id="card-auto-update">
+                    <div class="card-header">
+                        <div class="card-title">Auto-update</div>
+                    </div>
+                    <div class="card-body">
+                        <p style="font-size: 0.85rem; color: var(--text-secondary); margin: 0 0 0.75rem 0;">
+                            Daily check against GitHub. Updates apply automatically. data/ and
+                            user_config.php are preserved. Backups of the last 3 versions are kept
+                            under data/updates/backup/.
+                        </p>
+                        <div class="form-group">
+                            <label class="form-label">Current version</label>
+                            <code id="auto-update-current" style="display: block; background: rgba(0,0,0,0.2); padding: 0.6rem; border-radius: 8px; font-size: 0.85rem; user-select: all;">Loading…</code>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label" for="auto-update-channel">Channel</label>
+                            <select id="auto-update-channel" class="form-control" style="width: 100%;">
+                                <option value="main">main — stable</option>
+                                <option value="testing">testing — pre-release</option>
+                            </select>
+                            <p class="form-help">Override the value set in user_config.php.</p>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label" for="auto-update-email">Notification email (optional)</label>
+                            <input type="email" id="auto-update-email" class="form-input" placeholder="admin@example.com">
+                            <p class="form-help">If set, you get an email after each auto-update with a one-time rollback URL. Leave blank to skip email.</p>
+                        </div>
+                        <button class="btn btn-full" id="btn-save-update-channel" style="margin-bottom: 0.5rem;">Save settings</button>
+                        <div id="auto-update-htaccess-warning" class="hidden" style="background: rgba(247,147,26,0.15); border: 1px solid rgba(247,147,26,0.4); padding: 0.6rem; border-radius: 6px; font-size: 0.85rem; margin-bottom: 0.5rem;">
+                            A new .htaccess shipped with the latest update, but your live
+                            .htaccess was edited — it was left untouched. The new version is
+                            in <code>.htaccess.new</code>. Review and merge by hand.
+                        </div>
+                        <button class="btn btn-secondary btn-full" id="btn-rollback-update" style="margin-bottom: 0.25rem;">Roll back to previous version</button>
+                        <p class="form-help" id="auto-update-rollback-help">Restores the most recent backup. Disabled if no backup is available.</p>
+                    </div>
+                </div>
                 <?php endif; ?>
 
                 <!-- My Account card: own password + logout, available to every logged-in user -->
@@ -4036,6 +4138,10 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
             document.getElementById('btn-save-hosting-fee').addEventListener('click', saveHostingFee);
             const copyCronBtn = document.getElementById('btn-copy-cron-url');
             if (copyCronBtn) copyCronBtn.addEventListener('click', copyCronUrl);
+            const saveChannelBtn = document.getElementById('btn-save-update-channel');
+            if (saveChannelBtn) saveChannelBtn.addEventListener('click', saveUpdateChannel);
+            const rollbackBtn = document.getElementById('btn-rollback-update');
+            if (rollbackBtn) rollbackBtn.addEventListener('click', rollbackUpdate);
             const dismissCronBtn = document.getElementById('btn-dismiss-cron-stale');
             if (dismissCronBtn) dismissCronBtn.addEventListener('click', dismissCronStaleBanner);
             document.getElementById('btn-logout').addEventListener('click', logout);
@@ -4170,6 +4276,7 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                     loadReliabilityCard();
                     loadTrustedMintsCard();
                     loadCronUrl();
+                    loadAutoUpdateCard();
                 }
             }
         }
@@ -6848,6 +6955,100 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                 showToast('Cron entry copied to clipboard', 'success');
             } catch (e) {
                 showToast('Copy failed — select the text manually', 'error');
+            }
+        }
+
+        // Auto-update card: fetch current channel/version/backups and wire
+        // up the channel selector + rollback button.
+        async function loadAutoUpdateCard() {
+            const card = document.getElementById('card-auto-update');
+            if (!card) return;
+            const cur = document.getElementById('auto-update-current');
+            const sel = document.getElementById('auto-update-channel');
+            const warn = document.getElementById('auto-update-htaccess-warning');
+            const rollbackBtn = document.getElementById('btn-rollback-update');
+            const rollbackHelp = document.getElementById('auto-update-rollback-help');
+            try {
+                const r = await fetch(adminUrl + '?api=update_status', { credentials: 'same-origin' });
+                const data = await r.json();
+                const sha = data.current_sha ? data.current_sha.slice(0, 12) : 'unknown';
+                cur.textContent = (data.current_version || 'unknown') + ' (' + sha + ')';
+                if (sel) sel.value = (data.channel === 'testing') ? 'testing' : 'main';
+                const emailInput = document.getElementById('auto-update-email');
+                if (emailInput) emailInput.value = data.notification_email || '';
+                if (data.htaccess_new_exists) {
+                    warn.classList.remove('hidden');
+                } else {
+                    warn.classList.add('hidden');
+                }
+                const hasBackup = Array.isArray(data.backups) && data.backups.length > 0;
+                if (rollbackBtn) rollbackBtn.disabled = !hasBackup;
+                if (rollbackHelp) {
+                    rollbackHelp.textContent = hasBackup
+                        ? ('Restores backup: ' + data.backups[0])
+                        : 'No backups yet. The first update will create one.';
+                }
+                // Render the "X -> Y applied at ..." banner if there's a
+                // recent update the admin hasn't acknowledged.
+                if (data.last_update && !data.banner_dismissed) {
+                    showAutoUpdateBanner(data.last_update);
+                }
+            } catch (e) {
+                cur.textContent = 'Unable to load update status';
+            }
+        }
+
+        function showAutoUpdateBanner(last) {
+            // Reuse the page-top banner space: render a simple toast for now.
+            const from = last.from_version || 'unknown';
+            const to = last.to_version || 'unknown';
+            showToast('Updated ' + from + ' → ' + to, 'success');
+            // Best-effort dismiss so we don't re-toast on every settings open.
+            try {
+                fetch(adminUrl + '?action=dismiss_update_banner', { method: 'POST', credentials: 'same-origin' });
+            } catch (e) {}
+        }
+
+        async function saveUpdateChannel() {
+            const sel = document.getElementById('auto-update-channel');
+            if (!sel) return;
+            const channel = sel.value === 'testing' ? 'testing' : 'main';
+            const emailInput = document.getElementById('auto-update-email');
+            const email = emailInput ? emailInput.value.trim() : '';
+            const fd = new FormData();
+            fd.append('channel', channel);
+            fd.append('email', email);
+            try {
+                const r = await fetch(adminUrl + '?action=save_update_channel', {
+                    method: 'POST', body: fd, credentials: 'same-origin',
+                });
+                const data = await r.json();
+                if (data && data.success) {
+                    showToast('Saved', 'success');
+                } else {
+                    showToast(data.error || 'Failed to save', 'error');
+                }
+            } catch (e) {
+                showToast('Failed to save', 'error');
+            }
+        }
+
+        async function rollbackUpdate() {
+            if (!confirm('Roll back to the previous version? Your data/ and user_config.php are preserved either way.')) {
+                return;
+            }
+            try {
+                const r = await fetch(adminUrl + '?action=rollback_update', {
+                    method: 'POST', credentials: 'same-origin',
+                });
+                const data = await r.json();
+                if (data && data.success) {
+                    showToast('Rolled back. Reload the page.', 'success');
+                } else {
+                    showToast('Rollback failed', 'error');
+                }
+            } catch (e) {
+                showToast('Rollback failed', 'error');
             }
         }
 
