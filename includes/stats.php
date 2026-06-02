@@ -153,7 +153,26 @@ class Stats {
             $whereMelt['params']
         )['s'];
 
-        $totalFeesPaid = $feesPaidByNote['upstream'] + $feesPaidByNote['dev'] + $feesPaidByNote['hosting'] + $networkFees;
+        // Swap fees (paid by the customer, bundled into the LN invoice).
+        // Source: swap_attempts joined to settled invoices in the date window.
+        // We count provider percentage fee + lockup miner fee separately for
+        // future drill-down, but the summary surfaces only the total.
+        $whereSwap = self::compose(
+            ['clauses' => ["i.status = 'Settled'"], 'params' => []],
+            self::storeWhere($storeId, 'sa.store_id'),
+            self::rangeWhere($startTs, 'i.created_at')
+        );
+        $swapFeesRow = Database::fetchOne(
+            "SELECT
+                COALESCE(SUM(sa.swap_lockup_fee_sats), 0) AS lockup,
+                COALESCE(SUM(sa.swap_percent_fee_sats), 0) AS pct
+             FROM swap_attempts sa
+             JOIN invoices i ON i.id = sa.invoice_id" . $whereSwap['sql'],
+            $whereSwap['params']
+        );
+        $swapFees = (int)$swapFeesRow['lockup'] + (int)$swapFeesRow['pct'];
+
+        $totalFeesPaid = $feesPaidByNote['upstream'] + $feesPaidByNote['dev'] + $feesPaidByNote['hosting'] + $networkFees + $swapFees;
         $profit = $revenue - $totalFeesPaid;
         $effectiveFeePct = $revenue > 0 ? ($totalFeesPaid / $revenue * 100.0) : 0.0;
 
@@ -180,6 +199,7 @@ class Stats {
                 'dev' => $feesPaidByNote['dev'],
                 'hosting' => $feesPaidByNote['hosting'],
                 'network' => $networkFees,
+                'swap' => $swapFees,
                 'total' => $totalFeesPaid,
             ],
             'fees_owed' => $owed,

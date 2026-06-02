@@ -147,6 +147,16 @@ if (isset($_GET['api'])) {
                 'email' => $store['notification_email'] ?? '',
             ];
 
+            // Submarine swap (LN→onchain) tri-state override:
+            //   -1=inherit site default, 0=force off, 1=force on.
+            require_once __DIR__ . '/includes/swap/config.php';
+            $swapOverride = isset($store['swaps_enabled']) ? (int)$store['swaps_enabled'] : SwapsConfig::INHERIT;
+            $storeSwaps = [
+                'override' => $swapOverride,             // tri-state
+                'siteDefault' => SwapsConfig::siteEnabled(),
+                'effective' => SwapsConfig::isEnabledForStore($storeId),
+            ];
+
             // On-chain Bitcoin payment settings.
             $onchainXpub = $store['onchain_xpub'] ?? '';
             $onchain = [
@@ -223,6 +233,7 @@ if (isset($_GET['api'])) {
                 'autoMelt' => $autoMelt,
                 'notifications' => $storeNotifications,
                 'onchain' => $onchain,
+                'swaps' => $storeSwaps,
                 'reliability' => (function() {
                     require_once __DIR__ . '/includes/mint_reliability.php';
                     $disabled = MintReliability::listDisabledMints();
@@ -1338,6 +1349,74 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 Config::set('notifications_auto_withdraw_enabled', $autoWithdrawEnabled);
                 Config::set('notifications_to_email', $toEmail);
 
+                echo json_encode(['success' => true]);
+            } catch (Exception $e) {
+                http_response_code(400);
+                echo json_encode(['error' => $e->getMessage()]);
+            }
+            break;
+
+        // ----- Submarine swap settings -----
+
+        case 'get_swap_settings':
+            Auth::requireAdmin();
+            require_once __DIR__ . '/includes/swap/config.php';
+            require_once __DIR__ . '/includes/swap/factory.php';
+            echo json_encode([
+                'enabled'             => SwapsConfig::siteEnabled(),
+                'providerOrder'       => SwapsConfig::providerOrder(),
+                'knownProviders'      => SwapProviderFactory::knownProviderNames(),
+                'strictNoMintFallback'=> SwapsConfig::strictNoMintFallback(),
+                'minimumTargetSats'   => SwapsConfig::minimumTargetSats(),
+            ]);
+            break;
+
+        case 'save_swap_settings':
+            Auth::requireAdmin();
+            require_once __DIR__ . '/includes/swap/config.php';
+            require_once __DIR__ . '/includes/swap/factory.php';
+            try {
+                $enabled = ($_POST['enabled'] ?? '0') === '1';
+                $strict = ($_POST['strict_no_mint_fallback'] ?? '0') === '1';
+                $rawMin = trim((string)($_POST['minimum_target_sats'] ?? ''));
+                $minSats = ($rawMin === '') ? null : max(0, (int)$rawMin);
+
+                $orderRaw = trim((string)($_POST['provider_order'] ?? ''));
+                $known = SwapProviderFactory::knownProviderNames();
+                $order = [];
+                foreach (explode(',', $orderRaw) as $p) {
+                    $p = strtolower(trim($p));
+                    if ($p !== '' && in_array($p, $known, true) && !in_array($p, $order, true)) {
+                        $order[] = $p;
+                    }
+                }
+                if ($enabled && empty($order)) {
+                    throw new Exception('At least one provider must be selected when swaps are enabled');
+                }
+                if (!empty($order)) {
+                    SwapsConfig::setProviderOrder($order);
+                }
+                SwapsConfig::setSiteEnabled($enabled);
+                SwapsConfig::setStrictNoMintFallback($strict);
+                SwapsConfig::setMinimumTargetSats($minSats);
+
+                echo json_encode(['success' => true]);
+            } catch (Exception $e) {
+                http_response_code(400);
+                echo json_encode(['error' => $e->getMessage()]);
+            }
+            break;
+
+        case 'save_store_swaps':
+            Auth::requireAdmin();
+            require_once __DIR__ . '/includes/swap/config.php';
+            try {
+                $storeId = $_POST['store_id'] ?? '';
+                $override = (int)($_POST['override'] ?? SwapsConfig::INHERIT);
+                if (empty($storeId)) {
+                    throw new Exception('Store ID required');
+                }
+                SwapsConfig::setStoreOverride($storeId, $override);
                 echo json_encode(['success' => true]);
             } catch (Exception $e) {
                 http_response_code(400);
@@ -3253,6 +3332,37 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                         </div>
                     </div>
 
+                    <!-- Per-store submarine-swap override. Tri-state: inherit
+                         the site default, or force on/off for this store. -->
+                    <div class="card" id="card-store-swaps">
+                        <div class="card-header">
+                            <div class="card-title">Submarine Swaps (LN→on-chain)</div>
+                        </div>
+                        <div class="card-body">
+                            <p style="font-size: 0.85rem; color: var(--text-secondary); margin: 0 0 0.75rem 0;">
+                                Override the site-wide swap setting for this store. Requires an
+                                on-chain xpub on the Bitcoin tab. Site default:
+                                <strong id="store-swaps-site-default">—</strong>.
+                            </p>
+
+                            <div class="form-group">
+                                <label class="form-label">Mode</label>
+                                <select class="form-input" id="store-swaps-override">
+                                    <option value="-1">Inherit site default</option>
+                                    <option value="1">Force on for this store</option>
+                                    <option value="0">Force off for this store</option>
+                                </select>
+                                <p class="form-help">
+                                    Currently effective: <strong id="store-swaps-effective">—</strong>
+                                </p>
+                            </div>
+
+                            <button class="btn btn-full" id="btn-save-store-swaps" style="margin-top: 0.5rem;">
+                                Save
+                            </button>
+                        </div>
+                    </div>
+
                     <div class="card">
                         <div class="card-header">
                             <div class="card-title">Exchange Rate Settings</div>
@@ -3529,6 +3639,68 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                     </div>
                 </div>
 
+                <!--
+                    Submarine swaps — site-wide master switch + provider
+                    preference order + strict fallback policy. Replaces the
+                    cashu mint in the LN invoice flow with a non-custodial
+                    LN→on-chain swap that settles directly to the merchant's
+                    xpub. Disabled by default. Per-store override lives in
+                    that store's settings card.
+                -->
+                <div class="card" data-admin-only="true" id="card-swaps">
+                    <div class="card-header">
+                        <div class="card-title">Submarine Swaps</div>
+                    </div>
+                    <div class="card-body">
+                        <p style="font-size: 0.85rem; color: var(--text-secondary); margin: 0 0 0.75rem 0;">
+                            Settle Lightning invoices on-chain directly to the merchant's xpub via
+                            a third-party swap provider (Zeus, Boltz). Eliminates the cashu mint as
+                            an intermediate custodian. Requires each store using swaps to have an
+                            on-chain xpub configured. See README for trade-offs.
+                        </p>
+
+                        <div class="toggle-container">
+                            <span><strong>Enable submarine swaps</strong> (site-wide default)</span>
+                            <label class="toggle">
+                                <input type="checkbox" id="swaps-enabled">
+                                <span class="toggle-slider"></span>
+                            </label>
+                        </div>
+
+                        <div class="form-group" style="margin-top: 1rem;">
+                            <label class="form-label">Provider preference order</label>
+                            <input type="text" class="form-input" id="swaps-provider-order"
+                                   placeholder="zeus,boltz">
+                            <p class="form-help">
+                                Comma-separated; first reachable wins per invoice. Known providers:
+                                <span id="swaps-known-providers"></span>.
+                            </p>
+                        </div>
+
+                        <div class="toggle-container" style="margin-top: 0.75rem;">
+                            <span>Strict mode (don't fall back to mint when no swap can be created)</span>
+                            <label class="toggle">
+                                <input type="checkbox" id="swaps-strict">
+                                <span class="toggle-slider"></span>
+                            </label>
+                        </div>
+
+                        <div class="form-group" style="margin-top: 1rem;">
+                            <label class="form-label">Minimum target (sats)</label>
+                            <input type="number" class="form-input" id="swaps-min-sats"
+                                   placeholder="provider default" min="0" step="1">
+                            <p class="form-help">
+                                Local floor in addition to the provider's own minimum. Leave blank
+                                to use the provider's minimum (Boltz mainnet: 10,000 sats).
+                            </p>
+                        </div>
+
+                        <button class="btn btn-full" id="btn-save-swaps" style="margin-top: 1rem;">
+                            Save swap settings
+                        </button>
+                    </div>
+                </div>
+
                 <!-- My Account card: own password + logout, available to every logged-in user -->
                 <?php if (!Urls::isWordPress()): ?>
                 <div class="card" id="card-my-account">
@@ -3706,6 +3878,9 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                                 </div>
                                 <div class="stats-stat-row" title="Lightning routing fees and on-chain miner fees consumed by user payouts and fee settlements (sum of melts.network_fee_sats).">
                                     <span class="stats-stat-label">Network fees</span><span class="stats-stat-value" id="stats-fee-network-paid">—</span>
+                                </div>
+                                <div class="stats-stat-row" title="Submarine-swap fees paid by customers on swap-rail invoices (provider percentage + on-chain lockup miner fee, bundled into each LN invoice the customer paid).">
+                                    <span class="stats-stat-label">Swap fees</span><span class="stats-stat-value" id="stats-fee-swap-paid">—</span>
                                 </div>
                                 <hr style="border: 0; border-top: 1px solid var(--border); margin: 0.5rem 0;">
                                 <div class="stats-stat-row"><span class="stats-stat-label">Total fees owed</span><span class="stats-stat-value" id="stats-fees-owed">—</span></div>
@@ -4310,6 +4485,10 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
             if (saveNotifsBtn) saveNotifsBtn.addEventListener('click', saveNotificationSettings);
             const testNotifsBtn = document.getElementById('btn-send-test-notification');
             if (testNotifsBtn) testNotifsBtn.addEventListener('click', sendTestNotification);
+            const saveSwapsBtn = document.getElementById('btn-save-swaps');
+            if (saveSwapsBtn) saveSwapsBtn.addEventListener('click', saveSwapSettings);
+            const saveStoreSwapsBtn = document.getElementById('btn-save-store-swaps');
+            if (saveStoreSwapsBtn) saveStoreSwapsBtn.addEventListener('click', saveStoreSwaps);
             document.getElementById('btn-validate-onchain').addEventListener('click', validateOnchainXpub);
             document.getElementById('btn-test-onchain').addEventListener('click', testOnchainCurrent);
             document.getElementById('btn-save-onchain').addEventListener('click', saveOnchain);
@@ -4458,6 +4637,7 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                     loadCronUrl();
                     loadAutoUpdateCard();
                     loadNotificationSettings();
+                    loadSwapSettings();
                 }
             }
         }
@@ -4859,6 +5039,9 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                 updateReliabilityBanner(dashboardData.reliability);
                 updateCronStaleBanner(dashboardData.cronStaleWarning || null);
 
+                // Per-store swap override + effective indicator.
+                refreshStoreSwapsCard();
+
             } catch (e) {
                 console.error(e);
                 showToast('Failed to load dashboard', 'error');
@@ -5037,6 +5220,8 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
             document.getElementById('stats-fee-dev-paid').innerHTML = formatStatsAmount(s.fees_paid.dev);
             document.getElementById('stats-fee-hosting-paid').innerHTML = formatStatsAmount(s.fees_paid.hosting);
             document.getElementById('stats-fee-network-paid').innerHTML = formatStatsAmount(s.fees_paid.network);
+            const swapFeeEl = document.getElementById('stats-fee-swap-paid');
+            if (swapFeeEl) swapFeeEl.innerHTML = formatStatsAmount(s.fees_paid.swap || 0);
             document.getElementById('stats-fees-owed').innerHTML = formatStatsAmount(s.fees_owed.total);
             document.getElementById('stats-fees-paid').innerHTML = formatStatsAmount(s.fees_paid.total);
 
@@ -6368,6 +6553,87 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                 }
             } catch (e) {
                 showToast('Failed to save notification settings', 'error');
+            }
+        }
+
+        // -------- Submarine swap settings --------
+
+        async function loadSwapSettings() {
+            try {
+                const response = await fetch(`${adminUrl}?action=get_swap_settings`);
+                if (!response.ok) return;
+                const data = await response.json();
+                const enabledEl = document.getElementById('swaps-enabled');
+                const orderEl = document.getElementById('swaps-provider-order');
+                const strictEl = document.getElementById('swaps-strict');
+                const minEl = document.getElementById('swaps-min-sats');
+                const knownEl = document.getElementById('swaps-known-providers');
+                if (enabledEl) enabledEl.checked = !!data.enabled;
+                if (orderEl) orderEl.value = (data.providerOrder || []).join(',');
+                if (strictEl) strictEl.checked = !!data.strictNoMintFallback;
+                if (minEl) minEl.value = data.minimumTargetSats ?? '';
+                if (knownEl) knownEl.textContent = (data.knownProviders || []).join(', ');
+            } catch (e) {
+                console.error('Failed to load swap settings', e);
+            }
+        }
+
+        async function saveSwapSettings() {
+            const enabled = document.getElementById('swaps-enabled').checked ? '1' : '0';
+            const strict = document.getElementById('swaps-strict').checked ? '1' : '0';
+            const order = document.getElementById('swaps-provider-order').value.trim();
+            const minSats = document.getElementById('swaps-min-sats').value.trim();
+            try {
+                const response = await postWithCsrf(adminUrl,
+                    `action=save_swap_settings`
+                    + `&enabled=${enabled}`
+                    + `&strict_no_mint_fallback=${strict}`
+                    + `&provider_order=${encodeURIComponent(order)}`
+                    + `&minimum_target_sats=${encodeURIComponent(minSats)}`
+                );
+                const result = await response.json();
+                if (response.ok) {
+                    showToast('Swap settings saved!', 'success');
+                } else {
+                    showToast(result.error || 'Failed to save', 'error');
+                }
+            } catch (e) {
+                showToast('Failed to save swap settings', 'error');
+            }
+        }
+
+        function refreshStoreSwapsCard() {
+            // Driven by dashboardData.swaps once loaded.
+            if (!dashboardData || !dashboardData.swaps) return;
+            const sel = document.getElementById('store-swaps-override');
+            const eff = document.getElementById('store-swaps-effective');
+            const def = document.getElementById('store-swaps-site-default');
+            if (sel) sel.value = String(dashboardData.swaps.override);
+            if (eff) eff.textContent = dashboardData.swaps.effective ? 'on' : 'off';
+            if (def) def.textContent = dashboardData.swaps.siteDefault ? 'on' : 'off';
+        }
+
+        async function saveStoreSwaps() {
+            if (!currentStoreId) {
+                showToast('No store selected', 'error');
+                return;
+            }
+            const override = document.getElementById('store-swaps-override').value;
+            try {
+                const response = await postWithCsrf(adminUrl,
+                    `action=save_store_swaps&store_id=${encodeURIComponent(currentStoreId)}&override=${encodeURIComponent(override)}`
+                );
+                const result = await response.json();
+                if (response.ok) {
+                    showToast('Store swap setting saved', 'success');
+                    // Re-fetch dashboard data to refresh "effective" indicator.
+                    await loadDashboardData();
+                    refreshStoreSwapsCard();
+                } else {
+                    showToast(result.error || 'Failed to save', 'error');
+                }
+            } catch (e) {
+                showToast('Failed to save store swap setting', 'error');
             }
         }
 
