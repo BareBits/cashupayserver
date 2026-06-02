@@ -698,6 +698,68 @@ HTACCESS;
             ");
         }
 
+        // Submarine swaps (LN→on-chain via Boltz/Zeus). Replaces the cashu
+        // mint in the LN invoice flow with a non-custodial swap that settles
+        // directly to the merchant's xpub. Feature is off by default; site-
+        // wide and per-store toggles control activation.
+        if (!self::columnExists($pdo, 'stores', 'swaps_enabled')) {
+            // Tri-state: -1 inherit site default, 0 force off, 1 force on.
+            $pdo->exec("ALTER TABLE stores ADD COLUMN swaps_enabled INTEGER NOT NULL DEFAULT -1");
+        }
+        if (!self::columnExists($pdo, 'invoices', 'payment_rail')) {
+            // 'mint' (cashu mint, existing default) / 'swap' (submarine swap) /
+            // 'onchain' (pay-to-address only). Set once at invoice create time.
+            $pdo->exec("ALTER TABLE invoices ADD COLUMN payment_rail TEXT NOT NULL DEFAULT 'mint'");
+        }
+        if (!self::tableExists($pdo, 'swap_attempts')) {
+            $pdo->exec("
+                CREATE TABLE swap_attempts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    invoice_id TEXT NOT NULL REFERENCES invoices(id) ON DELETE CASCADE,
+                    store_id TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    network TEXT NOT NULL,
+                    direction TEXT NOT NULL DEFAULT 'reverse',
+                    swap_id_external TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    preimage_hex TEXT,
+                    preimage_hash_hex TEXT NOT NULL,
+                    claim_pubkey_hex TEXT NOT NULL,
+                    claim_privkey_hex TEXT NOT NULL,
+                    refund_pubkey_hex TEXT NOT NULL,
+                    lockup_address TEXT NOT NULL,
+                    lockup_txid TEXT,
+                    lockup_vout INTEGER,
+                    lockup_amount_sats INTEGER,
+                    timeout_block_height INTEGER NOT NULL,
+                    claim_leaf_script_hex TEXT NOT NULL,
+                    refund_leaf_script_hex TEXT NOT NULL,
+                    lightning_invoice TEXT NOT NULL,
+                    target_onchain_amount_sats INTEGER NOT NULL,
+                    invoice_amount_sats INTEGER NOT NULL,
+                    swap_lockup_fee_sats INTEGER NOT NULL DEFAULT 0,
+                    swap_percent_fee_sats INTEGER NOT NULL DEFAULT 0,
+                    merchant_address TEXT NOT NULL,
+                    merchant_address_index INTEGER NOT NULL,
+                    claim_txid TEXT,
+                    error_message TEXT,
+                    last_polled_at INTEGER,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    FOREIGN KEY (store_id) REFERENCES stores(id) ON DELETE CASCADE
+                );
+            ");
+        }
+        if (!self::indexExists($pdo, 'idx_swap_attempts_invoice')) {
+            $pdo->exec("CREATE INDEX idx_swap_attempts_invoice ON swap_attempts(invoice_id);");
+        }
+        if (!self::indexExists($pdo, 'idx_swap_attempts_status')) {
+            $pdo->exec("CREATE INDEX idx_swap_attempts_status ON swap_attempts(status, last_polled_at);");
+        }
+        if (!self::indexExists($pdo, 'idx_swap_attempts_store')) {
+            $pdo->exec("CREATE INDEX idx_swap_attempts_store ON swap_attempts(store_id, created_at DESC);");
+        }
+
         // Drop the legacy users.pin_hash column (PIN feature removed). Uses
         // the SQLite table-rebuild dance for compatibility with SQLite < 3.35.
         if (self::columnExists($pdo, 'users', 'pin_hash')) {

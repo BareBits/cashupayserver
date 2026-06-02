@@ -86,6 +86,62 @@ class OnchainPayments {
     }
 
     /**
+     * Atomically allocate the next address on the same xpub counter, intended
+     * as the destination of a submarine-swap claim transaction. Shares the
+     * counter with {@see allocateAddress} so addresses never collide between
+     * pay-to-xpub and swap-claim allocations; uses the same `m/0/{i}` branch
+     * so funds remain discoverable by the merchant's wallet via xpub scan.
+     *
+     * Unlike allocateAddress, this does NOT set anything on the invoices
+     * table — the caller persists merchant_address on swap_attempts.
+     *
+     * @return array{address:string, index:int}|null  null if store has no xpub
+     */
+    public static function allocateClaimAddress(string $storeId): ?array {
+        $pdo = Database::getInstance();
+        $pdo->beginTransaction();
+        try {
+            $stmt = $pdo->prepare("SELECT * FROM stores WHERE id = ?");
+            $stmt->execute([$storeId]);
+            $row = $stmt->fetch(PDO::FETCH_ASSOC);
+            if (!$row || empty($row['onchain_xpub'])) {
+                $pdo->commit();
+                return null;
+            }
+            $xpubHash = hash('sha256', $row['onchain_xpub']);
+            $now = time();
+            $pdo->prepare(
+                "INSERT INTO onchain_xpub_state (xpub_hash, next_index, updated_at)
+                 VALUES (?, 0, ?) ON CONFLICT(xpub_hash) DO NOTHING"
+            )->execute([$xpubHash, $now]);
+            $sel = $pdo->prepare(
+                "SELECT next_index FROM onchain_xpub_state WHERE xpub_hash = ?"
+            );
+            $sel->execute([$xpubHash]);
+            $index = (int)$sel->fetchColumn();
+            $pdo->prepare(
+                "UPDATE onchain_xpub_state SET next_index = next_index + 1, updated_at = ?
+                  WHERE xpub_hash = ?"
+            )->execute([$now, $xpubHash]);
+            $pdo->prepare(
+                "UPDATE stores SET onchain_next_index = ? WHERE id = ?"
+            )->execute([$index + 1, $storeId]);
+
+            $address = OnchainWallet::deriveAddress(
+                $row['onchain_xpub'],
+                $row['onchain_address_type'] ?: 'P2WPKH',
+                $row['onchain_network'] ?: 'mainnet',
+                $index
+            );
+            $pdo->commit();
+            return ['address' => $address, 'index' => $index];
+        } catch (Throwable $e) {
+            $pdo->rollBack();
+            throw $e;
+        }
+    }
+
+    /**
      * Poll the configured provider for an invoice's address and apply any
      * resulting lifecycle transitions.
      *

@@ -12,6 +12,12 @@ declare(strict_types=1);
 
 $dir = __DIR__;
 $files = glob($dir . '/test_*.php');
+// Sibling suites: include the swap/crypto self-tests in the same single command.
+$files = array_merge(
+    $files,
+    glob(dirname($dir) . '/crypto/test_*.php') ?: [],
+    glob(dirname($dir) . '/swap/test_*.php') ?: []
+);
 sort($files);
 
 if (empty($files)) {

@@ -58,6 +58,75 @@ BareBits Lite sits between custodial payment gateways and full self-hosting:
 | BTCPay Server | Full sovereignty | Needs VPS ($20+/mo), Docker, ongoing maintenance |
 | **BareBits Lite** | Simple, cheap hosting | Trust mint with funds until withdrawal |
 
+## Submarine Swaps (LN → on-chain, optional)
+
+When enabled, BareBits Lite can route a customer's Lightning payment through a
+third-party submarine-swap provider (Zeus or Boltz) and settle the proceeds
+**directly on-chain to the merchant's xpub** — without the cashu mint ever
+holding the funds.
+
+The customer's experience is unchanged: they pay the same single BOLT11 invoice
+on the checkout page. Behind the scenes, the provider holds the LN payment
+until BareBits Lite has claimed the corresponding on-chain output via a
+Taproot HTLC; the held LN invoice is then settled atomically with the on-chain
+claim.
+
+**Pros**
+
+- **Non-custodial.** Customer's funds never touch a mint. The provider holds the
+  LN payment for at most the swap window (typically tens of minutes); on success
+  the LN payment settles only when the on-chain claim completes. On failure the
+  LN HTLC times out and the customer's wallet refunds itself automatically.
+- **Direct on-chain settlement.** Funds land at an xpub-derived address you
+  control, discoverable by any standard wallet that scans the xpub.
+- **Provider-agnostic.** Site-wide preference order across multiple providers;
+  if the primary is unreachable at invoice creation, the next one is tried.
+- **Customer pays the fees.** Swap fees (provider percent + on-chain lockup
+  miner fee) are bundled into the LN invoice amount; the merchant receives the
+  target sat amount on-chain net of fees.
+
+**Cons**
+
+- **Per-invoice fees.** Boltz currently charges ~0.5% + the lockup miner fee.
+  Stats dashboard tracks both as a "Swap fees" line item.
+- **Min/max amount limits.** Boltz mainnet currently enforces 10,000 sats min
+  and 5,000,000 sats max per swap; invoices outside this range can't use the
+  swap rail.
+- **Provider dependency.** The provider must be reachable at invoice creation
+  to bake an HTLC; the cron poller must run on a regular cadence to claim the
+  on-chain output before the timeout. If neither runs, the customer's LN
+  payment is refunded automatically (no loss), but the merchant receives
+  nothing.
+- **Optional mint fallback.** By default, if all configured providers are
+  unreachable or the amount is out-of-range, BareBits Lite falls back to the
+  cashu mint. You can enable "strict mode" in settings to disable the fallback
+  and reject the invoice instead — useful for operators who want to eliminate
+  the mint entirely from their payment flow.
+
+**Enabling**
+
+1. Go to *Settings* → *Submarine Swaps*. Toggle the master switch on, configure
+   the provider preference order (`zeus,boltz` recommended; first reachable
+   wins), and decide whether to allow mint fallback.
+2. Each store that should use swaps needs an on-chain xpub configured under
+   *Bitcoin* in that store's settings.
+3. (Optional) Per-store override: a store can force swaps on or off
+   independently of the site default.
+
+**Providers and testnet**
+
+| Provider | Mainnet | Testnet | Regtest |
+|----------|---------|---------|---------|
+| Zeus     | `https://swaps.zeuslsp.com/api`       | `https://testnet-swaps.zeuslsp.com/api` | — |
+| Boltz    | `https://api.boltz.exchange`          | — (discontinued upstream)               | configurable (`swaps_boltz_regtest_url`) |
+
+**Out of scope for this version (planned follow-ups)**
+
+- Cooperative musig2 keypath claim (currently script-path only — slightly less
+  private on-chain, otherwise functionally identical).
+- On-chain → LN direction (only LN → on-chain is implemented; interface is
+  designed to accommodate it later).
+
 ## Requirements
 
 - PHP 8.0 or higher
