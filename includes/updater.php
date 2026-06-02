@@ -25,6 +25,20 @@ class Updater {
     public const BACKUPS_TO_KEEP = 3;
     public const HTTP_USER_AGENT = 'cashupayserver-updater';
 
+    /**
+     * Override for the release-tag API base URL. Tests point this at a
+     * local fixture server. Null = use GitHub. Production code never
+     * touches this; production callers should not see this property.
+     */
+    public static ?string $releaseApiUrlBase = null;
+
+    /**
+     * Override for the install root. Tests point this at a tempdir so
+     * the overlay / backup / rollback paths can run hermetically.
+     * Null = use the project root (parent of includes/).
+     */
+    public static ?string $installRootOverride = null;
+
     // Files/dirs that must survive an update (relative to install root).
     private const PRESERVE_PATHS = [
         'data',
@@ -100,7 +114,7 @@ class Updater {
     }
 
     public static function installRoot(): string {
-        return dirname(__DIR__);
+        return self::$installRootOverride ?? dirname(__DIR__);
     }
 
     private static function isWordPressMode(): bool {
@@ -115,12 +129,12 @@ class Updater {
      */
     private static function fetchRemoteBuildInfo(string $channel): ?array {
         $tag = 'channel-' . $channel;
-        $apiUrl = sprintf(
-            'https://api.github.com/repos/%s/%s/releases/tags/%s',
+        $base = self::$releaseApiUrlBase ?? sprintf(
+            'https://api.github.com/repos/%s/%s/releases/tags/',
             self::GH_OWNER,
-            self::GH_REPO,
-            $tag
+            self::GH_REPO
         );
+        $apiUrl = $base . $tag;
         $release = self::httpGetJson($apiUrl);
         if (!is_array($release) || empty($release['assets'])) {
             return null;
@@ -269,7 +283,6 @@ class Updater {
         ]);
         Config::set('updater_banner_dismissed', false);
 
-        self::notifyAdmin($oldVersion, $newVersion, $channel, $token, !$htaccessUntouched);
         self::log("update applied: $oldVersion -> $newVersion ($channel)");
         return true;
     }
@@ -465,35 +478,6 @@ class Updater {
     public static function consumeRecoveryToken(): void {
         $path = self::installRoot() . '/data/updates/recovery_token.txt';
         @unlink($path);
-    }
-
-    // ---------------- Admin notification ----------------
-
-    private static function notifyAdmin(string $from, string $to, string $channel, string $token, bool $htaccessHeldBack): void {
-        $email = Config::get('admin_notification_email');
-        if (!is_string($email) || $email === '') {
-            return;
-        }
-        $host = $_SERVER['HTTP_HOST'] ?? 'your-server';
-        $url = ($_SERVER['HTTPS'] ?? '') ? "https://$host" : "http://$host";
-        $recoveryUrl = $url . '/recover.php?token=' . urlencode($token);
-
-        $subject = "BareBits Lite updated: $from -> $to";
-        $body = "BareBits Lite auto-update applied on $host.\n\n"
-            . "Channel: $channel\n"
-            . "From version: $from\n"
-            . "To version:   $to\n\n"
-            . "If the site is broken, use this one-time recovery URL to roll back\n"
-            . "to the previous version:\n\n"
-            . "  $recoveryUrl\n\n";
-        if ($htaccessHeldBack) {
-            $body .= "Note: a new .htaccess shipped with this update, but your local\n"
-                . ".htaccess had been edited. The new version was saved as\n"
-                . ".htaccess.new — review and merge manually if needed.\n\n";
-        }
-        $body .= "This message was sent by your CashuPayServer / BareBits Lite installation.\n";
-        $headers = "From: no-reply@$host\r\nContent-Type: text/plain; charset=UTF-8";
-        @mail($email, $subject, $body, $headers);
     }
 
     // ---------------- HTTP ----------------

@@ -270,7 +270,6 @@ if (isset($_GET['api'])) {
                 'banner_dismissed' => $dismissed,
                 'backups' => Updater::listBackups(),
                 'htaccess_new_exists' => is_file(__DIR__ . '/.htaccess.new'),
-                'notification_email' => Config::get('admin_notification_email', ''),
             ]);
             break;
 
@@ -713,17 +712,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 break;
             }
             Updater::setChannel($channel);
-            // Optional notification email. Empty string clears it.
-            if (array_key_exists('email', $_POST)) {
-                $email = trim((string)$_POST['email']);
-                if ($email === '' || filter_var($email, FILTER_VALIDATE_EMAIL)) {
-                    Config::set('admin_notification_email', $email);
-                } else {
-                    http_response_code(400);
-                    echo json_encode(['error' => 'Invalid email']);
-                    break;
-                }
-            }
             // Forget the cached last-check so the next cron tick re-evaluates
             // against the newly chosen channel immediately.
             Config::set('updater_last_check', 0);
@@ -3338,12 +3326,7 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                             </select>
                             <p class="form-help">Override the value set in user_config.php.</p>
                         </div>
-                        <div class="form-group">
-                            <label class="form-label" for="auto-update-email">Notification email (optional)</label>
-                            <input type="email" id="auto-update-email" class="form-input" placeholder="admin@example.com">
-                            <p class="form-help">If set, you get an email after each auto-update with a one-time rollback URL. Leave blank to skip email.</p>
-                        </div>
-                        <button class="btn btn-full" id="btn-save-update-channel" style="margin-bottom: 0.5rem;">Save settings</button>
+                        <button class="btn btn-full" id="btn-save-update-channel" style="margin-bottom: 0.5rem;">Save channel</button>
                         <div id="auto-update-htaccess-warning" class="hidden" style="background: rgba(247,147,26,0.15); border: 1px solid rgba(247,147,26,0.4); padding: 0.6rem; border-radius: 6px; font-size: 0.85rem; margin-bottom: 0.5rem;">
                             A new .htaccess shipped with the latest update, but your live
                             .htaccess was edited — it was left untouched. The new version is
@@ -6974,8 +6957,6 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                 const sha = data.current_sha ? data.current_sha.slice(0, 12) : 'unknown';
                 cur.textContent = (data.current_version || 'unknown') + ' (' + sha + ')';
                 if (sel) sel.value = (data.channel === 'testing') ? 'testing' : 'main';
-                const emailInput = document.getElementById('auto-update-email');
-                if (emailInput) emailInput.value = data.notification_email || '';
                 if (data.htaccess_new_exists) {
                     warn.classList.remove('hidden');
                 } else {
@@ -7013,18 +6994,15 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
             const sel = document.getElementById('auto-update-channel');
             if (!sel) return;
             const channel = sel.value === 'testing' ? 'testing' : 'main';
-            const emailInput = document.getElementById('auto-update-email');
-            const email = emailInput ? emailInput.value.trim() : '';
             const fd = new FormData();
             fd.append('channel', channel);
-            fd.append('email', email);
             try {
                 const r = await fetch(adminUrl + '?action=save_update_channel', {
                     method: 'POST', body: fd, credentials: 'same-origin',
                 });
                 const data = await r.json();
                 if (data && data.success) {
-                    showToast('Saved', 'success');
+                    showToast('Channel set to ' + data.channel, 'success');
                 } else {
                     showToast(data.error || 'Failed to save', 'error');
                 }
