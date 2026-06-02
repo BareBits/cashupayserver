@@ -21,6 +21,7 @@ require_once __DIR__ . '/includes/free_trial.php';
 require_once __DIR__ . '/includes/security.php';
 require_once __DIR__ . '/includes/background.php';
 require_once __DIR__ . '/includes/onchain/payments.php';
+require_once __DIR__ . '/includes/swap/poller.php';
 require_once __DIR__ . '/includes/trusted_mints.php';
 require_once __DIR__ . '/includes/updater.php';
 require_once __DIR__ . '/includes/notification_sender.php';
@@ -148,6 +149,24 @@ try {
     $results['tasks']['poll_onchain'] = "polled {$polled} invoice(s)" . ($errored ? ", {$errored} errored" : '');
 } catch (Exception $e) {
     $results['tasks']['poll_onchain'] = 'error: ' . $e->getMessage();
+}
+
+// Task 4c: Drive in-flight submarine swaps through their lifecycle. Same
+// batched + last_polled_at gated pattern as the other pollers. Failures
+// inside individual rows are captured in swap_attempts.error_message; the
+// task only fails outright if pollPending() itself throws.
+try {
+    $swapResults = SwapPoller::pollPending(30, 20);
+    $results['tasks']['poll_swaps'] = "polled {$swapResults['polled']} swap(s)"
+        . ($swapResults['errors'] ? ", {$swapResults['errors']} errored" : '');
+} catch (Exception $e) {
+    $results['tasks']['poll_swaps'] = 'error: ' . $e->getMessage();
+}
+try {
+    SwapPoller::expireStale();
+    $results['tasks']['expire_swaps'] = 'ok';
+} catch (Exception $e) {
+    $results['tasks']['expire_swaps'] = 'error: ' . $e->getMessage();
 }
 
 // Task 5: C1 - Sync proof states with mint (if not synced recently)

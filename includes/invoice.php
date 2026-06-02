@@ -14,6 +14,10 @@ require_once __DIR__ . '/notification_sender.php';
 require_once __DIR__ . '/urls.php';
 require_once __DIR__ . '/../cashu-wallet-php/CashuWallet.php';
 require_once __DIR__ . '/onchain/payments.php';
+require_once __DIR__ . '/swap/factory.php';
+require_once __DIR__ . '/swap/config.php';
+require_once __DIR__ . '/crypto/secp256k1.php';
+require_once __DIR__ . '/crypto/taproot.php';
 
 use Cashu\Wallet;
 use Cashu\WalletStorage;
@@ -56,11 +60,28 @@ class Invoice {
             $exchangeRate = ExchangeRates::getBtcPrice($currency, $primaryProvider, $secondaryProvider);
         }
 
+        // ---- Submarine-swap path: replaces the cashu mint with a non-custodial
+        // LN→on-chain swap that settles directly to the merchant's xpub. ----
+        $swapAttempt = null; // populated by self::trySwapCreate on success
+        if (SwapsConfig::isEnabledForStore($storeId) && $onchainConfigured) {
+            // Target = what the merchant wants to receive on-chain in sats.
+            $targetSats = ExchangeRates::convertToSats((string)$amount, $currency, 'sat');
+            $swapAttempt = self::trySwapCreate($storeId, $store, $targetSats);
+            if ($swapAttempt === null && SwapsConfig::strictNoMintFallback()) {
+                throw new Exception(
+                    'Submarine swap could not be created (all providers failed or amount '
+                    . 'is outside provider limits). Strict mode is on — no mint fallback.'
+                );
+            }
+        }
+
         // ---- Cashu / Lightning path: try mint quote(s) if a mint is configured ----
+        // Skipped when the swap path won — the swap supplies its own BOLT11 and
+        // the customer must pay that exact invoice (mint would create a different one).
         $quote = null;
         $usedMintUrl = null;
         $amountInMintUnit = null;
-        if ($cashuConfigured) {
+        if ($cashuConfigured && $swapAttempt === null) {
             $mintUnit = $store['mint_unit'];
             $amountInMintUnit = ExchangeRates::convertToMintUnit(
                 $amount, $currency, $mintUnit, $exchangeFee, $primaryProvider, $secondaryProvider
@@ -92,11 +113,14 @@ class Invoice {
         }
 
         // ---- On-chain path: allocate a fresh address from the store's xpub ----
+        // Skipped on swap-rail invoices — the customer is paying via Lightning,
+        // and offering a pay-to-address option in parallel would create a
+        // second settlement path the swap lifecycle is not aware of.
         $onchainAddress = null;
         $onchainIndex = null;
         $onchainAmountSat = null;
         $onchainCreatedTipHeight = null;
-        if ($onchainConfigured) {
+        if ($onchainConfigured && $swapAttempt === null) {
             $allocation = OnchainPayments::allocateAddress($storeId);
             if ($allocation !== null) {
                 $onchainAddress = $allocation['address'];
@@ -106,7 +130,9 @@ class Invoice {
             }
         }
 
-        // Calculate expiration
+        // Calculate expiration. Swap-rail invoices use the provider's BOLT11
+        // expiration plus an extra grace window for cron to drive the claim;
+        // mint-rail and onchain-rail use the existing default.
         $expiration = ($quote && isset($quote->expiry))
             ? $quote->expiry
             : (time() + Config::getInvoiceExpiration());
@@ -115,6 +141,21 @@ class Invoice {
         $invoiceId = Database::generateId('inv');
         $now = Database::timestamp();
 
+        // Decide payment_rail + final field values
+        if ($swapAttempt !== null) {
+            $paymentRail = 'swap';
+            $bolt11Final = $swapAttempt['swap']->invoice;
+            $mintUrlFinal = null;
+            $quoteIdFinal = null;
+            $amountSatsFinal = $swapAttempt['swap']->invoiceAmountSats;
+        } else {
+            $paymentRail = $quote ? 'mint' : ($onchainAddress ? 'onchain' : 'mint');
+            $bolt11Final = $quote ? $quote->request : null;
+            $mintUrlFinal = $usedMintUrl;
+            $quoteIdFinal = $quote ? $quote->quote : null;
+            $amountSatsFinal = $amountInMintUnit;
+        }
+
         Database::insert('invoices', [
             'id' => $invoiceId,
             'store_id' => $storeId,
@@ -122,20 +163,26 @@ class Invoice {
             'additional_status' => 'None',
             'amount' => $amount,
             'currency' => $currency,
-            'amount_sats' => $amountInMintUnit,
+            'amount_sats' => $amountSatsFinal,
             'exchange_rate' => $exchangeRate,
-            'quote_id' => $quote ? $quote->quote : null,
-            'bolt11' => $quote ? $quote->request : null,
-            'mint_url' => $usedMintUrl,
+            'quote_id' => $quoteIdFinal,
+            'bolt11' => $bolt11Final,
+            'mint_url' => $mintUrlFinal,
             'onchain_address' => $onchainAddress,
             'onchain_address_index' => $onchainIndex,
             'onchain_amount_sat' => $onchainAmountSat,
             'onchain_created_tip_height' => $onchainCreatedTipHeight,
+            'payment_rail' => $paymentRail,
             'metadata' => $metadata ? json_encode($metadata) : null,
             'checkout_config' => $checkout ? json_encode($checkout) : null,
             'created_at' => $now,
             'expiration_time' => $expiration,
         ]);
+
+        // Persist the swap_attempts row, now that the invoice exists for the FK.
+        if ($swapAttempt !== null) {
+            self::persistSwapAttempt($invoiceId, $storeId, $swapAttempt, $now);
+        }
 
         $invoice = self::getById($invoiceId);
 
@@ -143,6 +190,178 @@ class Invoice {
         WebhookSender::fireEvent($storeId, 'InvoiceCreated', $invoice);
 
         return $invoice;
+    }
+
+    /**
+     * Try each configured swap provider in order. Returns null if none could
+     * service this request (provider unreachable, amount out of range, lockup
+     * verification failed). The caller then either falls back to the mint or
+     * errors out depending on the site's strict-fallback setting.
+     *
+     * On success returns:
+     *   ['swap' => SwapCreateResult,
+     *    'provider' => string,
+     *    'network' => string,
+     *    'claim_privkey' => string (32 bytes),
+     *    'claim_pubkey' => string (33 bytes),
+     *    'preimage' => string (32 bytes),
+     *    'preimage_hash' => string (32 bytes),
+     *    'merchant_address' => string,
+     *    'merchant_address_index' => int,
+     *    'lockup_fee_sats' => int,
+     *    'percent_fee_sats' => int]
+     */
+    private static function trySwapCreate(string $storeId, array $store, int $targetSats): ?array {
+        if ($targetSats <= 0) return null;
+        $localMin = SwapsConfig::minimumTargetSats();
+        if ($localMin !== null && $targetSats < $localMin) {
+            return null;
+        }
+        $network = $store['onchain_network'] ?? 'mainnet';
+
+        foreach (SwapProviderFactory::orderedForSite() as $provider) {
+            try {
+                $pairInfo = $provider->getReversePairInfo($network);
+                if ($targetSats < $pairInfo->minSats || $targetSats > $pairInfo->maxSats) {
+                    continue;
+                }
+
+                // Allocate destination address (shared xpub counter).
+                $alloc = OnchainPayments::allocateClaimAddress($storeId);
+                if ($alloc === null) {
+                    // Should not happen — caller guards on $onchainConfigured.
+                    return null;
+                }
+
+                // Per-swap fresh keypair + preimage.
+                $claimPriv = random_bytes(32);
+                $claimPubPoint = Secp256k1::generatorMult(Secp256k1::bytesToGmp($claimPriv));
+                if ($claimPubPoint === null) {
+                    continue; // 1-in-2^256 — re-roll on next call
+                }
+                $claimPub = Secp256k1::pointToCompressed($claimPubPoint);
+                $preimage = random_bytes(32);
+                $preimageHash = hash('sha256', $preimage, true);
+
+                $swap = $provider->createReverseSwap(
+                    $network,
+                    $targetSats,
+                    bin2hex($claimPub),
+                    bin2hex($preimageHash)
+                );
+
+                // Verify the lockup_address Boltz returned matches what we
+                // compute locally from the parsed swap tree. Defends against
+                // a buggy or hostile provider that would give us an address
+                // whose script-path we can't satisfy.
+                if (!self::verifySwapLockup($swap, $claimPub, $network)) {
+                    error_log("swap: lockup address mismatch from {$provider->getName()}; trying next");
+                    continue;
+                }
+
+                $lockupFee = $pairInfo->lockupFeeSats;
+                $percentFee = max(0, $swap->invoiceAmountSats - $targetSats - $lockupFee);
+
+                return [
+                    'swap' => $swap,
+                    'provider' => $provider->getName(),
+                    'network' => $network,
+                    'claim_privkey' => $claimPriv,
+                    'claim_pubkey' => $claimPub,
+                    'preimage' => $preimage,
+                    'preimage_hash' => $preimageHash,
+                    'merchant_address' => $alloc['address'],
+                    'merchant_address_index' => $alloc['index'],
+                    'lockup_fee_sats' => $lockupFee,
+                    'percent_fee_sats' => $percentFee,
+                ];
+            } catch (Throwable $e) {
+                error_log("swap: provider {$provider->getName()} failed: " . $e->getMessage());
+                continue;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Recompute the Taproot output key from claim+refund pubkeys + the parsed
+     * swap-tree leaves, and compare against the provider-returned lockup
+     * address. Returns false on any mismatch.
+     */
+    private static function verifySwapLockup(SwapCreateResult $swap, string $claimPub33, string $network): bool {
+        try {
+            $claimLeafHash  = Taproot::tapLeafHash(Taproot::TAPSCRIPT_LEAF_VERSION, $swap->claimLeafScript);
+            $refundLeafHash = Taproot::tapLeafHash(Taproot::TAPSCRIPT_LEAF_VERSION, $swap->refundLeafScript);
+            $merkleRoot = Taproot::tapBranchHash($claimLeafHash, $refundLeafHash);
+            $refundPub33 = hex2bin($swap->refundPublicKeyHex);
+            $internalKey = Taproot::keyAggInternalKey([$refundPub33, $claimPub33]);
+            [$outKey, $_parity] = Taproot::tweakOutputKey($internalKey, $merkleRoot);
+            $expected = Taproot::encodeP2trAddress($outKey, $network);
+            return strcasecmp($expected, $swap->lockupAddress) === 0;
+        } catch (Throwable $e) {
+            error_log('swap: lockup verification threw: ' . $e->getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Persist the swap_attempts row after the parent invoice has been inserted.
+     */
+    private static function persistSwapAttempt(string $invoiceId, string $storeId, array $att, int $now): void {
+        $swap = $att['swap'];
+        Database::getInstance()->prepare(
+            "INSERT INTO swap_attempts (
+                invoice_id, store_id, provider, network, direction,
+                swap_id_external, status,
+                preimage_hex, preimage_hash_hex,
+                claim_pubkey_hex, claim_privkey_hex, refund_pubkey_hex,
+                lockup_address, timeout_block_height,
+                claim_leaf_script_hex, refund_leaf_script_hex,
+                lightning_invoice,
+                target_onchain_amount_sats, invoice_amount_sats,
+                swap_lockup_fee_sats, swap_percent_fee_sats,
+                merchant_address, merchant_address_index,
+                created_at, updated_at
+            ) VALUES (
+                :invoice_id, :store_id, :provider, :network, :direction,
+                :swap_id_external, :status,
+                :preimage_hex, :preimage_hash_hex,
+                :claim_pubkey_hex, :claim_privkey_hex, :refund_pubkey_hex,
+                :lockup_address, :timeout_block_height,
+                :claim_leaf_script_hex, :refund_leaf_script_hex,
+                :lightning_invoice,
+                :target_onchain_amount_sats, :invoice_amount_sats,
+                :swap_lockup_fee_sats, :swap_percent_fee_sats,
+                :merchant_address, :merchant_address_index,
+                :created_at, :updated_at
+            )"
+        )->execute([
+            ':invoice_id' => $invoiceId,
+            ':store_id' => $storeId,
+            ':provider' => $att['provider'],
+            ':network' => $att['network'],
+            ':direction' => 'reverse',
+            ':swap_id_external' => $swap->swapId,
+            ':status' => 'swap.created',
+            ':preimage_hex' => bin2hex($att['preimage']),
+            ':preimage_hash_hex' => bin2hex($att['preimage_hash']),
+            ':claim_pubkey_hex' => bin2hex($att['claim_pubkey']),
+            ':claim_privkey_hex' => bin2hex($att['claim_privkey']),
+            ':refund_pubkey_hex' => $swap->refundPublicKeyHex,
+            ':lockup_address' => $swap->lockupAddress,
+            ':timeout_block_height' => $swap->timeoutBlockHeight,
+            ':claim_leaf_script_hex' => bin2hex($swap->claimLeafScript),
+            ':refund_leaf_script_hex' => bin2hex($swap->refundLeafScript),
+            ':lightning_invoice' => $swap->invoice,
+            ':target_onchain_amount_sats' => $swap->onchainAmountSats,
+            ':invoice_amount_sats' => $swap->invoiceAmountSats,
+            ':swap_lockup_fee_sats' => $att['lockup_fee_sats'],
+            ':swap_percent_fee_sats' => $att['percent_fee_sats'],
+            ':merchant_address' => $att['merchant_address'],
+            ':merchant_address_index' => $att['merchant_address_index'],
+            ':created_at' => $now,
+            ':updated_at' => $now,
+        ]);
     }
 
     /**
