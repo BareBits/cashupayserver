@@ -1,0 +1,48 @@
+# Override host-port bindings to avoid conflicts with whatever else is
+# running on the dev box. cashupayserver only needs Boltz's API (port 9001)
+# to be reachable from outside the Docker network; everything else stays
+# internal.
+services:
+  postgres:
+    ports: !override []
+  redis:
+    ports: !override []
+  bitcoind:
+    ports: !override []
+  elementsd:
+    ports: !override []
+  esplora:
+    ports: !override []
+  electrs:
+    ports: !override []
+  electrs-liquid:
+    ports: !override []
+  cln-1:
+    ports: !override []
+  cln-2:
+    ports: !override []
+  lnd-1:
+    ports: !override []
+  lnd-2:
+    ports: !override []
+  lnd-3:
+    ports: !override []
+  boltz-backend-nginx:
+    ports:
+      - 29001:9001
+  boltz-web-app:
+    ports: !override []
+  boltz-client:
+    ports: !override []
+  anvil:
+    ports: !override []
+  otterscan:
+    ports: !override []
+  nbxplorer:
+    ports: !override []
+  arkd-wallet:
+    ports: !override []
+  arkd:
+    ports: !override []
+  fulmine:
+    ports: !override []
