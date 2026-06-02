@@ -1,403 +1,239 @@
 #!/usr/bin/env python3
 """Unified dev driver for interactive submarine-swap testing.
 
-Spins up:
-  - Fulcrum (Electrum-protocol server) pointed at Boltz's bitcoind
-  - Electrum daemon, with a fresh regtest wallet, connected to Fulcrum
-  - cashupayserver via php -S, configured for swaps with the
-    Electrum-derived vpub as the merchant xpub
-  - Boltz regtest stack is assumed to be ALREADY RUNNING externally
-    (start with `cd /tmp/boltz-regtest && sudo bash start.sh`)
+Brings up the full single-bitcoind topology:
+  - Boltz regtest stack (started via the boltz_regtest fixture)
+  - Fulcrum + Electrum on the host pointed at Boltz's bitcoind
+  - cashupayserver configured for swaps with the Electrum vpub
+  - A Lightning channel from Electrum → Boltz's lnd-1 (so Electrum can
+    pay BOLT11 invoices that route through Boltz)
+  - Runs one demo swap end-to-end so you can see the on-chain UTXO appear
+  - Launches the Electrum GUI for hands-on testing
+  - Halts on Enter (TTY) or SIGTERM (when backgrounded)
 
-Halts at the end of bring-up; press Enter to clean up.
-
-Network topology: a single bitcoind (Boltz's container, RPC exposed on
-host :28443) is the authoritative chain. Electrum and Fulcrum see the
-same UTXOs Boltz's backend operates on. When a swap claim is broadcast
-by cashupayserver via the Boltz API, it lands in this chain — and
-Electrum picks it up at the merchant xpub address.
+Run from the repo root:
+    python3 tests/scripts/swap_dev.py
 """
 from __future__ import annotations
 
-import json
 import os
-import secrets
 import signal
-import socket
-import subprocess
 import sys
 import time
 import uuid
-from base64 import b64encode
 from pathlib import Path
 
-import urllib.request
-import urllib.error
+# Make tests/ importable so we can use the shared bring-up helpers.
+TESTS_DIR = Path(__file__).resolve().parent.parent
+if str(TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTS_DIR))
 
-REPO_ROOT = Path(__file__).resolve().parent.parent.parent
-PHP = REPO_ROOT / "tests" / "bin" / "php-8.3.31" / "php"
-FULCRUM = REPO_ROOT / "tests" / "bin" / "fulcrum-2.1.1" / "Fulcrum"
-ELECTRUM = REPO_ROOT / "tests" / "bin" / "electrum-4.7.2" / "electrum.AppImage"
-
-BOLTZ_BITCOIND_RPC_PORT = 28443
-BOLTZ_API_URL = "http://localhost:29001"
+from fixtures.boltz_regtest import start_boltz_regtest, stop_boltz_regtest, _check_docker_available
+from fixtures import swap_stack
+from fixtures.swap_stack import (
+    create_swap_invoice,
+    drive_swap_to_terminal,
+    fetch_invoice_row,
+    fetch_swap_row,
+    fund_electrum,
+    open_channel_to_boltz_receiver,
+    pay_bolt11,
+    setup_payserver,
+    start_electrum,
+    start_fulcrum,
+    stop_electrum,
+    stop_fulcrum,
+    stop_payserver,
+    wait_for_lightning_route,
+    ELECTRUM,
+)
 
 
 def echo(msg: str) -> None:
     print(f"[swap-dev] {msg}", flush=True)
 
 
-def free_port() -> int:
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    p = s.getsockname()[1]
-    s.close()
-    return p
-
-
-def boltz_bitcoind_cookie() -> str:
-    """Fetch the current cookie auth string from Boltz's bitcoind container."""
-    res = subprocess.run(
-        ["sudo", "-n", "docker", "exec", "boltz-bitcoind",
-         "cat", "/app/bitcoin/regtest/.cookie"],
-        capture_output=True, text=True, check=True,
-    )
-    return res.stdout.strip()
-
-
-def start_fulcrum(workdir: Path, cookie: str, tcp_port: int) -> subprocess.Popen:
-    datadir = workdir / "fulcrum"
-    datadir.mkdir(parents=True, exist_ok=True)
-    # cookie format: __cookie__:<value>
-    user, _, password = cookie.partition(":")
-    conf = datadir / "fulcrum.conf"
-    conf.write_text(
-        "\n".join([
-            f"datadir = {datadir}",
-            f"bitcoind = 127.0.0.1:{BOLTZ_BITCOIND_RPC_PORT}",
-            f"rpcuser = {user}",
-            f"rpcpassword = {password}",
-            f"tcp = 127.0.0.1:{tcp_port}",
-            "debug = false",
-            "polltime = 1",
-            "",
-        ])
-    )
-    log = (datadir / "fulcrum.log").open("ab")
-    proc = subprocess.Popen([str(FULCRUM), str(conf)], stdout=log, stderr=subprocess.STDOUT)
-    # Wait for it to accept connections
-    deadline = time.monotonic() + 30
-    while time.monotonic() < deadline:
+def launch_electrum_gui(electrum: swap_stack.ElectrumProc) -> None:
+    """Stop the daemon (it holds the wallet exclusively) and launch the GUI
+    against the same wallet path. Sets electrum.gui_process so cleanup
+    can stop it."""
+    if electrum.process and electrum.process.poll() is None:
         try:
-            with socket.create_connection(("127.0.0.1", tcp_port), timeout=1.0):
-                return proc
-        except OSError:
-            time.sleep(0.3)
-    proc.kill()
-    raise TimeoutError(f"Fulcrum did not come up on :{tcp_port}")
-
-
-def electrum_cli(appimage: Path, datadir: Path, *args: str) -> str:
-    env = os.environ.copy()
-    env.setdefault("APPIMAGE_EXTRACT_AND_RUN", "1")
-    res = subprocess.run(
-        [str(appimage), "--regtest", "--dir", str(datadir), *args],
-        capture_output=True, text=True, env=env,
-    )
-    if res.returncode != 0:
-        raise RuntimeError(f"electrum {args} failed: {res.stderr}\n{res.stdout}")
-    return res.stdout.strip()
-
-
-def electrum_rpc(rpc_port: int, user: str, password: str, method: str, params: list | dict | None = None) -> dict:
-    body = json.dumps({"id": 0, "method": method, "params": params or []}).encode()
-    auth = b64encode(f"{user}:{password}".encode()).decode()
-    req = urllib.request.Request(
-        f"http://127.0.0.1:{rpc_port}/",
-        data=body,
-        headers={"Authorization": f"Basic {auth}", "Content-Type": "application/json"},
-    )
-    with urllib.request.urlopen(req, timeout=20) as resp:
-        return json.loads(resp.read().decode())
-
-
-def start_electrum(workdir: Path, fulcrum_port: int) -> tuple[subprocess.Popen, int, str, str, str]:
-    """Returns (daemon_proc, rpc_port, rpc_user, rpc_pass, vpub)."""
-    datadir = workdir / "electrum"
-    datadir.mkdir(parents=True, exist_ok=True)
-    rpc_user = "electrum"
-    rpc_password = secrets.token_hex(16)
-    rpc_port = free_port()
-
-    # Configure
-    for k, v in [
-        ("rpcuser", rpc_user),
-        ("rpcpassword", rpc_password),
-        ("rpcport", str(rpc_port)),
-        ("server", f"127.0.0.1:{fulcrum_port}:t"),
-        ("oneserver", "true"),
-        ("auto_connect", "false"),
-        ("use_gossip", "true"),
-        ("decimal_point", "0"),
-        ("dont_show_testnet_warning", "true"),
-        ("check_updates", "false"),
-    ]:
-        electrum_cli(ELECTRUM, datadir, "--offline", "setconfig", k, v)
-
-    # Create wallet (fresh seed)
-    electrum_cli(ELECTRUM, datadir, "--offline", "create")
-
-    # Start daemon
-    env = os.environ.copy()
-    env.setdefault("APPIMAGE_EXTRACT_AND_RUN", "1")
-    log = (datadir / "daemon.log").open("ab")
-    proc = subprocess.Popen(
-        [str(ELECTRUM), "--regtest", "--dir", str(datadir), "daemon", "-v"],
-        env=env, stdout=log, stderr=subprocess.STDOUT,
-    )
-    # Wait for JSON-RPC
-    deadline = time.monotonic() + 30
-    while time.monotonic() < deadline:
-        try:
-            electrum_rpc(rpc_port, rpc_user, rpc_password, "version")
-            break
-        except Exception:
-            time.sleep(0.4)
-    else:
-        proc.kill()
-        raise TimeoutError("Electrum daemon did not start")
-
-    # Load the wallet
-    wallet_path = datadir / "regtest" / "wallets" / "default_wallet"
-    electrum_rpc(rpc_port, rpc_user, rpc_password, "load_wallet", {"wallet_path": str(wallet_path)})
-
-    # Get master public key via CLI — RPC `getmpk` is wallet-context-sensitive
-    # and AppImage's daemon API doesn't accept a wallet path the same way the
-    # CLI does. CLI talks to the daemon under the hood and returns the vpub.
-    vpub = electrum_cli(ELECTRUM, datadir, "getmpk", "-w", str(wallet_path)).strip()
-    if not vpub:
-        raise RuntimeError("getmpk returned empty")
-
-    return proc, rpc_port, rpc_user, rpc_password, vpub
-
-
-def php_eval(data_dir: Path, snippet: str) -> str:
-    code = (
-        f"define('CASHUPAY_DATA_DIR', {str(data_dir)!r});\n"
-        f"require_once {str(REPO_ROOT / 'includes' / 'database.php')!r};\n"
-        f"require_once {str(REPO_ROOT / 'includes' / 'config.php')!r};\n"
-        + snippet
-    )
-    res = subprocess.run([str(PHP), "-r", code], capture_output=True, text=True)
-    if res.returncode != 0:
-        raise RuntimeError(f"php failed: {res.stderr}\n---stdout---\n{res.stdout}")
-    return res.stdout.strip()
-
-
-def configure_payserver(data_dir: Path, vpub: str) -> tuple[str, str]:
-    """Initializes the DB, seeds setup-complete, creates one store with the
-    Electrum-derived vpub, enables swaps, and creates an API token.
-
-    Returns (store_id, api_token)."""
-    php_eval(data_dir, "Database::initialize(); echo 'ok';")
-    import sqlite3
-    db = data_dir / "cashupay.sqlite"
-    now = int(time.time())
-    store_id = f"store_{uuid.uuid4().hex[:12]}"
-    api_token = "dev-" + uuid.uuid4().hex[:20]
-    import hashlib
-    api_token_hash = hashlib.sha256(api_token.encode()).hexdigest()
-
-    conn = sqlite3.connect(str(db))
-    try:
-        cur = conn.cursor()
-        for k, v in [
-            ("setup_complete", json.dumps(True)),
-            ("swaps_enabled", json.dumps(True)),
-            ("swaps_provider_order", json.dumps(["boltz"])),
-            ("swaps_strict_no_mint_fallback", json.dumps(True)),
-            ("swaps_boltz_regtest_url", json.dumps(BOLTZ_API_URL)),
-            ("cron_key", json.dumps("dev-cron-key")),
-        ]:
-            cur.execute(
-                "INSERT INTO config (key, value, created_at, updated_at) VALUES (?, ?, ?, ?) "
-                "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
-                (k, v, now, now),
-            )
-        cur.execute(
-            "INSERT INTO stores (id, name, mint_unit, default_currency, created_at, "
-            "onchain_xpub, onchain_address_type, onchain_network) VALUES "
-            "(?, 'Swap Dev Store', 'sat', 'sat', ?, ?, 'P2WPKH', 'regtest')",
-            (store_id, now, vpub),
-        )
-        cur.execute(
-            "INSERT INTO api_keys (id, key_hash, store_id, label, permissions, created_at) "
-            "VALUES (?, ?, ?, 'dev', ?, ?)",
-            (
-                "key_" + uuid.uuid4().hex[:12],
-                api_token_hash,
-                store_id,
-                json.dumps(["*"]),
-                now,
-            ),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-    return store_id, api_token
-
-
-def start_payserver(data_dir: Path) -> tuple[subprocess.Popen, int]:
-    port = free_port()
-    wrapper = data_dir / "router_wrapper.php"
-    wrapper.write_text(
-        "<?php\n"
-        "$d = getenv('CASHUPAY_DATA_DIR');\n"
-        "if ($d !== false && $d !== '' && !defined('CASHUPAY_DATA_DIR')) {\n"
-        "    define('CASHUPAY_DATA_DIR', $d);\n"
-        "}\n"
-        f"return require {str(REPO_ROOT / 'router.php')!r};\n"
-    )
-    env = os.environ.copy()
-    env["CASHUPAY_DATA_DIR"] = str(data_dir)
-    log = (data_dir / "payserver.log").open("ab")
-    proc = subprocess.Popen(
-        [str(PHP), "-S", f"127.0.0.1:{port}", "-t", str(REPO_ROOT), str(wrapper)],
-        cwd=str(REPO_ROOT), env=env, stdout=log, stderr=subprocess.STDOUT,
-    )
-    # Wait for HTTP
-    deadline = time.monotonic() + 20
-    while time.monotonic() < deadline:
-        try:
-            urllib.request.urlopen(f"http://127.0.0.1:{port}/api/v1/server/info", timeout=1.0)
-            return proc, port
-        except Exception:
-            time.sleep(0.3)
-    proc.kill()
-    raise TimeoutError(f"cashupayserver did not come up on :{port}")
-
-
-def fund_electrum_wallet(rpc_port: int, user: str, password: str, sats: int, electrum_datadir: Path | None = None) -> None:
-    """Send some sats from Boltz's bitcoind to a fresh Electrum address."""
-    addr = None
-    if electrum_datadir is not None:
-        # CLI is more reliable for AppImage daemons; doesn't need wallet routing.
-        try:
-            addr = electrum_cli(ELECTRUM, electrum_datadir, "getunusedaddress").strip()
+            swap_stack.electrum_cli(electrum.datadir, "stop", timeout=10)
         except Exception:
             pass
-    if not addr:
-        addr_resp = electrum_rpc(rpc_port, user, password, "getunusedaddress")
-        addr = addr_resp.get("result")
-    if not addr:
-        echo(f"could not get electrum address")
-        return
-    echo(f"funding Electrum at {addr} with {sats} sats...")
-    btc = sats / 100_000_000
-    subprocess.run(
-        ["sudo", "-n", "docker", "exec", "boltz-scripts", "bash", "-c",
-         f"source /etc/profile.d/utils.sh && bitcoin-cli-sim-client -named sendtoaddress address={addr} amount={btc:.8f}"],
-        capture_output=True, text=True, check=False,
-    )
-    # Mine a few blocks to confirm
-    subprocess.run(
-        ["sudo", "-n", "docker", "exec", "boltz-scripts", "bash", "-c",
-         "source /etc/profile.d/utils.sh && bitcoin-cli-sim-client -generate 6"],
-        capture_output=True, text=True, check=False,
+        try:
+            electrum.process.wait(timeout=10)
+        except Exception:
+            try:
+                electrum.process.kill()
+            except Exception:
+                pass
+    env = os.environ.copy()
+    env.setdefault("APPIMAGE_EXTRACT_AND_RUN", "1")
+    import subprocess as _subprocess
+    electrum.gui_process = _subprocess.Popen(
+        [str(ELECTRUM), "--regtest", "--dir", str(electrum.datadir),
+         "--wallet", str(electrum.wallet_path)],
+        env=env,
+        stdout=_subprocess.DEVNULL, stderr=_subprocess.DEVNULL,
     )
 
 
 def main() -> int:
+    skip = _check_docker_available()
+    if skip:
+        echo(f"FATAL: {skip}")
+        echo("install docker + docker-compose-v2 and ensure `sudo -n docker version` works")
+        return 1
+
     workdir = Path("/tmp") / f"swap-dev-{int(time.time())}-{uuid.uuid4().hex[:6]}"
     workdir.mkdir()
     echo(f"workdir = {workdir}")
 
-    # 1. Boltz bitcoind cookie auth
-    echo("reading Boltz bitcoind cookie ...")
-    cookie = boltz_bitcoind_cookie()
+    boltz = None
+    fulcrum = None
+    electrum = None
+    payserver = None
 
-    # 2. Fulcrum -> Boltz bitcoind
-    fulcrum_port = free_port()
-    echo(f"starting Fulcrum on :{fulcrum_port} -> 127.0.0.1:{BOLTZ_BITCOIND_RPC_PORT}")
-    fulcrum_proc = start_fulcrum(workdir, cookie, fulcrum_port)
-
-    # 3. Electrum daemon
-    echo("starting Electrum daemon + creating wallet ...")
-    electrum_proc, electrum_rpc_port, electrum_user, electrum_pass, vpub = start_electrum(workdir, fulcrum_port)
-    echo(f"Electrum vpub = {vpub}")
-
-    # 4. cashupayserver
-    echo("initializing cashupayserver DB + seeding swap config ...")
-    data_dir = workdir / "payserver-data"
-    data_dir.mkdir()
-    store_id, api_token = configure_payserver(data_dir, vpub)
-
-    echo("starting cashupayserver (php -S) ...")
-    payserver_proc, payserver_port = start_payserver(data_dir)
-    payserver_url = f"http://127.0.0.1:{payserver_port}"
-
-    # 5. Optional: fund the Electrum wallet so the GUI shows some balance
     try:
-        echo("funding Electrum with 10,000,000 sats from Boltz bitcoind ...")
-        fund_electrum_wallet(electrum_rpc_port, electrum_user, electrum_pass, 10_000_000,
-                              electrum_datadir=workdir / "electrum")
-    except Exception as e:
-        echo(f"funding failed (non-fatal — fund via Electrum GUI or scripts container later): {e}")
+        echo("starting Boltz regtest stack (this can take ~60-90s on first run) ...")
+        boltz = start_boltz_regtest()
+        echo(f"Boltz API ready: {boltz.api_url}")
+        echo(f"Boltz lnd-1 pubkey: {boltz.lnd1_pubkey}")
 
-    print()
-    print("=" * 72)
-    print("Unified stack ready")
-    print("=" * 72)
-    print(f"Bitcoin RPC:         127.0.0.1:{BOLTZ_BITCOIND_RPC_PORT}  (Boltz's regtest bitcoind)")
-    print(f"Fulcrum:             127.0.0.1:{fulcrum_port}")
-    print(f"Electrum daemon RPC: 127.0.0.1:{electrum_rpc_port}  (user={electrum_user})")
-    print(f"Electrum vpub:       {vpub}")
-    print(f"Boltz API:           {BOLTZ_API_URL}")
-    print(f"Boltz web app:       http://localhost:8080")
-    print(f"Payserver:           {payserver_url}")
-    print(f"Payserver admin:     {payserver_url}/admin  (no password set; setup is bypassed)")
-    print(f"Store ID:            {store_id}")
-    print(f"API token:           {api_token}")
-    print(f"Workdir:             {workdir}")
-    print()
-    print("Try a swap end-to-end:")
-    print("  1. Create a 60,000+ sat invoice via the API:")
-    print(f"     curl -X POST {payserver_url}/api/v1/stores/{store_id}/invoices \\")
-    print(f"          -H 'Authorization: token {api_token}' \\")
-    print(f"          -H 'Content-Type: application/json' \\")
-    print(f"          -d '{{\"amount\":60000,\"currency\":\"sat\"}}'")
-    print("  2. Copy the bolt11 from the response (checkout.paymentMethods.BTC-LightningNetwork.destination).")
-    print("  3. Pay it from Boltz's customer LND:")
-    print("     sudo docker exec boltz-scripts bash -c \\")
-    print("       'source /etc/profile.d/utils.sh && lncli-sim 1 payinvoice -f <bolt11>'")
-    print("  4. Drive cron repeatedly until invoice.status == Settled:")
-    print(f"     while true; do curl -s '{payserver_url}/cron.php?key=dev-cron-key' >/dev/null; sleep 2; done")
-    print("  5. Open Electrum GUI to watch the claim UTXO land on your vpub:")
-    print(f"     APPIMAGE_EXTRACT_AND_RUN=1 {ELECTRUM} --regtest --dir {workdir / 'electrum'} gui")
-    print()
+        echo("starting Fulcrum (Electrum protocol -> Boltz bitcoind) ...")
+        fulcrum = start_fulcrum(workdir, boltz)
 
-    # Halt
-    if sys.stdin.isatty():
-        print("Press Enter to clean up and exit ...")
+        echo("starting Electrum daemon + creating fresh wallet ...")
+        electrum = start_electrum(workdir, fulcrum.port)
+        echo(f"Electrum vpub = {electrum.vpub}")
+
+        echo("funding Electrum on-chain with 5,000,000 sats from Boltz bitcoind ...")
+        fund_electrum(electrum, boltz, 5_000_000)
+
+        echo(f"opening 300,000-sat Lightning channel directly to Boltz's cln-2 (the BOLT11 receiver) ...")
+        channel_point = open_channel_to_boltz_receiver(electrum, boltz, capacity_sat=300_000)
+        echo(f"channel point: {channel_point}")
+        wait_for_lightning_route(electrum, boltz.cln2_pubkey, timeout=10)
+
+        echo("starting cashupayserver + seeding swap config ...")
+        # strict=False so the demo doesn't blow up if Boltz hiccups; you can
+        # still test strict mode by toggling in the admin.
+        payserver = setup_payserver(workdir, electrum.vpub, boltz.api_url,
+                                     strict_no_mint_fallback=False)
+        echo(f"payserver: {payserver.url}")
+
+        # ---- Demo swap ----
+        target_sats = 100_000
+        echo(f"creating demo invoice for {target_sats} sat ...")
+        invoice = create_swap_invoice(payserver, target_sats)
+        invoice_id = invoice["id"]
+        bolt11 = invoice["checkout"]["paymentMethods"]["BTC-LightningNetwork"]["destination"]
+        echo(f"invoice {invoice_id}; bolt11 {bolt11[:40]}...")
+
+        swap_row = fetch_swap_row(payserver, invoice_id)
+        if swap_row:
+            echo(f"swap_attempts: id={swap_row['id']} target={swap_row['target_onchain_amount_sats']} "
+                 f"invoice_amount={swap_row['invoice_amount_sats']} "
+                 f"fees=lockup:{swap_row['swap_lockup_fee_sats']}+pct:{swap_row['swap_percent_fee_sats']}")
+            echo(f"merchant address: {swap_row['merchant_address']}")
+
+        echo("paying the BOLT11 via Electrum lnpay (background) ...")
+        import threading
+        pay_done = threading.Event()
+        pay_result: dict = {}
+        def _pay():
+            try:
+                pay_result.update(pay_bolt11(electrum, bolt11, timeout=180))
+            except Exception as e:
+                pay_result["error"] = str(e)
+            finally:
+                pay_done.set()
+        t = threading.Thread(target=_pay, daemon=True)
+        t.start()
+
+        echo("driving cron until swap reaches terminal state ...")
         try:
-            input()
-        except (EOFError, KeyboardInterrupt):
-            pass
-    else:
-        print("(no TTY) Blocking on SIGTERM/SIGINT to keep the stack up...")
-        signal.signal(signal.SIGTERM, lambda s, f: sys.exit(0))
-        signal.signal(signal.SIGINT, lambda s, f: sys.exit(0))
-        signal.pause()
+            final = drive_swap_to_terminal(payserver, invoice_id, boltz, timeout=180)
+        except TimeoutError as e:
+            echo(f"WARN: {e} (continuing into GUI mode anyway)")
+            final = fetch_swap_row(payserver, invoice_id) or {}
 
-    echo("stopping payserver, electrum, fulcrum ...")
-    for name, proc in [("payserver", payserver_proc), ("electrum", electrum_proc), ("fulcrum", fulcrum_proc)]:
-        try:
-            proc.terminate()
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-        except Exception as e:
-            echo(f"{name} cleanup: {e}")
+        if final.get("status") == "invoice.settled":
+            echo(f"DEMO SUCCESS: invoice settled, claim_txid={final['claim_txid']}")
+        else:
+            echo(f"DEMO FINAL state: {final.get('status')} err={final.get('error_message')}")
+
+        pay_done.wait(timeout=10)
+        if pay_result.get("error"):
+            echo(f"pay_result error: {pay_result['error']}")
+
+        # ---- Manual mode: GUI + halt ----
+        echo("launching Electrum GUI for manual play ...")
+        launch_electrum_gui(electrum)
+        # mine a couple confirmations so the demo UTXO is visible
+        boltz.mine_blocks(2)
+
+        # Banner
+        print()
+        print("=" * 72)
+        print("Manual swap-dev stack ready")
+        print("=" * 72)
+        print(f"Bitcoin RPC:         127.0.0.1:{boltz.bitcoind_rpc_port}  (Boltz's regtest bitcoind)")
+        print(f"Fulcrum:             127.0.0.1:{fulcrum.port}")
+        print(f"Boltz API:           {boltz.api_url}")
+        print(f"Boltz web app:       http://localhost:8080")
+        print(f"Payserver:           {payserver.url}")
+        print(f"Payserver admin:     {payserver.url}/admin")
+        print(f"Store ID:            {payserver.store_id}")
+        print(f"API token:           {payserver.api_token}")
+        print(f"Electrum vpub:       {electrum.vpub}")
+        print(f"Electrum GUI:        wallet at {electrum.wallet_path}")
+        print(f"Workdir:             {workdir}")
+        print()
+        print("Demo swap result:")
+        print(f"  invoice {invoice_id} -> {final.get('status')}")
+        if final.get("claim_txid"):
+            print(f"  claim_txid: {final['claim_txid']}")
+            print(f"  merchant address (paid {target_sats} sat target): {final.get('merchant_address')}")
+        print()
+        print("Try more swaps:")
+        print(f"  curl -X POST {payserver.url}/api/v1/stores/{payserver.store_id}/invoices \\")
+        print(f"       -H 'Authorization: token {payserver.api_token}' \\")
+        print(f"       -H 'Content-Type: application/json' \\")
+        print(f"       -d '{{\"amount\":75000,\"currency\":\"sat\"}}'")
+        print(f"  (Then `lnpay <bolt11>` from the Electrum GUI's console)")
+        print()
+        print("Press Ctrl-C / send SIGTERM to clean up everything.")
+        print()
+
+        if sys.stdin.isatty():
+            try:
+                input("Press Enter to clean up and exit ... ")
+            except (EOFError, KeyboardInterrupt):
+                pass
+        else:
+            stop_event = signal.Event() if hasattr(signal, "Event") else None  # py3.13 has signal.Event
+            done = [False]
+            def _handler(*_):
+                done[0] = True
+            signal.signal(signal.SIGTERM, _handler)
+            signal.signal(signal.SIGINT, _handler)
+            while not done[0]:
+                signal.pause()
+
+    finally:
+        echo("cleaning up ...")
+        if payserver is not None:
+            stop_payserver(payserver)
+        if electrum is not None:
+            stop_electrum(electrum)
+        if fulcrum is not None:
+            stop_fulcrum(fulcrum)
+        if boltz is not None:
+            echo("tearing down Boltz regtest stack ...")
+            stop_boltz_regtest(boltz)
     return 0
 
 
