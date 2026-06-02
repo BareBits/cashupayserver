@@ -97,7 +97,6 @@ class Database {
                             id              TEXT PRIMARY KEY,
                             username        TEXT NOT NULL UNIQUE COLLATE NOCASE,
                             password_hash   TEXT NOT NULL,
-                            pin_hash        TEXT DEFAULT NULL,
                             role            TEXT NOT NULL CHECK (role IN ('admin','user')),
                             created_at      INTEGER NOT NULL
                         );
@@ -296,7 +295,6 @@ HTACCESS;
             id              TEXT PRIMARY KEY,
             username        TEXT NOT NULL UNIQUE COLLATE NOCASE,
             password_hash   TEXT NOT NULL,
-            pin_hash        TEXT DEFAULT NULL,
             role            TEXT NOT NULL CHECK (role IN ('admin','user')),
             created_at      INTEGER NOT NULL
         );
@@ -614,6 +612,26 @@ HTACCESS;
                 "INSERT INTO config (key, value, created_at, updated_at) VALUES ('installed_at', ?, ?, ?)"
             );
             $stmt->execute([json_encode($now), $now, $now]);
+        }
+
+        // Drop the legacy users.pin_hash column (PIN feature removed). Uses
+        // the SQLite table-rebuild dance for compatibility with SQLite < 3.35.
+        if (self::columnExists($pdo, 'users', 'pin_hash')) {
+            $pdo->exec("
+                BEGIN;
+                CREATE TABLE users_new (
+                    id              TEXT PRIMARY KEY,
+                    username        TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                    password_hash   TEXT NOT NULL,
+                    role            TEXT NOT NULL CHECK (role IN ('admin','user')),
+                    created_at      INTEGER NOT NULL
+                );
+                INSERT INTO users_new (id, username, password_hash, role, created_at)
+                    SELECT id, username, password_hash, role, created_at FROM users;
+                DROP TABLE users;
+                ALTER TABLE users_new RENAME TO users;
+                COMMIT;
+            ");
         }
     }
 

@@ -3,7 +3,7 @@
 Covers the action-level role enforcement in admin.php: every fund-touching
 or configuration-changing action returns 403 when called by a non-admin
 session, and the new user-management endpoints (list/create/delete/reset
-password/reset PIN) are admin-only and refuse to delete the last admin or
+password) are admin-only and refuse to delete the last admin or
 delete self.
 """
 from __future__ import annotations
@@ -57,7 +57,6 @@ def non_admin(configured: ConfiguredPayserver) -> dict[str, Any]:
         ("create_user", {"username": "x", "password": "abcdefgh", "role": "user"}),
         ("delete_user", {"user_id": "x"}),
         ("reset_password", {"user_id": "x", "new_password": "abcdefgh"}),
-        ("reset_user_pin", {"user_id": "x", "pin": "1234"}),
     ],
 )
 def test_non_admin_is_forbidden(
@@ -135,42 +134,6 @@ def test_change_own_password_rejects_wrong_current(
         data={"action": "change_own_password",
               "current_password": "wrong-pw",
               "new_password": "newpw1234ABC"},
-        headers={"X-CSRF-Token": staff.csrf_token},
-        timeout=15,
-    )
-    assert r.status_code == 401
-
-
-def test_user_can_set_own_pin_and_verify(
-    configured: ConfiguredPayserver, non_admin: dict[str, Any],
-) -> None:
-    staff = non_admin["client"]
-    assert staff._post_action("set_own_pin", pin="1357")["success"] is True
-
-    # Wrong PIN -> 401.
-    r = staff.s.post(
-        f"{configured.handle.url}/admin",
-        data={"action": "verify_pin", "pin": "0000"},
-        headers={"X-CSRF-Token": staff.csrf_token},
-        timeout=15,
-    )
-    assert r.status_code == 401
-
-    # Correct PIN -> success.
-    r = staff.s.post(
-        f"{configured.handle.url}/admin",
-        data={"action": "verify_pin", "pin": "1357"},
-        headers={"X-CSRF-Token": staff.csrf_token},
-        timeout=15,
-    )
-    assert r.status_code == 200
-    assert r.json()["success"] is True
-
-    # Clearing the PIN with empty string -> verify becomes impossible.
-    assert staff._post_action("set_own_pin", pin="")["success"] is True
-    r = staff.s.post(
-        f"{configured.handle.url}/admin",
-        data={"action": "verify_pin", "pin": "1357"},
         headers={"X-CSRF-Token": staff.csrf_token},
         timeout=15,
     )
@@ -270,37 +233,6 @@ def test_admin_can_reset_other_users_password(
     fresh = AdminClient(configured.handle.url)
     fresh.login("resetpw1234", username="staff")
     assert fresh.csrf_token
-
-
-def test_admin_can_set_and_clear_other_users_pin(
-    configured: ConfiguredPayserver, non_admin: dict[str, Any],
-) -> None:
-    admin = configured.admin
-
-    # Set the staff user's PIN.
-    r = admin._post_action("reset_user_pin", user_id=non_admin["id"], pin="4242")
-    assert r["success"] is True
-
-    # Verify by logging in as that user and checking PIN works.
-    staff = AdminClient(configured.handle.url)
-    staff.login("staffpw1234", username="staff")
-    v = staff.s.post(
-        f"{configured.handle.url}/admin",
-        data={"action": "verify_pin", "pin": "4242"},
-        headers={"X-CSRF-Token": staff.csrf_token},
-        timeout=15,
-    )
-    assert v.status_code == 200
-
-    # Clear it.
-    admin._post_action("reset_user_pin", user_id=non_admin["id"], pin="")
-    v = staff.s.post(
-        f"{configured.handle.url}/admin",
-        data={"action": "verify_pin", "pin": "4242"},
-        headers={"X-CSRF-Token": staff.csrf_token},
-        timeout=15,
-    )
-    assert v.status_code == 401  # No PIN -> verify returns false.
 
 
 def test_create_user_rejects_duplicate_username(

@@ -231,6 +231,82 @@ class Stats {
         return $totals;
     }
 
+    public const UPGRADE_BANNER_THRESHOLD_USD = 250.0;
+    public const UPGRADE_BANNER_DISMISS_SECS  = 90 * 86400;
+    public const UPGRADE_BANNER_DISMISS_KEY   = 'upgrade_banner_dismissed_at';
+
+    /**
+     * Eligibility check for the "upgrade to full BareBits" nudge on the stats
+     * dashboard. Returns null when the banner should stay hidden — dismissed
+     * within the last 90 days, BTC price unavailable, or revenue below the
+     * threshold across all stores. Otherwise returns the numbers used to
+     * decide so the caller can surface them for debugging if desired.
+     *
+     * Threshold logic: last 30 days > $250 OR average of non-zero buckets in
+     * the last 180 days (six rolling 30-day windows) > $250. Sats are
+     * converted to USD using the current BTC price — see Stats::btcPrice().
+     */
+    public static function upgradeBannerState(): ?array {
+        $dismissedAt = (int) Config::get(self::UPGRADE_BANNER_DISMISS_KEY, 0);
+        if ($dismissedAt > 0 && (time() - $dismissedAt) < self::UPGRADE_BANNER_DISMISS_SECS) {
+            return null;
+        }
+
+        $btcUsd = self::btcPrice('USD');
+        if ($btcUsd === null || $btcUsd <= 0) {
+            return null;
+        }
+
+        $now = time();
+        $bucketSats = [];
+        for ($i = 0; $i < 6; $i++) {
+            $start = $now - ($i + 1) * 30 * 86400;
+            $end   = $now - $i * 30 * 86400;
+            $bucketSats[$i] = (int) Database::fetchOne(
+                "SELECT COALESCE(SUM(amount_sats), 0) AS s
+                 FROM invoices
+                 WHERE status = 'Settled'
+                   AND amount_sats IS NOT NULL
+                   AND created_at >= ?
+                   AND created_at <  ?",
+                [$start, $end]
+            )['s'];
+        }
+
+        $satsToUsd = function (int $sats) use ($btcUsd): float {
+            return ($sats / 100000000.0) * $btcUsd;
+        };
+
+        $last30Usd = $satsToUsd($bucketSats[0]);
+
+        $nonZeroUsd = [];
+        foreach ($bucketSats as $sats) {
+            if ($sats > 0) {
+                $nonZeroUsd[] = $satsToUsd($sats);
+            }
+        }
+        $avgUsd = $nonZeroUsd ? array_sum($nonZeroUsd) / count($nonZeroUsd) : 0.0;
+
+        if ($last30Usd <= self::UPGRADE_BANNER_THRESHOLD_USD
+            && $avgUsd    <= self::UPGRADE_BANNER_THRESHOLD_USD) {
+            return null;
+        }
+
+        return [
+            'thresholdUsd'      => self::UPGRADE_BANNER_THRESHOLD_USD,
+            'revenueLast30dUsd' => round($last30Usd, 2),
+            'avgMonthlyUsd'     => round($avgUsd, 2),
+            'btcUsd'            => $btcUsd,
+        ];
+    }
+
+    /**
+     * Record the operator's dismissal of the upgrade banner.
+     */
+    public static function dismissUpgradeBanner(): void {
+        Config::set(self::UPGRADE_BANNER_DISMISS_KEY, time());
+    }
+
     /**
      * Chart data for the financials section. type ∈ {revenue, count, fees}.
      */

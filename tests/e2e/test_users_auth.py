@@ -5,7 +5,7 @@ Covers the foundational pieces of the security-enhancements branch:
 - login with the migrated 'admin' username works with the configured password
 - login with a bad username or password fails
 - login is case-insensitive on username
-- login response carries username + role + hasPin
+- login response carries username + role
 - session cookie is rotated on successful login
 """
 from __future__ import annotations
@@ -28,7 +28,6 @@ def test_admin_user_exists_after_setup(configured: ConfiguredPayserver) -> None:
     assert body["success"] is True
     assert body["user"]["username"] == "admin"
     assert body["user"]["role"] == "admin"
-    assert body["user"]["hasPin"] is False
 
 
 def test_login_with_wrong_password_fails(configured: ConfiguredPayserver) -> None:

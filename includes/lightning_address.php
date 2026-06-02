@@ -228,7 +228,7 @@ class LightningAddress {
                             $store['id'],
                             $store['auto_melt_address'],
                             $meltAmountSats,
-                            'Barebits Lite auto-withdrawal'
+                            'BareBits Lite auto-withdrawal'
                         );
 
                         // Record successful melt for fee-base accounting + future stats.
