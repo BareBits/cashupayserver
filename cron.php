@@ -17,6 +17,7 @@ require_once __DIR__ . '/includes/config.php';
 require_once __DIR__ . '/includes/invoice.php';
 require_once __DIR__ . '/includes/lightning_address.php';
 require_once __DIR__ . '/includes/dev_fee.php';
+require_once __DIR__ . '/includes/free_trial.php';
 require_once __DIR__ . '/includes/security.php';
 require_once __DIR__ . '/includes/background.php';
 require_once __DIR__ . '/includes/onchain/payments.php';
@@ -81,7 +82,14 @@ try {
 // BEFORE auto-melt so the fee math sees revenue that may otherwise drain in
 // this same cron pass. Per-fee failures are caught inside settleStore() so a
 // single broken LNURL never blocks the rest of the cron.
+//
+// FreeTrial::expireIfNeeded() runs first so a date- or revenue-threshold
+// crossing is observed and stamped before this tick computes owed amounts.
+// Without it, an expiry that happened mid-interval would still skip this
+// tick (DevFee::computeOwed calls it too, but explicit here keeps the
+// cron sequence obvious).
 try {
+    FreeTrial::expireIfNeeded();
     $feeResults = DevFee::settleAllStores();
     $results['tasks']['settle_fees'] = count($feeResults) > 0
         ? ['stores_processed' => count($feeResults)]
