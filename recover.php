@@ -101,7 +101,10 @@ function recover_apply(string $backupName): bool {
 
 // ---------------- Request handling ----------------
 
-$token = $_GET['token'] ?? '';
+// Token comes via GET on the confirmation step, via POST when the form
+// submits — accept either, but don't fall back to $_REQUEST (cookies can
+// override unintentionally).
+$token = $_POST['token'] ?? $_GET['token'] ?? '';
 if (!is_string($token) || !recover_verify_token($token)) {
     http_response_code(403);
     header('Content-Type: text/plain; charset=UTF-8');
@@ -142,15 +145,7 @@ HTML;
     exit;
 }
 
-// POST: actually perform rollback. Re-verify token in case of CSRF-ish replay.
-$postToken = $_POST['token'] ?? '';
-if (!is_string($postToken) || !recover_verify_token($postToken)) {
-    http_response_code(403);
-    header('Content-Type: text/plain; charset=UTF-8');
-    echo "Token invalid on POST.\n";
-    exit;
-}
-
+// POST: actually perform rollback. Token already verified at top of file.
 $ok = recover_apply($backups[0]);
 header('Content-Type: text/plain; charset=UTF-8');
 if ($ok) {
