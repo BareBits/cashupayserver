@@ -1,4 +1,4 @@
-# CashuPayServer
+# BareBits Lite
 
 > **A BTCPay-compatible payment gateway that runs on any PHP hosting.**
 
@@ -24,15 +24,15 @@ Accept Bitcoin Lightning payments without running a full BTCPay Server instance.
 
 ---
 
-## What is CashuPayServer?
+## What is BareBits Lite?
 
-CashuPayServer is a PHP-based Bitcoin Lightning payment gateway that implements BTCPay Server's Greenfield API. It uses [Cashu](https://cashu.space/) mints to handle Lightning payments, so you don't need to run your own Lightning node.
+BareBits Lite is a PHP-based Bitcoin Lightning payment gateway that implements BTCPay Server's Greenfield API. It uses [Cashu](https://cashu.space/) mints to handle Lightning payments, so you don't need to run your own Lightning node.
 
 ```
 E-commerce (WooCommerce, etc.)
     │
     ▼ (Greenfield API)
-CashuPayServer (PHP)
+BareBits Lite (PHP)
     │
     ▼ (Cashu Protocol)
 Cashu Mint ──► Lightning Network
@@ -50,13 +50,13 @@ Cashu Mint ──► Lightning Network
 
 ### Trade-offs
 
-CashuPayServer sits between custodial payment gateways and full self-hosting:
+BareBits Lite sits between custodial payment gateways and full self-hosting:
 
 | Solution | Pros | Cons |
 |----------|------|------|
 | Custodial gateways | Easy setup | KYC, can freeze funds, geographic restrictions |
 | BTCPay Server | Full sovereignty | Needs VPS ($20+/mo), Docker, ongoing maintenance |
-| **CashuPayServer** | Simple, cheap hosting | Trust mint with funds until withdrawal |
+| **BareBits Lite** | Simple, cheap hosting | Trust mint with funds until withdrawal |
 
 ## Requirements
 
@@ -83,7 +83,7 @@ if you're building from source (see Development below).
 1. **Download** `cashupay-wordpress.zip` from [GitHub Releases](https://github.com/jooray/cashupayserver/releases)
 2. In WordPress admin, go to **Plugins → Add New → Upload Plugin**
 3. **Upload** the zip file and activate
-4. Go to **Tools → CashuPay** to configure
+4. Go to **Tools → BareBits Lite** to configure
 5. Optionally integrates with the BTCPay for WooCommerce plugin if installed (configured during setup), or paste the pairing URL into BTCPay plugin settings manually
 
 ### Deployment Options
@@ -135,17 +135,17 @@ Server URL: https://yoursite.com/cashupayserver
 
 ### Connecting to WooCommerce
 
-After installation, configure WooCommerce to use CashuPayServer:
+After installation, configure WooCommerce to use BareBits Lite:
 
 1. Install the [BTCPay for WooCommerce](https://wordpress.org/plugins/btcpay-greenfield-for-woocommerce/) plugin
 2. In WooCommerce → Settings → Payments → BTCPay, set:
-   - **BTCPay Server URL**: Your CashuPayServer URL
+   - **BTCPay Server URL**: Your BareBits Lite URL
    - Click **Connect to BTCPay** to start the pairing flow
 3. Save and test with a small purchase
 
 ### Recommended: Configure system cron
 
-CashuPayServer's background tasks — invoice polling, auto-withdrawal, and
+BareBits Lite's background tasks — invoice polling, auto-withdrawal, and
 fee settlement — run on a tight schedule when your hosting environment
 invokes `cron.php` once a minute. Without it, the same tasks still fire
 opportunistically when an admin or customer loads a page, but with
@@ -188,7 +188,7 @@ Your seed phrase is your backup. Write it down and store it safely. If you lose 
 
 ### Quick Start with PHP Built-in Server
 
-The simplest way to run CashuPayServer locally:
+The simplest way to run BareBits Lite locally:
 
 ```bash
 git clone --recurse-submodules https://github.com/jooray/cashupayserver.git
@@ -228,7 +228,7 @@ docker run -p 80:80 -p 8080:8080 cashupayserver-standalone
 
 This starts:
 - **WordPress + WooCommerce**: http://localhost (login: admin/admin)
-- **CashuPayServer standalone**: http://localhost:8080
+- **BareBits Lite standalone**: http://localhost:8080
 
 #### WordPress Plugin Only
 
@@ -238,8 +238,8 @@ docker run -p 80:80 cashupayserver-wordpress
 ```
 
 This starts:
-- **WordPress with CashuPay plugin pre-installed**: http://localhost (login: admin/admin)
-- Plugin available at **Tools → CashuPay**
+- **WordPress with BareBits Lite plugin pre-installed**: http://localhost (login: admin/admin)
+- Plugin available at **Tools → BareBits Lite**
 
 ### Building Distribution Packages
 
@@ -330,7 +330,7 @@ php -S localhost:8000 router.php
 
 ## API Reference
 
-CashuPayServer implements the BTCPay Server Greenfield API:
+BareBits Lite implements the BTCPay Server Greenfield API:
 
 ### Create Invoice
 ```bash
@@ -407,6 +407,58 @@ If you like this project, I would appreciate if you contributed time, talent, or
 **Treasure** can be [donated here](https://cashupayserver.org/#donate). The
 software also pays a small built-in upstream development fee on revenue routed
 through it; see [LICENSE.md](LICENSE.md) for details.
+
+## Forked from CashuPayServer
+
+BareBits Lite is a fork of [CashuPayServer](https://github.com/jooray/cashupayserver) by Juraj Bednár. The original project established the core idea: a PHP-only Bitcoin payment gateway built on Cashu mints, speaking the BTCPay Greenfield API. BareBits Lite preserves that foundation and adds direct on-chain support, multi-user administration, security hardening, an in-app updater, a sustainable revenue model, and a comprehensive test suite — all while keeping the "upload and go" deployment story on any PHP host.
+
+### Major changes since the fork
+
+#### On-chain Bitcoin payments
+
+Accept native Bitcoin transactions alongside Lightning. Funds derive from your own xpub — never the mint — so on-chain payments go straight to your wallet. Built on `bitwasp/bitcoin`, with pluggable blockchain providers (Esplora HTTP and `bitcoind` RPC), per-xpub derivation counters that survive address reuse, and a setup-wizard step plus an admin settings card. See [docs/onchain.md](docs/onchain.md).
+
+#### Multi-user admin with role-based access
+
+A real account system replaces the original single-password model. Admins can create users, assign roles, and manage their own account from a header user-menu. Non-admin surfaces are gated server-side, not just hidden in the UI.
+
+#### Authentication & security hardening
+
+CSRF protection on login/approve/deny POSTs, hardened session cookies, XSS fixes across pairing, payment, and admin surfaces (including escaped API-key labels in Settings), removal of the legacy client-side PIN in favor of server-side session checks, and a setup-flow guard that refuses to create a second admin when one already exists.
+
+#### Auto-update from main/testing channels
+
+A PHP-only updater pulls release zips from a chosen channel (`main` or `testing`) and overlays them on the install in place, preserving local data, user config, and the updater itself. Includes backups, a reachable `recover.php` that accepts POST tokens, and a cron integration so updates can run unattended.
+
+#### Email notifications
+
+Optional SMTP or `mail()`-based notifications for invoice-paid and auto-withdrawal events, with per-recipient resolution, dedupe, queue-drain, and a master kill-switch. Plugs into the existing cron loop.
+
+#### Mint reliability tracking
+
+A trusted-mints list and per-mint reliability tracking. Mints marked `MINT_UNREACHABLE` are temporarily gated and automatically re-admitted after a retry interval, so a single flaky mint doesn't permanently break the dashboard.
+
+#### Free trial, dev fee, and license restructure
+
+A deployment-time free trial waives platform fees for new installs. After the trial, a small built-in upstream development fee is collected on revenue routed through the instance. Licensing was restructured to a dual MIT / Modified MIT model documented in [LICENSE.md](LICENSE.md) and the [BareBits Use Policy](USE_POLICY.md).
+
+#### Stats dashboard
+
+An admin stats view with CSV export, including a fix for the `dev_fee` status bug that previously misclassified some entries.
+
+#### Stale-cron warning + Settings cron URL
+
+The admin dashboard shows a dismissable banner if external cron hasn't fired in 24+ hours, and the Settings page displays the exact cron entry to copy into your host's crontab.
+
+#### Comprehensive test infrastructure
+
+The fork added an end-to-end test framework covering the Greenfield API surface (38+ tests), an auto-melt LNURL-pay path, a Playwright-driven UI tier, a WordPress-hosted plugin tier, an on-chain tier against `bitcoind` regtest, and GitHub Actions CI that runs the suite on push and PR. Customer-wallet fixtures cover Electrum, cashu.me, and Fulcrum.
+
+#### Brand rename to BareBits Lite
+
+User-facing surfaces (page titles, headings, footers, button labels, PWA manifest, WordPress admin labels, withdrawal-memo descriptions, API "setup not complete" error) were renamed to "BareBits Lite". Code identifiers, file paths, the composer package name, the `isCashuPayServer` BTCPay-compat API flag, and the WordPress menu slug are kept as-is to preserve compatibility.
+
+---
 
 ## License and Use Policy
 
