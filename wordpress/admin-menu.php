@@ -15,8 +15,8 @@ add_action('admin_notices', 'cashupay_admin_notice');
 function cashupay_admin_menu(): void {
     add_submenu_page(
         'tools.php',
-        'Barebits Lite',
-        'Barebits Lite',
+        'BareBits Lite',
+        'BareBits Lite',
         'manage_options',
         'cashupay',
         'cashupay_admin_redirect'
@@ -46,7 +46,7 @@ function cashupay_admin_notice(): void {
 
     if (!Database::isInitialized() || !Config::isSetupComplete()) {
         echo '<div class="notice notice-info"><p>';
-        echo '<strong>Barebits Lite:</strong> Plugin not configured yet, please ';
+        echo '<strong>BareBits Lite:</strong> Plugin not configured yet, please ';
         echo '<a href="' . esc_url(Urls::setup()) . '">configure the plugin here</a>.';
         echo '</p></div>';
     }

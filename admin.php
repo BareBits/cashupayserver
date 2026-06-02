@@ -2,7 +2,7 @@
 /**
  * CashuPayServer - Admin Interface
  *
- * Modern PWA admin dashboard with PIN access.
+ * Modern PWA admin dashboard.
  */
 
 require_once __DIR__ . '/includes/database.php';
@@ -249,6 +249,11 @@ if (isset($_GET['api'])) {
             Auth::requireAdmin();
             Background::dismissCronWarning();
             echo json_encode(['success' => true]);
+            break;
+
+        case 'upgrade_banner':
+            Auth::requireAdmin();
+            echo json_encode(['state' => Stats::upgradeBannerState()]);
             break;
 
         case 'invoices':
@@ -627,7 +632,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'user' => [
                     'username' => $user['username'] ?? null,
                     'role'     => $user['role'] ?? null,
-                    'hasPin'   => (bool)($user['has_pin'] ?? false),
                 ],
             ]);
         } else {
@@ -657,6 +661,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     switch ($action) {
         case 'logout':
             Auth::logout();
+            echo json_encode(['success' => true]);
+            break;
+
+        case 'dismiss_upgrade_banner':
+            Auth::requireAdmin();
+            Stats::dismissUpgradeBanner();
             echo json_encode(['success' => true]);
             break;
 
@@ -1270,7 +1280,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     if ($isBolt11) {
                         $bolt11ForQuote = $destination;
                     } else {
-                        $bolt11ForQuote = LightningAddress::getInvoice($destination, $amount, 'Barebits Lite withdrawal');
+                        $bolt11ForQuote = LightningAddress::getInvoice($destination, $amount, 'BareBits Lite withdrawal');
                     }
                     $result = LightningAddress::meltToBolt11($storeId, $bolt11ForQuote);
                 } else {
@@ -1279,7 +1289,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         $result = LightningAddress::meltToBolt11($storeId, $destination, $amount);
                     } else {
                         // For Lightning address with sat mint, amount is already in sats
-                        $result = LightningAddress::meltToAddress($storeId, $destination, $amount, 'Barebits Lite withdrawal');
+                        $result = LightningAddress::meltToAddress($storeId, $destination, $amount, 'BareBits Lite withdrawal');
                     }
                 }
 
@@ -1873,23 +1883,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
             break;
 
-        case 'reset_user_pin':
-            // Admin resets (or clears) another user's PIN.
-            Auth::requireAdmin();
-            try {
-                $userId = $_POST['user_id'] ?? '';
-                $pin = $_POST['pin'] ?? '';
-                Auth::setPin($userId, $pin === '' ? null : $pin);
-                echo json_encode(['success' => true]);
-            } catch (\InvalidArgumentException $e) {
-                http_response_code(400);
-                echo json_encode(['error' => $e->getMessage()]);
-            } catch (\RuntimeException $e) {
-                http_response_code(404);
-                echo json_encode(['error' => $e->getMessage()]);
-            }
-            break;
-
         // ===== Self-service (any logged-in user) =====
         case 'change_own_password':
             try {
@@ -1921,44 +1914,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
             break;
 
-        case 'set_own_pin':
-            try {
-                $self = Auth::currentUser();
-                if (!$self) {
-                    http_response_code(401);
-                    echo json_encode(['error' => 'Not authenticated']);
-                    break;
-                }
-                $pin = $_POST['pin'] ?? '';
-                Auth::setPin($self['id'], $pin === '' ? null : $pin);
-                echo json_encode(['success' => true]);
-            } catch (\InvalidArgumentException $e) {
-                http_response_code(400);
-                echo json_encode(['error' => $e->getMessage()]);
-            }
-            break;
-
-        case 'verify_pin':
-            // Lock-screen unlock: returns success/failure for the current
-            // user's PIN. Uses the same IP-based lockout as login.
-            $clientIp = Security::getClientIp();
-            if (Security::isLockedOut($clientIp)) {
-                $remaining = Security::getLockoutRemaining($clientIp);
-                http_response_code(429);
-                echo json_encode(['error' => "Too many failed attempts. Try again in {$remaining} seconds."]);
-                break;
-            }
-            $pin = $_POST['pin'] ?? '';
-            if (Auth::verifyPin($pin)) {
-                Security::clearLoginAttempts($clientIp);
-                echo json_encode(['success' => true]);
-            } else {
-                Security::recordFailedLogin($clientIp);
-                http_response_code(401);
-                echo json_encode(['error' => 'Incorrect PIN']);
-            }
-            break;
-
         default:
             http_response_code(400);
             echo json_encode(['error' => 'Unknown action']);
@@ -1972,7 +1927,6 @@ $isWp = Urls::isWordPress();
 $isLoggedIn = Auth::isLoggedIn();
 $currentUser = Auth::currentUser();   // null when WordPress mode or not logged in
 $currentRole = $currentUser['role'] ?? ($isLoggedIn ? Auth::ROLE_ADMIN : null);
-$currentHasPin = (bool)($currentUser['has_pin'] ?? false);
 $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
 ?>
 <!DOCTYPE html>
@@ -1983,9 +1937,9 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
     <meta name="theme-color" content="#0f0f23">
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-    <meta name="apple-mobile-web-app-title" content="Barebits Lite">
+    <meta name="apple-mobile-web-app-title" content="BareBits Lite">
     <meta name="csrf-token" content="<?= htmlspecialchars(Auth::generateCsrfToken()) ?>">
-    <title>Barebits Lite Admin</title>
+    <title>BareBits Lite Admin</title>
     <?php if (!$isWp): ?><link rel="manifest" href="manifest.json"><?php endif; ?>
     <link rel="apple-touch-icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect fill='%230f0f23' width='100' height='100' rx='20'/><text x='50' y='70' font-size='60' text-anchor='middle'>⚡</text></svg>">
     <style>
@@ -2051,80 +2005,6 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
         .lock-subtitle {
             color: var(--text-secondary);
             margin-bottom: 2rem;
-        }
-
-        .pin-dots {
-            display: none;
-            gap: 1rem;
-            margin-bottom: 2rem;
-        }
-
-        .pin-dot {
-            width: 16px;
-            height: 16px;
-            border-radius: 50%;
-            background: var(--border);
-            transition: background 0.2s;
-        }
-
-        .pin-dot.filled {
-            background: var(--accent);
-        }
-
-        .pin-dot.error {
-            background: var(--error);
-            animation: shake 0.5s;
-        }
-
-        @keyframes shake {
-            0%, 100% { transform: translateX(0); }
-            25% { transform: translateX(-5px); }
-            75% { transform: translateX(5px); }
-        }
-
-        .pin-pad {
-            display: none;
-            grid-template-columns: repeat(3, 1fr);
-            gap: 1rem;
-            max-width: 280px;
-        }
-
-        .pin-key {
-            width: 70px;
-            height: 70px;
-            border-radius: 50%;
-            background: var(--bg-card);
-            border: 1px solid var(--border);
-            color: var(--text-primary);
-            font-size: 1.5rem;
-            font-weight: 500;
-            cursor: pointer;
-            transition: all 0.2s;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-        }
-
-        .pin-key:hover {
-            background: var(--bg-card-hover);
-        }
-
-        .pin-key:active {
-            transform: scale(0.95);
-        }
-
-        .pin-key.empty {
-            background: transparent;
-            border: none;
-            cursor: default;
-        }
-
-        .pin-key.backspace {
-            font-size: 1.2rem;
-        }
-
-        .password-fallback {
-            margin-top: 2rem;
         }
 
         .password-fallback input {
@@ -2389,9 +2269,9 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
             display: block;
         }
 
-        /* Generic visibility helper — used by the Users / PIN settings UI
-           so JS can toggle whole cards/buttons by classList. Lock-screen has
-           its own .lock-screen.hidden rule above; this is the catch-all. */
+        /* Generic visibility helper — used by the Users / Settings UI so JS
+           can toggle whole cards/buttons by classList. Lock-screen has its
+           own .lock-screen.hidden rule above; this is the catch-all. */
         .hidden {
             display: none !important;
         }
@@ -2947,30 +2827,8 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
     <!-- Lock Screen -->
     <div class="lock-screen<?= $isLoggedIn ? ' hidden' : '' ?>" id="lock-screen">
         <div class="lock-logo">&#9889;</div>
-        <div class="lock-title">Barebits Lite</div>
-        <div class="lock-subtitle"><?= $isLoggedIn ? 'Enter PIN to unlock' : 'Enter your password' ?></div>
-
-        <div class="pin-dots" id="pin-dots">
-            <div class="pin-dot"></div>
-            <div class="pin-dot"></div>
-            <div class="pin-dot"></div>
-            <div class="pin-dot"></div>
-        </div>
-
-        <div class="pin-pad" id="pin-pad">
-            <button class="pin-key" data-key="1">1</button>
-            <button class="pin-key" data-key="2">2</button>
-            <button class="pin-key" data-key="3">3</button>
-            <button class="pin-key" data-key="4">4</button>
-            <button class="pin-key" data-key="5">5</button>
-            <button class="pin-key" data-key="6">6</button>
-            <button class="pin-key" data-key="7">7</button>
-            <button class="pin-key" data-key="8">8</button>
-            <button class="pin-key" data-key="9">9</button>
-            <button class="pin-key empty"></button>
-            <button class="pin-key" data-key="0">0</button>
-            <button class="pin-key backspace" data-key="back">&#8592;</button>
-        </div>
+        <div class="lock-title">BareBits Lite</div>
+        <div class="lock-subtitle">Enter your password</div>
 
         <div class="password-fallback" id="password-fallback">
             <input type="text" id="username-input" placeholder="Username"
@@ -3401,7 +3259,7 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                 </div>
                 <?php endif; ?>
 
-                <!-- My Account card: own password + own PIN, available to every logged-in user -->
+                <!-- My Account card: own password + logout, available to every logged-in user -->
                 <?php if (!Urls::isWordPress()): ?>
                 <div class="card" id="card-my-account">
                     <div class="card-header">
@@ -3415,12 +3273,6 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                         </div>
                         <button class="btn btn-secondary btn-full" id="btn-change-own-password" style="margin-bottom: 0.5rem;">
                             Change my password
-                        </button>
-                        <button class="btn btn-secondary btn-full" id="btn-set-pin" style="margin-bottom: 0.5rem;">
-                            <span id="btn-set-pin-label">Set PIN</span>
-                        </button>
-                        <button class="btn btn-secondary btn-full hidden" id="btn-clear-own-pin" style="margin-bottom: 0.5rem;">
-                            Remove my PIN
                         </button>
                         <button class="btn btn-danger btn-full" id="btn-logout">
                             Logout
@@ -3441,13 +3293,10 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                 <?php else: ?>
                 <div class="card">
                     <div class="card-header">
-                        <div class="card-title">Security</div>
+                        <div class="card-title">Account</div>
                     </div>
                     <div class="card-body">
-                        <button class="btn btn-secondary btn-full" id="btn-set-pin">
-                            Set/Change PIN
-                        </button>
-                        <button class="btn btn-danger btn-full" id="btn-logout" style="margin-top: 0.5rem;">
+                        <button class="btn btn-danger btn-full" id="btn-logout">
                             Logout
                         </button>
                     </div>
@@ -3499,7 +3348,7 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                 </div>
 
                 <div style="text-align: center; padding: 1.5rem 0; color: var(--text-muted); font-size: 0.8rem;">
-                    Barebits Lite v<?= CASHUPAY_VERSION ?> &middot;
+                    BareBits Lite v<?= CASHUPAY_VERSION ?> &middot;
                     Deployment ID: <code style="background: rgba(0,0,0,0.2); padding: 0.1rem 0.4rem; border-radius: 4px;"><?= htmlspecialchars((string) Config::get('deployment_id', 'ANONYMOUS')) ?></code> &middot;
                     <a href="https://github.com/jooray/cashupayserver/releases" target="_blank" rel="noopener"
                        style="color: var(--text-secondary); text-decoration: none;">Check for updates</a>
@@ -3508,6 +3357,14 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
 
             <!-- Stats Dashboard View (admin-only) -->
             <div class="view" id="view-stats">
+                <div id="upgrade-banner" class="hidden" style="background: rgba(247, 147, 26, 0.12); border: 1px solid rgba(247, 147, 26, 0.4); border-radius: 8px; padding: 0.75rem 1rem; margin-bottom: 1rem; font-size: 0.9rem; display: flex; align-items: flex-start; gap: 0.75rem;" data-admin-only="true">
+                    <span style="flex-shrink: 0; font-size: 1.1rem; line-height: 1.2;">🚀</span>
+                    <span style="flex: 1;">
+                        <strong style="display: block; margin-bottom: 0.15rem;">Heads up!</strong>
+                        <span style="color: var(--text-secondary); font-size: 0.85rem;">Your store is generating enough revenue that it makes sense to upgrade to the full BareBits payment software. It costs $5/month to run on a VPS (virtual private server), but here's what you get: full custody of your funds (eliminate custodial risk), finer-grained user permission control, contacts &amp; inventory management, lower fees, and more! Head to <a href="https://getbarebits.com" target="_blank" rel="noopener noreferrer" style="color: var(--accent);">getbarebits.com</a> for more information.</span>
+                    </span>
+                    <button id="btn-dismiss-upgrade-banner" aria-label="Dismiss for 90 days" title="Dismiss for 90 days" style="background: transparent; border: 0; color: var(--text-secondary); cursor: pointer; font-size: 1.2rem; line-height: 1; padding: 0 0.25rem; flex-shrink: 0;">×</button>
+                </div>
                 <div class="card">
                     <div class="card-body" style="display: flex; flex-wrap: wrap; gap: 1rem; align-items: flex-end;">
                         <div class="form-group" style="flex: 1 1 200px; margin: 0;">
@@ -3872,48 +3729,6 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
         </div>
     </div>
 
-    <!-- Reset another user's PIN (admin) -->
-    <div class="modal-overlay" id="modal-reset-user-pin">
-        <div class="modal">
-            <div class="modal-handle"></div>
-            <div class="modal-title">Reset PIN for <span id="rupin-username"></span></div>
-            <input type="hidden" id="rupin-user-id">
-            <p style="color: var(--text-secondary); margin-bottom: 1rem;">
-                Enter a new 4-digit PIN, or leave blank to remove the user's PIN.
-            </p>
-            <div class="form-group">
-                <input type="password" class="form-input" id="rupin-new"
-                       placeholder="New PIN (4 digits, or empty to clear)" maxlength="4" pattern="[0-9]{4}">
-            </div>
-            <button class="btn btn-full" id="btn-confirm-reset-user-pin">Save</button>
-            <button class="btn btn-secondary btn-full" style="margin-top: 0.5rem;"
-                    onclick="closeModal('modal-reset-user-pin')">Cancel</button>
-        </div>
-    </div>
-
-    <div class="modal-overlay" id="modal-pin-setup">
-        <div class="modal">
-            <div class="modal-handle"></div>
-            <div class="modal-title">Set PIN</div>
-            <p style="color: var(--text-secondary); margin-bottom: 1rem;">
-                Enter a 4-digit PIN to quickly unlock the app.
-            </p>
-
-            <div class="form-group">
-                <input type="password" class="form-input" id="new-pin" maxlength="4"
-                       placeholder="Enter 4-digit PIN" pattern="[0-9]{4}">
-            </div>
-
-            <div class="form-group">
-                <input type="password" class="form-input" id="confirm-pin" maxlength="4"
-                       placeholder="Confirm PIN" pattern="[0-9]{4}">
-            </div>
-
-            <button class="btn btn-full" id="btn-save-pin">Save PIN</button>
-            <button class="btn btn-secondary btn-full" style="margin-top: 0.5rem;" onclick="closeModal('modal-pin-setup')">Cancel</button>
-        </div>
-    </div>
-
     <!-- Toast -->
     <div class="toast" id="toast"></div>
 
@@ -3994,12 +3809,10 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
         // the server still considers us logged in.
         const phpLoggedIn = <?= $isLoggedIn ? 'true' : 'false' ?>;
         // Server-rendered identity used by the lock screen and the Settings
-        // visibility logic. Source of truth — JS no longer keeps PIN state
-        // in localStorage.
+        // visibility logic.
         const phpUser = {
             username: <?= json_encode($currentUsername) ?>,
             role:     <?= json_encode($currentRole) ?>,
-            hasPin:   <?= $currentHasPin ? 'true' : 'false' ?>,
         };
         const adminUrl = <?= json_encode(Urls::admin()) ?>;
         const setupUrl = <?= json_encode(Urls::setup()) ?>;
@@ -4013,11 +3826,9 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
 
         // State
         let isAuthenticated = false;
-        let pin = '';
         let dashboardData = null;
 
         // Local Storage Keys
-        const STORAGE_PIN = 'cashupay_pin';
         const STORAGE_AUTH = 'cashupay_auth';
 
         // M2: CSRF token helper - reads from meta tag dynamically
@@ -4085,19 +3896,10 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
             }
 
             if (phpLoggedIn) {
-                if (phpUser.hasPin) {
-                    // Session valid, PIN configured — require PIN to unlock UI
-                    document.getElementById('pin-pad').style.display = 'grid';
-                    document.getElementById('pin-dots').style.display = 'flex';
-                    document.querySelector('.lock-subtitle').textContent = 'Enter PIN to unlock';
-                    showLockScreen();
-                } else {
-                    // Session valid, no PIN — skip lock entirely
-                    showApp();
-                }
+                showApp();
             } else {
                 // No server session — password lock; PHP already rendered
-                // the lock screen visible with the correct subtitle.
+                // the lock screen visible.
                 showLockScreen();
             }
         }
@@ -4117,17 +3919,6 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                 const navStats = document.getElementById('nav-stats');
                 if (navStats) navStats.classList.remove('hidden');
             }
-
-            // One-time migration from the old client-side PIN. If the user
-            // had a localStorage PIN before upgrade, drop it and prompt to
-            // re-set from Settings (the new PIN lives server-side).
-            try {
-                const legacyPin = localStorage.getItem(STORAGE_PIN);
-                if (legacyPin && !phpUser.hasPin) {
-                    localStorage.removeItem(STORAGE_PIN);
-                    showToast('Your PIN moved to the server — please re-set it from Settings.', 'warning');
-                }
-            } catch (_) {}
 
             // Check for store_created parameter from setup.php redirect
             const urlParams = new URLSearchParams(window.location.search);
@@ -4150,61 +3941,8 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
             }
         }
 
-        // PIN handling — server-side verification (replaces the older
-        // localStorage comparison so PINs can be reset/cleared by admin
-        // and so a stale localStorage entry can't unlock a dead session).
-        async function handlePinInput(key) {
-            const dots = document.querySelectorAll('.pin-dot');
-
-            if (key === 'back') {
-                pin = pin.slice(0, -1);
-            } else if (pin.length < 4) {
-                pin += key;
-            }
-
-            dots.forEach((dot, i) => {
-                dot.classList.toggle('filled', i < pin.length);
-                dot.classList.remove('error');
-            });
-
-            if (pin.length === 4) {
-                const attempted = pin;
-                try {
-                    const res = await fetch(adminUrl, {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/x-www-form-urlencoded',
-                            'X-CSRF-Token': document.querySelector('meta[name="csrf-token"]').content,
-                        },
-                        body: `action=verify_pin&pin=${encodeURIComponent(attempted)}`,
-                    });
-                    if (res.ok) {
-                        showApp();
-                        return;
-                    }
-                } catch (_) {
-                    // network error -> treated same as wrong PIN
-                }
-                dots.forEach(dot => dot.classList.add('error'));
-                setTimeout(() => {
-                    pin = '';
-                    dots.forEach(dot => {
-                        dot.classList.remove('filled', 'error');
-                    });
-                }, 500);
-            }
-        }
-
         // Event Listeners
         function setupEventListeners() {
-            // PIN pad
-            document.querySelectorAll('.pin-key').forEach(key => {
-                key.addEventListener('click', () => {
-                    const value = key.dataset.key;
-                    if (value) handlePinInput(value);
-                });
-            });
-
             // Password login
             document.getElementById('password-submit').addEventListener('click', async () => {
                 const username = document.getElementById('username-input').value.trim();
@@ -4236,7 +3974,6 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                         if (data.user) {
                             phpUser.username = data.user.username || phpUser.username;
                             phpUser.role     = data.user.role     || phpUser.role;
-                            phpUser.hasPin   = !!data.user.hasPin;
                         }
 
                         showApp();
@@ -4307,8 +4044,6 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
             if (copyCronBtn) copyCronBtn.addEventListener('click', copyCronUrl);
             const dismissCronBtn = document.getElementById('btn-dismiss-cron-stale');
             if (dismissCronBtn) dismissCronBtn.addEventListener('click', dismissCronStaleBanner);
-            document.getElementById('btn-set-pin').addEventListener('click', () => openModal('modal-pin-setup'));
-            document.getElementById('btn-save-pin').addEventListener('click', savePin);
             document.getElementById('btn-logout').addEventListener('click', logout);
 
             // My Account + Users (standalone only — WordPress uses WP for user management)
@@ -4316,14 +4051,12 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
             if (btnChangePass) {
                 btnChangePass.addEventListener('click', () => openModal('modal-change-password'));
                 document.getElementById('btn-confirm-change-password').addEventListener('click', changeOwnPassword);
-                document.getElementById('btn-clear-own-pin').addEventListener('click', clearOwnPin);
             }
             const btnAddUser = document.getElementById('btn-add-user');
             if (btnAddUser) {
                 btnAddUser.addEventListener('click', () => openModal('modal-add-user'));
                 document.getElementById('btn-confirm-add-user').addEventListener('click', addUser);
                 document.getElementById('btn-confirm-reset-user-password').addEventListener('click', confirmResetUserPassword);
-                document.getElementById('btn-confirm-reset-user-pin').addEventListener('click', confirmResetUserPin);
             }
 
             // URL Mode settings (standalone only)
@@ -4499,11 +4232,6 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
             const badgeEl = document.getElementById('my-role-badge');
             if (usernameEl) usernameEl.textContent = u.username || '';
             if (badgeEl) badgeEl.textContent = u.role === 'admin' ? 'admin' : 'user';
-
-            const setLabel = document.getElementById('btn-set-pin-label');
-            const clearBtn = document.getElementById('btn-clear-own-pin');
-            if (setLabel) setLabel.textContent = u.hasPin ? 'Change my PIN' : 'Set my PIN';
-            if (clearBtn) clearBtn.classList.toggle('hidden', !u.hasPin);
         }
 
         async function renderUsersCard() {
@@ -4526,12 +4254,10 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                             <div class="list-title">
                                 ${escapeHtml(u.username)}
                                 <span style="margin-left: 0.5rem; padding: 0.125rem 0.5rem; border-radius: 999px; font-size: 0.7rem; background: rgba(247,147,26,0.2);">${escapeHtml(u.role)}</span>
-                                ${u.has_pin ? '<span style="margin-left: 0.5rem; font-size: 0.75rem; color: var(--text-secondary);">PIN</span>' : ''}
                             </div>
                         </div>
                         <div style="display: flex; gap: 0.25rem;">
                             <button class="btn btn-secondary user-action" data-user-action="reset-password" data-user-id="${escapeAttr(u.id)}" data-username="${escapeAttr(u.username)}" style="padding: 0.25rem 0.5rem; font-size: 0.75rem;">Reset password</button>
-                            <button class="btn btn-secondary user-action" data-user-action="reset-pin" data-user-id="${escapeAttr(u.id)}" data-username="${escapeAttr(u.username)}" style="padding: 0.25rem 0.5rem; font-size: 0.75rem;">Reset PIN</button>
                             ${u.username === phpUser.username ? '' : `<button class="btn btn-danger user-action" data-user-action="delete" data-user-id="${escapeAttr(u.id)}" data-username="${escapeAttr(u.username)}" style="padding: 0.25rem 0.5rem; font-size: 0.75rem;">Delete</button>`}
                         </div>
                     </div>
@@ -4542,7 +4268,6 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                         const name = btn.dataset.username;
                         switch (btn.dataset.userAction) {
                             case 'reset-password': openResetUserPassword(id, name); break;
-                            case 'reset-pin':      openResetUserPin(id, name); break;
                             case 'delete':         deleteUserById(id, name); break;
                         }
                     });
@@ -4629,32 +4354,6 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                 }
             } catch (e) {
                 showToast(e.message || 'Failed to reset password', 'error');
-            }
-        }
-
-        function openResetUserPin(userId, username) {
-            document.getElementById('rupin-user-id').value = userId;
-            document.getElementById('rupin-username').textContent = username;
-            document.getElementById('rupin-new').value = '';
-            openModal('modal-reset-user-pin');
-        }
-
-        async function confirmResetUserPin() {
-            const userId = document.getElementById('rupin-user-id').value;
-            const pin = document.getElementById('rupin-new').value;
-            try {
-                const response = await postWithCsrf(adminUrl,
-                    `action=reset_user_pin&user_id=${encodeURIComponent(userId)}&pin=${encodeURIComponent(pin)}`);
-                const res = await response.json();
-                if (response.ok && res.success) {
-                    showToast(pin === '' ? 'PIN removed' : 'PIN reset', 'success');
-                    closeModal('modal-reset-user-pin');
-                    renderUsersCard();
-                } else {
-                    showToast(res.error || 'Failed to reset PIN', 'error');
-                }
-            } catch (e) {
-                showToast(e.message || 'Failed to reset PIN', 'error');
             }
         }
 
@@ -4973,7 +4672,38 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                 refreshStatsChart('fee', token),
                 refreshPayouts(token),
                 refreshFeePayments(token),
+                refreshUpgradeBanner(),
             ]);
+        }
+
+        async function refreshUpgradeBanner() {
+            const banner = document.getElementById('upgrade-banner');
+            if (!banner) return;
+            try {
+                const r = await fetch(adminUrl + '?api=upgrade_banner');
+                if (!r.ok) {
+                    banner.classList.add('hidden');
+                    return;
+                }
+                const body = await r.json();
+                if (body && body.state) {
+                    banner.classList.remove('hidden');
+                } else {
+                    banner.classList.add('hidden');
+                }
+            } catch (_) {
+                banner.classList.add('hidden');
+            }
+        }
+
+        async function dismissUpgradeBanner() {
+            const banner = document.getElementById('upgrade-banner');
+            if (banner) banner.classList.add('hidden');
+            try {
+                await postWithCsrf(adminUrl, 'action=dismiss_upgrade_banner');
+            } catch (_) {
+                // Best-effort; banner will reappear on next stats load if dismissal didn't persist.
+            }
         }
 
         async function loadStatsStores() {
@@ -5249,6 +4979,9 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                     window.location.href = adminUrl + '?' + params.toString();
                 });
             }
+
+            const dismissUpgradeBtn = document.getElementById('btn-dismiss-upgrade-banner');
+            if (dismissUpgradeBtn) dismissUpgradeBtn.addEventListener('click', dismissUpgradeBanner);
         }
 
         // ===== End Stats Dashboard =====
@@ -6385,81 +6118,11 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
             }
         }
 
-        async function savePin() {
-            const newPin = document.getElementById('new-pin').value;
-            const confirmPin = document.getElementById('confirm-pin').value;
-
-            if (newPin.length !== 4 || !/^\d{4}$/.test(newPin)) {
-                showToast('PIN must be 4 digits', 'error');
-                return;
-            }
-
-            if (newPin !== confirmPin) {
-                showToast('PINs do not match', 'error');
-                return;
-            }
-
-            try {
-                const response = await postWithCsrf(adminUrl,
-                    `action=set_own_pin&pin=${encodeURIComponent(newPin)}`);
-                const res = await response.json();
-                if (response.ok && res.success) {
-                    phpUser.hasPin = true;
-                    showToast('PIN saved!', 'success');
-                    closeModal('modal-pin-setup');
-                    document.getElementById('new-pin').value = '';
-                    document.getElementById('confirm-pin').value = '';
-                    renderAccountCard();
-                } else {
-                    showToast(res.error || 'Failed to save PIN', 'error');
-                }
-            } catch (e) {
-                showToast('Failed to save PIN', 'error');
-            }
-        }
-
-        async function clearOwnPin() {
-            if (!confirm('Remove your PIN? You will only need your password to unlock.')) return;
-            try {
-                const response = await postWithCsrf(adminUrl, 'action=set_own_pin&pin=');
-                const res = await response.json();
-                if (response.ok && res.success) {
-                    phpUser.hasPin = false;
-                    showToast('PIN removed', 'success');
-                    renderAccountCard();
-                } else {
-                    showToast(res.error || 'Failed to remove PIN', 'error');
-                }
-            } catch (e) {
-                showToast('Failed to remove PIN', 'error');
-            }
-        }
-
         async function logout() {
             await postWithCsrf(adminUrl, 'action=logout');
 
             localStorage.removeItem(STORAGE_AUTH);
-            localStorage.removeItem(STORAGE_PIN);
             location.reload();
-        }
-
-        function lock() {
-            document.getElementById('app').classList.remove('visible');
-            document.getElementById('lock-screen').classList.remove('hidden');
-            pin = '';
-            document.querySelectorAll('.pin-dot').forEach(dot => {
-                dot.classList.remove('filled');
-            });
-
-            if (phpUser.hasPin) {
-                document.getElementById('pin-pad').style.display = 'grid';
-                document.getElementById('pin-dots').style.display = 'flex';
-                document.querySelector('.lock-subtitle').textContent = 'Enter PIN to unlock';
-            } else {
-                document.getElementById('pin-pad').style.display = 'none';
-                document.getElementById('pin-dots').style.display = 'none';
-                document.querySelector('.lock-subtitle').textContent = 'Enter your password';
-            }
         }
 
         // ===============================

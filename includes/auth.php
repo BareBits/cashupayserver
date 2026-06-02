@@ -78,9 +78,8 @@ class Auth {
     }
 
     /**
-     * Return the current logged-in user's row (id/username/role/has_pin),
-     * or null if no session / WordPress mode. Does NOT return password_hash
-     * or pin_hash.
+     * Return the current logged-in user's row (id/username/role), or null
+     * if no session / WordPress mode. Does NOT return password_hash.
      */
     public static function currentUser(): ?array {
         if (defined('CASHUPAY_WORDPRESS') && CASHUPAY_WORDPRESS) {
@@ -177,9 +176,7 @@ class Auth {
 
     public static function getUserById(string $userId): ?array {
         $row = Database::fetchOne(
-            "SELECT id, username, role, created_at,
-                    CASE WHEN pin_hash IS NULL THEN 0 ELSE 1 END AS has_pin
-             FROM users WHERE id = ?",
+            "SELECT id, username, role, created_at FROM users WHERE id = ?",
             [$userId]
         );
         return $row ?: null;
@@ -197,8 +194,7 @@ class Auth {
      */
     public static function listUsers(): array {
         return Database::fetchAll(
-            "SELECT id, username, role, created_at,
-                    CASE WHEN pin_hash IS NULL THEN 0 ELSE 1 END AS has_pin
+            "SELECT id, username, role, created_at
              FROM users
              ORDER BY (role = 'admin') DESC, LOWER(username) ASC"
         );
@@ -220,16 +216,6 @@ class Auth {
     public static function validatePassword(string $password): ?string {
         if (strlen($password) < 8) {
             return 'Password must be at least 8 characters';
-        }
-        return null;
-    }
-
-    /**
-     * Validate a PIN. Returns null if OK, or an error message string.
-     */
-    public static function validatePin(string $pin): ?string {
-        if (!preg_match('/^\d{4}$/', $pin)) {
-            return 'PIN must be exactly 4 digits';
         }
         return null;
     }
@@ -297,47 +283,6 @@ class Auth {
             'id = ?',
             [$userId]
         );
-    }
-
-    /**
-     * Set or clear a user's PIN. Pass null to remove the PIN.
-     */
-    public static function setPin(string $userId, ?string $pin): void {
-        if (!self::getUserById($userId)) {
-            throw new \RuntimeException('User not found');
-        }
-        if ($pin === null) {
-            Database::update('users', ['pin_hash' => null], 'id = ?', [$userId]);
-            return;
-        }
-        if ($err = self::validatePin($pin)) {
-            throw new \InvalidArgumentException($err);
-        }
-        Database::update(
-            'users',
-            ['pin_hash' => password_hash($pin, PASSWORD_DEFAULT)],
-            'id = ?',
-            [$userId]
-        );
-    }
-
-    /**
-     * Verify a PIN against the current logged-in user. Returns false if
-     * no session, no PIN configured, or wrong PIN.
-     */
-    public static function verifyPin(string $pin): bool {
-        $user = self::currentUser();
-        if (!$user) {
-            return false;
-        }
-        $row = Database::fetchOne(
-            "SELECT pin_hash FROM users WHERE id = ?",
-            [$user['id']]
-        );
-        if (!$row || !$row['pin_hash']) {
-            return false;
-        }
-        return password_verify($pin, $row['pin_hash']);
     }
 
     /**

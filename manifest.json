@@ -1,6 +1,6 @@
 {
-  "name": "Barebits Lite",
-  "short_name": "Barebits Lite",
+  "name": "BareBits Lite",
+  "short_name": "BareBits Lite",
   "description": "Lightning payments with Cashu ecash",
   "start_url": "/admin.php",
   "display": "standalone",
