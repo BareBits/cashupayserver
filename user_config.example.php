@@ -91,3 +91,35 @@
 // plugin build instead (auto-update is skipped in WP mode).
 //
 // define('CASHUPAY_UPDATE_CHANNEL', 'main');
+
+// =============================================================================
+// EMAIL NOTIFICATIONS — SMTP (optional)
+// =============================================================================
+// Outbound email is opt-in: notifications stay off until the admin enables
+// them in the Settings UI. The SMTP settings below are only consulted if
+// notifications are turned on for the deployment.
+//
+// If CASHUPAY_SMTP_HOST is unset, the sender falls back to PHP's built-in
+// mail() function, which relies on a working local MTA (sendmail / postfix /
+// msmtp). Many shared hosts do not have one, so configuring SMTP explicitly
+// is strongly recommended for reliable delivery.
+//
+// CASHUPAY_SMTP_HOST          SMTP server hostname (e.g. 'smtp.sendgrid.net').
+//                             Unset → use PHP mail().
+// CASHUPAY_SMTP_PORT          SMTP server port (typical: 587 for STARTTLS,
+//                             465 for implicit TLS, 25 for unauthenticated).
+// CASHUPAY_SMTP_USERNAME      Auth username. Unset → no auth.
+// CASHUPAY_SMTP_PASSWORD      Auth password. Treat this file as a secret.
+// CASHUPAY_SMTP_ENCRYPTION    'tls' (STARTTLS, port 587), 'ssl' (implicit
+//                             TLS, port 465), or 'none' (cleartext, dev only).
+// CASHUPAY_SMTP_FROM_ADDRESS  Envelope + header From address. REQUIRED to send.
+// CASHUPAY_SMTP_FROM_NAME     Display name for the From header (default:
+//                             'CashuPayServer').
+//
+// define('CASHUPAY_SMTP_HOST', 'smtp.example.com');
+// define('CASHUPAY_SMTP_PORT', 587);
+// define('CASHUPAY_SMTP_USERNAME', 'apikey');
+// define('CASHUPAY_SMTP_PASSWORD', 'replace-me');
+// define('CASHUPAY_SMTP_ENCRYPTION', 'tls');
+// define('CASHUPAY_SMTP_FROM_ADDRESS', 'notifications@example.com');
+// define('CASHUPAY_SMTP_FROM_NAME', 'CashuPayServer');
