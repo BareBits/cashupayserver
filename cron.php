@@ -22,6 +22,7 @@ require_once __DIR__ . '/includes/security.php';
 require_once __DIR__ . '/includes/background.php';
 require_once __DIR__ . '/includes/onchain/payments.php';
 require_once __DIR__ . '/includes/trusted_mints.php';
+require_once __DIR__ . '/includes/updater.php';
 
 // Check if setup is complete
 if (!Database::isInitialized() || !Config::isSetupComplete()) {
@@ -274,6 +275,18 @@ try {
     }
 } catch (Exception $e) {
     $results['tasks']['trusted_mints'] = 'error: ' . $e->getMessage();
+}
+
+// Task 12: Auto-update check. Daily, no-op in WordPress mode. Skipped on
+// internal background self-requests so checkout traffic doesn't trigger
+// a download — only the dedicated cron tick checks for updates.
+if (!$isInternal) {
+    try {
+        $applied = Updater::checkAndApply();
+        $results['tasks']['updater'] = $applied ? 'update applied' : 'no update';
+    } catch (Throwable $e) {
+        $results['tasks']['updater'] = 'error: ' . $e->getMessage();
+    }
 }
 
 echo json_encode($results, JSON_PRETTY_PRINT);

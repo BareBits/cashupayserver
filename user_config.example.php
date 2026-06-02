@@ -70,3 +70,24 @@
 // "no trial".
 //
 // define('CASHUPAY_FREE_TRIAL_REVENUE_SATS', 500000);
+
+// =============================================================================
+// AUTO-UPDATE CHANNEL
+// =============================================================================
+// Which release channel this install tracks. The auto-updater (run from
+// cron.php) fetches the latest build attached to the matching channel-* tag
+// on https://github.com/BareBits/cashupayserver and overlays it on this
+// install, preserving data/ and user_config.php.
+//
+// Values:
+//   'main'    — stable. Receives commits merged to main.
+//   'testing' — pre-release. Receives commits pushed to the testing branch.
+//
+// This sets the deployment-time default. The admin can override it at
+// runtime from the Settings page; once overridden, the database value wins.
+//
+// Auto-update is fully automatic on the chosen channel. There is no kill
+// switch — operators who don't want auto-update should run the WordPress
+// plugin build instead (auto-update is skipped in WP mode).
+//
+// define('CASHUPAY_UPDATE_CHANNEL', 'main');
