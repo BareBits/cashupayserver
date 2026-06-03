@@ -1,10 +1,10 @@
 # BareBits Lite
-
+## ⚠️ DO NOT USE THIS WE ARE MOVING FAST AND BREAKING THINGS IN THIS CODE, THERE IS A SIGNIFICANT RISK OF FUNDS LOSS ⚠️
 > **A BTCPay-compatible payment gateway that runs on any PHP hosting.**
 
 Accept Bitcoin Lightning payments without running a full BTCPay Server instance. No Docker, no VPS, no command line. Just upload and go.
 
-**[cashupayserver.org](https://cashupayserver.org/)**
+**Forked from [cashupayserver.org](https://cashupayserver.org/)**
 
 ---
 
