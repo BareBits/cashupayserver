@@ -162,7 +162,12 @@ class LndHandle:
         return self._request("GET", f"/v2/invoices/lookup?payment_hash={urllib.parse.quote(encoded, safe='')}")
 
 
-def start_lnd(workdir: Path, name: str, bitcoind: BitcoindHandle) -> LndHandle:
+def start_lnd(workdir: Path, name: str, bitcoind: BitcoindHandle,
+              *, rpc_user: str = "regtest", rpc_pass: str = "regtest") -> LndHandle:
+    """Spawn an LND configured against `bitcoind`. `rpc_user`/`rpc_pass`
+    default to the standard fixture creds; pass overrides to point LND at
+    a bitcoind with different auth (e.g. Boltz's cookie-auth bitcoind:
+    rpc_user=`__cookie__`, rpc_pass=`<cookie value>`)."""
     exes = binaries.ensure(binaries.LND)
     lnd_exe = exes["lnd"]
     lncli_exe = exes["lncli"]
@@ -197,8 +202,8 @@ def start_lnd(workdir: Path, name: str, bitcoind: BitcoindHandle) -> LndHandle:
                 "",
                 "[Bitcoind]",
                 f"bitcoind.rpchost=127.0.0.1:{bitcoind.rpc_port}",
-                "bitcoind.rpcuser=regtest",
-                "bitcoind.rpcpass=regtest",
+                f"bitcoind.rpcuser={rpc_user}",
+                f"bitcoind.rpcpass={rpc_pass}",
                 f"bitcoind.zmqpubrawblock=tcp://127.0.0.1:{bitcoind.zmq_block_port}",
                 f"bitcoind.zmqpubrawtx=tcp://127.0.0.1:{bitcoind.zmq_tx_port}",
                 "",
