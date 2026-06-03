@@ -384,6 +384,12 @@ def setup_payserver(workdir: Path, vpub: str, boltz_api_url: str,
         cur = conn.cursor()
         kvs = [
             ("setup_complete", json.dumps(True)),
+            # PHP's built-in server treats /router.php as a real file and
+            # bypasses our router_wrapper.php (which is the only way
+            # CASHUPAY_DATA_DIR gets defined). Using direct URLs routes
+            # everything through the wrapper. The setup wizard normally
+            # detects this; we skip the wizard, so set it explicitly.
+            ("url_mode", json.dumps("direct")),
             ("swaps_enabled", json.dumps(True)),
             ("swaps_provider_order", json.dumps(["boltz"])),
             ("swaps_strict_no_mint_fallback", json.dumps(bool(strict_no_mint_fallback))),
