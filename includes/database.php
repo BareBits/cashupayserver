@@ -95,8 +95,14 @@ class Database {
             $hasReliability = self::$instance
                 ->query("SELECT name FROM sqlite_master WHERE type='table' AND name='mint_reliability'")
                 ->fetch() !== false;
+            // Marker for the most recent migration set. When a new migration
+            // is added, set this to a column/table that only exists *after*
+            // that migration ran — getInstance() will then trigger runMigrations()
+            // on existing installs that haven't yet picked it up. All migrations
+            // are idempotent, so a fire is safe.
+            $hasLatestMigration = $hasConfig && self::columnExists(self::$instance, 'swap_attempts', 'provider_response_json');
 
-            if ($hasConfig && (!$hasUsers || !$hasReliability)) {
+            if ($hasConfig && (!$hasUsers || !$hasReliability || !$hasLatestMigration)) {
                 if (!$hasUsers) {
                     self::$instance->exec("
                         CREATE TABLE IF NOT EXISTS users (
@@ -758,6 +764,19 @@ HTACCESS;
         }
         if (!self::indexExists($pdo, 'idx_swap_attempts_store')) {
             $pdo->exec("CREATE INDEX idx_swap_attempts_store ON swap_attempts(store_id, created_at DESC);");
+        }
+        // Recovery aids: store raw hex/JSON snapshots so an operator can manually
+        // claim a stuck lockup without needing access to the original Bitcoin
+        // node or having to recompute anything. All three are populated lazily
+        // — null on rows created before the migration ran.
+        if (!self::columnExists($pdo, 'swap_attempts', 'lockup_tx_hex')) {
+            $pdo->exec("ALTER TABLE swap_attempts ADD COLUMN lockup_tx_hex TEXT");
+        }
+        if (!self::columnExists($pdo, 'swap_attempts', 'claim_tx_hex')) {
+            $pdo->exec("ALTER TABLE swap_attempts ADD COLUMN claim_tx_hex TEXT");
+        }
+        if (!self::columnExists($pdo, 'swap_attempts', 'provider_response_json')) {
+            $pdo->exec("ALTER TABLE swap_attempts ADD COLUMN provider_response_json TEXT");
         }
 
         // Drop the legacy users.pin_hash column (PIN feature removed). Uses

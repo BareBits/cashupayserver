@@ -62,15 +62,20 @@ final class SwapClaimer {
         $lockupTxidLE = hash('sha256', hash('sha256', $lockupRawNoWit, true), true);
         $lockupTxidBE = strrev($lockupTxidLE);
 
-        // Persist what we observed before attempting the spend.
+        // Persist what we observed before attempting the spend. Includes the
+        // raw lockup tx hex so an operator could manually craft a claim even
+        // without access to the originating Bitcoin node.
         Database::getInstance()->prepare(
             "UPDATE swap_attempts
-                SET lockup_txid = ?, lockup_vout = ?, lockup_amount_sats = ?, updated_at = ?
+                SET lockup_txid = ?, lockup_vout = ?, lockup_amount_sats = ?,
+                    lockup_tx_hex = COALESCE(lockup_tx_hex, ?),
+                    updated_at = ?
               WHERE id = ?"
         )->execute([
             bin2hex($lockupTxidBE),
             $lockupVout,
             $lockupAmount,
+            $lockupTxHex,
             time(),
             $row['id'],
         ]);
@@ -168,10 +173,13 @@ final class SwapClaimer {
 
         $txid = self::broadcastWithFallback($row, $finalHex);
 
+        // Also persist the raw signed claim tx hex. If something goes wrong
+        // post-broadcast (chain reorg, dropped by mempool, fee bump needed),
+        // the operator has the exact bytes to re-broadcast from any node.
         Database::getInstance()->prepare(
-            "UPDATE swap_attempts SET claim_txid = ?, status = ?, updated_at = ?
+            "UPDATE swap_attempts SET claim_txid = ?, claim_tx_hex = ?, status = ?, updated_at = ?
               WHERE id = ?"
-        )->execute([$txid, 'claim.broadcast', time(), $row['id']]);
+        )->execute([$txid, $finalHex, 'claim.broadcast', time(), $row['id']]);
 
         return $txid;
     }

@@ -45,6 +45,7 @@ final class SwapCreateResult {
         public readonly int    $timeoutBlockHeight,
         public readonly string $claimLeafScript,    // raw script bytes (parsed from response)
         public readonly string $refundLeafScript,   // raw script bytes (parsed from response)
+        public readonly array  $rawResponse = [],   // full decoded provider response; archived to swap_attempts.provider_response_json for forensic / recovery purposes
     ) {}
 }
 
