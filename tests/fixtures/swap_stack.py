@@ -347,9 +347,12 @@ def _php_eval(data_dir: Path, snippet: str) -> str:
 
 
 def setup_payserver(workdir: Path, vpub: str, boltz_api_url: str,
-                    strict_no_mint_fallback: bool = True) -> PayserverProc:
+                    strict_no_mint_fallback: bool = True,
+                    admin_password: str = "password") -> PayserverProc:
     """Initialize DB, seed setup-complete + swap config + one store using the
-    given vpub, create an API token, start php -S. Returns a handle."""
+    given vpub, create an admin user (admin/<admin_password>) + a public API
+    token + the store's internal-API-key (used by the admin UI). Start php -S.
+    Returns a handle."""
     data_dir = workdir / "payserver-data"
     data_dir.mkdir(parents=True, exist_ok=True)
     _php_eval(data_dir, "Database::initialize(); echo 'ok';")
@@ -360,6 +363,21 @@ def setup_payserver(workdir: Path, vpub: str, boltz_api_url: str,
     store_id = f"store_{uuid.uuid4().hex[:12]}"
     api_token = "dev-" + uuid.uuid4().hex[:20]
     api_token_hash = hashlib.sha256(api_token.encode()).hexdigest()
+
+    # The admin UI's invoice form reads stores.internal_api_key, which is
+    # created on demand by Auth::getOrCreateInternalApiKey() the first time
+    # an authed admin loads the store row. Seed it directly so the UI works
+    # without requiring an admin browser load first.
+    internal_api_token = "internal-" + uuid.uuid4().hex[:24]
+    internal_api_hash = hashlib.sha256(internal_api_token.encode()).hexdigest()
+
+    # Admin user password hash. The PHP layer uses password_hash(PASSWORD_BCRYPT)
+    # — we generate that hash here via php -r so we don't have to ship a PHP
+    # bcrypt implementation.
+    admin_pw_hash = _php_eval(
+        data_dir,
+        f"echo password_hash({admin_password!r}, PASSWORD_BCRYPT);",
+    ).strip()
 
     conn = sqlite3.connect(str(db))
     try:
@@ -378,16 +396,30 @@ def setup_payserver(workdir: Path, vpub: str, boltz_api_url: str,
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
                 (k, v, now, now),
             )
+        # Admin user — username 'admin', password from arg (default 'password')
+        cur.execute(
+            "INSERT INTO users (id, username, password_hash, role, created_at) "
+            "VALUES (?, 'admin', ?, 'admin', ?)",
+            ("user_" + uuid.uuid4().hex[:12], admin_pw_hash, now),
+        )
+        # Store + store.internal_api_key
         cur.execute(
             "INSERT INTO stores (id, name, mint_unit, default_currency, created_at, "
-            "onchain_xpub, onchain_address_type, onchain_network) VALUES "
-            "(?, 'Swap Dev Store', 'sat', 'sat', ?, ?, 'P2WPKH', 'regtest')",
-            (store_id, now, vpub),
+            "onchain_xpub, onchain_address_type, onchain_network, internal_api_key) VALUES "
+            "(?, 'Swap Dev Store', 'sat', 'sat', ?, ?, 'P2WPKH', 'regtest', ?)",
+            (store_id, now, vpub, internal_api_token),
         )
+        # API keys: external dev token + the internal one referenced by the UI
         cur.execute(
             "INSERT INTO api_keys (id, key_hash, store_id, label, permissions, created_at) "
             "VALUES (?, ?, ?, 'dev', ?, ?)",
             ("key_" + uuid.uuid4().hex[:12], api_token_hash, store_id,
+             json.dumps(["*"]), now),
+        )
+        cur.execute(
+            "INSERT INTO api_keys (id, key_hash, store_id, label, permissions, created_at) "
+            "VALUES (?, ?, ?, 'internal', ?, ?)",
+            ("key_" + uuid.uuid4().hex[:12], internal_api_hash, store_id,
              json.dumps(["*"]), now),
         )
         conn.commit()
