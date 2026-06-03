@@ -66,11 +66,17 @@ class Invoice {
         if (SwapsConfig::isEnabledForStore($storeId) && $onchainConfigured) {
             // Target = what the merchant wants to receive on-chain in sats.
             $targetSats = ExchangeRates::convertToSats((string)$amount, $currency, 'sat');
-            $swapAttempt = self::trySwapCreate($storeId, $store, $targetSats);
+            $swapFailures = []; // per-provider reasons, populated by trySwapCreate
+            $swapAttempt = self::trySwapCreate($storeId, $store, $targetSats, $swapFailures);
             if ($swapAttempt === null && SwapsConfig::strictNoMintFallback()) {
+                // Surface each provider's reason so the operator can act
+                // (typically: "Boltz: amount 10000 sat outside range [50000, 5000000]").
+                $detail = $swapFailures
+                    ? ' Provider attempts: ' . implode('; ', $swapFailures) . '.'
+                    : '';
                 throw new Exception(
-                    'Submarine swap could not be created (all providers failed or amount '
-                    . 'is outside provider limits). Strict mode is on — no mint fallback.'
+                    'Submarine swap could not be created for ' . $targetSats . ' sat target.'
+                    . ' Strict mode is on (no mint fallback).' . $detail
                 );
             }
         }
@@ -211,18 +217,26 @@ class Invoice {
      *    'lockup_fee_sats' => int,
      *    'percent_fee_sats' => int]
      */
-    private static function trySwapCreate(string $storeId, array $store, int $targetSats): ?array {
+    private static function trySwapCreate(string $storeId, array $store, int $targetSats,
+                                          ?array &$failureReasons = null): ?array {
+        if ($failureReasons === null) $failureReasons = [];
         if ($targetSats <= 0) return null;
         $localMin = SwapsConfig::minimumTargetSats();
         if ($localMin !== null && $targetSats < $localMin) {
+            $failureReasons[] = "site min override ({$localMin} sat) blocks {$targetSats} sat target";
             return null;
         }
         $network = $store['onchain_network'] ?? 'mainnet';
 
         foreach (SwapProviderFactory::orderedForSite() as $provider) {
+            $name = $provider->getName();
             try {
                 $pairInfo = $provider->getReversePairInfo($network);
                 if ($targetSats < $pairInfo->minSats || $targetSats > $pairInfo->maxSats) {
+                    $failureReasons[] = sprintf(
+                        "%s: %d sat outside range [%d, %d]",
+                        $name, $targetSats, $pairInfo->minSats, $pairInfo->maxSats
+                    );
                     continue;
                 }
 
@@ -230,6 +244,7 @@ class Invoice {
                 $alloc = OnchainPayments::allocateClaimAddress($storeId);
                 if ($alloc === null) {
                     // Should not happen — caller guards on $onchainConfigured.
+                    $failureReasons[] = "{$name}: store has no on-chain xpub allocated";
                     return null;
                 }
 
@@ -237,7 +252,8 @@ class Invoice {
                 $claimPriv = random_bytes(32);
                 $claimPubPoint = Secp256k1::generatorMult(Secp256k1::bytesToGmp($claimPriv));
                 if ($claimPubPoint === null) {
-                    continue; // 1-in-2^256 — re-roll on next call
+                    $failureReasons[] = "{$name}: claim key derivation failed (retry)";
+                    continue;
                 }
                 $claimPub = Secp256k1::pointToCompressed($claimPubPoint);
                 $preimage = random_bytes(32);
@@ -255,7 +271,8 @@ class Invoice {
                 // a buggy or hostile provider that would give us an address
                 // whose script-path we can't satisfy.
                 if (!self::verifySwapLockup($swap, $claimPub, $network)) {
-                    error_log("swap: lockup address mismatch from {$provider->getName()}; trying next");
+                    error_log("swap: lockup address mismatch from {$name}; trying next");
+                    $failureReasons[] = "{$name}: lockup address mismatch (provider returned non-matching script tree)";
                     continue;
                 }
 
@@ -264,7 +281,7 @@ class Invoice {
 
                 return [
                     'swap' => $swap,
-                    'provider' => $provider->getName(),
+                    'provider' => $name,
                     'network' => $network,
                     'claim_privkey' => $claimPriv,
                     'claim_pubkey' => $claimPub,
@@ -276,7 +293,8 @@ class Invoice {
                     'percent_fee_sats' => $percentFee,
                 ];
             } catch (Throwable $e) {
-                error_log("swap: provider {$provider->getName()} failed: " . $e->getMessage());
+                error_log("swap: provider {$name} failed: " . $e->getMessage());
+                $failureReasons[] = "{$name}: " . $e->getMessage();
                 continue;
             }
         }
@@ -321,6 +339,7 @@ class Invoice {
                 target_onchain_amount_sats, invoice_amount_sats,
                 swap_lockup_fee_sats, swap_percent_fee_sats,
                 merchant_address, merchant_address_index,
+                provider_response_json,
                 created_at, updated_at
             ) VALUES (
                 :invoice_id, :store_id, :provider, :network, :direction,
@@ -333,6 +352,7 @@ class Invoice {
                 :target_onchain_amount_sats, :invoice_amount_sats,
                 :swap_lockup_fee_sats, :swap_percent_fee_sats,
                 :merchant_address, :merchant_address_index,
+                :provider_response_json,
                 :created_at, :updated_at
             )"
         )->execute([
@@ -359,6 +379,7 @@ class Invoice {
             ':swap_percent_fee_sats' => $att['percent_fee_sats'],
             ':merchant_address' => $att['merchant_address'],
             ':merchant_address_index' => $att['merchant_address_index'],
+            ':provider_response_json' => $swap->rawResponse ? json_encode($swap->rawResponse) : null,
             ':created_at' => $now,
             ':updated_at' => $now,
         ]);

@@ -94,6 +94,7 @@ abstract class BoltzLikeProvider implements SwapProvider {
             timeoutBlockHeight: (int)$resp['timeoutBlockHeight'],
             claimLeafScript: hex2bin($claimOutHex),
             refundLeafScript: hex2bin($refundOutHex),
+            rawResponse: $resp,
         );
     }
 

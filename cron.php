@@ -61,24 +61,50 @@ if ($isInternal) {
 // the operator's environment isn't actually invoking cron.php on a schedule.
 // Internal self-requests do not count, otherwise opportunistic admin/checkout
 // triggers would mask the missing cron entry indefinitely.
+//
+// Tracked per-mode so the admin UI can confirm both the main cron AND the
+// swap-fast-lane cron are wired up. `only=swaps` requests bump only the
+// fast-lane stamp; the default mode bumps both (a full cron pass IS doing
+// the swap work too, so the operator who only sets up the full cron still
+// sees the fast-lane "last seen" advance — they only need a separate fast
+// lane if they want sub-minute swap latency).
+$only = $_GET['only'] ?? null;
 if (!$isInternal) {
-    Config::set('last_external_cron_at', time());
+    $nowStamp = time();
+    if ($only === 'swaps') {
+        Config::set('last_external_cron_swaps_at', $nowStamp);
+    } else {
+        Config::set('last_external_cron_at', $nowStamp);
+        Config::set('last_external_cron_swaps_at', $nowStamp);
+    }
 }
 
 // Set content type
 header('Content-Type: application/json');
 
+// `?only=swaps` lets operators wire a tight (e.g. every-10-seconds) cron
+// dedicated to driving the swap lifecycle without also running the
+// expensive cashu / on-chain / cleanup tasks that only need to run on
+// the normal (minute-ish) cadence. Submarine swaps are latency-sensitive
+// (every poll-tick delay shows up in the end-to-end settlement time);
+// everything else isn't.
+// ($only is read above to stamp the right last-seen config key.)
+$swapOnly = ($only === 'swaps');
+
 $results = [
     'timestamp' => time(),
+    'mode' => $swapOnly ? 'swaps-only' : 'all',
     'tasks' => [],
 ];
 
 // Task 1: Poll pending quotes
-try {
-    Invoice::pollPendingQuotes();
-    $results['tasks']['poll_quotes'] = 'success';
-} catch (Exception $e) {
-    $results['tasks']['poll_quotes'] = 'error: ' . $e->getMessage();
+if (!$swapOnly) {
+    try {
+        Invoice::pollPendingQuotes();
+        $results['tasks']['poll_quotes'] = 'success';
+    } catch (Exception $e) {
+        $results['tasks']['poll_quotes'] = 'error: ' . $e->getMessage();
+    }
 }
 
 // Task 1b: Settle dev / hosting / upstream-dev fees for every store. Runs
@@ -91,64 +117,74 @@ try {
 // Without it, an expiry that happened mid-interval would still skip this
 // tick (DevFee::computeOwed calls it too, but explicit here keeps the
 // cron sequence obvious).
-try {
-    FreeTrial::expireIfNeeded();
-    $feeResults = DevFee::settleAllStores();
-    $results['tasks']['settle_fees'] = count($feeResults) > 0
-        ? ['stores_processed' => count($feeResults)]
-        : 'skipped';
-} catch (Exception $e) {
-    $results['tasks']['settle_fees'] = 'error: ' . $e->getMessage();
+if (!$swapOnly) {
+    try {
+        FreeTrial::expireIfNeeded();
+        $feeResults = DevFee::settleAllStores();
+        $results['tasks']['settle_fees'] = count($feeResults) > 0
+            ? ['stores_processed' => count($feeResults)]
+            : 'skipped';
+    } catch (Exception $e) {
+        $results['tasks']['settle_fees'] = 'error: ' . $e->getMessage();
+    }
 }
 
 // Task 2: Check auto-melt
-try {
-    $meltResult = LightningAddress::checkAutoMelt();
-    if ($meltResult) {
-        $results['tasks']['auto_melt'] = [
-            'success' => true,
-            'amount' => $meltResult['amountPaid'],
-        ];
-    } else {
-        $results['tasks']['auto_melt'] = 'skipped';
+if (!$swapOnly) {
+    try {
+        $meltResult = LightningAddress::checkAutoMelt();
+        if ($meltResult) {
+            $results['tasks']['auto_melt'] = [
+                'success' => true,
+                'amount' => $meltResult['amountPaid'],
+            ];
+        } else {
+            $results['tasks']['auto_melt'] = 'skipped';
+        }
+    } catch (Exception $e) {
+        $results['tasks']['auto_melt'] = 'error: ' . $e->getMessage();
     }
-} catch (Exception $e) {
-    $results['tasks']['auto_melt'] = 'error: ' . $e->getMessage();
 }
 
 // Task 3: Clean expired cache
-try {
-    Security::cleanCache();
-    $results['tasks']['clean_cache'] = 'success';
-} catch (Exception $e) {
-    $results['tasks']['clean_cache'] = 'error: ' . $e->getMessage();
+if (!$swapOnly) {
+    try {
+        Security::cleanCache();
+        $results['tasks']['clean_cache'] = 'success';
+    } catch (Exception $e) {
+        $results['tasks']['clean_cache'] = 'error: ' . $e->getMessage();
+    }
 }
 
 // Task 4: Expire old invoices - now handled by pollPendingQuotes() via markExpiredInvoices()
 // Kept as a separate explicit call for visibility in cron results
-try {
-    $expired = Invoice::markExpiredInvoices();
-    $results['tasks']['expire_invoices'] = "expired {$expired} invoices";
-} catch (Exception $e) {
-    $results['tasks']['expire_invoices'] = 'error: ' . $e->getMessage();
+if (!$swapOnly) {
+    try {
+        $expired = Invoice::markExpiredInvoices();
+        $results['tasks']['expire_invoices'] = "expired {$expired} invoices";
+    } catch (Exception $e) {
+        $results['tasks']['expire_invoices'] = 'error: ' . $e->getMessage();
+    }
 }
 
 // Task 4b: Poll on-chain payments for any invoices with onchain_address set.
 // Same batched + rate-limited pattern as the Cashu quote poller. Provider
 // failures (network, rate-limit) are caught per-invoice; the overall task
 // only fails if pollPending() itself throws.
-try {
-    $onchainResults = OnchainPayments::pollPending(60, 20);
-    $polled = count($onchainResults);
-    $errored = 0;
-    foreach ($onchainResults as $r) {
-        if (isset($r['error'])) {
-            $errored++;
+if (!$swapOnly) {
+    try {
+        $onchainResults = OnchainPayments::pollPending(60, 20);
+        $polled = count($onchainResults);
+        $errored = 0;
+        foreach ($onchainResults as $r) {
+            if (isset($r['error'])) {
+                $errored++;
+            }
         }
+        $results['tasks']['poll_onchain'] = "polled {$polled} invoice(s)" . ($errored ? ", {$errored} errored" : '');
+    } catch (Exception $e) {
+        $results['tasks']['poll_onchain'] = 'error: ' . $e->getMessage();
     }
-    $results['tasks']['poll_onchain'] = "polled {$polled} invoice(s)" . ($errored ? ", {$errored} errored" : '');
-} catch (Exception $e) {
-    $results['tasks']['poll_onchain'] = 'error: ' . $e->getMessage();
 }
 
 // Task 4c: Drive in-flight submarine swaps through their lifecycle. Same
@@ -170,7 +206,7 @@ try {
 }
 
 // Task 5: C1 - Sync proof states with mint (if not synced recently)
-try {
+if (!$swapOnly) try {
     if (Background::shouldSync()) {
         $stores = Database::fetchAll(
             "SELECT id FROM stores WHERE mint_url IS NOT NULL AND seed_phrase IS NOT NULL"
@@ -197,7 +233,7 @@ try {
 }
 
 // Task 6: C2/H4 - Recover orphaned invoices stuck in Processing
-try {
+if (!$swapOnly) try {
     $recovered = Invoice::recoverOrphanedInvoices();
     $count = count($recovered);
     $results['tasks']['recover_orphaned'] = $count > 0 ? "recovered {$count}" : 'none';
@@ -206,7 +242,7 @@ try {
 }
 
 // Task 7: H3 - Auto-expire very old invoices (older than 30 days)
-try {
+if (!$swapOnly) try {
     $veryOld = Database::query(
         "UPDATE invoices SET status = 'Expired'
          WHERE status = 'New' AND created_at < ?",
@@ -219,7 +255,7 @@ try {
 }
 
 // Task 8: L1 - Clean very old invoices (settled/expired older than 90 days)
-try {
+if (!$swapOnly) try {
     $deleted = Database::query(
         "DELETE FROM invoices WHERE status IN ('Settled', 'Expired', 'Invalid')
          AND created_at < ?",
@@ -232,7 +268,7 @@ try {
 }
 
 // Task 9: L3 - Clean expired pending operations from wallet storage
-try {
+if (!$swapOnly) try {
     $stores = Database::fetchAll(
         "SELECT id FROM stores WHERE mint_url IS NOT NULL AND seed_phrase IS NOT NULL"
     );
@@ -254,7 +290,7 @@ try {
 }
 
 // Task 10: L4 - Webhook delivery cleanup (keep only last 1000)
-try {
+if (!$swapOnly) try {
     // First get the count
     $countResult = Database::fetchOne("SELECT COUNT(*) as cnt FROM webhook_deliveries");
     $totalCount = (int)($countResult['cnt'] ?? 0);
@@ -278,7 +314,7 @@ try {
 }
 
 // Task 11: Refresh trusted mints list (default 24h interval).
-try {
+if (!$swapOnly) try {
     if (TrustedMints::getUrl() !== null) {
         $refreshed = TrustedMints::refresh();
         if ($refreshed) {
@@ -300,7 +336,7 @@ try {
 // Task 12: Auto-update check. Daily, no-op in WordPress mode. Skipped on
 // internal background self-requests so checkout traffic doesn't trigger
 // a download — only the dedicated cron tick checks for updates.
-if (!$isInternal) {
+if (!$isInternal && !$swapOnly) {
     try {
         $applied = Updater::checkAndApply();
         $results['tasks']['updater'] = $applied ? 'update applied' : 'no update';
@@ -311,7 +347,7 @@ if (!$isInternal) {
 
 // Task 13: Drain queued notification emails. Runs on every tick so backlogs
 // from a temporarily-unreachable SMTP server self-heal on the next cron pass.
-try {
+if (!$swapOnly) try {
     $drain = NotificationSender::drainQueue();
     $results['tasks']['notifications'] = "sent: {$drain['sent']}, failed: {$drain['failed']}";
 } catch (Throwable $e) {

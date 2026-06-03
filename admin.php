@@ -257,9 +257,17 @@ if (isset($_GET['api'])) {
                 Config::set('cron_key', $key);
             }
             $url = Urls::cron() . '?key=' . urlencode($key);
+            $swapsUrl = $url . '&only=swaps';
+            $now = time();
+            $fullSeenAt = (int) Config::get('last_external_cron_at', 0);
+            $swapsSeenAt = (int) Config::get('last_external_cron_swaps_at', 0);
             echo json_encode([
                 'url' => $url,
+                'swaps_url' => $swapsUrl,
                 'crontab' => '* * * * * curl -fsS ' . $url . ' > /dev/null',
+                'crontab_swaps' => "* * * * * for i in 0 10 20 30 40 50; do curl -fsS '" . $swapsUrl . "' > /dev/null & sleep 10; done",
+                'last_full_seen_ago_sec' => $fullSeenAt > 0 ? ($now - $fullSeenAt) : null,
+                'last_swaps_seen_ago_sec' => $swapsSeenAt > 0 ? ($now - $swapsSeenAt) : null,
             ]);
             break;
 
@@ -3516,16 +3524,35 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                     </div>
                     <div class="card-body">
                         <p style="font-size: 0.85rem; color: var(--text-secondary); margin: 0 0 0.75rem 0;">
-                            Optional but recommended. Adding this URL to your hosting's system cron
-                            (every minute) makes invoice polling, auto-withdrawal, and fee settlement
-                            run on a tight, predictable schedule. Without it, background tasks fire
+                            Optional but recommended. Adding the line below to your hosting's system
+                            cron makes invoice polling, auto-withdrawal, and fee settlement run on a
+                            tight, predictable schedule. Without it, background tasks fire
                             opportunistically when an admin or customer loads a page.
                         </p>
                         <div class="form-group">
-                            <label class="form-label">Suggested crontab entry</label>
+                            <label class="form-label">Main cron (every minute)</label>
                             <code id="cron-url-display" style="display: block; background: rgba(0,0,0,0.2); padding: 0.75rem; border-radius: 8px; font-size: 0.85rem; word-break: break-all; user-select: all;">Loading…</code>
+                            <p class="form-help" id="cron-url-status" style="margin-top: 0.4rem;">Checking…</p>
                         </div>
                         <button class="btn btn-secondary btn-full" id="btn-copy-cron-url">Copy</button>
+
+                        <hr style="border: 0; border-top: 1px solid var(--border); margin: 1rem 0;">
+
+                        <p style="font-size: 0.85rem; color: var(--text-secondary); margin: 0 0 0.75rem 0;">
+                            <strong>Optional swap fast-lane.</strong> Submarine-swap settlement
+                            is latency-sensitive (every poll-tick delay shows up in end-to-end
+                            time). If you want sub-minute swap settlement, add this second
+                            entry too — it hits cashupayserver every 10 seconds with
+                            <code>?only=swaps</code> so only the swap-state poller runs, leaving
+                            the expensive cashu / cleanup tasks on the main minute cadence.
+                            Skip this entirely if you don't use submarine swaps.
+                        </p>
+                        <div class="form-group">
+                            <label class="form-label">Swap fast-lane cron (every 10 seconds)</label>
+                            <code id="cron-swaps-url-display" style="display: block; background: rgba(0,0,0,0.2); padding: 0.75rem; border-radius: 8px; font-size: 0.85rem; word-break: break-all; user-select: all;">Loading…</code>
+                            <p class="form-help" id="cron-swaps-url-status" style="margin-top: 0.4rem;">Checking…</p>
+                        </div>
+                        <button class="btn btn-secondary btn-full" id="btn-copy-cron-swaps-url">Copy</button>
                     </div>
                 </div>
 
@@ -3668,12 +3695,13 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                         </div>
 
                         <div class="form-group" style="margin-top: 1rem;">
-                            <label class="form-label">Provider preference order</label>
-                            <input type="text" class="form-input" id="swaps-provider-order"
-                                   placeholder="zeus,boltz">
+                            <label class="form-label">Providers</label>
+                            <div id="swaps-provider-checkboxes" style="display: flex; flex-direction: column; gap: 0.4rem; padding: 0.5rem 0;">
+                                <!-- populated by loadSwapSettings(); one checkbox per known provider -->
+                            </div>
                             <p class="form-help">
-                                Comma-separated; first reachable wins per invoice. Known providers:
-                                <span id="swaps-known-providers"></span>.
+                                Each enabled provider is tried in the order shown. At invoice creation
+                                we use the first reachable one.
                             </p>
                         </div>
 
@@ -4497,6 +4525,8 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
             document.getElementById('btn-save-hosting-fee').addEventListener('click', saveHostingFee);
             const copyCronBtn = document.getElementById('btn-copy-cron-url');
             if (copyCronBtn) copyCronBtn.addEventListener('click', copyCronUrl);
+            const copyCronSwapsBtn = document.getElementById('btn-copy-cron-swaps-url');
+            if (copyCronSwapsBtn) copyCronSwapsBtn.addEventListener('click', copyCronSwapsUrl);
             const saveChannelBtn = document.getElementById('btn-save-update-channel');
             if (saveChannelBtn) saveChannelBtn.addEventListener('click', saveUpdateChannel);
             const rollbackBtn = document.getElementById('btn-rollback-update');
@@ -6564,15 +6594,38 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                 if (!response.ok) return;
                 const data = await response.json();
                 const enabledEl = document.getElementById('swaps-enabled');
-                const orderEl = document.getElementById('swaps-provider-order');
                 const strictEl = document.getElementById('swaps-strict');
                 const minEl = document.getElementById('swaps-min-sats');
-                const knownEl = document.getElementById('swaps-known-providers');
                 if (enabledEl) enabledEl.checked = !!data.enabled;
-                if (orderEl) orderEl.value = (data.providerOrder || []).join(',');
                 if (strictEl) strictEl.checked = !!data.strictNoMintFallback;
                 if (minEl) minEl.value = data.minimumTargetSats ?? '';
-                if (knownEl) knownEl.textContent = (data.knownProviders || []).join(', ');
+
+                // Render provider checkboxes. Order: providerOrder (enabled, in
+                // preference order) first, then the rest of knownProviders
+                // disabled-by-default.
+                const known = (data.knownProviders || []);
+                const order = (data.providerOrder || []);
+                const enabledSet = new Set(order);
+                const renderedOrder = [...order, ...known.filter(p => !enabledSet.has(p))];
+                const container = document.getElementById('swaps-provider-checkboxes');
+                if (container) {
+                    container.innerHTML = '';
+                    renderedOrder.forEach(name => {
+                        const label = document.createElement('label');
+                        label.style.display = 'flex';
+                        label.style.alignItems = 'center';
+                        label.style.gap = '0.5rem';
+                        label.style.cursor = 'pointer';
+                        const cb = document.createElement('input');
+                        cb.type = 'checkbox';
+                        cb.value = name;
+                        cb.checked = enabledSet.has(name);
+                        cb.dataset.providerName = name;
+                        label.appendChild(cb);
+                        label.appendChild(document.createTextNode(' ' + name));
+                        container.appendChild(label);
+                    });
+                }
             } catch (e) {
                 console.error('Failed to load swap settings', e);
             }
@@ -6581,7 +6634,12 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
         async function saveSwapSettings() {
             const enabled = document.getElementById('swaps-enabled').checked ? '1' : '0';
             const strict = document.getElementById('swaps-strict').checked ? '1' : '0';
-            const order = document.getElementById('swaps-provider-order').value.trim();
+            // Build the provider list from checked checkboxes, preserving the
+            // DOM order (the checkboxes were rendered with the saved order first).
+            const checked = Array.from(document.querySelectorAll(
+                '#swaps-provider-checkboxes input[type=checkbox]:checked'))
+                .map(cb => cb.value);
+            const order = checked.join(',');
             const minSats = document.getElementById('swaps-min-sats').value.trim();
             try {
                 const response = await postWithCsrf(adminUrl,
@@ -7469,10 +7527,17 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
             }
         }
 
-        // Settings page: fetch the suggested crontab entry and render it. Lazily
-        // generates a cron_key server-side on first call.
+        // Settings page: fetch the suggested crontab entries and render them.
+        // Lazily generates a cron_key server-side on first call. Surfaces
+        // last-seen timestamps for both modes so the admin can confirm cron
+        // is actually hitting them at the expected cadence — there's no way
+        // for a PHP script to read the operator's crontab directly, this is
+        // the best we can do.
         async function loadCronUrl() {
             const code = document.getElementById('cron-url-display');
+            const codeSwaps = document.getElementById('cron-swaps-url-display');
+            const status = document.getElementById('cron-url-status');
+            const statusSwaps = document.getElementById('cron-swaps-url-status');
             if (!code) return;
             try {
                 const response = await fetch(adminUrl + '?action=cron_url');
@@ -7482,9 +7547,32 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                 } else {
                     code.textContent = 'Unable to load cron URL';
                 }
+                if (codeSwaps) {
+                    codeSwaps.textContent = data.crontab_swaps || 'Unable to load swaps cron URL';
+                }
+                if (status) status.innerHTML = formatCronSeenAgo(data.last_full_seen_ago_sec, 90);
+                if (statusSwaps) statusSwaps.innerHTML = formatCronSeenAgo(data.last_swaps_seen_ago_sec, 30);
             } catch (e) {
                 code.textContent = 'Unable to load cron URL';
             }
+        }
+
+        // Return an HTML fragment showing how long ago this cron mode was
+        // last seen, color-coded green/yellow/red depending on how recent.
+        // `expectedMaxSec` is the threshold beyond which we render red.
+        function formatCronSeenAgo(secsAgo, expectedMaxSec) {
+            if (secsAgo === null || secsAgo === undefined) {
+                return '<span style="color:#dc4646">Never seen.</span> Configure the cron line above.';
+            }
+            const ago = Math.max(0, parseInt(secsAgo, 10));
+            const human = ago < 60 ? ago + 's' :
+                          ago < 3600 ? Math.floor(ago/60) + 'm' :
+                          Math.floor(ago/3600) + 'h';
+            let color = '#5ec07f';   // green
+            let note = 'Cron is hitting this endpoint.';
+            if (ago > expectedMaxSec * 3) { color = '#dc4646'; note = 'Stale — cron may not be configured.'; }
+            else if (ago > expectedMaxSec * 1.5) { color = '#f7931a'; note = 'Slower than expected.'; }
+            return `Last seen <strong style="color:${color}">${human} ago</strong>. ${note}`;
         }
 
         async function copyCronUrl() {
@@ -7493,6 +7581,17 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
             try {
                 await navigator.clipboard.writeText(code.textContent);
                 showToast('Cron entry copied to clipboard', 'success');
+            } catch (e) {
+                showToast('Copy failed — select the text manually', 'error');
+            }
+        }
+
+        async function copyCronSwapsUrl() {
+            const code = document.getElementById('cron-swaps-url-display');
+            if (!code) return;
+            try {
+                await navigator.clipboard.writeText(code.textContent);
+                showToast('Swap fast-lane cron entry copied to clipboard', 'success');
             } catch (e) {
                 showToast('Copy failed — select the text manually', 'error');
             }
