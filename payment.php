@@ -387,7 +387,7 @@ $baseUrl = Config::getBaseUrl();
 
         .barebits-notice {
             margin-top: 0.65rem;
-            font-size: 0.7rem;
+            font-size: 1.05rem;
             color: var(--text-secondary);
             opacity: 0.85;
             line-height: 1.45;
