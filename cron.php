@@ -91,9 +91,25 @@ header('Content-Type: application/json');
 // ($only is read above to stamp the right last-seen config key.)
 $swapOnly = ($only === 'swaps');
 
+// When the operator's real cron is ticking, internal (page-load-triggered)
+// self-requests skip the non-latency-sensitive tasks — the cron will pick
+// them up on its next pass. Page loads keep running the essential, customer-
+// facing work (quote/onchain polling, expiry, recovery, swaps) so checkout
+// UX is unaffected. External cron calls and fresh installs always run the
+// full task list.
+$skipNonEssential = $isInternal && !$swapOnly && Background::isExternalCronFresh();
+
+if ($swapOnly) {
+    $mode = 'swaps-only';
+} elseif ($skipNonEssential) {
+    $mode = 'essentials-only';
+} else {
+    $mode = 'all';
+}
+
 $results = [
     'timestamp' => time(),
-    'mode' => $swapOnly ? 'swaps-only' : 'all',
+    'mode' => $mode,
     'tasks' => [],
 ];
 
@@ -117,7 +133,7 @@ if (!$swapOnly) {
 // Without it, an expiry that happened mid-interval would still skip this
 // tick (DevFee::computeOwed calls it too, but explicit here keeps the
 // cron sequence obvious).
-if (!$swapOnly) {
+if (!$swapOnly && !$skipNonEssential) {
     try {
         FreeTrial::expireIfNeeded();
         $feeResults = DevFee::settleAllStores();
@@ -130,7 +146,7 @@ if (!$swapOnly) {
 }
 
 // Task 2: Check auto-melt
-if (!$swapOnly) {
+if (!$swapOnly && !$skipNonEssential) {
     try {
         $meltResult = LightningAddress::checkAutoMelt();
         if ($meltResult) {
@@ -147,7 +163,7 @@ if (!$swapOnly) {
 }
 
 // Task 3: Clean expired cache
-if (!$swapOnly) {
+if (!$swapOnly && !$skipNonEssential) {
     try {
         Security::cleanCache();
         $results['tasks']['clean_cache'] = 'success';
@@ -206,7 +222,7 @@ try {
 }
 
 // Task 5: C1 - Sync proof states with mint (if not synced recently)
-if (!$swapOnly) try {
+if (!$swapOnly && !$skipNonEssential) try {
     if (Background::shouldSync()) {
         $stores = Database::fetchAll(
             "SELECT id FROM stores WHERE mint_url IS NOT NULL AND seed_phrase IS NOT NULL"
@@ -242,7 +258,7 @@ if (!$swapOnly) try {
 }
 
 // Task 7: H3 - Auto-expire very old invoices (older than 30 days)
-if (!$swapOnly) try {
+if (!$swapOnly && !$skipNonEssential) try {
     $veryOld = Database::query(
         "UPDATE invoices SET status = 'Expired'
          WHERE status = 'New' AND created_at < ?",
@@ -255,7 +271,7 @@ if (!$swapOnly) try {
 }
 
 // Task 8: L1 - Clean very old invoices (settled/expired older than 90 days)
-if (!$swapOnly) try {
+if (!$swapOnly && !$skipNonEssential) try {
     $deleted = Database::query(
         "DELETE FROM invoices WHERE status IN ('Settled', 'Expired', 'Invalid')
          AND created_at < ?",
@@ -268,7 +284,7 @@ if (!$swapOnly) try {
 }
 
 // Task 9: L3 - Clean expired pending operations from wallet storage
-if (!$swapOnly) try {
+if (!$swapOnly && !$skipNonEssential) try {
     $stores = Database::fetchAll(
         "SELECT id FROM stores WHERE mint_url IS NOT NULL AND seed_phrase IS NOT NULL"
     );
@@ -290,7 +306,7 @@ if (!$swapOnly) try {
 }
 
 // Task 10: L4 - Webhook delivery cleanup (keep only last 1000)
-if (!$swapOnly) try {
+if (!$swapOnly && !$skipNonEssential) try {
     // First get the count
     $countResult = Database::fetchOne("SELECT COUNT(*) as cnt FROM webhook_deliveries");
     $totalCount = (int)($countResult['cnt'] ?? 0);
@@ -314,7 +330,7 @@ if (!$swapOnly) try {
 }
 
 // Task 11: Refresh trusted mints list (default 24h interval).
-if (!$swapOnly) try {
+if (!$swapOnly && !$skipNonEssential) try {
     if (TrustedMints::getUrl() !== null) {
         $refreshed = TrustedMints::refresh();
         if ($refreshed) {
@@ -347,7 +363,7 @@ if (!$isInternal && !$swapOnly) {
 
 // Task 13: Drain queued notification emails. Runs on every tick so backlogs
 // from a temporarily-unreachable SMTP server self-heal on the next cron pass.
-if (!$swapOnly) try {
+if (!$swapOnly && !$skipNonEssential) try {
     $drain = NotificationSender::drainQueue();
     $results['tasks']['notifications'] = "sent: {$drain['sent']}, failed: {$drain['failed']}";
 } catch (Throwable $e) {
