@@ -444,6 +444,10 @@ def setup_payserver(workdir: Path, vpub: str, boltz_api_url: str,
     )
     env = os.environ.copy()
     env["CASHUPAY_DATA_DIR"] = str(data_dir)
+    # Kill the auto-updater for the whole test run — without this, a swap test
+    # that runs for several minutes will eventually overlay the working tree
+    # with the latest channel-main build mid-run.
+    env.setdefault("CASHUPAY_UPDATER_DISABLED", "1")
     port = free_port()
     log = (data_dir / "payserver.log").open("ab")
     proc = subprocess.Popen(
@@ -567,3 +571,450 @@ def drive_swap_to_terminal(payserver: PayserverProc, invoice_id: str,
             return row
         time.sleep(2)
     raise TimeoutError(f"Swap {invoice_id} did not reach a terminal state within {timeout}s")
+
+
+# ===========================================================================
+# Sweep / auto-melt helpers
+# ===========================================================================
+#
+# The pieces below are shared between the auto-melt e2e test and
+# any interactive dev driver that wants to exercise the sweep path.
+# They build on top of the Boltz regtest stack: a host-side LND backs the
+# cashu mint, a direct LND<->Boltz-lnd1 channel provides both inbound
+# (funding the cashu wallet) and outbound (paying the sweep's BOLT11)
+# liquidity.
+
+try:
+    from fixtures.boltz_regtest import (
+        HOST_PORT_BITCOIND_RPC,
+        HOST_PORT_BITCOIND_ZMQ_BLOCK,
+        HOST_PORT_BITCOIND_ZMQ_TX,
+    )
+except ImportError:
+    # Fallback when imported as fixtures.swap_stack rather than via the test
+    # bootstrap path. Mirrors the values in fixtures/boltz_regtest.py.
+    HOST_PORT_BITCOIND_RPC = 28443  # type: ignore[assignment]
+    HOST_PORT_BITCOIND_ZMQ_BLOCK = 29001  # type: ignore[assignment]
+    HOST_PORT_BITCOIND_ZMQ_TX = 29000  # type: ignore[assignment]
+
+
+@dataclass
+class BoltzBitcoindShim:
+    """Looks enough like fixtures/bitcoind.py:BitcoindHandle for the LND +
+    channel-bringup fixtures to use it.
+
+    Talks to Boltz's bitcoind via the host-exposed RPC port + cookie auth.
+    The cookie is cached on first access; if bitcoind restarts mid-session
+    we won't auto-refresh (acceptable for a single-shot interactive run or
+    a single pytest invocation).
+    """
+    boltz: BoltzRegtestHandle
+    rpc_port: int = HOST_PORT_BITCOIND_RPC
+    zmq_block_port: int = HOST_PORT_BITCOIND_ZMQ_BLOCK
+    zmq_tx_port: int = HOST_PORT_BITCOIND_ZMQ_TX
+    p2p_port: int = 0  # not used by the LND fixture
+    miner_address: str | None = None
+    default_wallet: str = "miner"
+    _cookie_user: str = ""
+    _cookie_pass: str = ""
+
+    def __post_init__(self):
+        cookie = self.boltz.bitcoind_cookie()
+        self._cookie_user, _, self._cookie_pass = cookie.partition(":")
+
+    # Boltz bitcoind has two wallets loaded ('regtest' = mining, 'client' =
+    # boltz client wallet). Bitcoin Core requires per-wallet URLs when
+    # multiple are loaded, so route wallet RPCs to the mining wallet.
+    WALLET_NAME = "regtest"
+    WALLET_RPCS = {"getnewaddress", "sendtoaddress", "getbalance", "listunspent",
+                   "getwalletinfo", "createwallet", "loadwallet", "unloadwallet"}
+
+    def rpc(self, method: str, *params: Any) -> Any:
+        from base64 import b64encode
+        body = json.dumps({"jsonrpc": "1.0", "id": "shim", "method": method,
+                           "params": list(params)}).encode()
+        auth = b64encode(f"{self._cookie_user}:{self._cookie_pass}".encode()).decode()
+        wallet_path = f"/wallet/{self.WALLET_NAME}" if method in self.WALLET_RPCS else "/"
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{self.rpc_port}{wallet_path}",
+            data=body,
+            headers={"Authorization": f"Basic {auth}", "Content-Type": "text/plain"},
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read())
+        if data.get("error"):
+            raise RuntimeError(f"bitcoind RPC {method}: {data['error']}")
+        return data.get("result")
+
+    def new_address(self) -> str:
+        return self.rpc("getnewaddress")
+
+    def mine(self, n: int = 1) -> list[str]:
+        if self.miner_address is None:
+            self.miner_address = self.new_address()
+        return self.rpc("generatetoaddress", n, self.miner_address)
+
+    def send_to_address(self, address: str, amount_btc: float) -> str:
+        return self.rpc("sendtoaddress", address, amount_btc)
+
+    def block_count(self) -> int:
+        return self.rpc("getblockcount")
+
+
+def open_lnd_to_boltz_lnd1_channel(lnd, boltz: BoltzRegtestHandle,
+                                    bitcoind_shim: BoltzBitcoindShim,
+                                    capacity_sat: int = 10_000_000,
+                                    push_sat: int = 5_000_000,
+                                    confirmations: int = 6,
+                                    timeout: float = 90.0) -> None:
+    """Open a dual-direction channel from `lnd` to Boltz's lnd-1.
+
+    Funds `lnd`'s on-chain wallet first, then connects + opens a channel
+    with the requested push so both directions have liquidity. Mines for
+    confirmations and waits for the channel to be active before returning.
+
+    Used by the auto-melt sweep test: lnd_mint needs outbound liquidity
+    TO Boltz so the cashu mint can route the sweep's BOLT11 payment, AND
+    inbound liquidity FROM Boltz so Boltz's lnd-1 can fund the cashu
+    wallet via an LN payment to the mint.
+    """
+    # 1. Top up lnd's on-chain wallet — channel funding needs capacity +
+    # change + miner fee. Send a bit more than capacity.
+    btc_to_fund = (capacity_sat + 200_000) / 100_000_000
+    addr = lnd.new_address()
+    bitcoind_shim.send_to_address(addr, btc_to_fund)
+    bitcoind_shim.mine(confirmations)
+
+    # 2. Wait until lnd is synced + sees the UTXO.
+    deadline = time.monotonic() + timeout
+    needed = capacity_sat + 50_000
+    target_height = bitcoind_shim.block_count()
+    while time.monotonic() < deadline:
+        try:
+            info = lnd.get_info()
+            synced = bool(info.get("synced_to_chain"))
+            height = int(info.get("block_height", 0))
+            if synced and height >= target_height and lnd.wallet_balance_sat() >= needed:
+                break
+        except Exception:
+            pass
+        time.sleep(0.5)
+    else:
+        raise TimeoutError(
+            f"LND {lnd.name} didn't reach synced + balance>={needed} within {timeout}s"
+        )
+
+    # 3. Connect to the Boltz lnd-1 peer. LND's POST /v1/peers returns when
+    # the peer is queued; the actual TCP connection comes shortly after.
+    # Poll list_peers until the peer is confirmed online, then open the
+    # channel with push so both sides have liquidity.
+    lnd.connect_peer(boltz.lnd1_pubkey,
+                     f"{boltz.lnd1_p2p_host}:{boltz.lnd1_p2p_port}")
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        peers = lnd.list_peers()
+        if any(p.get("pub_key") == boltz.lnd1_pubkey for p in peers):
+            break
+        time.sleep(0.5)
+    else:
+        raise TimeoutError(
+            f"LND {lnd.name} did not connect to Boltz lnd-1 ({boltz.lnd1_pubkey[:16]}…) within 30s"
+        )
+    lnd.open_channel(boltz.lnd1_pubkey, capacity_sat, push_sat)
+    bitcoind_shim.mine(confirmations)
+
+    # 4. Wait for the channel to become active. Channels in OPENING state
+    # take a few blocks beyond the funding confs to be usable for routing.
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        channels = lnd.list_channels()
+        for c in channels:
+            if (c.get("remote_pubkey") == boltz.lnd1_pubkey
+                    and c.get("active", False)):
+                return
+        time.sleep(2)
+    raise TimeoutError(
+        f"LND {lnd.name} -> Boltz lnd-1 channel did not become active within {timeout}s"
+    )
+
+
+@dataclass
+class SweepPayserverProc:
+    """Variant of PayserverProc for the auto-melt-sweep flow: includes the
+    seed phrase so the cashu wallet is fully usable, and tracks the store
+    in swap-mode (auto_melt_use_swap=1)."""
+    process: subprocess.Popen
+    port: int
+    data_dir: Path
+    store_id: str
+    api_token: str
+    seed_phrase: str
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self.port}"
+
+
+def setup_payserver_for_sweep(workdir: Path, vpub: str, mint_url: str,
+                               boltz_api_url: str,
+                               admin_password: str = "password") -> SweepPayserverProc:
+    """Stand up cashupayserver with a single store wired for the sweep flow:
+      - Cashu mint + seed (so the wallet can hold proofs)
+      - On-chain xpub (so SwapAutoMelt has a sweep destination)
+      - swaps_enabled = FORCE_OFF initially — flip to FORCE_ON after funding
+        via {@see enable_sweep_mode_for_store} so the funding-side invoice
+        creation goes through the cashu mint path, not swap.
+      - auto_melt_enabled = 1, auto_melt_use_swap = 1 (force swap).
+      - Site-wide swap config: enabled, boltz provider, no mint fallback.
+
+    Returns a handle including the seed phrase + store id + API token.
+    """
+    data_dir = workdir / "payserver-data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    _php_eval(data_dir, "Database::initialize(); echo 'ok';")
+
+    import sqlite3
+    db = data_dir / "cashupay.sqlite"
+    now = int(time.time())
+    store_id = f"store_{uuid.uuid4().hex[:12]}"
+    api_token = "dev-" + uuid.uuid4().hex[:20]
+    api_hash = hashlib.sha256(api_token.encode()).hexdigest()
+    internal_token = "internal-" + uuid.uuid4().hex[:24]
+    internal_hash = hashlib.sha256(internal_token.encode()).hexdigest()
+
+    seed_phrase = _php_eval(
+        data_dir,
+        "require_once " + repr(str(REPO_ROOT / "cashu-wallet-php" / "CashuWallet.php")) + ";"
+        "echo \\Cashu\\Mnemonic::generate();",
+    ).strip()
+    admin_pw_hash = _php_eval(
+        data_dir,
+        f"echo password_hash({admin_password!r}, PASSWORD_BCRYPT);",
+    ).strip()
+
+    conn = sqlite3.connect(str(db))
+    try:
+        cur = conn.cursor()
+        kvs = [
+            ("setup_complete", json.dumps(True)),
+            ("url_mode", json.dumps("direct")),
+            ("swaps_enabled", json.dumps(True)),
+            ("swaps_provider_order", json.dumps(["boltz"])),
+            ("swaps_strict_no_mint_fallback", json.dumps(False)),
+            ("swaps_boltz_regtest_url", json.dumps(boltz_api_url)),
+            ("cron_key", json.dumps("dev-cron-key")),
+            # Site default off for sweep mode — the per-store override below
+            # flips it on for this one store.
+            ("auto_melt_use_swap_default", json.dumps(False)),
+        ]
+        for k, v in kvs:
+            cur.execute(
+                "INSERT INTO config (key, value, created_at, updated_at) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+                (k, v, now, now),
+            )
+        cur.execute(
+            "INSERT INTO users (id, username, password_hash, role, created_at) "
+            "VALUES (?, 'admin', ?, 'admin', ?)",
+            ("user_" + uuid.uuid4().hex[:12], admin_pw_hash, now),
+        )
+        # Store: swaps initially FORCE_OFF so funding works via cashu mint
+        # rail. auto_melt_use_swap initially -1 (inherit) so the funding
+        # invoice's checkAutoMelt run won't try to sweep before we tell it to.
+        # auto_melt_enabled left at 0 — flipped on after funding.
+        cur.execute(
+            "INSERT INTO stores ("
+            " id, name, mint_url, mint_unit, default_currency, seed_phrase,"
+            " created_at, onchain_xpub, onchain_address_type, onchain_network,"
+            " onchain_min_confs, swaps_enabled,"
+            " auto_melt_enabled, auto_melt_threshold, auto_melt_use_swap,"
+            " internal_api_key"
+            ") VALUES "
+            "(?, 'Sweep Test Store', ?, 'sat', 'sat', ?, ?, ?, 'P2WPKH',"
+            " 'regtest', 1, 0, 0, 1000, -1, ?)",
+            (store_id, mint_url, seed_phrase, now, vpub, internal_token),
+        )
+        cur.execute(
+            "INSERT INTO api_keys (id, key_hash, store_id, label, permissions, created_at) "
+            "VALUES (?, ?, ?, 'dev', ?, ?)",
+            ("key_" + uuid.uuid4().hex[:12], api_hash, store_id, json.dumps(["*"]), now),
+        )
+        cur.execute(
+            "INSERT INTO api_keys (id, key_hash, store_id, label, permissions, created_at) "
+            "VALUES (?, ?, ?, 'internal', ?, ?)",
+            ("key_" + uuid.uuid4().hex[:12], internal_hash, store_id, json.dumps(["*"]), now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    wrapper = data_dir / "router_wrapper.php"
+    wrapper.write_text(
+        "<?php\n"
+        "$d = getenv('CASHUPAY_DATA_DIR');\n"
+        "if ($d !== false && $d !== '' && !defined('CASHUPAY_DATA_DIR')) {\n"
+        "    define('CASHUPAY_DATA_DIR', $d);\n"
+        "}\n"
+        f"return require {str(REPO_ROOT / 'router.php')!r};\n"
+    )
+    env = os.environ.copy()
+    env["CASHUPAY_DATA_DIR"] = str(data_dir)
+    env.setdefault("CASHUPAY_UPDATER_DISABLED", "1")
+    port = free_port()
+    log = (data_dir / "payserver.log").open("ab")
+    proc = subprocess.Popen(
+        [str(PHP), "-S", f"127.0.0.1:{port}", "-t", str(REPO_ROOT), str(wrapper)],
+        cwd=str(REPO_ROOT), env=env, stdout=log, stderr=subprocess.STDOUT,
+    )
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        try:
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/api/v1/server/info", timeout=1.0)
+            return SweepPayserverProc(process=proc, port=port, data_dir=data_dir,
+                                       store_id=store_id, api_token=api_token,
+                                       seed_phrase=seed_phrase)
+        except Exception:
+            time.sleep(0.3)
+    proc.kill()
+    raise TimeoutError(f"cashupayserver did not come up on :{port}")
+
+
+def stop_sweep_payserver(p: SweepPayserverProc) -> None:
+    if p.process.poll() is None:
+        p.process.terminate()
+        try:
+            p.process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            p.process.kill()
+
+
+def enable_sweep_mode_for_store(payserver: SweepPayserverProc) -> None:
+    """Flip the store row into the active-sweep configuration. Done after
+    cashu funding so the funding invoice goes through the mint rail, not
+    swap. After this call, the next cron tick will trigger SwapAutoMelt
+    for this store.
+    """
+    import sqlite3
+    db = payserver.data_dir / "cashupay.sqlite"
+    conn = sqlite3.connect(str(db))
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE stores SET swaps_enabled = 1, auto_melt_enabled = 1,"
+            "                  auto_melt_use_swap = 1"
+            " WHERE id = ?",
+            (payserver.store_id,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def fund_cashu_wallet_via_lnd1(payserver: SweepPayserverProc,
+                                boltz: BoltzRegtestHandle,
+                                amount_sats: int,
+                                timeout: float = 90.0) -> dict:
+    """Fund the payserver's cashu wallet by creating a mint-rail store
+    invoice and paying its BOLT11 from Boltz's lnd-1.
+
+    Requires the lnd_mint <-> lnd-1 channel to be active (so lnd-1 has a
+    route to the mint-backing LND) AND swaps_enabled=FORCE_OFF on the
+    store (so Invoice::create uses the cashu mint path).
+
+    Returns the final invoice row once it transitions to Settled.
+    """
+    status, body = http_json(
+        f"{payserver.url}/api/v1/stores/{payserver.store_id}/invoices",
+        method="POST",
+        body={"amount": amount_sats, "currency": "sat"},
+        headers={"Authorization": f"token {payserver.api_token}"},
+    )
+    if status != 200 or not isinstance(body, dict) or "id" not in body:
+        raise RuntimeError(f"create funding invoice failed: status={status} body={body}")
+    inv_id = body["id"]
+    bolt11 = body["checkout"]["paymentMethods"]["BTC-LightningNetwork"]["destination"]
+
+    # Pay from Boltz lnd-1 -> our LND-mint -> cashu mint.
+    boltz.lnd1_payinvoice(bolt11, timeout=int(timeout))
+
+    # Poll cron until the invoice is Settled (mint quote claimed).
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        trigger_cron(payserver)
+        row = fetch_invoice_row_compat(payserver, inv_id)
+        if row and row["status"] == "Settled":
+            return row
+        time.sleep(1)
+    raise TimeoutError(f"funding invoice {inv_id} did not Settle within {timeout}s")
+
+
+def fetch_invoice_row_compat(payserver, invoice_id: str) -> dict | None:
+    """Like fetch_invoice_row but accepts either PayserverProc shape."""
+    import sqlite3
+    db = payserver.data_dir / "cashupay.sqlite"
+    conn = sqlite3.connect(str(db))
+    try:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM invoices WHERE id = ?", (invoice_id,)).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def fetch_sweep_row(payserver, store_id: str) -> dict | None:
+    """Return the most recent sweep_attempts row for the given store, or None."""
+    import sqlite3
+    db = payserver.data_dir / "cashupay.sqlite"
+    conn = sqlite3.connect(str(db))
+    try:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM sweep_attempts WHERE store_id = ?"
+            " ORDER BY created_at DESC, id DESC LIMIT 1",
+            (store_id,),
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def trigger_cron_compat(payserver) -> None:
+    """Like trigger_cron but accepts either PayserverProc shape."""
+    try:
+        with urllib.request.urlopen(
+            f"{payserver.url}/cron.php?key=dev-cron-key", timeout=15) as r:
+            r.read()
+    except Exception:
+        pass
+
+
+def drive_sweep_to_terminal(payserver: SweepPayserverProc,
+                             boltz: BoltzRegtestHandle,
+                             timeout: float = 240.0) -> dict:
+    """Loop cron + mine until a sweep_attempts row for the store reaches a
+    terminal state. Returns the final row.
+
+    Mines a regtest block every ~6 ticks so the lockup tx confirms +
+    propagates (Boltz's status transitions watch the chain tip).
+    """
+    terminal = {"invoice.settled", "swap.expired", "transaction.refunded",
+                "transaction.failed", "invoice.expired", "claim.confirmed", "error"}
+    deadline = time.monotonic() + timeout
+    tick = 0
+    last_status = None
+    while time.monotonic() < deadline:
+        trigger_cron_compat(payserver)
+        tick += 1
+        if tick % 3 == 0:
+            boltz.mine_blocks(1)
+        row = fetch_sweep_row(payserver, payserver.store_id)
+        if row:
+            if row["status"] != last_status:
+                last_status = row["status"]
+            if row["status"] in terminal:
+                return row
+        time.sleep(2)
+    raise TimeoutError(
+        f"sweep for store {payserver.store_id} did not reach a terminal state "
+        f"within {timeout}s (last status={last_status})"
+    )

@@ -824,6 +824,99 @@ HTACCESS;
             $pdo->exec("ALTER TABLE swap_attempts ADD COLUMN quotes_compared_json TEXT");
         }
 
+        // Auto-melt via submarine swap: a per-store opt-in that replaces
+        // Lightning-address auto-melt with an on-chain sweep over the
+        // existing reverse-swap infrastructure. Tri-state matches the
+        // swaps_enabled override convention: -1 inherit site default,
+        // 0 force lightning, 1 force swap.
+        if (!self::columnExists($pdo, 'stores', 'auto_melt_use_swap')) {
+            $pdo->exec("ALTER TABLE stores ADD COLUMN auto_melt_use_swap INTEGER NOT NULL DEFAULT -1");
+        }
+
+        // Sweep-origin swaps. Mirrors swap_attempts but tied to a store
+        // balance rather than a customer invoice, so polling/claim can run
+        // on the same machinery without polluting the invoice table.
+        if (!self::tableExists($pdo, 'sweep_attempts')) {
+            $pdo->exec("
+                CREATE TABLE sweep_attempts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    store_id TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    network TEXT NOT NULL,
+                    direction TEXT NOT NULL DEFAULT 'reverse',
+                    swap_id_external TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    preimage_hex TEXT,
+                    preimage_hash_hex TEXT NOT NULL,
+                    claim_pubkey_hex TEXT NOT NULL,
+                    claim_privkey_hex TEXT NOT NULL,
+                    refund_pubkey_hex TEXT NOT NULL,
+                    lockup_address TEXT NOT NULL,
+                    lockup_txid TEXT,
+                    lockup_vout INTEGER,
+                    lockup_amount_sats INTEGER,
+                    lockup_tx_hex TEXT,
+                    timeout_block_height INTEGER NOT NULL,
+                    claim_leaf_script_hex TEXT NOT NULL,
+                    refund_leaf_script_hex TEXT NOT NULL,
+                    lightning_invoice TEXT NOT NULL,
+                    target_onchain_amount_sats INTEGER NOT NULL,
+                    invoice_amount_sats INTEGER NOT NULL,
+                    swap_lockup_fee_sats INTEGER NOT NULL DEFAULT 0,
+                    swap_percent_fee_sats INTEGER NOT NULL DEFAULT 0,
+                    merchant_address TEXT NOT NULL,
+                    merchant_address_index INTEGER NOT NULL,
+                    claim_txid TEXT,
+                    claim_tx_hex TEXT,
+                    melt_preimage TEXT,
+                    balance_sats_at_create INTEGER NOT NULL,
+                    quote_total_cost_sats INTEGER NOT NULL,
+                    provider_response_json TEXT,
+                    quotes_compared_json TEXT,
+                    error_message TEXT,
+                    last_polled_at INTEGER,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    FOREIGN KEY (store_id) REFERENCES stores(id) ON DELETE CASCADE
+                );
+            ");
+        }
+        if (!self::indexExists($pdo, 'idx_sweep_attempts_status')) {
+            $pdo->exec("CREATE INDEX idx_sweep_attempts_status ON sweep_attempts(status, last_polled_at);");
+        }
+        if (!self::indexExists($pdo, 'idx_sweep_attempts_store')) {
+            $pdo->exec("CREATE INDEX idx_sweep_attempts_store ON sweep_attempts(store_id, created_at DESC);");
+        }
+
+        // Rolling 30-day quote-history backing the per-store auto-melt-via-swap
+        // gate. The gate stops requesting fresh quotes once we have a few
+        // recent ones that don't satisfy the percent threshold, so a high-fee
+        // environment doesn't hammer providers for quotes that can never
+        // settle. One row per (store, provider, fetch).
+        if (!self::tableExists($pdo, 'swap_quote_history')) {
+            $pdo->exec("
+                CREATE TABLE swap_quote_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    store_id TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    network TEXT NOT NULL,
+                    fetched_at INTEGER NOT NULL,
+                    fee_percent REAL NOT NULL,
+                    lockup_fee_sats INTEGER NOT NULL,
+                    claim_fee_estimate_sats INTEGER NOT NULL,
+                    min_sats INTEGER NOT NULL,
+                    max_sats INTEGER NOT NULL,
+                    balance_sats_at_fetch INTEGER NOT NULL,
+                    total_cost_sats_at_fetch INTEGER NOT NULL,
+                    met_threshold INTEGER NOT NULL DEFAULT 0,
+                    FOREIGN KEY (store_id) REFERENCES stores(id) ON DELETE CASCADE
+                );
+            ");
+        }
+        if (!self::indexExists($pdo, 'idx_swap_quote_history_store_time')) {
+            $pdo->exec("CREATE INDEX idx_swap_quote_history_store_time ON swap_quote_history(store_id, fetched_at DESC);");
+        }
+
         // Drop the legacy users.pin_hash column (PIN feature removed). Uses
         // the SQLite table-rebuild dance for compatibility with SQLite < 3.35.
         if (self::columnExists($pdo, 'users', 'pin_hash')) {

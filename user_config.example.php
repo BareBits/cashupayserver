@@ -123,3 +123,36 @@
 // define('CASHUPAY_SMTP_ENCRYPTION', 'tls');
 // define('CASHUPAY_SMTP_FROM_ADDRESS', 'notifications@example.com');
 // define('CASHUPAY_SMTP_FROM_NAME', 'CashuPayServer');
+
+// =============================================================================
+// AUTO-MELT VIA SUBMARINE SWAP
+// =============================================================================
+// When a store opts into "Auto-withdraw via submarine swap" (instead of the
+// Lightning-address path), the cron sweeps the mint balance through a
+// reverse submarine swap to the store's on-chain xpub.
+//
+// Two cost gates protect against sweeping at unfavourable rates. A sweep
+// runs only when BOTH are satisfied:
+//   1. Mint balance ≥ CASHUPAY_AUTO_MELT_SWAP_MIN_SATS (cheap pre-flight; we
+//      don't even fetch a quote below this).
+//   2. Best available swap-provider quote's total cost (percent fee +
+//      lockup miner fee + claim miner fee estimate) is ≤
+//      CASHUPAY_AUTO_MELT_SWAP_MAX_FEE_PCT % of the amount being swept.
+//
+// Both are display-only knobs in the admin UI: defaults below drive
+// behaviour, the UI just shows the active values so operators can size
+// their balances. To change them, edit this file and restart PHP-FPM.
+
+// CASHUPAY_AUTO_MELT_SWAP_MIN_SATS — static floor in satoshis. Defaults to
+// 5000 (~$5 at typical rates) which covers the swap-provider minimums and
+// is the smallest amount where the percent-fee gate has any realistic
+// chance of being satisfied.
+//
+// define('CASHUPAY_AUTO_MELT_SWAP_MIN_SATS', 5000);
+
+// CASHUPAY_AUTO_MELT_SWAP_MAX_FEE_PCT — percent cap on the swap-provider's
+// total fees relative to the amount being swept. Defaults to 1.0 (i.e.
+// total swap cost must not exceed 1% of the sweep amount). Accepts a
+// float; values < 0.1 will almost never be satisfiable in practice.
+//
+// define('CASHUPAY_AUTO_MELT_SWAP_MAX_FEE_PCT', 1.0);

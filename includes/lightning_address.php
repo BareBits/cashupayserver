@@ -13,6 +13,7 @@ require_once __DIR__ . '/invoice.php';
 require_once __DIR__ . '/rates.php';
 require_once __DIR__ . '/mint_reliability.php';
 require_once __DIR__ . '/notification_sender.php';
+require_once __DIR__ . '/swap/auto_melt.php';
 require_once __DIR__ . '/../cashu-wallet-php/CashuWallet.php';
 
 use Cashu\Wallet;
@@ -164,9 +165,14 @@ class LightningAddress {
      * Called on each admin page load to check if any stores need auto-withdrawal
      */
     public static function checkAutoMelt(): ?array {
-        // Get all stores with auto-melt enabled
+        // Get all stores with auto-melt enabled. Includes auto_melt_use_swap +
+        // the on-chain fields {@see SwapAutoMelt::modeForStore} needs, so we
+        // can hand stores that opted into swap-mode auto-melt over to
+        // SwapAutoMelt::checkAndExecute without re-querying.
         $stores = Database::fetchAll(
             "SELECT id, name, mint_url, mint_unit, auto_melt_address, auto_melt_threshold,
+                    auto_melt_use_swap, onchain_address_mode, onchain_xpub,
+                    swaps_enabled,
                     price_provider_primary, price_provider_secondary
              FROM stores
              WHERE auto_melt_enabled = 1
@@ -183,6 +189,9 @@ class LightningAddress {
         $results = [];
 
         foreach ($stores as $store) {
+            if (SwapAutoMelt::modeForStore($store) === 'swap') {
+                continue;
+            }
             try {
                 // Check store balance from local storage (offline-first, no mint contact)
                 // This prevents crashes when mint is unreachable

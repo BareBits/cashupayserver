@@ -307,6 +307,9 @@ def setup_payserver_with_stores(workdir: Path, vpub: str, mint_url: str,
     )
     env = os.environ.copy()
     env["CASHUPAY_DATA_DIR"] = str(data_dir)
+    # Honoured by includes/updater.php::isDisabledForTests() — keep the
+    # auto-updater from clobbering the working tree mid-run.
+    env.setdefault("CASHUPAY_UPDATER_DISABLED", "1")
     port = swap_stack.free_port()
     log = (data_dir / "payserver.log").open("ab")
     proc = subprocess.Popen(

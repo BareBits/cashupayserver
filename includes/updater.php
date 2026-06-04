@@ -53,6 +53,14 @@ class Updater {
         if (self::isWordPressMode()) {
             return false;
         }
+        // Test-harness kill switch. Honoured when running under iterate.py
+        // or the pytest payserver fixture so a long-running stack doesn't
+        // overlay an in-progress dev branch with the latest channel-main
+        // build mid-iteration. Operators should not set this — the WP
+        // build remains the supported "no auto-update" path.
+        if (self::isDisabledForTests()) {
+            return false;
+        }
 
         $now = time();
         $lastCheck = (int)Config::get('updater_last_check', 0);
@@ -119,6 +127,22 @@ class Updater {
 
     private static function isWordPressMode(): bool {
         return defined('CASHUPAY_WORDPRESS') && CASHUPAY_WORDPRESS;
+    }
+
+    /**
+     * Test-harness opt-out, driven by either the CASHUPAY_UPDATER_DISABLED
+     * PHP constant or the env var of the same name. Truthy in either source
+     * disables {@see checkAndApply}.
+     */
+    private static function isDisabledForTests(): bool {
+        if (defined('CASHUPAY_UPDATER_DISABLED') && CASHUPAY_UPDATER_DISABLED) {
+            return true;
+        }
+        $env = getenv('CASHUPAY_UPDATER_DISABLED');
+        if ($env !== false && $env !== '' && $env !== '0') {
+            return true;
+        }
+        return false;
     }
 
     // ---------------- Remote / local build info ----------------
