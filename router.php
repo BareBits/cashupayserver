@@ -91,9 +91,13 @@ if (preg_match('#^/payment(?:/(.+))?$#', $uri, $matches)) {
 }
 
 // -----------------------------------------------------------------------------
-// Admin: /admin
+// Admin: /admin, /admin.php, or /admin[.php]/<view> (e.g. /admin/invoices)
+// The sub-path is the SPA view slug — forwarded via PATH_INFO so admin.php
+// can pick it up uniformly. The optional .php form keeps router-mode links
+// like /router.php/admin.php/<view> working after canonicalization.
 // -----------------------------------------------------------------------------
-if (preg_match('#^/admin$#', $uri)) {
+if (preg_match('#^/admin(?:\.php)?(?:/(.+))?$#', $uri, $matches)) {
+    $_SERVER['PATH_INFO'] = '/' . ($matches[1] ?? '');
     require __DIR__ . '/admin.php';
     exit;
 }

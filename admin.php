@@ -2157,6 +2157,57 @@ $isLoggedIn = Auth::isLoggedIn();
 $currentUser = Auth::currentUser();   // null when WordPress mode or not logged in
 $currentRole = $currentUser['role'] ?? ($isLoggedIn ? Auth::ROLE_ADMIN : null);
 $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
+
+// -----------------------------------------------------------------------------
+// SPA view routing
+//
+// Every SPA view has its own URL slug (e.g. /admin/invoices). The view is
+// parsed here so a refresh restores the operator's current page instead of
+// always dropping them back on the dashboard.
+//
+// Sources for the view slug:
+//   - Standalone (direct, router, or PATH_INFO mode): $_SERVER['PATH_INFO']
+//   - WordPress: a query var captured by the cashupay-admin rewrite rule
+//
+// Unknown or empty view → 302 to <base>/dashboard so /admin canonicalizes to
+// /admin/dashboard and bookmarks of removed views still resolve sensibly.
+// -----------------------------------------------------------------------------
+const ADMIN_VIEWS = ['dashboard', 'invoices', 'stores', 'settings', 'stats'];
+
+if ($isWp) {
+    $rawAdminView = (string)get_query_var('cashupay_admin_view');
+} else {
+    $rawAdminView = trim((string)($_SERVER['PATH_INFO'] ?? ''), '/');
+}
+
+// Compute the base path the JS uses to build view URLs and to call back into
+// admin.php for ?api=... requests. In standalone mode it's REQUEST_URI minus
+// the PATH_INFO tail and any query string; in WordPress mode the rewrite
+// owns the URL shape, so we use the canonical admin URL.
+if ($isWp) {
+    $adminBasePath = rtrim(Urls::admin(), '/');
+} else {
+    $reqPath = parse_url((string)($_SERVER['REQUEST_URI'] ?? ''), PHP_URL_PATH) ?: '';
+    $pi = (string)($_SERVER['PATH_INFO'] ?? '');
+    if ($pi !== '' && $pi !== '/' && substr($reqPath, -strlen($pi)) === $pi) {
+        $reqPath = substr($reqPath, 0, -strlen($pi));
+    }
+    $adminBasePath = rtrim($reqPath, '/');
+    if ($adminBasePath === '') {
+        // Fallback if REQUEST_URI was unexpectedly empty.
+        $adminBasePath = rtrim(Urls::admin(), '/');
+    }
+}
+
+// Canonicalize: unknown or empty view → /admin/dashboard, preserving query.
+if (!in_array($rawAdminView, ADMIN_VIEWS, true)) {
+    $reqQuery = parse_url((string)($_SERVER['REQUEST_URI'] ?? ''), PHP_URL_QUERY);
+    $location = $adminBasePath . '/dashboard' . ($reqQuery ? '?' . $reqQuery : '');
+    header('Location: ' . $location);
+    exit;
+}
+
+$adminView = $rawAdminView;
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -4464,8 +4515,18 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
             username: <?= json_encode($currentUsername) ?>,
             role:     <?= json_encode($currentRole) ?>,
         };
-        const adminUrl = <?= json_encode(Urls::admin()) ?>;
+        // Path-based SPA routing: adminBasePath is the URL prefix the user
+        // reached the admin under (no trailing slash, no view tail). All view
+        // URLs and ?api=... fetches build off this so the same code works
+        // under direct, router, and WordPress modes — and under PATH_INFO
+        // where relative URLs would otherwise resolve incorrectly.
+        const adminBasePath = <?= json_encode($adminBasePath) ?>;
+        const adminUrl = adminBasePath;
         const setupUrl = <?= json_encode(Urls::setup()) ?>;
+
+        // Server-parsed view slug (validated against the allowed list above).
+        const initialView = <?= json_encode($adminView) ?>;
+        const ADMIN_VIEWS = <?= json_encode(ADMIN_VIEWS) ?>;
 
         // URL mode config (embedded from PHP)
         const urlModeConfig = {
@@ -4579,8 +4640,12 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                 currentStoreId = createdStoreId;
                 localStorage.setItem('selectedStoreId', createdStoreId);
 
-                // Clean up URL
-                window.history.replaceState({}, document.title, window.location.pathname);
+                // Strip ?store_created= but keep the current SPA view path
+                // (e.g. /admin/dashboard) so refreshes still land here.
+                urlParams.delete('store_created');
+                const qs = urlParams.toString();
+                window.history.replaceState({}, document.title,
+                    window.location.pathname + (qs ? '?' + qs : ''));
             }
 
             await loadDashboard();
@@ -4590,12 +4655,12 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                 showToast('Store created successfully!', 'success');
             }
 
-            // If the URL hash points at the invoices view (e.g. operator
-            // refreshed while filtering), jump there. switchView seeds the
-            // dropdown from the hash itself.
-            const hash = window.location.hash || '';
-            if (hash.startsWith('#invoices')) {
-                switchView('invoices');
+            // Restore the server-parsed view (e.g. operator refreshed while on
+            // /admin/invoices). Dashboard is already active from the markup, so
+            // we only call switchView for non-dashboard views to avoid a
+            // wasted re-render.
+            if (initialView && initialView !== 'dashboard') {
+                switchView(initialView, { replace: true });
             }
         }
 
@@ -4678,11 +4743,11 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
             document.getElementById('btn-request').addEventListener('click', () => openModal('modal-request'));
             document.getElementById('btn-new-invoice').addEventListener('click', () => openModal('modal-request'));
 
-            // Invoices status filter: persist choice in URL hash + refetch.
+            // Invoices status filter: persist choice in the URL + refetch.
             const invStatusSel = document.getElementById('invoice-status-filter');
             if (invStatusSel) {
                 invStatusSel.addEventListener('change', () => {
-                    writeInvoiceFilterToHash(getInvoiceStatusFilter());
+                    writeInvoiceFilterToUrl(getInvoiceStatusFilter());
                     loadInvoices();
                 });
             }
@@ -4819,7 +4884,12 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
         }
 
         // View switching
-        function switchView(view) {
+        //
+        // opts.replace=true uses history.replaceState instead of pushState.
+        // Used on initial-view restore and on popstate so Back/Forward don't
+        // grow a duplicate history entry.
+        function switchView(view, opts) {
+            if (!ADMIN_VIEWS.includes(view)) view = 'dashboard';
             if (view === 'stats' && phpUser.role !== 'admin') {
                 showToast('Admin role required', 'error');
                 return;
@@ -4848,10 +4918,14 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                 storeSelector.style.display = 'flex';
             }
 
+            // Reflect the active view in the URL so refreshes restore it.
+            // Invoices keeps its ?status filter (read from the existing URL
+            // when we re-enter the view) so the operator's selection survives
+            // both refreshes and navigation across views.
+            writeViewToUrl(view, opts && opts.replace);
+
             if (view === 'invoices') {
-                // Hydrate the status dropdown from the URL hash on first
-                // entry so a refresh restores the operator's filter.
-                setInvoiceStatusFilter(readInvoiceFilterFromHash());
+                setInvoiceStatusFilter(readInvoiceFilterFromUrl());
                 loadInvoices();
             }
             if (view === 'stores') loadStoreSettings();
@@ -4869,6 +4943,38 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                 }
             }
         }
+
+        // Build a URL for a view, preserving the invoices ?status filter when
+        // navigating between invoices states. Other views drop the query
+        // string — none of them currently carry URL-resident state.
+        function urlForView(view, query) {
+            let url = adminBasePath + '/' + view;
+            if (query) url += '?' + query;
+            return url;
+        }
+
+        function writeViewToUrl(view, replace) {
+            // Preserve the current ?status= only when staying on /invoices;
+            // navigating away from invoices drops it.
+            let query = '';
+            if (view === 'invoices') {
+                const status = readInvoiceFilterFromUrl();
+                if (status) query = 'status=' + encodeURIComponent(status);
+            }
+            const url = urlForView(view, query);
+            const fn = replace ? history.replaceState : history.pushState;
+            fn.call(history, { view }, '', url);
+        }
+
+        // Browser Back/Forward should navigate between admin views without a
+        // full page reload — derive the target view from the new URL.
+        window.addEventListener('popstate', () => {
+            const path = window.location.pathname;
+            // The view slug is the last non-empty path segment.
+            const seg = path.split('/').filter(Boolean).pop() || 'dashboard';
+            const view = ADMIN_VIEWS.includes(seg) ? seg : 'dashboard';
+            switchView(view, { replace: true });
+        });
 
         // Client-side admin guard for buttons whose modals shouldn't even
         // open for non-admins. Server-side gates still enforce the actual
@@ -5276,8 +5382,9 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
             }
         }
 
-        // Status filter for the All Invoices view. Persisted in the URL hash
-        // (e.g. #invoices?status=Settled) so a refresh preserves the choice.
+        // Status filter for the All Invoices view. Persisted in the URL query
+        // string (e.g. /admin/invoices?status=Settled) so a refresh preserves
+        // the choice and the URL stays linkable.
         const INVOICE_STATUSES = ['New', 'Processing', 'Settled', 'Expired', 'Invalid'];
 
         function getInvoiceStatusFilter() {
@@ -5291,26 +5398,18 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
             if (sel) sel.value = INVOICE_STATUSES.includes(v) ? v : '';
         }
 
-        function readInvoiceFilterFromHash() {
-            const hash = window.location.hash || '';
-            const qIdx = hash.indexOf('?');
-            if (qIdx < 0) return '';
-            const params = new URLSearchParams(hash.slice(qIdx + 1));
-            const s = params.get('status') || '';
+        function readInvoiceFilterFromUrl() {
+            const s = new URLSearchParams(window.location.search).get('status') || '';
             return INVOICE_STATUSES.includes(s) ? s : '';
         }
 
-        function writeInvoiceFilterToHash(status) {
-            // Only touch the hash while the invoices view is the active view,
-            // so we don't stomp on other views' hash usage.
+        function writeInvoiceFilterToUrl(status) {
+            // Only touch the URL while the invoices view is the active view,
+            // so we don't stomp on other views' URL state.
             const view = document.querySelector('.view.active');
             if (!view || view.id !== 'view-invoices') return;
-            const base = '#invoices';
-            if (status) {
-                history.replaceState(null, '', base + '?status=' + encodeURIComponent(status));
-            } else {
-                history.replaceState(null, '', base);
-            }
+            const url = urlForView('invoices', status ? 'status=' + encodeURIComponent(status) : '');
+            history.replaceState({ view: 'invoices' }, '', url);
         }
 
         async function loadInvoices() {
