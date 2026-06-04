@@ -100,7 +100,7 @@ class Database {
             // that migration ran — getInstance() will then trigger runMigrations()
             // on existing installs that haven't yet picked it up. All migrations
             // are idempotent, so a fire is safe.
-            $hasLatestMigration = $hasConfig && self::columnExists(self::$instance, 'swap_attempts', 'provider_response_json');
+            $hasLatestMigration = $hasConfig && self::columnExists(self::$instance, 'stores', 'onchain_address_mode');
 
             if ($hasConfig && (!$hasUsers || !$hasReliability || !$hasLatestMigration)) {
                 if (!$hasUsers) {
@@ -433,6 +433,19 @@ HTACCESS;
         if (!self::columnExists($pdo, 'stores', 'onchain_provider_url')) {
             $pdo->exec("ALTER TABLE stores ADD COLUMN onchain_provider_url TEXT DEFAULT NULL");
         }
+        // Static-address mode: alternative to xpub for merchants without an
+        // extended public key. When mode='static', onchain_static_address is
+        // reused for every invoice and per-invoice tweaks (in sats) make each
+        // expected total unique so incoming txs can be attributed.
+        if (!self::columnExists($pdo, 'stores', 'onchain_address_mode')) {
+            $pdo->exec("ALTER TABLE stores ADD COLUMN onchain_address_mode TEXT NOT NULL DEFAULT 'xpub'");
+        }
+        if (!self::columnExists($pdo, 'stores', 'onchain_static_address')) {
+            $pdo->exec("ALTER TABLE stores ADD COLUMN onchain_static_address TEXT DEFAULT NULL");
+        }
+        if (!self::columnExists($pdo, 'stores', 'onchain_static_tweak_range')) {
+            $pdo->exec("ALTER TABLE stores ADD COLUMN onchain_static_tweak_range INTEGER NOT NULL DEFAULT 1000");
+        }
 
         if (!self::columnExists($pdo, 'invoices', 'onchain_address')) {
             $pdo->exec("ALTER TABLE invoices ADD COLUMN onchain_address TEXT DEFAULT NULL");
@@ -451,6 +464,19 @@ HTACCESS;
         // invoice existed). NULL on legacy rows → no filtering applied.
         if (!self::columnExists($pdo, 'invoices', 'onchain_created_tip_height')) {
             $pdo->exec("ALTER TABLE invoices ADD COLUMN onchain_created_tip_height INTEGER DEFAULT NULL");
+        }
+        // Static-address mode bookkeeping. tweak_sats is the per-invoice sat
+        // offset added to the base amount so each open invoice has a unique
+        // total. needs_manual_confirmation + manual_candidates handle the case
+        // where multiple invoices match the same incoming tx amount.
+        if (!self::columnExists($pdo, 'invoices', 'onchain_amount_tweak_sats')) {
+            $pdo->exec("ALTER TABLE invoices ADD COLUMN onchain_amount_tweak_sats INTEGER DEFAULT NULL");
+        }
+        if (!self::columnExists($pdo, 'invoices', 'onchain_needs_manual_confirmation')) {
+            $pdo->exec("ALTER TABLE invoices ADD COLUMN onchain_needs_manual_confirmation INTEGER NOT NULL DEFAULT 0");
+        }
+        if (!self::columnExists($pdo, 'invoices', 'onchain_manual_candidates')) {
+            $pdo->exec("ALTER TABLE invoices ADD COLUMN onchain_manual_candidates TEXT DEFAULT NULL");
         }
 
         if (!self::tableExists($pdo, 'onchain_xpub_state')) {

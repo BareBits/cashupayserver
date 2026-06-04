@@ -330,24 +330,51 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if ($onchainAction === 'skip') {
                     // user chose to add it later from admin
                 } elseif ($onchainAction === 'save') {
-                    $xpub = trim($_POST['onchain_xpub'] ?? '');
+                    $mode = $_POST['onchain_address_mode'] ?? 'xpub';
+                    if (!in_array($mode, ['xpub', 'static'], true)) {
+                        throw new Exception('Invalid mode');
+                    }
                     $network = $_POST['onchain_network'] ?? 'mainnet';
-                    $type = $_POST['onchain_address_type'] ?? 'P2WPKH';
                     $minConfs = max(0, (int)($_POST['onchain_min_confs'] ?? 1));
                     $providerUrl = trim($_POST['onchain_provider_url'] ?? '');
 
                     require_once __DIR__ . '/includes/onchain/wallet.php';
-                    $check = OnchainWallet::validateXpub($xpub, $network, $type);
-                    if (!$check['valid']) {
-                        throw new Exception($check['error'] ?: 'Invalid xpub');
+                    if ($mode === 'static') {
+                        $staticAddress = trim($_POST['onchain_static_address'] ?? '');
+                        $tweakRange = max(100, min(100000, (int)($_POST['onchain_static_tweak_range'] ?? 1000)));
+                        if ($staticAddress === '') {
+                            throw new Exception('Static address required');
+                        }
+                        $check = OnchainWallet::validateAddress($staticAddress, $network);
+                        if (!$check['valid']) {
+                            throw new Exception($check['error'] ?: 'Invalid address');
+                        }
+                        Config::updateStore($storeId, [
+                            'onchain_address_mode' => 'static',
+                            'onchain_static_address' => $staticAddress,
+                            'onchain_static_tweak_range' => $tweakRange,
+                            'onchain_xpub' => null,
+                            'onchain_network' => $network,
+                            'onchain_min_confs' => $minConfs,
+                            'onchain_provider_url' => $providerUrl ?: null,
+                        ]);
+                    } else {
+                        $xpub = trim($_POST['onchain_xpub'] ?? '');
+                        $type = $_POST['onchain_address_type'] ?? 'P2WPKH';
+                        $check = OnchainWallet::validateXpub($xpub, $network, $type);
+                        if (!$check['valid']) {
+                            throw new Exception($check['error'] ?: 'Invalid xpub');
+                        }
+                        Config::updateStore($storeId, [
+                            'onchain_address_mode' => 'xpub',
+                            'onchain_xpub' => $xpub,
+                            'onchain_static_address' => null,
+                            'onchain_network' => $network,
+                            'onchain_address_type' => $type,
+                            'onchain_min_confs' => $minConfs,
+                            'onchain_provider_url' => $providerUrl ?: null,
+                        ]);
                     }
-                    Config::updateStore($storeId, [
-                        'onchain_xpub' => $xpub,
-                        'onchain_network' => $network,
-                        'onchain_address_type' => $type,
-                        'onchain_min_confs' => $minConfs,
-                        'onchain_provider_url' => $providerUrl ?: null,
-                    ]);
                 } else {
                     // GET landing on step 8 — fall through to render the form.
                     break;
@@ -1380,11 +1407,46 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                     <input type="hidden" name="onchain_action" value="save">
 
                     <div class="form-group">
+                        <label for="onchain_address_mode">Address source:</label>
+                        <select id="onchain_address_mode" name="onchain_address_mode">
+                            <option value="xpub">Extended public key (recommended)</option>
+                            <option value="static">Single static address (not recommended)</option>
+                        </select>
+                    </div>
+
+                    <div id="onchain-static-warning" class="warning" style="display:none; margin-bottom: 1rem;">
+                        <strong>&#9888; Static address re-use is strongly discouraged.</strong>
+                        <p style="margin: 0.5rem 0;">
+                            It is STRONGLY recommended that you use an xpub instead of a static
+                            address. Static address re-use decreases the privacy of you and your
+                            customers and prevents correctly detecting payment when multiple
+                            transactions are used to pay an invoice. Each invoice will be assigned
+                            a unique sat-tweak so totals don&rsquo;t collide; customers must pay the
+                            exact amount in a single transaction.
+                        </p>
+                    </div>
+
+                    <div class="form-group" id="onchain-xpub-row">
                         <label for="onchain_xpub">Extended public key (xpub):</label>
                         <textarea id="onchain_xpub" name="onchain_xpub" rows="2"
                                   style="width: 100%; font-family: monospace; font-size: 0.85rem;"
                                   placeholder="xpub6CUGRUonZ... or zpub6rFR7y4Q2... or vpub5SLqN2bL...">
                         </textarea>
+                    </div>
+
+                    <div class="form-group" id="onchain-static-address-row" style="display:none;">
+                        <label for="onchain_static_address">Static receive address:</label>
+                        <input type="text" id="onchain_static_address" name="onchain_static_address"
+                               style="width: 100%; font-family: monospace; font-size: 0.85rem;"
+                               placeholder="bc1q... / 3... / 1... (or testnet / regtest equivalent)">
+                    </div>
+
+                    <div class="form-group" id="onchain-static-tweak-row" style="display:none;">
+                        <label for="onchain_static_tweak_range">
+                            Tweak range (number of unique sat-offsets):
+                        </label>
+                        <input type="number" id="onchain_static_tweak_range" name="onchain_static_tweak_range"
+                               min="100" max="100000" value="1000">
                     </div>
 
                     <div class="form-group">
@@ -1397,7 +1459,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                         </select>
                     </div>
 
-                    <div class="form-group">
+                    <div class="form-group" id="onchain-address-type-row">
                         <label for="onchain_address_type">Address type:</label>
                         <select id="onchain_address_type" name="onchain_address_type">
                             <option value="P2WPKH">P2WPKH (native segwit, recommended)</option>
@@ -1441,6 +1503,30 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                     const validateBtn = document.getElementById('onchain-validate-btn');
                     const saveBtn = document.getElementById('onchain-save-btn');
                     const box = document.getElementById('onchain-validation');
+                    const modeSel = document.getElementById('onchain_address_mode');
+                    const warning = document.getElementById('onchain-static-warning');
+                    const xpubRow = document.getElementById('onchain-xpub-row');
+                    const addrRow = document.getElementById('onchain-static-address-row');
+                    const tweakRow = document.getElementById('onchain-static-tweak-row');
+                    const typeRow = document.getElementById('onchain-address-type-row');
+
+                    function applyMode() {
+                        const isStatic = modeSel.value === 'static';
+                        warning.style.display = isStatic ? 'block' : 'none';
+                        xpubRow.style.display = isStatic ? 'none' : '';
+                        typeRow.style.display = isStatic ? 'none' : '';
+                        addrRow.style.display = isStatic ? '' : 'none';
+                        tweakRow.style.display = isStatic ? '' : 'none';
+                        validateBtn.style.display = isStatic ? 'none' : '';
+                        // In static mode the xpub validate flow doesn't apply,
+                        // so enable Save directly. The server still validates
+                        // the address on submit.
+                        saveBtn.disabled = !isStatic;
+                        box.style.display = 'none';
+                    }
+                    modeSel.addEventListener('change', applyMode);
+                    applyMode();
+
                     validateBtn.addEventListener('click', async () => {
                         const xpub = document.getElementById('onchain_xpub').value.trim();
                         const network = document.getElementById('onchain_network').value;

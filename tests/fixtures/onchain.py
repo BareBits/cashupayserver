@@ -177,6 +177,46 @@ def configure_store_for_onchain(
         conn.close()
 
 
+def configure_store_for_static_onchain(
+    db_path: Path,
+    store_id: str,
+    *,
+    static_address: str,
+    network: str = "regtest",
+    tweak_range: int = 1000,
+    min_confs: int = 0,
+    confirm_timeout_sec: int = 86400,
+    provider_url: str | None = None,
+) -> None:
+    """Direct DB write: put a store into static-address mode.
+
+    The xpub field is cleared because the runtime enforces "one OR the other"
+    on save_onchain; tests that drive the DB directly should match that
+    invariant so subsequent UI calls don't get into surprising states.
+    """
+    conn = sqlite3.connect(db_path, isolation_level=None)
+    try:
+        conn.execute(
+            """
+            UPDATE stores
+               SET onchain_address_mode = 'static',
+                   onchain_static_address = ?,
+                   onchain_static_tweak_range = ?,
+                   onchain_xpub = NULL,
+                   onchain_network = ?,
+                   onchain_min_confs = ?,
+                   onchain_confirm_timeout_sec = ?,
+                   onchain_provider = 'bitcoind-rpc',
+                   onchain_provider_url = ?
+             WHERE id = ?
+            """,
+            (static_address, tweak_range, network, min_confs, confirm_timeout_sec,
+             provider_url, store_id),
+        )
+    finally:
+        conn.close()
+
+
 def derive_address_in_bitcoind(bitcoind: BitcoindHandle, xpub: str, address_type: str, index: int) -> str:
     """Reference derivation via `bitcoin-cli deriveaddresses` for parity checks."""
     # Build a watch-only descriptor matching cashupayserver's m/0/{index}.

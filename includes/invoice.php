@@ -43,7 +43,15 @@ class Invoice {
         }
 
         $cashuConfigured = Config::isStoreConfigured($storeId);
-        $onchainConfigured = !empty($store['onchain_xpub']);
+        // A store is "on-chain configured" if it has either an xpub (default
+        // mode) or a static receive address (alternative mode for merchants
+        // without an xpub). Treating only xpub as configured caused
+        // static-mode invoices to be created without an on-chain payment
+        // method block.
+        $onchainMode = $store['onchain_address_mode'] ?? 'xpub';
+        $onchainConfigured = ($onchainMode === 'static')
+            ? !empty($store['onchain_static_address'])
+            : !empty($store['onchain_xpub']);
         if (!$cashuConfigured && !$onchainConfigured) {
             throw new Exception(
                 'Store has no payment methods configured. Add a Cashu mint or an on-chain xpub.'
@@ -118,21 +126,39 @@ class Invoice {
             }
         }
 
-        // ---- On-chain path: allocate a fresh address from the store's xpub ----
+        // ---- On-chain path: allocate a receive address ----
         // Skipped on swap-rail invoices — the customer is paying via Lightning,
         // and offering a pay-to-address option in parallel would create a
         // second settlement path the swap lifecycle is not aware of.
+        //
+        // In xpub mode the allocation derives a fresh address per invoice. In
+        // static-address mode it returns the shared address plus a per-invoice
+        // tweak (in sats) that makes the expected total unique among open
+        // invoices, so incoming txs can be attributed by exact amount match.
         $onchainAddress = null;
         $onchainIndex = null;
         $onchainAmountSat = null;
+        $onchainAmountTweakSats = null;
         $onchainCreatedTipHeight = null;
         if ($onchainConfigured && $swapAttempt === null) {
-            $allocation = OnchainPayments::allocateAddress($storeId);
+            $baseAmountSat = (int)ExchangeRates::convertToSats((string)$amount, $currency, 'sat');
+            try {
+                $allocation = OnchainPayments::allocateAddress($storeId, $baseAmountSat);
+            } catch (RuntimeException $e) {
+                if ($e->getMessage() === OnchainPayments::ERR_TWEAK_SLOTS_EXHAUSTED) {
+                    throw new RuntimeException(
+                        'All on-chain payment slots are temporarily reserved. Please try again in a few minutes.'
+                    );
+                }
+                throw $e;
+            }
             if ($allocation !== null) {
                 $onchainAddress = $allocation['address'];
                 $onchainIndex = $allocation['index'];
                 $onchainCreatedTipHeight = $allocation['tip_height'] ?? null;
-                $onchainAmountSat = ExchangeRates::convertToSats((string)$amount, $currency, 'sat');
+                $tweak = $allocation['tweak'] ?? null;
+                $onchainAmountTweakSats = $tweak;
+                $onchainAmountSat = $baseAmountSat + ($tweak !== null ? (int)$tweak : 0);
             }
         }
 
@@ -177,6 +203,7 @@ class Invoice {
             'onchain_address' => $onchainAddress,
             'onchain_address_index' => $onchainIndex,
             'onchain_amount_sat' => $onchainAmountSat,
+            'onchain_amount_tweak_sats' => $onchainAmountTweakSats,
             'onchain_created_tip_height' => $onchainCreatedTipHeight,
             'payment_rail' => $paymentRail,
             'metadata' => $metadata ? json_encode($metadata) : null,
