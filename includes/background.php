@@ -83,6 +83,30 @@ class Background {
 
     public const CRON_STALE_THRESHOLD_SECS = 86400;
 
+    // Window during which a recent `last_external_cron_at` stamp is taken as
+    // proof that the operator's real cron is wired up and ticking. When an
+    // internal (page-load-triggered) self-request lands inside this window,
+    // cron.php runs only the latency-sensitive "essential" tasks and lets the
+    // real cron pick up the housekeeping next tick. One hour is generous
+    // enough that a cron with a long cadence (or a transient miss) doesn't
+    // accidentally fall back to running everything on every page load.
+    public const EXTERNAL_CRON_FRESH_THRESHOLD_SECS = 3600;
+
+    /**
+     * True when `last_external_cron_at` was stamped within the fresh window.
+     * Used by cron.php to decide whether to skip non-essential tasks on an
+     * internal self-request. Fresh installs (stamp never set) return false so
+     * the opportunistic page-load triggers keep doing the full work until the
+     * operator's cron proves itself.
+     */
+    public static function isExternalCronFresh(): bool {
+        $lastExternal = (int) Config::get('last_external_cron_at', 0);
+        if ($lastExternal === 0) {
+            return false;
+        }
+        return (time() - $lastExternal) < self::EXTERNAL_CRON_FRESH_THRESHOLD_SECS;
+    }
+
     /**
      * Return the cron-staleness warning state for the dashboard, or null
      * if the warning should not be shown (fresh install, recent external
