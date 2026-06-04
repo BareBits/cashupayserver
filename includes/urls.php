@@ -77,6 +77,20 @@ class Urls {
     }
 
     /**
+     * Get the URL for static images.
+     *
+     * @param string $subpath Path within images/ directory (e.g., 'payment-methods/strike.png')
+     * @return string Full URL to the image
+     */
+    public static function images(string $subpath = ''): string {
+        if (self::isWordPress()) {
+            $pluginFile = self::$pluginFile ?? (defined('CASHUPAY_PLUGIN_DIR') ? CASHUPAY_PLUGIN_DIR . '/cashupay.php' : __FILE__);
+            return plugins_url('images/' . $subpath, $pluginFile);
+        }
+        return 'images/' . $subpath;
+    }
+
+    /**
      * Get the API base URL (same as server URL for API calls)
      */
     public static function api(): string {
