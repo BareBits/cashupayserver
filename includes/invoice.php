@@ -417,11 +417,20 @@ class Invoice {
     /**
      * Update invoice status
      */
-    public static function updateStatus(string $invoiceId, string $status, ?string $additionalStatus = null): void {
+    public static function updateStatus(string $invoiceId, string $status, ?string $additionalStatus = null, ?string $settledRail = null): void {
         $updates = ['status' => $status];
 
         if ($additionalStatus !== null) {
             $updates['additional_status'] = $additionalStatus;
+        }
+
+        // Capture the moment we recognise the invoice as paid + which rail
+        // actually moved the funds. Used by the admin invoices view.
+        if ($status === 'Settled') {
+            $updates['paid_at'] = time();
+            if ($settledRail !== null) {
+                $updates['settled_rail'] = $settledRail;
+            }
         }
 
         Database::update('invoices', $updates, 'id = ?', [$invoiceId]);
@@ -536,7 +545,12 @@ class Invoice {
         try {
             self::queueWebhook($invoice['store_id'], 'InvoiceReceivedPayment', $invoice);
 
-            Database::update('invoices', ['status' => 'Settled'], 'id = ?', [$invoice['id']]);
+            Database::update(
+                'invoices',
+                ['status' => 'Settled', 'paid_at' => time(), 'settled_rail' => 'mint'],
+                'id = ?',
+                [$invoice['id']]
+            );
             $updatedInvoice = self::getById($invoice['id']);
             self::queueWebhook($invoice['store_id'], 'InvoiceSettled', $updatedInvoice);
 
@@ -567,8 +581,59 @@ class Invoice {
             'additionalStatus' => $invoice['additional_status'],
             'createdTime' => $invoice['created_at'],
             'expirationTime' => $invoice['expiration_time'],
+            'paidTime' => $invoice['paid_at'] ?? null,
+            // settled_rail is the rail that actually moved funds; fall back to
+            // payment_rail (the rail chosen at create time) for rows that
+            // settled before the column existed, or for the Greenfield API
+            // path that marks Settled without knowing the rail.
+            'paymentRail' => $invoice['settled_rail'] ?: ($invoice['payment_rail'] ?? null),
             'checkoutLink' => Urls::payment($invoice['id']),
         ];
+
+        // Per-store network drives mempool.space URLs in the admin UI. We
+        // can't always look up the store (deleted store_id), so default to
+        // mainnet on lookup failure.
+        $store = Config::getStore($invoice['store_id']);
+        $result['network'] = $store['onchain_network'] ?? 'mainnet';
+
+        // Destination + customer-side txid populated per rail. Used by the
+        // admin invoices view; null for Lightning-only.
+        $rail = $result['paymentRail'];
+        if ($rail === 'onchain' && !empty($invoice['onchain_address'])) {
+            $result['destination'] = $invoice['onchain_address'];
+            $oc = Database::fetchOne(
+                "SELECT txid FROM onchain_payments
+                  WHERE invoice_id = ?
+                  ORDER BY first_seen_at ASC, id ASC
+                  LIMIT 1",
+                [$invoice['id']]
+            );
+            if ($oc) {
+                $result['txid'] = $oc['txid'];
+            }
+        } elseif ($rail === 'swap') {
+            $sa = Database::fetchOne(
+                "SELECT merchant_address, status, lockup_txid, claim_txid
+                   FROM swap_attempts
+                  WHERE invoice_id = ?
+                  ORDER BY id DESC
+                  LIMIT 1",
+                [$invoice['id']]
+            );
+            if ($sa) {
+                $result['destination'] = $sa['merchant_address'];
+                $result['swapStatus'] = $sa['status'];
+                // Show the customer-side on-chain event (the provider's
+                // lockup). claimTxid is also exposed so the UI can reveal
+                // both in a hover tooltip.
+                if (!empty($sa['lockup_txid'])) {
+                    $result['txid'] = $sa['lockup_txid'];
+                }
+                if (!empty($sa['claim_txid'])) {
+                    $result['claimTxid'] = $sa['claim_txid'];
+                }
+            }
+        }
 
         // Aggregate payment methods (Lightning + on-chain, both optional).
         $methods = [];
@@ -766,7 +831,12 @@ class Invoice {
             if (!empty($proofs)) {
                 Database::beginTransaction();
                 try {
-                    Database::update('invoices', ['status' => 'Settled'], 'id = ?', [$invoice['id']]);
+                    Database::update(
+                        'invoices',
+                        ['status' => 'Settled', 'paid_at' => time(), 'settled_rail' => 'mint'],
+                        'id = ?',
+                        [$invoice['id']]
+                    );
                     Database::commit();
 
                     $updatedInvoice = self::getById($invoice['id']);
@@ -804,7 +874,12 @@ class Invoice {
                 if ($wallet->hasStorage() && $invoice['quote_id']) {
                     $proofs = $wallet->getStorage()->getProofsByQuoteId($invoice['quote_id']);
                     if (!empty($proofs)) {
-                        Database::update('invoices', ['status' => 'Settled'], 'id = ?', [$invoice['id']]);
+                        Database::update(
+                            'invoices',
+                            ['status' => 'Settled', 'paid_at' => time(), 'settled_rail' => 'mint'],
+                            'id = ?',
+                            [$invoice['id']]
+                        );
                         $recovered[] = $invoice['id'];
 
                         $updatedInvoice = self::getById($invoice['id']);

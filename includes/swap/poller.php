@@ -178,8 +178,10 @@ final class SwapPoller {
         $pdo->beginTransaction();
         try {
             $pdo->prepare(
-                "UPDATE invoices SET status = 'Settled', additional_status = 'PaidNormal' WHERE id = ?"
-            )->execute([$row['invoice_id']]);
+                "UPDATE invoices SET status = 'Settled', additional_status = 'PaidNormal',
+                                     paid_at = ?, settled_rail = 'swap'
+                 WHERE id = ?"
+            )->execute([time(), $row['invoice_id']]);
             $pdo->prepare(
                 "UPDATE swap_attempts SET status = 'invoice.settled', updated_at = ? WHERE id = ?"
             )->execute([time(), $row['id']]);
