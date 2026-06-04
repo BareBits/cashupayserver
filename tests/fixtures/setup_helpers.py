@@ -83,6 +83,16 @@ def run_setup_wizard(
     )
     _assert_step_ok(r, "step 6b (confirm seed)")
 
+    # Step 9: auto-withdraw destination — skip so existing tests don't need
+    # to provide a lightning address or xpub.
+    r = s.post(
+        setup,
+        data={"step": "9", "auto_withdraw_action": "skip"},
+        timeout=15,
+        allow_redirects=False,
+    )
+    _assert_step_ok(r, "step 9 (skip auto-withdraw)")
+
     # Step 8: optional on-chain step — skip to complete setup.
     r = s.post(
         setup,

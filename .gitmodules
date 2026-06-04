@@ -3,4 +3,4 @@
 	url = https://github.com/BareBits/cashu-wallet-php.git
 [submodule "mint-discovery"]
 	path = mint-discovery
-	url = https://github.com/jooray/mint-discovery.git
+	url = https://github.com/BareBits/mint-discovery.git
