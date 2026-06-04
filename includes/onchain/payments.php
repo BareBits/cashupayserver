@@ -340,7 +340,7 @@ class OnchainPayments {
         // Settled when total confirmed reaches the invoice amount.
         if ($status !== 'Settled' && $totalConfirmed >= $amount && $amount > 0) {
             require_once __DIR__ . '/../invoice.php';
-            Invoice::updateStatus($invoice['id'], 'Settled');
+            Invoice::updateStatus($invoice['id'], 'Settled', null, 'onchain');
             return ['status' => 'Settled', 'fired' => $fired ?: 'InvoiceSettled'];
         }
 

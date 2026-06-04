@@ -304,6 +304,13 @@ if (isset($_GET['api'])) {
             $limit = min((int)($_GET['limit'] ?? 50), 100);
             $offset = (int)($_GET['offset'] ?? 0);
 
+            // Whitelist filter values so the UI can't slip arbitrary status
+            // strings past the LIKE-style WHERE.
+            $allowedStatuses = ['New', 'Processing', 'Settled', 'Expired', 'Invalid'];
+            if ($status !== null && !in_array($status, $allowedStatuses, true)) {
+                $status = null;
+            }
+
             $sql = "SELECT * FROM invoices";
             $params = [];
             $conditions = [];
@@ -3043,6 +3050,164 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
             text-overflow: ellipsis;
             white-space: nowrap;
         }
+
+        /* Invoices table: rail/swap chips, monospace truncation, status colors. */
+        .inv-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.85rem;
+        }
+        .inv-table th,
+        .inv-table td {
+            text-align: left;
+            padding: 0.5rem 0.75rem;
+            border-bottom: 1px solid var(--border);
+            vertical-align: top;
+        }
+        .inv-table th {
+            color: var(--text-secondary);
+            font-weight: 600;
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            white-space: nowrap;
+        }
+        .inv-table tbody tr:hover {
+            background: var(--bg-hover, rgba(255,255,255,0.02));
+        }
+        .inv-table td.inv-amount {
+            text-align: right;
+            white-space: nowrap;
+        }
+        .inv-chip {
+            display: inline-block;
+            padding: 0.1rem 0.5rem;
+            border-radius: 999px;
+            font-size: 0.72rem;
+            font-weight: 600;
+            background: rgba(255,255,255,0.08);
+            color: var(--text-secondary);
+            white-space: nowrap;
+        }
+        .inv-chip.status-Settled  { background: rgba(72, 187, 120, 0.2); color: #48bb78; }
+        .inv-chip.status-New      { background: rgba(247, 147, 26, 0.2); color: #f7931a; }
+        .inv-chip.status-Processing { background: rgba(247, 147, 26, 0.2); color: #f7931a; }
+        .inv-chip.status-Expired  { background: rgba(229, 62, 62, 0.2); color: #e53e3e; }
+        .inv-chip.status-Invalid  { background: rgba(229, 62, 62, 0.2); color: #e53e3e; }
+        .inv-chip.swap-confirming { background: rgba(247, 147, 26, 0.2); color: #f7931a; }
+        .inv-chip.swap-waiting    { background: rgba(160, 174, 192, 0.2); color: var(--text-secondary); }
+        .inv-chip.swap-failed     { background: rgba(229, 62, 62, 0.2); color: #e53e3e; }
+        .inv-mono {
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+            font-size: 0.78rem;
+        }
+        .inv-mono a {
+            color: var(--accent);
+            text-decoration: none;
+        }
+        .inv-mono a:hover { text-decoration: underline; }
+        .inv-filter-row {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0 0 0.75rem 0;
+        }
+        .inv-filter-row label {
+            color: var(--text-secondary);
+            font-size: 0.85rem;
+        }
+        /* Match the header store selector so the dropdown is readable and
+           consistent with the rest of the admin UI. */
+        .inv-filter-row select {
+            padding: 0.5rem 2rem 0.5rem 0.75rem;
+            background-color: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            color: var(--text-primary);
+            font-size: 0.875rem;
+            font-weight: 500;
+            cursor: pointer;
+            appearance: none;
+            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 24 24' fill='none' stroke='%239ca3af' stroke-width='2'%3E%3Cpolyline points='6 9 12 15 18 9'%3E%3C/polyline%3E%3C/svg%3E");
+            background-repeat: no-repeat;
+            background-position: right 0.5rem center;
+        }
+        .inv-filter-row select option {
+            background-color: var(--bg-secondary);
+            color: var(--text-primary);
+        }
+        .inv-filter-row select:focus {
+            outline: none;
+            border-color: var(--accent);
+        }
+        /* Short invoice id + ⓘ tooltip trigger sit inline on one row. */
+        .inv-id-row {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.35rem;
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+            font-size: 0.8rem;
+        }
+
+        /* Invoice ID tooltip: a small ⓘ next to the truncated id reveals
+           the full id + a copy button on hover/focus. */
+        .inv-id-tip {
+            position: relative;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 14px;
+            height: 14px;
+            border-radius: 50%;
+            background: rgba(255,255,255,0.08);
+            color: var(--text-secondary);
+            font-size: 10px;
+            font-weight: 700;
+            cursor: pointer;
+            user-select: none;
+        }
+        .inv-id-tip:hover,
+        .inv-id-tip:focus-within {
+            background: rgba(255,255,255,0.16);
+            color: var(--text-primary);
+        }
+        .inv-id-tip .inv-id-pop {
+            visibility: hidden;
+            opacity: 0;
+            transition: opacity 0.1s ease-in;
+            position: absolute;
+            bottom: calc(100% + 6px);
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 10;
+            display: flex;
+            align-items: center;
+            gap: 0.4rem;
+            padding: 0.35rem 0.5rem;
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            white-space: nowrap;
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+            font-size: 0.75rem;
+            color: var(--text-primary);
+            box-shadow: 0 6px 16px rgba(0,0,0,0.4);
+        }
+        .inv-id-tip:hover .inv-id-pop,
+        .inv-id-tip:focus-within .inv-id-pop {
+            visibility: visible;
+            opacity: 1;
+        }
+        .inv-id-copy {
+            background: none;
+            border: none;
+            color: var(--text-secondary);
+            cursor: pointer;
+            padding: 0;
+            display: inline-flex;
+            align-items: center;
+        }
+        .inv-id-copy:hover { color: var(--accent); }
     </style>
 </head>
 <body>
@@ -3166,6 +3331,17 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                             <button class="btn btn-secondary" id="btn-export-invoices-csv">Export CSV</button>
                             <button class="btn" id="btn-new-invoice">+ New Invoice</button>
                         </div>
+                    </div>
+                    <div class="inv-filter-row">
+                        <label for="invoice-status-filter">Status:</label>
+                        <select id="invoice-status-filter">
+                            <option value="">All</option>
+                            <option value="New">New</option>
+                            <option value="Processing">Processing</option>
+                            <option value="Settled">Paid</option>
+                            <option value="Expired">Expired</option>
+                            <option value="Invalid">Invalid</option>
+                        </select>
                     </div>
                     <div id="all-invoices">
                         <div class="loading"><div class="spinner"></div></div>
@@ -4413,6 +4589,14 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
             if (createdStoreId) {
                 showToast('Store created successfully!', 'success');
             }
+
+            // If the URL hash points at the invoices view (e.g. operator
+            // refreshed while filtering), jump there. switchView seeds the
+            // dropdown from the hash itself.
+            const hash = window.location.hash || '';
+            if (hash.startsWith('#invoices')) {
+                switchView('invoices');
+            }
         }
 
         // Event Listeners
@@ -4493,6 +4677,15 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
             });
             document.getElementById('btn-request').addEventListener('click', () => openModal('modal-request'));
             document.getElementById('btn-new-invoice').addEventListener('click', () => openModal('modal-request'));
+
+            // Invoices status filter: persist choice in URL hash + refetch.
+            const invStatusSel = document.getElementById('invoice-status-filter');
+            if (invStatusSel) {
+                invStatusSel.addEventListener('change', () => {
+                    writeInvoiceFilterToHash(getInvoiceStatusFilter());
+                    loadInvoices();
+                });
+            }
 
             // Withdraw modal
             document.getElementById('btn-confirm-withdraw').addEventListener('click', handleWithdraw);
@@ -4655,7 +4848,12 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                 storeSelector.style.display = 'flex';
             }
 
-            if (view === 'invoices') loadInvoices();
+            if (view === 'invoices') {
+                // Hydrate the status dropdown from the URL hash on first
+                // entry so a refresh restores the operator's filter.
+                setInvoiceStatusFilter(readInvoiceFilterFromHash());
+                loadInvoices();
+            }
             if (view === 'stores') loadStoreSettings();
             if (view === 'stats') loadStats();
             if (view === 'settings') {
@@ -5078,15 +5276,56 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
             }
         }
 
+        // Status filter for the All Invoices view. Persisted in the URL hash
+        // (e.g. #invoices?status=Settled) so a refresh preserves the choice.
+        const INVOICE_STATUSES = ['New', 'Processing', 'Settled', 'Expired', 'Invalid'];
+
+        function getInvoiceStatusFilter() {
+            const sel = document.getElementById('invoice-status-filter');
+            const v = sel ? sel.value : '';
+            return INVOICE_STATUSES.includes(v) ? v : '';
+        }
+
+        function setInvoiceStatusFilter(v) {
+            const sel = document.getElementById('invoice-status-filter');
+            if (sel) sel.value = INVOICE_STATUSES.includes(v) ? v : '';
+        }
+
+        function readInvoiceFilterFromHash() {
+            const hash = window.location.hash || '';
+            const qIdx = hash.indexOf('?');
+            if (qIdx < 0) return '';
+            const params = new URLSearchParams(hash.slice(qIdx + 1));
+            const s = params.get('status') || '';
+            return INVOICE_STATUSES.includes(s) ? s : '';
+        }
+
+        function writeInvoiceFilterToHash(status) {
+            // Only touch the hash while the invoices view is the active view,
+            // so we don't stomp on other views' hash usage.
+            const view = document.querySelector('.view.active');
+            if (!view || view.id !== 'view-invoices') return;
+            const base = '#invoices';
+            if (status) {
+                history.replaceState(null, '', base + '?status=' + encodeURIComponent(status));
+            } else {
+                history.replaceState(null, '', base);
+            }
+        }
+
         async function loadInvoices() {
             try {
                 let url = adminUrl + '?api=invoices&limit=100';
                 if (currentStoreId) {
                     url += `&store_id=${encodeURIComponent(currentStoreId)}`;
                 }
+                const status = getInvoiceStatusFilter();
+                if (status) {
+                    url += `&status=${encodeURIComponent(status)}`;
+                }
                 const response = await fetch(url);
                 const invoices = await response.json();
-                renderInvoices('all-invoices', invoices);
+                renderInvoicesTable('all-invoices', invoices);
             } catch (e) {
                 showToast('Failed to load invoices', 'error');
             }
@@ -5700,6 +5939,166 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
                     </div>
                 `;
             }).join('');
+        }
+
+        // ---- Detailed invoice table (All Invoices view) ----
+
+        // Build a mempool.space URL for an address or txid on the invoice's
+        // network. Regtest has no public explorer; we still return a mainnet
+        // URL so operators get *something* clickable — they know it'll 404.
+        function mempoolUrl(kind, value, network) {
+            const base = network === 'testnet' ? 'https://mempool.space/testnet'
+                       : network === 'signet'  ? 'https://mempool.space/signet'
+                       : 'https://mempool.space';
+            return `${base}/${kind}/${encodeURIComponent(value)}`;
+        }
+
+        // Render an address/txid as "xxx...xxx" linked to the block explorer,
+        // with the full value in a hover tooltip. Optional extraTitle adds a
+        // second line to the tooltip (used to surface the swap claim txid).
+        function renderMonoLink(kind, value, network, extraTitle) {
+            if (!value) return '—';
+            const safe = escapeHtml(value);
+            const head = value.length > 6 ? value.slice(0, 3) : value;
+            const tail = value.length > 6 ? value.slice(-3) : '';
+            const title = extraTitle ? `${safe}\n${escapeHtml(extraTitle)}` : safe;
+            const url = mempoolUrl(kind, value, network);
+            return `<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer" title="${title}">${escapeHtml(head)}...${escapeHtml(tail)}</a>`;
+        }
+
+        // Copy the full invoice id to the clipboard from the tooltip popup.
+        // Flashes a "Copied!" toast and bumps the icon stroke briefly so the
+        // operator sees feedback without losing their place in the table.
+        window.copyInvoiceId = function (e, id, btn) {
+            e.preventDefault();
+            e.stopPropagation();
+            navigator.clipboard.writeText(id).then(() => {
+                showToast('Invoice ID copied', 'success');
+                if (btn) {
+                    const orig = btn.style.color;
+                    btn.style.color = 'var(--success, #48bb78)';
+                    setTimeout(() => { btn.style.color = orig; }, 900);
+                }
+            }).catch(() => showToast('Copy failed', 'error'));
+        };
+
+        // Map paymentRail → emoji+text chip cell. Lightning shows a bolt,
+        // on-chain a chain, swap the recycle arrows.
+        function renderPaymentMethod(rail) {
+            const map = {
+                mint:    { icon: '⚡', label: 'Lightning' },
+                onchain: { icon: '🔗', label: 'On-chain' },
+                swap:    { icon: '🔄', label: 'Swap' },
+            };
+            const m = map[rail] || { icon: '', label: rail || '—' };
+            return `<span class="inv-chip">${m.icon} ${escapeHtml(m.label)}</span>`;
+        }
+
+        // Swap status badge. invoice.settled is suppressed because the row's
+        // own "Settled" status chip already conveys completion; everything
+        // else (waiting / confirming / failed) gets a labelled badge so the
+        // operator can see in-flight or error state at a glance.
+        function renderSwapBadge(swapStatus) {
+            if (!swapStatus || swapStatus === 'invoice.settled') return '';
+            const settling = ['swap.created', 'minerfee.paid', 'transaction.mempool'];
+            const failed   = ['invoice.expired', 'swap.expired', 'transaction.refunded', 'transaction.failed'];
+            let cls = 'swap-waiting', label = swapStatus;
+            if (swapStatus === 'transaction.confirmed') { cls = 'swap-confirming'; label = 'Confirming'; }
+            else if (settling.includes(swapStatus))     { cls = 'swap-waiting';    label = 'Awaiting payment'; }
+            else if (failed.includes(swapStatus))       { cls = 'swap-failed';     label = swapStatus.replace(/\./g, ' '); }
+            return ` <span class="inv-chip ${cls}">${escapeHtml(label)}</span>`;
+        }
+
+        function formatPaidTime(ts) {
+            if (!ts) return '<span style="color: var(--text-secondary);">—</span>';
+            const d = new Date(ts * 1000);
+            return escapeHtml(d.toLocaleString());
+        }
+
+        function renderInvoicesTable(containerId, invoices) {
+            const container = document.getElementById(containerId);
+
+            if (!invoices || invoices.length === 0) {
+                container.innerHTML = `
+                    <div class="empty-state">
+                        <div class="empty-state-icon">📄</div>
+                        <p>No invoices match this filter</p>
+                    </div>
+                `;
+                return;
+            }
+
+            const rows = invoices.map(inv => {
+                const description = inv.metadata?.itemDesc || '';
+                const network = inv.network || 'mainnet';
+                const swapBadge = renderSwapBadge(inv.swapStatus);
+                const idShort = inv.id.length > 4 ? '..' + inv.id.slice(-4) : inv.id;
+                const idEsc = escapeHtml(inv.id);
+                const idCell = `
+                    <span class="inv-id-row">
+                        <span>${escapeHtml(idShort)}</span>
+                        <span class="inv-id-tip" tabindex="0">ⓘ
+                            <span class="inv-id-pop" role="tooltip">
+                                <span>${idEsc}</span>
+                                <button type="button" class="inv-id-copy" title="Copy invoice ID"
+                                        onclick="copyInvoiceId(event, '${idEsc}', this)">
+                                    <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+                                </button>
+                            </span>
+                        </span>
+                    </span>
+                `;
+                // Note column: invoice description (metadata.itemDesc) plus a
+                // swap-status badge appended when the swap isn't fully settled.
+                // Em-dash when there's neither a description nor a badge.
+                const noteCell = description || swapBadge
+                    ? `<div>${description ? escapeHtml(description) : ''}${swapBadge}</div>`
+                    : '<span style="color: var(--text-secondary);">—</span>';
+                const destCell = inv.destination
+                    ? `<span class="inv-mono">${renderMonoLink('address', inv.destination, network)}</span>`
+                    : '<span style="color: var(--text-secondary);">—</span>';
+                const txidCell = inv.txid
+                    ? `<span class="inv-mono">${renderMonoLink('tx', inv.txid, network, inv.claimTxid ? 'Claim: ' + inv.claimTxid : null)}</span>`
+                    : '<span style="color: var(--text-secondary);">—</span>';
+
+                // Display label for the status chip: "Settled" reads as
+                // "Paid" in the operator UI. The CSS class still uses the
+                // raw status so colour styling stays keyed on the internal
+                // state machine.
+                const statusLabel = inv.status === 'Settled' ? 'Paid' : inv.status;
+                return `
+                    <tr>
+                        <td><span class="inv-chip status-${escapeHtml(inv.status)}">${escapeHtml(statusLabel)}</span></td>
+                        <td>${renderPaymentMethod(inv.paymentRail)}</td>
+                        <td>${idCell}</td>
+                        <td>${noteCell}</td>
+                        <td>${formatPaidTime(inv.paidTime)}</td>
+                        <td>${destCell}</td>
+                        <td>${txidCell}</td>
+                        <td class="inv-amount">${escapeHtml(String(inv.amount))} ${escapeHtml(String(inv.currency))}</td>
+                    </tr>
+                `;
+            }).join('');
+
+            container.innerHTML = `
+                <div style="overflow-x: auto;">
+                    <table class="inv-table">
+                        <thead>
+                            <tr>
+                                <th>Status</th>
+                                <th>Method</th>
+                                <th>Invoice</th>
+                                <th>Note</th>
+                                <th>Paid</th>
+                                <th>Destination</th>
+                                <th>TxID</th>
+                                <th style="text-align: right;">Amount</th>
+                            </tr>
+                        </thead>
+                        <tbody>${rows}</tbody>
+                    </table>
+                </div>
+            `;
         }
 
         // Actions

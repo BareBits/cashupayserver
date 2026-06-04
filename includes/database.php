@@ -271,6 +271,8 @@ HTACCESS;
             created_at INTEGER NOT NULL,
             expiration_time INTEGER NOT NULL,
             last_polled_at INTEGER DEFAULT NULL,
+            paid_at INTEGER DEFAULT NULL,
+            settled_rail TEXT DEFAULT NULL,
             FOREIGN KEY (store_id) REFERENCES stores(id) ON DELETE CASCADE
         );
 
@@ -716,6 +718,16 @@ HTACCESS;
             // 'mint' (cashu mint, existing default) / 'swap' (submarine swap) /
             // 'onchain' (pay-to-address only). Set once at invoice create time.
             $pdo->exec("ALTER TABLE invoices ADD COLUMN payment_rail TEXT NOT NULL DEFAULT 'mint'");
+        }
+        // Settlement metadata for the admin invoices view: when the invoice
+        // was paid and which rail actually moved the funds (vs the rail that
+        // was offered at creation, which payment_rail records). Nullable
+        // because legacy Settled rows have no timestamp to backfill.
+        if (!self::columnExists($pdo, 'invoices', 'paid_at')) {
+            $pdo->exec("ALTER TABLE invoices ADD COLUMN paid_at INTEGER DEFAULT NULL");
+        }
+        if (!self::columnExists($pdo, 'invoices', 'settled_rail')) {
+            $pdo->exec("ALTER TABLE invoices ADD COLUMN settled_rail TEXT DEFAULT NULL");
         }
         if (!self::tableExists($pdo, 'swap_attempts')) {
             $pdo->exec("
