@@ -16,6 +16,7 @@ require_once __DIR__ . '/../cashu-wallet-php/CashuWallet.php';
 require_once __DIR__ . '/onchain/payments.php';
 require_once __DIR__ . '/swap/factory.php';
 require_once __DIR__ . '/swap/config.php';
+require_once __DIR__ . '/swap/quote_fetcher.php';
 require_once __DIR__ . '/crypto/secp256k1.php';
 require_once __DIR__ . '/crypto/taproot.php';
 
@@ -255,10 +256,15 @@ class Invoice {
         }
         $network = $store['onchain_network'] ?? 'mainnet';
 
-        foreach (SwapProviderFactory::orderedForSite() as $provider) {
+        // When auto-select-cheapest is on, rankedForSite() fetches quotes from
+        // every reachable provider in parallel and reorders them by total cost
+        // (subject to the 10%-cheaper threshold). When off, it returns the
+        // configured priority order with no cached quotes — behaviour matches
+        // the historical sequential path.
+        foreach (SwapProviderFactory::rankedForSite($network, $targetSats) as ['provider' => $provider, 'quote' => $cachedQuote]) {
             $name = $provider->getName();
             try {
-                $pairInfo = $provider->getReversePairInfo($network);
+                $pairInfo = $cachedQuote ?? $provider->getReversePairInfo($network);
                 if ($targetSats < $pairInfo->minSats || $targetSats > $pairInfo->maxSats) {
                     $failureReasons[] = sprintf(
                         "%s: %d sat outside range [%d, %d]",
@@ -318,6 +324,7 @@ class Invoice {
                     'merchant_address_index' => $alloc['index'],
                     'lockup_fee_sats' => $lockupFee,
                     'percent_fee_sats' => $percentFee,
+                    'quotes_audit' => SwapQuoteFetcher::lastAuditTrail(),
                 ];
             } catch (Throwable $e) {
                 error_log("swap: provider {$name} failed: " . $e->getMessage());
@@ -354,6 +361,9 @@ class Invoice {
      */
     private static function persistSwapAttempt(string $invoiceId, string $storeId, array $att, int $now): void {
         $swap = $att['swap'];
+        $quotesAuditJson = !empty($att['quotes_audit'])
+            ? json_encode($att['quotes_audit'])
+            : null;
         Database::getInstance()->prepare(
             "INSERT INTO swap_attempts (
                 invoice_id, store_id, provider, network, direction,
@@ -366,7 +376,7 @@ class Invoice {
                 target_onchain_amount_sats, invoice_amount_sats,
                 swap_lockup_fee_sats, swap_percent_fee_sats,
                 merchant_address, merchant_address_index,
-                provider_response_json,
+                provider_response_json, quotes_compared_json,
                 created_at, updated_at
             ) VALUES (
                 :invoice_id, :store_id, :provider, :network, :direction,
@@ -379,7 +389,7 @@ class Invoice {
                 :target_onchain_amount_sats, :invoice_amount_sats,
                 :swap_lockup_fee_sats, :swap_percent_fee_sats,
                 :merchant_address, :merchant_address_index,
-                :provider_response_json,
+                :provider_response_json, :quotes_compared_json,
                 :created_at, :updated_at
             )"
         )->execute([
@@ -407,6 +417,7 @@ class Invoice {
             ':merchant_address' => $att['merchant_address'],
             ':merchant_address_index' => $att['merchant_address_index'],
             ':provider_response_json' => $swap->rawResponse ? json_encode($swap->rawResponse) : null,
+            ':quotes_compared_json' => $quotesAuditJson,
             ':created_at' => $now,
             ':updated_at' => $now,
         ]);

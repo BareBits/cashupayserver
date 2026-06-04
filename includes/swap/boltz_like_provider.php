@@ -13,9 +13,10 @@ abstract class BoltzLikeProvider implements SwapProvider {
 
     /**
      * Return the API base URL for the given network, or null if this provider
-     * does not support that network.
+     * does not support that network. Public so SwapQuoteFetcher can build
+     * curl_multi handles without subclassing.
      */
-    abstract protected function baseUrl(string $network): ?string;
+    abstract public function baseUrl(string $network): ?string;
 
     public function isReachable(string $network): bool {
         $base = $this->baseUrl($network);
@@ -30,11 +31,20 @@ abstract class BoltzLikeProvider implements SwapProvider {
 
     public function getReversePairInfo(string $network): SwapPairInfo {
         $data = $this->httpGet($network, '/v2/swap/reverse');
+        return self::parseReversePairInfo($data, $this->getName());
+    }
+
+    /**
+     * Parse a /v2/swap/reverse JSON response into SwapPairInfo. Shared between
+     * the per-provider getReversePairInfo() path and the parallel
+     * SwapQuoteFetcher path so both produce identical results.
+     */
+    public static function parseReversePairInfo(array $data, string $providerName): SwapPairInfo {
         // The response is a 2-level map keyed by from/to currency.
         // We only care about BTC/BTC for v1.
         $pair = $data['BTC']['BTC'] ?? null;
         if (!is_array($pair)) {
-            throw new RuntimeException($this->getName() . ': BTC/BTC reverse pair not advertised');
+            throw new RuntimeException($providerName . ': BTC/BTC reverse pair not advertised');
         }
         return new SwapPairInfo(
             feePercent:           (float)($pair['fees']['percentage'] ?? 0),

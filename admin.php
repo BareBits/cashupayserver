@@ -1506,11 +1506,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             require_once __DIR__ . '/includes/swap/config.php';
             require_once __DIR__ . '/includes/swap/factory.php';
             echo json_encode([
-                'enabled'             => SwapsConfig::siteEnabled(),
-                'providerOrder'       => SwapsConfig::providerOrder(),
-                'knownProviders'      => SwapProviderFactory::knownProviderNames(),
-                'strictNoMintFallback'=> SwapsConfig::strictNoMintFallback(),
-                'minimumTargetSats'   => SwapsConfig::minimumTargetSats(),
+                'enabled'                => SwapsConfig::siteEnabled(),
+                'providerOrder'          => SwapsConfig::providerOrder(),
+                'knownProviders'         => SwapProviderFactory::knownProviderNames(),
+                'strictNoMintFallback'   => SwapsConfig::strictNoMintFallback(),
+                'minimumTargetSats'      => SwapsConfig::minimumTargetSats(),
+                'autoSelectCheapest'     => SwapsConfig::autoSelectCheapest(),
+                'autoSelectThresholdPct' => SwapsConfig::autoSelectThresholdPct(),
             ]);
             break;
 
@@ -1523,6 +1525,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $strict = ($_POST['strict_no_mint_fallback'] ?? '0') === '1';
                 $rawMin = trim((string)($_POST['minimum_target_sats'] ?? ''));
                 $minSats = ($rawMin === '') ? null : max(0, (int)$rawMin);
+
+                $autoSelect = ($_POST['auto_select_cheapest'] ?? '0') === '1';
+                $rawThreshold = trim((string)($_POST['auto_select_threshold_pct'] ?? ''));
+                if ($rawThreshold === '' || !is_numeric($rawThreshold)) {
+                    $autoThreshold = SwapsConfig::DEFAULT_AUTO_SELECT_THRESHOLD_PCT;
+                } else {
+                    $autoThreshold = (int)$rawThreshold;
+                    if ($autoThreshold < 1 || $autoThreshold > 90) {
+                        throw new Exception('Threshold must be between 1 and 90 percent');
+                    }
+                }
 
                 $orderRaw = trim((string)($_POST['provider_order'] ?? ''));
                 $known = SwapProviderFactory::knownProviderNames();
@@ -1542,6 +1555,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 SwapsConfig::setSiteEnabled($enabled);
                 SwapsConfig::setStrictNoMintFallback($strict);
                 SwapsConfig::setMinimumTargetSats($minSats);
+                SwapsConfig::setAutoSelectCheapest($autoSelect);
+                SwapsConfig::setAutoSelectThresholdPct($autoThreshold);
 
                 echo json_encode(['success' => true]);
             } catch (Exception $e) {
@@ -4131,7 +4146,32 @@ $adminView = $rawAdminView;
                             </div>
                             <p class="form-help">
                                 Each enabled provider is tried in the order shown. At invoice creation
-                                we use the first reachable one.
+                                we use the first reachable one — unless the auto-select option below
+                                finds a meaningfully cheaper alternative.
+                            </p>
+                        </div>
+
+                        <div class="toggle-container" style="margin-top: 0.75rem;">
+                            <span><strong>Automatically select the cheapest swap provider</strong></span>
+                            <label class="toggle">
+                                <input type="checkbox" id="swaps-auto-select">
+                                <span class="toggle-slider"></span>
+                            </label>
+                        </div>
+                        <p class="form-help" style="margin-top: -0.25rem;">
+                            Fetches a quote from every enabled provider in parallel and prefers a
+                            cheaper one when it beats the highest-priority provider by more than the
+                            threshold below. Falls back to the priority order whenever a quote can't
+                            be fetched, so it never adds a new failure mode.
+                        </p>
+
+                        <div class="form-group" style="margin-top: 0.5rem;">
+                            <label class="form-label" for="swaps-auto-threshold">Minimum savings to switch providers (%)</label>
+                            <input type="number" class="form-input" id="swaps-auto-threshold"
+                                   min="1" max="90" step="1" value="10" style="max-width: 8rem;">
+                            <p class="form-help">
+                                How much cheaper a lower-priority provider must be before we
+                                use it instead. Default 10%.
                             </p>
                         </div>
 
@@ -7367,15 +7407,27 @@ $adminView = $rawAdminView;
 
         async function loadSwapSettings() {
             try {
-                const response = await fetch(`${adminUrl}?action=get_swap_settings`);
+                // POST via postWithCsrf — get_swap_settings lives in the POST
+                // action dispatcher, and GET ?action=... is intercepted by the
+                // path-based admin router as a page nav.
+                const response = await postWithCsrf(adminUrl, 'action=get_swap_settings');
                 if (!response.ok) return;
                 const data = await response.json();
                 const enabledEl = document.getElementById('swaps-enabled');
                 const strictEl = document.getElementById('swaps-strict');
                 const minEl = document.getElementById('swaps-min-sats');
+                const autoEl = document.getElementById('swaps-auto-select');
+                const thresholdEl = document.getElementById('swaps-auto-threshold');
                 if (enabledEl) enabledEl.checked = !!data.enabled;
                 if (strictEl) strictEl.checked = !!data.strictNoMintFallback;
                 if (minEl) minEl.value = data.minimumTargetSats ?? '';
+                if (autoEl) autoEl.checked = data.autoSelectCheapest !== false; // default true
+                if (thresholdEl) thresholdEl.value = data.autoSelectThresholdPct ?? 10;
+                if (autoEl && thresholdEl) {
+                    const sync = () => { thresholdEl.disabled = !autoEl.checked; };
+                    sync();
+                    autoEl.onchange = sync;
+                }
 
                 // Render provider checkboxes. Order: providerOrder (enabled, in
                 // preference order) first, then the rest of knownProviders
@@ -7411,6 +7463,8 @@ $adminView = $rawAdminView;
         async function saveSwapSettings() {
             const enabled = document.getElementById('swaps-enabled').checked ? '1' : '0';
             const strict = document.getElementById('swaps-strict').checked ? '1' : '0';
+            const autoSelect = document.getElementById('swaps-auto-select').checked ? '1' : '0';
+            const threshold = document.getElementById('swaps-auto-threshold').value.trim();
             // Build the provider list from checked checkboxes, preserving the
             // DOM order (the checkboxes were rendered with the saved order first).
             const checked = Array.from(document.querySelectorAll(
@@ -7425,6 +7479,8 @@ $adminView = $rawAdminView;
                     + `&strict_no_mint_fallback=${strict}`
                     + `&provider_order=${encodeURIComponent(order)}`
                     + `&minimum_target_sats=${encodeURIComponent(minSats)}`
+                    + `&auto_select_cheapest=${autoSelect}`
+                    + `&auto_select_threshold_pct=${encodeURIComponent(threshold)}`
                 );
                 const result = await response.json();
                 if (response.ok) {
