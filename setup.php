@@ -10,10 +10,14 @@
  * Step 4: Create Store (name only)
  * Step 5: Connect Mint (URL → fetch keysets → select unit)
  * Step 6: Generate Seed for Store
+ * Step 9: Configure Auto-Withdraw (lightning address or on-chain xpub)
+ * Step 8: On-chain Bitcoin payment destinations (xpub or static address)
  * Step 7: Complete
  *
  * Note: Step 3 was merged into Step 1. Internal step numbers are preserved
- * for backwards compatibility, but step 3 is no longer used.
+ * for backwards compatibility, but step 3 is no longer used. Step 9 was
+ * added after step 6 instead of renumbering to avoid breaking saved-state
+ * users mid-wizard.
  */
 
 require_once __DIR__ . '/includes/database.php';
@@ -315,10 +319,72 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
                     unset($_SESSION['temp_seed']);
 
-                    // After confirming the Cashu seed, offer the optional
-                    // on-chain Bitcoin payment configuration before finishing.
-                    $step = 8;
+                    // After confirming the Cashu seed, ask where the operator
+                    // wants auto-withdrawals to land. The on-chain step that
+                    // follows uses that choice to decide whether an xpub is
+                    // required (on-chain auto-melt) or just recommended.
+                    $step = 9;
                 }
+                break;
+
+            case 9: // Auto-withdraw destination (lightning address or on-chain swap)
+                $storeId = $_SESSION['setup_store_id'] ?? null;
+                if (!$storeId) {
+                    throw new Exception('Store not found. Please restart setup.');
+                }
+
+                $autoWithdrawAction = $_POST['auto_withdraw_action'] ?? '';
+
+                // The auto_melt_* columns aren't in Config::updateStore's
+                // allowlist (kept intentionally tight), so save them via
+                // Database::update directly — same pattern admin.php uses
+                // in the save_auto_melt action.
+                if ($autoWithdrawAction === 'skip') {
+                    // Persist that the user explicitly skipped, so step 8 can
+                    // adjust its copy and so we don't keep nagging them.
+                    Database::update('stores', [
+                        'auto_melt_enabled' => 0,
+                    ], 'id = ?', [$storeId]);
+                    $_SESSION['setup_auto_withdraw_mode'] = 'skip';
+                } elseif ($autoWithdrawAction === 'save') {
+                    $autoMode = $_POST['auto_withdraw_mode'] ?? '';
+                    if ($autoMode === 'lightning') {
+                        $address = trim($_POST['lightning_address'] ?? '');
+                        // Lightning addresses are user@host — same shape as email,
+                        // but we don't want filter_var rejecting legitimate ones
+                        // for nitpick reasons (e.g. plus tags). Keep the check
+                        // simple: non-empty, exactly one '@', host has a dot.
+                        if ($address === '' || substr_count($address, '@') !== 1) {
+                            throw new Exception('Enter a Lightning address (user@host)');
+                        }
+                        [, $host] = explode('@', $address);
+                        if ($host === '' || strpos($host, '.') === false) {
+                            throw new Exception('Lightning address host looks invalid');
+                        }
+                        Database::update('stores', [
+                            'auto_melt_enabled' => 1,
+                            'auto_melt_address' => $address,
+                            'auto_melt_use_swap' => 0, // explicit Lightning mode
+                        ], 'id = ?', [$storeId]);
+                        $_SESSION['setup_auto_withdraw_mode'] = 'lightning';
+                    } elseif ($autoMode === 'onchain') {
+                        // On-chain mode: store the choice, the actual xpub
+                        // gets validated and saved on step 8.
+                        Database::update('stores', [
+                            'auto_melt_enabled' => 1,
+                            'auto_melt_address' => null,
+                            'auto_melt_use_swap' => 1, // submarine-swap to on-chain
+                        ], 'id = ?', [$storeId]);
+                        $_SESSION['setup_auto_withdraw_mode'] = 'onchain';
+                    } else {
+                        throw new Exception('Pick an auto-withdraw method or Skip');
+                    }
+                } else {
+                    // GET landing on step 9 — fall through to render the form.
+                    break;
+                }
+
+                $step = 8;
                 break;
 
             case 8: // Optional: configure on-chain Bitcoin payments
@@ -327,11 +393,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     throw new Exception('Store not found. Please restart setup.');
                 }
                 $onchainAction = $_POST['onchain_action'] ?? '';
+                // The user picked on-chain auto-withdraw on step 9, so a real
+                // on-chain destination is mandatory here — there's no other
+                // place to point the swap output. Skip is blocked.
+                $autoWithdrawMode = $_SESSION['setup_auto_withdraw_mode'] ?? '';
                 if ($onchainAction === 'skip') {
+                    if ($autoWithdrawMode === 'onchain') {
+                        throw new Exception(
+                            'On-chain auto-withdraw needs an xpub or static address. '
+                            . 'Configure one below, or go back and pick Lightning / Skip on the previous step.'
+                        );
+                    }
                     // user chose to add it later from admin
                 } elseif ($onchainAction === 'save') {
-                    $mode = $_POST['onchain_address_mode'] ?? 'xpub';
-                    if (!in_array($mode, ['xpub', 'static'], true)) {
+                    $onchainMode = $_POST['onchain_address_mode'] ?? 'xpub';
+                    if (!in_array($onchainMode, ['xpub', 'static'], true)) {
                         throw new Exception('Invalid mode');
                     }
                     $network = $_POST['onchain_network'] ?? 'mainnet';
@@ -339,7 +415,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $providerUrl = trim($_POST['onchain_provider_url'] ?? '');
 
                     require_once __DIR__ . '/includes/onchain/wallet.php';
-                    if ($mode === 'static') {
+                    if ($onchainMode === 'static') {
+                        if ($autoWithdrawMode === 'onchain') {
+                            // Submarine-swap auto-melt needs an xpub to derive
+                            // a fresh sweep destination per swap. A reused
+                            // static address would leak the swap history.
+                            throw new Exception(
+                                'On-chain auto-withdraw requires an xpub (not a static address). '
+                                . 'Static-address mode is fine for receiving customer payments, but '
+                                . 'submarine swaps derive a fresh address each time.'
+                            );
+                        }
                         $staticAddress = trim($_POST['onchain_static_address'] ?? '');
                         $tweakRange = max(100, min(100000, (int)($_POST['onchain_static_tweak_range'] ?? 1000)));
                         if ($staticAddress === '') {
@@ -379,6 +465,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     // GET landing on step 8 — fall through to render the form.
                     break;
                 }
+
+                // Clear the step-9 hint now that step 8 has consumed it.
+                unset($_SESSION['setup_auto_withdraw_mode']);
 
                 // Either save+skip from here funnels to completion/add_store handler.
                 if ($mode === 'add_store') {
@@ -790,9 +879,12 @@ function getDataDirHttpPath(): ?string {
             <?php if ($mode === 'add_store'): ?>
                 <h1>Add New Store</h1>
                 <?php
-                // Map internal steps 4-6 to display steps 1-3
-                $displayStep = $step - 3;
-                $totalDisplaySteps = 3;
+                // add_store walks steps 4 → 5 → 6 → 9 (auto-withdraw) → 8
+                // (on-chain) before redirecting to admin. Step 7 (Complete)
+                // is not reached in this mode.
+                $addStoreMapping = [4 => 1, 5 => 2, 6 => 3, 9 => 4, 8 => 5];
+                $totalDisplaySteps = 5;
+                $displayStep = $addStoreMapping[$step] ?? $step;
                 ?>
                 <p class="subtitle">Step <?= $displayStep ?> of <?= $totalDisplaySteps ?></p>
 
@@ -805,16 +897,15 @@ function getDataDirHttpPath(): ?string {
                 <h1>BareBits Lite Setup</h1>
                 <?php
                 $isWpMode = Urls::isWordPress();
-                // WordPress: 5 steps (skip password step 2)
-                // Standalone: 6 steps
-                $totalSteps = $isWpMode ? 5 : 6;
-
-                // Map internal step numbers to display step numbers
-                // Internal: 1(welcome+security), 2(password), 4(store), 5(mint), 6(seed), 7(complete)
-                // Step 3 no longer exists (merged into 1)
+                // Internal step order:
+                //   1 (welcome+security), 2 (password, standalone only),
+                //   4 (store), 5 (mint), 6 (seed), 9 (auto-withdraw),
+                //   8 (on-chain), 7 (complete).
+                // Step 3 was merged into step 1 and is unused.
                 $stepMapping = $isWpMode
-                    ? [1 => 1, 4 => 2, 5 => 3, 6 => 4, 7 => 5]  // Skip step 2 (password)
-                    : [1 => 1, 2 => 2, 4 => 3, 5 => 4, 6 => 5, 7 => 6];
+                    ? [1 => 1, 4 => 2, 5 => 3, 6 => 4, 9 => 5, 8 => 6, 7 => 7]
+                    : [1 => 1, 2 => 2, 4 => 3, 5 => 4, 6 => 5, 9 => 6, 8 => 7, 7 => 8];
+                $totalSteps = $isWpMode ? 7 : 8;
                 $displayStep = $stepMapping[$step] ?? $step;
                 ?>
                 <p class="subtitle">Step <?= $displayStep ?> of <?= $totalSteps ?></p>
@@ -1391,27 +1482,134 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                     </details>
                 <?php endif; ?>
 
-            <?php elseif ($step === 8): ?>
-                <!-- Step 8: Optional on-chain Bitcoin payments -->
-                <h2 style="margin-bottom: 0.5rem;">On-chain Bitcoin payments (optional)</h2>
+            <?php elseif ($step === 9): ?>
+                <!-- Step 9: Auto-withdraw destination -->
+                <h2 style="margin-bottom: 0.5rem;">Auto-withdraw destination</h2>
                 <p style="color: #a0aec0; margin-bottom: 1.25rem; font-size: 0.9rem;">
-                    Accept direct Bitcoin transactions in addition to Lightning.
-                    You can skip this step now and configure it later from Admin.
-                    Provide an extended public key (xpub / zpub / vpub / etc.) from your wallet
-                    &mdash; the server will derive a fresh receive address per invoice.
-                    The key will be automatically validated for the chosen network and address type.
+                    Where should incoming payments end up? Picking a destination
+                    lets the server sweep funds out of the Cashu mint automatically
+                    once the balance is high enough, so you don't have to.
+                </p>
+
+                <form id="auto-withdraw-form" method="POST" action="<?= htmlspecialchars(Urls::setup()) ?>" style="margin-bottom: 1rem;">
+                    <input type="hidden" name="step" value="9">
+                    <input type="hidden" name="auto_withdraw_action" value="save">
+                    <?php if ($mode === 'add_store'): ?>
+                        <input type="hidden" name="mode" value="add_store">
+                    <?php endif; ?>
+
+                    <label class="aw-choice" style="display: block; padding: 1rem; border: 1px solid #2d3748; border-radius: 8px; margin-bottom: 0.75rem; cursor: pointer;">
+                        <input type="radio" name="auto_withdraw_mode" value="lightning" checked
+                               onchange="document.getElementById('aw-ln-row').style.display = this.checked ? 'block' : 'none';">
+                        <strong>Auto-withdraw to Lightning</strong>
+                        <p style="margin: 0.25rem 0 0 1.5rem; color: #a0aec0; font-size: 0.85rem;">
+                            Fastest, lowest fees. Requires a Lightning address
+                            like <code>awesomemerchant@strike.me</code>.
+                        </p>
+                    </label>
+
+                    <div id="aw-ln-row" class="form-group" style="margin-left: 1.5rem;">
+                        <label for="lightning_address" style="font-size: 0.85rem;">Lightning address</label>
+                        <input type="text" id="lightning_address" name="lightning_address"
+                               placeholder="awesomemerchant@strike.me"
+                               style="width: 100%; font-family: monospace; font-size: 0.9rem;">
+                    </div>
+
+                    <label class="aw-choice" style="display: block; padding: 1rem; border: 1px solid #2d3748; border-radius: 8px; margin: 0.75rem 0; cursor: pointer;">
+                        <input type="radio" name="auto_withdraw_mode" value="onchain"
+                               onchange="document.getElementById('aw-ln-row').style.display = this.checked ? 'none' : 'block';">
+                        <strong>Auto-withdraw to on-chain (any wallet)</strong>
+                        <p style="margin: 0.25rem 0 0 1.5rem; color: #a0aec0; font-size: 0.85rem;">
+                            Submarine-swap sweep to the on-chain xpub you'll set up
+                            next. Slower and a bit more expensive than Lightning,
+                            but works with any Bitcoin wallet.
+                        </p>
+                    </label>
+
+                    <button type="submit" class="btn" style="width: 100%; margin-top: 0.75rem;">Save and continue</button>
+                </form>
+
+                <div class="warning" style="margin-bottom: 0.75rem;">
+                    <strong>Strongly recommended:</strong> set an auto-withdraw
+                    destination. Without one, incoming funds sit on this server
+                    and inside the third-party Cashu mint until you withdraw
+                    manually &mdash; the safest place for your money is the
+                    wallet you control on the other end.
+                </div>
+
+                <form method="POST" action="<?= htmlspecialchars(Urls::setup()) ?>">
+                    <input type="hidden" name="step" value="9">
+                    <input type="hidden" name="auto_withdraw_action" value="skip">
+                    <?php if ($mode === 'add_store'): ?>
+                        <input type="hidden" name="mode" value="add_store">
+                    <?php endif; ?>
+                    <button type="submit" class="btn btn-secondary" style="width: 100%;">
+                        Skip for now (configure later in Admin)
+                    </button>
+                </form>
+
+                <script>
+                (function () {
+                    // The Lightning Address row visibility is wired via inline
+                    // onchange on the radios above; this just ensures the
+                    // server-redrawn state matches whichever option is checked
+                    // (e.g. after a validation error redraws the form).
+                    var checked = document.querySelector('input[name="auto_withdraw_mode"]:checked');
+                    if (checked) checked.dispatchEvent(new Event('change'));
+                })();
+                </script>
+
+            <?php elseif ($step === 8): ?>
+                <!-- Step 8: On-chain Bitcoin payment destination -->
+                <?php
+                $awMode = $_SESSION['setup_auto_withdraw_mode'] ?? '';
+                $onchainRequired = ($awMode === 'onchain');
+                ?>
+                <h2 style="margin-bottom: 0.5rem;">
+                    On-chain Bitcoin payments<?= $onchainRequired ? '' : ' (optional)' ?>
+                </h2>
+                <p style="color: #a0aec0; margin-bottom: 1.25rem; font-size: 0.9rem;">
+                    <?php if ($onchainRequired): ?>
+                        You picked on-chain auto-withdraw on the previous step, so the
+                        xpub you set here is also where your withdrawals will land.
+                        Provide an extended public key (xpub / zpub / vpub / etc.)
+                        from your wallet &mdash; the server derives a fresh receive
+                        address per invoice and per swap output.
+                    <?php elseif ($awMode === 'lightning'): ?>
+                        Optionally accept direct Bitcoin transactions in addition to
+                        Lightning. Adding an on-chain address means lower fees and
+                        faster settlement for customers paying on-chain &mdash; without
+                        one, they have no on-chain option at all.
+                    <?php else: ?>
+                        Accept direct Bitcoin transactions in addition to Lightning.
+                        You can skip this step now and configure it later from Admin.
+                        Provide an extended public key (xpub / zpub / vpub / etc.) from your wallet
+                        &mdash; the server will derive a fresh receive address per invoice.
+                        The key will be automatically validated for the chosen network and address type.
+                    <?php endif; ?>
                 </p>
 
                 <form id="onchain-form" method="POST" action="<?= htmlspecialchars(Urls::setup()) ?>">
                     <input type="hidden" name="step" value="8">
                     <input type="hidden" name="onchain_action" value="save">
+                    <?php if ($mode === 'add_store'): ?>
+                        <input type="hidden" name="mode" value="add_store">
+                    <?php endif; ?>
 
                     <div class="form-group">
                         <label for="onchain_address_mode">Address source:</label>
                         <select id="onchain_address_mode" name="onchain_address_mode">
                             <option value="xpub">Extended public key (recommended)</option>
-                            <option value="static">Single static address (not recommended)</option>
+                            <?php if (!$onchainRequired): ?>
+                                <option value="static">Single static address (not recommended)</option>
+                            <?php endif; ?>
                         </select>
+                        <?php if ($onchainRequired): ?>
+                            <p style="font-size: 0.8rem; color: #fbd38d; margin-top: 0.35rem;">
+                                Static-address mode is hidden because on-chain auto-withdraw
+                                derives a fresh address per swap and needs an xpub.
+                            </p>
+                        <?php endif; ?>
                     </div>
 
                     <div id="onchain-static-warning" class="warning" style="display:none; margin-bottom: 1rem;">
@@ -1490,13 +1688,18 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                     </button>
                 </form>
 
+                <?php if (!$onchainRequired): ?>
                 <form method="POST" action="<?= htmlspecialchars(Urls::setup()) ?>" style="margin-top: 0.75rem;">
                     <input type="hidden" name="step" value="8">
                     <input type="hidden" name="onchain_action" value="skip">
+                    <?php if ($mode === 'add_store'): ?>
+                        <input type="hidden" name="mode" value="add_store">
+                    <?php endif; ?>
                     <button type="submit" class="btn btn-secondary" style="width: 100%;">
                         Skip for now (configure later in Admin)
                     </button>
                 </form>
+                <?php endif; ?>
 
                 <script>
                 (function () {

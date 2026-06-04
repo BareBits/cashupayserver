@@ -122,8 +122,14 @@ def start_payserver(workdir: Path, *, extra_env: dict[str, str] | None = None) -
     # Kill the auto-updater for the entire test run. Without this, a long-
     # running stack will eventually overlay the live working tree with the
     # latest channel-main build and undo any in-progress dev edits. Honoured
-    # by includes/updater.php::isDisabledForTests().
+    # by includes/updater.php::isDisabledForTests(). We also drop a sentinel
+    # file inside the data dir as belt-and-suspenders — an external curl to
+    # /cron.php (a real cron set up by the operator, a stray browser tab,
+    # etc.) won't inherit the env var, but it WILL see the sentinel.
     env.setdefault("CASHUPAY_UPDATER_DISABLED", "1")
+    (data_dir / ".updater_disabled").write_text(
+        "auto-updates disabled by tests/fixtures/payserver.py\n"
+    )
     if extra_env:
         env.update(extra_env)
 

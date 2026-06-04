@@ -130,9 +130,16 @@ class Updater {
     }
 
     /**
-     * Test-harness opt-out, driven by either the CASHUPAY_UPDATER_DISABLED
-     * PHP constant or the env var of the same name. Truthy in either source
-     * disables {@see checkAndApply}.
+     * Test-harness opt-out. Honoured when any of these is true:
+     *   - PHP constant CASHUPAY_UPDATER_DISABLED is defined and truthy
+     *   - Env var CASHUPAY_UPDATER_DISABLED is non-empty and not "0"
+     *   - A sentinel file `.updater_disabled` exists in CASHUPAY_DATA_DIR
+     *     (or the default data/ dir, if no CASHUPAY_DATA_DIR override).
+     *
+     * The sentinel-file path exists for iterate.py / pytest stacks: a stale
+     * env var on an external cron hit (or any other path that bypasses the
+     * fixture-spawned process tree) won't fire the updater and overwrite
+     * an in-progress dev branch.
      */
     private static function isDisabledForTests(): bool {
         if (defined('CASHUPAY_UPDATER_DISABLED') && CASHUPAY_UPDATER_DISABLED) {
@@ -140,6 +147,12 @@ class Updater {
         }
         $env = getenv('CASHUPAY_UPDATER_DISABLED');
         if ($env !== false && $env !== '' && $env !== '0') {
+            return true;
+        }
+        $dataDir = defined('CASHUPAY_DATA_DIR')
+            ? (string)CASHUPAY_DATA_DIR
+            : (getenv('CASHUPAY_DATA_DIR') ?: (self::installRoot() . '/data'));
+        if ($dataDir !== '' && is_file($dataDir . '/.updater_disabled')) {
             return true;
         }
         return false;

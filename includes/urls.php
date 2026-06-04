@@ -52,13 +52,20 @@ class Urls {
     }
 
     /**
-     * Get the setup wizard URL
+     * Get the setup wizard URL.
+     *
+     * Returns an absolute URL so it resolves correctly when called from
+     * admin views that live under a deeper path (e.g. /admin/stores after
+     * path-based view routing). Mirrors the absolute-URL convention used
+     * by server(), payment(), cron(), and receive().
      */
     public static function setup(): string {
         if (self::isWordPress()) {
             return site_url('/cashupay-setup/');
         }
-        return 'setup.php';
+        $base = rtrim(Config::getBaseUrl(), '/');
+        $mode = Config::getUrlMode();
+        return $mode === 'direct' ? $base . '/setup.php' : $base . '/router.php/setup.php';
     }
 
     /**
