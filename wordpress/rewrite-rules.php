@@ -9,8 +9,15 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
+// Bump this whenever the rewrite-rule shape changes. cashupay_maybe_flush_rules()
+// compares it to the cashupay_rewrite_version option and flushes once on
+// mismatch — so an in-place update doesn't require deactivate/reactivate or a
+// manual Settings → Permalinks → Save Changes to pick up new routes.
+const CASHUPAY_REWRITE_VERSION = '2';
+
 // Register rewrite rules on init
 add_action('init', 'cashupay_add_rewrite_rules');
+add_action('init', 'cashupay_maybe_flush_rules', 11); // after rules registered
 add_filter('query_vars', 'cashupay_query_vars');
 add_action('template_redirect', 'cashupay_handle_request');
 add_filter('redirect_canonical', 'cashupay_disable_trailing_slash_redirect', 10, 2);
@@ -29,11 +36,24 @@ function cashupay_disable_trailing_slash_redirect($redirect_url, $requested_url)
 function cashupay_add_rewrite_rules(): void {
     add_rewrite_rule('^cashupay/api/v1/(.*)$', 'index.php?cashupay_api=1&cashupay_path=$matches[1]', 'top');
     add_rewrite_rule('^cashupay/payment/(.*)$', 'index.php?cashupay_payment=$matches[1]', 'top');
-    add_rewrite_rule('^cashupay-admin/?$', 'index.php?cashupay_admin=1', 'top');
+    // Admin SPA: capture optional view slug (e.g. /cashupay-admin/invoices) so
+    // a refresh restores the operator's current page.
+    add_rewrite_rule('^cashupay-admin(?:/([^/]+))?/?$', 'index.php?cashupay_admin=1&cashupay_admin_view=$matches[1]', 'top');
     add_rewrite_rule('^cashupay-setup/?$', 'index.php?cashupay_setup=1', 'top');
     add_rewrite_rule('^cashupay/cron/?$', 'index.php?cashupay_cron=1', 'top');
     add_rewrite_rule('^cashupay/receive/?$', 'index.php?cashupay_receive=1', 'top');
     add_rewrite_rule('^cashupay/api-keys/authorize/?$', 'index.php?cashupay_authorize=1', 'top');
+}
+
+// One-shot flush whenever CASHUPAY_REWRITE_VERSION changes. flush_rewrite_rules()
+// is expensive (rewrites the rewrite_rules option), so we gate it on a stored
+// version comparison instead of running it on every page load.
+function cashupay_maybe_flush_rules(): void {
+    $stored = get_option('cashupay_rewrite_version');
+    if ($stored !== CASHUPAY_REWRITE_VERSION) {
+        flush_rewrite_rules(false);
+        update_option('cashupay_rewrite_version', CASHUPAY_REWRITE_VERSION);
+    }
 }
 
 function cashupay_query_vars(array $vars): array {
@@ -41,6 +61,7 @@ function cashupay_query_vars(array $vars): array {
     $vars[] = 'cashupay_path';
     $vars[] = 'cashupay_payment';
     $vars[] = 'cashupay_admin';
+    $vars[] = 'cashupay_admin_view';
     $vars[] = 'cashupay_setup';
     $vars[] = 'cashupay_cron';
     $vars[] = 'cashupay_receive';

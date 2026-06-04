@@ -27,6 +27,9 @@ if ($timestamp) {
     wp_unschedule_event($timestamp, 'cashupay_poll_quotes');
 }
 
+// Remove rewrite-version marker so a reinstall flushes again.
+delete_option('cashupay_rewrite_version');
+
 // Flush rewrite rules
 flush_rewrite_rules();
 
