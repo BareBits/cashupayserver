@@ -22,6 +22,7 @@ require_once __DIR__ . '/includes/security.php';
 require_once __DIR__ . '/includes/background.php';
 require_once __DIR__ . '/includes/onchain/payments.php';
 require_once __DIR__ . '/includes/swap/poller.php';
+require_once __DIR__ . '/includes/swap/auto_melt.php';
 require_once __DIR__ . '/includes/trusted_mints.php';
 require_once __DIR__ . '/includes/updater.php';
 require_once __DIR__ . '/includes/notification_sender.php';
@@ -145,7 +146,10 @@ if (!$swapOnly && !$skipNonEssential) {
     }
 }
 
-// Task 2: Check auto-melt
+// Task 2: Check auto-melt — runs both rails. LightningAddress::checkAutoMelt
+// internally skips stores that have opted into the swap rail (via
+// SwapAutoMelt::modeForStore), and SwapAutoMelt::checkAndExecute does the
+// opposite, so each store gets handled by exactly one path.
 if (!$swapOnly && !$skipNonEssential) {
     try {
         $meltResult = LightningAddress::checkAutoMelt();
@@ -159,6 +163,14 @@ if (!$swapOnly && !$skipNonEssential) {
         }
     } catch (Exception $e) {
         $results['tasks']['auto_melt'] = 'error: ' . $e->getMessage();
+    }
+    try {
+        $sweepResult = SwapAutoMelt::checkAndExecute();
+        $results['tasks']['auto_melt_swap'] = $sweepResult
+            ? ['stores_processed' => count($sweepResult)]
+            : 'skipped';
+    } catch (Exception $e) {
+        $results['tasks']['auto_melt_swap'] = 'error: ' . $e->getMessage();
     }
 }
 
@@ -219,6 +231,18 @@ try {
     $results['tasks']['expire_swaps'] = 'ok';
 } catch (Exception $e) {
     $results['tasks']['expire_swaps'] = 'error: ' . $e->getMessage();
+}
+
+// Task 4d: Same lifecycle drive for sweep_attempts (auto-melt-via-swap).
+// Reuses SwapPoller via a sweep settlement context so on-chain claim and
+// status transitions run on the same machinery as customer swaps. Runs on
+// every cron mode (including swap-only fast-lane) for latency parity.
+try {
+    $sweepResults = SwapPoller::pollPending(30, 20, new SweepSwapSettlement());
+    $results['tasks']['poll_sweeps'] = "polled {$sweepResults['polled']} sweep(s)"
+        . ($sweepResults['errors'] ? ", {$sweepResults['errors']} errored" : '');
+} catch (Exception $e) {
+    $results['tasks']['poll_sweeps'] = 'error: ' . $e->getMessage();
 }
 
 // Task 5: C1 - Sync proof states with mint (if not synced recently)
@@ -303,6 +327,14 @@ if (!$swapOnly && !$skipNonEssential) try {
     $results['tasks']['cleanup_pending_ops'] = "cleaned {$totalCleaned}";
 } catch (Exception $e) {
     $results['tasks']['cleanup_pending_ops'] = 'error: ' . $e->getMessage();
+}
+
+// Task 9b: L3 - Trim 30-day-old quote history rows for auto-melt-via-swap.
+if (!$swapOnly && !$skipNonEssential) try {
+    $trimmed = SwapAutoMelt::cleanupQuoteHistory();
+    $results['tasks']['cleanup_swap_quote_history'] = "deleted {$trimmed}";
+} catch (Exception $e) {
+    $results['tasks']['cleanup_swap_quote_history'] = 'error: ' . $e->getMessage();
 }
 
 // Task 10: L4 - Webhook delivery cleanup (keep only last 1000)

@@ -119,6 +119,11 @@ def start_payserver(workdir: Path, *, extra_env: dict[str, str] | None = None) -
 
     env = os.environ.copy()
     env["CASHUPAY_DATA_DIR"] = str(data_dir)
+    # Kill the auto-updater for the entire test run. Without this, a long-
+    # running stack will eventually overlay the live working tree with the
+    # latest channel-main build and undo any in-progress dev edits. Honoured
+    # by includes/updater.php::isDisabledForTests().
+    env.setdefault("CASHUPAY_UPDATER_DISABLED", "1")
     if extra_env:
         env.update(extra_env)
 

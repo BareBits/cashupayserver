@@ -136,10 +136,20 @@ if (isset($_GET['api'])) {
 
             // Get store details including auto-melt settings
             $store = Config::getStore($storeId);
+            require_once __DIR__ . '/includes/swap/auto_melt.php';
+            $autoMeltMode = SwapAutoMelt::modeForStore($store);
+            $autoMeltUseSwap = isset($store['auto_melt_use_swap'])
+                ? (int)$store['auto_melt_use_swap']
+                : SwapAutoMelt::INHERIT;
             $autoMelt = [
                 'address' => $store['auto_melt_address'] ?? '',
                 'enabled' => (bool)($store['auto_melt_enabled'] ?? 0),
                 'threshold' => (int)($store['auto_melt_threshold'] ?? 2000),
+                'modeOverride' => $autoMeltUseSwap,
+                'mode' => $autoMeltMode,
+                'siteSwapDefault' => SwapAutoMelt::siteDefault(),
+                'swapMinSats' => SwapAutoMelt::minSats(),
+                'swapMaxFeePct' => SwapAutoMelt::maxFeePct(),
             ];
 
             $storeNotifications = [
@@ -1407,17 +1417,26 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         case 'save_auto_melt':
             Auth::requireAdmin();
+            require_once __DIR__ . '/includes/swap/auto_melt.php';
             try {
                 $storeId = $_POST['store_id'] ?? '';
                 $address = $_POST['address'] ?? '';
                 $enabled = ($_POST['enabled'] ?? '0') === '1' ? 1 : 0;
                 $threshold = (int)($_POST['threshold'] ?? 2000);
+                // Tri-state per-store override: -1 inherit, 0 force LN, 1 force swap.
+                $modeOverrideRaw = $_POST['mode_override'] ?? (string)SwapAutoMelt::INHERIT;
+                $modeOverride = (int)$modeOverrideRaw;
+                if (!in_array($modeOverride, [SwapAutoMelt::INHERIT, SwapAutoMelt::FORCE_LIGHTNING, SwapAutoMelt::FORCE_SWAP], true)) {
+                    throw new Exception('Invalid auto-melt mode override');
+                }
 
                 if (empty($storeId)) {
                     throw new Exception('Store ID required');
                 }
 
-                // Validate Lightning address format if provided
+                // Validate Lightning address format if provided. When the
+                // resolved mode is "swap" we don't require an LN address —
+                // the operator has chosen the on-chain rail.
                 if (!empty($address) && !preg_match('/^[a-zA-Z0-9._-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/', $address)) {
                     throw new Exception('Invalid Lightning address format');
                 }
@@ -1425,7 +1444,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 Database::update('stores', [
                     'auto_melt_enabled' => $enabled,
                     'auto_melt_address' => $address ?: null,
-                    'auto_melt_threshold' => $threshold
+                    'auto_melt_threshold' => $threshold,
+                    'auto_melt_use_swap' => $modeOverride,
                 ], 'id = ?', [$storeId]);
 
                 echo json_encode(['success' => true]);
@@ -1505,6 +1525,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             Auth::requireAdmin();
             require_once __DIR__ . '/includes/swap/config.php';
             require_once __DIR__ . '/includes/swap/factory.php';
+            require_once __DIR__ . '/includes/swap/auto_melt.php';
             echo json_encode([
                 'enabled'                => SwapsConfig::siteEnabled(),
                 'providerOrder'          => SwapsConfig::providerOrder(),
@@ -1513,6 +1534,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'minimumTargetSats'      => SwapsConfig::minimumTargetSats(),
                 'autoSelectCheapest'     => SwapsConfig::autoSelectCheapest(),
                 'autoSelectThresholdPct' => SwapsConfig::autoSelectThresholdPct(),
+                'autoMeltUseSwapDefault' => SwapAutoMelt::siteDefault(),
+                'autoMeltSwapMinSats'    => SwapAutoMelt::minSats(),
+                'autoMeltSwapMaxFeePct'  => SwapAutoMelt::maxFeePct(),
             ]);
             break;
 
@@ -1520,9 +1544,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             Auth::requireAdmin();
             require_once __DIR__ . '/includes/swap/config.php';
             require_once __DIR__ . '/includes/swap/factory.php';
+            require_once __DIR__ . '/includes/swap/auto_melt.php';
             try {
                 $enabled = ($_POST['enabled'] ?? '0') === '1';
                 $strict = ($_POST['strict_no_mint_fallback'] ?? '0') === '1';
+                $autoMeltUseSwap = ($_POST['auto_melt_use_swap_default'] ?? '0') === '1';
                 $rawMin = trim((string)($_POST['minimum_target_sats'] ?? ''));
                 $minSats = ($rawMin === '') ? null : max(0, (int)$rawMin);
 
@@ -1557,6 +1583,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 SwapsConfig::setMinimumTargetSats($minSats);
                 SwapsConfig::setAutoSelectCheapest($autoSelect);
                 SwapsConfig::setAutoSelectThresholdPct($autoThreshold);
+                SwapAutoMelt::setSiteDefault($autoMeltUseSwap);
 
                 echo json_encode(['success' => true]);
             } catch (Exception $e) {
@@ -3723,15 +3750,39 @@ $adminView = $rawAdminView;
 
                     <div class="card">
                         <div class="card-header">
-                            <div class="card-title">Auto-Withdraw to Lightning Address</div>
+                            <div class="card-title">Auto-Withdraw</div>
                         </div>
                         <div class="card-body">
                             <div class="form-group">
+                                <label class="form-label">Withdraw to</label>
+                                <select class="form-input" id="auto-melt-mode-override">
+                                    <option value="-1">Inherit site default (<span id="auto-melt-mode-default-label">Lightning address</span>)</option>
+                                    <option value="0">Lightning address</option>
+                                    <option value="1">On-chain via submarine swap</option>
+                                </select>
+                                <p class="form-help">
+                                    Currently effective: <strong id="auto-melt-mode-effective">Lightning address</strong>.
+                                    Submarine-swap mode requires an on-chain xpub on the Bitcoin tab and
+                                    site-wide swaps enabled. The Lightning-address field below applies
+                                    only when this is set to Lightning.
+                                </p>
+                            </div>
+
+                            <div class="form-group" id="auto-melt-address-group">
                                 <label class="form-label">Lightning Address</label>
                                 <input type="text" class="form-input" id="auto-melt-address"
                                        placeholder="user@wallet.com">
                                 <p class="form-help">e.g., yourname@walletofsatoshi.com, yourname@blink.sv</p>
                             </div>
+
+                            <p class="form-help" id="auto-melt-swap-info" style="display: none;">
+                                Sweeps the mint balance through a reverse submarine swap to the store's
+                                on-chain xpub. May result in longer intervals between auto-withdrawals
+                                during high-fee periods. Minimum sweep:
+                                <strong id="auto-melt-mode-min-sats">5,000</strong> sats (~$5);
+                                swap cost must be ≤
+                                <strong id="auto-melt-mode-max-fee-pct">1%</strong> of the swept amount.
+                            </p>
 
                             <div class="toggle-container">
                                 <span>Auto-withdraw when balance reaches threshold</span>
@@ -4192,6 +4243,23 @@ $adminView = $rawAdminView;
                                 to use the provider's minimum (Boltz mainnet: 10,000 sats).
                             </p>
                         </div>
+
+                        <div class="toggle-container" style="margin-top: 1.5rem; padding-top: 1rem; border-top: 1px solid var(--border-color, rgba(255,255,255,0.08));">
+                            <span><strong>Auto-withdraw via submarine swap</strong> (site-wide default)</span>
+                            <label class="toggle">
+                                <input type="checkbox" id="auto-melt-use-swap-default">
+                                <span class="toggle-slider"></span>
+                            </label>
+                        </div>
+                        <p class="form-help" style="margin-top: -0.25rem;">
+                            Default for new stores: sweep accumulated mint balance to the store's on-chain
+                            xpub instead of a Lightning address. Each store can override on its dashboard.
+                            Site-wide swaps must be enabled (above) and the store must have an on-chain xpub.
+                            During high-fee periods sweeps are deferred until the swap cost is
+                            ≤ <strong id="auto-melt-swap-max-fee-pct-display">1%</strong> of the sweep amount.
+                            Minimum sweep: <strong id="auto-melt-swap-min-sats-display">5,000</strong> sats
+                            (~$5).
+                        </p>
 
                         <button class="btn btn-full" id="btn-save-swaps" style="margin-top: 1rem;">
                             Save swap settings
@@ -5008,6 +5076,20 @@ $adminView = $rawAdminView;
 
             // Settings
             document.getElementById('btn-save-auto-melt').addEventListener('click', saveAutoMelt);
+            // Live-update LN-address vs swap-mode hint pane when the operator
+            // changes the dropdown, even before they save.
+            const autoMeltModeSel = document.getElementById('auto-melt-mode-override');
+            if (autoMeltModeSel) autoMeltModeSel.addEventListener('change', () => {
+                if (!dashboardData || !dashboardData.autoMelt) return;
+                const v = parseInt(autoMeltModeSel.value, 10);
+                // Recompute effective from override + site default for the live preview.
+                let mode;
+                if (v === 1) mode = 'swap';
+                else if (v === 0) mode = 'lightning';
+                else mode = dashboardData.autoMelt.siteSwapDefault ? 'swap' : 'lightning';
+                dashboardData.autoMelt = { ...dashboardData.autoMelt, modeOverride: v, mode };
+                renderAutoMeltMode();
+            });
             const saveStoreNotifsBtn = document.getElementById('btn-save-store-notifications');
             if (saveStoreNotifsBtn) saveStoreNotifsBtn.addEventListener('click', saveStoreNotifications);
             const saveNotifsBtn = document.getElementById('btn-save-notifications');
@@ -5616,6 +5698,7 @@ $adminView = $rawAdminView;
                         thresholdInput.step = '1';
                         thresholdInput.min = '1';
                     }
+                    renderAutoMeltMode();
                 }
 
                 // Render recent invoices
@@ -6182,6 +6265,7 @@ $adminView = $rawAdminView;
                         thresholdInput.step = '1';
                         thresholdInput.min = '1';
                     }
+                    renderAutoMeltMode();
                 }
 
                 // Load per-store notification settings
@@ -7320,24 +7404,61 @@ $adminView = $rawAdminView;
             const mintUnit = dashboardData?.mintUnit || 'sat';
             const address = document.getElementById('auto-melt-address').value;
             const enabled = document.getElementById('auto-melt-enabled').checked ? '1' : '0';
+            const modeOverride = document.getElementById('auto-melt-mode-override').value;
             // Convert threshold to smallest unit (cents for fiat)
             const threshold = parseAmount(document.getElementById('auto-melt-threshold').value, mintUnit);
 
             try {
                 const response = await postWithCsrf(adminUrl,
-                    `action=save_auto_melt&store_id=${encodeURIComponent(currentStoreId)}&address=${encodeURIComponent(address)}&enabled=${enabled}&threshold=${threshold}`
+                    `action=save_auto_melt&store_id=${encodeURIComponent(currentStoreId)}`
+                    + `&address=${encodeURIComponent(address)}`
+                    + `&enabled=${enabled}`
+                    + `&threshold=${threshold}`
+                    + `&mode_override=${encodeURIComponent(modeOverride)}`
                 );
 
                 const result = await response.json();
 
                 if (response.ok) {
                     showToast('Settings saved!', 'success');
+                    // Reload dashboard so the effective-mode badge reflects the save.
+                    if (typeof loadDashboard === 'function') loadDashboard();
                 } else {
                     showToast(result.error || 'Failed to save', 'error');
                 }
             } catch (e) {
                 showToast('Failed to save settings', 'error');
             }
+        }
+
+        /**
+         * Populate the auto-melt card from dashboardData.autoMelt. Toggles
+         * the LN-address vs swap-mode hint pane based on the effective mode,
+         * and updates the inherit-default label so the dropdown reflects what
+         * the site default actually resolves to right now.
+         */
+        function renderAutoMeltMode() {
+            const am = dashboardData && dashboardData.autoMelt;
+            if (!am) return;
+            const modeEl = document.getElementById('auto-melt-mode-override');
+            if (modeEl) modeEl.value = String(am.modeOverride);
+            const defLabel = document.getElementById('auto-melt-mode-default-label');
+            if (defLabel) defLabel.textContent = am.siteSwapDefault ? 'On-chain via swap' : 'Lightning address';
+            const effLabel = document.getElementById('auto-melt-mode-effective');
+            if (effLabel) effLabel.textContent = (am.mode === 'swap') ? 'On-chain via submarine swap' : 'Lightning address';
+            const addrGroup = document.getElementById('auto-melt-address-group');
+            const swapInfo = document.getElementById('auto-melt-swap-info');
+            if (am.mode === 'swap') {
+                if (addrGroup) addrGroup.style.display = 'none';
+                if (swapInfo) swapInfo.style.display = 'block';
+            } else {
+                if (addrGroup) addrGroup.style.display = '';
+                if (swapInfo) swapInfo.style.display = 'none';
+            }
+            const minSatsEl = document.getElementById('auto-melt-mode-min-sats');
+            if (minSatsEl && am.swapMinSats != null) minSatsEl.textContent = Number(am.swapMinSats).toLocaleString();
+            const maxPctEl = document.getElementById('auto-melt-mode-max-fee-pct');
+            if (maxPctEl && am.swapMaxFeePct != null) maxPctEl.textContent = am.swapMaxFeePct + '%';
         }
 
         async function saveStoreNotifications() {
@@ -7423,6 +7544,16 @@ $adminView = $rawAdminView;
                 if (minEl) minEl.value = data.minimumTargetSats ?? '';
                 if (autoEl) autoEl.checked = data.autoSelectCheapest !== false; // default true
                 if (thresholdEl) thresholdEl.value = data.autoSelectThresholdPct ?? 10;
+                const autoMeltSwapEl = document.getElementById('auto-melt-use-swap-default');
+                if (autoMeltSwapEl) autoMeltSwapEl.checked = !!data.autoMeltUseSwapDefault;
+                const minSatsDisp = document.getElementById('auto-melt-swap-min-sats-display');
+                if (minSatsDisp && data.autoMeltSwapMinSats != null) {
+                    minSatsDisp.textContent = Number(data.autoMeltSwapMinSats).toLocaleString();
+                }
+                const maxPctDisp = document.getElementById('auto-melt-swap-max-fee-pct-display');
+                if (maxPctDisp && data.autoMeltSwapMaxFeePct != null) {
+                    maxPctDisp.textContent = data.autoMeltSwapMaxFeePct + '%';
+                }
                 if (autoEl && thresholdEl) {
                     const sync = () => { thresholdEl.disabled = !autoEl.checked; };
                     sync();
@@ -7472,6 +7603,7 @@ $adminView = $rawAdminView;
                 .map(cb => cb.value);
             const order = checked.join(',');
             const minSats = document.getElementById('swaps-min-sats').value.trim();
+            const autoMeltSwapDefault = document.getElementById('auto-melt-use-swap-default').checked ? '1' : '0';
             try {
                 const response = await postWithCsrf(adminUrl,
                     `action=save_swap_settings`
@@ -7481,6 +7613,7 @@ $adminView = $rawAdminView;
                     + `&minimum_target_sats=${encodeURIComponent(minSats)}`
                     + `&auto_select_cheapest=${autoSelect}`
                     + `&auto_select_threshold_pct=${encodeURIComponent(threshold)}`
+                    + `&auto_melt_use_swap_default=${autoMeltSwapDefault}`
                 );
                 const result = await response.json();
                 if (response.ok) {

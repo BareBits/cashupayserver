@@ -19,18 +19,23 @@ require_once __DIR__ . '/../crypto/schnorr.php';
 require_once __DIR__ . '/../crypto/taproot.php';
 require_once __DIR__ . '/../crypto/tx_builder.php';
 require_once __DIR__ . '/factory.php';
+require_once __DIR__ . '/settlement_context.php';
 
 final class SwapClaimer {
     /**
      * Build, sign, and broadcast the claim transaction. Returns the txid on
-     * success and stores it in swap_attempts.claim_txid. Throws on any error
-     * so the caller can mark the row with an error_message.
+     * success and stores it in the row's table (swap_attempts or
+     * sweep_attempts, per the supplied context). Throws on any error so the
+     * caller can mark the row with an error_message.
      *
-     * @param array $row the swap_attempts row (assoc)
+     * @param array $row the swap row (assoc) — same column shape on both tables
      * @param string $lockupTxHex hex of the lockup transaction (from provider status)
+     * @param SwapSettlementContext|null $ctx settlement context (defaults to customer)
      * @return string txid (hex, big-endian display order)
      */
-    public static function buildAndBroadcast(array $row, string $lockupTxHex): string {
+    public static function buildAndBroadcast(array $row, string $lockupTxHex, ?SwapSettlementContext $ctx = null): string {
+        $ctx = $ctx ?? new CustomerSwapSettlement();
+        $table = $ctx->tableName();
         // 1. Parse the lockup transaction; find the output paying our lockup_address.
         $lockupRaw = self::hexToBin($lockupTxHex);
         // The lockup tx may be a segwit transaction; strip marker+flag so the
@@ -66,7 +71,7 @@ final class SwapClaimer {
         // raw lockup tx hex so an operator could manually craft a claim even
         // without access to the originating Bitcoin node.
         Database::getInstance()->prepare(
-            "UPDATE swap_attempts
+            "UPDATE {$table}
                 SET lockup_txid = ?, lockup_vout = ?, lockup_amount_sats = ?,
                     lockup_tx_hex = COALESCE(lockup_tx_hex, ?),
                     updated_at = ?
@@ -177,7 +182,7 @@ final class SwapClaimer {
         // post-broadcast (chain reorg, dropped by mempool, fee bump needed),
         // the operator has the exact bytes to re-broadcast from any node.
         Database::getInstance()->prepare(
-            "UPDATE swap_attempts SET claim_txid = ?, claim_tx_hex = ?, status = ?, updated_at = ?
+            "UPDATE {$table} SET claim_txid = ?, claim_tx_hex = ?, status = ?, updated_at = ?
               WHERE id = ?"
         )->execute([$txid, $finalHex, 'claim.broadcast', time(), $row['id']]);
 

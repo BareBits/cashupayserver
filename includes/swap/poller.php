@@ -1,17 +1,23 @@
 <?php
 /**
- * Swap lifecycle poller: drives swap_attempts rows through the Boltz/Zeus
- * reverse-swap status machine, builds + broadcasts the claim transaction
- * when ready, and applies invoice state transitions accordingly.
+ * Swap lifecycle poller: drives swap_attempts (customer flow) and
+ * sweep_attempts (auto-melt flow) rows through the Boltz/Zeus reverse-swap
+ * status machine, builds + broadcasts the claim transaction when ready,
+ * and runs the per-context tail-end action on terminal status.
  *
  * Called from cron.php each tick. Uses last_polled_at as an atomic gate so
  * two concurrent cron invocations don't both work the same row.
+ *
+ * The same code drives both tables — a SwapSettlementContext supplied by the
+ * caller picks the target table and the on-settled / on-invalid handler.
+ * When omitted, defaults to the historical customer/swap_attempts flow.
  */
 
 require_once __DIR__ . '/../database.php';
 require_once __DIR__ . '/../webhook_sender.php';
 require_once __DIR__ . '/factory.php';
 require_once __DIR__ . '/claimer.php';
+require_once __DIR__ . '/settlement_context.php';
 
 final class SwapPoller {
     // Statuses we consider terminal — rows in these states are skipped on poll.
@@ -26,12 +32,19 @@ final class SwapPoller {
     ];
 
     /**
-     * Walk active swap_attempts rows, advance state, attempt claim where
-     * possible. Per-row failures are logged and don't halt the loop.
+     * Walk active rows for the supplied context, advance state, attempt
+     * claim where possible. Per-row failures are logged and don't halt
+     * the loop.
      *
      * @return array{polled:int, errors:int}
      */
-    public static function pollPending(int $minInterval = 30, int $batchLimit = 20): array {
+    public static function pollPending(
+        int $minInterval = 30,
+        int $batchLimit = 20,
+        ?SwapSettlementContext $ctx = null
+    ): array {
+        $ctx = $ctx ?? new CustomerSwapSettlement();
+        $table = $ctx->tableName();
         $now = time();
         $pdo = Database::getInstance();
         $placeholders = implode(',', array_fill(0, count(self::TERMINAL_STATUSES), '?'));
@@ -43,7 +56,7 @@ final class SwapPoller {
         array_push($params, $now, $batchLimit);
 
         $rows = $pdo->prepare(
-            "SELECT * FROM swap_attempts
+            "SELECT * FROM {$table}
              WHERE status NOT IN ({$placeholders})
              AND (last_polled_at IS NULL OR (CAST(? AS INTEGER) - last_polled_at) >= {$mi})
              ORDER BY
@@ -59,7 +72,7 @@ final class SwapPoller {
         foreach ($rowList as $row) {
             // Atomic claim: only proceed if we successfully stamp last_polled_at.
             $upd = $pdo->prepare(
-                "UPDATE swap_attempts
+                "UPDATE {$table}
                     SET last_polled_at = ?, updated_at = ?
                   WHERE id = ?
                     AND (last_polled_at IS NULL OR (CAST(? AS INTEGER) - last_polled_at) >= {$mi})"
@@ -70,13 +83,13 @@ final class SwapPoller {
             }
 
             try {
-                self::processRow($row);
+                self::processRow($row, $ctx);
                 $polled++;
             } catch (Throwable $e) {
                 $errors++;
-                error_log("SwapPoller row {$row['id']}: " . $e->getMessage());
+                error_log("SwapPoller ({$table}) row {$row['id']}: " . $e->getMessage());
                 $pdo->prepare(
-                    "UPDATE swap_attempts SET error_message = ?, updated_at = ? WHERE id = ?"
+                    "UPDATE {$table} SET error_message = ?, updated_at = ? WHERE id = ?"
                 )->execute([substr($e->getMessage(), 0, 500), time(), $row['id']]);
             }
         }
@@ -84,9 +97,14 @@ final class SwapPoller {
     }
 
     /**
-     * Cancel held HTLCs for swap_attempts whose parent invoice has expired
-     * locally before the customer paid. Best-effort: errors logged, never
-     * thrown. Sets local status to 'invoice.expired' so the row is now terminal.
+     * Cancel held HTLCs for customer swap_attempts whose parent invoice has
+     * expired locally before the customer paid. Best-effort: errors logged,
+     * never thrown. Sets local status to 'invoice.expired' so the row is now
+     * terminal.
+     *
+     * Customer-only: sweep rows don't have a parent invoice to track, and
+     * the provider's own swap timeout drives them to a terminal status via
+     * pollPending().
      */
     public static function expireStale(): void {
         $rows = Database::fetchAll(
@@ -97,6 +115,7 @@ final class SwapPoller {
                 AND i.expiration_time < ?",
             [time()]
         );
+        $ctx = new CustomerSwapSettlement();
         foreach ($rows as $row) {
             $provider = SwapProviderFactory::byName($row['provider']);
             if ($provider) {
@@ -106,14 +125,14 @@ final class SwapPoller {
                     error_log("SwapPoller cancelInvoice {$row['id']}: " . $e->getMessage());
                 }
             }
-            self::transitionToInvalid($row, 'invoice.expired', 'Invoice expired before customer payment');
+            self::transitionToInvalid($row, 'invoice.expired', 'Invoice expired before customer payment', $ctx);
         }
     }
 
     /**
      * Drive a single row through one tick of state.
      */
-    private static function processRow(array $row): void {
+    private static function processRow(array $row, SwapSettlementContext $ctx): void {
         $provider = SwapProviderFactory::byName($row['provider']);
         if (!$provider) {
             throw new RuntimeException("Unknown provider in DB row: {$row['provider']}");
@@ -121,19 +140,20 @@ final class SwapPoller {
         $status = $provider->getSwapStatus($row['network'], $row['swap_id_external']);
         if ($status === null) {
             // 404: provider forgot about the swap. Treat as failed.
-            self::transitionToInvalid($row, 'transaction.failed', 'Provider returned 404 for swap');
+            self::transitionToInvalid($row, 'transaction.failed', 'Provider returned 404 for swap', $ctx);
             return;
         }
 
+        $table = $ctx->tableName();
         // Mirror status into our row, persisting the preimage if it appeared.
         if ($status->preimage && empty($row['preimage_hex'])) {
             Database::getInstance()->prepare(
-                "UPDATE swap_attempts SET status = ?, preimage_hex = ?, updated_at = ? WHERE id = ?"
+                "UPDATE {$table} SET status = ?, preimage_hex = ?, updated_at = ? WHERE id = ?"
             )->execute([$status->status, $status->preimage, time(), $row['id']]);
             $row['preimage_hex'] = $status->preimage;
         } else {
             Database::getInstance()->prepare(
-                "UPDATE swap_attempts SET status = ?, updated_at = ? WHERE id = ?"
+                "UPDATE {$table} SET status = ?, updated_at = ? WHERE id = ?"
             )->execute([$status->status, time(), $row['id']]);
         }
         $row['status'] = $status->status;
@@ -141,7 +161,7 @@ final class SwapPoller {
         switch ($status->status) {
             case 'swap.created':
             case 'minerfee.paid':
-                // waiting for customer LN payment / setup. No action.
+                // waiting for LN payment / setup. No action.
                 return;
 
             case 'transaction.mempool':
@@ -150,19 +170,19 @@ final class SwapPoller {
                     if ($status->lockupTxHex === null) {
                         throw new RuntimeException('Provider returned ' . $status->status . ' without lockup tx hex');
                     }
-                    SwapClaimer::buildAndBroadcast($row, $status->lockupTxHex);
+                    SwapClaimer::buildAndBroadcast($row, $status->lockupTxHex, $ctx);
                 }
                 return;
 
             case 'invoice.settled':
-                self::transitionToSettled($row);
+                self::transitionToSettled($row, $ctx);
                 return;
 
             case 'invoice.expired':
             case 'swap.expired':
             case 'transaction.refunded':
             case 'transaction.failed':
-                self::transitionToInvalid($row, $status->status, "Provider reported {$status->status}");
+                self::transitionToInvalid($row, $status->status, "Provider reported {$status->status}", $ctx);
                 return;
 
             default:
@@ -173,51 +193,40 @@ final class SwapPoller {
         }
     }
 
-    private static function transitionToSettled(array $row): void {
+    private static function transitionToSettled(array $row, SwapSettlementContext $ctx): void {
         $pdo = Database::getInstance();
+        $table = $ctx->tableName();
         $pdo->beginTransaction();
         try {
             $pdo->prepare(
-                "UPDATE invoices SET status = 'Settled', additional_status = 'PaidNormal',
-                                     paid_at = ?, settled_rail = 'swap'
-                 WHERE id = ?"
-            )->execute([time(), $row['invoice_id']]);
-            $pdo->prepare(
-                "UPDATE swap_attempts SET status = 'invoice.settled', updated_at = ? WHERE id = ?"
+                "UPDATE {$table} SET status = 'invoice.settled', updated_at = ? WHERE id = ?"
             )->execute([time(), $row['id']]);
+            $ctx->onSettled($row);
             $pdo->commit();
         } catch (Throwable $e) {
             $pdo->rollBack();
             throw $e;
-        }
-        $invoice = Database::fetchOne("SELECT * FROM invoices WHERE id = ?", [$row['invoice_id']]);
-        if ($invoice) {
-            WebhookSender::fireEvent($invoice['store_id'], 'InvoiceSettled', $invoice);
         }
     }
 
-    private static function transitionToInvalid(array $row, string $providerStatus, string $message): void {
+    private static function transitionToInvalid(
+        array $row,
+        string $providerStatus,
+        string $message,
+        SwapSettlementContext $ctx
+    ): void {
         $pdo = Database::getInstance();
+        $table = $ctx->tableName();
         $pdo->beginTransaction();
         try {
-            // Only flip invoice status if it's still in a non-terminal state —
-            // an already-Settled invoice should not be marked Invalid by a
-            // late-arriving expiry tick.
             $pdo->prepare(
-                "UPDATE invoices SET status = 'Invalid', additional_status = 'PaidLate'
-                  WHERE id = ? AND status = 'New'"
-            )->execute([$row['invoice_id']]);
-            $pdo->prepare(
-                "UPDATE swap_attempts SET status = ?, error_message = ?, updated_at = ? WHERE id = ?"
+                "UPDATE {$table} SET status = ?, error_message = ?, updated_at = ? WHERE id = ?"
             )->execute([$providerStatus, substr($message, 0, 500), time(), $row['id']]);
+            $ctx->onInvalid($row, $providerStatus, $message);
             $pdo->commit();
         } catch (Throwable $e) {
             $pdo->rollBack();
             throw $e;
-        }
-        $invoice = Database::fetchOne("SELECT * FROM invoices WHERE id = ?", [$row['invoice_id']]);
-        if ($invoice) {
-            WebhookSender::fireEvent($invoice['store_id'], 'InvoiceInvalid', $invoice);
         }
     }
 }
