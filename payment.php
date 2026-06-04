@@ -371,9 +371,10 @@ $baseUrl = Config::getBaseUrl();
             vertical-align: middle;
         }
         .pm-logo.pm-strike { border-radius: 10px; }
-        /* Venmo's blue wordmark on a dark page is illegible, so it gets a
-           white card the way Venmo presents itself in its own marketing. */
-        .pm-logo.pm-venmo {
+        /* Venmo and PayPal use thin blue wordmarks that disappear against
+           the dark card; give them white backgrounds the way each brand
+           presents itself in its own marketing. */
+        .pm-logo.pm-card {
             background: #fff;
             padding: 6px 8px;
             border-radius: 8px;
@@ -566,8 +567,8 @@ $baseUrl = Config::getBaseUrl();
                         <img class="pm-logo pm-strike" src="<?= htmlspecialchars($imgBase) ?>strike.png" alt="Strike" title="Strike">
                         <img class="pm-logo" src="<?= htmlspecialchars($imgBase) ?>coinbase.svg" alt="Coinbase" title="Coinbase">
                         <img class="pm-logo" src="<?= htmlspecialchars($imgBase) ?>kraken.svg" alt="Kraken" title="Kraken">
-                        <img class="pm-logo pm-venmo pm-no-lightning" src="<?= htmlspecialchars($imgBase) ?>venmo.svg" alt="Venmo" title="Venmo">
-                        <img class="pm-logo pm-no-lightning" src="<?= htmlspecialchars($imgBase) ?>paypal.svg" alt="PayPal" title="PayPal">
+                        <img class="pm-logo pm-card pm-no-lightning" src="<?= htmlspecialchars($imgBase) ?>venmo.svg" alt="Venmo" title="Venmo">
+                        <img class="pm-logo pm-card pm-no-lightning" src="<?= htmlspecialchars($imgBase) ?>paypal.svg" alt="PayPal" title="PayPal">
                     </span>
                     <span class="pm-label">or any Bitcoin wallet</span>
                 </div>
