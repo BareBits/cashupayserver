@@ -16,7 +16,7 @@ final class ZeusSwapProvider extends BoltzLikeProvider {
 
     public function getName(): string { return 'zeus'; }
 
-    protected function baseUrl(string $network): ?string {
+    public function baseUrl(string $network): ?string {
         return self::URLS[$network] ?? null;
     }
 }

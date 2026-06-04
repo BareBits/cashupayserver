@@ -816,6 +816,13 @@ HTACCESS;
         if (!self::columnExists($pdo, 'swap_attempts', 'provider_response_json')) {
             $pdo->exec("ALTER TABLE swap_attempts ADD COLUMN provider_response_json TEXT");
         }
+        // Auto-select-cheapest audit trail: JSON snapshot of every quote
+        // fetched at invoice creation, the threshold in force, and the
+        // chosen provider. Null for rows created before the feature
+        // landed or when the feature was off.
+        if (!self::columnExists($pdo, 'swap_attempts', 'quotes_compared_json')) {
+            $pdo->exec("ALTER TABLE swap_attempts ADD COLUMN quotes_compared_json TEXT");
+        }
 
         // Drop the legacy users.pin_hash column (PIN feature removed). Uses
         // the SQLite table-rebuild dance for compatibility with SQLite < 3.35.

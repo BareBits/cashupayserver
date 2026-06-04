@@ -12,6 +12,13 @@
  *                                   instead of falling back to the mint.
  *   swaps_minimum_target_sats — int; optional override (UX guard) above
  *                               the provider's own minimum.
+ *   swaps_auto_select_cheapest — bool; if true (default), fetch quotes from
+ *                                every enabled provider in parallel and pick
+ *                                the cheapest when it beats the priority
+ *                                leader by more than the threshold.
+ *   swaps_auto_select_threshold_pct — int 1..90; percent the cheapest must
+ *                                     undercut the priority leader to win.
+ *                                     Default 10.
  *   swaps_boltz_regtest_url   — string; required for the boltz provider on
  *                               regtest networks.
  *
@@ -80,6 +87,26 @@ final class SwapsConfig {
 
     public static function setMinimumTargetSats(?int $sats): void {
         Config::set('swaps_minimum_target_sats', $sats === null ? null : max(0, $sats));
+    }
+
+    public const DEFAULT_AUTO_SELECT_THRESHOLD_PCT = 10;
+
+    public static function autoSelectCheapest(): bool {
+        return (bool)Config::get('swaps_auto_select_cheapest', true);
+    }
+
+    public static function setAutoSelectCheapest(bool $enabled): void {
+        Config::set('swaps_auto_select_cheapest', $enabled);
+    }
+
+    public static function autoSelectThresholdPct(): int {
+        $v = Config::get('swaps_auto_select_threshold_pct', self::DEFAULT_AUTO_SELECT_THRESHOLD_PCT);
+        if (!is_numeric($v)) return self::DEFAULT_AUTO_SELECT_THRESHOLD_PCT;
+        return max(1, min(90, (int)$v));
+    }
+
+    public static function setAutoSelectThresholdPct(int $pct): void {
+        Config::set('swaps_auto_select_threshold_pct', max(1, min(90, $pct)));
     }
 
     /**

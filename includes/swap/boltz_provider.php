@@ -14,7 +14,7 @@ require_once __DIR__ . '/../config.php';
 final class BoltzSwapProvider extends BoltzLikeProvider {
     public function getName(): string { return 'boltz'; }
 
-    protected function baseUrl(string $network): ?string {
+    public function baseUrl(string $network): ?string {
         return match ($network) {
             'mainnet' => 'https://api.boltz.exchange',
             'testnet' => null, // discontinued upstream
