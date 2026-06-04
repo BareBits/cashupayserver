@@ -9,6 +9,7 @@ require_once __DIR__ . '/includes/database.php';
 require_once __DIR__ . '/includes/config.php';
 require_once __DIR__ . '/includes/invoice.php';
 require_once __DIR__ . '/includes/background.php';
+require_once __DIR__ . '/includes/urls.php';
 
 // Check setup
 if (!Database::isInitialized() || !Config::isSetupComplete()) {
@@ -340,6 +341,56 @@ $baseUrl = Config::getBaseUrl();
             color: var(--error);
         }
 
+        /* "Pay with [logos] or any Bitcoin wallet" row.
+           Each SVG carries its own brand fill; the row only sets size. */
+        .payment-methods {
+            margin-top: 0.85rem;
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            justify-content: center;
+            gap: 0.35rem 0.5rem;
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            line-height: 1.4;
+        }
+        .payment-methods .pm-label {
+            white-space: nowrap;
+        }
+        .payment-methods .pm-logos {
+            display: inline-flex;
+            flex-wrap: wrap;
+            align-items: center;
+            justify-content: center;
+            gap: 0.5rem;
+        }
+        .pm-logo {
+            display: inline-block;
+            height: 22px;
+            width: auto;
+            vertical-align: middle;
+        }
+        .pm-logo.pm-strike { border-radius: 5px; }
+        /* On the Lightning view, hide brands that don't natively send LN. */
+        .payment-methods[data-method="lightning"] .pm-no-lightning {
+            display: none;
+        }
+
+        .barebits-notice {
+            margin-top: 0.65rem;
+            font-size: 0.7rem;
+            color: var(--text-secondary);
+            opacity: 0.85;
+            line-height: 1.45;
+        }
+        .barebits-notice a {
+            color: var(--text-secondary);
+            text-decoration: underline;
+        }
+        .barebits-notice a:hover {
+            color: var(--text-primary);
+        }
+
         .success-animation {
             display: none;
             flex-direction: column;
@@ -495,6 +546,27 @@ $baseUrl = Config::getBaseUrl();
                 <?php endif; ?>
 
                 <div class="timer" id="timer"></div>
+
+                <?php
+                $initialMethod = $hasLightning ? 'lightning' : 'onchain';
+                $imgBase = Urls::images('payment-methods/');
+                ?>
+                <div class="payment-methods" id="payment-methods" data-method="<?= $initialMethod ?>">
+                    <span class="pm-label">Pay with</span>
+                    <span class="pm-logos">
+                        <img class="pm-logo" src="<?= htmlspecialchars($imgBase) ?>cashapp.svg" alt="Cash App">
+                        <img class="pm-logo pm-strike" src="<?= htmlspecialchars($imgBase) ?>strike.png" alt="Strike">
+                        <img class="pm-logo" src="<?= htmlspecialchars($imgBase) ?>coinbase.svg" alt="Coinbase">
+                        <img class="pm-logo" src="<?= htmlspecialchars($imgBase) ?>kraken.svg" alt="Kraken">
+                        <img class="pm-logo pm-no-lightning" src="<?= htmlspecialchars($imgBase) ?>venmo.svg" alt="Venmo">
+                        <img class="pm-logo pm-no-lightning" src="<?= htmlspecialchars($imgBase) ?>paypal.svg" alt="PayPal">
+                    </span>
+                    <span class="pm-label">or any Bitcoin wallet</span>
+                </div>
+
+                <div class="barebits-notice">
+                    Payments by <a href="https://getbarebits.com" target="_blank" rel="noopener">BareBits</a>. Powered by the Bitcoin Lightning Network &mdash; pay with any Lightning or Cashu wallet.
+                </div>
             </div>
 
             <div id="payment-processing" class="<?= $invoice['status'] !== 'Processing' ? 'hidden' : '' ?>">
@@ -586,6 +658,8 @@ $baseUrl = Config::getBaseUrl();
                 document.querySelectorAll('[data-method-block]').forEach(block => {
                     block.classList.toggle('hidden', block.dataset.methodBlock !== method);
                 });
+                const pm = document.getElementById('payment-methods');
+                if (pm) pm.dataset.method = method;
             });
         });
 

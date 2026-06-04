@@ -8373,7 +8373,7 @@ $adminView = $rawAdminView;
             const statusSwaps = document.getElementById('cron-swaps-url-status');
             if (!code) return;
             try {
-                const response = await fetch(adminUrl + '?action=cron_url');
+                const response = await fetch(adminUrl + '?api=cron_url');
                 const data = await response.json();
                 if (data && data.crontab) {
                     code.textContent = data.crontab;
