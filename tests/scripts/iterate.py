@@ -284,6 +284,10 @@ def _create_second_store(admin: AdminClient, db_path: Path, name: str, model_sto
 def main() -> int:
     kill_stale_processes()
 
+    # Honoured by includes/updater.php::isDisabledForTests() — keep the
+    # auto-updater from overlaying the working tree mid-session.
+    os.environ.setdefault("CASHUPAY_UPDATER_DISABLED", "1")
+
     workdir = ITERATE_ROOT / f"iterate-{int(time.time())}-{uuid.uuid4().hex[:6]}"
     workdir.mkdir(parents=True, exist_ok=True)
     print(f"[iterate] workdir = {workdir}")
