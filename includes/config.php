@@ -150,7 +150,7 @@ class Config {
      * Get invoice expiration time in seconds
      */
     public static function getInvoiceExpiration(): int {
-        return self::get('invoice_expiration', 900); // 15 minutes default
+        return self::get('invoice_expiration', 3600); // 1 hour default
     }
 
     /**

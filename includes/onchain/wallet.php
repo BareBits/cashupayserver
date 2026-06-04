@@ -15,6 +15,7 @@
 
 require_once __DIR__ . '/../../vendor/autoload.php';
 
+use BitWasp\Bitcoin\Address\AddressCreator;
 use BitWasp\Bitcoin\Address\ScriptHashAddress;
 use BitWasp\Bitcoin\Address\SegwitAddress;
 use BitWasp\Bitcoin\Key\Factory\HierarchicalKeyFactory;
@@ -175,6 +176,40 @@ class OnchainWallet {
             // P2SH-P2WPKH: wrap the v0 witness program in a P2SH.
             $witScript = ScriptFactory::scriptPubKey()->p2wkh($pubKeyHash);
             return (new ScriptHashAddress($witScript->getScriptHash()))->getAddress($net);
+        } finally {
+            error_reporting($prev);
+        }
+    }
+
+    /**
+     * Validate a plain Bitcoin address against the configured network.
+     * Used by static-address mode where the merchant pastes a single
+     * address rather than an xpub. Mainnet/testnet-family mismatch is
+     * rejected so a tpub-era address can't accidentally be saved on
+     * a mainnet store (and vice versa).
+     *
+     * @return array{valid:bool, error:?string}
+     */
+    public static function validateAddress(string $address, string $network): array {
+        $address = trim($address);
+        if ($address === '') {
+            return ['valid' => false, 'error' => 'Empty address'];
+        }
+        if (!in_array($network, self::SUPPORTED_NETWORKS, true)) {
+            return ['valid' => false, 'error' => "Unsupported network: {$network}"];
+        }
+        $net = self::bitwaspNetwork($network);
+        $prev = error_reporting();
+        error_reporting($prev & ~E_DEPRECATED);
+        try {
+            (new AddressCreator())->fromString($address, $net);
+            return ['valid' => true, 'error' => null];
+        } catch (Throwable $e) {
+            $isTestnetFamily = in_array($network, ['testnet', 'signet', 'regtest'], true);
+            $hint = $isTestnetFamily
+                ? 'Expected a testnet/signet/regtest address (starts with m/n/2 or tb1/bcrt1).'
+                : 'Expected a mainnet address (starts with 1/3 or bc1).';
+            return ['valid' => false, 'error' => "Invalid address for {$network}. {$hint}"];
         } finally {
             error_reporting($prev);
         }

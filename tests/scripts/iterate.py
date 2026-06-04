@@ -48,6 +48,7 @@ from fixtures.bitcoind import BitcoindHandle, start_bitcoind, stop_bitcoind  # n
 from fixtures.cashume import CashuMeHandle, start_cashume, stop_cashume  # noqa: E402
 from fixtures.electrum import (  # noqa: E402
     ElectrumHandle,
+    electrum_send_onchain,
     fund_electrum_from_bitcoind,
     launch_electrum_gui,
     open_electrum_channel_to_lnd,
@@ -66,6 +67,7 @@ from fixtures.nutshell import MintHandle, NUTSHELL_VENV, start_mint, stop_mint  
 from fixtures.onchain import (  # noqa: E402
     OnchainContext,
     configure_store_for_onchain,
+    configure_store_for_static_onchain,
     make_onchain_context,
 )
 from fixtures.payserver import PayserverHandle, start_payserver, stop_payserver  # noqa: E402
@@ -78,8 +80,13 @@ from fixtures.setup_helpers import run_setup_wizard  # noqa: E402
 ADMIN_PASSWORD = "password"
 STORE_ONECONF = "oneconf"
 STORE_ZEROCONF = "zeroconf"
+STORE_SINGLECONF_SINGLE = "singleconf_single"  # static-address mode
 LIGHTNING_AMOUNT_SAT = 1500
 ONCHAIN_AMOUNT_SAT = 25000
+# Two distinct base amounts for the static-address store so the customer
+# (Electrum) can pay each invoice with a single tx of the exact tweaked total.
+SINGLE_ONCHAIN_AMOUNT_SAT_A = 30000
+SINGLE_ONCHAIN_AMOUNT_SAT_B = 45000
 CASHU_AMOUNT_SAT = 800
 CASHU_FUNDING_SAT = 5000  # how much to mint into the auto-pay Cashu wallet
 # Customer-side wallet funding (the wallets handed off for manual play)
@@ -424,6 +431,28 @@ def main() -> int:
             provider_url=onchain.watch_wallet_url, start_index=0,
         )
 
+        # 6b. Third store: static-address mode. A single Bitcoin address
+        #     (pulled from the Electrum wallet) is reused for every invoice;
+        #     each invoice gets a unique sat-tweak so totals never collide.
+        #     We use a separate fresh Electrum address here so it doesn't
+        #     overlap with the deposit address fund_electrum_from_bitcoind
+        #     uses for its initial 0.1 BTC funding (avoids confusing the
+        #     poller's tip-height filter with pre-existing UTXOs).
+        print(f"[iterate] creating third store '{STORE_SINGLECONF_SINGLE}' (static-address mode) ...")
+        single_store_id = _create_second_store(
+            admin, payserver.db_path, STORE_SINGLECONF_SINGLE, oneconf_store_id,
+        )
+        key3 = admin.create_api_key(single_store_id, label="iterate-single")
+        gc_single = GreenfieldClient(payserver.url, key3["key"])
+        single_static_addr = electrum.cli("createnewaddress").strip()
+        print(f"[iterate] static address for {STORE_SINGLECONF_SINGLE}: {single_static_addr}")
+        configure_store_for_static_onchain(
+            payserver.db_path, single_store_id,
+            static_address=single_static_addr, network="regtest",
+            tweak_range=1000, min_confs=1, confirm_timeout_sec=86400,
+            provider_url=onchain.watch_wallet_url,
+        )
+
         # 5. Prepare the customer-side Cashu wallet — mint enough tokens upfront
         #    that we can pay the two Cashu-flow invoices with melts.
         print(f"[iterate] funding customer Cashu wallet with {CASHU_FUNDING_SAT} sats ...")
@@ -487,6 +516,33 @@ def main() -> int:
             electrum, bitcoind, lnd_mint.pubkey, "127.0.0.1", lnd_mint.p2p_port,
             capacity_sat=ELECTRUM_CHANNEL_SAT,
         )
+
+        # 8b. Static-address store: create + pay 2 invoices, paid from the
+        #     now-funded Electrum wallet. Each invoice has a distinct base
+        #     amount + unique tweak, so Electrum sends two single-tx
+        #     payments and each one settles unambiguously.
+        print(f"\n[iterate] === Static-address invoices for '{STORE_SINGLECONF_SINGLE}' ===")
+        for label, base_amount in [
+            ("static-A", SINGLE_ONCHAIN_AMOUNT_SAT_A),
+            ("static-B", SINGLE_ONCHAIN_AMOUNT_SAT_B),
+        ]:
+            inv = gc_single.create_invoice(
+                single_store_id, amount=str(base_amount), currency="sat",
+                metadata={"label": f"{label}-iterate"},
+            )
+            total = int(inv["checkout"]["paymentMethods"]["BTC-OnChain"]["amount"])
+            tweak = total - base_amount
+            addr = onchain_address_of(inv)
+            print(f"  [{label}] {inv['id']} -> base={base_amount} tweak={tweak} total={total} "
+                  f"-> sending from Electrum to {addr}")
+            txid = electrum_send_onchain(electrum, bitcoind, addr, total, confirmations=1)
+            print(f"  [{label}] broadcast txid={txid}")
+            settled = wait_for_status(
+                gc_single, single_store_id, inv["id"], "Settled",
+                timeout_s=60, label=f"static {label}",
+            )
+            results.append((STORE_SINGLECONF_SINGLE, f"OnChain-Static ({label})",
+                            inv["id"], settled["status"]))
 
         # 1 BTC pre-mint needs much more outbound than the dual-channel 5M
         # push gives. Open an extra big channel from the customer LN to the

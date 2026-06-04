@@ -159,15 +159,25 @@ if (isset($_GET['api'])) {
 
             // On-chain Bitcoin payment settings.
             $onchainXpub = $store['onchain_xpub'] ?? '';
+            $onchainMode = $store['onchain_address_mode'] ?? 'xpub';
+            $onchainStaticAddress = $store['onchain_static_address'] ?? '';
+            $onchainEnabled = ($onchainMode === 'static')
+                ? ($onchainStaticAddress !== '')
+                : ($onchainXpub !== '');
+            require_once __DIR__ . '/includes/onchain/payments.php';
             $onchain = [
-                'enabled' => $onchainXpub !== '',
+                'enabled' => $onchainEnabled,
+                'mode' => $onchainMode,
                 'xpub' => $onchainXpub,
+                'staticAddress' => $onchainStaticAddress,
+                'staticTweakRange' => (int)($store['onchain_static_tweak_range'] ?? 1000),
                 'network' => $store['onchain_network'] ?? 'mainnet',
                 'addressType' => $store['onchain_address_type'] ?? 'P2WPKH',
                 'minConfs' => (int)($store['onchain_min_confs'] ?? 1),
                 'confirmTimeoutSec' => (int)($store['onchain_confirm_timeout_sec'] ?? 86400),
                 'nextIndex' => (int)($store['onchain_next_index'] ?? 0),
                 'providerUrl' => $store['onchain_provider_url'] ?? '',
+                'needsManualConfirmation' => OnchainPayments::countNeedingManualConfirmation($storeId),
             ];
 
             // Calculate balance in sats for fiat mints (uses cached exchange rates)
@@ -1140,28 +1150,86 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         case 'save_onchain':
             Auth::requireAdmin();
             // Persist a store's on-chain Bitcoin payment configuration.
+            // Two modes are supported: 'xpub' (server derives a fresh address
+            // per invoice) and 'static' (server reuses a single address and
+            // tweaks each invoice's amount for disambiguation).
             try {
                 $storeId = $_POST['store_id'] ?? '';
                 if (empty($storeId)) {
                     throw new Exception('Store ID required');
                 }
-                $xpub = trim($_POST['xpub'] ?? '');
+                $mode = $_POST['mode'] ?? 'xpub';
+                if (!in_array($mode, ['xpub', 'static'], true)) {
+                    throw new Exception('Invalid mode');
+                }
                 $network = $_POST['network'] ?? 'mainnet';
                 $type = $_POST['address_type'] ?? 'P2WPKH';
                 $minConfs = max(0, (int)($_POST['min_confs'] ?? 1));
                 $confirmTimeoutSec = max(60, (int)($_POST['confirm_timeout_sec'] ?? 86400));
                 $providerUrl = trim($_POST['provider_url'] ?? '');
 
-                if ($xpub === '') {
-                    // Empty xpub -> disable on-chain for this store.
-                    Database::update('stores', [
+                require_once __DIR__ . '/includes/onchain/wallet.php';
+
+                if ($mode === 'static') {
+                    $staticAddress = trim($_POST['static_address'] ?? '');
+                    $tweakRange = max(100, min(100000, (int)($_POST['static_tweak_range'] ?? 1000)));
+
+                    if ($staticAddress === '') {
+                        // Empty address -> disable on-chain for this store.
+                        Database::update('stores', [
+                            'onchain_address_mode' => 'static',
+                            'onchain_static_address' => null,
+                            'onchain_xpub' => null,
+                        ], 'id = ?', [$storeId]);
+                        echo json_encode(['success' => true, 'disabled' => true]);
+                        break;
+                    }
+
+                    $check = OnchainWallet::validateAddress($staticAddress, $network);
+                    if (!$check['valid']) {
+                        throw new Exception($check['error'] ?: 'Invalid address');
+                    }
+
+                    $update = [
+                        'onchain_address_mode' => 'static',
+                        'onchain_static_address' => $staticAddress,
+                        'onchain_static_tweak_range' => $tweakRange,
+                        // Clearing the xpub enforces the "one OR the other"
+                        // invariant: switching to static mode drops any
+                        // previously-set xpub so it can't be silently used.
                         'onchain_xpub' => null,
+                        'onchain_network' => $network,
+                        'onchain_min_confs' => $minConfs,
+                        'onchain_confirm_timeout_sec' => $confirmTimeoutSec,
+                        'onchain_provider' => 'esplora',
+                        'onchain_provider_url' => $providerUrl ?: null,
+                    ];
+                    Database::update('stores', $update, 'id = ?', [$storeId]);
+                    echo json_encode([
+                        'success' => true,
+                        'mode' => 'static',
+                        'staticAddress' => $staticAddress,
+                        'tweakRange' => $tweakRange,
+                    ]);
+                    break;
+                }
+
+                // xpub mode (existing behavior)
+                $xpub = trim($_POST['xpub'] ?? '');
+
+                if ($xpub === '') {
+                    // Empty xpub -> disable on-chain for this store. Also
+                    // clear any leftover static address so the row is in a
+                    // clean disabled state.
+                    Database::update('stores', [
+                        'onchain_address_mode' => 'xpub',
+                        'onchain_xpub' => null,
+                        'onchain_static_address' => null,
                     ], 'id = ?', [$storeId]);
                     echo json_encode(['success' => true, 'disabled' => true]);
                     break;
                 }
 
-                require_once __DIR__ . '/includes/onchain/wallet.php';
                 $check = OnchainWallet::validateXpub($xpub, $network, $type);
                 if (!$check['valid']) {
                     throw new Exception($check['error'] ?: 'Invalid xpub');
@@ -1179,7 +1247,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 // 'bitcoind-rpc' even after the user clears the URL, and every
                 // poll throws "bitcoind provider requires onchain_provider_url".
                 $update = [
+                    'onchain_address_mode' => 'xpub',
                     'onchain_xpub' => $xpub,
+                    // Clear static-mode address on switch (mutual exclusion).
+                    'onchain_static_address' => null,
                     'onchain_network' => $network,
                     'onchain_address_type' => $type,
                     'onchain_min_confs' => $minConfs,
@@ -1271,6 +1342,63 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $idx
                 );
                 echo json_encode(['address' => $addr, 'index' => $idx]);
+            } catch (Exception $e) {
+                http_response_code(400);
+                echo json_encode(['error' => $e->getMessage()]);
+            }
+            break;
+
+        case 'list_onchain_manual':
+            Auth::requireAdmin();
+            // List invoices awaiting manual confirmation. Scoped to a single
+            // store if store_id is provided; otherwise lists across every
+            // store the (admin) user can see.
+            try {
+                require_once __DIR__ . '/includes/onchain/payments.php';
+                $storeIds = null;
+                $storeId = $_GET['store_id'] ?? null;
+                if ($storeId) {
+                    $storeIds = [$storeId];
+                }
+                $rows = OnchainPayments::listNeedingManualConfirmation($storeIds);
+                $out = [];
+                foreach ($rows as $r) {
+                    $out[] = [
+                        'id' => $r['id'],
+                        'store_id' => $r['store_id'],
+                        'amount' => $r['amount'],
+                        'currency' => $r['currency'],
+                        'onchain_address' => $r['onchain_address'],
+                        'onchain_amount_sat' => (int)($r['onchain_amount_sat'] ?? 0),
+                        'onchain_amount_tweak_sats' => isset($r['onchain_amount_tweak_sats'])
+                            ? (int)$r['onchain_amount_tweak_sats'] : null,
+                        'created_at' => $r['created_at'],
+                        'expiration_time' => $r['expiration_time'],
+                        'status' => $r['status'],
+                        'candidates' => $r['onchain_manual_candidates_decoded'],
+                    ];
+                }
+                echo json_encode(['invoices' => $out]);
+            } catch (Exception $e) {
+                http_response_code(400);
+                echo json_encode(['error' => $e->getMessage()]);
+            }
+            break;
+
+        case 'resolve_onchain_manual':
+            Auth::requireAdmin();
+            // Attribute a specific (txid, vout) to the chosen invoice and
+            // clear the candidate from every other invoice that listed it.
+            try {
+                require_once __DIR__ . '/includes/onchain/payments.php';
+                $invoiceId = $_POST['invoice_id'] ?? '';
+                $txid = $_POST['txid'] ?? '';
+                $vout = (int)($_POST['vout'] ?? 0);
+                if ($invoiceId === '' || $txid === '') {
+                    throw new Exception('invoice_id and txid required');
+                }
+                OnchainPayments::manuallyAttribute($invoiceId, $txid, $vout);
+                echo json_encode(['success' => true]);
             } catch (Exception $e) {
                 http_response_code(400);
                 echo json_encode(['error' => $e->getMessage()]);
@@ -3317,6 +3445,21 @@ $adminView = $rawAdminView;
         </header>
 
         <main class="main">
+            <!-- Global banner: on-chain static-address payments awaiting manual confirmation.
+                 Shown across all admin views (dashboard, invoices, settings) so the
+                 issue isn't missed. Hidden by default; populated by JS from
+                 dashboardData.onchain.needsManualConfirmation. -->
+            <div id="onchain-manual-banner" class="hidden" style="background: rgba(245, 158, 11, 0.15); border: 1px solid rgba(245, 158, 11, 0.45); border-radius: 8px; padding: 0.75rem 1rem; margin-bottom: 1rem; font-size: 0.9rem; display: flex; align-items: center; gap: 0.75rem;" data-admin-only="true">
+                <span style="flex-shrink: 0; font-size: 1.1rem; line-height: 1.2;">&#9888;</span>
+                <span style="flex: 1;">
+                    <strong id="onchain-manual-banner-text">On-chain payment(s) need manual confirmation.</strong>
+                    <span style="display: block; color: var(--text-secondary); font-size: 0.85rem; margin-top: 0.15rem;">
+                        Multiple invoices matched the same incoming amount on your static address. Resolve in the Invoices view.
+                    </span>
+                </span>
+                <a href="#" class="btn btn-secondary js-goto-invoices" style="padding: 0.25rem 0.75rem; font-size: 0.8rem; flex-shrink: 0;">Open invoices</a>
+            </div>
+
             <!-- Dashboard View -->
             <div class="view active" id="view-dashboard">
                 <div id="reliability-banner" class="hidden" style="background: rgba(220, 53, 69, 0.15); border: 1px solid rgba(220, 53, 69, 0.5); border-radius: 8px; padding: 0.75rem 1rem; margin-bottom: 1rem; font-size: 0.9rem; display: flex; align-items: center; gap: 0.75rem;" data-admin-only="true">
@@ -3375,6 +3518,25 @@ $adminView = $rawAdminView;
 
             <!-- Invoices View -->
             <div class="view" id="view-invoices">
+                <!-- Static-address manual-confirmation queue. Hidden when empty.
+                     Each row shows the invoice plus the candidate (txid, vout)
+                     pairs that matched its amount. Admin picks one to attribute. -->
+                <div class="card hidden" id="card-onchain-manual" data-admin-only="true">
+                    <div class="card-header">
+                        <div class="card-title" style="color: #f59e0b;">&#9888; Payments awaiting manual confirmation</div>
+                    </div>
+                    <div class="card-body">
+                        <p class="form-help" style="margin-bottom: 0.75rem;">
+                            These invoices are in static-address mode and matched the same
+                            incoming amount as one or more other open invoices, so the
+                            server cannot safely auto-attribute the payment. Pick the
+                            invoice each candidate transaction belongs to.
+                        </p>
+                        <div id="onchain-manual-list">
+                            <div class="loading"><div class="spinner"></div></div>
+                        </div>
+                    </div>
+                </div>
                 <div class="card">
                     <div class="card-header">
                         <div class="card-title">All Invoices</div>
@@ -3445,17 +3607,56 @@ $adminView = $rawAdminView;
                         <div class="card-body">
                             <p class="form-help" style="margin-bottom: 1rem;">
                                 Accept direct on-chain Bitcoin transactions in addition to Lightning.
-                                Paste an extended public key (xpub) from your wallet &mdash; the server
-                                will derive a fresh receive address per invoice.
-                                The key will be automatically validated.
-                                Leave blank to disable.
+                                The recommended option is to provide an extended public key (xpub)
+                                so the server can derive a fresh address per invoice. If your wallet
+                                does not expose an xpub, you can fall back to reusing a single
+                                static address.
                             </p>
                             <div class="form-group">
+                                <label class="form-label">Address source</label>
+                                <select class="form-input" id="onchain-mode">
+                                    <option value="xpub">Extended public key (recommended)</option>
+                                    <option value="static">Single static address (not recommended)</option>
+                                </select>
+                            </div>
+                            <div id="onchain-static-warning" style="display:none; margin-bottom:1rem; padding:0.75rem; border-radius:8px; background:rgba(245,158,11,0.12); border:1px solid rgba(245,158,11,0.35); font-size:0.85rem;">
+                                <strong>&#9888; Static address re-use is strongly discouraged.</strong>
+                                It is STRONGLY recommended that you use an xpub instead of a static
+                                address. Static address re-use decreases the privacy of you and your
+                                customers and prevents correctly detecting payment when multiple
+                                transactions are used to pay an invoice. Each invoice will be assigned
+                                a unique sat-tweak so totals don&rsquo;t collide; customers must pay the
+                                exact amount in a single transaction.
+                            </div>
+                            <div class="form-group" id="onchain-xpub-row">
                                 <label class="form-label">Extended public key (xpub / zpub / vpub / etc.)</label>
                                 <textarea class="form-input" id="onchain-xpub" rows="2"
                                           style="font-family: monospace; font-size: 0.85rem;"
                                           placeholder="xpub... or zpub... or vpub..."></textarea>
                                 <p class="form-help" id="onchain-xpub-meta"></p>
+                            </div>
+                            <div class="form-group" id="onchain-static-address-row" style="display:none;">
+                                <label class="form-label">Static receive address</label>
+                                <input type="text" class="form-input" id="onchain-static-address"
+                                       style="font-family: monospace; font-size: 0.85rem;"
+                                       placeholder="bc1q... / 3... / 1... (or testnet / regtest equivalent)">
+                                <p class="form-help" id="onchain-static-address-meta">
+                                    Paste a single Bitcoin address you control. The server will reuse
+                                    it for every invoice. Leave blank to disable on-chain payments.
+                                </p>
+                            </div>
+                            <div class="form-group" id="onchain-static-tweak-row" style="display:none;">
+                                <label class="form-label">
+                                    Tweak range (number of unique sat-offsets;
+                                    each open invoice consumes one slot)
+                                </label>
+                                <input type="number" class="form-input" id="onchain-static-tweak-range"
+                                       min="100" max="100000" value="1000">
+                                <p class="form-help">
+                                    Larger ranges allow more concurrent open invoices but make customer
+                                    over-payment more visible. Default 1000 (up to 999 extra sats per
+                                    invoice).
+                                </p>
                             </div>
                             <div class="form-group">
                                 <label class="form-label">Network</label>
@@ -3491,12 +3692,14 @@ $adminView = $rawAdminView;
                                        placeholder="https://mempool.space/api">
                             </div>
                             <div id="onchain-validation-box" style="display:none; margin: 0.75rem 0; padding: 0.75rem; border-radius: 8px; font-size: 0.85rem;"></div>
-                            <button class="btn btn-secondary btn-full" id="btn-validate-onchain" style="margin-top: 0.5rem;">
-                                Validate &amp; preview first 3 addresses
-                            </button>
-                            <button class="btn btn-secondary btn-full" id="btn-test-onchain" style="margin-top: 0.5rem;">
-                                Test current next address (m/0/<span id="onchain-current-index">0</span>)
-                            </button>
+                            <div id="onchain-xpub-buttons">
+                                <button class="btn btn-secondary btn-full" id="btn-validate-onchain" style="margin-top: 0.5rem;">
+                                    Validate &amp; preview first 3 addresses
+                                </button>
+                                <button class="btn btn-secondary btn-full" id="btn-test-onchain" style="margin-top: 0.5rem;">
+                                    Test current next address (m/0/<span id="onchain-current-index">0</span>)
+                                </button>
+                            </div>
                             <button class="btn btn-full" id="btn-save-onchain" style="margin-top: 0.5rem;">
                                 Save on-chain settings
                             </button>
@@ -4779,6 +4982,7 @@ $adminView = $rawAdminView;
             document.getElementById('btn-test-onchain').addEventListener('click', testOnchainCurrent);
             document.getElementById('btn-save-onchain').addEventListener('click', saveOnchain);
             document.getElementById('onchain-xpub').addEventListener('input', applyOnchainAddressTypeVisibility);
+            document.getElementById('onchain-mode').addEventListener('change', applyOnchainModeVisibility);
             document.getElementById('btn-save-exchange-settings').addEventListener('click', saveExchangeSettings);
             document.getElementById('btn-save-hosting-fee').addEventListener('click', saveHostingFee);
             const copyCronBtn = document.getElementById('btn-copy-cron-url');
@@ -4852,6 +5056,14 @@ $adminView = $rawAdminView;
                 el.addEventListener('click', (e) => {
                     e.preventDefault();
                     switchView('settings');
+                });
+            });
+
+            // Banner "Open invoices" link mirrors the goto-settings pattern.
+            document.querySelectorAll('.js-goto-invoices').forEach(el => {
+                el.addEventListener('click', (e) => {
+                    e.preventDefault();
+                    switchView('invoices');
                 });
             });
 
@@ -5372,6 +5584,12 @@ $adminView = $rawAdminView;
                 // Reliability banner / settings cards.
                 updateReliabilityBanner(dashboardData.reliability);
                 updateCronStaleBanner(dashboardData.cronStaleWarning || null);
+
+                // Static-address manual-confirmation banner. Visible on every
+                // admin view (it lives above the view containers) but the
+                // detailed queue lives on the invoices view.
+                updateOnchainManualBanner(dashboardData.onchain);
+                loadOnchainManualList();
 
                 // Per-store swap override + effective indicator.
                 refreshStoreSwapsCard();
@@ -6829,18 +7047,40 @@ $adminView = $rawAdminView;
             }
         }
 
+        function applyOnchainModeVisibility() {
+            const mode = document.getElementById('onchain-mode').value;
+            const isStatic = mode === 'static';
+            document.getElementById('onchain-static-warning').style.display = isStatic ? 'block' : 'none';
+            document.getElementById('onchain-xpub-row').style.display = isStatic ? 'none' : '';
+            document.getElementById('onchain-static-address-row').style.display = isStatic ? '' : 'none';
+            document.getElementById('onchain-static-tweak-row').style.display = isStatic ? '' : 'none';
+            // Address type, validate/test buttons only make sense for xpub mode.
+            document.getElementById('onchain-xpub-buttons').style.display = isStatic ? 'none' : '';
+            const atRow = document.getElementById('onchain-address-type-row');
+            const atInf = document.getElementById('onchain-address-type-inferred');
+            if (isStatic) {
+                atRow.style.display = 'none';
+                atInf.style.display = 'none';
+            } else {
+                applyOnchainAddressTypeVisibility();
+            }
+        }
+
         function renderOnchainDashboard() {
             if (!dashboardData?.onchain) return;
             const oc = dashboardData.onchain;
+            document.getElementById('onchain-mode').value = oc.mode || 'xpub';
             document.getElementById('onchain-network').value = oc.network || 'mainnet';
             document.getElementById('onchain-address-type').value = oc.addressType || 'P2WPKH';
             document.getElementById('onchain-min-confs').value = oc.minConfs ?? 1;
             document.getElementById('onchain-confirm-timeout').value = oc.confirmTimeoutSec ?? 86400;
             document.getElementById('onchain-provider-url').value = oc.providerUrl || '';
             document.getElementById('onchain-current-index').textContent = oc.nextIndex ?? 0;
+            document.getElementById('onchain-static-address').value = oc.staticAddress || '';
+            document.getElementById('onchain-static-tweak-range').value = oc.staticTweakRange ?? 1000;
             const meta = document.getElementById('onchain-xpub-meta');
             const xpubInput = document.getElementById('onchain-xpub');
-            if (oc.enabled) {
+            if (oc.mode !== 'static' && oc.enabled) {
                 meta.innerHTML = 'Currently configured: <code style="word-break:break-all; font-size:0.8rem;">'
                     + escapeHtml(oc.xpub || '(set)')
                     + '</code><br>Paste a new xpub above to replace it.';
@@ -6849,7 +7089,16 @@ $adminView = $rawAdminView;
                 meta.textContent = '';
                 xpubInput.placeholder = 'xpub... or zpub... or vpub...';
             }
-            applyOnchainAddressTypeVisibility();
+            const staticMeta = document.getElementById('onchain-static-address-meta');
+            if (oc.mode === 'static' && oc.enabled) {
+                staticMeta.innerHTML = 'Currently configured: <code style="word-break:break-all; font-size:0.8rem;">'
+                    + escapeHtml(oc.staticAddress || '(set)')
+                    + '</code>. Edit above to replace, or clear to disable.';
+            } else {
+                staticMeta.textContent =
+                    'Paste a single Bitcoin address you control. The server will reuse it for every invoice. Leave blank to disable on-chain payments.';
+            }
+            applyOnchainModeVisibility();
         }
 
         async function validateOnchainXpub() {
@@ -6950,26 +7199,56 @@ $adminView = $rawAdminView;
                 showToast('No store selected', 'error');
                 return;
             }
-            const xpub = document.getElementById('onchain-xpub').value.trim();
+            const mode = document.getElementById('onchain-mode').value;
             const network = document.getElementById('onchain-network').value;
-            const type = document.getElementById('onchain-address-type').value;
             const minConfs = document.getElementById('onchain-min-confs').value;
             const timeout = document.getElementById('onchain-confirm-timeout').value;
             const providerUrl = document.getElementById('onchain-provider-url').value.trim();
-            if (xpub === '' && dashboardData?.onchain?.enabled) {
-                const ok = await confirmOnchain(
-                    'Disable on-chain payments?',
-                    'Saving with an empty xpub will disable on-chain payments for this store.'
-                );
-                if (!ok) { showInline('<strong>Cancelled.</strong> No changes saved.', false); return; }
-            } else if (xpub !== '' && dashboardData?.onchain?.enabled) {
-                const ok = await confirmOnchain(
-                    'Switch to a different xpub?',
-                    'Replace the currently configured xpub with the one you just pasted.'
-                );
-                if (!ok) { showInline('<strong>Cancelled.</strong> No changes saved.', false); return; }
+            const prevMode = dashboardData?.onchain?.mode || 'xpub';
+            const prevEnabled = !!dashboardData?.onchain?.enabled;
+
+            let body;
+            if (mode === 'static') {
+                const staticAddress = document.getElementById('onchain-static-address').value.trim();
+                const tweakRange = document.getElementById('onchain-static-tweak-range').value;
+                if (staticAddress === '' && prevEnabled) {
+                    const ok = await confirmOnchain(
+                        'Disable on-chain payments?',
+                        'Saving with an empty static address will disable on-chain payments for this store.'
+                    );
+                    if (!ok) { showInline('<strong>Cancelled.</strong> No changes saved.', false); return; }
+                } else if (prevMode === 'xpub' && prevEnabled) {
+                    const ok = await confirmOnchain(
+                        'Switch to static address mode?',
+                        'This will clear the currently configured xpub. Static address re-use reduces privacy and prevents detecting multi-transaction payments.'
+                    );
+                    if (!ok) { showInline('<strong>Cancelled.</strong> No changes saved.', false); return; }
+                }
+                body = `action=save_onchain&store_id=${encodeURIComponent(currentStoreId)}&mode=static&static_address=${encodeURIComponent(staticAddress)}&static_tweak_range=${encodeURIComponent(tweakRange)}&network=${network}&min_confs=${minConfs}&confirm_timeout_sec=${timeout}&provider_url=${encodeURIComponent(providerUrl)}`;
+            } else {
+                const xpub = document.getElementById('onchain-xpub').value.trim();
+                const type = document.getElementById('onchain-address-type').value;
+                if (xpub === '' && prevEnabled && prevMode === 'xpub') {
+                    const ok = await confirmOnchain(
+                        'Disable on-chain payments?',
+                        'Saving with an empty xpub will disable on-chain payments for this store.'
+                    );
+                    if (!ok) { showInline('<strong>Cancelled.</strong> No changes saved.', false); return; }
+                } else if (xpub !== '' && prevEnabled && prevMode === 'xpub') {
+                    const ok = await confirmOnchain(
+                        'Switch to a different xpub?',
+                        'Replace the currently configured xpub with the one you just pasted.'
+                    );
+                    if (!ok) { showInline('<strong>Cancelled.</strong> No changes saved.', false); return; }
+                } else if (prevMode === 'static' && prevEnabled) {
+                    const ok = await confirmOnchain(
+                        'Switch from static address to xpub?',
+                        'This will clear the currently configured static address.'
+                    );
+                    if (!ok) { showInline('<strong>Cancelled.</strong> No changes saved.', false); return; }
+                }
+                body = `action=save_onchain&store_id=${encodeURIComponent(currentStoreId)}&mode=xpub&xpub=${encodeURIComponent(xpub)}&network=${network}&address_type=${type}&min_confs=${minConfs}&confirm_timeout_sec=${timeout}&provider_url=${encodeURIComponent(providerUrl)}`;
             }
-            const body = `action=save_onchain&store_id=${encodeURIComponent(currentStoreId)}&xpub=${encodeURIComponent(xpub)}&network=${network}&address_type=${type}&min_confs=${minConfs}&confirm_timeout_sec=${timeout}&provider_url=${encodeURIComponent(providerUrl)}`;
             // Mirror the result inline next to the Save button — the global
             // toast sits above the mobile bottom-nav and is easy to miss.
             const r = await postWithCsrf(adminUrl, body);
@@ -8182,6 +8461,99 @@ $adminView = $rawAdminView;
             } catch (e) {
                 showToast('Rollback failed', 'error');
             }
+        }
+
+        function updateOnchainManualBanner(onchain) {
+            const banner = document.getElementById('onchain-manual-banner');
+            const text = document.getElementById('onchain-manual-banner-text');
+            if (!banner || !text) return;
+            const n = (onchain && onchain.needsManualConfirmation) || 0;
+            if (n > 0) {
+                text.textContent =
+                    n + ' on-chain payment' + (n === 1 ? '' : 's') + ' need' + (n === 1 ? 's' : '') + ' manual confirmation.';
+                banner.classList.remove('hidden');
+            } else {
+                banner.classList.add('hidden');
+            }
+        }
+
+        async function loadOnchainManualList() {
+            const card = document.getElementById('card-onchain-manual');
+            const list = document.getElementById('onchain-manual-list');
+            if (!card || !list) return;
+            if (!currentStoreId) {
+                card.classList.add('hidden');
+                return;
+            }
+            try {
+                const r = await fetch(adminUrl + '?api=list_onchain_manual&store_id=' + encodeURIComponent(currentStoreId));
+                const data = await r.json();
+                const invoices = data.invoices || [];
+                if (invoices.length === 0) {
+                    card.classList.add('hidden');
+                    list.innerHTML = '';
+                    return;
+                }
+                card.classList.remove('hidden');
+                list.innerHTML = invoices.map(renderManualInvoiceBlock).join('');
+                list.querySelectorAll('[data-manual-action="attribute"]').forEach(btn => {
+                    btn.addEventListener('click', async () => {
+                        const invoiceId = btn.dataset.invoiceId;
+                        const txid = btn.dataset.txid;
+                        const vout = btn.dataset.vout;
+                        btn.disabled = true;
+                        try {
+                            const resp = await postWithCsrf(adminUrl,
+                                'action=resolve_onchain_manual&invoice_id=' + encodeURIComponent(invoiceId) +
+                                '&txid=' + encodeURIComponent(txid) +
+                                '&vout=' + encodeURIComponent(vout));
+                            const result = await resp.json();
+                            if (resp.ok) {
+                                showToast('Attributed and settled', 'success');
+                                await loadDashboard();
+                            } else {
+                                showToast(result.error || 'Failed to attribute', 'error');
+                                btn.disabled = false;
+                            }
+                        } catch (e) {
+                            showToast('Network error: ' + e.message, 'error');
+                            btn.disabled = false;
+                        }
+                    });
+                });
+            } catch (e) {
+                list.innerHTML = '<p style="color: var(--text-secondary);">Failed to load: ' + escapeHtml(e.message) + '</p>';
+            }
+        }
+
+        function renderManualInvoiceBlock(inv) {
+            const candidates = (inv.candidates || []).map(c => {
+                const conf = (c.confirmations || 0);
+                return `
+                    <li style="margin-bottom: 0.5rem; padding: 0.5rem; background: rgba(0,0,0,0.08); border-radius: 6px;">
+                        <div style="font-family: monospace; font-size: 0.78rem; word-break: break-all;">${escapeHtml(c.txid)}:${c.vout}</div>
+                        <div style="font-size: 0.8rem; color: var(--text-secondary); margin: 0.25rem 0;">
+                            ${c.amount_sat} sats &middot; ${conf} confirmation${conf === 1 ? '' : 's'}
+                        </div>
+                        <button class="btn btn-secondary" style="padding: 0.25rem 0.75rem; font-size: 0.8rem;"
+                                data-manual-action="attribute"
+                                data-invoice-id="${escapeAttr(inv.id)}"
+                                data-txid="${escapeAttr(c.txid)}"
+                                data-vout="${c.vout}">
+                            Attribute to this invoice
+                        </button>
+                    </li>`;
+            }).join('');
+            return `
+                <div style="margin-bottom: 1rem; padding: 0.75rem; border: 1px solid var(--border); border-radius: 8px;">
+                    <div style="display: flex; justify-content: space-between; align-items: baseline; flex-wrap: wrap; gap: 0.5rem;">
+                        <div><strong>${escapeHtml(inv.id)}</strong>
+                            <span style="color: var(--text-secondary); font-size: 0.85rem;"> &middot; ${escapeHtml(inv.amount)} ${escapeHtml(inv.currency)} &middot; expected ${inv.onchain_amount_sat} sats</span>
+                        </div>
+                        <span style="font-size: 0.8rem; color: var(--text-secondary);">${escapeHtml(inv.status)}</span>
+                    </div>
+                    <ul style="list-style: none; padding: 0; margin: 0.5rem 0 0;">${candidates}</ul>
+                </div>`;
         }
 
         function updateReliabilityBanner(reliability) {

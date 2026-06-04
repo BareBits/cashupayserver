@@ -190,6 +190,41 @@ def start_electrum(workdir: Path, fulcrum: FulcrumHandle) -> ElectrumHandle:
     return handle
 
 
+def electrum_send_onchain(
+    handle: ElectrumHandle,
+    bitcoind: BitcoindHandle,
+    address: str,
+    amount_sat: int,
+    *,
+    confirmations: int = 1,
+    feerate_sat_per_vb: int = 5,
+) -> str:
+    """Drive the Electrum wallet to send `amount_sat` to `address` and mine
+    `confirmations` blocks so the recipient observes it confirmed. Returns
+    the broadcast txid.
+
+    Used by the static-address iterate flow: the merchant has a single
+    Bitcoin address and the customer (this Electrum wallet) pays the exact
+    tweaked total for each invoice.
+    """
+    btc = f"{amount_sat / 100_000_000:.8f}"
+    # `payto` returns a complete serialized transaction (hex). It signs
+    # with the wallet's keys since the wallet is unencrypted in the
+    # iterate flow (no --password).
+    tx_hex = handle.cli(
+        "payto", address, btc,
+        f"--feerate={feerate_sat_per_vb}",
+    ).strip()
+    # Strip any leading/trailing whitespace and quotes — older Electrum
+    # versions wrap the hex in quotes.
+    tx_hex = tx_hex.strip('"').strip("'")
+    txid = handle.cli("broadcast", tx_hex).strip()
+    txid = txid.strip('"').strip("'")
+    if confirmations > 0:
+        bitcoind.mine(confirmations)
+    return txid
+
+
 def fund_electrum_from_bitcoind(
     handle: ElectrumHandle,
     bitcoind: BitcoindHandle,
