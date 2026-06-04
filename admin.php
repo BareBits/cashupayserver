@@ -8395,7 +8395,7 @@ $adminView = $rawAdminView;
         // `expectedMaxSec` is the threshold beyond which we render red.
         function formatCronSeenAgo(secsAgo, expectedMaxSec) {
             if (secsAgo === null || secsAgo === undefined) {
-                return '<span style="color:#dc4646">Never seen.</span> Configure the cron line above.';
+                return '<span style="color:#dc4646">Last run: never.</span> Add this to your cron settings on your server.';
             }
             const ago = Math.max(0, parseInt(secsAgo, 10));
             const human = ago < 60 ? ago + 's' :

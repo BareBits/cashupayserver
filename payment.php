@@ -366,11 +366,19 @@ $baseUrl = Config::getBaseUrl();
         }
         .pm-logo {
             display: inline-block;
-            height: 22px;
+            height: 44px;
             width: auto;
             vertical-align: middle;
         }
-        .pm-logo.pm-strike { border-radius: 5px; }
+        .pm-logo.pm-strike { border-radius: 10px; }
+        /* Venmo's blue wordmark on a dark page is illegible, so it gets a
+           white card the way Venmo presents itself in its own marketing. */
+        .pm-logo.pm-venmo {
+            background: #fff;
+            padding: 6px 8px;
+            border-radius: 8px;
+            box-sizing: border-box;
+        }
         /* On the Lightning view, hide brands that don't natively send LN. */
         .payment-methods[data-method="lightning"] .pm-no-lightning {
             display: none;
@@ -554,12 +562,12 @@ $baseUrl = Config::getBaseUrl();
                 <div class="payment-methods" id="payment-methods" data-method="<?= $initialMethod ?>">
                     <span class="pm-label">Pay with</span>
                     <span class="pm-logos">
-                        <img class="pm-logo" src="<?= htmlspecialchars($imgBase) ?>cashapp.svg" alt="Cash App">
-                        <img class="pm-logo pm-strike" src="<?= htmlspecialchars($imgBase) ?>strike.png" alt="Strike">
-                        <img class="pm-logo" src="<?= htmlspecialchars($imgBase) ?>coinbase.svg" alt="Coinbase">
-                        <img class="pm-logo" src="<?= htmlspecialchars($imgBase) ?>kraken.svg" alt="Kraken">
-                        <img class="pm-logo pm-no-lightning" src="<?= htmlspecialchars($imgBase) ?>venmo.svg" alt="Venmo">
-                        <img class="pm-logo pm-no-lightning" src="<?= htmlspecialchars($imgBase) ?>paypal.svg" alt="PayPal">
+                        <img class="pm-logo" src="<?= htmlspecialchars($imgBase) ?>cashapp.svg" alt="Cash App" title="Cash App">
+                        <img class="pm-logo pm-strike" src="<?= htmlspecialchars($imgBase) ?>strike.png" alt="Strike" title="Strike">
+                        <img class="pm-logo" src="<?= htmlspecialchars($imgBase) ?>coinbase.svg" alt="Coinbase" title="Coinbase">
+                        <img class="pm-logo" src="<?= htmlspecialchars($imgBase) ?>kraken.svg" alt="Kraken" title="Kraken">
+                        <img class="pm-logo pm-venmo pm-no-lightning" src="<?= htmlspecialchars($imgBase) ?>venmo.svg" alt="Venmo" title="Venmo">
+                        <img class="pm-logo pm-no-lightning" src="<?= htmlspecialchars($imgBase) ?>paypal.svg" alt="PayPal" title="PayPal">
                     </span>
                     <span class="pm-label">or any Bitcoin wallet</span>
                 </div>
