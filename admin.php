@@ -3816,6 +3816,77 @@ $adminView = $rawAdminView;
 
                     <div class="card">
                         <div class="card-header">
+                            <div class="card-title">Auto-Withdraw</div>
+                        </div>
+                        <div class="card-body">
+                            <div class="form-group">
+                                <label class="form-label">Withdraw to</label>
+                                <select class="form-input" id="auto-melt-mode-override">
+                                    <option value="-1">Inherit site default (<span id="auto-melt-mode-default-label">Lightning address</span>)</option>
+                                    <option value="0">Lightning address</option>
+                                    <option value="1">On-chain via submarine swap</option>
+                                </select>
+                                <p class="form-help">
+                                    Currently effective: <strong id="auto-melt-mode-effective">Lightning address</strong>.
+                                    Submarine-swap mode requires an on-chain xpub on the Bitcoin tab and
+                                    site-wide swaps enabled. The Lightning-address field below applies
+                                    only when this is set to Lightning.
+                                </p>
+                            </div>
+
+                            <div class="form-group" id="auto-melt-address-group">
+                                <label class="form-label">Lightning Address</label>
+                                <input type="text" class="form-input" id="auto-melt-address"
+                                       placeholder="user@wallet.com">
+                                <p class="form-help">e.g., yourname@walletofsatoshi.com, yourname@blink.sv</p>
+                                <p class="form-help" id="auto-melt-lud21-warning"
+                                   style="display: none; color: var(--warning, #b07b00);">
+                                    This Lightning address host does not advertise a LUD-21 verify URL.
+                                    Incoming Lightning payments will route through the mint and then
+                                    auto-withdraw to this address (the normal two-hop flow) instead of
+                                    going directly to the address.
+                                </p>
+                                <p class="form-help" id="auto-melt-lud21-ok"
+                                   style="display: none; color: var(--success, #2d7a3a);">
+                                    This Lightning address host supports LUD-21 verify URLs. Incoming
+                                    Lightning payments will route directly to this address, except
+                                    when an invoice is smaller than the accumulated upstream/dev/hosting
+                                    fees the store owes — in that case the payment routes through the
+                                    mint so the resulting balance can cover the owed fees.
+                                </p>
+                            </div>
+
+                            <p class="form-help" id="auto-melt-swap-info" style="display: none;">
+                                Sweeps the mint balance through a reverse submarine swap to the store's
+                                on-chain xpub. May result in longer intervals between auto-withdrawals
+                                during high-fee periods. Minimum sweep:
+                                <strong id="auto-melt-mode-min-sats">5,000</strong> sats (~$5);
+                                swap cost must be ≤
+                                <strong id="auto-melt-mode-max-fee-pct">1%</strong> of the swept amount.
+                            </p>
+
+                            <div class="toggle-container">
+                                <span>Auto-withdraw when balance reaches threshold</span>
+                                <label class="toggle">
+                                    <input type="checkbox" id="auto-melt-enabled">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
+
+                            <div class="form-group" style="margin-top: 1rem;">
+                                <label class="form-label" id="auto-melt-threshold-label">Threshold (<span class="unit-label">SAT</span>)</label>
+                                <input type="number" class="form-input" id="auto-melt-threshold"
+                                       value="2000" min="1" step="1">
+                            </div>
+
+                            <button class="btn btn-full" id="btn-save-auto-melt" style="margin-top: 1rem;">
+                                Save Settings
+                            </button>
+                        </div>
+                    </div>
+
+                    <div class="card">
+                        <div class="card-header">
                             <div class="card-title">API Keys</div>
                             <button class="btn" id="btn-create-api-key">+ New</button>
                         </div>
@@ -3939,77 +4010,6 @@ $adminView = $rawAdminView;
                             </div>
                             <button class="btn btn-full" id="btn-save-onchain" style="margin-top: 0.5rem;">
                                 Save on-chain settings
-                            </button>
-                        </div>
-                    </div>
-
-                    <div class="card">
-                        <div class="card-header">
-                            <div class="card-title">Auto-Withdraw</div>
-                        </div>
-                        <div class="card-body">
-                            <div class="form-group">
-                                <label class="form-label">Withdraw to</label>
-                                <select class="form-input" id="auto-melt-mode-override">
-                                    <option value="-1">Inherit site default (<span id="auto-melt-mode-default-label">Lightning address</span>)</option>
-                                    <option value="0">Lightning address</option>
-                                    <option value="1">On-chain via submarine swap</option>
-                                </select>
-                                <p class="form-help">
-                                    Currently effective: <strong id="auto-melt-mode-effective">Lightning address</strong>.
-                                    Submarine-swap mode requires an on-chain xpub on the Bitcoin tab and
-                                    site-wide swaps enabled. The Lightning-address field below applies
-                                    only when this is set to Lightning.
-                                </p>
-                            </div>
-
-                            <div class="form-group" id="auto-melt-address-group">
-                                <label class="form-label">Lightning Address</label>
-                                <input type="text" class="form-input" id="auto-melt-address"
-                                       placeholder="user@wallet.com">
-                                <p class="form-help">e.g., yourname@walletofsatoshi.com, yourname@blink.sv</p>
-                                <p class="form-help" id="auto-melt-lud21-warning"
-                                   style="display: none; color: var(--warning, #b07b00);">
-                                    This Lightning address host does not advertise a LUD-21 verify URL.
-                                    Incoming Lightning payments will route through the mint and then
-                                    auto-withdraw to this address (the normal two-hop flow) instead of
-                                    going directly to the address.
-                                </p>
-                                <p class="form-help" id="auto-melt-lud21-ok"
-                                   style="display: none; color: var(--success, #2d7a3a);">
-                                    This Lightning address host supports LUD-21 verify URLs. Incoming
-                                    Lightning payments will route directly to this address, except
-                                    when an invoice is smaller than the accumulated upstream/dev/hosting
-                                    fees the store owes — in that case the payment routes through the
-                                    mint so the resulting balance can cover the owed fees.
-                                </p>
-                            </div>
-
-                            <p class="form-help" id="auto-melt-swap-info" style="display: none;">
-                                Sweeps the mint balance through a reverse submarine swap to the store's
-                                on-chain xpub. May result in longer intervals between auto-withdrawals
-                                during high-fee periods. Minimum sweep:
-                                <strong id="auto-melt-mode-min-sats">5,000</strong> sats (~$5);
-                                swap cost must be ≤
-                                <strong id="auto-melt-mode-max-fee-pct">1%</strong> of the swept amount.
-                            </p>
-
-                            <div class="toggle-container">
-                                <span>Auto-withdraw when balance reaches threshold</span>
-                                <label class="toggle">
-                                    <input type="checkbox" id="auto-melt-enabled">
-                                    <span class="toggle-slider"></span>
-                                </label>
-                            </div>
-
-                            <div class="form-group" style="margin-top: 1rem;">
-                                <label class="form-label" id="auto-melt-threshold-label">Threshold (<span class="unit-label">SAT</span>)</label>
-                                <input type="number" class="form-input" id="auto-melt-threshold"
-                                       value="2000" min="1" step="1">
-                            </div>
-
-                            <button class="btn btn-full" id="btn-save-auto-melt" style="margin-top: 1rem;">
-                                Save Settings
                             </button>
                         </div>
                     </div>
@@ -4169,10 +4169,20 @@ $adminView = $rawAdminView;
 
             <!-- Settings View (Global) -->
             <div class="view" id="view-settings">
+                <div id="settings-scope-note" style="margin-bottom: 1rem; padding: 0.85rem 1rem; border-radius: 12px; background: rgba(96, 165, 250, 0.1); border: 1px solid rgba(96, 165, 250, 0.3); font-size: 0.9rem; line-height: 1.45;">
+                    <strong>These are site-wide settings and defaults.</strong>
+                    Most knobs operators want to tweak day-to-day &mdash; auto-withdraw destination,
+                    on-chain xpub, exchange-rate provider, hosting fee, per-store email &mdash;
+                    live on the per-store settings page.
+                    <a href="#" class="js-goto-stores"
+                       style="color: var(--accent); text-decoration: underline; white-space: nowrap;">
+                        Open Store Settings &rarr;
+                    </a>
+                </div>
                 <?php if (!Urls::isWordPress()): ?>
                 <div class="card" data-admin-only="true">
                     <div class="card-header">
-                        <div class="card-title">Server URL Mode</div>
+                        <div class="card-title">Server URL</div>
                     </div>
                     <div class="card-body">
                         <div class="form-group">
@@ -4180,39 +4190,28 @@ $adminView = $rawAdminView;
                             <code id="current-server-url" style="display: block; background: rgba(0,0,0,0.2); padding: 0.75rem; border-radius: 8px; font-size: 0.9rem; word-break: break-all; user-select: all;">
                                 <?= htmlspecialchars(Urls::server()) ?>
                             </code>
-                            <p class="form-help">This URL is used for e-commerce plugin integration</p>
+                            <p class="form-help">This URL is used for e-commerce plugin integration.</p>
                         </div>
 
-                        <div class="form-group">
-                            <label class="form-label">URL Mode</label>
-                            <div id="url-mode-options" style="display: flex; flex-direction: column; gap: 0.5rem;">
-                                <label style="display: flex; align-items: center; gap: 0.75rem; padding: 0.75rem; background: rgba(0,0,0,0.2); border-radius: 8px; cursor: pointer;">
-                                    <input type="radio" name="url_mode" value="direct" id="url-mode-direct" style="width: 18px; height: 18px;">
-                                    <span>
-                                        <span style="display: block; font-weight: 500;">Direct URLs</span>
-                                        <span style="display: block; font-size: 0.85rem; color: var(--text-secondary);">/api/v1/... (requires server rewrite rules)</span>
-                                    </span>
-                                    <span id="url-mode-direct-status" style="margin-left: auto; font-size: 0.75rem;"></span>
-                                </label>
-                                <label style="display: flex; align-items: center; gap: 0.75rem; padding: 0.75rem; background: rgba(0,0,0,0.2); border-radius: 8px; cursor: pointer;">
-                                    <input type="radio" name="url_mode" value="router" id="url-mode-router" style="width: 18px; height: 18px;">
-                                    <span>
-                                        <span style="display: block; font-weight: 500;">Router.php URLs</span>
-                                        <span style="display: block; font-size: 0.85rem; color: var(--text-secondary);">/router.php/api/v1/... (works on any PHP host)</span>
-                                    </span>
-                                    <span id="url-mode-router-status" style="margin-left: auto; font-size: 0.75rem;"></span>
-                                </label>
+                        <div class="form-group" style="margin-bottom: 0.75rem;">
+                            <label class="form-label">URL routing</label>
+                            <div style="display: flex; align-items: center; gap: 0.5rem; padding: 0.75rem; background: rgba(0,0,0,0.2); border-radius: 8px;">
+                                <span style="font-weight: 500;" id="url-mode-current-label">
+                                    <?= htmlspecialchars(Config::getUrlMode() === 'direct' ? 'Direct URLs' : 'Router.php URLs') ?>
+                                </span>
+                                <span style="font-size: 0.8rem; color: var(--text-secondary);">
+                                    (auto-detected)
+                                </span>
+                                <span id="url-mode-detect-status" style="margin-left: auto; font-size: 0.75rem; color: var(--text-secondary);"></span>
                             </div>
+                            <p class="form-help">
+                                Detected once during setup. Re-detect only if you change hosting (e.g. enabled rewrite rules, switched servers).
+                            </p>
                         </div>
 
-                        <div style="display: flex; gap: 0.5rem;">
-                            <button class="btn btn-secondary" id="btn-detect-url-mode" style="flex: 1;">
-                                Re-detect
-                            </button>
-                            <button class="btn" id="btn-save-url-mode" style="flex: 1;">
-                                Save
-                            </button>
-                        </div>
+                        <button class="btn btn-secondary btn-full" id="btn-detect-url-mode">
+                            Re-detect now
+                        </button>
                     </div>
                 </div>
 
@@ -5376,12 +5375,13 @@ $adminView = $rawAdminView;
                 document.getElementById('btn-confirm-reset-user-password').addEventListener('click', confirmResetUserPassword);
             }
 
-            // URL Mode settings (standalone only)
-            if (document.getElementById('btn-detect-url-mode')) {
-                document.getElementById('btn-detect-url-mode').addEventListener('click', detectUrlMode);
-                document.getElementById('btn-save-url-mode').addEventListener('click', saveUrlMode);
-                // Set radio button to saved mode (no auto-detection, user clicks Recheck if needed)
-                initUrlModeSettings();
+            // URL Mode re-detect button (standalone only). Detection is normally
+            // run once during the setup wizard and persisted; this button is the
+            // escape hatch for environment changes (e.g. enabling rewrite rules
+            // after install).
+            const btnDetectUrlMode = document.getElementById('btn-detect-url-mode');
+            if (btnDetectUrlMode) {
+                btnDetectUrlMode.addEventListener('click', detectAndSaveUrlMode);
             }
 
             // Stores
@@ -5430,6 +5430,14 @@ $adminView = $rawAdminView;
                 el.addEventListener('click', (e) => {
                     e.preventDefault();
                     switchView('invoices');
+                });
+            });
+
+            // Settings-scope banner link to the Store Settings view.
+            document.querySelectorAll('.js-goto-stores').forEach(el => {
+                el.addEventListener('click', (e) => {
+                    e.preventDefault();
+                    switchView('stores');
                 });
             });
 
@@ -8014,83 +8022,47 @@ $adminView = $rawAdminView;
             }
         }
 
-        // URL Mode settings (standalone deployments only)
-        let urlModeTestResults = { direct: null, router: null };
-
-        function initUrlModeSettings() {
-            if (urlModeConfig.isWordPress) return; // WordPress uses its own routing
-
-            // Set the current mode radio button based on saved config
-            // Detection only runs when user clicks "Recheck" button
-            const radio = document.getElementById('url-mode-' + urlModeConfig.currentMode);
-            if (radio) radio.checked = true;
-        }
-
-        async function detectUrlMode() {
-            const directStatus = document.getElementById('url-mode-direct-status');
-            const routerStatus = document.getElementById('url-mode-router-status');
-
-            if (!directStatus || !routerStatus) return;
-
-            directStatus.textContent = 'Testing...';
-            directStatus.style.color = 'var(--text-secondary)';
-            routerStatus.textContent = 'Testing...';
-            routerStatus.style.color = 'var(--text-secondary)';
-
-            if (urlModeConfig.isWordPress) return;
-
-            const baseUrl = urlModeConfig.baseUrl;
-
-            // Test both URLs in parallel
-            // Direct mode routes /api/v1/* to api.php via nginx/Apache rewrite
-            // Router mode routes everything through router.php
-            const tests = await Promise.all([
-                testUrlEndpoint(baseUrl + '/api/v1/server/info'),
-                testUrlEndpoint(baseUrl + '/router.php/api/v1/server/info')
-            ]);
-
-            urlModeTestResults.direct = tests[0];
-            urlModeTestResults.router = tests[1];
-
-            // Update status indicators
-            if (tests[0]) {
-                directStatus.textContent = 'Working';
-                directStatus.style.color = 'var(--success)';
-            } else {
-                directStatus.textContent = 'Not working';
-                directStatus.style.color = 'var(--text-secondary)';
-            }
-
-            if (tests[1]) {
-                routerStatus.textContent = 'Working';
-                routerStatus.style.color = 'var(--success)';
-            } else {
-                routerStatus.textContent = 'Not working';
-                routerStatus.style.color = 'var(--text-secondary)';
-            }
-        }
-
+        // URL Mode re-detect (standalone deployments only). The setup wizard
+        // already auto-detected once; this is the same probe + auto-save flow,
+        // run manually from the Settings page when hosting changes.
         async function testUrlEndpoint(url) {
             try {
                 const response = await fetch(url, { method: 'GET', mode: 'same-origin' });
-                return response.status === 200;
+                // 200 from a healthy server, 503 from a half-set-up one — both
+                // confirm the route resolves (mirrors setup.php's logic).
+                return response.status === 200 || response.status === 503;
             } catch (e) {
                 return false;
             }
         }
 
-        async function saveUrlMode() {
-            const selectedMode = document.querySelector('input[name="url_mode"]:checked')?.value;
-            if (!selectedMode) {
-                showToast('Please select a URL mode', 'error');
-                return;
+        async function detectAndSaveUrlMode() {
+            if (urlModeConfig.isWordPress) return;
+
+            const statusEl = document.getElementById('url-mode-detect-status');
+            const labelEl = document.getElementById('url-mode-current-label');
+            if (statusEl) {
+                statusEl.textContent = 'Detecting…';
+                statusEl.style.color = 'var(--text-secondary)';
             }
 
-            // Warn if selected mode isn't working
-            if (!urlModeTestResults[selectedMode]) {
-                if (!confirm('The selected URL mode does not appear to be working. Save anyway?')) {
-                    return;
+            const baseUrl = urlModeConfig.baseUrl;
+            const tests = await Promise.all([
+                testUrlEndpoint(baseUrl + '/api/v1/server/info'),
+                testUrlEndpoint(baseUrl + '/router.php/api/v1/server/info')
+            ]);
+
+            let selectedMode = null;
+            if (tests[0]) selectedMode = 'direct';
+            else if (tests[1]) selectedMode = 'router';
+
+            if (!selectedMode) {
+                if (statusEl) {
+                    statusEl.textContent = 'No routing detected';
+                    statusEl.style.color = 'var(--warning, #b07b00)';
                 }
+                showToast('Could not detect a working URL routing mode', 'error');
+                return;
             }
 
             try {
@@ -8098,20 +8070,36 @@ $adminView = $rawAdminView;
                 const result = await response.json();
 
                 if (response.ok && result.success) {
-                    // Update the displayed server URL
+                    urlModeConfig.currentMode = selectedMode;
+                    if (labelEl) {
+                        labelEl.textContent = selectedMode === 'direct' ? 'Direct URLs' : 'Router.php URLs';
+                    }
                     const urlEl = document.getElementById('current-server-url');
-                    if (urlEl) urlEl.textContent = result.serverUrl;
+                    if (urlEl && result.serverUrl) urlEl.textContent = result.serverUrl;
 
-                    // Update global URL variables so all components use new URL
-                    serverUrl = result.serverUrl;
-                    API_BASE_URL = result.serverUrl.replace(/\/$/, '');  // Ensure no trailing slash
+                    if (result.serverUrl) {
+                        serverUrl = result.serverUrl;
+                        API_BASE_URL = result.serverUrl.replace(/\/$/, '');
+                    }
 
-                    showToast('URL mode saved!', 'success');
+                    if (statusEl) {
+                        statusEl.textContent = 'Updated';
+                        statusEl.style.color = 'var(--success)';
+                    }
+                    showToast('URL routing updated to ' + (selectedMode === 'direct' ? 'Direct URLs' : 'Router.php URLs'), 'success');
                 } else {
-                    showToast(result.error || 'Failed to save URL mode', 'error');
+                    if (statusEl) {
+                        statusEl.textContent = 'Save failed';
+                        statusEl.style.color = 'var(--warning, #b07b00)';
+                    }
+                    showToast(result.error || 'Failed to save URL routing', 'error');
                 }
             } catch (e) {
-                showToast('Failed to save URL mode', 'error');
+                if (statusEl) {
+                    statusEl.textContent = 'Save failed';
+                    statusEl.style.color = 'var(--warning, #b07b00)';
+                }
+                showToast('Failed to save URL routing', 'error');
             }
         }
 

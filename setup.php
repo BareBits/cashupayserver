@@ -287,8 +287,72 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     ]);
 
                     unset($_SESSION['mint_url_temp'], $_SESSION['mint_units']);
-                    $step = 6;
+                    // After primary mint is saved, force the operator to pick a
+                    // backup mint before they advance to the seed step. New
+                    // installs without a backup have no fallback if the primary
+                    // goes offline. Step 10 is wedged in here rather than
+                    // renumbering 6/7 to keep session state and existing
+                    // step links unaffected.
+                    $step = 10;
                 }
+                break;
+
+            case 10: // Backup mint (required) — same unit as primary
+                $storeId = $_SESSION['setup_store_id'] ?? null;
+                if (!$storeId) {
+                    throw new Exception('Store not found. Please restart setup.');
+                }
+
+                $store = Config::getStore($storeId);
+                if (!$store || empty($store['mint_url']) || empty($store['mint_unit'])) {
+                    // Primary not saved yet — can't pick a backup. Bounce back.
+                    $step = 5;
+                    break;
+                }
+                $primaryUrl = rtrim($store['mint_url'], '/');
+                $primaryUnit = $store['mint_unit'];
+
+                $backupUrl = rtrim(trim($_POST['backup_mint_url'] ?? ''), '/');
+                if ($backupUrl === '') {
+                    throw new Exception('Pick a backup mint to continue.');
+                }
+                if (strcasecmp($backupUrl, $primaryUrl) === 0) {
+                    throw new Exception(
+                        'Backup mint must be different from your primary mint '
+                        . '(' . htmlspecialchars($primaryUrl) . ').'
+                    );
+                }
+
+                // Reject if this URL was already added (e.g. trusted-list applier
+                // ran in step 4 and pre-seeded it). The (store_id, mint_url)
+                // unique constraint would surface this as a DB error otherwise.
+                foreach (Config::getStoreBackupMints($storeId) as $existing) {
+                    if (strcasecmp(rtrim($existing['mint_url'], '/'), $backupUrl) === 0) {
+                        throw new Exception(
+                            'That mint is already configured as a backup for this store. '
+                            . 'Pick a different one.'
+                        );
+                    }
+                }
+
+                require_once __DIR__ . '/cashu-wallet-php/CashuWallet.php';
+                try {
+                    $units = \Cashu\Wallet::getSupportedUnits($backupUrl);
+                } catch (Exception $e) {
+                    throw new Exception('Failed to connect to backup mint: ' . $e->getMessage());
+                }
+                if (empty($units)) {
+                    throw new Exception('Could not connect to backup mint or no keysets found.');
+                }
+                if (!isset($units[$primaryUnit])) {
+                    throw new Exception(
+                        'Backup mint must support unit "' . htmlspecialchars($primaryUnit)
+                        . '" (your primary mint uses it). This mint does not advertise that unit.'
+                    );
+                }
+
+                Config::addStoreBackupMint($storeId, $backupUrl, $primaryUnit, 100);
+                $step = 6;
                 break;
 
             case 6: // Seed phrase for this store
@@ -989,10 +1053,10 @@ function getDataDirHttpPath(): ?string {
                 <h1>Add New Store</h1>
                 <?php
                 // add_store walks steps 4 → 9 (auto-withdraw) → 8 (on-chain)
-                // → 5 (mint URL) → 6 (seed) before redirecting to admin.
-                // Step 7 (Complete) is not reached in this mode.
-                $addStoreMapping = [4 => 1, 9 => 2, 8 => 3, 5 => 4, 6 => 5];
-                $totalDisplaySteps = 5;
+                // → 5 (mint URL) → 10 (backup mint) → 6 (seed) before
+                // redirecting to admin. Step 7 (Complete) is not reached.
+                $addStoreMapping = [4 => 1, 9 => 2, 8 => 3, 5 => 4, 10 => 5, 6 => 6];
+                $totalDisplaySteps = 6;
                 $displayStep = $addStoreMapping[$step] ?? $step;
                 ?>
                 <p class="subtitle">Step <?= $displayStep ?> of <?= $totalDisplaySteps ?></p>
@@ -1009,12 +1073,12 @@ function getDataDirHttpPath(): ?string {
                 // Internal step order:
                 //   1 (welcome+security), 2 (password, standalone only),
                 //   4 (store), 9 (auto-withdraw), 8 (on-chain),
-                //   5 (mint), 6 (seed), 7 (complete).
+                //   5 (primary mint), 10 (backup mint), 6 (seed), 7 (complete).
                 // Step 3 was merged into step 1 and is unused.
                 $stepMapping = $isWpMode
-                    ? [1 => 1, 4 => 2, 9 => 3, 8 => 4, 5 => 5, 6 => 6, 7 => 7]
-                    : [1 => 1, 2 => 2, 4 => 3, 9 => 4, 8 => 5, 5 => 6, 6 => 7, 7 => 8];
-                $totalSteps = $isWpMode ? 7 : 8;
+                    ? [1 => 1, 4 => 2, 9 => 3, 8 => 4, 5 => 5, 10 => 6, 6 => 7, 7 => 8]
+                    : [1 => 1, 2 => 2, 4 => 3, 9 => 4, 8 => 5, 5 => 6, 10 => 7, 6 => 8, 7 => 9];
+                $totalSteps = $isWpMode ? 8 : 9;
                 $displayStep = $stepMapping[$step] ?? $step;
                 ?>
                 <p class="subtitle">Step <?= $displayStep ?> of <?= $totalSteps ?></p>
@@ -1525,6 +1589,47 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
 
                         <button type="submit" class="btn" style="width: 100%;">Connect to Mint</button>
                     <?php endif; ?>
+                </form>
+
+            <?php elseif ($step === 10): ?>
+                <!-- Step 10: Backup Mint (required) -->
+                <?php
+                $primaryStore = Config::getStore($_SESSION['setup_store_id'] ?? '');
+                $primaryUrlForCopy = $primaryStore['mint_url'] ?? '';
+                $primaryUnitForCopy = $primaryStore['mint_unit'] ?? 'sat';
+                ?>
+                <h2 style="margin-bottom: 1rem;">Backup Mint</h2>
+                <p style="margin-bottom: 1.25rem;">
+                    Pick a second Cashu mint to use as a fallback if your primary
+                    mint becomes unreachable. Incoming payments will automatically
+                    route to the backup mint when the primary is down, keeping
+                    checkouts working without manual intervention.
+                </p>
+                <p style="margin-bottom: 1.5rem; color: #a0aec0; font-size: 0.9rem;">
+                    The backup must support the same unit as your primary
+                    (<code><?= htmlspecialchars($primaryUnitForCopy) ?></code>)
+                    and must be a different mint from
+                    <code style="word-break: break-all;"><?= htmlspecialchars($primaryUrlForCopy) ?></code>.
+                </p>
+
+                <form method="post">
+                    <input type="hidden" name="step" value="10">
+                    <?php if ($mode === 'add_store'): ?>
+                        <input type="hidden" name="mode" value="add_store">
+                    <?php endif; ?>
+
+                    <div class="form-group">
+                        <label for="mint_url">Backup Mint URL</label>
+                        <div style="display: flex; gap: 0.5rem;">
+                            <input type="url" id="mint_url" name="backup_mint_url"
+                                   placeholder="https://..."
+                                   value="<?= htmlspecialchars($_POST['backup_mint_url'] ?? '') ?>"
+                                   required style="flex: 1;">
+                            <button type="button" class="btn btn-secondary" onclick="openMintDiscovery()" style="white-space: nowrap;">Discover</button>
+                        </div>
+                    </div>
+
+                    <button type="submit" class="btn" style="width: 100%;">Add Backup Mint</button>
                 </form>
 
             <?php elseif ($step === 6): ?>
