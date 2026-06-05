@@ -363,6 +363,16 @@ def main() -> int:
             page.click("button[type=submit]")
             page.fill("#store_name", STORE_ONECONF)
             page.click("button[type=submit]")
+            # Step 9: auto-withdraw destination. The new flow asks for this
+            # before the mint URL — skip it here so we still drive the rest
+            # of the wizard the same way. Operator can configure
+            # auto-withdraw from admin once the stack is up.
+            page.wait_for_selector("button:has-text('Skip for now')")
+            page.click("button:has-text('Skip for now')")
+            # Step 8: on-chain destination. Skip is offered because we
+            # skipped auto-withdraw above (so on-chain isn't required).
+            page.wait_for_selector("button:has-text('Skip for now')")
+            page.click("button:has-text('Skip for now')")
             page.fill("#mint_url", mint.url)
             page.click("button[type=submit]")
             page.wait_for_selector("#mint_unit")
@@ -373,8 +383,12 @@ def main() -> int:
             page.wait_for_selector("#seed_confirmed")
             page.check("#seed_confirmed")
             page.click("button[type=submit]")
-            page.wait_for_selector("button:has-text('Skip for now')")
-            page.click("button:has-text('Skip for now')")
+            # Seed confirmation lands on step 7 ("Setup Complete!"). The
+            # earlier post-seed "Skip for now" step no longer exists — those
+            # skip buttons live on steps 9 and 8, which we consumed before
+            # the mint URL. Wait for the completion heading so the wizard
+            # flow ends cleanly.
+            page.wait_for_selector("h2:has-text('Setup Complete')")
 
             browser.close()
 
