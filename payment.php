@@ -57,10 +57,67 @@ if (isset($_GET['json'])) {
     exit;
 }
 
+// Public POST endpoint: payer enters their email on the payment-complete
+// modal and requests a receipt. No CSRF token because there's no auth
+// context to abuse — the page itself is unauthenticated. The per-invoice
+// send cap inside NotificationSender is what bounds abuse.
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'send_receipt') {
+    require_once __DIR__ . '/includes/notification_sender.php';
+    header('Content-Type: application/json');
+
+    if ($invoice['status'] !== 'Settled') {
+        http_response_code(400);
+        echo json_encode(['error' => 'Invoice is not paid yet.']);
+        exit;
+    }
+    if (!NotificationSender::isPayerReceiptOffered()) {
+        http_response_code(403);
+        echo json_encode(['error' => 'Payment receipts are not available on this server.']);
+        exit;
+    }
+
+    $email = trim((string)($_POST['email'] ?? ''));
+    if ($email === '' || !filter_var($email, FILTER_VALIDATE_EMAIL)) {
+        http_response_code(400);
+        echo json_encode(['error' => 'Please enter a valid email address.']);
+        exit;
+    }
+
+    if (NotificationSender::payerReceiptCountForInvoice($invoice['id'])
+            >= NotificationSender::PAYER_RECEIPT_MAX_PER_INVOICE) {
+        http_response_code(429);
+        echo json_encode(['error' => 'Receipt limit reached for this invoice.']);
+        exit;
+    }
+
+    $queued = NotificationSender::queuePayerReceipt($invoice, $email);
+    if (!$queued) {
+        // Race: the cap was reached between the check above and the call.
+        http_response_code(429);
+        echo json_encode(['error' => 'Receipt limit reached for this invoice.']);
+        exit;
+    }
+
+    echo json_encode(['success' => true]);
+    exit;
+}
+
 // Get checkout config
 $checkoutConfig = $invoice['checkout_config'] ? json_decode($invoice['checkout_config'], true) : [];
 $redirectUrl = $checkoutConfig['redirectURL'] ?? null;
 $redirectAuto = $checkoutConfig['redirectAutomatically'] ?? true;
+
+// Pull the payer-facing note out of the invoice's metadata. itemDesc is what
+// admin.php's "Create invoice" wizard stores for the memo field; other callers
+// of the API may use the same key. Anything else in metadata is internal.
+$invoiceMetadata = $invoice['metadata'] ? json_decode($invoice['metadata'], true) : null;
+$invoiceNote = is_array($invoiceMetadata) ? trim((string)($invoiceMetadata['itemDesc'] ?? '')) : '';
+
+// Decide whether to render the payer-receipt form. The check is composed of
+// site-wide master switch + per-type toggle + SMTP. When false, the success
+// modal shows a "screenshot this page" fallback instead.
+require_once __DIR__ . '/includes/notification_sender.php';
+$payerReceiptOffered = NotificationSender::isPayerReceiptOffered();
 
 // Format amount for display - use store's mint unit
 $mintUnit = Config::getStoreMintUnit($invoice['store_id']);
@@ -439,6 +496,96 @@ $baseUrl = Config::getBaseUrl();
             display: none;
         }
 
+        /* Invoice ID + note block shown on both pending and success screens.
+           Compact, monospace for the ID, wraps the note. */
+        .invoice-details {
+            margin: 1rem 0;
+            padding: 0.75rem 1rem;
+            background: rgba(0, 0, 0, 0.25);
+            border-radius: 10px;
+            text-align: left;
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+            line-height: 1.5;
+        }
+        .invoice-details .label {
+            font-weight: 600;
+            color: var(--text-primary);
+            margin-right: 0.4rem;
+        }
+        .invoice-details .invoice-id-value {
+            font-family: monospace;
+            word-break: break-all;
+        }
+        .invoice-details .invoice-note-value {
+            word-break: break-word;
+        }
+        .invoice-details > div + div {
+            margin-top: 0.35rem;
+        }
+
+        /* Payer-receipt opt-in form on the success modal. */
+        .receipt-form {
+            margin: 1rem 0 0;
+            text-align: left;
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+        }
+        .receipt-form .receipt-prompt {
+            margin-bottom: 0.5rem;
+            text-align: center;
+            color: var(--text-primary);
+        }
+        .receipt-form .receipt-prompt small {
+            display: block;
+            margin-top: 0.15rem;
+            color: var(--text-secondary);
+            font-size: 0.75rem;
+        }
+        .receipt-form .form-input {
+            width: 100%;
+            background: rgba(0, 0, 0, 0.3);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 12px;
+            padding: 0.75rem 1rem;
+            color: var(--text-primary);
+            font-size: 0.9rem;
+            margin-bottom: 0.5rem;
+        }
+        .receipt-form .form-input:focus {
+            outline: none;
+            border-color: var(--accent);
+        }
+        .receipt-form .receipt-skip {
+            display: block;
+            margin-top: 0.75rem;
+            text-align: center;
+            color: var(--text-secondary);
+            text-decoration: underline;
+            font-size: 0.8rem;
+            cursor: pointer;
+            background: none;
+            border: none;
+            width: 100%;
+        }
+        .receipt-form .receipt-status {
+            margin-top: 0.5rem;
+            text-align: center;
+            font-size: 0.8rem;
+        }
+        .receipt-form .receipt-status.error {
+            color: var(--error);
+        }
+        .receipt-form .receipt-status.success {
+            color: var(--success);
+        }
+        .receipt-fallback {
+            margin: 1rem 0 0;
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+            text-align: center;
+        }
+
         .footer {
             padding: 1rem;
             text-align: center;
@@ -497,6 +644,13 @@ $baseUrl = Config::getBaseUrl();
                 <div class="status-badge new">
                     <div class="spinner"></div>
                     Waiting for payment
+                </div>
+
+                <div class="invoice-details">
+                    <div><span class="label">Invoice:</span><span class="invoice-id-value"><?= htmlspecialchars($invoice['id']) ?></span></div>
+                    <?php if ($invoiceNote !== ''): ?>
+                    <div><span class="label">Note:</span><span class="invoice-note-value"><?= htmlspecialchars($invoiceNote) ?></span></div>
+                    <?php endif; ?>
                 </div>
 
                 <?php if ($hasLightning && $hasOnchain): ?>
@@ -598,6 +752,29 @@ $baseUrl = Config::getBaseUrl();
                 <div class="status-badge settled">
                     Payment Complete
                 </div>
+                <div class="invoice-details">
+                    <div><span class="label">Invoice:</span><span class="invoice-id-value"><?= htmlspecialchars($invoice['id']) ?></span></div>
+                    <?php if ($invoiceNote !== ''): ?>
+                    <div><span class="label">Note:</span><span class="invoice-note-value"><?= htmlspecialchars($invoiceNote) ?></span></div>
+                    <?php endif; ?>
+                </div>
+                <?php if ($payerReceiptOffered): ?>
+                <form class="receipt-form" id="receipt-form" novalidate>
+                    <div class="receipt-prompt">
+                        Email me a payment confirmation
+                        <small>Optional</small>
+                    </div>
+                    <input type="email" class="form-input" id="receipt-email"
+                           placeholder="you@example.com" autocomplete="email" required>
+                    <button type="submit" class="btn" id="receipt-submit">Send receipt</button>
+                    <button type="button" class="receipt-skip" id="receipt-skip">No thanks</button>
+                    <div class="receipt-status hidden" id="receipt-status"></div>
+                </form>
+                <?php else: ?>
+                <div class="receipt-fallback">
+                    Screenshot this page or save your invoice ID for your records.
+                </div>
+                <?php endif; ?>
                 <?php if ($redirectUrl): ?>
                     <a href="<?= htmlspecialchars($redirectUrl) ?>" class="btn" id="redirect-btn">
                         Continue to Store
@@ -636,7 +813,27 @@ $baseUrl = Config::getBaseUrl();
         const expirationTime = <?= (int)$invoice['expiration_time'] ?>;
         const redirectUrl = <?= json_encode($redirectUrl) ?>;
         const redirectAuto = <?= json_encode($redirectAuto) ?>;
+        const payerReceiptOffered = <?= json_encode($payerReceiptOffered) ?>;
         let currentStatus = <?= json_encode($invoice['status']) ?>;
+
+        // Redirect coordination. When the receipt form is shown, we hold the
+        // auto-redirect off until the payer either submits a receipt request
+        // or clicks "No thanks" — otherwise the page would whisk them away
+        // before they could opt in.
+        let redirectHeld = false;
+        let redirectFired = false;
+        function scheduleRedirect(delayMs) {
+            if (!redirectUrl || !redirectAuto) return;
+            if (redirectFired) return;
+            if (redirectHeld) return;
+            redirectFired = true;
+            setTimeout(() => { window.location.href = redirectUrl; }, delayMs);
+        }
+        function holdRedirect() { redirectHeld = true; }
+        function releaseRedirect() {
+            redirectHeld = false;
+            scheduleRedirect(800);
+        }
 
         function renderQR(targetId, data) {
             const target = document.getElementById(targetId);
@@ -777,11 +974,7 @@ $baseUrl = Config::getBaseUrl();
                     break;
                 case 'Settled':
                     document.getElementById('payment-success').classList.add('show');
-                    if (redirectUrl && redirectAuto) {
-                        setTimeout(() => {
-                            window.location.href = redirectUrl;
-                        }, 2000);
-                    }
+                    onSettled();
                     break;
                 case 'Expired':
                 case 'Invalid':
@@ -799,11 +992,84 @@ $baseUrl = Config::getBaseUrl();
             }
         }
 
-        // Handle settled state on load with redirect
-        if (currentStatus === 'Settled' && redirectUrl && redirectAuto) {
-            setTimeout(() => {
-                window.location.href = redirectUrl;
-            }, 2000);
+        // Settled-state entry point. Decides whether to hold the auto-redirect
+        // while the payer fills in the receipt form, or fire it on the normal
+        // 2-second timer. Called both at page load and on poll transitions.
+        function onSettled() {
+            if (payerReceiptOffered) {
+                holdRedirect();
+                wireReceiptForm();
+            } else {
+                scheduleRedirect(2000);
+            }
+        }
+
+        // Wire up the receipt form: submit POSTs to this same URL with
+        // action=send_receipt, skip just releases the held redirect. Both
+        // paths end with the page either being replaced (success → redirect)
+        // or settled into a stable post-action state (no redirect URL).
+        let receiptFormWired = false;
+        function wireReceiptForm() {
+            if (receiptFormWired) return;
+            const form = document.getElementById('receipt-form');
+            if (!form) { scheduleRedirect(2000); return; }
+            receiptFormWired = true;
+
+            const submitBtn = document.getElementById('receipt-submit');
+            const skipBtn = document.getElementById('receipt-skip');
+            const emailInput = document.getElementById('receipt-email');
+            const statusEl = document.getElementById('receipt-status');
+
+            function setStatus(msg, kind) {
+                statusEl.textContent = msg;
+                statusEl.classList.remove('hidden', 'error', 'success');
+                if (kind) statusEl.classList.add(kind);
+            }
+
+            skipBtn.addEventListener('click', () => releaseRedirect());
+
+            form.addEventListener('submit', async (e) => {
+                e.preventDefault();
+                const email = emailInput.value.trim();
+                if (!email) { setStatus('Please enter an email address.', 'error'); return; }
+                submitBtn.disabled = true;
+                setStatus('Sending…', null);
+                try {
+                    const body = new URLSearchParams();
+                    body.set('action', 'send_receipt');
+                    body.set('email', email);
+                    const pollUrl = new URL(window.location.href);
+                    pollUrl.searchParams.set('id', invoiceId);
+                    const response = await fetch(pollUrl.toString(), {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                        body: body.toString(),
+                    });
+                    const data = await response.json().catch(() => ({}));
+                    if (response.ok && data.success) {
+                        setStatus('Receipt queued — check your inbox.', 'success');
+                        emailInput.disabled = true;
+                        submitBtn.style.display = 'none';
+                        // Leave the redirect held: the "Continue to Store"
+                        // button is right there if they want it, but we don't
+                        // want to whisk them away before they see the
+                        // confirmation. If there is no Continue button they
+                        // simply stay on this page.
+                        skipBtn.style.display = 'none';
+                    } else {
+                        setStatus(data.error || 'Could not send receipt.', 'error');
+                        submitBtn.disabled = false;
+                    }
+                } catch (err) {
+                    setStatus('Network error — please try again.', 'error');
+                    submitBtn.disabled = false;
+                }
+            });
+        }
+
+        // Handle settled state on initial page load.
+        if (currentStatus === 'Settled') {
+            onSettled();
         }
     </script>
 </body>

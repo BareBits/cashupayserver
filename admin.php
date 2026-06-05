@@ -1607,6 +1607,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'enabled' => Config::get('notifications_enabled', false) === true,
                 'invoicePaidEnabled' => Config::get('notifications_invoice_paid_enabled', false) === true,
                 'autoWithdrawEnabled' => Config::get('notifications_auto_withdraw_enabled', false) === true,
+                'payerReceiptEnabled' => Config::get('notifications_payer_receipt_enabled', false) === true,
                 'toEmail' => (string)Config::get('notifications_to_email', ''),
                 'smtpConfigured' => EmailSender::isSmtpConfigured(),
                 'pendingQueueCount' => NotificationSender::pendingCount(),
@@ -1619,6 +1620,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $enabled = ($_POST['enabled'] ?? '0') === '1';
                 $invoicePaidEnabled = ($_POST['invoice_paid_enabled'] ?? '0') === '1';
                 $autoWithdrawEnabled = ($_POST['auto_withdraw_enabled'] ?? '0') === '1';
+                $payerReceiptEnabled = ($_POST['payer_receipt_enabled'] ?? '0') === '1';
                 $toEmail = trim((string)($_POST['to_email'] ?? ''));
 
                 if ($toEmail !== '' && !filter_var($toEmail, FILTER_VALIDATE_EMAIL)) {
@@ -1628,6 +1630,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 Config::set('notifications_enabled', $enabled);
                 Config::set('notifications_invoice_paid_enabled', $invoicePaidEnabled);
                 Config::set('notifications_auto_withdraw_enabled', $autoWithdrawEnabled);
+                Config::set('notifications_payer_receipt_enabled', $payerReceiptEnabled);
                 Config::set('notifications_to_email', $toEmail);
 
                 echo json_encode(['success' => true]);
@@ -4347,6 +4350,18 @@ $adminView = $rawAdminView;
                                     <span class="toggle-slider"></span>
                                 </label>
                             </div>
+                            <div class="toggle-container" style="margin-top: 0.5rem;">
+                                <span>Offer payer receipt on payment page</span>
+                                <label class="toggle">
+                                    <input type="checkbox" id="notifications-payer-receipt">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
+                            <p class="form-help" style="margin-top: 0.5rem;">
+                                When enabled, after an invoice is paid the customer can
+                                optionally enter an email address to receive a payment
+                                confirmation. Receipts are queued to the same SMTP server.
+                            </p>
                         </div>
 
                         <div class="form-group" style="margin-top: 1rem;">
@@ -7755,6 +7770,7 @@ $adminView = $rawAdminView;
                 document.getElementById('notifications-enabled').checked = !!data.enabled;
                 document.getElementById('notifications-invoice-paid').checked = !!data.invoicePaidEnabled;
                 document.getElementById('notifications-auto-withdraw').checked = !!data.autoWithdrawEnabled;
+                document.getElementById('notifications-payer-receipt').checked = !!data.payerReceiptEnabled;
                 document.getElementById('notifications-to-email').value = data.toEmail || '';
                 document.getElementById('notifications-smtp-warning').classList.toggle('hidden', !!data.smtpConfigured);
                 const pending = document.getElementById('notifications-pending');
@@ -7772,10 +7788,11 @@ $adminView = $rawAdminView;
             const enabled = document.getElementById('notifications-enabled').checked ? '1' : '0';
             const invoicePaid = document.getElementById('notifications-invoice-paid').checked ? '1' : '0';
             const autoWithdraw = document.getElementById('notifications-auto-withdraw').checked ? '1' : '0';
+            const payerReceipt = document.getElementById('notifications-payer-receipt').checked ? '1' : '0';
             const toEmail = document.getElementById('notifications-to-email').value.trim();
             try {
                 const response = await postWithCsrf(adminUrl,
-                    `action=save_notifications_settings&enabled=${enabled}&invoice_paid_enabled=${invoicePaid}&auto_withdraw_enabled=${autoWithdraw}&to_email=${encodeURIComponent(toEmail)}`
+                    `action=save_notifications_settings&enabled=${enabled}&invoice_paid_enabled=${invoicePaid}&auto_withdraw_enabled=${autoWithdraw}&payer_receipt_enabled=${payerReceipt}&to_email=${encodeURIComponent(toEmail)}`
                 );
                 const result = await response.json();
                 if (response.ok) {
