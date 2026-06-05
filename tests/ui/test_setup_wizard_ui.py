@@ -30,24 +30,6 @@ def test_setup_wizard_completes_in_browser(
     page.fill("#store_name", "Browser Store")
     page.click("button[type=submit]")
 
-    # Step 5a: mint URL.
-    page.fill("#mint_url", mint.url)
-    page.click("button[type=submit]")
-
-    # Step 5b: unit selector — pick 'sat' and submit.
-    page.wait_for_selector("#mint_unit")
-    page.select_option("#mint_unit", "sat")
-    page.click("#continue-btn")
-
-    # Step 6: generate a fresh seed.
-    page.wait_for_selector("button[type=submit]")
-    # "Generate New Seed Phrase" — the page shows this if no seed exists yet.
-    page.click("button:has-text('Generate New Seed Phrase')")
-    # The generated seed flow shows a confirmation checkbox.
-    page.wait_for_selector("#seed_confirmed")
-    page.check("#seed_confirmed")
-    page.click("button[type=submit]")
-
     # Step 9: auto-withdraw destination. Skip — the wizard nudges with a
     # warning but lets you move on if you really mean it.
     page.wait_for_selector("#auto-withdraw-form")
@@ -56,6 +38,23 @@ def test_setup_wizard_completes_in_browser(
     # Step 8: optional on-chain Bitcoin step — skip it.
     page.wait_for_selector("#onchain-form")
     page.click("button:has-text('Skip for now')")
+
+    # Step 5a: mint URL.
+    page.wait_for_selector("#mint_url")
+    page.fill("#mint_url", mint.url)
+    page.click("button[type=submit]")
+
+    # Step 5b: unit selector — pick 'sat' and submit.
+    page.wait_for_selector("#mint_unit")
+    page.select_option("#mint_unit", "sat")
+    page.click("#continue-btn")
+
+    # Step 6: generate a fresh seed (terminal step — completes setup).
+    page.wait_for_selector("button[type=submit]")
+    page.click("button:has-text('Generate New Seed Phrase')")
+    page.wait_for_selector("#seed_confirmed")
+    page.check("#seed_confirmed")
+    page.click("button[type=submit]")
 
     # Step 7: completion. Either a "Go to admin" link or admin redirect.
     # The setup_complete config flag should now be set.

@@ -466,6 +466,13 @@ $baseUrl = Config::getBaseUrl();
             font-size: 0.8rem;
             margin-top: 1rem;
         }
+
+        /* Dark dropdown options so the open <select> menu stays legible
+           against the dark theme (white-on-white is the OS default). */
+        select option {
+            background-color: #1a1a2e;
+            color: #fff;
+        }
     </style>
 </head>
 <body>

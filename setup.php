@@ -28,6 +28,54 @@ require_once __DIR__ . '/includes/urls.php';
 // Initialize session early - needed for storing temp data during setup
 Auth::initSession();
 
+// AJAX endpoints that are stateless and need to work both during and after
+// setup (e.g. the mint-discovery modal opens from add_store mode after
+// setup is complete). Handled before the redirect-if-set-up guard below.
+if (isset($_GET['action'])) {
+    $action = $_GET['action'];
+    if ($action === 'mint_country') {
+        require_once __DIR__ . '/includes/ipgeo.php';
+        header('Content-Type: application/json');
+        $url = $_GET['url'] ?? '';
+        $cc = is_string($url) && $url !== '' ? IpGeo::lookupCountry($url) : null;
+        echo json_encode(['country' => $cc]);
+        exit;
+    }
+    if ($action === 'mint_country_batch') {
+        // Single request for many mint URLs. The per-process CSV index is
+        // built once and reused across lookups, so this is dramatically
+        // faster than N individual ?action=mint_country calls.
+        require_once __DIR__ . '/includes/ipgeo.php';
+        header('Content-Type: application/json');
+        $raw = $_GET['urls'] ?? '';
+        $urls = array_filter(array_map('trim', explode(',', $raw)));
+        $out = [];
+        foreach ($urls as $u) {
+            $u = (string)$u;
+            if ($u === '') continue;
+            $out[$u] = IpGeo::lookupCountry($u);
+        }
+        echo json_encode(['countries' => $out]);
+        exit;
+    }
+    if ($action === 'get_suggested_mints') {
+        require_once __DIR__ . '/includes/trusted_mints.php';
+        header('Content-Type: application/json');
+        $list = TrustedMints::getCachedList();
+        $urls = [];
+        if (is_array($list) && isset($list['mints']) && is_array($list['mints'])) {
+            foreach ($list['mints'] as $entry) {
+                if (!is_array($entry) || empty($entry['url']) || !empty($entry['disabled'])) {
+                    continue;
+                }
+                $urls[] = rtrim((string)$entry['url'], '/');
+            }
+        }
+        echo json_encode(['mints' => $urls]);
+        exit;
+    }
+}
+
 // Get mode parameter
 $mode = $_GET['mode'] ?? $_POST['mode'] ?? '';
 
@@ -190,7 +238,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 }
 
                 $_SESSION['setup_store_id'] = $storeId;
-                $step = 5;
+                // New flow: ask about auto-withdraw destination first, then
+                // on-chain xpub, *then* mint URL / seed. The wallet operator
+                // typically knows where they want funds to end up before they
+                // pick the temporary holding mint.
+                $step = 9;
                 break;
 
             case 5: // Mint configuration
@@ -319,11 +371,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
                     unset($_SESSION['temp_seed']);
 
-                    // After confirming the Cashu seed, ask where the operator
-                    // wants auto-withdrawals to land. The on-chain step that
-                    // follows uses that choice to decide whether an xpub is
-                    // required (on-chain auto-melt) or just recommended.
-                    $step = 9;
+                    // Seed confirmation is the last step of the wizard in the
+                    // new order (auto-withdraw + on-chain already happened
+                    // earlier). Finalize the install or hand back to admin.
+                    unset($_SESSION['setup_auto_withdraw_mode']);
+                    if ($mode === 'add_store') {
+                        $createdStoreId = $storeId;
+                        unset($_SESSION['setup_store_id']);
+                        header('Location: ' . Urls::admin() . '?store_created=' . urlencode($createdStoreId));
+                        exit;
+                    }
+                    Config::set('setup_complete', true);
+                    $step = 7;
                 }
                 break;
 
@@ -466,18 +525,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     break;
                 }
 
-                // Clear the step-9 hint now that step 8 has consumed it.
-                unset($_SESSION['setup_auto_withdraw_mode']);
-
-                // Either save+skip from here funnels to completion/add_store handler.
-                if ($mode === 'add_store') {
-                    $createdStoreId = $storeId;
-                    unset($_SESSION['setup_store_id']);
-                    header('Location: ' . Urls::admin() . '?store_created=' . urlencode($createdStoreId));
-                    exit;
-                }
-                Config::set('setup_complete', true);
-                $step = 7;
+                // In the new flow, on-chain comes before mint+seed. Move on to
+                // configuring the Cashu mint URL for this store.
+                $step = 5;
                 break;
         }
     } catch (Exception $e) {
@@ -636,6 +686,14 @@ function getDataDirHttpPath(): ?string {
             border-color: #f7931a;
         }
 
+        /* Dark dropdown options so the open <select> menu stays legible
+           against the dark theme — <option> elements ignore the parent
+           <select>'s color/background by default. */
+        select option {
+            background-color: #1a202c;
+            color: #e2e8f0;
+        }
+
         textarea {
             font-family: monospace;
             resize: vertical;
@@ -779,6 +837,57 @@ function getDataDirHttpPath(): ?string {
             margin-top: 0.5rem;
         }
 
+        /* Inline info-tip: a small "i" badge with a popup on hover/focus. */
+        .info-tip {
+            position: relative;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 14px;
+            height: 14px;
+            margin-left: 0.4rem;
+            border-radius: 50%;
+            background: rgba(255,255,255,0.12);
+            color: #a0aec0;
+            font-size: 10px;
+            font-weight: 700;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            cursor: help;
+            user-select: none;
+        }
+        .info-tip:hover, .info-tip:focus-within {
+            background: rgba(255,255,255,0.2);
+            color: #fff;
+        }
+        .info-tip .info-tip-text {
+            visibility: hidden;
+            opacity: 0;
+            position: absolute;
+            bottom: 130%;
+            left: 50%;
+            transform: translateX(-50%);
+            min-width: 260px;
+            max-width: 320px;
+            background: #1a202c;
+            border: 1px solid rgba(255,255,255,0.1);
+            border-radius: 6px;
+            padding: 0.6rem 0.75rem;
+            font-size: 0.8rem;
+            font-weight: 400;
+            line-height: 1.4;
+            color: #e2e8f0;
+            text-align: left;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+            z-index: 10;
+            transition: opacity 0.15s;
+            pointer-events: none;
+        }
+        .info-tip:hover .info-tip-text,
+        .info-tip:focus-within .info-tip-text {
+            visibility: visible;
+            opacity: 1;
+        }
+
         /* Mint discovery filter row */
         .mint-filter-row {
             display: flex;
@@ -879,10 +988,10 @@ function getDataDirHttpPath(): ?string {
             <?php if ($mode === 'add_store'): ?>
                 <h1>Add New Store</h1>
                 <?php
-                // add_store walks steps 4 → 5 → 6 → 9 (auto-withdraw) → 8
-                // (on-chain) before redirecting to admin. Step 7 (Complete)
-                // is not reached in this mode.
-                $addStoreMapping = [4 => 1, 5 => 2, 6 => 3, 9 => 4, 8 => 5];
+                // add_store walks steps 4 → 9 (auto-withdraw) → 8 (on-chain)
+                // → 5 (mint URL) → 6 (seed) before redirecting to admin.
+                // Step 7 (Complete) is not reached in this mode.
+                $addStoreMapping = [4 => 1, 9 => 2, 8 => 3, 5 => 4, 6 => 5];
                 $totalDisplaySteps = 5;
                 $displayStep = $addStoreMapping[$step] ?? $step;
                 ?>
@@ -899,12 +1008,12 @@ function getDataDirHttpPath(): ?string {
                 $isWpMode = Urls::isWordPress();
                 // Internal step order:
                 //   1 (welcome+security), 2 (password, standalone only),
-                //   4 (store), 5 (mint), 6 (seed), 9 (auto-withdraw),
-                //   8 (on-chain), 7 (complete).
+                //   4 (store), 9 (auto-withdraw), 8 (on-chain),
+                //   5 (mint), 6 (seed), 7 (complete).
                 // Step 3 was merged into step 1 and is unused.
                 $stepMapping = $isWpMode
-                    ? [1 => 1, 4 => 2, 5 => 3, 6 => 4, 9 => 5, 8 => 6, 7 => 7]
-                    : [1 => 1, 2 => 2, 4 => 3, 5 => 4, 6 => 5, 9 => 6, 8 => 7, 7 => 8];
+                    ? [1 => 1, 4 => 2, 9 => 3, 8 => 4, 5 => 5, 6 => 6, 7 => 7]
+                    : [1 => 1, 2 => 2, 4 => 3, 9 => 4, 8 => 5, 5 => 6, 6 => 7, 7 => 8];
                 $totalSteps = $isWpMode ? 7 : 8;
                 $displayStep = $stepMapping[$step] ?? $step;
                 ?>
@@ -1308,7 +1417,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
             <?php elseif ($step === 4): ?>
                 <!-- Step 4: Create Store (name only) -->
                 <h2 style="margin-bottom: 1rem;">Create Store</h2>
-                <p style="margin-bottom: 1.5rem;"><?= $mode === 'add_store' ? 'Create a new store. You\'ll configure its mint and wallet next.' : 'Create your first store. You\'ll configure its mint and wallet next.' ?></p>
+                <p style="margin-bottom: 1.5rem;"><?= $mode === 'add_store' ? 'Create a new store. You\'ll set its auto-withdraw destination next, then connect a Cashu mint.' : 'Create your first store. You\'ll set its auto-withdraw destination next, then connect a Cashu mint.' ?></p>
 
                 <form method="post">
                     <input type="hidden" name="step" value="4">
@@ -1336,7 +1445,11 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                     <?php if (!empty($mintUnits)): ?>
                         Select which currency unit to use with this mint.
                     <?php else: ?>
-                        Enter the URL of the Cashu mint for this store.
+                        Choose a Cashu Mint for your store. This is a third
+                        party who you trust to temporarily hold on to some small
+                        amount of funds via lightning (around $10 max). This
+                        store will only be used if you select on-chain cashouts
+                        or your main LN cashout mechanism is offline.
                     <?php endif; ?>
                 </p>
 
@@ -1416,7 +1529,12 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
 
             <?php elseif ($step === 6): ?>
                 <!-- Step 6: Seed Phrase for this Store -->
-                <h2 style="margin-bottom: 1rem;">Store Wallet Seed</h2>
+                <h2 style="margin-bottom: 1rem;">Mint Wallet Seed</h2>
+                <p style="margin-bottom: 1.25rem; color: #a0aec0; font-size: 0.9rem;">
+                    This is the seed phrase for the wallet this store uses with
+                    its Cashu mint. It lets you recover the small mint balance
+                    held on your behalf if this server is lost or restored.
+                </p>
 
                 <?php if ($tempSeed): ?>
                     <div class="warning">
@@ -1446,7 +1564,8 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                     </form>
                 <?php else: ?>
                     <p style="margin-bottom: 1.5rem;">
-                        Generate a new seed phrase for this store's wallet, or restore from an existing seed.
+                        Generate a new seed phrase for this store's mint wallet,
+                        or restore from an existing seed.
                     </p>
 
                     <form method="post" style="margin-bottom: 1rem;">
@@ -1666,14 +1785,21 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                     </div>
 
                     <div class="form-group">
-                        <label for="onchain_min_confs">Required confirmations (0 = accept zero-conf):</label>
+                        <label for="onchain_min_confs">
+                            Required confirmations (0 = accept zero-conf):
+                            <span class="info-tip" tabindex="0" aria-label="More info">i<span class="info-tip-text">
+                                How many block confirmations the on-chain payment
+                                needs before the invoice is marked paid.
+                                <br><br>
+                                <strong>0 (zero-conf):</strong> instant settlement, but a malicious
+                                customer could double-spend the unconfirmed tx. For ~90% of merchants
+                                taking small consumer payments, zero-conf is a fine default.
+                                <br><br>
+                                <strong>1+ confirmations:</strong> safer for high-value invoices, but
+                                customers wait ~10 minutes per confirmation.
+                            </span></span>
+                        </label>
                         <input type="number" id="onchain_min_confs" name="onchain_min_confs" min="0" max="100" value="1">
-                    </div>
-
-                    <div class="form-group">
-                        <label for="onchain_provider_url">Provider URL (optional &mdash; leave blank for default mempool.space):</label>
-                        <input type="text" id="onchain_provider_url" name="onchain_provider_url"
-                               placeholder="https://mempool.space/api">
                     </div>
 
                     <div id="onchain-validation" style="display:none; margin: 1rem 0; padding: 0.75rem; border-radius: 6px;"></div>
@@ -2066,6 +2192,19 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
     var mintDiscoveryInstance = null;
     var discoveredMints = [];
     var disclaimerAcknowledged = false;
+    // URLs returned by ?action=get_suggested_mints — these get the
+    // "Suggested by BareBits" badge and float to the top of the list.
+    var suggestedMintUrls = [];
+    // Mint URL -> ISO 3166-1 alpha-2 country code (uppercase). Populated
+    // lazily as cards render; null means "lookup failed / pending".
+    var mintCountryCache = {};
+
+    var FLAG_BASE = <?= json_encode(Urls::assets('img/flags/')) ?>;
+    var SETUP_URL = <?= json_encode(Urls::setup()) ?>;
+
+    function normalizeMintUrl(u) {
+        return String(u || '').replace(/\/+$/, '');
+    }
 
     function openMintDiscovery() {
         document.getElementById('mint-discovery-modal').style.display = 'flex';
@@ -2077,8 +2216,129 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
         }
         // Setup hover listeners for disabled buttons
         setupDisabledButtonHover();
-        // Auto-start discovery
+        // Pull the suggested-mints list first (best effort), then start
+        // Nostr discovery. The two run in parallel; sort happens on each
+        // render so order stabilizes as info trickles in.
+        fetchSuggestedMints();
         startMintDiscovery();
+    }
+
+    function fetchSuggestedMints() {
+        return fetch(SETUP_URL + '?action=get_suggested_mints', { credentials: 'same-origin' })
+            .then(function (r) { return r.ok ? r.json() : { mints: [] }; })
+            .then(function (data) {
+                var urls = Array.isArray(data && data.mints) ? data.mints : [];
+                suggestedMintUrls = urls.map(normalizeMintUrl);
+                // For any suggested URL not in the Nostr-discovered set, fetch
+                // its /v1/info directly so it can render with full metadata.
+                suggestedMintUrls.forEach(function (url) {
+                    var present = discoveredMints.some(function (m) { return normalizeMintUrl(m.url) === url; });
+                    if (present) return;
+                    fetch(url + '/v1/info', { credentials: 'omit' })
+                        .then(function (r) { return r.ok ? r.json() : null; })
+                        .then(function (info) {
+                            var existing = discoveredMints.findIndex(function (m) { return normalizeMintUrl(m.url) === url; });
+                            var entry = {
+                                url: url,
+                                info: info,
+                                error: !info,
+                                averageRating: null,
+                                reviewsCount: 0,
+                            };
+                            if (existing >= 0) {
+                                discoveredMints[existing] = entry;
+                            } else {
+                                discoveredMints.push(entry);
+                            }
+                            renderMintList();
+                        })
+                        .catch(function () {
+                            // Even on failure, surface the suggested mint so
+                            // the operator sees it. They can still pick it.
+                            var existing = discoveredMints.findIndex(function (m) { return normalizeMintUrl(m.url) === url; });
+                            if (existing < 0) {
+                                discoveredMints.push({
+                                    url: url,
+                                    info: null,
+                                    error: true,
+                                    averageRating: null,
+                                    reviewsCount: 0,
+                                });
+                                renderMintList();
+                            }
+                        });
+                });
+                renderMintList();
+            })
+            .catch(function () {
+                // No suggested-mints config or unreachable — fall back to
+                // plain discovery, which is the documented "no suggestions"
+                // behavior.
+                suggestedMintUrls = [];
+            });
+    }
+
+    function isSuggested(mintUrl) {
+        return suggestedMintUrls.indexOf(normalizeMintUrl(mintUrl)) !== -1;
+    }
+
+    // Debounced batch country lookup: collect pending URLs for one tick,
+    // then issue a single ?action=mint_country_batch request so the server
+    // builds its CSV index once per render rather than once per card.
+    var countryFetchQueue = [];
+    var countryFetchTimer = null;
+
+    function fetchCountryForCard(url, cardEl) {
+        var normalized = normalizeMintUrl(url);
+        if (mintCountryCache[normalized] !== undefined) {
+            applyCountryToCard(cardEl, mintCountryCache[normalized]);
+            return;
+        }
+        countryFetchQueue.push({ url: url, cardEl: cardEl });
+        if (countryFetchTimer) return;
+        countryFetchTimer = setTimeout(flushCountryFetchQueue, 50);
+    }
+
+    function flushCountryFetchQueue() {
+        countryFetchTimer = null;
+        if (!countryFetchQueue.length) return;
+        var pending = countryFetchQueue.splice(0, countryFetchQueue.length);
+        // Dedup by URL while preserving the card -> URL mapping so we apply
+        // results to every card that asked.
+        var uniqueUrls = [];
+        var seen = {};
+        pending.forEach(function (p) {
+            var n = normalizeMintUrl(p.url);
+            if (!seen[n]) { seen[n] = true; uniqueUrls.push(p.url); }
+        });
+        var qs = uniqueUrls.map(encodeURIComponent).join(',');
+        fetch(SETUP_URL + '?action=mint_country_batch&urls=' + qs, { credentials: 'same-origin' })
+            .then(function (r) { return r.ok ? r.json() : { countries: {} }; })
+            .then(function (data) {
+                var byUrl = (data && data.countries) || {};
+                pending.forEach(function (p) {
+                    var raw = byUrl[p.url];
+                    var cc = raw ? String(raw).toUpperCase() : null;
+                    mintCountryCache[normalizeMintUrl(p.url)] = cc;
+                    applyCountryToCard(p.cardEl, cc);
+                });
+            })
+            .catch(function () {
+                pending.forEach(function (p) {
+                    mintCountryCache[normalizeMintUrl(p.url)] = null;
+                });
+            });
+    }
+
+    function applyCountryToCard(cardEl, cc) {
+        if (!cardEl || !cc) return;
+        var holder = cardEl.querySelector('.mint-country-slot');
+        if (!holder) return;
+        var safe = cc.toLowerCase().replace(/[^a-z]/g, '');
+        if (safe.length !== 2) return;
+        holder.innerHTML = '<img src="' + FLAG_BASE + safe + '.svg" alt="' +
+            cc + '" class="mint-flag" style="width: 16px; height: 12px; vertical-align: middle; border-radius: 2px; margin-right: 0.25rem; box-shadow: 0 0 0 1px rgba(0,0,0,0.2);"> ' +
+            '<span style="font-size: 0.75rem; color: #a0aec0; letter-spacing: 0.5px;">' + cc + '</span>';
     }
 
     function onDisclaimerChange(checkbox) {
@@ -2256,23 +2516,49 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
             return true;
         });
 
-        if (filtered.length === 0) {
+        // Pin suggested mints (in the order returned by the server) to the
+        // top, regardless of review counts. Everything else keeps its
+        // existing review-count / rating sort applied earlier.
+        var pinned = [];
+        var rest = [];
+        filtered.forEach(function (m) {
+            if (isSuggested(m.url)) pinned.push(m); else rest.push(m);
+        });
+        pinned.sort(function (a, b) {
+            return suggestedMintUrls.indexOf(normalizeMintUrl(a.url)) -
+                   suggestedMintUrls.indexOf(normalizeMintUrl(b.url));
+        });
+        var ordered = pinned.concat(rest);
+
+        if (ordered.length === 0) {
             listEl.innerHTML = '<p style="color: #a0aec0; text-align: center; padding: 2rem;">No mints found matching your criteria</p>';
             return;
         }
 
-        var html = filtered.map(function(m) {
+        var html = ordered.map(function(m) {
             var name = (m.info && m.info.name) ? m.info.name : 'Unknown Mint';
             var isOnline = !m.error && m.info;
             var units = getUnitsFromInfo(m.info);
+            var suggested = isSuggested(m.url);
+            var border = suggested
+                ? '1px solid rgba(247, 147, 26, 0.5)'
+                : '1px solid rgba(255,255,255,0.1)';
+            var bg = suggested ? 'rgba(247, 147, 26, 0.08)' : 'rgba(0,0,0,0.2)';
+            var badge = suggested
+                ? '<span style="display: inline-block; background: rgba(247, 147, 26, 0.2); color: #f7931a; ' +
+                  'border: 1px solid rgba(247, 147, 26, 0.4); padding: 0.15rem 0.45rem; border-radius: 4px; ' +
+                  'font-size: 0.7rem; font-weight: 600; margin-right: 0.4rem;">\u2605 Suggested by BareBits</span>'
+                : '';
+            var countrySlot = '<span class="mint-country-slot" data-mint-url="' + escapeAttr(m.url) + '"></span>';
 
-            return '<div style="background: rgba(0,0,0,0.2); border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; padding: 1rem; margin-bottom: 0.75rem;">' +
-                '<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem;">' +
+            return '<div class="mint-discovery-card" data-mint-url="' + escapeAttr(m.url) + '" style="background: ' + bg + '; border: ' + border + '; border-radius: 8px; padding: 1rem; margin-bottom: 0.75rem;">' +
+                '<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem; gap: 0.5rem;">' +
                     '<div style="font-size: 0.9rem;">' + renderStars(m.averageRating) +
                         ' <span style="color: #a0aec0; font-size: 0.8rem;">(' + (m.reviewsCount || 0) + ' reviews)</span></div>' +
                     '<span style="font-size: 0.8rem; color: ' + (isOnline ? '#48bb78' : '#e53e3e') + ';">' +
                         (isOnline ? '\u25CF Online' : '\u25CB Offline') + '</span>' +
                 '</div>' +
+                '<div style="margin-bottom: 0.35rem;">' + badge + countrySlot + '</div>' +
                 '<h4 style="margin: 0 0 0.25rem 0; font-size: 1rem;">' + escapeHtml(name) + '</h4>' +
                 '<p style="font-size: 0.8rem; color: #a0aec0; margin: 0 0 0.5rem 0; word-break: break-all;">' + escapeHtml(m.url) + '</p>' +
                 '<div style="font-size: 0.8rem; color: #a0aec0; margin-bottom: 0.75rem;">' +
@@ -2283,6 +2569,12 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
         }).join('');
 
         listEl.innerHTML = html;
+        // Kick off per-card country lookups. Each request is fast (binary
+        // search over a static index); browsers happily run them in parallel.
+        listEl.querySelectorAll('.mint-discovery-card').forEach(function (card) {
+            var url = card.getAttribute('data-mint-url');
+            if (url) fetchCountryForCard(url, card);
+        });
         listEl.querySelectorAll('button.select-discovered-mint').forEach(function(btn) {
             btn.addEventListener('click', function() {
                 selectDiscoveredMint(btn.dataset.mintUrl);

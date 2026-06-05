@@ -24,7 +24,11 @@ LIGHTNING_ADDRESS = "awesomemerchant@strike.me"
 
 
 def _walk_to_auto_withdraw_step(page, payserver, mint, store_name="AW Store") -> None:
-    """Drive a fresh setup wizard to step 9 (auto-withdraw)."""
+    """Drive a fresh setup wizard to step 9 (auto-withdraw).
+
+    Under the new step order, auto-withdraw comes immediately after
+    create-store, so the walk is just security ack → password → store name.
+    """
     page.set_default_timeout(15000)
     page.goto(f"{payserver.url}/setup")
     page.check("#security_acknowledged")
@@ -33,15 +37,6 @@ def _walk_to_auto_withdraw_step(page, payserver, mint, store_name="AW Store") ->
     page.fill("#confirm_password", "wizard-test-pw")
     page.click("button[type=submit]")
     page.fill("#store_name", store_name)
-    page.click("button[type=submit]")
-    page.fill("#mint_url", mint.url)
-    page.click("button[type=submit]")
-    page.wait_for_selector("#mint_unit")
-    page.select_option("#mint_unit", "sat")
-    page.click("#continue-btn")
-    page.click("button:has-text('Generate New Seed Phrase')")
-    page.wait_for_selector("#seed_confirmed")
-    page.check("#seed_confirmed")
     page.click("button[type=submit]")
     page.wait_for_selector("#auto-withdraw-form")
 
@@ -137,6 +132,18 @@ def test_auto_withdraw_step_visible_in_add_store_mode(
     ).click()
     page.wait_for_selector("#onchain-form")
     page.click("button:has-text('Skip for now')")
+    # Complete the rest of the wizard (mint URL → unit → seed) so we end up
+    # at the admin UI for the add_store path below.
+    page.wait_for_selector("#mint_url")
+    page.fill("#mint_url", mint.url)
+    page.click("button[type=submit]")
+    page.wait_for_selector("#mint_unit")
+    page.select_option("#mint_unit", "sat")
+    page.click("#continue-btn")
+    page.click("button:has-text('Generate New Seed Phrase')")
+    page.wait_for_selector("#seed_confirmed")
+    page.check("#seed_confirmed")
+    page.click("button[type=submit]")
 
     # Now log in and navigate to setup.php?mode=add_store.
     page.goto(f"{payserver.url}/admin")
@@ -148,17 +155,7 @@ def test_auto_withdraw_step_visible_in_add_store_mode(
     page.wait_for_selector("h1:has-text('Add New Store')")
     page.fill("#store_name", "Second Store")
     page.click("button[type=submit]")
-    page.fill("#mint_url", mint.url)
-    page.click("button[type=submit]")
-    page.wait_for_selector("#mint_unit")
-    page.select_option("#mint_unit", "sat")
-    page.click("#continue-btn")
-    page.click("button:has-text('Generate New Seed Phrase')")
-    page.wait_for_selector("#seed_confirmed")
-    page.check("#seed_confirmed")
-    page.click("button[type=submit]")
 
-    # The wizard must land on step 9 (auto-withdraw), not skip straight to
-    # on-chain. Both forms exist on their own steps, so #auto-withdraw-form
-    # is the distinguishing selector.
+    # Under the new step order, create-store funnels straight to step 9
+    # (auto-withdraw) before any mint/seed configuration.
     page.wait_for_selector("#auto-withdraw-form", state="visible")

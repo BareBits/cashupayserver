@@ -1,11 +1,13 @@
 """Drive the cashupayserver setup wizard programmatically.
 
 The wizard at /setup uses PHP sessions (cookies) and a 'step' POST field
-that walks 1 -> 2 -> 4 -> 5 (mint URL) -> 5 again (mint unit) -> 6 (seed) -> 7.
+that walks 1 -> 2 -> 4 -> 9 (auto-withdraw) -> 8 (on-chain) -> 5 (mint URL)
+-> 5 again (mint unit) -> 6 (seed) -> 7.
 
 `run_setup_wizard()` performs the standalone happy-path: security ack,
-admin password, store create, mint URL, mint unit, generated seed,
-seed confirm. Leaves the server initialized and ready for API auth.
+admin password, store create, skip auto-withdraw, skip on-chain, mint URL,
+mint unit, generated seed, seed confirm. Leaves the server initialized and
+ready for API auth.
 """
 from __future__ import annotations
 
@@ -57,6 +59,25 @@ def run_setup_wizard(
     r = s.post(setup, data={"step": "4", "store_name": store_name}, timeout=10, allow_redirects=False)
     _assert_step_ok(r, "step 4 (store)")
 
+    # Step 9: auto-withdraw destination — skip so existing tests don't need
+    # to provide a lightning address or xpub.
+    r = s.post(
+        setup,
+        data={"step": "9", "auto_withdraw_action": "skip"},
+        timeout=15,
+        allow_redirects=False,
+    )
+    _assert_step_ok(r, "step 9 (skip auto-withdraw)")
+
+    # Step 8: optional on-chain step — skip.
+    r = s.post(
+        setup,
+        data={"step": "8", "onchain_action": "skip"},
+        timeout=15,
+        allow_redirects=False,
+    )
+    _assert_step_ok(r, "step 8 (skip on-chain)")
+
     # Step 5a: submit mint URL (no unit yet); server caches available units in session
     r = s.post(setup, data={"step": "5", "mint_url": mint_url}, timeout=30, allow_redirects=False)
     _assert_step_ok(r, "step 5a (mint URL)")
@@ -74,7 +95,7 @@ def run_setup_wizard(
     r = s.post(setup, data={"step": "6", "action": "generate"}, timeout=10, allow_redirects=False)
     _assert_step_ok(r, "step 6a (generate seed)")
 
-    # Step 6b: confirm
+    # Step 6b: confirm (terminal step — completes setup)
     r = s.post(
         setup,
         data={"step": "6", "action": "confirm", "seed_confirmed": "1"},
@@ -82,25 +103,6 @@ def run_setup_wizard(
         allow_redirects=False,
     )
     _assert_step_ok(r, "step 6b (confirm seed)")
-
-    # Step 9: auto-withdraw destination — skip so existing tests don't need
-    # to provide a lightning address or xpub.
-    r = s.post(
-        setup,
-        data={"step": "9", "auto_withdraw_action": "skip"},
-        timeout=15,
-        allow_redirects=False,
-    )
-    _assert_step_ok(r, "step 9 (skip auto-withdraw)")
-
-    # Step 8: optional on-chain step — skip to complete setup.
-    r = s.post(
-        setup,
-        data={"step": "8", "onchain_action": "skip"},
-        timeout=15,
-        allow_redirects=False,
-    )
-    _assert_step_ok(r, "step 8 (skip on-chain)")
 
     return SetupResult(
         admin_password=admin_password,
