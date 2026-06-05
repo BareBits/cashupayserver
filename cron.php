@@ -381,6 +381,23 @@ if (!$swapOnly && !$skipNonEssential) try {
     $results['tasks']['trusted_mints'] = 'error: ' . $e->getMessage();
 }
 
+// Task 12a: Refresh IP-to-country geo database (monthly DB-IP Lite snapshot).
+// Cheap to attempt — IpGeo::refresh skips the download if the cached file
+// is still fresh enough. Best-effort, never blocks other tasks.
+if (!$swapOnly && !$skipNonEssential) try {
+    require_once __DIR__ . '/includes/ipgeo.php';
+    $csv = IpGeo::getCsvPath();
+    $stale = !is_file($csv) || (time() - (int)@filemtime($csv)) > 25 * 24 * 3600;
+    if ($stale) {
+        $ok = IpGeo::refresh();
+        $results['tasks']['ipgeo'] = $ok ? 'refreshed' : 'refresh failed (kept prior copy)';
+    } else {
+        $results['tasks']['ipgeo'] = 'skipped (fresh)';
+    }
+} catch (Exception $e) {
+    $results['tasks']['ipgeo'] = 'error: ' . $e->getMessage();
+}
+
 // Task 12: Auto-update check. Daily, no-op in WordPress mode. Skipped on
 // internal background self-requests so checkout traffic doesn't trigger
 // a download — only the dedicated cron tick checks for updates.

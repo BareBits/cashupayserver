@@ -202,6 +202,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
         }
         .btn:hover { transform: translateY(-1px); }
         .help-text { font-size: 0.85rem; color: #a0aec0; margin-top: 0.25rem; }
+        /* Dark dropdown options so the open <select> menu stays legible
+           against the dark theme (white-on-white is the OS default). */
+        select option {
+            background-color: #1a202c;
+            color: #e2e8f0;
+        }
     </style>
 </head>
 <body>

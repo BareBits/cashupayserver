@@ -652,6 +652,49 @@ if (isset($_GET['api'])) {
             ]);
             break;
 
+        case 'get_suggested_mints':
+            // Non-disabled trusted-list URLs, surfaced to the mint-discovery
+            // modal so it can badge them and pin them to the top. No env
+            // override needed — same source as TrustedMints uses internally.
+            require_once __DIR__ . '/includes/trusted_mints.php';
+            $list = TrustedMints::getCachedList();
+            $urls = [];
+            if (is_array($list) && isset($list['mints']) && is_array($list['mints'])) {
+                foreach ($list['mints'] as $entry) {
+                    if (!is_array($entry) || empty($entry['url']) || !empty($entry['disabled'])) {
+                        continue;
+                    }
+                    $urls[] = rtrim((string)$entry['url'], '/');
+                }
+            }
+            echo json_encode(['mints' => $urls]);
+            break;
+
+        case 'mint_country':
+            // Resolve a mint URL to an ISO 3166-1 alpha-2 country code via
+            // local DB-IP lookup. Returns null on any failure (DNS, missing
+            // CSV, .onion, etc.) — the caller treats null as "no flag".
+            require_once __DIR__ . '/includes/ipgeo.php';
+            $url = $_GET['url'] ?? '';
+            $cc = is_string($url) && $url !== '' ? IpGeo::lookupCountry($url) : null;
+            echo json_encode(['country' => $cc]);
+            break;
+
+        case 'mint_country_batch':
+            // Batched lookup: many URLs in one request so the per-process
+            // CSV index gets built once and reused.
+            require_once __DIR__ . '/includes/ipgeo.php';
+            $raw = $_GET['urls'] ?? '';
+            $urls = array_filter(array_map('trim', explode(',', $raw)));
+            $out = [];
+            foreach ($urls as $u) {
+                $u = (string)$u;
+                if ($u === '') continue;
+                $out[$u] = IpGeo::lookupCountry($u);
+            }
+            echo json_encode(['countries' => $out]);
+            break;
+
         default:
             http_response_code(404);
             echo json_encode(['error' => 'Unknown action']);
@@ -2900,10 +2943,71 @@ $adminView = $rawAdminView;
             border-color: var(--accent);
         }
 
+        /* Dark dropdown options so the open <select> menu stays legible.
+           Mirrors the .header-store-selector option rule, but applies to
+           every <select> on the page so future dropdowns don't have to
+           opt in individually. */
+        select option {
+            background-color: var(--bg-secondary);
+            color: var(--text-primary);
+        }
+
         .form-help {
             font-size: 0.875rem;
             color: var(--text-secondary);
             margin-top: 0.5rem;
+        }
+
+        /* Inline info-tip: a small "i" badge with a popup on hover/focus. */
+        .info-tip {
+            position: relative;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 14px;
+            height: 14px;
+            margin-left: 0.4rem;
+            border-radius: 50%;
+            background: rgba(255,255,255,0.12);
+            color: var(--text-secondary);
+            font-size: 10px;
+            font-weight: 700;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            cursor: help;
+            user-select: none;
+            vertical-align: middle;
+        }
+        .info-tip:hover, .info-tip:focus-within {
+            background: rgba(255,255,255,0.2);
+            color: var(--text-primary);
+        }
+        .info-tip .info-tip-text {
+            visibility: hidden;
+            opacity: 0;
+            position: absolute;
+            bottom: 130%;
+            left: 50%;
+            transform: translateX(-50%);
+            min-width: 260px;
+            max-width: 320px;
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 0.6rem 0.75rem;
+            font-size: 0.8rem;
+            font-weight: 400;
+            line-height: 1.4;
+            color: var(--text-primary);
+            text-align: left;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+            z-index: 10;
+            transition: opacity 0.15s;
+            pointer-events: none;
+        }
+        .info-tip:hover .info-tip-text,
+        .info-tip:focus-within .info-tip-text {
+            visibility: visible;
+            opacity: 1;
         }
 
         /* Buttons */
@@ -3721,7 +3825,20 @@ $adminView = $rawAdminView;
                             </div>
                             <p class="form-help" id="onchain-address-type-inferred" style="display:none;"></p>
                             <div class="form-group">
-                                <label class="form-label">Required confirmations (0 = accept zero-conf)</label>
+                                <label class="form-label">
+                                    Required confirmations (0 = accept zero-conf)
+                                    <span class="info-tip" tabindex="0" aria-label="More info">i<span class="info-tip-text">
+                                        How many block confirmations the on-chain payment
+                                        needs before the invoice is marked paid.
+                                        <br><br>
+                                        <strong>0 (zero-conf):</strong> instant settlement, but a malicious
+                                        customer could double-spend the unconfirmed tx. For ~90% of merchants
+                                        taking small consumer payments, zero-conf is a fine default.
+                                        <br><br>
+                                        <strong>1+ confirmations:</strong> safer for high-value invoices, but
+                                        customers wait ~10 minutes per confirmation.
+                                    </span></span>
+                                </label>
                                 <input type="number" class="form-input" id="onchain-min-confs" min="0" max="100" value="1">
                             </div>
                             <div class="form-group">
@@ -7848,6 +7965,17 @@ $adminView = $rawAdminView;
         let discoveredMints = [];
         let discoveryCallback = null;
         let discoveryContext = null;
+        // Trusted-list URLs that should show the "Suggested by BareBits"
+        // badge and float to the top of the list.
+        let suggestedMintUrls = [];
+        // Mint URL -> ISO country code (uppercase), populated lazily as
+        // cards render.
+        const mintCountryCache = {};
+        const FLAG_BASE = <?= json_encode(Urls::assets('img/flags/')) ?>;
+
+        function normalizeMintUrl(u) {
+            return String(u || '').replace(/\/+$/, '');
+        }
 
         function openBackupMintDiscovery(storeId, storeName) {
             discoveryContext = 'backup';
@@ -7867,8 +7995,108 @@ $adminView = $rawAdminView;
                 checkbox.checked = false;
                 mintDisclaimerAcknowledged = false;
             }
+            // Suggested-mints list is fetched in parallel with Nostr discovery;
+            // both populate `discoveredMints` and sort happens on each render.
+            fetchSuggestedMintsAdmin();
             // Auto-start discovery
             startMintDiscovery();
+        }
+
+        function fetchSuggestedMintsAdmin() {
+            return fetch(adminUrl + '?api=get_suggested_mints', { credentials: 'same-origin' })
+                .then(r => r.ok ? r.json() : { mints: [] })
+                .then(data => {
+                    const urls = Array.isArray(data && data.mints) ? data.mints : [];
+                    suggestedMintUrls = urls.map(normalizeMintUrl);
+                    suggestedMintUrls.forEach(url => {
+                        const present = discoveredMints.some(m => normalizeMintUrl(m.url) === url);
+                        if (present) return;
+                        fetch(url + '/v1/info', { credentials: 'omit' })
+                            .then(r => r.ok ? r.json() : null)
+                            .then(info => {
+                                const entry = {
+                                    url,
+                                    info,
+                                    error: !info,
+                                    averageRating: null,
+                                    reviewsCount: 0,
+                                };
+                                const existing = discoveredMints.findIndex(m => normalizeMintUrl(m.url) === url);
+                                if (existing >= 0) discoveredMints[existing] = entry;
+                                else discoveredMints.push(entry);
+                                renderDiscoveredMints();
+                            })
+                            .catch(() => {
+                                const existing = discoveredMints.findIndex(m => normalizeMintUrl(m.url) === url);
+                                if (existing < 0) {
+                                    discoveredMints.push({ url, info: null, error: true, averageRating: null, reviewsCount: 0 });
+                                    renderDiscoveredMints();
+                                }
+                            });
+                    });
+                    renderDiscoveredMints();
+                })
+                .catch(() => { suggestedMintUrls = []; });
+        }
+
+        function isSuggestedMint(url) {
+            return suggestedMintUrls.indexOf(normalizeMintUrl(url)) !== -1;
+        }
+
+        // Debounced batch country lookup: collect pending URLs for one tick,
+        // then issue a single ?api=mint_country_batch request.
+        let countryFetchQueue = [];
+        let countryFetchTimer = null;
+
+        function fetchCountryForCard(url, cardEl) {
+            const normalized = normalizeMintUrl(url);
+            if (mintCountryCache[normalized] !== undefined) {
+                applyCountryToCard(cardEl, mintCountryCache[normalized]);
+                return;
+            }
+            countryFetchQueue.push({ url, cardEl });
+            if (countryFetchTimer) return;
+            countryFetchTimer = setTimeout(flushCountryFetchQueueAdmin, 50);
+        }
+
+        function flushCountryFetchQueueAdmin() {
+            countryFetchTimer = null;
+            if (!countryFetchQueue.length) return;
+            const pending = countryFetchQueue.splice(0, countryFetchQueue.length);
+            const uniqueUrls = [];
+            const seen = {};
+            pending.forEach(p => {
+                const n = normalizeMintUrl(p.url);
+                if (!seen[n]) { seen[n] = true; uniqueUrls.push(p.url); }
+            });
+            const qs = uniqueUrls.map(encodeURIComponent).join(',');
+            fetch(adminUrl + '?api=mint_country_batch&urls=' + qs, { credentials: 'same-origin' })
+                .then(r => r.ok ? r.json() : { countries: {} })
+                .then(data => {
+                    const byUrl = (data && data.countries) || {};
+                    pending.forEach(p => {
+                        const raw = byUrl[p.url];
+                        const cc = raw ? String(raw).toUpperCase() : null;
+                        mintCountryCache[normalizeMintUrl(p.url)] = cc;
+                        applyCountryToCard(p.cardEl, cc);
+                    });
+                })
+                .catch(() => {
+                    pending.forEach(p => {
+                        mintCountryCache[normalizeMintUrl(p.url)] = null;
+                    });
+                });
+        }
+
+        function applyCountryToCard(cardEl, cc) {
+            if (!cardEl || !cc) return;
+            const holder = cardEl.querySelector('.mint-country-slot');
+            if (!holder) return;
+            const safe = cc.toLowerCase().replace(/[^a-z]/g, '');
+            if (safe.length !== 2) return;
+            holder.innerHTML = '<img src="' + FLAG_BASE + safe + '.svg" alt="' + cc +
+                '" style="width: 16px; height: 12px; vertical-align: middle; border-radius: 2px; margin-right: 0.25rem; box-shadow: 0 0 0 1px rgba(0,0,0,0.2);"> ' +
+                '<span style="font-size: 0.75rem; color: var(--text-secondary); letter-spacing: 0.5px;">' + cc + '</span>';
         }
 
         function onMintDisclaimerChange(checkbox) {
@@ -7972,19 +8200,39 @@ $adminView = $rawAdminView;
                 return true;
             });
 
-            if (filtered.length === 0) {
+            // Suggested mints float to the top (in their declared order);
+            // everything else keeps the upstream review-count sort.
+            const pinned = filtered.filter(m => isSuggestedMint(m.url));
+            const rest = filtered.filter(m => !isSuggestedMint(m.url));
+            pinned.sort((a, b) =>
+                suggestedMintUrls.indexOf(normalizeMintUrl(a.url)) -
+                suggestedMintUrls.indexOf(normalizeMintUrl(b.url))
+            );
+            const ordered = pinned.concat(rest);
+
+            if (ordered.length === 0) {
                 listEl.innerHTML = '<p style="color: var(--text-secondary); text-align: center; padding: 2rem;">No mints found</p>';
                 return;
             }
 
-            listEl.innerHTML = filtered.map(m => {
+            listEl.innerHTML = ordered.map(m => {
                 const name = m.info?.name || 'Unknown Mint';
                 const isOnline = !m.error && m.info;
                 const units = getUnitsFromMintInfo(m.info);
+                const suggested = isSuggestedMint(m.url);
+                const border = suggested
+                    ? '1px solid rgba(247, 147, 26, 0.5)'
+                    : '1px solid var(--border)';
+                const bg = suggested
+                    ? 'rgba(247, 147, 26, 0.08)'
+                    : 'var(--card-bg)';
+                const badge = suggested
+                    ? '<span style="display: inline-block; background: rgba(247, 147, 26, 0.2); color: #f7931a; border: 1px solid rgba(247, 147, 26, 0.4); padding: 0.15rem 0.45rem; border-radius: 4px; font-size: 0.7rem; font-weight: 600; margin-right: 0.4rem;">\u2605 Suggested by BareBits</span>'
+                    : '';
 
                 return `
-                    <div style="background: var(--card-bg); border: 1px solid var(--border); border-radius: 8px; padding: 1rem; margin-bottom: 0.75rem;">
-                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem;">
+                    <div class="mint-discovery-card" data-mint-url="${escapeAttr(m.url)}" style="background: ${bg}; border: ${border}; border-radius: 8px; padding: 1rem; margin-bottom: 0.75rem;">
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem; gap: 0.5rem;">
                             <div style="font-size: 0.9rem;">
                                 ${renderDiscoveryStars(m.averageRating)}
                                 <span style="color: var(--text-secondary); font-size: 0.8rem; margin-left: 0.25rem;">(${m.reviewsCount || 0})</span>
@@ -7993,6 +8241,7 @@ $adminView = $rawAdminView;
                                 ${isOnline ? '\u25CF Online' : '\u25CB Offline'}
                             </span>
                         </div>
+                        <div style="margin-bottom: 0.35rem;">${badge}<span class="mint-country-slot" data-mint-url="${escapeAttr(m.url)}"></span></div>
                         <h4 style="margin: 0 0 0.25rem 0; font-size: 1rem;">${escapeHtml(name)}</h4>
                         <p style="font-size: 0.8rem; color: var(--text-secondary); margin: 0 0 0.5rem 0; word-break: break-all;">${escapeHtml(m.url)}</p>
                         <div style="font-size: 0.8rem; color: var(--text-secondary); margin-bottom: 0.75rem;">
@@ -8004,6 +8253,10 @@ $adminView = $rawAdminView;
             }).join('');
             listEl.querySelectorAll('button.select-discovered-mint').forEach(btn => {
                 btn.addEventListener('click', () => selectDiscoveredMint(btn.dataset.mintUrl));
+            });
+            listEl.querySelectorAll('.mint-discovery-card').forEach(card => {
+                const url = card.getAttribute('data-mint-url');
+                if (url) fetchCountryForCard(url, card);
             });
 
             const statusEl = document.getElementById('mint-discovery-status');

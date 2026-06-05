@@ -45,7 +45,8 @@ def test_mint_discovery_finds_mints(
     console_msgs: list[str] = []
     page.on("console", lambda m: console_msgs.append(f"[{m.type}] {m.text}"))
 
-    # Walk wizard to step 5 (mint URL).
+    # Walk wizard to step 5 (mint URL). Under the new step order, create-store
+    # funnels to auto-withdraw (step 9) → on-chain (step 8) → mint URL (5).
     page.goto(f"{payserver.url}/setup")
     page.check("#security_acknowledged")
     page.click("button[type=submit]")
@@ -54,6 +55,13 @@ def test_mint_discovery_finds_mints(
     page.click("button[type=submit]")
     page.fill("#store_name", "Disco Store")
     page.click("button[type=submit]")
+    page.wait_for_selector("#auto-withdraw-form")
+    page.locator(
+        'form:has(input[name="auto_withdraw_action"][value="skip"]) '
+        'button:has-text("Skip for now")'
+    ).click()
+    page.wait_for_selector("#onchain-form")
+    page.click("button:has-text('Skip for now')")
     page.wait_for_selector("#mint_url")
 
     # Trigger discovery + acknowledge disclaimer so the "Select" buttons enable
