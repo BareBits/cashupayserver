@@ -141,6 +141,10 @@ if (isset($_GET['api'])) {
             $autoMeltUseSwap = isset($store['auto_melt_use_swap'])
                 ? (int)$store['auto_melt_use_swap']
                 : SwapAutoMelt::INHERIT;
+            require_once __DIR__ . '/includes/lnurl_receive.php';
+            $lud21RawStored = array_key_exists('lnurl_supports_verify', $store)
+                ? $store['lnurl_supports_verify']
+                : null;
             $autoMelt = [
                 'address' => $store['auto_melt_address'] ?? '',
                 'enabled' => (bool)($store['auto_melt_enabled'] ?? 0),
@@ -150,6 +154,15 @@ if (isset($_GET['api'])) {
                 'siteSwapDefault' => SwapAutoMelt::siteDefault(),
                 'swapMinSats' => SwapAutoMelt::minSats(),
                 'swapMaxFeePct' => SwapAutoMelt::maxFeePct(),
+                // LUD-21 verify-URL support for the configured LN address:
+                // null = not probed / unreachable, 0 = unsupported (warn the
+                // operator that payments will route via the mint), 1 = ok.
+                'lud21Support' => $lud21RawStored === null ? null : (int)$lud21RawStored,
+                // Override-gate thresholds, displayed read-only so operators
+                // can reason about why a given invoice may not have taken
+                // the LNURL receive path. PHP-define-only by design.
+                'feeOverrideAmount' => (int)FEE_OVERRIDE_AMOUNT,
+                'feeOverrideForceAmount' => (int)FEE_OVERRIDE_FORCE_AMOUNT,
             ];
 
             $storeNotifications = [
@@ -1461,6 +1474,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         case 'save_auto_melt':
             Auth::requireAdmin();
             require_once __DIR__ . '/includes/swap/auto_melt.php';
+            require_once __DIR__ . '/includes/lnurl_receive.php';
             try {
                 $storeId = $_POST['store_id'] ?? '';
                 $address = $_POST['address'] ?? '';
@@ -1484,14 +1498,33 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     throw new Exception('Invalid Lightning address format');
                 }
 
+                // Probe LUD-21 support whenever an LN address is provided.
+                // Result drives the receive-rail decision in Invoice::create
+                // and (when 0) the operator-facing warning that lightning
+                // payments will route via the mint instead of direct-receive.
+                // Null on unreachable host — treated as "unknown, runtime
+                // probe will retry" rather than blocking the save.
+                $lud21Support = null;
+                if (!empty($address)) {
+                    try {
+                        $lud21Support = LnUrlReceive::probeLud21Support($address);
+                    } catch (Throwable $e) {
+                        error_log('[lnurl-receive] LUD-21 save-time probe threw: ' . $e->getMessage());
+                    }
+                }
+
                 Database::update('stores', [
                     'auto_melt_enabled' => $enabled,
                     'auto_melt_address' => $address ?: null,
                     'auto_melt_threshold' => $threshold,
                     'auto_melt_use_swap' => $modeOverride,
+                    'lnurl_supports_verify' => $lud21Support,
                 ], 'id = ?', [$storeId]);
 
-                echo json_encode(['success' => true]);
+                echo json_encode([
+                    'success' => true,
+                    'lnurl_supports_verify' => $lud21Support,
+                ]);
             } catch (Exception $e) {
                 http_response_code(400);
                 echo json_encode(['error' => $e->getMessage()]);
@@ -3890,6 +3923,20 @@ $adminView = $rawAdminView;
                                 <input type="text" class="form-input" id="auto-melt-address"
                                        placeholder="user@wallet.com">
                                 <p class="form-help">e.g., yourname@walletofsatoshi.com, yourname@blink.sv</p>
+                                <p class="form-help" id="auto-melt-lud21-warning"
+                                   style="display: none; color: var(--warning, #b07b00);">
+                                    This Lightning address host does not advertise a LUD-21 verify URL.
+                                    Incoming Lightning payments will route through the mint and then
+                                    auto-withdraw to this address (the normal two-hop flow) instead of
+                                    going directly to the address.
+                                </p>
+                                <p class="form-help" id="auto-melt-lud21-ok"
+                                   style="display: none; color: var(--success, #2d7a3a);">
+                                    This Lightning address host supports LUD-21 verify URLs. Incoming
+                                    Lightning payments will route directly to this address when fees
+                                    due are below
+                                    <strong id="auto-melt-fee-override-amount">5,000</strong> sats.
+                                </p>
                             </div>
 
                             <p class="form-help" id="auto-melt-swap-info" style="display: none;">
@@ -7538,6 +7585,14 @@ $adminView = $rawAdminView;
 
                 if (response.ok) {
                     showToast('Settings saved!', 'success');
+                    // Update the live LUD-21 warning from the save response so
+                    // the operator sees the probe result without a full reload.
+                    if (dashboardData && dashboardData.autoMelt) {
+                        dashboardData.autoMelt.lud21Support = (result && result.lnurl_supports_verify != null)
+                            ? Number(result.lnurl_supports_verify)
+                            : null;
+                        renderLud21Warning();
+                    }
                     // Reload dashboard so the effective-mode badge reflects the save.
                     if (typeof loadDashboard === 'function') loadDashboard();
                 } else {
@@ -7545,6 +7600,35 @@ $adminView = $rawAdminView;
                 }
             } catch (e) {
                 showToast('Failed to save settings', 'error');
+            }
+        }
+
+        /**
+         * Show the LUD-21 hint underneath the LN-address field, reflecting
+         * the most recent probe stored on the store. Three states:
+         *   null  — not probed (or host unreachable at save time): hide both
+         *   0     — probed and unsupported: show the warning
+         *   1     — probed and supported: show the ok hint
+         */
+        function renderLud21Warning() {
+            const am = dashboardData && dashboardData.autoMelt;
+            const warn = document.getElementById('auto-melt-lud21-warning');
+            const ok = document.getElementById('auto-melt-lud21-ok');
+            if (!warn || !ok) return;
+            warn.style.display = 'none';
+            ok.style.display = 'none';
+            if (!am) return;
+            // Hide the hint entirely when the operator picked swap mode —
+            // LNURL-receive doesn't apply.
+            if (am.mode === 'swap') return;
+            if (am.lud21Support === 0) {
+                warn.style.display = '';
+            } else if (am.lud21Support === 1) {
+                const feeAmtEl = document.getElementById('auto-melt-fee-override-amount');
+                if (feeAmtEl && am.feeOverrideAmount != null) {
+                    feeAmtEl.textContent = Number(am.feeOverrideAmount).toLocaleString();
+                }
+                ok.style.display = '';
             }
         }
 
@@ -7576,6 +7660,7 @@ $adminView = $rawAdminView;
             if (minSatsEl && am.swapMinSats != null) minSatsEl.textContent = Number(am.swapMinSats).toLocaleString();
             const maxPctEl = document.getElementById('auto-melt-mode-max-fee-pct');
             if (maxPctEl && am.swapMaxFeePct != null) maxPctEl.textContent = am.swapMaxFeePct + '%';
+            renderLud21Warning();
         }
 
         async function saveStoreNotifications() {

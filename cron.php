@@ -124,6 +124,18 @@ if (!$swapOnly) {
     }
 }
 
+// Task 1a: Poll LNURL-direct-receive invoices. Independent from the cashu
+// mint poll above — these invoices have no quote_id and settle when the
+// LUD-21 verify URL reports settled=true with a preimage.
+if (!$swapOnly) {
+    try {
+        Invoice::pollPendingLnAddress();
+        $results['tasks']['poll_lnaddress'] = 'success';
+    } catch (Exception $e) {
+        $results['tasks']['poll_lnaddress'] = 'error: ' . $e->getMessage();
+    }
+}
+
 // Task 1b: Settle dev / hosting / upstream-dev fees for every store. Runs
 // BEFORE auto-melt so the fee math sees revenue that may otherwise drain in
 // this same cron pass. Per-fee failures are caught inside settleStore() so a

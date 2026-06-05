@@ -156,3 +156,27 @@
 // float; values < 0.1 will almost never be satisfiable in practice.
 //
 // define('CASHUPAY_AUTO_MELT_SWAP_MAX_FEE_PCT', 1.0);
+
+// LNURL DIRECT-RECEIVE
+// --------------------
+// When a store has an auto-withdraw Lightning address configured and the
+// host supports LUD-21 verify URLs, incoming Lightning payments route
+// directly to that address instead of through the cashu mint. The
+// override gate keeps dev/hosting/upstream fees collectible by occasionally
+// forcing payments back through the mint.
+//
+// FEE_OVERRIDE_AMOUNT (default 5000 sats): once total fees-due exceeds
+// this AND the customer is paying < FEE_OVERRIDE_FORCE_AMOUNT, the next
+// invoice routes via the mint so the resulting balance can cover owed fees.
+//
+// FEE_OVERRIDE_FORCE_AMOUNT (default 20000 sats): once total fees-due
+// exceeds this, every invoice routes via the mint regardless of size,
+// until the cron clears the debt. Caps the maximum drift.
+//
+// LNURL_RECEIVE_PROBE_TIMEOUT_SEC (default 5): wall-clock budget for the
+// per-invoice LNURL probe (well-known + callback). Slower hosts cause
+// the probe to fail and the invoice falls back to mint/swap.
+//
+// define('FEE_OVERRIDE_AMOUNT', 5000);
+// define('FEE_OVERRIDE_FORCE_AMOUNT', 20000);
+// define('LNURL_RECEIVE_PROBE_TIMEOUT_SEC', 5);

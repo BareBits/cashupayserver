@@ -917,6 +917,37 @@ HTACCESS;
             $pdo->exec("CREATE INDEX idx_swap_quote_history_store_time ON swap_quote_history(store_id, fetched_at DESC);");
         }
 
+        // LNURL direct-receive: route incoming LN payments straight to the
+        // auto-withdraw LN address when the host supports LUD-21 verify URLs,
+        // bypassing both the cashu mint and submarine swap. lnurl_verify_url
+        // is what we poll to detect settlement; lnurl_preimage is the
+        // cryptographic proof the verify URL returned on settled=true.
+        if (!self::columnExists($pdo, 'invoices', 'lnurl_verify_url')) {
+            $pdo->exec("ALTER TABLE invoices ADD COLUMN lnurl_verify_url TEXT DEFAULT NULL");
+        }
+        if (!self::columnExists($pdo, 'invoices', 'lnurl_preimage')) {
+            $pdo->exec("ALTER TABLE invoices ADD COLUMN lnurl_preimage TEXT DEFAULT NULL");
+        }
+        // Set on mint-rail invoices that landed on the mint rail BECAUSE the
+        // override gate fired (fees-due exceeded threshold). On settlement,
+        // these trigger immediate DevFee::settleStore + auto-melt so that
+        // accumulated owed fees clear without waiting for cron.
+        if (!self::columnExists($pdo, 'invoices', 'lnurl_override_reason')) {
+            $pdo->exec("ALTER TABLE invoices ADD COLUMN lnurl_override_reason TEXT DEFAULT NULL");
+        }
+        // Cached at save-time admin probe of the LN-address host's LUD-21
+        // support. NULL = unknown / not probed, 0 = no verify URL field
+        // (warn the operator), 1 = verify URL field present. Runtime decisions
+        // re-probe anyway since host config can drift.
+        if (!self::columnExists($pdo, 'stores', 'lnurl_supports_verify')) {
+            $pdo->exec("ALTER TABLE stores ADD COLUMN lnurl_supports_verify INTEGER DEFAULT NULL");
+        }
+        if (!self::indexExists($pdo, 'idx_invoices_lnaddress_pending')) {
+            $pdo->exec(
+                "CREATE INDEX idx_invoices_lnaddress_pending ON invoices(status, payment_rail)"
+            );
+        }
+
         // Drop the legacy users.pin_hash column (PIN feature removed). Uses
         // the SQLite table-rebuild dance for compatibility with SQLite < 3.35.
         if (self::columnExists($pdo, 'users', 'pin_hash')) {

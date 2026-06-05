@@ -19,6 +19,7 @@ require_once __DIR__ . '/swap/config.php';
 require_once __DIR__ . '/swap/quote_fetcher.php';
 require_once __DIR__ . '/crypto/secp256k1.php';
 require_once __DIR__ . '/crypto/taproot.php';
+require_once __DIR__ . '/lnurl_receive.php';
 
 use Cashu\Wallet;
 use Cashu\WalletStorage;
@@ -69,10 +70,65 @@ class Invoice {
             $exchangeRate = ExchangeRates::getBtcPrice($currency, $primaryProvider, $secondaryProvider);
         }
 
+        // ---- LNURL direct-receive path: route LN payment straight to the
+        // merchant's auto-withdraw LN address when the host supports LUD-21
+        // (verify URL) so we can detect settlement without running the LN
+        // node ourselves. Wins over swap and mint when eligible. ----
+        $lnurlAttempt = null;          // ['bolt11','verify_url','amount_sats'] on success
+        $lnurlOverrideReason = null;   // set when override-gate fired; recorded on the fallback invoice
+        $lnAutoMeltEnabled = (int)($store['auto_melt_enabled'] ?? 0) === 1;
+        $lnAutoMeltAddress = trim((string)($store['auto_melt_address'] ?? ''));
+        $lnAddressLooksValid = $lnAutoMeltAddress !== ''
+            && (bool)preg_match('/^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$/', $lnAutoMeltAddress);
+        if ($lnAutoMeltEnabled && $lnAddressLooksValid) {
+            $lnurlTargetSats = (int) ExchangeRates::convertToSats((string)$amount, $currency, 'sat');
+            $feesDueSats = LnUrlReceive::feesDueSats($storeId);
+            $decision = LnUrlReceive::shouldOverride(
+                $feesDueSats, $lnurlTargetSats,
+                (int)FEE_OVERRIDE_AMOUNT, (int)FEE_OVERRIDE_FORCE_AMOUNT
+            );
+            // Log every routing decision so the override mechanism is
+            // auditable from production logs — both fired and skipped cases.
+            error_log(sprintf(
+                '[lnurl-override] store=%s invoice_sats=%d fees_due_sats=%d override=%s reason=%s thresholds=%d/%d',
+                $storeId, $lnurlTargetSats, $feesDueSats,
+                $decision['override'] ? '1' : '0',
+                $decision['reason'],
+                (int)FEE_OVERRIDE_AMOUNT, (int)FEE_OVERRIDE_FORCE_AMOUNT
+            ));
+            if ($decision['override']) {
+                // Skip LNURL this invoice and remember why; the mint-rail
+                // path below will record this on the invoice so settlement
+                // can fire the immediate-settle-and-forward handler.
+                $lnurlOverrideReason = $decision['reason'];
+            } elseif ($lnurlTargetSats > 0) {
+                try {
+                    $probed = LnUrlReceive::probeAndFetchInvoice(
+                        $lnAutoMeltAddress, $lnurlTargetSats
+                    );
+                } catch (Throwable $e) {
+                    error_log("[lnurl-receive] probe threw for store {$storeId}: " . $e->getMessage());
+                    $probed = null;
+                }
+                if ($probed !== null) {
+                    $lnurlAttempt = [
+                        'bolt11' => $probed['bolt11'],
+                        'verify_url' => $probed['verify_url'],
+                        'amount_sats' => $lnurlTargetSats,
+                    ];
+                } else {
+                    error_log(sprintf(
+                        '[lnurl-receive] probe failed for store=%s address=%s amount_sats=%d; falling back',
+                        $storeId, $lnAutoMeltAddress, $lnurlTargetSats
+                    ));
+                }
+            }
+        }
+
         // ---- Submarine-swap path: replaces the cashu mint with a non-custodial
         // LN→on-chain swap that settles directly to the merchant's xpub. ----
         $swapAttempt = null; // populated by self::trySwapCreate on success
-        if (SwapsConfig::isEnabledForStore($storeId) && $onchainConfigured) {
+        if ($lnurlAttempt === null && SwapsConfig::isEnabledForStore($storeId) && $onchainConfigured) {
             // Target = what the merchant wants to receive on-chain in sats.
             $targetSats = ExchangeRates::convertToSats((string)$amount, $currency, 'sat');
             $swapFailures = []; // per-provider reasons, populated by trySwapCreate
@@ -96,7 +152,7 @@ class Invoice {
         $quote = null;
         $usedMintUrl = null;
         $amountInMintUnit = null;
-        if ($cashuConfigured && $swapAttempt === null) {
+        if ($cashuConfigured && $swapAttempt === null && $lnurlAttempt === null) {
             $mintUnit = $store['mint_unit'];
             $amountInMintUnit = ExchangeRates::convertToMintUnit(
                 $amount, $currency, $mintUnit, $exchangeFee, $primaryProvider, $secondaryProvider
@@ -141,7 +197,7 @@ class Invoice {
         $onchainAmountSat = null;
         $onchainAmountTweakSats = null;
         $onchainCreatedTipHeight = null;
-        if ($onchainConfigured && $swapAttempt === null) {
+        if ($onchainConfigured && $swapAttempt === null && $lnurlAttempt === null) {
             $baseAmountSat = (int)ExchangeRates::convertToSats((string)$amount, $currency, 'sat');
             try {
                 $allocation = OnchainPayments::allocateAddress($storeId, $baseAmountSat);
@@ -175,7 +231,15 @@ class Invoice {
         $now = Database::timestamp();
 
         // Decide payment_rail + final field values
-        if ($swapAttempt !== null) {
+        $lnurlVerifyUrl = null;
+        if ($lnurlAttempt !== null) {
+            $paymentRail = 'lnaddress';
+            $bolt11Final = $lnurlAttempt['bolt11'];
+            $mintUrlFinal = null;
+            $quoteIdFinal = null;
+            $amountSatsFinal = $lnurlAttempt['amount_sats'];
+            $lnurlVerifyUrl = $lnurlAttempt['verify_url'];
+        } elseif ($swapAttempt !== null) {
             $paymentRail = 'swap';
             $bolt11Final = $swapAttempt['swap']->invoice;
             $mintUrlFinal = null;
@@ -207,6 +271,8 @@ class Invoice {
             'onchain_amount_tweak_sats' => $onchainAmountTweakSats,
             'onchain_created_tip_height' => $onchainCreatedTipHeight,
             'payment_rail' => $paymentRail,
+            'lnurl_verify_url' => $lnurlVerifyUrl,
+            'lnurl_override_reason' => $lnurlOverrideReason,
             'metadata' => $metadata ? json_encode($metadata) : null,
             'checkout_config' => $checkout ? json_encode($checkout) : null,
             'created_at' => $now,
@@ -596,11 +662,159 @@ class Invoice {
 
             self::flushWebhookQueue();
             NotificationSender::queueInvoicePaid($updatedInvoice);
+            self::maybeFireOverrideSettled($updatedInvoice);
         } catch (Exception $e) {
             Database::rollback();
             self::clearWebhookQueue();
             throw $e;
         }
+    }
+
+    /**
+     * Mint-rail invoices that landed on the mint rail because the LNURL
+     * override gate fired (lnurl_override_reason IS NOT NULL) need to
+     * immediately settle owed fees + auto-melt the remainder to the
+     * merchant's LN address. See {@see LnUrlReceive::handleOverrideSettled}.
+     *
+     * Best-effort wrapper around the handler — any failure is logged but
+     * doesn't propagate, because the customer invoice is already paid and
+     * the cron's regular DevFee::settleStore + auto-melt loop will catch up
+     * on the next tick if this synchronous attempt fails.
+     */
+    private static function maybeFireOverrideSettled(?array $invoice): void {
+        if ($invoice === null) {
+            return;
+        }
+        if (empty($invoice['lnurl_override_reason'])) {
+            return;
+        }
+        if (($invoice['settled_rail'] ?? null) !== 'mint') {
+            return;
+        }
+        try {
+            LnUrlReceive::handleOverrideSettled((string)$invoice['id']);
+        } catch (Throwable $e) {
+            error_log('[lnurl-override] handler failed for invoice '
+                . ($invoice['id'] ?? '?') . ': ' . $e->getMessage());
+        }
+    }
+
+    /**
+     * Poll LUD-21 verify URLs for LNURL-direct-receive invoices. Mirrors
+     * {@see pollPendingQuotes}: rate-limited via last_polled_at, batched, and
+     * settles the invoice with payment_rail='lnaddress' on settled=true.
+     *
+     * Unlike the mint path, no tokens get minted into our wallet — the
+     * payment lands directly at the merchant's LN address. We just record
+     * the settlement (with preimage for cryptographic proof) and fire the
+     * InvoiceSettled webhook.
+     */
+    public static function pollPendingLnAddress(int $minInterval = 30, int $batchLimit = 10): void {
+        self::markExpiredInvoices();
+        $now = time();
+
+        $pending = Database::fetchAll(
+            "SELECT * FROM invoices
+              WHERE status = 'New'
+                AND payment_rail = 'lnaddress'
+                AND lnurl_verify_url IS NOT NULL
+                AND expiration_time > ?
+                AND (last_polled_at IS NULL OR (? - last_polled_at) >= ?)
+              ORDER BY
+                  CASE WHEN last_polled_at IS NULL THEN 0 ELSE 1 END,
+                  last_polled_at ASC
+              LIMIT ?",
+            [$now, $now, $minInterval, $batchLimit]
+        );
+
+        if (empty($pending)) {
+            return;
+        }
+
+        foreach ($pending as $invoice) {
+            try {
+                Database::update('invoices', ['last_polled_at' => $now], 'id = ?', [$invoice['id']]);
+                $result = LnUrlReceive::pollVerifyUrl((string)$invoice['lnurl_verify_url']);
+                if ($result['state'] === 'paid') {
+                    self::markLnAddressPaid($invoice, $result['preimage']);
+                }
+            } catch (Throwable $e) {
+                error_log("[lnurl-receive] poll failed for invoice {$invoice['id']}: " . $e->getMessage());
+            }
+        }
+    }
+
+    /**
+     * Single-invoice variant of {@see pollPendingLnAddress} for the live
+     * payment-page poll. No rate-limit gate; the customer's tab is already
+     * waiting for us.
+     */
+    public static function pollSingleLnAddress(string $invoiceId): void {
+        $invoice = self::getById($invoiceId);
+        if (!$invoice) {
+            return;
+        }
+        if (($invoice['payment_rail'] ?? null) !== 'lnaddress') {
+            return;
+        }
+        if (!in_array($invoice['status'], ['New', 'Processing'], true)) {
+            return;
+        }
+        if ($invoice['status'] === 'New' && (int)$invoice['expiration_time'] < time()) {
+            self::updateStatus((string)$invoice['id'], 'Expired');
+            return;
+        }
+        if (empty($invoice['lnurl_verify_url'])) {
+            return;
+        }
+        try {
+            Database::update('invoices', ['last_polled_at' => time()], 'id = ?', [$invoice['id']]);
+            $result = LnUrlReceive::pollVerifyUrl((string)$invoice['lnurl_verify_url']);
+            if ($result['state'] === 'paid') {
+                self::markLnAddressPaid($invoice, $result['preimage']);
+            }
+        } catch (Throwable $e) {
+            error_log("[lnurl-receive] single poll failed for {$invoiceId}: " . $e->getMessage());
+        }
+    }
+
+    /**
+     * Mark an LNURL-rail invoice as Settled. Stores the preimage from the
+     * LUD-21 verify response as cryptographic settlement proof, then fires
+     * webhooks + notification queue parallel to the mint-rail settlement
+     * path. No minting because the funds went straight to the merchant LN
+     * address — there are no proofs in our wallet.
+     */
+    private static function markLnAddressPaid(array $invoice, ?string $preimage): void {
+        Database::beginTransaction();
+        try {
+            Database::update(
+                'invoices',
+                [
+                    'status' => 'Settled',
+                    'paid_at' => time(),
+                    'settled_rail' => 'lnaddress',
+                    'lnurl_preimage' => $preimage ?: null,
+                ],
+                'id = ?',
+                [$invoice['id']]
+            );
+            Database::commit();
+        } catch (Throwable $e) {
+            Database::rollback();
+            throw $e;
+        }
+
+        $updated = self::getById((string)$invoice['id']);
+        if ($updated !== null) {
+            WebhookSender::fireEvent($invoice['store_id'], 'InvoiceSettled', $updated);
+            NotificationSender::queueInvoicePaid($updated);
+        }
+        error_log(sprintf(
+            '[lnurl-receive] invoice=%s store=%s settled via lnaddress (preimage=%s)',
+            $invoice['id'], $invoice['store_id'],
+            $preimage ? substr($preimage, 0, 8) . '…' : 'missing'
+        ));
     }
 
     /**
@@ -809,6 +1023,14 @@ class Invoice {
             return;
         }
 
+        // LNURL direct-receive: poll the LUD-21 verify URL instead of any
+        // mint quote or on-chain address. The invoice has no quote_id and
+        // no onchain_address by construction; nothing else to check.
+        if (($invoice['payment_rail'] ?? null) === 'lnaddress') {
+            self::pollSingleLnAddress($invoiceId);
+            return;
+        }
+
         // Best-effort on-chain poll first — if the invoice has an on-chain
         // address, this can transition state independent of any Cashu quote.
         if (!empty($invoice['onchain_address'])) {
@@ -880,6 +1102,7 @@ class Invoice {
                     $updatedInvoice = self::getById($invoice['id']);
                     WebhookSender::fireEvent($invoice['store_id'], 'InvoiceSettled', $updatedInvoice);
                     NotificationSender::queueInvoicePaid($updatedInvoice);
+                    self::maybeFireOverrideSettled($updatedInvoice);
                     return;
                 } catch (Exception $e) {
                     Database::rollback();
@@ -923,6 +1146,7 @@ class Invoice {
                         $updatedInvoice = self::getById($invoice['id']);
                         WebhookSender::fireEvent($invoice['store_id'], 'InvoiceSettled', $updatedInvoice);
                         NotificationSender::queueInvoicePaid($updatedInvoice);
+                        self::maybeFireOverrideSettled($updatedInvoice);
 
                         error_log("CashuPayServer: Recovered orphaned invoice {$invoice['id']}");
                     }
