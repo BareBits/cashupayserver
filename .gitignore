@@ -19,5 +19,7 @@ tests/.tmp/**
 tests/.venv/**
 tests/.venv-nutshell/**
 tests/.pytest_cache/**
+tests/.playwright/**
 tests/**/__pycache__/**
 user_config.php
+BUILD_INFO

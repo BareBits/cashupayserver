@@ -181,6 +181,15 @@ def configure_swaps(db_path: Path) -> None:
 def start_payserver(data_dir: Path, port: int) -> subprocess.Popen:
     env = os.environ.copy()
     env["CASHUPAY_DATA_DIR"] = str(data_dir)
+    # Kill the auto-updater for the duration of this script. Without this
+    # the updater can overlay the working tree mid-run and silently revert
+    # in-progress edits. Honoured by includes/updater.php::isDisabledForTests
+    # via either the env var OR the sentinel file in CASHUPAY_DATA_DIR.
+    env["CASHUPAY_UPDATER_DISABLED"] = "1"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    (data_dir / ".updater_disabled").write_text(
+        "auto-updates disabled by tests/scripts/swap_e2e.py\n"
+    )
     # Database::getDataDir() reads from `defined('CASHUPAY_DATA_DIR')`, not
     # getenv(). PHP's CGI sees env vars but doesn't auto-define constants from
     # them. So write a tiny router wrapper that defines the constant from the
