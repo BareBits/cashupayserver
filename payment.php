@@ -812,28 +812,8 @@ $baseUrl = Config::getBaseUrl();
         const invoiceId = <?= json_encode($invoiceId) ?>;
         const expirationTime = <?= (int)$invoice['expiration_time'] ?>;
         const redirectUrl = <?= json_encode($redirectUrl) ?>;
-        const redirectAuto = <?= json_encode($redirectAuto) ?>;
         const payerReceiptOffered = <?= json_encode($payerReceiptOffered) ?>;
         let currentStatus = <?= json_encode($invoice['status']) ?>;
-
-        // Redirect coordination. When the receipt form is shown, we hold the
-        // auto-redirect off until the payer either submits a receipt request
-        // or clicks "No thanks" — otherwise the page would whisk them away
-        // before they could opt in.
-        let redirectHeld = false;
-        let redirectFired = false;
-        function scheduleRedirect(delayMs) {
-            if (!redirectUrl || !redirectAuto) return;
-            if (redirectFired) return;
-            if (redirectHeld) return;
-            redirectFired = true;
-            setTimeout(() => { window.location.href = redirectUrl; }, delayMs);
-        }
-        function holdRedirect() { redirectHeld = true; }
-        function releaseRedirect() {
-            redirectHeld = false;
-            scheduleRedirect(800);
-        }
 
         function renderQR(targetId, data) {
             const target = document.getElementById(targetId);
@@ -992,27 +972,27 @@ $baseUrl = Config::getBaseUrl();
             }
         }
 
-        // Settled-state entry point. Decides whether to hold the auto-redirect
-        // while the payer fills in the receipt form, or fire it on the normal
-        // 2-second timer. Called both at page load and on poll transitions.
+        // Settled-state entry point. Wires up the receipt form (if offered)
+        // so the payer can opt into a receipt. We deliberately do NOT auto-
+        // redirect: the success modal stays visible until the payer clicks
+        // the "Continue to Store" link (when the merchant configured one) or
+        // navigates away themselves. Auto-redirect used to flash the modal
+        // for ~2 seconds, which made the invoice ID + note unreadable.
         function onSettled() {
             if (payerReceiptOffered) {
-                holdRedirect();
                 wireReceiptForm();
-            } else {
-                scheduleRedirect(2000);
             }
         }
 
         // Wire up the receipt form: submit POSTs to this same URL with
-        // action=send_receipt, skip just releases the held redirect. Both
-        // paths end with the page either being replaced (success → redirect)
-        // or settled into a stable post-action state (no redirect URL).
+        // action=send_receipt. "No thanks" just hides the form so the
+        // modal isn't cluttered. Neither path navigates the user away —
+        // they leave via the "Continue to Store" link (if present).
         let receiptFormWired = false;
         function wireReceiptForm() {
             if (receiptFormWired) return;
             const form = document.getElementById('receipt-form');
-            if (!form) { scheduleRedirect(2000); return; }
+            if (!form) return;
             receiptFormWired = true;
 
             const submitBtn = document.getElementById('receipt-submit');
@@ -1026,7 +1006,9 @@ $baseUrl = Config::getBaseUrl();
                 if (kind) statusEl.classList.add(kind);
             }
 
-            skipBtn.addEventListener('click', () => releaseRedirect());
+            skipBtn.addEventListener('click', () => {
+                form.style.display = 'none';
+            });
 
             form.addEventListener('submit', async (e) => {
                 e.preventDefault();
@@ -1050,11 +1032,6 @@ $baseUrl = Config::getBaseUrl();
                         setStatus('Receipt queued — check your inbox.', 'success');
                         emailInput.disabled = true;
                         submitBtn.style.display = 'none';
-                        // Leave the redirect held: the "Continue to Store"
-                        // button is right there if they want it, but we don't
-                        // want to whisk them away before they see the
-                        // confirmation. If there is no Continue button they
-                        // simply stay on this page.
                         skipBtn.style.display = 'none';
                     } else {
                         setStatus(data.error || 'Could not send receipt.', 'error');

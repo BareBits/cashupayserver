@@ -26,6 +26,7 @@ $fixture = updater_fixture_start('main', [
 
 Updater::$installRootOverride = $fixture['installRoot'];
 Updater::$releaseApiUrlBase = $fixture['baseUrl'];
+Updater::$autoUpdateEnabledOverride = true;
 Config::set('update_channel', 'main');
 Config::set('updater_last_check', 0);
 
@@ -55,5 +56,6 @@ assert_eq('cronsha-' . str_repeat('b', 35), $info['COMMIT_SHA'], 'BUILD_INFO adv
 
 Updater::$installRootOverride = null;
 Updater::$releaseApiUrlBase = null;
+Updater::$autoUpdateEnabledOverride = null;
 
 echo "ok\n";

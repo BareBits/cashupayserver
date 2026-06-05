@@ -86,11 +86,18 @@
 // This sets the deployment-time default. The admin can override it at
 // runtime from the Settings page; once overridden, the database value wins.
 //
-// Auto-update is fully automatic on the chosen channel. There is no kill
-// switch — operators who don't want auto-update should run the WordPress
-// plugin build instead (auto-update is skipped in WP mode).
-//
 // define('CASHUPAY_UPDATE_CHANNEL', 'main');
+
+// CASHUPAY_AUTO_UPDATE_ENABLED — explicit opt-in for the auto-updater.
+// Defaults to false: fresh installs do NOT auto-update. To enable cron-driven
+// updates on this install, set this constant to true (or set the env var of
+// the same name to a non-empty, non-"0" string). The updater respects the
+// CASHUPAY_UPDATE_CHANNEL setting above when fetching.
+//
+// Operators who don't want auto-update can leave this alone, or run the
+// WordPress plugin build (auto-update is skipped in WP mode regardless).
+//
+// define('CASHUPAY_AUTO_UPDATE_ENABLED', true);
 
 // =============================================================================
 // EMAIL NOTIFICATIONS — SMTP (optional)
