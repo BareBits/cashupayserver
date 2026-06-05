@@ -601,6 +601,53 @@ if (isset($_GET['api'])) {
             echo json_encode(['mints' => $out]);
             break;
 
+        case 'stuck_funds_summary':
+            // Per-store breakdown of sats stranded in mints with an active
+            // withdrawal-failure flag, plus how much has been absorbed against
+            // each owed fee bucket. Drives the Stuck Funds admin card.
+            Auth::requireAdmin();
+            require_once __DIR__ . '/includes/stuck_funds.php';
+            require_once __DIR__ . '/includes/dev_fee.php';
+            $rows = Database::fetchAll(
+                "SELECT id, name FROM stores WHERE mint_url IS NOT NULL AND seed_phrase IS NOT NULL"
+            );
+            $storesOut = [];
+            $totalStuckSats = 0;
+            $totalAbsorbedSats = 0;
+            foreach ($rows as $r) {
+                $owed = DevFee::computeOwed($r['id']);
+                $perMint = $owed['stuck_per_mint'] ?? [];
+                $stuckTotal = (int)($owed['stuck_total_sats'] ?? 0);
+                if ($stuckTotal === 0 && empty($perMint)) {
+                    continue;
+                }
+                $mintsOut = [];
+                foreach ($perMint as $mintUrl => $sats) {
+                    $mintsOut[] = ['mintUrl' => $mintUrl, 'stuckSats' => (int)$sats];
+                }
+                $storesOut[] = [
+                    'storeId' => $r['id'],
+                    'storeName' => $r['name'],
+                    'stuckTotalSats' => $stuckTotal,
+                    'absorbedTotalSats' => (int)($owed['stuck_absorbed_total'] ?? 0),
+                    'absorbedDevSats' => (int)($owed['stuck_absorbed_dev'] ?? 0),
+                    'absorbedUpstreamSats' => (int)($owed['stuck_absorbed_upstream'] ?? 0),
+                    'absorbedHostingSats' => (int)($owed['stuck_absorbed_hosting'] ?? 0),
+                    'uncoveredSats' => (int)($owed['stuck_uncovered'] ?? 0),
+                    'mints' => $mintsOut,
+                ];
+                $totalStuckSats += $stuckTotal;
+                $totalAbsorbedSats += (int)($owed['stuck_absorbed_total'] ?? 0);
+            }
+            echo json_encode([
+                'stores' => $storesOut,
+                'totals' => [
+                    'stuckSats' => $totalStuckSats,
+                    'absorbedSats' => $totalAbsorbedSats,
+                ],
+            ]);
+            break;
+
         case 'get_mint_diagnostic':
             Auth::requireAdmin();
             require_once __DIR__ . '/includes/mint_reliability.php';
@@ -4471,6 +4518,28 @@ $adminView = $rawAdminView;
                 </div>
                 <?php endif; ?>
 
+                <!-- Stuck Funds card: admin-only.
+                     Hidden when no store has any sats stranded in a mint with
+                     an active withdrawal-failure flag. -->
+                <div class="card hidden" id="card-stuck-funds" data-admin-only="true">
+                    <div class="card-header">
+                        <div class="card-title">Stuck Funds</div>
+                    </div>
+                    <div class="card-body">
+                        <p style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 0.75rem;">
+                            Sats currently held in a mint whose last withdrawal attempt failed.
+                            While funds are stuck, the equivalent amount is deducted from owed dev
+                            fees (then upstream, then hosting) so any unrecoverable loss comes out
+                            of the operator share, not the merchant. Once a withdrawal succeeds
+                            against that mint, the deduction stops automatically.
+                        </p>
+                        <div id="stuck-funds-totals" style="margin-bottom: 0.75rem; font-size: 0.85rem;"></div>
+                        <div id="stuck-funds-list">
+                            <p style="color: var(--text-secondary); font-size: 0.85rem;">Loading…</p>
+                        </div>
+                    </div>
+                </div>
+
                 <!-- Mint Reliability card: admin-only -->
                 <div class="card hidden" id="card-mint-reliability" data-admin-only="true">
                     <div class="card-header">
@@ -5428,6 +5497,7 @@ $adminView = $rawAdminView;
                 renderAccountCard();
                 if (phpUser.role === 'admin') {
                     renderUsersCard();
+                    loadStuckFundsCard();
                     loadReliabilityCard();
                     loadTrustedMintsCard();
                     loadCronUrl();
@@ -8674,6 +8744,55 @@ $adminView = $rawAdminView;
                 loadReliabilityCard();
             } catch (e) {
                 showToast('Failed to reset counters', 'error');
+            }
+        }
+
+        async function loadStuckFundsCard() {
+            const card = document.getElementById('card-stuck-funds');
+            if (!card) return;
+            try {
+                const r = await fetch(adminUrl + '?api=stuck_funds_summary', { credentials: 'same-origin' });
+                if (!r.ok) { card.classList.add('hidden'); return; }
+                const data = await r.json();
+                const stores = Array.isArray(data.stores) ? data.stores : [];
+                if (stores.length === 0) {
+                    // No store has any stuck balance — hide the card entirely.
+                    card.classList.add('hidden');
+                    return;
+                }
+                const totals = data.totals || {};
+                document.getElementById('stuck-funds-totals').innerHTML =
+                    '<strong>' + Number(totals.stuckSats || 0).toLocaleString() + '</strong> sats stuck across all stores &middot; ' +
+                    '<strong>' + Number(totals.absorbedSats || 0).toLocaleString() + '</strong> sats absorbed against owed fees';
+                const list = document.getElementById('stuck-funds-list');
+                list.innerHTML = stores.map(s => {
+                    const mintsHtml = (s.mints || []).map(m => {
+                        return '<div style="font-size: 0.75rem; color: var(--text-secondary); margin-top: 0.2rem;">'
+                            + '<code style="font-size: 0.7rem; word-break: break-all;">' + escapeHtml(m.mintUrl) + '</code>'
+                            + ' &middot; ' + Number(m.stuckSats || 0).toLocaleString() + ' sats stuck'
+                            + '</div>';
+                    }).join('');
+                    const uncovered = Number(s.uncoveredSats || 0);
+                    const uncoveredNote = uncovered > 0
+                        ? ' &middot; <span style="color: var(--text-secondary);">' + uncovered.toLocaleString() + ' sats exceeds owed fees</span>'
+                        : '';
+                    return `
+                        <div style="padding: 0.6rem; background: rgba(0,0,0,0.2); border-radius: 6px; margin-bottom: 0.5rem;">
+                            <div style="font-weight: 600; font-size: 0.9rem;">${escapeHtml(s.storeName || s.storeId)}</div>
+                            <div style="font-size: 0.8rem; color: var(--text-secondary); margin-top: 0.2rem;">
+                                ${Number(s.stuckTotalSats || 0).toLocaleString()} sats stuck &middot;
+                                ${Number(s.absorbedTotalSats || 0).toLocaleString()} sats absorbed
+                                (${Number(s.absorbedDevSats || 0).toLocaleString()} dev,
+                                ${Number(s.absorbedUpstreamSats || 0).toLocaleString()} upstream,
+                                ${Number(s.absorbedHostingSats || 0).toLocaleString()} hosting)${uncoveredNote}
+                            </div>
+                            ${mintsHtml}
+                        </div>
+                    `;
+                }).join('');
+                card.classList.remove('hidden');
+            } catch (e) {
+                card.classList.add('hidden');
             }
         }
 

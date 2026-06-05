@@ -138,7 +138,7 @@ class LightningAddress {
      */
     private static function recordMeltFailure(
         ?string $mintUrl,
-        string $address,
+        ?string $address,
         string $storeId,
         Exception $e,
         string $stage,
@@ -429,17 +429,44 @@ class LightningAddress {
     }
 
     /**
-     * Melt tokens to a BOLT-11 invoice
+     * Melt tokens to a BOLT-11 invoice.
+     *
+     * Failures here flow through the mint reliability tracker on the same
+     * terms as {@see meltToAddress}: a manual BOLT-11 melt (or a dev-fee
+     * settlement, which also goes through this method) that fails counts
+     * toward the mint's withdrawal-failure state and therefore toward stuck-
+     * fund detection. Insufficient balance is filtered out inside
+     * MintReliability.
      *
      * @param string $storeId Store ID for wallet access
      * @param string $bolt11 The BOLT-11 invoice
      * @param int|null $expectedAmount Optional expected amount (for amountless invoices)
      */
     public static function meltToBolt11(string $storeId, string $bolt11, ?int $expectedAmount = null): array {
-        $wallet = Invoice::getWalletInstance($storeId);
+        $mintUrl = Config::getStoreMintUrl($storeId);
+        $wallet = null;
+        $meltQuoteId = null;
 
-        // Request melt quote
-        $meltQuote = $wallet->requestMeltQuote($bolt11);
+        // BOLT-11 is a one-shot invoice, not a reusable address — pass null
+        // so the reliability tracker doesn't use it for cross-mint
+        // differential resolution (which is keyed on stable Lightning
+        // addresses).
+        $addressForRecord = null;
+
+        try {
+            $wallet = Invoice::getWalletInstance($storeId);
+        } catch (Exception $e) {
+            self::recordMeltFailure($mintUrl, $addressForRecord, $storeId, $e, 'requestMeltQuote', null, null);
+            throw $e;
+        }
+
+        try {
+            $meltQuote = $wallet->requestMeltQuote($bolt11);
+            $meltQuoteId = $meltQuote->quote ?? null;
+        } catch (Exception $e) {
+            self::recordMeltFailure($mintUrl, $addressForRecord, $storeId, $e, 'requestMeltQuote', null, $wallet);
+            throw $e;
+        }
 
         $totalNeeded = $meltQuote->amount + $meltQuote->feeReserve;
 
@@ -450,6 +477,7 @@ class LightningAddress {
         $mintUnit = Config::getStoreMintUnit($storeId);
 
         if ($balance < $totalNeeded) {
+            // Pre-flight; not a mint or wallet fault — see MintReliability.
             throw new Exception("Insufficient balance. Have: {$balance} {$mintUnit}, Need: {$totalNeeded} {$mintUnit}");
         }
 
@@ -457,13 +485,24 @@ class LightningAddress {
         $selectedProofs = Wallet::selectProofs($proofs, $totalNeeded);
 
         // Execute melt
-        $result = $wallet->melt($meltQuote->quote, $selectedProofs);
+        try {
+            $result = $wallet->melt($meltQuote->quote, $selectedProofs);
+        } catch (Exception $e) {
+            self::recordMeltFailure($mintUrl, $addressForRecord, $storeId, $e, 'melt', $meltQuoteId, $wallet);
+            throw $e;
+        }
 
         if (!$result['paid']) {
-            if ($result['pending'] ?? false) {
-                throw new Exception("Lightning payment pending - proofs marked as pending for recovery");
-            }
-            throw new Exception("Lightning payment failed");
+            $msg = ($result['pending'] ?? false)
+                ? 'Lightning payment pending - proofs marked as pending for recovery'
+                : 'Lightning payment failed';
+            $e = new Exception($msg);
+            self::recordMeltFailure($mintUrl, $addressForRecord, $storeId, $e, 'melt', $meltQuoteId, $wallet);
+            throw $e;
+        }
+
+        if ($mintUrl !== null && $mintUrl !== '') {
+            MintReliability::recordWithdrawSuccess($mintUrl, null, $storeId);
         }
 
         return [

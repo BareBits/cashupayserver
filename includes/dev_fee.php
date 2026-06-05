@@ -37,6 +37,7 @@ require_once __DIR__ . '/invoice.php';
 require_once __DIR__ . '/rates.php';
 require_once __DIR__ . '/lightning_address.php';
 require_once __DIR__ . '/free_trial.php';
+require_once __DIR__ . '/stuck_funds.php';
 require_once __DIR__ . '/../cashu-wallet-php/CashuWallet.php';
 
 use Cashu\Wallet;
@@ -233,16 +234,34 @@ class DevFee {
             $hostingOwed = 0;
         }
 
+        // Stuck-funds absorption: sats currently stranded in a mint with a
+        // pending withdrawal-failure flag come out of the dev share first
+        // (then upstream, then hosting) so the loss doesn't shift onto the
+        // merchant's settlement. Live read — once the mint recovers and the
+        // proofs drain or the flag clears, the next call returns 0 here.
+        $stuckPerMint = StuckFunds::computeStuckSatsPerMint($storeId);
+        $stuckTotal = array_sum($stuckPerMint);
+        $deduction = StuckFunds::applyDeduction(
+            $upstreamOwed, $devOwed, $hostingOwed, $stuckTotal
+        );
+
         return [
             'revenue' => $revenue,
             'network_cost' => $networkCost,
             'upstream_paid' => $upstreamPaid,
             'dev_paid' => $devPaid,
             'hosting_paid' => $hostingPaid,
-            'upstream_owed' => $upstreamOwed,
-            'dev_owed' => $devOwed,
-            'hosting_owed' => $hostingOwed,
+            'upstream_owed' => $deduction['upstream_owed'],
+            'dev_owed' => $deduction['dev_owed'],
+            'hosting_owed' => $deduction['hosting_owed'],
             'trial_active' => $trialActive,
+            'stuck_total_sats' => $deduction['stuck_total_sats'],
+            'stuck_absorbed_total' => $deduction['stuck_absorbed_total'],
+            'stuck_absorbed_dev' => $deduction['stuck_absorbed_dev'],
+            'stuck_absorbed_upstream' => $deduction['stuck_absorbed_upstream'],
+            'stuck_absorbed_hosting' => $deduction['stuck_absorbed_hosting'],
+            'stuck_uncovered' => $deduction['stuck_uncovered'],
+            'stuck_per_mint' => $stuckPerMint,
         ];
     }
 
