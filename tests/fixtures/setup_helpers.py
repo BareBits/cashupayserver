@@ -2,12 +2,12 @@
 
 The wizard at /setup uses PHP sessions (cookies) and a 'step' POST field
 that walks 1 -> 2 -> 4 -> 9 (auto-withdraw) -> 8 (on-chain) -> 5 (mint URL)
--> 5 again (mint unit) -> 6 (seed) -> 7.
+-> 5 again (mint unit) -> 10 (backup mint) -> 6 (seed) -> 7.
 
 `run_setup_wizard()` performs the standalone happy-path: security ack,
 admin password, store create, skip auto-withdraw, skip on-chain, mint URL,
-mint unit, generated seed, seed confirm. Leaves the server initialized and
-ready for API auth.
+mint unit, backup mint URL, generated seed, seed confirm. Leaves the
+server initialized and ready for API auth.
 """
 from __future__ import annotations
 
@@ -34,6 +34,7 @@ def run_setup_wizard(
     store_name: str = "Test Store",
     mint_url: str,
     mint_unit: str = "sat",
+    backup_mint_url: str,
 ) -> SetupResult:
     """Walk the standalone setup wizard end-to-end."""
     s = requests.Session()
@@ -90,6 +91,15 @@ def run_setup_wizard(
         allow_redirects=False,
     )
     _assert_step_ok(r, "step 5b (mint unit)")
+
+    # Step 10: required backup mint (server forces same unit as primary).
+    r = s.post(
+        setup,
+        data={"step": "10", "backup_mint_url": backup_mint_url},
+        timeout=30,
+        allow_redirects=False,
+    )
+    _assert_step_ok(r, "step 10 (backup mint)")
 
     # Step 6a: generate seed
     r = s.post(setup, data={"step": "6", "action": "generate"}, timeout=10, allow_redirects=False)

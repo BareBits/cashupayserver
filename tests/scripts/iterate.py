@@ -335,6 +335,12 @@ def main() -> int:
         mint = start_mint(workdir, lnd_mint)
         handles.append(("mint", stop_mint, mint))
 
+        # Second nutshell instance just to satisfy the setup wizard's now-
+        # required backup-mint step. Same LND backend; isolated datadir/port.
+        print("[iterate] starting backup nutshell mint ...")
+        backup_mint = start_mint(workdir, lnd_mint, name="nutshell-backup")
+        handles.append(("backup_mint", stop_mint, backup_mint))
+
         print("[iterate] starting cashupayserver ...")
         payserver = start_payserver(workdir / "payserver")
         handles.append(("payserver", stop_payserver, payserver))
@@ -378,6 +384,11 @@ def main() -> int:
             page.wait_for_selector("#mint_unit")
             page.select_option("#mint_unit", "sat")
             page.click("#continue-btn")
+            # Step 10: backup mint (required, same unit as primary). Drive the
+            # second nutshell instance in here.
+            page.wait_for_selector("button:has-text('Add Backup Mint')")
+            page.fill("#mint_url", backup_mint.url)
+            page.click("button:has-text('Add Backup Mint')")
             page.wait_for_selector("button[type=submit]")
             page.click("button:has-text('Generate New Seed Phrase')")
             page.wait_for_selector("#seed_confirmed")

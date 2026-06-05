@@ -102,6 +102,15 @@ def mint(session_workdir: Path, lnd_mint: LndHandle, channels: None) -> Iterator
     stop_mint(handle)
 
 
+@pytest.fixture(scope="session")
+def backup_mint(session_workdir: Path, lnd_mint: LndHandle, channels: None) -> Iterator[MintHandle]:
+    """Second nutshell mint used only to satisfy the setup wizard's required
+    backup-mint step. Same LND backend, isolated datadir/port."""
+    handle = start_mint(session_workdir, lnd_mint, name="nutshell-backup")
+    yield handle
+    stop_mint(handle)
+
+
 @pytest.fixture
 def payserver(tmp_path_factory: pytest.TempPathFactory) -> Iterator[PayserverHandle]:
     workdir = SESSION_TMP / f"payserver-{uuid.uuid4().hex[:8]}"
@@ -181,13 +190,16 @@ class ConfiguredPayserver:
     greenfield: GreenfieldClient
 
 
-def _configure(payserver: PayserverHandle, mint: MintHandle) -> ConfiguredPayserver:
+def _configure(
+    payserver: PayserverHandle, mint: MintHandle, backup_mint: MintHandle
+) -> ConfiguredPayserver:
     run_setup_wizard(
         payserver.url,
         admin_password=DEFAULT_ADMIN_PASSWORD,
         store_name=DEFAULT_STORE_NAME,
         mint_url=mint.url,
         mint_unit="sat",
+        backup_mint_url=backup_mint.url,
     )
     admin = AdminClient(payserver.url)
     admin.login(DEFAULT_ADMIN_PASSWORD)
@@ -208,14 +220,16 @@ def _configure(payserver: PayserverHandle, mint: MintHandle) -> ConfiguredPayser
 
 
 @pytest.fixture
-def configured(payserver: PayserverHandle, mint: MintHandle) -> ConfiguredPayserver:
+def configured(
+    payserver: PayserverHandle, mint: MintHandle, backup_mint: MintHandle
+) -> ConfiguredPayserver:
     """Setup-wizard-walked payserver + admin client + API key + Greenfield client."""
-    return _configure(payserver, mint)
+    return _configure(payserver, mint, backup_mint)
 
 
 @pytest.fixture
 def configured_with_lnurlp(
-    payserver_with_lnurlp: PayserverHandle, mint: MintHandle
+    payserver_with_lnurlp: PayserverHandle, mint: MintHandle, backup_mint: MintHandle
 ) -> ConfiguredPayserver:
     """Same as `configured` but uses the LNURL-mock-aware payserver."""
-    return _configure(payserver_with_lnurlp, mint)
+    return _configure(payserver_with_lnurlp, mint, backup_mint)

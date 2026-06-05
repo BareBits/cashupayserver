@@ -78,10 +78,10 @@ def _ensure_nutshell_installed() -> Path:
     return mint_exe
 
 
-def start_mint(workdir: Path, lnd_mint: LndHandle) -> MintHandle:
+def start_mint(workdir: Path, lnd_mint: LndHandle, name: str = "nutshell") -> MintHandle:
     mint_exe = _ensure_nutshell_installed()
 
-    datadir = workdir / "nutshell"
+    datadir = workdir / name
     datadir.mkdir(parents=True, exist_ok=True)
 
     port = ports.allocate(1)[0]
