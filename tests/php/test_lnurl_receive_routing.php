@@ -11,9 +11,9 @@
  *   2. With auto_melt_enabled=0, the LNURL path is not even attempted —
  *      the routing falls through to the existing mint/onchain path.
  *
- *   3. When pre-existing settled invoices accumulate fees-due past the
- *      FORCE threshold, the override gate fires and the LNURL probe is
- *      skipped; the resulting invoice records lnurl_override_reason.
+ *   3. When pre-existing settled invoices accumulate fees-due larger than
+ *      the next invoice amount, the override gate fires and the LNURL
+ *      probe is skipped; the resulting invoice records lnurl_override_reason.
  *
  *   4. When the mock host returns no verify URL, the LNURL probe fails
  *      and routing falls back transparently.
@@ -163,10 +163,10 @@ try {
     assert_eq(false, callback_was_hit($serverDir),
               'LNURL not probed when auto_melt_enabled=0');
 
-    // ---------- Scenario 3: override gate fires (fees_force) ----------
-    // Inflate revenue so feesDue > FEE_OVERRIDE_FORCE_AMOUNT (20000 sats by
-    // default). With dev_fee 2% + upstream 0.5%, 1_000_000 sats revenue
-    // owes ~25,000 sats which clears the FORCE bar.
+    // ---------- Scenario 3: override gate fires (fees_due) ----------
+    // Inflate revenue so feesDue exceeds the invoice we're about to create.
+    // With dev_fee 2% + upstream 0.5%, 1_000_000 sats revenue owes ~25_000
+    // sats, which is larger than the 5_000-sat invoice below.
     $store3 = 'store_override_force';
     make_store($store3, $mintStub);
     Database::update('stores', [
@@ -177,8 +177,8 @@ try {
 
     $owed = DevFee::computeOwed($store3);
     $feesDue = (int)$owed['upstream_owed'] + (int)$owed['dev_owed'] + (int)$owed['hosting_owed'];
-    assert_true($feesDue > (int)FEE_OVERRIDE_FORCE_AMOUNT,
-                "fees_due ($feesDue) must exceed FORCE for this scenario");
+    assert_true($feesDue > 5000,
+                "fees_due ($feesDue) must exceed the upcoming invoice amount for this scenario");
 
     reset_callbacks($serverDir);
     $threw = false;

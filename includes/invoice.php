@@ -83,18 +83,14 @@ class Invoice {
         if ($lnAutoMeltEnabled && $lnAddressLooksValid) {
             $lnurlTargetSats = (int) ExchangeRates::convertToSats((string)$amount, $currency, 'sat');
             $feesDueSats = LnUrlReceive::feesDueSats($storeId);
-            $decision = LnUrlReceive::shouldOverride(
-                $feesDueSats, $lnurlTargetSats,
-                (int)FEE_OVERRIDE_AMOUNT, (int)FEE_OVERRIDE_FORCE_AMOUNT
-            );
+            $decision = LnUrlReceive::shouldOverride($feesDueSats, $lnurlTargetSats);
             // Log every routing decision so the override mechanism is
             // auditable from production logs — both fired and skipped cases.
             error_log(sprintf(
-                '[lnurl-override] store=%s invoice_sats=%d fees_due_sats=%d override=%s reason=%s thresholds=%d/%d',
+                '[lnurl-override] store=%s invoice_sats=%d fees_due_sats=%d override=%s reason=%s',
                 $storeId, $lnurlTargetSats, $feesDueSats,
                 $decision['override'] ? '1' : '0',
-                $decision['reason'],
-                (int)FEE_OVERRIDE_AMOUNT, (int)FEE_OVERRIDE_FORCE_AMOUNT
+                $decision['reason']
             ));
             if ($decision['override']) {
                 // Skip LNURL this invoice and remember why; the mint-rail

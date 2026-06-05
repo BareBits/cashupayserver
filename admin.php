@@ -158,11 +158,6 @@ if (isset($_GET['api'])) {
                 // null = not probed / unreachable, 0 = unsupported (warn the
                 // operator that payments will route via the mint), 1 = ok.
                 'lud21Support' => $lud21RawStored === null ? null : (int)$lud21RawStored,
-                // Override-gate thresholds, displayed read-only so operators
-                // can reason about why a given invoice may not have taken
-                // the LNURL receive path. PHP-define-only by design.
-                'feeOverrideAmount' => (int)FEE_OVERRIDE_AMOUNT,
-                'feeOverrideForceAmount' => (int)FEE_OVERRIDE_FORCE_AMOUNT,
             ];
 
             $storeNotifications = [
@@ -3933,9 +3928,10 @@ $adminView = $rawAdminView;
                                 <p class="form-help" id="auto-melt-lud21-ok"
                                    style="display: none; color: var(--success, #2d7a3a);">
                                     This Lightning address host supports LUD-21 verify URLs. Incoming
-                                    Lightning payments will route directly to this address when fees
-                                    due are below
-                                    <strong id="auto-melt-fee-override-amount">5,000</strong> sats.
+                                    Lightning payments will route directly to this address, except
+                                    when an invoice is smaller than the accumulated upstream/dev/hosting
+                                    fees the store owes — in that case the payment routes through the
+                                    mint so the resulting balance can cover the owed fees.
                                 </p>
                             </div>
 
@@ -7624,10 +7620,6 @@ $adminView = $rawAdminView;
             if (am.lud21Support === 0) {
                 warn.style.display = '';
             } else if (am.lud21Support === 1) {
-                const feeAmtEl = document.getElementById('auto-melt-fee-override-amount');
-                if (feeAmtEl && am.feeOverrideAmount != null) {
-                    feeAmtEl.textContent = Number(am.feeOverrideAmount).toLocaleString();
-                }
                 ok.style.display = '';
             }
         }
