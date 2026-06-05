@@ -100,7 +100,7 @@ class Database {
             // that migration ran — getInstance() will then trigger runMigrations()
             // on existing installs that haven't yet picked it up. All migrations
             // are idempotent, so a fire is safe.
-            $hasLatestMigration = $hasConfig && self::columnExists(self::$instance, 'stores', 'onchain_address_mode');
+            $hasLatestMigration = $hasConfig && self::columnExists(self::$instance, 'notification_queue', 'invoice_id');
 
             if ($hasConfig && (!$hasUsers || !$hasReliability || !$hasLatestMigration)) {
                 if (!$hasUsers) {
