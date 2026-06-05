@@ -100,7 +100,7 @@ class Database {
             // that migration ran — getInstance() will then trigger runMigrations()
             // on existing installs that haven't yet picked it up. All migrations
             // are idempotent, so a fire is safe.
-            $hasLatestMigration = $hasConfig && self::columnExists(self::$instance, 'stores', 'onchain_address_mode');
+            $hasLatestMigration = $hasConfig && self::columnExists(self::$instance, 'notification_queue', 'invoice_id');
 
             if ($hasConfig && (!$hasUsers || !$hasReliability || !$hasLatestMigration)) {
                 if (!$hasUsers) {
@@ -730,6 +730,17 @@ HTACCESS;
                     PRIMARY KEY (store_id, event_type, dedupe_key)
                 );
             ");
+        }
+        // Payer-receipt feature needs a way to enforce a per-invoice send cap.
+        // Adding invoice_id to the queue row is the simplest path — sent rows
+        // stay around (sent_at IS NOT NULL), so a COUNT over them and any
+        // still-pending rows tells us how many receipts we've accepted for a
+        // given invoice. Nullable because pre-existing rows have no value.
+        if (!self::columnExists($pdo, 'notification_queue', 'invoice_id')) {
+            $pdo->exec("ALTER TABLE notification_queue ADD COLUMN invoice_id TEXT DEFAULT NULL");
+        }
+        if (!self::indexExists($pdo, 'idx_notification_queue_invoice')) {
+            $pdo->exec("CREATE INDEX idx_notification_queue_invoice ON notification_queue(invoice_id) WHERE invoice_id IS NOT NULL");
         }
 
         // Submarine swaps (LN→on-chain via Boltz/Zeus). Replaces the cashu

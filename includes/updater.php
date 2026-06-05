@@ -39,6 +39,12 @@ class Updater {
      */
     public static ?string $installRootOverride = null;
 
+    // Test hook: when non-null, bypasses the CASHUPAY_AUTO_UPDATE_ENABLED
+    // opt-in check (which is otherwise needed for the updater to run at all).
+    // Production code paths leave this at null; updater unit tests set it to
+    // true for the duration of a single case.
+    public static ?bool $autoUpdateEnabledOverride = null;
+
     // Files/dirs that must survive an update (relative to install root).
     private const PRESERVE_PATHS = [
         'data',
@@ -53,11 +59,16 @@ class Updater {
         if (self::isWordPressMode()) {
             return false;
         }
+        // Operator opt-in. Auto-update is OFF by default for fresh installs;
+        // an operator who wants it has to set CASHUPAY_AUTO_UPDATE_ENABLED in
+        // user_config.php (or as an env var). See user_config.example.php.
+        if (!self::isAutoUpdateEnabled()) {
+            return false;
+        }
         // Test-harness kill switch. Honoured when running under iterate.py
         // or the pytest payserver fixture so a long-running stack doesn't
         // overlay an in-progress dev branch with the latest channel-main
-        // build mid-iteration. Operators should not set this — the WP
-        // build remains the supported "no auto-update" path.
+        // build mid-iteration.
         if (self::isDisabledForTests()) {
             return false;
         }
@@ -127,6 +138,26 @@ class Updater {
 
     private static function isWordPressMode(): bool {
         return defined('CASHUPAY_WORDPRESS') && CASHUPAY_WORDPRESS;
+    }
+
+    /**
+     * Operator-facing opt-in for the auto-updater. Returns true when:
+     *   - PHP constant CASHUPAY_AUTO_UPDATE_ENABLED is defined and truthy, or
+     *   - Env var CASHUPAY_AUTO_UPDATE_ENABLED is non-empty and not "0", or
+     *   - Updater::$autoUpdateEnabledOverride is set to true (test hook).
+     *
+     * Default (constant undefined, env unset, override null) is false — fresh
+     * installs do not auto-update. Operators who want it must opt in.
+     */
+    public static function isAutoUpdateEnabled(): bool {
+        if (self::$autoUpdateEnabledOverride !== null) {
+            return self::$autoUpdateEnabledOverride;
+        }
+        if (defined('CASHUPAY_AUTO_UPDATE_ENABLED') && CASHUPAY_AUTO_UPDATE_ENABLED) {
+            return true;
+        }
+        $env = getenv('CASHUPAY_AUTO_UPDATE_ENABLED');
+        return ($env !== false && $env !== '' && $env !== '0');
     }
 
     /**

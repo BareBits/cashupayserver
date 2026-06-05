@@ -35,9 +35,11 @@ $fixture = updater_fixture_start('main', [
     '.htaccess' => $shippedHtaccess,
 ]);
 
-// Point Updater at the fixture install + fixture server.
+// Point Updater at the fixture install + fixture server, and opt into
+// auto-updates for this test (default for fresh installs is OFF).
 Updater::$installRootOverride = $fixture['installRoot'];
 Updater::$releaseApiUrlBase = $fixture['baseUrl'];
+Updater::$autoUpdateEnabledOverride = true;
 
 // Pre-flight: install root has the "old" content.
 assert_eq("COMMIT_SHA=0000000000000000000000000000000000000000\nVERSION=0.0-old\n",
@@ -99,5 +101,6 @@ assert_true(!$applied, 'second checkAndApply is a no-op (already current)');
 // Clean up overrides for any later tests in the same process.
 Updater::$installRootOverride = null;
 Updater::$releaseApiUrlBase = null;
+Updater::$autoUpdateEnabledOverride = null;
 
 echo "ok\n";

@@ -20,6 +20,7 @@ class NotificationSender {
     public const EVENT_INVOICE_PAID = 'InvoicePaid';
     public const EVENT_AUTO_WITHDRAW_SUCCESS = 'AutoWithdrawSuccess';
     public const EVENT_AUTO_WITHDRAW_FAILURE = 'AutoWithdrawFailure';
+    public const EVENT_PAYER_RECEIPT = 'PayerReceipt';
 
     // 48-hour window for suppressing identical auto-withdraw failure emails.
     private const FAILURE_DEDUPE_WINDOW_SEC = 48 * 60 * 60;
@@ -27,6 +28,12 @@ class NotificationSender {
     // Cap drain work per cron tick. Real-world traffic is low, but a backlog
     // of failed deliveries shouldn't be able to wedge the whole cron run.
     private const DRAIN_BATCH = 25;
+
+    // Per-invoice cap on payer receipts. The endpoint that calls
+    // queuePayerReceipt is public (anyone with the invoice URL can hit it),
+    // so without a limit it becomes a small open relay for paste-the-invoice
+    // spam. Three lets a customer fix one typo'd address.
+    public const PAYER_RECEIPT_MAX_PER_INVOICE = 3;
 
     /**
      * Queue an "invoice paid" email for a settled invoice. Idempotent at
@@ -66,12 +73,171 @@ class NotificationSender {
               . "Amount:      {$satsLine}\n"
               . "Amount (fiat): {$fiatLine}\n";
 
-        self::enqueue($storeId, self::EVENT_INVOICE_PAID, $recipient, $subject, $body, null);
+        self::enqueue($storeId, self::EVENT_INVOICE_PAID, $recipient, $subject, $body, null, $invoiceId);
     }
 
     /**
-     * Queue an auto-withdrawal success email.
+     * Whether the public payment page should offer the "email me a receipt"
+     * form for a paid invoice. Composed gate: site-wide master switch ON,
+     * per-type toggle ON, and SMTP configured. If any of these is off, the
+     * payment page falls back to a "screenshot this page" hint instead.
      */
+    public static function isPayerReceiptOffered(): bool {
+        if (Config::get('notifications_enabled', false) !== true) return false;
+        if (Config::get('notifications_payer_receipt_enabled', false) !== true) return false;
+        return EmailSender::isSmtpConfigured();
+    }
+
+    /**
+     * Count payer-receipt rows we've accepted for this invoice (queued, sent,
+     * or stuck failing — they all count toward the cap). The cap is the only
+     * thing protecting this public endpoint from being abused as an open
+     * relay for paste-the-invoice spam.
+     */
+    public static function payerReceiptCountForInvoice(string $invoiceId): int {
+        $row = Database::fetchOne(
+            "SELECT COUNT(*) AS c FROM notification_queue
+             WHERE invoice_id = ? AND event_type = ?",
+            [$invoiceId, self::EVENT_PAYER_RECEIPT]
+        );
+        return (int)($row['c'] ?? 0);
+    }
+
+    /**
+     * Queue a payment-confirmation email to the payer. Caller is responsible
+     * for verifying the invoice is Settled and that isPayerReceiptOffered()
+     * is true; this method only re-checks the rate limit (since the public
+     * endpoint can be hit concurrently). Returns true if queued, false if
+     * the per-invoice cap is already reached.
+     *
+     * The receipt is per-payer, not per-store: the payer entered the address
+     * to opt in, so we bypass the store's notifications_enabled flag.
+     */
+    public static function queuePayerReceipt(array $invoice, string $payerEmail): bool {
+        $invoiceId = $invoice['id'] ?? null;
+        if (!$invoiceId) return false;
+        if (self::payerReceiptCountForInvoice($invoiceId) >= self::PAYER_RECEIPT_MAX_PER_INVOICE) {
+            return false;
+        }
+
+        $storeId = $invoice['store_id'] ?? '';
+        $storeName = $storeId !== '' ? self::storeName($storeId) : '';
+
+        $subject = "Payment receipt: invoice {$invoiceId}";
+        $body = self::buildPayerReceiptBody($invoice, $storeName);
+
+        self::enqueue($storeId, self::EVENT_PAYER_RECEIPT, $payerEmail, $subject, $body, null, $invoiceId);
+        return true;
+    }
+
+    /**
+     * Build the plain-text body of a payer-facing payment confirmation.
+     * Format mirrors the operator-facing InvoicePaid template — same
+     * label-aligned style, plus payment-method-specific lines (on-chain
+     * txids, swap claim txid, receiving address).
+     */
+    private static function buildPayerReceiptBody(array $invoice, string $storeName): string {
+        $invoiceId = (string)($invoice['id'] ?? '(unknown)');
+        $paidAt = isset($invoice['paid_at']) && $invoice['paid_at']
+            ? gmdate('Y-m-d H:i:s', (int)$invoice['paid_at']) . ' UTC'
+            : '(unknown)';
+
+        $amountSats = $invoice['amount_sats'] ?? null;
+        $satsLine = $amountSats !== null
+            ? number_format((int)$amountSats) . ' sats'
+            : '(sats amount unavailable)';
+
+        $currency = strtoupper((string)($invoice['currency'] ?? ''));
+        $amount = $invoice['amount'] ?? null;
+        // For sat-denominated invoices the "fiat" line is the same number — drop
+        // it. For fiat-denominated invoices, show what the customer was billed.
+        $fiatLine = ($amount !== null && $currency !== '' && $currency !== 'SAT' && $currency !== 'SATS')
+            ? trim($amount . ' ' . $currency)
+            : null;
+
+        // settled_rail is the rail that actually moved funds; fall back to the
+        // rail chosen at create time so older rows (no settled_rail backfill)
+        // still get a sensible label.
+        $rail = (string)($invoice['settled_rail'] ?? $invoice['payment_rail'] ?? '');
+        $methodLine = self::paymentMethodLabel($rail);
+
+        $lines = ["Thank you for shopping at {$storeName}.", ""];
+        $lines[] = "Your payment has been received.";
+        $lines[] = "";
+        $lines[] = "Invoice ID:     {$invoiceId}";
+        $lines[] = "Paid at:        {$paidAt}";
+        $lines[] = "Amount:         {$satsLine}";
+        if ($fiatLine !== null) {
+            $lines[] = "Amount (fiat):  {$fiatLine}";
+        }
+        $lines[] = "Payment method: {$methodLine}";
+
+        // Rail-specific receipt detail: on-chain txid(s) + receiving address,
+        // or swap claim txid + merchant address. Pure Lightning rails have no
+        // on-chain identifier to print.
+        foreach (self::railDetailLines($invoice, $rail) as $detail) {
+            $lines[] = $detail;
+        }
+
+        $lines[] = "";
+        $lines[] = "Keep this email for your records.";
+        return implode("\n", $lines) . "\n";
+    }
+
+    private static function paymentMethodLabel(string $rail): string {
+        switch ($rail) {
+            case 'onchain':   return 'On-chain Bitcoin';
+            case 'swap':      return 'Lightning → submarine swap to on-chain';
+            case 'lnaddress': return 'Lightning (LNURL)';
+            case 'mint':      return 'Lightning';
+            default:          return $rail !== '' ? $rail : '(unknown)';
+        }
+    }
+
+    /**
+     * Look up rail-specific identifiers we want to surface on the receipt.
+     * Done as a separate query rather than at enqueue time because the rail
+     * tables (onchain_payments, swap_attempts) only get their txid filled in
+     * once settlement actually broadcasts — and the payer can request the
+     * receipt at any moment after the invoice is marked Settled.
+     */
+    private static function railDetailLines(array $invoice, string $rail): array {
+        $invoiceId = (string)($invoice['id'] ?? '');
+        if ($invoiceId === '') return [];
+
+        $lines = [];
+        if ($rail === 'onchain') {
+            $addr = (string)($invoice['onchain_address'] ?? '');
+            if ($addr !== '') {
+                $lines[] = "Receiving addr: {$addr}";
+            }
+            $rows = Database::fetchAll(
+                "SELECT txid, vout, amount_sat FROM onchain_payments
+                 WHERE invoice_id = ? ORDER BY first_seen_at ASC",
+                [$invoiceId]
+            );
+            foreach ($rows as $row) {
+                $lines[] = "Txid:           {$row['txid']}:{$row['vout']}";
+            }
+        } elseif ($rail === 'swap') {
+            $row = Database::fetchOne(
+                "SELECT merchant_address, claim_txid FROM swap_attempts
+                 WHERE invoice_id = ? ORDER BY id DESC LIMIT 1",
+                [$invoiceId]
+            );
+            if ($row) {
+                if (!empty($row['merchant_address'])) {
+                    $lines[] = "Receiving addr: {$row['merchant_address']}";
+                }
+                if (!empty($row['claim_txid'])) {
+                    $lines[] = "Claim txid:     {$row['claim_txid']}";
+                }
+            }
+        }
+        // mint / lnaddress: nothing to surface — pure Lightning, no on-chain
+        // identifier the payer can look up.
+        return $lines;
+    }
     public static function queueAutoWithdrawSuccess(
         string $storeId,
         int $amountSats,
@@ -274,7 +440,8 @@ class NotificationSender {
         string $toEmail,
         string $subject,
         string $body,
-        ?string $dedupeKey
+        ?string $dedupeKey,
+        ?string $invoiceId = null
     ): void {
         Database::insert('notification_queue', [
             'store_id' => $storeId,
@@ -283,6 +450,7 @@ class NotificationSender {
             'subject' => $subject,
             'body' => $body,
             'dedupe_key' => $dedupeKey,
+            'invoice_id' => $invoiceId,
             'created_at' => time(),
         ]);
     }
