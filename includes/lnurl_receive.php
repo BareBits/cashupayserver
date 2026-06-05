@@ -13,10 +13,11 @@
  *      BOLT11 for the exact amount, require a `verify` URL in the response.
  *   2. If the probe succeeds and the fee-override gate does not fire, the
  *      LNURL-issued BOLT11 becomes the invoice (payment_rail='lnaddress').
- *   3. If the override gate fires (operator fees due exceed thresholds), the
- *      LNURL path is skipped this invoice and we fall through to mint/swap.
- *      The resulting mint-rail invoice is flagged with lnurl_override_reason
- *      so settlement triggers an immediate DevFee::settleStore + auto-melt.
+ *   3. If the override gate fires (this invoice is smaller than the
+ *      accumulated fees the operator owes upstream/dev/hosting), the LNURL
+ *      path is skipped and we fall through to mint/swap. The resulting
+ *      mint-rail invoice is flagged with lnurl_override_reason so settlement
+ *      triggers an immediate DevFee::settleStore + auto-melt.
  *   4. If the probe fails (host down, no LUD-21, timeout), we silently fall
  *      through to the existing mint/swap decision.
  *
@@ -32,30 +33,6 @@ require_once __DIR__ . '/database.php';
 require_once __DIR__ . '/config.php';
 require_once __DIR__ . '/dev_fee.php';
 
-// Override gate thresholds. The override only fires for stores whose mint
-// fees aren't being collected (because LNURL receive bypasses the mint), so
-// these values are tuned to keep the dev/hosting/upstream-fee accounting from
-// drifting more than ~20k sats away from "settled" at any given time.
-//
-// FEE_OVERRIDE_AMOUNT (default 5000): when total fees-due crosses this and
-// the customer is paying < FORCE_AMOUNT, route via the mint so the resulting
-// mint balance can clear the owed fees. The merchant-attributable amount
-// (post-fee) still ends up at the LN address via auto-melt, so the merchant
-// experience is unchanged — only the rail differs.
-//
-// FEE_OVERRIDE_FORCE_AMOUNT (default 20000): hard ceiling. Once fees-due
-// exceeds this, every invoice (regardless of size) goes through the mint
-// until the cron clears the debt. Prevents indefinite divergence.
-//
-// Both are PHP-define-only by design: changing them at runtime would let an
-// operator skirt the dev fee. Admin UI displays them read-only.
-if (!defined('FEE_OVERRIDE_AMOUNT')) {
-    define('FEE_OVERRIDE_AMOUNT', 5000);
-}
-if (!defined('FEE_OVERRIDE_FORCE_AMOUNT')) {
-    define('FEE_OVERRIDE_FORCE_AMOUNT', 20000);
-}
-
 // Wall-clock budget for the LNURL probe at invoice creation. The probe is
 // two HTTP round-trips (well-known + callback). 5 seconds keeps invoice
 // creation snappy while tolerating sluggish hosts; tune via user_config.php.
@@ -66,32 +43,27 @@ if (!defined('LNURL_RECEIVE_PROBE_TIMEOUT_SEC')) {
 class LnUrlReceive {
     /** Override decision reasons written to invoices.lnurl_override_reason. */
     public const REASON_NONE = 'none';
-    public const REASON_FEES_THRESHOLD = 'fees_threshold';
-    public const REASON_FEES_FORCE = 'fees_force';
+    public const REASON_FEES_DUE = 'fees_due';
 
     /**
      * Pure override-gate function: should the LNURL-receive path be skipped
      * for an invoice of this size given the store's current fees-due?
      *
-     * Two skip conditions:
-     *   - feesDue > FORCE_AMOUNT: skip unconditionally (mandatory override).
-     *   - feesDue > AMOUNT AND invoiceAmount < FORCE_AMOUNT: skip (gate
-     *     override — small invoice can carry the owed fees).
+     * Single rule: when the invoice amount is smaller than the accumulated
+     * upstream/dev/hosting fees the operator owes, route via the mint so the
+     * resulting mint balance can clear the owed fees. Larger invoices take
+     * the LNURL direct path even if some fees are outstanding — the next
+     * small invoice (or the cron) will catch the debt up.
      *
      * Pure in/out for unit testing; caller fetches feesDue from
      * {@see DevFee::computeOwed}.
      */
     public static function shouldOverride(
         int $feesDueSats,
-        int $invoiceAmountSats,
-        int $feeOverrideAmount,
-        int $feeForceAmount
+        int $invoiceAmountSats
     ): array {
-        if ($feesDueSats > $feeForceAmount) {
-            return ['override' => true, 'reason' => self::REASON_FEES_FORCE];
-        }
-        if ($feesDueSats > $feeOverrideAmount && $invoiceAmountSats < $feeForceAmount) {
-            return ['override' => true, 'reason' => self::REASON_FEES_THRESHOLD];
+        if ($feesDueSats > 0 && $invoiceAmountSats < $feesDueSats) {
+            return ['override' => true, 'reason' => self::REASON_FEES_DUE];
         }
         return ['override' => false, 'reason' => self::REASON_NONE];
     }

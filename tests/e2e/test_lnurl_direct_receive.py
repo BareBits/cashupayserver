@@ -10,10 +10,10 @@ Exercises the full stack — cashupayserver, the LUD-21 mock LNURL host
    settled=true with a preimage, and marks the invoice Settled with
    settled_rail='lnaddress'.
 
-2. **Override gate**: when fees-due crosses FEE_OVERRIDE_FORCE_AMOUNT
+2. **Override gate**: when fees-due exceeds the next invoice amount
    (seeded by inserting a settled-revenue invoice directly), the routing
    logic skips the LNURL probe and records the invoice on the mint rail
-   with lnurl_override_reason='fees_force'. The pure-PHP unit tests cover
+   with lnurl_override_reason='fees_due'. The pure-PHP unit tests cover
    the truth table; this test confirms the gate is wired into the e2e
    create-invoice flow and produces the expected DB state.
 
@@ -283,13 +283,13 @@ def test_lnurl_direct_receive_happy_path(
 # ---------------------------------------------------------------------------
 
 
-def test_lnurl_override_routes_via_mint_when_fees_force(
+def test_lnurl_override_routes_via_mint_when_fees_due_exceeds_invoice(
     configured_with_lnurlp: ConfiguredPayserver,
     lnurlp_server: LnurlpServer,
 ) -> None:
-    """When accumulated fees-due cross FEE_OVERRIDE_FORCE_AMOUNT, the LNURL
+    """When accumulated fees-due exceed the next invoice amount, the LNURL
     probe is skipped and the invoice lands on the mint rail with
-    lnurl_override_reason='fees_force', so settlement can clear the owed
+    lnurl_override_reason='fees_due', so settlement can clear the owed
     fees from the resulting mint balance."""
     configured = configured_with_lnurlp
 
@@ -298,8 +298,9 @@ def test_lnurl_override_routes_via_mint_when_fees_force(
     assert save_result.get("lnurl_supports_verify") == 1
 
     # Seed enough revenue that the combined fee % (2% dev + 0.5% upstream
-    # + 0% hosting = 2.5%) yields owed sats above FEE_OVERRIDE_FORCE_AMOUNT.
-    # 1_000_000 sats * 0.025 = 25_000 sats > 20_000 (the FORCE threshold).
+    # + 0% hosting = 2.5%) yields owed sats above the upcoming invoice
+    # amount. 1_000_000 sats * 0.025 = 25_000 sats, comfortably larger
+    # than INVOICE_AMOUNT_SAT (5_000).
     _seed_fee_revenue(configured.handle, configured.store_id, sats=1_000_000)
 
     # Sanity check: the lnaddress-rail probe count must not increase for
@@ -321,8 +322,8 @@ def test_lnurl_override_routes_via_mint_when_fees_force(
     assert row["payment_rail"] == "mint", (
         f"override should land invoice on mint rail; got {row['payment_rail']!r}"
     )
-    assert row["lnurl_override_reason"] == "fees_force", (
-        f"expected fees_force override; got {row['lnurl_override_reason']!r}"
+    assert row["lnurl_override_reason"] == "fees_due", (
+        f"expected fees_due override; got {row['lnurl_override_reason']!r}"
     )
     assert row["lnurl_verify_url"] is None, (
         "mint-rail invoice should not have a verify URL"
