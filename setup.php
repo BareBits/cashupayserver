@@ -4,20 +4,20 @@
  *
  * Multi-step setup wizard for initial configuration.
  *
- * Flow:
- * Step 1: Welcome/Requirements + Security Check (merged)
- * Step 2: Admin Password (skipped in WordPress mode)
- * Step 4: Create Store (name only)
- * Step 5: Connect Mint (URL → fetch keysets → select unit)
- * Step 6: Generate Seed for Store
- * Step 9: Configure Auto-Withdraw (lightning address or on-chain xpub)
- * Step 8: On-chain Bitcoin payment destinations (xpub or static address)
- * Step 7: Complete
+ * Flow (in execution order; internal step numbers are non-sequential):
+ * Step 1:  Welcome/Requirements + Security Check (merged)
+ * Step 2:  Admin Password (skipped in WordPress mode)
+ * Step 4:  Create Store (name only)
+ * Step 5:  Connect Mint (URL → fetch keysets → select unit)
+ * Step 10: Backup Mint (required, same unit as primary)
+ * Step 6:  Generate Seed for Store
+ * Step 9:  Configure Auto-Withdraw (lightning address or on-chain xpub)
+ * Step 8:  On-chain Bitcoin payment destinations (xpub or static address)
+ * Step 7:  Complete
  *
- * Note: Step 3 was merged into Step 1. Internal step numbers are preserved
- * for backwards compatibility, but step 3 is no longer used. Step 9 was
- * added after step 6 instead of renumbering to avoid breaking saved-state
- * users mid-wizard.
+ * Note: Step 3 was merged into Step 1 and is unused. Steps 9 and 10 were
+ * appended (rather than renumbered) to avoid breaking saved-state users
+ * mid-wizard; the numbers do not reflect execution order.
  */
 
 require_once __DIR__ . '/includes/database.php';
