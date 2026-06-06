@@ -654,6 +654,19 @@ HTACCESS;
             $stmt->execute([json_encode($now), $now, $now]);
         }
 
+        // Seed cron_key on first migration so cron.php is never reachable with
+        // an unset key. Without this, the admin had to load the "Cron URL" page
+        // to lazily generate one; before that, cron.php's auth check fell
+        // through (any caller could trigger the full cron pipeline).
+        $cronKeyRow = $pdo->query("SELECT value FROM config WHERE key = 'cron_key'")->fetchColumn();
+        if ($cronKeyRow === false) {
+            $now = time();
+            $stmt = $pdo->prepare(
+                "INSERT INTO config (key, value, created_at, updated_at) VALUES ('cron_key', ?, ?, ?)"
+            );
+            $stmt->execute([bin2hex(random_bytes(32)), $now, $now]);
+        }
+
         // Free-trial seeding (deployment-time). Operator sets either
         // CASHUPAY_FREE_TRIAL_UNTIL (ISO 8601 date or unix seconds) and/or
         // CASHUPAY_FREE_TRIAL_REVENUE_SATS (integer sat cap). If both are set
