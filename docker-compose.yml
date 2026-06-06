@@ -1,0 +1,38 @@
+# Production deploy of CashuPayServer (BareBits fork).
+# See docs/docker-production.md for the operator guide.
+#
+# TLS belongs in a reverse proxy in front of this service (Caddy, Traefik,
+# nginx, Cloudflare). This image only serves HTTP on port 80 inside the
+# container, mapped to 8080 on the host to leave port 80 free for the proxy.
+
+services:
+  cashupayserver:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.production
+    image: cashupayserver:latest
+    container_name: cashupayserver
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    volumes:
+      # Whole-app volume. The entrypoint seeds the source into this on first
+      # boot; thereafter the in-app auto-updater can overlay files durably.
+      # data/ lives at /var/www/html/data inside the same mount.
+      - cashupay_app:/var/www/html
+    environment:
+      TZ: UTC
+      # Uncomment and set as needed:
+      # CASHUPAY_BASE_URL: https://pay.example.com
+      # CASHUPAY_AUTO_UPDATE_ENABLED: "1"    # default 1; "0" pins to image tag
+      # CASHUPAY_UPDATE_CHANNEL: main        # 'main' or 'testing'
+      # CRON_INTERVAL_SECONDS: "60"          # "0" disables in-container cron
+      # CASHUPAY_SMTP_HOST: smtp.example.com
+      # CASHUPAY_SMTP_PORT: "587"
+      # CASHUPAY_SMTP_USERNAME: apikey
+      # CASHUPAY_SMTP_PASSWORD: replace-me
+      # CASHUPAY_SMTP_ENCRYPTION: tls
+      # CASHUPAY_SMTP_FROM_ADDRESS: notifications@example.com
+
+volumes:
+  cashupay_app:

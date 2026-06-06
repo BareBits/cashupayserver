@@ -2,6 +2,11 @@
 
 Two Docker setups for testing CashuPayServer with WordPress + WooCommerce. Both use SQLite (no MySQL required).
 
+> **Looking for production deploy?** This file documents the *test* images.
+> For deploying CashuPayServer to a server, see
+> [docs/docker-production.md](docs/docker-production.md) and the
+> `docker-compose.yml` at the repo root.
+
 ## Prerequisites
 
 - Docker installed
