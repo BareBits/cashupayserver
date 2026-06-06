@@ -104,9 +104,11 @@ final class SwapClaimer {
 
         // 4. Compute the claim amount: lockup_amount minus a current claim-fee
         // estimate (re-fetched, since on-chain feerate may have moved since
-        // create-time). Falls back to the stored estimate if re-fetch fails.
+        // create-time). swap_attempts has no stored fee column, so if the
+        // re-fetch fails the placeholder below is left intact and the sanity
+        // check at line 118 forces the hardcoded ~1 sat/vB fallback.
         $provider = SwapProviderFactory::byName($row['provider']);
-        $claimFeeEstimate = (int)($row['lockup_amount_sats'] ?? 0); // placeholder
+        $claimFeeEstimate = (int)($row['lockup_amount_sats'] ?? 0); // placeholder; sanity-floored below
         try {
             if ($provider) {
                 $pair = $provider->getReversePairInfo($row['network'] ?? 'mainnet');
