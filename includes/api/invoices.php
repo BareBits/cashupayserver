@@ -11,8 +11,9 @@ require_once __DIR__ . '/../security.php';
  */
 function handleCreateInvoice(array $auth, array $params, array $body): void {
     $storeId = $params['storeId'];
+    requireStoreAccess($auth, $storeId);
 
-    // Verify store exists and user has access
+    // Verify store exists
     $store = Database::fetchOne("SELECT id FROM stores WHERE id = ?", [$storeId]);
     if ($store === null) {
         errorResponse('not-found', 'Store not found', 404);
@@ -57,6 +58,7 @@ function handleCreateInvoice(array $auth, array $params, array $body): void {
  */
 function handleGetInvoices(array $auth, array $params, array $body): void {
     $storeId = $params['storeId'];
+    requireStoreAccess($auth, $storeId);
 
     // Parse query parameters
     $status = $_GET['status'] ?? null;
@@ -75,15 +77,19 @@ function handleGetInvoices(array $auth, array $params, array $body): void {
 function handleGetInvoice(array $auth, array $params, array $body): void {
     $storeId = $params['storeId'];
     $invoiceId = $params['invoiceId'];
+    requireStoreAccess($auth, $storeId);
 
-    // Poll only this specific invoice's quote status
-    Invoice::pollSingleQuote($invoiceId);
-
+    // Confirm the invoice belongs to this store BEFORE polling — otherwise
+    // anyone with any API key could force-poll arbitrary invoice IDs.
     $invoice = Invoice::getById($invoiceId);
-
     if ($invoice === null || $invoice['store_id'] !== $storeId) {
         errorResponse('not-found', 'Invoice not found', 404);
     }
+
+    // Poll only this specific invoice's quote status, then re-fetch to
+    // pick up any status transition the poll triggered.
+    Invoice::pollSingleQuote($invoiceId);
+    $invoice = Invoice::getById($invoiceId);
 
     jsonResponse(Invoice::formatForApi($invoice));
 }
@@ -94,6 +100,7 @@ function handleGetInvoice(array $auth, array $params, array $body): void {
 function handleUpdateInvoiceStatus(array $auth, array $params, array $body): void {
     $storeId = $params['storeId'];
     $invoiceId = $params['invoiceId'];
+    requireStoreAccess($auth, $storeId);
 
     $invoice = Invoice::getById($invoiceId);
 

@@ -10,6 +10,7 @@ require_once __DIR__ . '/../webhook_sender.php';
  */
 function handleCreateWebhook(array $auth, array $params, array $body): void {
     $storeId = $params['storeId'];
+    requireStoreAccess($auth, $storeId);
 
     // Verify store exists
     $store = Database::fetchOne("SELECT id FROM stores WHERE id = ?", [$storeId]);
@@ -53,6 +54,7 @@ function handleCreateWebhook(array $auth, array $params, array $body): void {
  */
 function handleGetWebhooks(array $auth, array $params, array $body): void {
     $storeId = $params['storeId'];
+    requireStoreAccess($auth, $storeId);
 
     $webhooks = Database::fetchAll(
         "SELECT * FROM webhooks WHERE store_id = ? ORDER BY created_at DESC",
@@ -69,6 +71,7 @@ function handleGetWebhooks(array $auth, array $params, array $body): void {
 function handleGetWebhook(array $auth, array $params, array $body): void {
     $storeId = $params['storeId'];
     $webhookId = $params['webhookId'];
+    requireStoreAccess($auth, $storeId);
 
     $webhook = Database::fetchOne(
         "SELECT * FROM webhooks WHERE id = ? AND store_id = ?",
@@ -88,6 +91,7 @@ function handleGetWebhook(array $auth, array $params, array $body): void {
 function handleUpdateWebhook(array $auth, array $params, array $body): void {
     $storeId = $params['storeId'];
     $webhookId = $params['webhookId'];
+    requireStoreAccess($auth, $storeId);
 
     $webhook = Database::fetchOne(
         "SELECT * FROM webhooks WHERE id = ? AND store_id = ?",
@@ -130,6 +134,7 @@ function handleUpdateWebhook(array $auth, array $params, array $body): void {
 function handleDeleteWebhook(array $auth, array $params, array $body): void {
     $storeId = $params['storeId'];
     $webhookId = $params['webhookId'];
+    requireStoreAccess($auth, $storeId);
 
     $webhook = Database::fetchOne(
         "SELECT id FROM webhooks WHERE id = ? AND store_id = ?",

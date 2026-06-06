@@ -5,11 +5,22 @@
 
 /**
  * Get all stores
+ *
+ * Scoped to the caller's own store unless the key has wildcard permission
+ * (the internal admin-dashboard key). Without this scoping any merchant
+ * could enumerate every other store on the instance.
  */
 function handleGetStores(array $auth, array $params, array $body): void {
-    $stores = Database::fetchAll(
-        "SELECT id, name, created_at FROM stores ORDER BY created_at DESC"
-    );
+    if (Auth::hasPermission($auth, '*')) {
+        $stores = Database::fetchAll(
+            "SELECT id, name, created_at FROM stores ORDER BY created_at DESC"
+        );
+    } else {
+        $stores = Database::fetchAll(
+            "SELECT id, name, created_at FROM stores WHERE id = ? ORDER BY created_at DESC",
+            [$auth['store_id'] ?? '']
+        );
+    }
 
     $result = array_map(function ($store) {
         return [
@@ -24,8 +35,15 @@ function handleGetStores(array $auth, array $params, array $body): void {
 
 /**
  * Create a new store
+ *
+ * Requires wildcard permission. A standard per-store API key has no
+ * business spawning new stores on the instance.
  */
 function handleCreateStore(array $auth, array $params, array $body): void {
+    if (!Auth::hasPermission($auth, '*')) {
+        errorResponse('unauthorized', 'Insufficient permissions', 403);
+    }
+
     $name = $body['name'] ?? '';
 
     if (empty($name)) {
@@ -61,6 +79,7 @@ function handleCreateStore(array $auth, array $params, array $body): void {
  */
 function handleGetStore(array $auth, array $params, array $body): void {
     $storeId = $params['storeId'];
+    requireStoreAccess($auth, $storeId);
 
     $store = Database::fetchOne(
         "SELECT id, name, created_at FROM stores WHERE id = ?",
@@ -83,6 +102,7 @@ function handleGetStore(array $auth, array $params, array $body): void {
  */
 function handleDeleteStore(array $auth, array $params, array $body): void {
     $storeId = $params['storeId'];
+    requireStoreAccess($auth, $storeId);
 
     $store = Database::fetchOne(
         "SELECT id FROM stores WHERE id = ?",
