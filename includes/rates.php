@@ -8,6 +8,7 @@
 
 require_once __DIR__ . '/database.php';
 require_once __DIR__ . '/config.php';
+require_once __DIR__ . '/safe_http.php';
 
 /**
  * Price provider interface
@@ -35,24 +36,18 @@ class CoinGeckoProvider implements PriceProvider {
             'vs_currencies' => $currency,
         ]);
 
-        $ch = curl_init($url);
-        curl_setopt_array($ch, [
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_TIMEOUT => 10,
-            CURLOPT_HTTPHEADER => [
-                'Accept: application/json',
-                'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            ],
+        $result = \SafeHttp::request($url, [
+            'timeout' => 10,
+            'userAgent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'headers' => ['Accept: application/json'],
+            'allowPrivate' => false,
         ]);
 
-        $response = curl_exec($ch);
-        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-
-        if ($httpCode !== 200 || empty($response)) {
+        if ($result['status'] !== 200 || $result['body'] === '') {
             return null;
         }
 
-        $data = json_decode($response, true);
+        $data = json_decode($result['body'], true);
         return $data['bitcoin'][$currency] ?? null;
     }
 }
@@ -89,21 +84,17 @@ class BinanceProvider implements PriceProvider {
 
         $url = self::API_URL . '?symbol=' . $symbol;
 
-        $ch = curl_init($url);
-        curl_setopt_array($ch, [
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_TIMEOUT => 10,
-            CURLOPT_HTTPHEADER => ['Accept: application/json'],
+        $result = \SafeHttp::request($url, [
+            'timeout' => 10,
+            'headers' => ['Accept: application/json'],
+            'allowPrivate' => false,
         ]);
 
-        $response = curl_exec($ch);
-        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-
-        if ($httpCode !== 200 || empty($response)) {
+        if ($result['status'] !== 200 || $result['body'] === '') {
             return null;
         }
 
-        $data = json_decode($response, true);
+        $data = json_decode($result['body'], true);
         return isset($data['price']) ? (float)$data['price'] : null;
     }
 }
@@ -139,21 +130,17 @@ class KrakenProvider implements PriceProvider {
 
         $url = self::API_URL . '?pair=' . $pair;
 
-        $ch = curl_init($url);
-        curl_setopt_array($ch, [
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_TIMEOUT => 10,
-            CURLOPT_HTTPHEADER => ['Accept: application/json'],
+        $result = \SafeHttp::request($url, [
+            'timeout' => 10,
+            'headers' => ['Accept: application/json'],
+            'allowPrivate' => false,
         ]);
 
-        $response = curl_exec($ch);
-        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-
-        if ($httpCode !== 200 || empty($response)) {
+        if ($result['status'] !== 200 || $result['body'] === '') {
             return null;
         }
 
-        $data = json_decode($response, true);
+        $data = json_decode($result['body'], true);
 
         if (!empty($data['error'])) {
             return null;

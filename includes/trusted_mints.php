@@ -28,6 +28,7 @@
 require_once __DIR__ . '/database.php';
 require_once __DIR__ . '/config.php';
 require_once __DIR__ . '/mint_reliability.php';
+require_once __DIR__ . '/safe_http.php';
 
 class TrustedMints {
     const DEFAULT_REFRESH_MINUTES = 1440; // 24h
@@ -189,32 +190,24 @@ class TrustedMints {
     // ------------------------------------------------------------------
 
     private static function fetchUrl(string $url): string {
-        $ch = curl_init($url);
-        if ($ch === false) {
-            throw new \RuntimeException('curl_init failed');
-        }
-        curl_setopt_array($ch, [
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_FOLLOWLOCATION => true,
-            CURLOPT_MAXREDIRS => 3,
-            CURLOPT_CONNECTTIMEOUT => 5,
-            CURLOPT_TIMEOUT => self::FETCH_TIMEOUT_SEC,
-            CURLOPT_SSL_VERIFYPEER => true,
-            CURLOPT_USERAGENT => 'CashuPayServer/TrustedMints',
-            CURLOPT_HTTPHEADER => ['Accept: application/json'],
+        $result = \SafeHttp::request($url, [
+            'method' => 'GET',
+            'timeout' => self::FETCH_TIMEOUT_SEC,
+            'connectTimeout' => 5,
+            'userAgent' => 'CashuPayServer/TrustedMints',
+            'headers' => ['Accept: application/json'],
+            'allowPrivate' => false,
+            'followRedirects' => true,
+            'maxRedirects' => 3,
         ]);
-        $body = curl_exec($ch);
-        if ($body === false) {
-            $err = curl_error($ch);
-            curl_close($ch);
-            throw new \RuntimeException('HTTP fetch failed: ' . $err);
+        if ($result['error'] !== '') {
+            throw new \RuntimeException('HTTP fetch failed: ' . $result['error']);
         }
-        $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        curl_close($ch);
+        $code = $result['status'];
         if ($code < 200 || $code >= 300) {
             throw new \RuntimeException("HTTP $code from trusted list URL");
         }
-        return (string)$body;
+        return $result['body'];
     }
 
     /**

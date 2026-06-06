@@ -32,6 +32,7 @@ declare(strict_types=1);
 require_once __DIR__ . '/database.php';
 require_once __DIR__ . '/config.php';
 require_once __DIR__ . '/dev_fee.php';
+require_once __DIR__ . '/safe_http.php';
 
 // Wall-clock budget for the LNURL probe at invoice creation. The probe is
 // two HTTP round-trips (well-known + callback). 5 seconds keeps invoice
@@ -394,23 +395,25 @@ class LnUrlReceive {
      * @return array{0:?string,1:int,2:string} [body|null, httpCode, curlErr]
      */
     private static function httpGetWithDiag(string $url, int $timeoutSec): array {
-        $ch = curl_init($url);
-        if ($ch === false) {
-            return [null, 0, 'curl_init failed'];
-        }
-        curl_setopt_array($ch, [
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_FOLLOWLOCATION => true,
-            CURLOPT_MAXREDIRS => 3,
-            CURLOPT_CONNECTTIMEOUT => $timeoutSec,
-            CURLOPT_TIMEOUT => $timeoutSec,
-            CURLOPT_HTTPHEADER => ['Accept: application/json'],
+        // LNURL callback/verify URLs are the LNURL host's choice. By
+        // default we refuse private destinations; the operator opt-in
+        // (allow_private_endpoints) lifts it for self-hosted LN address
+        // services and the local test rigs.
+        // Redirects stay off either way: LNURL endpoints are supposed to
+        // respond directly, and following redirects opens an SSRF-via-
+        // redirect path that the IP pin alone doesn't close.
+        $result = \SafeHttp::request($url, [
+            'method' => 'GET',
+            'timeout' => $timeoutSec,
+            'connectTimeout' => $timeoutSec,
+            'headers' => ['Accept: application/json'],
+            'allowPrivate' => \SafeHttp::privateEndpointsAllowed(),
+            'followRedirects' => false,
         ]);
-        $resp = curl_exec($ch);
-        $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        $err = (string) curl_error($ch);
-        curl_close($ch);
-        if ($resp === false || $code !== 200 || !is_string($resp) || $resp === '') {
+        $code = $result['status'];
+        $resp = $result['body'];
+        $err = $result['error'];
+        if ($err !== '' || $code !== 200 || $resp === '') {
             return [null, $code, $err];
         }
         return [$resp, $code, ''];

@@ -13,6 +13,7 @@
  */
 
 require_once __DIR__ . '/../database.php';
+require_once __DIR__ . '/../safe_http.php';
 require_once __DIR__ . '/../onchain/wallet.php';
 require_once __DIR__ . '/../crypto/secp256k1.php';
 require_once __DIR__ . '/../crypto/schnorr.php';
@@ -208,22 +209,17 @@ final class SwapClaimer {
         $esploraUrl = EsploraProvider::defaultUrlForNetwork($network);
         if ($esploraUrl !== null) {
             $url = rtrim($esploraUrl, '/') . '/tx';
-            $ch = curl_init($url);
-            curl_setopt_array($ch, [
-                CURLOPT_POST => true,
-                CURLOPT_POSTFIELDS => $rawTxHex,
-                CURLOPT_RETURNTRANSFER => true,
-                CURLOPT_TIMEOUT => 20,
-                CURLOPT_HTTPHEADER => ['Content-Type: text/plain'],
+            $result = \SafeHttp::request($url, [
+                'method' => 'POST',
+                'body' => $rawTxHex,
+                'timeout' => 20,
+                'headers' => ['Content-Type: text/plain'],
+                'allowPrivate' => \SafeHttp::privateEndpointsAllowed(),
             ]);
-            $body = curl_exec($ch);
-            $status = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-            $err = curl_error($ch);
-            curl_close($ch);
-            if ($body !== false && $status < 400 && !$err) {
-                return trim((string)$body);
+            if ($result['error'] === '' && $result['status'] < 400) {
+                return trim($result['body']);
             }
-            error_log("swap broadcast via esplora failed: HTTP {$status}: " . substr((string)$body, 0, 200));
+            error_log("swap broadcast via esplora failed: HTTP {$result['status']}: " . substr($result['body'], 0, 200));
         }
         throw new RuntimeException('All broadcast paths failed for swap claim');
     }

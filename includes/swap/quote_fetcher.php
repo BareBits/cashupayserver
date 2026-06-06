@@ -14,6 +14,7 @@
 
 require_once __DIR__ . '/provider.php';
 require_once __DIR__ . '/boltz_like_provider.php';
+require_once __DIR__ . '/../safe_http.php';
 
 final class SwapQuoteFetcher {
     private const REVERSE_PAIR_PATH = '/v2/swap/reverse';
@@ -83,13 +84,35 @@ final class SwapQuoteFetcher {
                 );
                 continue;
             }
-            $ch = curl_init(rtrim($base, '/') . self::REVERSE_PAIR_PATH);
+            $endpointUrl = rtrim($base, '/') . self::REVERSE_PAIR_PATH;
+            // Validate up front so curl_multi handles a hostile/private-IP
+            // provider URL the same way the serial path does.
+            try {
+                $validated = \SafeHttp::validateUrl(
+                    $endpointUrl,
+                    \SafeHttp::privateEndpointsAllowed()
+                );
+            } catch (\Throwable $e) {
+                $out[$name] = null;
+                $audit['providers'][] = self::auditFailure(
+                    $name, $priorityIndex[$name] ?? null,
+                    "URL rejected: {$e->getMessage()}"
+                );
+                continue;
+            }
+            $ch = curl_init($endpointUrl);
             curl_setopt_array($ch, [
                 CURLOPT_RETURNTRANSFER => true,
                 CURLOPT_TIMEOUT        => $timeoutSec,
                 CURLOPT_CONNECTTIMEOUT => self::CONNECT_TIMEOUT_SEC,
                 CURLOPT_HTTPHEADER     => ['Accept: application/json'],
                 CURLOPT_USERAGENT      => self::USER_AGENT,
+                CURLOPT_PROTOCOLS      => CURLPROTO_HTTP | CURLPROTO_HTTPS,
+                CURLOPT_REDIR_PROTOCOLS=> CURLPROTO_HTTP | CURLPROTO_HTTPS,
+                CURLOPT_FOLLOWLOCATION => false,
+                CURLOPT_SSL_VERIFYPEER => true,
+                CURLOPT_SSL_VERIFYHOST => 2,
+                CURLOPT_RESOLVE        => $validated['resolve'],
             ]);
             curl_multi_add_handle($multi, $ch);
             $handles[$name] = $ch;

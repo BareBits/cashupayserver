@@ -49,9 +49,16 @@ if ($isInternal) {
         exit;
     }
 } else {
-    // External cron request - verify cron key if set
+    // External cron request - cron_key is seeded during install (see
+    // Database::initialize). If it's missing the install is broken; refuse
+    // rather than fall through to an open endpoint.
     $cronKey = Config::get('cron_key');
-    if ($cronKey && !hash_equals($cronKey, $providedKey)) {
+    if (!$cronKey) {
+        http_response_code(503);
+        echo 'Cron not configured';
+        exit;
+    }
+    if (!hash_equals($cronKey, $providedKey)) {
         http_response_code(403);
         echo 'Invalid cron key';
         exit;

@@ -26,10 +26,29 @@ if (empty($invoiceId)) {
     exit;
 }
 
-// H3: Poll only this specific invoice (fast) instead of all pending quotes
-Invoice::pollSingleQuote($invoiceId);
+// JSON polling branch runs first — it must not fire pollSingleQuote or
+// Background::trigger. The customer's browser polls this every 2 s; every
+// poll firing a full mint round-trip + cron fan-out fights cron for the
+// same rows (concurrency race in mintAndStoreTokens) and burns mint API
+// budget. Cron drives state transitions; the poll only reads them.
+if (isset($_GET['json'])) {
+    header('Content-Type: application/json');
+    $invoice = Invoice::getById($invoiceId);
+    if ($invoice === null) {
+        http_response_code(404);
+        echo json_encode(['error' => 'Invoice not found']);
+        exit;
+    }
+    echo json_encode([
+        'status' => $invoice['status'],
+        'additionalStatus' => $invoice['additional_status'],
+    ]);
+    exit;
+}
 
-// Trigger background processing for other tasks (non-blocking)
+// HTML render: poll this one quote so the initial page reflects current
+// state, then kick background work for everything else.
+Invoice::pollSingleQuote($invoiceId);
 Background::trigger();
 
 // Get invoice
@@ -46,16 +65,6 @@ $store = Database::fetchOne(
     [$invoice['store_id']]
 );
 $storeName = $store['name'] ?? 'Payment';
-
-// Handle JSON requests (polling)
-if (isset($_GET['json'])) {
-    header('Content-Type: application/json');
-    echo json_encode([
-        'status' => $invoice['status'],
-        'additionalStatus' => $invoice['additional_status'],
-    ]);
-    exit;
-}
 
 // Public POST endpoint: payer enters their email on the payment-complete
 // modal and requests a receipt. No CSRF token because there's no auth

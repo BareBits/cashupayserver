@@ -17,7 +17,9 @@ class Background {
      * Uses a short timeout (100ms) so the calling request doesn't wait.
      */
     public static function trigger(): void {
-        $url = Urls::cron() . '?internal=1&key=' . urlencode(self::getInternalKey());
+        // Internal key travels in a header (not the query string) so it
+        // doesn't leak through webserver access logs.
+        $url = Urls::cron() . '?internal=1';
 
         // Fire-and-forget curl (100ms timeout - enough for localhost self-request)
         $ch = curl_init($url);
@@ -27,6 +29,9 @@ class Background {
             CURLOPT_NOSIGNAL => 1,
             CURLOPT_SSL_VERIFYPEER => false, // For local development
             CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_HTTPHEADER => [
+                'X-CRON-KEY: ' . self::getInternalKey(),
+            ],
         ]);
         @curl_exec($ch);
         // Note: curl_close() is a no-op since PHP 8.0, handle is auto-closed

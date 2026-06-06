@@ -275,25 +275,29 @@ if (isset($_GET['api'])) {
             break;
 
         case 'cron_url':
-            // Surfaces the operator-facing cron URL with key. Lazily generates
-            // a cron_key on first call so existing installs that never set one
-            // up don't need a manual config step.
+            // Surfaces the operator-facing cron URL with key. The key is seeded
+            // at install time (Database::initialize) and lazily regenerated
+            // here for the rare case of an install that predates seeding.
+            // Crontab is rendered with the key passed via the X-CRON-KEY
+            // header instead of ?key= so it doesn't leak through access logs.
+            // cron.php still accepts ?key= for backward compatibility.
             Auth::requireAdmin();
             $key = Config::get('cron_key');
             if (!$key) {
-                $key = bin2hex(random_bytes(16));
+                $key = bin2hex(random_bytes(32));
                 Config::set('cron_key', $key);
             }
-            $url = Urls::cron() . '?key=' . urlencode($key);
-            $swapsUrl = $url . '&only=swaps';
+            $baseUrl = Urls::cron();
+            $swapsBaseUrl = $baseUrl . '?only=swaps';
+            $headerArg = "-H 'X-CRON-KEY: " . $key . "'";
             $now = time();
             $fullSeenAt = (int) Config::get('last_external_cron_at', 0);
             $swapsSeenAt = (int) Config::get('last_external_cron_swaps_at', 0);
             echo json_encode([
-                'url' => $url,
-                'swaps_url' => $swapsUrl,
-                'crontab' => '* * * * * curl -fsS ' . $url . ' > /dev/null',
-                'crontab_swaps' => "* * * * * for i in 0 10 20 30 40 50; do curl -fsS '" . $swapsUrl . "' > /dev/null & sleep 10; done",
+                'url' => $baseUrl,
+                'swaps_url' => $swapsBaseUrl,
+                'crontab' => '* * * * * curl -fsS ' . $headerArg . ' ' . $baseUrl . ' > /dev/null',
+                'crontab_swaps' => "* * * * * for i in 0 10 20 30 40 50; do curl -fsS " . $headerArg . " '" . $swapsBaseUrl . "' > /dev/null & sleep 10; done",
                 'last_full_seen_ago_sec' => $fullSeenAt > 0 ? ($now - $fullSeenAt) : null,
                 'last_swaps_seen_ago_sec' => $swapsSeenAt > 0 ? ($now - $swapsSeenAt) : null,
             ]);

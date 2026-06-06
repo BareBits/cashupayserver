@@ -7,6 +7,7 @@
  */
 
 require_once __DIR__ . '/provider.php';
+require_once __DIR__ . '/../safe_http.php';
 
 abstract class BoltzLikeProvider implements SwapProvider {
     protected int $timeoutSec = 15;
@@ -151,25 +152,22 @@ abstract class BoltzLikeProvider implements SwapProvider {
             throw new RuntimeException($this->getName() . ": no base URL for network '{$network}'");
         }
         $url = rtrim($base, '/') . $path;
-        $ch = curl_init($url);
-        curl_setopt_array($ch, [
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_TIMEOUT => $this->timeoutSec,
-            CURLOPT_CONNECTTIMEOUT => 5,
-            CURLOPT_HTTPHEADER => ['Accept: application/json'],
-            CURLOPT_USERAGENT => 'CashuPayServer/1.0 (swaps)',
+        // Swap-provider URL is admin-configured; private endpoints honored
+        // via the operator's opt-in for self-hosted Boltz mirrors.
+        $result = \SafeHttp::request($url, [
+            'timeout' => $this->timeoutSec,
+            'connectTimeout' => 5,
+            'headers' => ['Accept: application/json'],
+            'userAgent' => 'CashuPayServer/1.0 (swaps)',
+            'allowPrivate' => \SafeHttp::privateEndpointsAllowed(),
         ]);
-        $body = curl_exec($ch);
-        $err = curl_error($ch);
-        $status = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        curl_close($ch);
-        if ($body === false || $err) {
-            throw new RuntimeException($this->getName() . " GET {$path} failed: {$err}");
+        if ($result['error'] !== '') {
+            throw new RuntimeException($this->getName() . " GET {$path} failed: {$result['error']}");
         }
-        if ($status >= 400) {
-            throw new RuntimeException($this->getName() . " GET {$path} -> HTTP {$status}: " . substr((string)$body, 0, 200));
+        if ($result['status'] >= 400) {
+            throw new RuntimeException($this->getName() . " GET {$path} -> HTTP {$result['status']}: " . substr($result['body'], 0, 200));
         }
-        $decoded = json_decode((string)$body, true);
+        $decoded = json_decode($result['body'], true);
         if (!is_array($decoded)) {
             throw new RuntimeException($this->getName() . " GET {$path}: malformed JSON");
         }
@@ -186,27 +184,22 @@ abstract class BoltzLikeProvider implements SwapProvider {
         if ($json === false) {
             throw new RuntimeException($this->getName() . ": failed to encode request body");
         }
-        $ch = curl_init($url);
-        curl_setopt_array($ch, [
-            CURLOPT_POST => true,
-            CURLOPT_POSTFIELDS => $json,
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_TIMEOUT => $this->timeoutSec,
-            CURLOPT_CONNECTTIMEOUT => 5,
-            CURLOPT_HTTPHEADER => ['Content-Type: application/json', 'Accept: application/json'],
-            CURLOPT_USERAGENT => 'CashuPayServer/1.0 (swaps)',
+        $result = \SafeHttp::request($url, [
+            'method' => 'POST',
+            'body' => $json,
+            'timeout' => $this->timeoutSec,
+            'connectTimeout' => 5,
+            'headers' => ['Content-Type: application/json', 'Accept: application/json'],
+            'userAgent' => 'CashuPayServer/1.0 (swaps)',
+            'allowPrivate' => \SafeHttp::privateEndpointsAllowed(),
         ]);
-        $resBody = curl_exec($ch);
-        $err = curl_error($ch);
-        $status = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        curl_close($ch);
-        if ($resBody === false || $err) {
-            throw new RuntimeException($this->getName() . " POST {$path} failed: {$err}");
+        if ($result['error'] !== '') {
+            throw new RuntimeException($this->getName() . " POST {$path} failed: {$result['error']}");
         }
-        $decoded = json_decode((string)$resBody, true);
-        if ($status >= 400) {
-            $msg = $decoded['error'] ?? substr((string)$resBody, 0, 200);
-            throw new RuntimeException($this->getName() . " POST {$path} -> HTTP {$status}: {$msg}");
+        $decoded = json_decode($result['body'], true);
+        if ($result['status'] >= 400) {
+            $msg = $decoded['error'] ?? substr($result['body'], 0, 200);
+            throw new RuntimeException($this->getName() . " POST {$path} -> HTTP {$result['status']}: {$msg}");
         }
         if (!is_array($decoded)) {
             throw new RuntimeException($this->getName() . " POST {$path}: malformed JSON");

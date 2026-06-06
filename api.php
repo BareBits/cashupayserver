@@ -170,6 +170,23 @@ function errorResponse(string $code, string $message, int $status = 400): void {
 }
 
 /**
+ * Tenant guard: refuse the request unless the authenticated API key is
+ * bound to the store named in the URL. Returns 404 rather than 403 so we
+ * don't leak whether the other store exists.
+ *
+ * The wildcard '*' permission grants cross-store access (used by the
+ * internal admin-dashboard key).
+ */
+function requireStoreAccess(array $auth, string $storeId): void {
+    if (Auth::hasPermission($auth, '*')) {
+        return;
+    }
+    if (($auth['store_id'] ?? null) !== $storeId) {
+        errorResponse('not-found', 'Store not found', 404);
+    }
+}
+
+/**
  * Server info endpoint (no auth required)
  */
 function handleServerInfo(): void {

@@ -9,6 +9,12 @@
 
 declare(strict_types=1);
 
+// The PHP test suite uses local mock HTTP servers on 127.0.0.1 — LNURL
+// hosts, mint stubs, updater simulators. SafeHttp's default posture
+// rejects loopback to defeat SSRF in production; the test harness has to
+// flip the same opt-in flag tests/fixtures/swap_stack.py uses.
+putenv('CASHUPAY_ALLOW_PRIVATE_ENDPOINTS=1');
+
 function fail(string $msg): void {
     fwrite(STDERR, $msg . "\n");
     debug_print_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS, 6);
