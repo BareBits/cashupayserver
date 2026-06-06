@@ -333,6 +333,10 @@ def start_wordpress(workdir: Path) -> WordPressHandle:
     # 8. Spin php -S.
     env = os.environ.copy()
     env["CASHUPAY_DATA_DIR"] = str(data_dir)
+    # SafeHttp blocks loopback/RFC1918 destinations by default; the
+    # webhook sink in this test runs on 127.0.0.1, so let the WP-served
+    # cashupay plugin opt in.
+    env.setdefault("CASHUPAY_ALLOW_PRIVATE_ENDPOINTS", "1")
     log = (workdir / "wp-server.log").open("ab")
     proc = subprocess.Popen(
         [

@@ -358,10 +358,12 @@ def payserver_no_lud21(lnurlp_server_no_lud21: LnurlpServer) -> Iterator[Payserv
 
 @pytest.fixture
 def configured_no_lud21(
-    payserver_no_lud21: PayserverHandle, mint: MintHandle
+    payserver_no_lud21: PayserverHandle,
+    mint: MintHandle,
+    backup_mint: MintHandle,
 ) -> ConfiguredPayserver:
     """Same as `configured` but the LNURL host doesn't support LUD-21."""
-    return _configure(payserver_no_lud21, mint)
+    return _configure(payserver_no_lud21, mint, backup_mint)
 
 
 def test_lnurl_lud21_missing_falls_back_to_mint(

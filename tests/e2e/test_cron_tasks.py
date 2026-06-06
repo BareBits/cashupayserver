@@ -13,8 +13,9 @@ def test_cron_returns_503_before_setup(payserver: PayserverHandle) -> None:
     assert "Not configured" in r.text
 
 
-def test_cron_runs_without_key_when_unconfigured(configured: ConfiguredPayserver) -> None:
-    """No cron_key set during the test wizard, so any caller can run it."""
+def test_cron_runs_with_seeded_key(configured: ConfiguredPayserver) -> None:
+    """`cron_key` is seeded during install (Database::initialize); the fixture
+    reads it and passes it as ?key=, so the cron endpoint runs all tasks."""
     r = configured.handle.trigger_cron()
     assert r.status_code == 200, r.text
     body = r.json()

@@ -6,6 +6,7 @@ checked-in PHP source.
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import signal
@@ -84,12 +85,28 @@ class PayserverHandle:
             conn.close()
 
     def trigger_cron(self, *, internal_key: str | None = None) -> requests.Response:
-        """Hit cron.php. If `internal_key` is None we rely on the install
-        having no `cron_key` set, which is true for the test wizard."""
+        """Hit cron.php. With `internal_key`, performs an internal self-request
+        auth check; without it, reads the seeded `cron_key` from the DB
+        (Database::initialize seeds it on install) and sends it as ?key=."""
         if internal_key is not None:
             params = {"internal": "1", "key": internal_key}
         else:
-            params = {}
+            with self.db() as conn:
+                row = conn.execute(
+                    "SELECT value FROM config WHERE key = 'cron_key'"
+                ).fetchone()
+            if not row:
+                raise RuntimeError(
+                    "cron_key not seeded — Database::initialize should set it"
+                )
+            raw = row["value"]
+            try:
+                key = json.loads(raw)
+                if not isinstance(key, str):
+                    key = raw
+            except (json.JSONDecodeError, ValueError):
+                key = raw
+            params = {"key": key}
         return requests.get(f"{self.url}/cron.php", params=params, timeout=30)
 
 
@@ -130,6 +147,11 @@ def start_payserver(workdir: Path, *, extra_env: dict[str, str] | None = None) -
     (data_dir / ".updater_disabled").write_text(
         "auto-updates disabled by tests/fixtures/payserver.py\n"
     )
+    # SafeHttp blocks loopback/RFC1918 destinations by default to defend
+    # against tenant-supplied SSRF (webhook URLs, LNURL callbacks, etc.).
+    # Every test sink — webhook receiver, LNURL mock, Esplora, the wp test
+    # site — runs on 127.0.0.1, so let the test rig opt in.
+    env.setdefault("CASHUPAY_ALLOW_PRIVATE_ENDPOINTS", "1")
     if extra_env:
         env.update(extra_env)
 

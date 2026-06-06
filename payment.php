@@ -26,12 +26,16 @@ if (empty($invoiceId)) {
     exit;
 }
 
-// JSON polling branch runs first — it must not fire pollSingleQuote or
-// Background::trigger. The customer's browser polls this every 2 s; every
-// poll firing a full mint round-trip + cron fan-out fights cron for the
-// same rows (concurrency race in mintAndStoreTokens) and burns mint API
-// budget. Cron drives state transitions; the poll only reads them.
+// JSON polling branch runs first so we can keep its work tight. The
+// customer's browser polls this every 2 s; firing the full Background
+// fan-out on every poll burns mint API budget and fights cron for the
+// same rows (concurrency race in mintAndStoreTokens). pollSingleQuote
+// stays — it's the only thing that drives settlement for THIS invoice
+// when no external cron is running, and skipping it stalls customers
+// on the "Waiting for payment" screen until the next cron tick (which
+// is never, for shops that haven't wired cron up).
 if (isset($_GET['json'])) {
+    Invoice::pollSingleQuote($invoiceId);
     header('Content-Type: application/json');
     $invoice = Invoice::getById($invoiceId);
     if ($invoice === null) {
