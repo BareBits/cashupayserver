@@ -1,0 +1,93 @@
+# syntax=docker/dockerfile:1.6
+#
+# Production Dockerfile for CashuPayServer (BareBits fork).
+#
+# Two stages:
+#   1. composer install in the upstream composer image (no PHP runtime needed).
+#   2. runtime image based on php:8.3-apache with mod_php + mod_rewrite.
+#
+# Operators mount /var/www/html as a persistent volume; the entrypoint seeds
+# the app source into it on first boot, after which the in-app auto-updater
+# is the upgrade path. `docker pull` of a new tag is for OS/PHP refreshes;
+# set CASHUPAY_AUTO_UPDATE_ENABLED=0 if you prefer immutable infrastructure.
+#
+# Companion files:
+#   docker/entrypoint-production.sh — first-boot seed + cron loop + apache.
+#   docker/production-vhost.conf    — Apache vhost that honours the in-repo .htaccess.
+#   docs/docker-production.md       — operator guide.
+
+# ---- Stage 1: composer install --------------------------------------------
+FROM composer:2 AS deps
+
+WORKDIR /app
+COPY composer.json composer.lock /app/
+
+# --ignore-platform-reqs: lastguest/murmurhash carries a stale PHP 7 pin that
+# runs fine on PHP 8.3. Mirrors the flag used by scripts/build-standalone.sh.
+RUN composer install \
+        --no-dev \
+        --no-progress \
+        --optimize-autoloader \
+        --ignore-platform-reqs
+
+
+# ---- Stage 2: runtime ------------------------------------------------------
+FROM php:8.3-apache AS runtime
+
+# PHP extensions used by the app: gmp (bitwasp/bitcoin), pdo_sqlite (storage).
+# curl is needed for the HEALTHCHECK and is convenient for ops.
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        libgmp-dev \
+        libsqlite3-dev \
+        curl \
+        ca-certificates; \
+    docker-php-ext-install -j"$(nproc)" gmp pdo_sqlite; \
+    apt-get clean; \
+    rm -rf /var/lib/apt/lists/*
+
+# Apache modules the in-repo .htaccess relies on.
+RUN a2enmod rewrite headers expires deflate
+
+# Apache vhost: DocumentRoot + AllowOverride All so .htaccess is honoured,
+# logs piped to container stdout/stderr.
+COPY docker/production-vhost.conf /etc/apache2/sites-available/000-default.conf
+
+# Bake source into /usr/src/cashupayserver. The entrypoint copies it into
+# /var/www/html on first boot, then leaves it alone so subsequent runs
+# pick up auto-updater changes from the volume.
+RUN mkdir -p /usr/src/cashupayserver
+COPY --from=deps /app/vendor                                       /usr/src/cashupayserver/vendor/
+COPY includes/                                                     /usr/src/cashupayserver/includes/
+COPY assets/                                                       /usr/src/cashupayserver/assets/
+COPY api-keys/                                                     /usr/src/cashupayserver/api-keys/
+COPY images/                                                       /usr/src/cashupayserver/images/
+COPY cashu-wallet-php/CashuWallet.php                              /usr/src/cashupayserver/cashu-wallet-php/CashuWallet.php
+COPY cashu-wallet-php/bip39-english.txt                            /usr/src/cashupayserver/cashu-wallet-php/bip39-english.txt
+COPY admin.php setup.php api.php payment.php receive.php cron.php \
+     router.php index.php recover.php                              /usr/src/cashupayserver/
+COPY .htaccess manifest.json favicon.ico                           /usr/src/cashupayserver/
+
+# Entrypoint.
+COPY docker/entrypoint-production.sh /usr/local/bin/cashupay-entrypoint.sh
+RUN chmod +x /usr/local/bin/cashupay-entrypoint.sh
+
+# Auto-update is opt-in in the upstream code (includes/updater.php:64). The
+# Docker image flips it on by default; override with CASHUPAY_AUTO_UPDATE_ENABLED=0
+# at runtime to pin to image tags.
+ENV CASHUPAY_AUTO_UPDATE_ENABLED=1 \
+    CRON_INTERVAL_SECONDS=60 \
+    TZ=UTC
+
+EXPOSE 80
+
+# Probe the root with -L so we accept the setup.php→admin.php redirect chain
+# both during and after setup; -f trips on the final 5xx if PHP is broken.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD curl -fsSL http://localhost/ > /dev/null || exit 1
+
+VOLUME ["/var/www/html"]
+
+ENTRYPOINT ["/usr/local/bin/cashupay-entrypoint.sh"]
+CMD ["apache2-foreground"]

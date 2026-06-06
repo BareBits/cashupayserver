@@ -1,0 +1,42 @@
+# Keep the build context small and prevent local dev state from leaking into
+# the image. The production Dockerfile uses targeted COPY statements, so this
+# is defense-in-depth rather than the only line of defense.
+
+# VCS
+.git
+.gitignore
+.gitattributes
+.github
+
+# Editor / tooling
+.claude
+.vscode
+.idea
+.DS_Store
+*.swp
+
+# Test artifacts and runtime caches
+tests/
+build/
+vendor/
+node_modules/
+mint-discovery/node_modules/
+
+# Local dev state and secrets (must never end up in the image)
+user_config.php
+includes/config.local.php
+data/cashupay.sqlite
+data/cache/
+data/updates/
+data/dbip-country-lite.csv.gz
+data/notification_queue/
+
+# Docs aren't shipped in the runtime image
+docs/
+DOCKER.md
+README.md
+USE_POLICY.md
+LICENSE.md
+
+# Composer phar (re-fetched in stage 1)
+composer.phar
