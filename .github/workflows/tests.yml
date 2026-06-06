@@ -13,7 +13,7 @@ jobs:
   e2e-and-ui:
     name: E2E + UI
     runs-on: ubuntu-22.04
-    timeout-minutes: 25
+    timeout-minutes: 40
 
     steps:
       - name: Use HTTPS for SSH-form submodule URLs
@@ -70,7 +70,7 @@ jobs:
           PYTHONUNBUFFERED: "1"
 
       - name: Upload test logs on failure
-        if: failure()
+        if: failure() || cancelled()
         uses: actions/upload-artifact@v4
         with:
           name: test-logs
