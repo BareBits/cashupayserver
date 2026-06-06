@@ -82,10 +82,12 @@ ENV CASHUPAY_AUTO_UPDATE_ENABLED=1 \
 
 EXPOSE 80
 
-# Probe the root with -L so we accept the setup.php→admin.php redirect chain
-# both during and after setup; -f trips on the final 5xx if PHP is broken.
+# Probe /setup.php with -L: pre-setup it returns 200; post-setup it 302s to
+# admin → login, which -L follows to a final 200. We avoid '/' because on a
+# fresh install before the schema is bootstrapped, index.php 500s while
+# resolving Urls::setup() against the un-migrated config table.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD curl -fsSL http://localhost/ > /dev/null || exit 1
+    CMD curl -fsSL http://localhost/setup.php > /dev/null || exit 1
 
 VOLUME ["/var/www/html"]
 
