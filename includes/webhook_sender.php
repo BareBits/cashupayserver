@@ -6,6 +6,7 @@
  */
 
 require_once __DIR__ . '/database.php';
+require_once __DIR__ . '/safe_http.php';
 
 class WebhookSender {
     private const MAX_RETRIES = 3;
@@ -108,36 +109,36 @@ class WebhookSender {
 
     /**
      * Send HTTP request
+     *
+     * Webhook URLs are merchant-supplied. By default we refuse private/
+     * loopback destinations (defense against tenant-supplied SSRF). The
+     * operator opt-in (allow_private_endpoints) lifts the restriction —
+     * intended for self-hosters who want to point webhooks at a LAN
+     * service or local development.
      */
     private static function sendRequest(string $url, string $payload, string $signature): array {
-        $ch = curl_init($url);
-
-        curl_setopt_array($ch, [
-            CURLOPT_POST => true,
-            CURLOPT_POSTFIELDS => $payload,
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_TIMEOUT => self::TIMEOUT,
-            CURLOPT_HTTPHEADER => [
+        $result = SafeHttp::request($url, [
+            'method' => 'POST',
+            'body' => $payload,
+            'timeout' => self::TIMEOUT,
+            'headers' => [
                 'Content-Type: application/json',
                 'BTCPay-Sig: ' . $signature,
-                'User-Agent: CashuPayServer/1.0',
             ],
+            'allowPrivate' => SafeHttp::privateEndpointsAllowed(),
+            'followRedirects' => false,
         ]);
 
-        $response = curl_exec($ch);
-        $statusCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        $error = curl_error($ch);
-
-        if ($error) {
+        if ($result['error'] !== '') {
             return [
                 'status_code' => 0,
-                'response' => 'cURL error: ' . $error,
+                'response' => 'cURL error: ' . $result['error'],
             ];
         }
 
         return [
-            'status_code' => $statusCode,
-            'response' => substr($response, 0, 1000), // Limit stored response
+            'status_code' => $result['status'],
+            'response' => substr($result['body'], 0, 1000),
         ];
     }
 

@@ -38,6 +38,7 @@ require_once __DIR__ . '/rates.php';
 require_once __DIR__ . '/lightning_address.php';
 require_once __DIR__ . '/free_trial.php';
 require_once __DIR__ . '/stuck_funds.php';
+require_once __DIR__ . '/safe_http.php';
 require_once __DIR__ . '/../cashu-wallet-php/CashuWallet.php';
 
 use Cashu\Wallet;
@@ -417,21 +418,17 @@ class LnurlPay {
             $url = $address;
         }
 
-        $ch = curl_init($url);
-        curl_setopt_array($ch, [
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_TIMEOUT => 10,
-            CURLOPT_FOLLOWLOCATION => true,
-            CURLOPT_HTTPHEADER => ['Accept: application/json'],
+        $result = \SafeHttp::request($url, [
+            'timeout' => 10,
+            'followRedirects' => false,
+            'headers' => ['Accept: application/json'],
+            'allowPrivate' => \SafeHttp::privateEndpointsAllowed(),
         ]);
-        $response = curl_exec($ch);
-        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        curl_close($ch);
 
-        if ($httpCode !== 200 || empty($response)) {
+        if ($result['status'] !== 200 || $result['body'] === '') {
             return null;
         }
-        $data = json_decode($response, true);
+        $data = json_decode($result['body'], true);
         if (!is_array($data) || !isset($data['callback'], $data['minSendable'], $data['maxSendable'])) {
             return null;
         }
@@ -472,21 +469,20 @@ class LnurlPay {
                 . strlen($memo) . " chars and has no payerData.name; paying without memo");
         }
 
-        $ch = curl_init($url);
-        curl_setopt_array($ch, [
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_TIMEOUT => 15,
-            CURLOPT_FOLLOWLOCATION => true,
-            CURLOPT_HTTPHEADER => ['Accept: application/json'],
+        // The callback URL was chosen by the LNURL host — treat it as
+        // attacker-influenced. Honor the operator opt-in (same flag the
+        // mint and onchain provider use); refuse redirects unconditionally.
+        $result = \SafeHttp::request($url, [
+            'timeout' => 15,
+            'followRedirects' => false,
+            'headers' => ['Accept: application/json'],
+            'allowPrivate' => \SafeHttp::privateEndpointsAllowed(),
         ]);
-        $response = curl_exec($ch);
-        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        curl_close($ch);
 
-        if ($httpCode !== 200 || empty($response)) {
-            throw new Exception("LNURL callback failed (HTTP {$httpCode})");
+        if ($result['status'] !== 200 || $result['body'] === '') {
+            throw new Exception("LNURL callback failed (HTTP {$result['status']})");
         }
-        $data = json_decode($response, true);
+        $data = json_decode($result['body'], true);
         if (!is_array($data) || !isset($data['pr'])) {
             $err = $data['reason'] ?? $data['message'] ?? 'no pr field';
             throw new Exception("LNURL callback error: {$err}");

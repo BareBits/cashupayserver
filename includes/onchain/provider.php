@@ -8,6 +8,7 @@
  */
 
 require_once __DIR__ . '/../database.php';
+require_once __DIR__ . '/../safe_http.php';
 
 /**
  * A single transaction output observed paying a given watch address.
@@ -98,25 +99,23 @@ final class EsploraProvider implements BlockchainProvider {
 
     private function httpRaw(string $path): string {
         $url = rtrim($this->baseUrl, '/') . $path;
-        $ch = curl_init($url);
-        curl_setopt_array($ch, [
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_TIMEOUT => $this->timeoutSec,
-            CURLOPT_CONNECTTIMEOUT => 5,
-            CURLOPT_FOLLOWLOCATION => true,
-            CURLOPT_HTTPHEADER => ['Accept: application/json'],
-            CURLOPT_USERAGENT => 'CashuPayServer/1.0 (onchain)',
+        // Esplora URL is admin-configured; the operator's allow_private_endpoints
+        // opt-in lets them point at a local Bitcoin node.
+        $result = \SafeHttp::request($url, [
+            'timeout' => $this->timeoutSec,
+            'connectTimeout' => 5,
+            'followRedirects' => true,
+            'headers' => ['Accept: application/json'],
+            'userAgent' => 'CashuPayServer/1.0 (onchain)',
+            'allowPrivate' => \SafeHttp::privateEndpointsAllowed(),
         ]);
-        $body = curl_exec($ch);
-        $err = curl_error($ch);
-        $status = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        if ($body === false || $err) {
-            throw new RuntimeException("Esplora request failed for {$path}: {$err}");
+        if ($result['error'] !== '') {
+            throw new RuntimeException("Esplora request failed for {$path}: {$result['error']}");
         }
-        if ($status >= 400) {
-            throw new RuntimeException("Esplora {$path} -> HTTP {$status}: " . substr((string)$body, 0, 200));
+        if ($result['status'] >= 400) {
+            throw new RuntimeException("Esplora {$path} -> HTTP {$result['status']}: " . substr($result['body'], 0, 200));
         }
-        return (string)$body;
+        return $result['body'];
     }
 
     private function httpJson(string $path): array {
@@ -217,30 +216,28 @@ final class BitcoindRpcProvider implements BlockchainProvider {
             'method' => $method,
             'params' => $params,
         ]);
-        $ch = curl_init($this->rpcUrl);
-        curl_setopt_array($ch, [
-            CURLOPT_POST => true,
-            CURLOPT_POSTFIELDS => $body,
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_TIMEOUT => $this->timeoutSec,
-            CURLOPT_CONNECTTIMEOUT => 5,
-            CURLOPT_HTTPHEADER => ['Content-Type: application/json'],
+        // bitcoind RPC almost always points at localhost; the URL is
+        // admin-configured via the store record.
+        $result = \SafeHttp::request($this->rpcUrl, [
+            'method' => 'POST',
+            'body' => $body,
+            'timeout' => $this->timeoutSec,
+            'connectTimeout' => 5,
+            'headers' => ['Content-Type: application/json'],
+            'allowPrivate' => \SafeHttp::privateEndpointsAllowed(),
         ]);
-        $response = curl_exec($ch);
-        $err = curl_error($ch);
-        $status = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        if ($response === false || $err) {
-            throw new RuntimeException("bitcoind RPC {$method} failed: {$err}");
+        if ($result['error'] !== '') {
+            throw new RuntimeException("bitcoind RPC {$method} failed: {$result['error']}");
         }
-        $decoded = json_decode((string)$response, true);
+        $decoded = json_decode($result['body'], true);
         if (!is_array($decoded)) {
             throw new RuntimeException("bitcoind RPC {$method}: malformed JSON");
         }
         if (!empty($decoded['error'])) {
             throw new RuntimeException("bitcoind RPC {$method}: " . json_encode($decoded['error']));
         }
-        if ($status >= 400 && empty($decoded['result'])) {
-            throw new RuntimeException("bitcoind RPC {$method}: HTTP {$status}");
+        if ($result['status'] >= 400 && empty($decoded['result'])) {
+            throw new RuntimeException("bitcoind RPC {$method}: HTTP {$result['status']}");
         }
         return $decoded['result'];
     }

@@ -17,6 +17,7 @@
  */
 
 require_once __DIR__ . '/config.php';
+require_once __DIR__ . '/safe_http.php';
 
 class Updater {
     public const GH_OWNER = 'BareBits';
@@ -551,22 +552,23 @@ class Updater {
     // ---------------- HTTP ----------------
 
     private static function httpGet(string $url): ?string {
-        $ch = curl_init($url);
-        curl_setopt_array($ch, [
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_FOLLOWLOCATION => true,
-            CURLOPT_TIMEOUT => 60,
-            CURLOPT_CONNECTTIMEOUT => 10,
-            CURLOPT_USERAGENT => self::HTTP_USER_AGENT,
-            CURLOPT_HTTPHEADER => ['Accept: */*'],
+        // Release URLs are typically GitHub but the channel can be
+        // overridden by the operator. Honor the same allow-private opt-in
+        // we use elsewhere so tests can serve releases from a local
+        // fixture and self-hosters can mirror releases on their LAN.
+        $result = \SafeHttp::request($url, [
+            'timeout' => 60,
+            'connectTimeout' => 10,
+            'userAgent' => self::HTTP_USER_AGENT,
+            'headers' => ['Accept: */*'],
+            'followRedirects' => true,
+            'maxRedirects' => 5,
+            'allowPrivate' => \SafeHttp::privateEndpointsAllowed(),
         ]);
-        $body = curl_exec($ch);
-        $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        curl_close($ch);
-        if ($body === false || $code < 200 || $code >= 300) {
+        if ($result['error'] !== '' || $result['status'] < 200 || $result['status'] >= 300) {
             return null;
         }
-        return (string)$body;
+        return $result['body'];
     }
 
     private static function httpGetJson(string $url): ?array {
@@ -577,6 +579,17 @@ class Updater {
     }
 
     private static function httpDownload(string $url, string $dest): bool {
+        // Release tarballs can be tens of MB, so we stream to disk via
+        // CURLOPT_FILE rather than buffer in memory through SafeHttp.
+        // SafeHttp::validateUrl() still vets the host and pins the IP so
+        // a hostile redirect can't pivot to a private address. Same opt-in
+        // as httpGet: tests + LAN mirrors need to allow private destinations.
+        try {
+            $validated = \SafeHttp::validateUrl($url, \SafeHttp::privateEndpointsAllowed());
+        } catch (\Throwable $e) {
+            return false;
+        }
+
         $fp = @fopen($dest, 'w');
         if ($fp === false) return false;
         $ch = curl_init($url);
@@ -586,6 +599,10 @@ class Updater {
             CURLOPT_TIMEOUT => 300,
             CURLOPT_CONNECTTIMEOUT => 10,
             CURLOPT_USERAGENT => self::HTTP_USER_AGENT,
+            CURLOPT_PROTOCOLS => CURLPROTO_HTTP | CURLPROTO_HTTPS,
+            CURLOPT_REDIR_PROTOCOLS => CURLPROTO_HTTP | CURLPROTO_HTTPS,
+            CURLOPT_SSL_VERIFYPEER => true,
+            CURLOPT_RESOLVE => $validated['resolve'],
         ]);
         $ok = curl_exec($ch);
         $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);

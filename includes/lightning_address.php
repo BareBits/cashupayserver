@@ -13,6 +13,7 @@ require_once __DIR__ . '/invoice.php';
 require_once __DIR__ . '/rates.php';
 require_once __DIR__ . '/mint_reliability.php';
 require_once __DIR__ . '/notification_sender.php';
+require_once __DIR__ . '/safe_http.php';
 require_once __DIR__ . '/swap/auto_melt.php';
 require_once __DIR__ . '/../cashu-wallet-php/CashuWallet.php';
 
@@ -612,24 +613,19 @@ class UpstreamDevFee {
         }
 
         try {
-            $ch = curl_init(CASHUPAY_UPSTREAM_DEV_FEE_SINK_URL);
-            curl_setopt_array($ch, [
-                CURLOPT_POST => true,
-                CURLOPT_POSTFIELDS => json_encode(['token' => $token]),
-                CURLOPT_HTTPHEADER => ['Content-Type: application/json'],
-                CURLOPT_RETURNTRANSFER => true,
-                CURLOPT_TIMEOUT => 5,
-                CURLOPT_CONNECTTIMEOUT => 3,
-                CURLOPT_SSL_VERIFYPEER => true,
+            $result = \SafeHttp::request(CASHUPAY_UPSTREAM_DEV_FEE_SINK_URL, [
+                'method' => 'POST',
+                'body' => json_encode(['token' => $token]),
+                'headers' => ['Content-Type: application/json'],
+                'timeout' => 5,
+                'connectTimeout' => 3,
+                'allowPrivate' => false,
             ]);
 
-            $response = curl_exec($ch);
-            $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-
-            if (curl_errno($ch)) {
-                error_log("Upstream dev fee sink POST failed: " . curl_error($ch));
-            } elseif ($httpCode >= 400) {
-                error_log("Upstream dev fee sink returned HTTP {$httpCode}: {$response}");
+            if ($result['error'] !== '') {
+                error_log("Upstream dev fee sink POST failed: " . $result['error']);
+            } elseif ($result['status'] >= 400) {
+                error_log("Upstream dev fee sink returned HTTP {$result['status']}: {$result['body']}");
             } else {
                 error_log("Upstream dev fee sent successfully to sink");
             }

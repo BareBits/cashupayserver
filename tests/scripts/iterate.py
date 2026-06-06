@@ -288,6 +288,11 @@ def main() -> int:
     # auto-updater from overlaying the working tree mid-session.
     os.environ.setdefault("CASHUPAY_UPDATER_DISABLED", "1")
 
+    # Honoured by includes/safe_http.php — the local stack points the mint
+    # and onchain provider at 127.0.0.1 / regtest endpoints, which
+    # SafeHttp's default posture (block private/loopback IPs) would reject.
+    os.environ.setdefault("CASHUPAY_ALLOW_PRIVATE_ENDPOINTS", "1")
+
     workdir = ITERATE_ROOT / f"iterate-{int(time.time())}-{uuid.uuid4().hex[:6]}"
     workdir.mkdir(parents=True, exist_ok=True)
     print(f"[iterate] workdir = {workdir}")
