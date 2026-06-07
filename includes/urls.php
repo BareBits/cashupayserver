@@ -80,7 +80,13 @@ class Urls {
             $pluginFile = self::$pluginFile ?? (defined('CASHUPAY_PLUGIN_DIR') ? CASHUPAY_PLUGIN_DIR . '/cashupay.php' : __FILE__);
             return plugins_url('assets/' . $subpath, $pluginFile);
         }
-        return 'assets/' . $subpath;
+        // Absolute (base-rooted) URL rather than a page-relative 'assets/...'.
+        // With path-based admin routing the SPA is served at sub-paths like
+        // /admin/dashboard and /admin/stats, where a relative 'assets/...'
+        // resolves to /admin/assets/... and 404s — which silently broke
+        // chart.min.js (blank stats charts), mint-discovery, animated-qr and
+        // flag images. A base-rooted URL loads correctly from any sub-path.
+        return Config::getBaseUrl() . '/assets/' . $subpath;
     }
 
     /**

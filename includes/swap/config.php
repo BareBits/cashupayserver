@@ -136,7 +136,7 @@ final class SwapsConfig {
         if (!in_array($tri, [self::INHERIT, self::FORCE_OFF, self::FORCE_ON], true)) {
             throw new InvalidArgumentException("Invalid swaps_enabled tri-state: {$tri}");
         }
-        Database::exec(
+        Database::query(
             "UPDATE stores SET swaps_enabled = ? WHERE id = ?",
             [$tri, $storeId]
         );
