@@ -164,6 +164,12 @@
 //
 // define('CASHUPAY_AUTO_MELT_SWAP_MAX_FEE_PCT', 1.0);
 
+// CASHUPAY_STRIKE_URL — destination for the "get a free lightning address"
+// Strike links shown in the auto-withdrawal settings. Defaults to
+// 'http://strike.me'. Override to point merchants at a referral/localized URL.
+//
+// define('CASHUPAY_STRIKE_URL', 'http://strike.me');
+
 // LNURL DIRECT-RECEIVE
 // --------------------
 // When a store has an auto-withdraw Lightning address configured and the

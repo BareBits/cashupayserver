@@ -1520,6 +1520,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         case 'save_auto_melt':
             Auth::requireAdmin();
             require_once __DIR__ . '/includes/swap/auto_melt.php';
+            require_once __DIR__ . '/includes/swap/config.php';
             require_once __DIR__ . '/includes/lnurl_receive.php';
             try {
                 $storeId = $_POST['store_id'] ?? '';
@@ -1544,6 +1545,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     throw new Exception('Invalid Lightning address format');
                 }
 
+                // On-chain auto-withdraw requires the store to have an on-chain
+                // xpub / static address — refuse to save otherwise so we never
+                // select a destination that can't actually receive funds.
+                if ($modeOverride === SwapAutoMelt::FORCE_SWAP) {
+                    $ocRow = Database::fetchOne(
+                        "SELECT onchain_address_mode, onchain_xpub, onchain_static_address FROM stores WHERE id = ?",
+                        [$storeId]
+                    );
+                    $hasOnchain = $ocRow && ((($ocRow['onchain_address_mode'] ?? 'xpub') === 'static')
+                        ? (($ocRow['onchain_static_address'] ?? '') !== '')
+                        : (($ocRow['onchain_xpub'] ?? '') !== ''));
+                    if (!$hasOnchain) {
+                        throw new Exception('On-chain withdrawal requires an on-chain xpub or address on the Bitcoin tab.');
+                    }
+                }
+
                 // Probe LUD-21 support whenever an LN address is provided.
                 // Result drives the receive-rail decision in Invoice::create
                 // and (when 0) the operator-facing warning that lightning
@@ -1566,6 +1583,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'auto_melt_use_swap' => $modeOverride,
                     'lnurl_supports_verify' => $lud21Support,
                 ], 'id = ?', [$storeId]);
+
+                // Choosing on-chain auto-withdraw forces submarine swaps on for
+                // this store, and enables the site-wide master switch if it was
+                // off (without forcing swaps on for any other store).
+                if ($modeOverride === SwapAutoMelt::FORCE_SWAP) {
+                    SwapsConfig::setStoreOverride($storeId, SwapsConfig::FORCE_ON);
+                    if (!SwapsConfig::siteEnabled()) {
+                        SwapsConfig::setSiteEnabled(true);
+                    }
+                }
 
                 echo json_encode([
                     'success' => true,
@@ -1725,6 +1752,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $override = (int)($_POST['override'] ?? SwapsConfig::INHERIT);
                 if (empty($storeId)) {
                     throw new Exception('Store ID required');
+                }
+                // Submarine swaps settle on-chain, so forcing them on requires the
+                // store to have an on-chain xpub / static address. Refuse + warn
+                // otherwise rather than saving a setting that can't work.
+                if ($override === SwapsConfig::FORCE_ON) {
+                    $ocRow = Database::fetchOne(
+                        "SELECT onchain_address_mode, onchain_xpub, onchain_static_address FROM stores WHERE id = ?",
+                        [$storeId]
+                    );
+                    $hasOnchain = $ocRow && ((($ocRow['onchain_address_mode'] ?? 'xpub') === 'static')
+                        ? (($ocRow['onchain_static_address'] ?? '') !== '')
+                        : (($ocRow['onchain_xpub'] ?? '') !== ''));
+                    if (!$hasOnchain) {
+                        throw new Exception('Submarine swaps require an on-chain xpub or address on the Bitcoin tab.');
+                    }
                 }
                 SwapsConfig::setStoreOverride($storeId, $override);
                 echo json_encode(['success' => true]);
@@ -2830,9 +2872,14 @@ $adminView = $rawAdminView;
             flex: 1;
             padding: 1rem;
             padding-bottom: calc(5rem + env(safe-area-inset-bottom));
-            max-width: 800px;
+            max-width: 1100px;
             margin: 0 auto;
             width: 100%;
+            /* Flex column so the active view can vertically center when it's
+               shorter than the viewport (auto margins collapse to 0 and the
+               view top-aligns + scrolls normally when it's taller). */
+            display: flex;
+            flex-direction: column;
         }
 
         /* Views */
@@ -2842,6 +2889,10 @@ $adminView = $rawAdminView;
 
         .view.active {
             display: block;
+            /* Center vertically within .main when short; collapses to top-align
+               (margin 0) and scrolls when content is taller than the viewport. */
+            margin: auto 0;
+            width: 100%;
         }
 
         /* Generic visibility helper — used by the Users / Settings UI so JS
@@ -2928,6 +2979,124 @@ $adminView = $rawAdminView;
         .card-body {
             padding: 1rem;
         }
+
+        /* Collapsible cards (default open; add .collapsed to start closed) */
+        .card.collapsible > .card-header {
+            cursor: pointer;
+            user-select: none;
+            justify-content: flex-start;
+            gap: 0.5rem;
+        }
+        .card.collapsible > .card-header > .card-title {
+            margin-right: auto;
+        }
+        .card.collapsible > .card-header::after {
+            content: "";
+            width: 0.55rem;
+            height: 0.55rem;
+            border-right: 2px solid var(--text-secondary);
+            border-bottom: 2px solid var(--text-secondary);
+            transform: rotate(45deg);
+            transition: transform 0.2s;
+            flex-shrink: 0;
+            margin-bottom: 2px;
+        }
+        .card.collapsible.collapsed > .card-header::after {
+            transform: rotate(-45deg);
+            margin-bottom: 0;
+        }
+        .card.collapsible.collapsed > :not(.card-header) {
+            display: none !important;
+        }
+
+        /* Collapsible subsection (e.g. Advanced inside a card) */
+        .subsection-toggle {
+            display: flex;
+            align-items: center;
+            gap: 0.4rem;
+            cursor: pointer;
+            user-select: none;
+            font-weight: 600;
+            font-size: 0.9rem;
+            padding: 0.5rem 0;
+            color: var(--text-secondary);
+        }
+        .subsection-toggle::after {
+            content: "";
+            width: 0.5rem;
+            height: 0.5rem;
+            border-right: 2px solid var(--text-secondary);
+            border-bottom: 2px solid var(--text-secondary);
+            transform: rotate(45deg);
+            transition: transform 0.2s;
+            margin-bottom: 2px;
+        }
+        .subsection.collapsed > .subsection-toggle::after {
+            transform: rotate(-45deg);
+            margin-bottom: 0;
+        }
+        .subsection.collapsed > .subsection-body {
+            display: none;
+        }
+
+        /* Auto-withdrawal column selector */
+        .aw-title {
+            font-weight: 600;
+            font-size: 0.95rem;
+            margin: 0 0 0.6rem 0;
+        }
+        .aw-cols {
+            display: flex;
+            gap: 0.75rem;
+            flex-wrap: wrap;
+        }
+        .aw-col {
+            flex: 1 1 0;
+            min-width: 190px;
+            border: 2px solid var(--border);
+            border-radius: 12px;
+            padding: 0.85rem;
+            cursor: pointer;
+            transition: border-color 0.15s, background 0.15s;
+            position: relative;
+            display: flex;
+            flex-direction: column;
+            gap: 0.35rem;
+        }
+        .aw-col:hover { border-color: var(--text-secondary); }
+        .aw-col.selected {
+            border-color: var(--accent);
+            background: rgba(247, 147, 26, 0.08);
+        }
+        .aw-col-head {
+            display: flex;
+            align-items: baseline;
+            gap: 0.4rem;
+            flex-wrap: wrap;
+        }
+        .aw-col-name { font-weight: 600; font-size: 0.95rem; }
+        .aw-col-badge {
+            font-size: 0.65rem;
+            font-weight: 700;
+            color: var(--accent);
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+        }
+        .aw-col-desc { font-size: 0.8rem; color: var(--text-secondary); line-height: 1.35; }
+        /* Keep the Strike/CoinOS links white — the default link colour is hard
+           to read against the column's tinted background. */
+        .aw-col a { color: #fff; text-decoration: underline; }
+        .aw-col ul { margin: 0.1rem 0 0 0; padding-left: 1.1rem; font-size: 0.78rem; color: var(--text-secondary); }
+        .aw-col li { margin-bottom: 0.12rem; }
+        .aw-col-check {
+            position: absolute;
+            top: 0.55rem;
+            right: 0.7rem;
+            opacity: 0;
+            color: var(--accent);
+            font-weight: 700;
+        }
+        .aw-col.selected .aw-col-check { opacity: 1; }
 
         /* Lists */
         .list-item {
@@ -3330,11 +3499,19 @@ $adminView = $rawAdminView;
             border-radius: 12px;
             font-size: 0.875rem;
             z-index: 300;
-            transition: transform 0.3s;
+            transition: transform 0.3s, opacity 0.3s, visibility 0.3s;
+            /* Keep the (empty) toast fully hidden until shown — the transform
+               alone left a small empty rounded box floating at the bottom. */
+            opacity: 0;
+            visibility: hidden;
+            pointer-events: none;
         }
 
         .toast.show {
             transform: translateX(-50%) translateY(0);
+            opacity: 1;
+            visibility: visible;
+            pointer-events: auto;
         }
 
         .toast.success {
@@ -3385,13 +3562,16 @@ $adminView = $rawAdminView;
                 border-right: 1px solid var(--border);
             }
 
-            .main {
-                margin-left: 80px;
-                padding-bottom: 2rem;
+            /* Reserve the fixed sidebar's width on the whole app column so the
+               header and content sit to its right; content then centers within
+               the remaining space (margin:0 auto on .main) instead of being
+               pinned left by a margin-left offset. */
+            .app {
+                padding-left: 80px;
             }
 
-            .header {
-                margin-left: 80px;
+            .main {
+                padding-bottom: 2rem;
             }
 
             .modal {
@@ -3719,12 +3899,6 @@ $adminView = $rawAdminView;
                             </svg>
                             Withdraw
                         </button>
-                        <button class="balance-btn" id="btn-export">
-                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12"></path>
-                            </svg>
-                            Export Token
-                        </button>
                         <button class="balance-btn" id="btn-request">
                             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                                 <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"></path>
@@ -3793,7 +3967,7 @@ $adminView = $rawAdminView;
             <!-- Store Settings View -->
             <div class="view" id="view-stores">
                 <div id="store-settings-content">
-                    <div class="card">
+                    <div class="card collapsible">
                         <div class="card-header">
                             <div class="card-title">Store Info</div>
                             <button class="btn btn-secondary" id="btn-edit-store">Edit</button>
@@ -3818,25 +3992,47 @@ $adminView = $rawAdminView;
                         </div>
                     </div>
 
-                    <div class="card">
+                    <div class="card collapsible">
                         <div class="card-header">
                             <div class="card-title">Auto-Withdraw</div>
                         </div>
                         <div class="card-body">
-                            <div class="form-group">
-                                <label class="form-label">Withdraw to</label>
-                                <select class="form-input" id="auto-melt-mode-override">
-                                    <option value="-1">Inherit site default (<span id="auto-melt-mode-default-label">Lightning address</span>)</option>
-                                    <option value="0">Lightning address</option>
-                                    <option value="1">On-chain via submarine swap</option>
-                                </select>
-                                <p class="form-help">
-                                    Currently effective: <strong id="auto-melt-mode-effective">Lightning address</strong>.
-                                    Submarine-swap mode requires an on-chain xpub on the Bitcoin tab and
-                                    site-wide swaps enabled. The Lightning-address field below applies
-                                    only when this is set to Lightning.
-                                </p>
+                            <div id="aw-store" data-aw data-aw-scope="store">
+                            <p class="aw-title">auto-withdrawal settings</p>
+                            <div id="aw-store-warning" class="hidden" style="margin-bottom:0.75rem; padding:0.6rem 0.8rem; border-radius:8px; background:rgba(245,158,11,0.12); border:1px solid rgba(245,158,11,0.4); font-size:0.82rem;">
+                                &#9888; This store has no on-chain xpub or withdrawal address configured on the Bitcoin tab. On-chain withdrawal cannot be used until you add one.
                             </div>
+                            <input type="hidden" id="auto-melt-mode-override" value="-1">
+                            <div class="aw-cols">
+                                <div class="aw-col" data-aw-mode="-1" tabindex="0" role="button" aria-pressed="false">
+                                    <span class="aw-col-check">&#10003;</span>
+                                    <div class="aw-col-head"><span class="aw-col-name">Use global settings</span></div>
+                                    <div class="aw-col-desc">Follow the site-wide auto-withdrawal default (<strong id="auto-melt-mode-default-label">Lightning address</strong>).</div>
+                                </div>
+                                <div class="aw-col" data-aw-mode="0" tabindex="0" role="button" aria-pressed="false">
+                                    <span class="aw-col-check">&#10003;</span>
+                                    <div class="aw-col-head"><span class="aw-col-name">Lightning Withdrawal</span><span class="aw-col-badge">Suggested</span></div>
+                                    <div class="aw-col-desc">Withdraw to LNURL (lightning address) like myawesomestore@strike.me. Don&rsquo;t have a lightning address? Get one for free at <a class="aw-strike-link" href="http://strike.me" target="_blank" rel="noopener noreferrer">Strike</a> or <a href="https://coinos.io/" target="_blank" rel="noopener noreferrer">CoinOS</a> (all merchants).</div>
+                                    <ul>
+                                        <li>Get your funds the fastest</li>
+                                        <li>Automatic conversion to USD on Strike</li>
+                                        <li>Lowest fees</li>
+                                    </ul>
+                                </div>
+                                <div class="aw-col" data-aw-mode="1" tabindex="0" role="button" aria-pressed="false">
+                                    <span class="aw-col-check">&#10003;</span>
+                                    <div class="aw-col-head"><span class="aw-col-name">On-chain Withdrawal</span></div>
+                                    <div class="aw-col-desc">Withdraw to On-chain Address.</div>
+                                    <ul>
+                                        <li>Slower funds transfers</li>
+                                        <li>Works with all Bitcoin wallets</li>
+                                        <li>Funds may sit in the mint until sufficient for the on-chain transaction fee (custodial risk)</li>
+                                    </ul>
+                                </div>
+                            </div>
+                            <p class="form-help" style="margin-top:0.6rem;">
+                                Currently effective: <strong id="auto-melt-mode-effective">Lightning address</strong>.
+                            </p>
 
                             <div class="form-group" id="auto-melt-address-group">
                                 <label class="form-label">Lightning Address</label>
@@ -3883,23 +4079,15 @@ $adminView = $rawAdminView;
                                        value="2000" min="1" step="1">
                             </div>
 
+                            <div id="aw-store-error" class="hidden" style="margin-top:0.75rem; color: var(--error); font-size: 0.85rem;"></div>
                             <button class="btn btn-full" id="btn-save-auto-melt" style="margin-top: 1rem;">
                                 Save Settings
                             </button>
+                            </div>
                         </div>
                     </div>
 
-                    <div class="card">
-                        <div class="card-header">
-                            <div class="card-title">API Keys</div>
-                            <button class="btn" id="btn-create-api-key">+ New</button>
-                        </div>
-                        <div id="store-api-keys">
-                            <div class="loading"><div class="spinner"></div></div>
-                        </div>
-                    </div>
-
-                    <div class="card">
+                    <div class="card collapsible">
                         <div class="card-header">
                             <div class="card-title">On-chain Bitcoin payments</div>
                         </div>
@@ -3944,6 +4132,9 @@ $adminView = $rawAdminView;
                                     it for every invoice. Leave blank to disable on-chain payments.
                                 </p>
                             </div>
+                            <div class="subsection collapsed" id="onchain-advanced">
+                            <div class="subsection-toggle">Advanced</div>
+                            <div class="subsection-body">
                             <div class="form-group" id="onchain-static-tweak-row" style="display:none;">
                                 <label class="form-label">
                                     Tweak range (number of unique sat-offsets;
@@ -4003,6 +4194,8 @@ $adminView = $rawAdminView;
                                 <input type="text" class="form-input" id="onchain-provider-url"
                                        placeholder="https://mempool.space/api">
                             </div>
+                            </div><!-- /.subsection-body -->
+                            </div><!-- /#onchain-advanced -->
                             <div id="onchain-validation-box" style="display:none; margin: 0.75rem 0; padding: 0.75rem; border-radius: 8px; font-size: 0.85rem;"></div>
                             <div id="onchain-xpub-buttons">
                                 <button class="btn btn-secondary btn-full" id="btn-validate-onchain" style="margin-top: 0.5rem;">
@@ -4018,7 +4211,40 @@ $adminView = $rawAdminView;
                         </div>
                     </div>
 
-                    <div class="card">
+                    <!-- Per-store submarine-swap override. Tri-state: inherit
+                         the site default, or force on/off for this store. -->
+                    <div class="card collapsible" id="card-store-swaps">
+                        <div class="card-header">
+                            <div class="card-title">Submarine Swaps (LN&rarr;on-chain)</div>
+                        </div>
+                        <div class="card-body">
+                            <p style="font-size: 0.85rem; color: var(--text-secondary); margin: 0 0 0.75rem 0;">
+                                When your customers try to pay with lightning, let them, but have them
+                                automatically pay the lightning -&gt; on-chain conversion fee (around 10c
+                                in low fee environments). Requires an on-chain xpub on the Bitcoin tab.
+                                Site default: <strong id="store-swaps-site-default">&mdash;</strong>.
+                            </p>
+
+                            <div class="form-group">
+                                <label class="form-label">Mode</label>
+                                <select class="form-input" id="store-swaps-override">
+                                    <option value="-1">Inherit site default</option>
+                                    <option value="1">Force on for this store</option>
+                                    <option value="0">Force off for this store</option>
+                                </select>
+                                <p class="form-help">
+                                    Currently effective: <strong id="store-swaps-effective">&mdash;</strong>
+                                </p>
+                            </div>
+
+                            <div id="store-swaps-error" class="hidden" style="margin-top:0.5rem; color: var(--error); font-size: 0.85rem;"></div>
+                            <button class="btn btn-full" id="btn-save-store-swaps" style="margin-top: 0.5rem;">
+                                Save
+                            </button>
+                        </div>
+                    </div>
+
+                    <div class="card collapsible">
                         <div class="card-header">
                             <div class="card-title">Email Notifications</div>
                         </div>
@@ -4050,38 +4276,7 @@ $adminView = $rawAdminView;
                         </div>
                     </div>
 
-                    <!-- Per-store submarine-swap override. Tri-state: inherit
-                         the site default, or force on/off for this store. -->
-                    <div class="card" id="card-store-swaps">
-                        <div class="card-header">
-                            <div class="card-title">Submarine Swaps (LN→on-chain)</div>
-                        </div>
-                        <div class="card-body">
-                            <p style="font-size: 0.85rem; color: var(--text-secondary); margin: 0 0 0.75rem 0;">
-                                Override the site-wide swap setting for this store. Requires an
-                                on-chain xpub on the Bitcoin tab. Site default:
-                                <strong id="store-swaps-site-default">—</strong>.
-                            </p>
-
-                            <div class="form-group">
-                                <label class="form-label">Mode</label>
-                                <select class="form-input" id="store-swaps-override">
-                                    <option value="-1">Inherit site default</option>
-                                    <option value="1">Force on for this store</option>
-                                    <option value="0">Force off for this store</option>
-                                </select>
-                                <p class="form-help">
-                                    Currently effective: <strong id="store-swaps-effective">—</strong>
-                                </p>
-                            </div>
-
-                            <button class="btn btn-full" id="btn-save-store-swaps" style="margin-top: 0.5rem;">
-                                Save
-                            </button>
-                        </div>
-                    </div>
-
-                    <div class="card">
+                    <div class="card collapsible">
                         <div class="card-header">
                             <div class="card-title">Exchange Rate Settings</div>
                         </div>
@@ -4121,13 +4316,14 @@ $adminView = $rawAdminView;
                         </div>
                     </div>
 
-                    <div class="card">
+                    <div class="card collapsible">
                         <div class="card-header">
                             <div class="card-title">Hosting Fee</div>
                         </div>
                         <div class="card-body">
                             <p class="form-help" style="margin-bottom: 0.75rem;">
-                                Optional percentage taken on all revenue and paid to your Lightning address.
+                                Optional percentage taken on all revenue and paid to your web host's Lightning
+                                address. Talk to your web host before disabling this.
                                 Intended for white-label deployers who collect a deployment fee. Default 0%.
                                 Settled automatically on the cron tick once at least
                                 <?= (int) (defined('CASHUPAY_FEE_SETTLE_THRESHOLD_SATS') ? CASHUPAY_FEE_SETTLE_THRESHOLD_SATS : 1000) ?> sats are owed.
@@ -4150,7 +4346,17 @@ $adminView = $rawAdminView;
                         </div>
                     </div>
 
-                    <div class="card">
+                    <div class="card collapsible">
+                        <div class="card-header">
+                            <div class="card-title">API Keys</div>
+                            <button class="btn" id="btn-create-api-key">+ New</button>
+                        </div>
+                        <div id="store-api-keys">
+                            <div class="loading"><div class="spinner"></div></div>
+                        </div>
+                    </div>
+
+                    <div class="card collapsible">
                         <div class="card-header">
                             <div class="card-title">Danger Zone</div>
                         </div>
@@ -4183,137 +4389,7 @@ $adminView = $rawAdminView;
                         Open Store Settings &rarr;
                     </a>
                 </div>
-                <?php if (!Urls::isWordPress()): ?>
-                <div class="card" data-admin-only="true">
-                    <div class="card-header">
-                        <div class="card-title">Server URL</div>
-                    </div>
-                    <div class="card-body">
-                        <div class="form-group">
-                            <label class="form-label">Current Server URL</label>
-                            <code id="current-server-url" style="display: block; background: rgba(0,0,0,0.2); padding: 0.75rem; border-radius: 8px; font-size: 0.9rem; word-break: break-all; user-select: all;">
-                                <?= htmlspecialchars(Urls::server()) ?>
-                            </code>
-                            <p class="form-help">This URL is used for e-commerce plugin integration.</p>
-                        </div>
-
-                        <div class="form-group" style="margin-bottom: 0.75rem;">
-                            <label class="form-label">URL routing</label>
-                            <div style="display: flex; align-items: center; gap: 0.5rem; padding: 0.75rem; background: rgba(0,0,0,0.2); border-radius: 8px;">
-                                <span style="font-weight: 500;" id="url-mode-current-label">
-                                    <?= htmlspecialchars(Config::getUrlMode() === 'direct' ? 'Direct URLs' : 'Router.php URLs') ?>
-                                </span>
-                                <span style="font-size: 0.8rem; color: var(--text-secondary);">
-                                    (auto-detected)
-                                </span>
-                                <span id="url-mode-detect-status" style="margin-left: auto; font-size: 0.75rem; color: var(--text-secondary);"></span>
-                            </div>
-                            <p class="form-help">
-                                Detected once during setup. Re-detect only if you change hosting (e.g. enabled rewrite rules, switched servers).
-                            </p>
-                        </div>
-
-                        <button class="btn btn-secondary btn-full" id="btn-detect-url-mode">
-                            Re-detect now
-                        </button>
-                    </div>
-                </div>
-
-                <!--
-                    Cron URL — surfaces the operator-facing curl command so an
-                    admin can set up a system cron entry. The key is auto-
-                    generated lazily by the cron-url admin action; the
-                    same key authenticates `?key=...` in cron.php. Optional —
-                    background tasks also fire opportunistically from admin
-                    page-loads (5-min gate) and checkout views.
-                -->
-                <div class="card" data-admin-only="true" id="card-cron-url">
-                    <div class="card-header">
-                        <div class="card-title">Cron URL</div>
-                    </div>
-                    <div class="card-body">
-                        <p style="font-size: 0.85rem; color: var(--text-secondary); margin: 0 0 0.75rem 0;">
-                            Optional but recommended. Adding the line below to your hosting's system
-                            cron makes invoice polling, auto-withdrawal, and fee settlement run on a
-                            tight, predictable schedule. Without it, background tasks fire
-                            opportunistically when an admin or customer loads a page.
-                        </p>
-                        <div class="form-group">
-                            <label class="form-label">Main cron (every minute)</label>
-                            <code id="cron-url-display" style="display: block; background: rgba(0,0,0,0.2); padding: 0.75rem; border-radius: 8px; font-size: 0.85rem; word-break: break-all; user-select: all;">Loading…</code>
-                            <p class="form-help" id="cron-url-status" style="margin-top: 0.4rem;">Checking…</p>
-                        </div>
-                        <button class="btn btn-secondary btn-full" id="btn-copy-cron-url">Copy</button>
-
-                        <hr style="border: 0; border-top: 1px solid var(--border); margin: 1rem 0;">
-
-                        <p style="font-size: 0.85rem; color: var(--text-secondary); margin: 0 0 0.75rem 0;">
-                            <strong>Optional swap fast-lane.</strong> Submarine-swap settlement
-                            is latency-sensitive (every poll-tick delay shows up in end-to-end
-                            time). If you want sub-minute swap settlement, add this second
-                            entry too — it hits cashupayserver every 10 seconds with
-                            <code>?only=swaps</code> so only the swap-state poller runs, leaving
-                            the expensive cashu / cleanup tasks on the main minute cadence.
-                            Skip this entirely if you don't use submarine swaps.
-                        </p>
-                        <div class="form-group">
-                            <label class="form-label">Swap fast-lane cron (every 10 seconds)</label>
-                            <code id="cron-swaps-url-display" style="display: block; background: rgba(0,0,0,0.2); padding: 0.75rem; border-radius: 8px; font-size: 0.85rem; word-break: break-all; user-select: all;">Loading…</code>
-                            <p class="form-help" id="cron-swaps-url-status" style="margin-top: 0.4rem;">Checking…</p>
-                        </div>
-                        <button class="btn btn-secondary btn-full" id="btn-copy-cron-swaps-url">Copy</button>
-                    </div>
-                </div>
-
-                <!--
-                    Auto-update — channel selector + last-update info + rollback.
-                    The cron tick (Task 12 in cron.php) fetches the latest
-                    cashupayserver.zip built by CI for the chosen channel and
-                    overlays it on the install. data/ and user_config.php are
-                    preserved. .htaccess is only overwritten if untouched.
-                    Skipped entirely in WordPress mode.
-                -->
-                <div class="card" data-admin-only="true" id="card-auto-update">
-                    <div class="card-header">
-                        <div class="card-title">Auto-update</div>
-                    </div>
-                    <div class="card-body">
-                        <p style="font-size: 0.85rem; color: var(--text-secondary); margin: 0 0 0.75rem 0;">
-                            Daily check against GitHub. Updates apply automatically. data/ and
-                            user_config.php are preserved. Backups of the last 3 versions are kept
-                            under data/updates/backup/.
-                        </p>
-                        <div class="form-group">
-                            <label class="form-label">Current version</label>
-                            <code id="auto-update-current" style="display: block; background: rgba(0,0,0,0.2); padding: 0.6rem; border-radius: 8px; font-size: 0.85rem; user-select: all;">Loading…</code>
-                        </div>
-                        <div class="form-group">
-                            <label class="form-label" for="auto-update-channel">Channel</label>
-                            <select id="auto-update-channel" class="form-control" style="width: 100%;">
-                                <option value="main">main — stable</option>
-                                <option value="testing">testing — pre-release</option>
-                            </select>
-                            <p class="form-help">Override the value set in user_config.php.</p>
-                        </div>
-                        <button class="btn btn-full" id="btn-save-update-channel" style="margin-bottom: 0.5rem;">Save channel</button>
-                        <div id="auto-update-htaccess-warning" class="hidden" style="background: rgba(247,147,26,0.15); border: 1px solid rgba(247,147,26,0.4); padding: 0.6rem; border-radius: 6px; font-size: 0.85rem; margin-bottom: 0.5rem;">
-                            A new .htaccess shipped with the latest update, but your live
-                            .htaccess was edited — it was left untouched. The new version is
-                            in <code>.htaccess.new</code>. Review and merge by hand.
-                        </div>
-                        <button class="btn btn-secondary btn-full" id="btn-rollback-update" style="margin-bottom: 0.25rem;">Roll back to previous version</button>
-                        <p class="form-help" id="auto-update-rollback-help">Restores the most recent backup. Disabled if no backup is available.</p>
-                    </div>
-                </div>
-                <?php endif; ?>
-
-                <!--
-                    Email notifications — site-wide master switch + per-type
-                    toggles + default "to" address. Per-store opt-in lives in
-                    the store-settings card; the master switch here gates
-                    everything.
-                -->
-                <div class="card" data-admin-only="true" id="card-notifications">
+                <div class="card collapsible" data-admin-only="true" id="card-notifications">
                     <div class="card-header">
                         <div class="card-title">Email Notifications</div>
                     </div>
@@ -4386,7 +4462,136 @@ $adminView = $rawAdminView;
                         <p class="form-help" id="notifications-pending" style="margin-top: 0.5rem;"></p>
                     </div>
                 </div>
+                <?php if (!Urls::isWordPress()): ?>
+                <div class="card collapsible" data-admin-only="true">
+                    <div class="card-header">
+                        <div class="card-title">Server URL</div>
+                    </div>
+                    <div class="card-body">
+                        <div class="form-group">
+                            <label class="form-label">Current Server URL</label>
+                            <code id="current-server-url" style="display: block; background: rgba(0,0,0,0.2); padding: 0.75rem; border-radius: 8px; font-size: 0.9rem; word-break: break-all; user-select: all;">
+                                <?= htmlspecialchars(Urls::server()) ?>
+                            </code>
+                            <p class="form-help">This URL is used for e-commerce plugin integration.</p>
+                        </div>
 
+                        <div class="form-group" style="margin-bottom: 0.75rem;">
+                            <label class="form-label">URL routing</label>
+                            <div style="display: flex; align-items: center; gap: 0.5rem; padding: 0.75rem; background: rgba(0,0,0,0.2); border-radius: 8px;">
+                                <span style="font-weight: 500;" id="url-mode-current-label">
+                                    <?= htmlspecialchars(Config::getUrlMode() === 'direct' ? 'Direct URLs' : 'Router.php URLs') ?>
+                                </span>
+                                <span style="font-size: 0.8rem; color: var(--text-secondary);">
+                                    (auto-detected)
+                                </span>
+                                <span id="url-mode-detect-status" style="margin-left: auto; font-size: 0.75rem; color: var(--text-secondary);"></span>
+                            </div>
+                            <p class="form-help">
+                                Detected once during setup. Re-detect only if you change hosting (e.g. enabled rewrite rules, switched servers).
+                            </p>
+                        </div>
+
+                        <button class="btn btn-secondary btn-full" id="btn-detect-url-mode">
+                            Re-detect now
+                        </button>
+                    </div>
+                </div>
+
+                <!--
+                    Cron URL — surfaces the operator-facing curl command so an
+                    admin can set up a system cron entry. The key is auto-
+                    generated lazily by the cron-url admin action; the
+                    same key authenticates `?key=...` in cron.php. Optional —
+                    background tasks also fire opportunistically from admin
+                    page-loads (5-min gate) and checkout views.
+                -->
+                <div class="card collapsible" data-admin-only="true" id="card-cron-url">
+                    <div class="card-header">
+                        <div class="card-title">Cron URL</div>
+                    </div>
+                    <div class="card-body">
+                        <p style="font-size: 0.85rem; color: var(--text-secondary); margin: 0 0 0.75rem 0;">
+                            Optional but recommended. Adding the line below to your hosting's system
+                            cron makes invoice polling, auto-withdrawal, and fee settlement run on a
+                            tight, predictable schedule. Without it, background tasks fire
+                            opportunistically when an admin or customer loads a page.
+                        </p>
+                        <div class="form-group">
+                            <label class="form-label">Main cron (every minute)</label>
+                            <code id="cron-url-display" style="display: block; background: rgba(0,0,0,0.2); padding: 0.75rem; border-radius: 8px; font-size: 0.85rem; word-break: break-all; user-select: all;">Loading…</code>
+                            <p class="form-help" id="cron-url-status" style="margin-top: 0.4rem;">Checking…</p>
+                        </div>
+                        <button class="btn btn-secondary btn-full" id="btn-copy-cron-url">Copy</button>
+
+                        <hr style="border: 0; border-top: 1px solid var(--border); margin: 1rem 0;">
+
+                        <p style="font-size: 0.85rem; color: var(--text-secondary); margin: 0 0 0.75rem 0;">
+                            <strong>Optional swap fast-lane.</strong> Submarine-swap settlement
+                            is latency-sensitive (every poll-tick delay shows up in end-to-end
+                            time). If you want sub-minute swap settlement, add this second
+                            entry too — it hits cashupayserver every 10 seconds with
+                            <code>?only=swaps</code> so only the swap-state poller runs, leaving
+                            the expensive cashu / cleanup tasks on the main minute cadence.
+                            Skip this entirely if you don't use submarine swaps.
+                        </p>
+                        <div class="form-group">
+                            <label class="form-label">Swap fast-lane cron (every 10 seconds)</label>
+                            <code id="cron-swaps-url-display" style="display: block; background: rgba(0,0,0,0.2); padding: 0.75rem; border-radius: 8px; font-size: 0.85rem; word-break: break-all; user-select: all;">Loading…</code>
+                            <p class="form-help" id="cron-swaps-url-status" style="margin-top: 0.4rem;">Checking…</p>
+                        </div>
+                        <button class="btn btn-secondary btn-full" id="btn-copy-cron-swaps-url">Copy</button>
+                    </div>
+                </div>
+
+                <!--
+                    Auto-update — channel selector + last-update info + rollback.
+                    The cron tick (Task 12 in cron.php) fetches the latest
+                    cashupayserver.zip built by CI for the chosen channel and
+                    overlays it on the install. data/ and user_config.php are
+                    preserved. .htaccess is only overwritten if untouched.
+                    Skipped entirely in WordPress mode.
+                -->
+                <div class="card collapsible" data-admin-only="true" id="card-auto-update">
+                    <div class="card-header">
+                        <div class="card-title">Auto-update</div>
+                    </div>
+                    <div class="card-body">
+                        <p style="font-size: 0.85rem; color: var(--text-secondary); margin: 0 0 0.75rem 0;">
+                            Daily check against GitHub. Updates apply automatically. data/ and
+                            user_config.php are preserved. Backups of the last 3 versions are kept
+                            under data/updates/backup/.
+                        </p>
+                        <div class="form-group">
+                            <label class="form-label">Current version</label>
+                            <code id="auto-update-current" style="display: block; background: rgba(0,0,0,0.2); padding: 0.6rem; border-radius: 8px; font-size: 0.85rem; user-select: all;">Loading…</code>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label" for="auto-update-channel">Channel</label>
+                            <select id="auto-update-channel" class="form-control" style="width: 100%;">
+                                <option value="main">main — stable</option>
+                                <option value="testing">testing — pre-release</option>
+                            </select>
+                            <p class="form-help">Override the value set in user_config.php.</p>
+                        </div>
+                        <button class="btn btn-full" id="btn-save-update-channel" style="margin-bottom: 0.5rem;">Save channel</button>
+                        <div id="auto-update-htaccess-warning" class="hidden" style="background: rgba(247,147,26,0.15); border: 1px solid rgba(247,147,26,0.4); padding: 0.6rem; border-radius: 6px; font-size: 0.85rem; margin-bottom: 0.5rem;">
+                            A new .htaccess shipped with the latest update, but your live
+                            .htaccess was edited — it was left untouched. The new version is
+                            in <code>.htaccess.new</code>. Review and merge by hand.
+                        </div>
+                        <button class="btn btn-secondary btn-full" id="btn-rollback-update" style="margin-bottom: 0.25rem;">Roll back to previous version</button>
+                        <p class="form-help" id="auto-update-rollback-help">Restores the most recent backup. Disabled if no backup is available.</p>
+                    </div>
+                </div>
+                <?php endif; ?>
+
+                <!--
+                    Email notifications — site-wide master switch + per-type
+                    toggles + default "to" address. Per-store opt-in lives in
+                    the store-settings card; the master switch here gates
+                    everything.
+                -->
                 <!--
                     Submarine swaps — site-wide master switch + provider
                     preference order + strict fallback policy. Replaces the
@@ -4395,7 +4600,7 @@ $adminView = $rawAdminView;
                     xpub. Disabled by default. Per-store override lives in
                     that store's settings card.
                 -->
-                <div class="card" data-admin-only="true" id="card-swaps">
+                <div class="card collapsible" data-admin-only="true" id="card-swaps">
                     <div class="card-header">
                         <div class="card-title">Submarine Swaps</div>
                     </div>
@@ -4469,22 +4674,42 @@ $adminView = $rawAdminView;
                             </p>
                         </div>
 
-                        <div class="toggle-container" style="margin-top: 1.5rem; padding-top: 1rem; border-top: 1px solid var(--border-color, rgba(255,255,255,0.08));">
-                            <span><strong>Auto-withdraw via submarine swap</strong> (site-wide default)</span>
-                            <label class="toggle">
-                                <input type="checkbox" id="auto-melt-use-swap-default">
-                                <span class="toggle-slider"></span>
-                            </label>
+                        <div id="aw-site" data-aw data-aw-scope="site" style="margin-top: 1.5rem; padding-top: 1rem; border-top: 1px solid var(--border-color, rgba(255,255,255,0.08));">
+                            <p class="aw-title">auto-withdrawal settings (site-wide default for new stores)</p>
+                            <!-- Hidden boolean kept so the existing save_swaps flow keeps working:
+                                 Lightning column => unchecked, On-chain column => checked. -->
+                            <input type="checkbox" id="auto-melt-use-swap-default" style="display:none;">
+                            <div class="aw-cols">
+                                <div class="aw-col" data-aw-mode="0" tabindex="0" role="button" aria-pressed="false">
+                                    <span class="aw-col-check">&#10003;</span>
+                                    <div class="aw-col-head"><span class="aw-col-name">Lightning Withdrawal</span><span class="aw-col-badge">Suggested</span></div>
+                                    <div class="aw-col-desc">Withdraw to LNURL (lightning address) like myawesomestore@strike.me. Don&rsquo;t have a lightning address? Get one for free at <a class="aw-strike-link" href="http://strike.me" target="_blank" rel="noopener noreferrer">Strike</a> or <a href="https://coinos.io/" target="_blank" rel="noopener noreferrer">CoinOS</a> (all merchants).</div>
+                                    <ul>
+                                        <li>Get your funds the fastest</li>
+                                        <li>Automatic conversion to USD on Strike</li>
+                                        <li>Lowest fees</li>
+                                    </ul>
+                                </div>
+                                <div class="aw-col" data-aw-mode="1" tabindex="0" role="button" aria-pressed="false">
+                                    <span class="aw-col-check">&#10003;</span>
+                                    <div class="aw-col-head"><span class="aw-col-name">On-chain Withdrawal</span></div>
+                                    <div class="aw-col-desc">Withdraw to On-chain Address (via submarine swap to the store's on-chain xpub).</div>
+                                    <ul>
+                                        <li>Slower funds transfers</li>
+                                        <li>Works with all Bitcoin wallets</li>
+                                        <li>Funds may sit in the mint until sufficient for the on-chain transaction fee (custodial risk)</li>
+                                    </ul>
+                                </div>
+                            </div>
+                            <p class="form-help" style="margin-top: 0.6rem;">
+                                Default for new stores; each store can override on its dashboard. On-chain
+                                requires site-wide swaps enabled (above) and the store to have an on-chain xpub.
+                                During high-fee periods sweeps are deferred until the swap cost is
+                                ≤ <strong id="auto-melt-swap-max-fee-pct-display">1%</strong> of the sweep amount.
+                                Minimum sweep: <strong id="auto-melt-swap-min-sats-display">5,000</strong> sats
+                                (~$5).
+                            </p>
                         </div>
-                        <p class="form-help" style="margin-top: -0.25rem;">
-                            Default for new stores: sweep accumulated mint balance to the store's on-chain
-                            xpub instead of a Lightning address. Each store can override on its dashboard.
-                            Site-wide swaps must be enabled (above) and the store must have an on-chain xpub.
-                            During high-fee periods sweeps are deferred until the swap cost is
-                            ≤ <strong id="auto-melt-swap-max-fee-pct-display">1%</strong> of the sweep amount.
-                            Minimum sweep: <strong id="auto-melt-swap-min-sats-display">5,000</strong> sats
-                            (~$5).
-                        </p>
 
                         <button class="btn btn-full" id="btn-save-swaps" style="margin-top: 1rem;">
                             Save swap settings
@@ -4494,7 +4719,7 @@ $adminView = $rawAdminView;
 
                 <!-- My Account card: own password + logout, available to every logged-in user -->
                 <?php if (!Urls::isWordPress()): ?>
-                <div class="card" id="card-my-account">
+                <div class="card collapsible" id="card-my-account">
                     <div class="card-header">
                         <div class="card-title">My Account</div>
                     </div>
@@ -4514,7 +4739,7 @@ $adminView = $rawAdminView;
                 </div>
 
                 <!-- Users card: admin-only -->
-                <div class="card hidden" id="card-users" data-admin-only="true">
+                <div class="card collapsible hidden" id="card-users" data-admin-only="true">
                     <div class="card-header">
                         <div class="card-title">Users</div>
                         <button class="btn" id="btn-add-user" style="padding: 0.25rem 0.75rem; font-size: 0.85rem;">Add user</button>
@@ -4524,7 +4749,7 @@ $adminView = $rawAdminView;
                     </div>
                 </div>
                 <?php else: ?>
-                <div class="card">
+                <div class="card collapsible">
                     <div class="card-header">
                         <div class="card-title">Account</div>
                     </div>
@@ -4539,7 +4764,7 @@ $adminView = $rawAdminView;
                 <!-- Stuck Funds card: admin-only.
                      Hidden when no store has any sats stranded in a mint with
                      an active withdrawal-failure flag. -->
-                <div class="card hidden" id="card-stuck-funds" data-admin-only="true">
+                <div class="card collapsible hidden" id="card-stuck-funds" data-admin-only="true">
                     <div class="card-header">
                         <div class="card-title">Stuck Funds</div>
                     </div>
@@ -4559,7 +4784,7 @@ $adminView = $rawAdminView;
                 </div>
 
                 <!-- Mint Reliability card: admin-only -->
-                <div class="card hidden" id="card-mint-reliability" data-admin-only="true">
+                <div class="card collapsible hidden" id="card-mint-reliability" data-admin-only="true">
                     <div class="card-header">
                         <div class="card-title">Mint Reliability</div>
                         <button class="btn btn-secondary" id="btn-reset-all-mint-counters" style="padding: 0.25rem 0.75rem; font-size: 0.8rem;">Reset all counters</button>
@@ -4575,7 +4800,7 @@ $adminView = $rawAdminView;
                 </div>
 
                 <!-- Trusted Mints card: admin-only -->
-                <div class="card hidden" id="card-trusted-mints" data-admin-only="true">
+                <div class="card collapsible hidden" id="card-trusted-mints" data-admin-only="true">
                     <div class="card-header">
                         <div class="card-title">Trusted Mints</div>
                     </div>
@@ -4833,35 +5058,6 @@ $adminView = $rawAdminView;
         </div>
     </div>
 
-    <div class="modal-overlay" id="modal-export">
-        <div class="modal">
-            <div class="modal-handle"></div>
-            <div class="modal-title">Export Cashu Token</div>
-
-            <div id="export-form">
-                <div class="form-group">
-                    <label class="form-label">Amount (<span class="unit-label">SAT</span>)</label>
-                    <div style="display: flex; gap: 0.5rem;">
-                        <input type="number" class="form-input" id="export-amount"
-                               placeholder="0" min="1" step="1" style="flex: 1;" oninput="updateExportButton()">
-                        <button type="button" class="btn btn-secondary" id="btn-send-max" onclick="sendMax()">Max</button>
-                    </div>
-                    <p class="form-help">Available: <span id="export-available">0</span> <span class="unit-label">SAT</span></p>
-                </div>
-
-                <button class="btn btn-full" id="btn-confirm-export">Generate Token</button>
-            </div>
-
-            <div id="export-result" style="display: none;">
-                <div class="modal-qr" id="export-qr"></div>
-                <div class="token-display" id="export-token"></div>
-                <button class="btn btn-full" id="btn-copy-token">Copy Token</button>
-            </div>
-
-            <button class="btn btn-secondary btn-full" style="margin-top: 0.5rem;" onclick="closeModal('modal-export')">Close</button>
-        </div>
-    </div>
-
     <div class="modal-overlay" id="modal-apikey">
         <div class="modal">
             <div class="modal-handle"></div>
@@ -5081,6 +5277,9 @@ $adminView = $rawAdminView;
         const adminBasePath = <?= json_encode($adminBasePath) ?>;
         const adminUrl = adminBasePath;
         const setupUrl = <?= json_encode(Urls::setup()) ?>;
+        // Where to point "get a free lightning address" links (Strike). Operator
+        // override via CASHUPAY_STRIKE_URL in user_config.php; defaults to strike.me.
+        const strikeUrl = <?= json_encode(defined('CASHUPAY_STRIKE_URL') ? CASHUPAY_STRIKE_URL : 'http://strike.me') ?>;
 
         // Server-parsed view slug (validated against the allowed list above).
         const initialView = <?= json_encode($adminView) ?>;
@@ -5294,10 +5493,6 @@ $adminView = $rawAdminView;
                 if (!ensureAdmin('Only admins can withdraw funds.')) return;
                 openModal('modal-withdraw');
             });
-            document.getElementById('btn-export').addEventListener('click', () => {
-                if (!ensureAdmin('Only admins can export a Cashu token.')) return;
-                openModal('modal-export');
-            });
             document.getElementById('btn-request').addEventListener('click', () => openModal('modal-request'));
             document.getElementById('btn-new-invoice').addEventListener('click', () => openModal('modal-request'));
 
@@ -5313,10 +5508,6 @@ $adminView = $rawAdminView;
             // Withdraw modal
             document.getElementById('btn-confirm-withdraw').addEventListener('click', handleWithdraw);
             document.getElementById('withdraw-amount').addEventListener('input', updateWithdrawInfo);
-
-            // Export modal
-            document.getElementById('btn-confirm-export').addEventListener('click', () => handleExport());
-            document.getElementById('btn-copy-token').addEventListener('click', copyToken);
 
             // Request modal
             document.getElementById('btn-generate-request').addEventListener('click', handleGenerateRequest);
@@ -5337,8 +5528,16 @@ $adminView = $rawAdminView;
                 dashboardData.autoMelt = { ...dashboardData.autoMelt, modeOverride: v, mode };
                 renderAutoMeltMode();
             });
+            // Wire collapsible cards/subsections and the auto-withdrawal column
+            // selectors (both the store and site-wide instances).
+            wireCollapsibles();
+            wireAwSelectors();
             const saveStoreNotifsBtn = document.getElementById('btn-save-store-notifications');
             if (saveStoreNotifsBtn) saveStoreNotifsBtn.addEventListener('click', saveStoreNotifications);
+            const storeNotifsToggle = document.getElementById('store-notifications-enabled');
+            if (storeNotifsToggle) storeNotifsToggle.addEventListener('change', () => {
+                if (storeNotifsToggle.checked) warnIfSiteEmailUnavailable();
+            });
             const saveNotifsBtn = document.getElementById('btn-save-notifications');
             if (saveNotifsBtn) saveNotifsBtn.addEventListener('click', saveNotificationSettings);
             const testNotifsBtn = document.getElementById('btn-send-test-notification');
@@ -5877,7 +6076,6 @@ $adminView = $rawAdminView;
                         document.getElementById('balance-unit').textContent = '';
                         document.querySelector('.balance-label').textContent = 'No stores configured';
                         document.getElementById('withdraw-available').textContent = '0';
-                        document.getElementById('export-available').textContent = '0';
                         renderInvoices('recent-invoices', []);
                         return;
                     }
@@ -5926,8 +6124,6 @@ $adminView = $rawAdminView;
                 // Update available amounts in modals with proper formatting
                 document.getElementById('withdraw-available').textContent =
                     formatAmount(dashboardData.balance ?? 0, mintUnit);
-                document.getElementById('export-available').textContent =
-                    formatAmount(dashboardData.exportAvailable ?? 0, mintUnit);
 
                 // Update unit labels in modals
                 document.querySelectorAll('.unit-label').forEach(el => el.textContent = unitLabel);
@@ -7658,10 +7854,27 @@ $adminView = $rawAdminView;
                 showToast('No store selected', 'error');
                 return;
             }
+            clearAwError('aw-store-error');
             const mintUnit = dashboardData?.mintUnit || 'sat';
-            const address = document.getElementById('auto-melt-address').value;
+            const address = document.getElementById('auto-melt-address').value.trim();
             const enabled = document.getElementById('auto-melt-enabled').checked ? '1' : '0';
             const modeOverride = document.getElementById('auto-melt-mode-override').value;
+
+            // Validate the chosen destination before saving so bad data surfaces
+            // inline rather than failing silently on the server.
+            if (modeOverride === '0') {
+                if (enabled === '1' && !address) {
+                    return awError('aw-store-error', 'Enter a lightning address to withdraw to.');
+                }
+                if (address && !isValidLightningAddress(address)) {
+                    return awError('aw-store-error', "That doesn't look like a valid lightning address (expected name@domain.tld).");
+                }
+            } else if (modeOverride === '1') {
+                if (!storeHasOnchain()) {
+                    return awError('aw-store-error', 'On-chain withdrawal needs an on-chain xpub or address. Add one in the On-chain Bitcoin payments section first.');
+                }
+            }
+
             // Convert threshold to smallest unit (cents for fiat)
             const threshold = parseAmount(document.getElementById('auto-melt-threshold').value, mintUnit);
 
@@ -7693,6 +7906,122 @@ $adminView = $rawAdminView;
                 }
             } catch (e) {
                 showToast('Failed to save settings', 'error');
+            }
+        }
+
+        // ---- Auto-withdrawal column selector + collapsible sections ----
+
+        function isValidLightningAddress(addr) {
+            // LUD-16 lightning address: local-part@domain.tld (basic shape check).
+            return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(addr || '').trim());
+        }
+
+        // Whether the current store has an on-chain xpub / static address set.
+        function storeHasOnchain() {
+            return !!(dashboardData && dashboardData.onchain && dashboardData.onchain.enabled);
+        }
+
+        function awError(elId, msg) {
+            const el = document.getElementById(elId);
+            if (el) { el.textContent = msg; el.classList.remove('hidden'); }
+            showToast(msg, 'error');
+            return false;
+        }
+        function clearAwError(elId) {
+            const el = document.getElementById(elId);
+            if (el) { el.textContent = ''; el.classList.add('hidden'); }
+        }
+
+        function awContainer(scope) {
+            return document.querySelector(`[data-aw][data-aw-scope="${scope}"]`);
+        }
+
+        // Highlight the column matching `mode` ("-1" | "0" | "1") within a container.
+        function highlightAwColumn(container, mode) {
+            if (!container) return;
+            container.querySelectorAll('.aw-col').forEach(col => {
+                const on = col.getAttribute('data-aw-mode') === String(mode);
+                col.classList.toggle('selected', on);
+                col.setAttribute('aria-pressed', on ? 'true' : 'false');
+            });
+        }
+
+        // User picked a column. Reflect it into the hidden control that the
+        // existing save flow reads, and (for the store) fire the live-preview
+        // 'change' listener so the effective-mode hint updates immediately.
+        function selectAwColumn(container, mode) {
+            const scope = container.getAttribute('data-aw-scope');
+            highlightAwColumn(container, mode);
+            if (scope === 'store') {
+                clearAwError('aw-store-error');
+                const hidden = document.getElementById('auto-melt-mode-override');
+                if (hidden) {
+                    hidden.value = String(mode);
+                    hidden.dispatchEvent(new Event('change'));
+                }
+            } else if (scope === 'site') {
+                const cb = document.getElementById('auto-melt-use-swap-default');
+                if (cb) cb.checked = String(mode) === '1';
+            }
+        }
+
+        function wireAwSelectors() {
+            document.querySelectorAll('[data-aw]').forEach(container => {
+                if (container.dataset.awWired) return;
+                container.dataset.awWired = '1';
+                container.querySelectorAll('.aw-col').forEach(col => {
+                    const pick = () => selectAwColumn(container, col.getAttribute('data-aw-mode'));
+                    col.addEventListener('click', pick);
+                    col.addEventListener('keydown', (e) => {
+                        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); pick(); }
+                    });
+                });
+            });
+            // Point the "Strike" links at the configured STRIKE_URL.
+            if (typeof strikeUrl === 'string' && strikeUrl) {
+                document.querySelectorAll('.aw-strike-link').forEach(a => { a.href = strikeUrl; });
+            }
+        }
+
+        // Wire collapsible cards (.card.collapsible) and subsections (.subsection).
+        // Default state is open; a card/subsection starts collapsed only if it
+        // carries the .collapsed class in markup.
+        function wireCollapsibles() {
+            document.querySelectorAll('.card.collapsible > .card-header').forEach(header => {
+                if (header.dataset.collapsibleWired) return;
+                header.dataset.collapsibleWired = '1';
+                header.addEventListener('click', (e) => {
+                    // Ignore clicks on interactive controls inside the header.
+                    if (e.target.closest('button, a, input, select, textarea, label')) return;
+                    header.parentElement.classList.toggle('collapsed');
+                });
+            });
+            document.querySelectorAll('.subsection > .subsection-toggle').forEach(tog => {
+                if (tog.dataset.collapsibleWired) return;
+                tog.dataset.collapsibleWired = '1';
+                tog.addEventListener('click', () => tog.parentElement.classList.toggle('collapsed'));
+            });
+        }
+
+        // Site-wide email state, fetched lazily so the store settings page can
+        // warn when per-store notifications are enabled but site email is off.
+        let _siteNotifState = null;
+        async function getSiteNotifState(force = false) {
+            if (_siteNotifState && !force) return _siteNotifState;
+            try {
+                const r = await postWithCsrf(adminUrl, 'action=get_notifications_settings');
+                if (r.ok) _siteNotifState = await r.json();
+            } catch (e) { /* leave null; warning just won't show */ }
+            return _siteNotifState;
+        }
+        async function warnIfSiteEmailUnavailable() {
+            const st = await getSiteNotifState(true);
+            if (!st) return;
+            if (!st.enabled || !st.smtpConfigured) {
+                const why = !st.enabled
+                    ? 'site-wide email notifications are turned off'
+                    : 'no SMTP server is configured';
+                showToast(`Heads up: ${why} in site Settings, so this store's emails won't be delivered until that's fixed.`, 'info');
             }
         }
 
@@ -7749,6 +8078,17 @@ $adminView = $rawAdminView;
             if (minSatsEl && am.swapMinSats != null) minSatsEl.textContent = Number(am.swapMinSats).toLocaleString();
             const maxPctEl = document.getElementById('auto-melt-mode-max-fee-pct');
             if (maxPctEl && am.swapMaxFeePct != null) maxPctEl.textContent = am.swapMaxFeePct + '%';
+
+            // Reflect the override into the column selector + show the on-chain
+            // warning when On-chain is picked but no xpub/address is configured.
+            const storeAw = awContainer('store');
+            highlightAwColumn(storeAw, am.modeOverride);
+            const warnBox = document.getElementById('aw-store-warning');
+            if (warnBox) {
+                const needsAddr = String(am.modeOverride) === '1' && !storeHasOnchain();
+                warnBox.classList.toggle('hidden', !needsAddr);
+            }
+
             renderLud21Warning();
         }
 
@@ -7766,6 +8106,7 @@ $adminView = $rawAdminView;
                 const result = await response.json();
                 if (response.ok) {
                     showToast('Notification settings saved!', 'success');
+                    if (enabled === '1') warnIfSiteEmailUnavailable();
                 } else {
                     showToast(result.error || 'Failed to save', 'error');
                 }
@@ -7776,7 +8117,9 @@ $adminView = $rawAdminView;
 
         async function loadNotificationSettings() {
             try {
-                const response = await fetch(`${adminUrl}?action=get_notifications_settings`);
+                // POST (not GET ?action=) — with path-based admin routing a GET to
+                // a sub-path URL is served the SPA page, not the JSON action.
+                const response = await postWithCsrf(adminUrl, 'action=get_notifications_settings');
                 if (!response.ok) return;
                 const data = await response.json();
                 document.getElementById('notifications-enabled').checked = !!data.enabled;
@@ -7839,6 +8182,8 @@ $adminView = $rawAdminView;
                 if (thresholdEl) thresholdEl.value = data.autoSelectThresholdPct ?? 10;
                 const autoMeltSwapEl = document.getElementById('auto-melt-use-swap-default');
                 if (autoMeltSwapEl) autoMeltSwapEl.checked = !!data.autoMeltUseSwapDefault;
+                // Reflect the site default into the auto-withdrawal column selector.
+                highlightAwColumn(awContainer('site'), data.autoMeltUseSwapDefault ? 1 : 0);
                 const minSatsDisp = document.getElementById('auto-melt-swap-min-sats-display');
                 if (minSatsDisp && data.autoMeltSwapMinSats != null) {
                     minSatsDisp.textContent = Number(data.autoMeltSwapMinSats).toLocaleString();
@@ -7935,7 +8280,12 @@ $adminView = $rawAdminView;
                 showToast('No store selected', 'error');
                 return;
             }
+            clearAwError('store-swaps-error');
             const override = document.getElementById('store-swaps-override').value;
+            // Forcing swaps on requires an on-chain address; warn + don't save.
+            if (override === '1' && !storeHasOnchain()) {
+                return awError('store-swaps-error', 'Submarine swaps require an on-chain xpub or address on the Bitcoin tab.');
+            }
             try {
                 const response = await postWithCsrf(adminUrl,
                     `action=save_store_swaps&store_id=${encodeURIComponent(currentStoreId)}&override=${encodeURIComponent(override)}`
@@ -7947,7 +8297,7 @@ $adminView = $rawAdminView;
                     await loadDashboardData();
                     refreshStoreSwapsCard();
                 } else {
-                    showToast(result.error || 'Failed to save', 'error');
+                    awError('store-swaps-error', result.error || 'Failed to save');
                 }
             } catch (e) {
                 showToast('Failed to save store swap setting', 'error');
