@@ -50,6 +50,22 @@ def _store_row(payserver: PayserverHandle) -> sqlite3.Row:
         conn.close()
 
 
+def _ln_addresses(payserver: PayserverHandle) -> list[str]:
+    """Ordered Lightning-address fallback chain for the (single) store.
+
+    Replaces the old stores.auto_melt_address column lookup — addresses now
+    live in the store_ln_addresses table, ordered by priority.
+    """
+    conn = sqlite3.connect(payserver.data_dir / "cashupay.sqlite")
+    try:
+        rows = conn.execute(
+            "SELECT address FROM store_ln_addresses ORDER BY position ASC"
+        ).fetchall()
+        return [r[0] for r in rows]
+    finally:
+        conn.close()
+
+
 def test_auto_withdraw_lightning_persists_address(
     payserver: PayserverHandle, mint: MintHandle, page
 ) -> None:
@@ -65,7 +81,7 @@ def test_auto_withdraw_lightning_persists_address(
 
     row = _store_row(payserver)
     assert row["auto_melt_enabled"] == 1, "auto-melt should be enabled"
-    assert row["auto_melt_address"] == LIGHTNING_ADDRESS
+    assert _ln_addresses(payserver) == [LIGHTNING_ADDRESS]
     # use_swap=0 means Lightning-address mode (vs 1=submarine-swap).
     assert row["auto_melt_use_swap"] == 0
 
@@ -95,7 +111,7 @@ def test_auto_withdraw_onchain_makes_onchain_step_required(
     row = _store_row(payserver)
     assert row["auto_melt_enabled"] == 1
     assert row["auto_melt_use_swap"] == 1
-    assert (row["auto_melt_address"] or "") == ""
+    assert _ln_addresses(payserver) == []
 
 
 def test_auto_withdraw_skip_disables_auto_melt(

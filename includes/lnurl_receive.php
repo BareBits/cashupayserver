@@ -278,6 +278,7 @@ class LnUrlReceive {
         require_once __DIR__ . '/invoice.php';
         require_once __DIR__ . '/rates.php';
         require_once __DIR__ . '/notification_sender.php';
+        require_once __DIR__ . '/store_ln_addresses.php';
 
         $invoice = Invoice::getById($invoiceId);
         if ($invoice === null) {
@@ -311,67 +312,83 @@ class LnUrlReceive {
         // Step 2: auto-melt the remaining balance to the operator's LN address,
         // regardless of auto_melt_enabled toggle. The LNURL-receive feature only
         // engages when auto_melt_enabled=1 at invoice creation, so this is
-        // expected to be on; we re-check defensively.
-        $address = (string)($store['auto_melt_address'] ?? '');
-        if ($address === '') {
-            error_log("[lnurl-override] no auto_melt_address for store {$storeId}; skipping auto-melt");
+        // expected to be on; we re-check defensively. The address list is tried
+        // in priority order — the first that accepts the payment wins.
+        $addresses = StoreLnAddresses::addressesForStore($storeId);
+        if (empty($addresses)) {
+            error_log("[lnurl-override] no LN addresses for store {$storeId}; skipping auto-melt");
             return;
         }
 
-        try {
-            $balance = Invoice::getBalance($storeId);
-            $mintUnit = strtolower((string)($store['mint_unit'] ?? 'sat'));
-            $isFiat = !in_array($mintUnit, ['sat', 'sats', 'msat'], true);
-            if ($balance < 1) {
-                error_log("[lnurl-override] store {$storeId} has zero balance after fee settle; nothing to forward");
-                return;
-            }
-            if ($isFiat) {
-                $meltSats = (int) ExchangeRates::convertMintUnitToSats(
-                    $balance, $mintUnit,
-                    $store['price_provider_primary'] ?? null,
-                    $store['price_provider_secondary'] ?? null
-                );
-            } else {
-                $meltSats = (int)$balance;
-            }
-            // Match the existing auto-melt fee-reserve buffer so the mint
-            // doesn't reject for fee shortfall.
-            $feeBuffer = max(2, min(100, (int)ceil($meltSats * 0.01)));
-            $meltSats -= $feeBuffer;
-            if ($meltSats < 1) {
-                error_log("[lnurl-override] store {$storeId} balance below fee buffer; deferring to cron");
-                return;
-            }
-            $result = LightningAddress::meltToAddress(
-                $storeId,
-                $address,
-                $meltSats,
-                'BareBits Lite override-triggered auto-withdrawal'
-            );
-            $networkFeeSats = (int)($result['fee'] ?? 0);
-            if ($isFiat && $networkFeeSats > 0) {
-                $networkFeeSats = (int) ExchangeRates::convertMintUnitToSats(
-                    $networkFeeSats, $mintUnit,
-                    $store['price_provider_primary'] ?? null,
-                    $store['price_provider_secondary'] ?? null
-                );
-            }
-            MeltLog::record(
-                $storeId, $meltSats, $networkFeeSats, $address,
-                $result['preimage'] ?? null, null
-            );
-            NotificationSender::queueAutoWithdrawSuccess($storeId, $meltSats, $address);
-            error_log(sprintf(
-                '[lnurl-override] auto-melt ok store=%s amount_sats=%d to=%s',
-                $storeId, $meltSats, $address
-            ));
-        } catch (Throwable $e) {
-            error_log("[lnurl-override] auto-melt failed for store {$storeId}: " . $e->getMessage());
-            NotificationSender::queueAutoWithdrawFailure(
-                $storeId, $address, $e->getMessage(), null
-            );
+        $balance = Invoice::getBalance($storeId);
+        $mintUnit = strtolower((string)($store['mint_unit'] ?? 'sat'));
+        $isFiat = !in_array($mintUnit, ['sat', 'sats', 'msat'], true);
+        if ($balance < 1) {
+            error_log("[lnurl-override] store {$storeId} has zero balance after fee settle; nothing to forward");
+            return;
         }
+        if ($isFiat) {
+            $meltSats = (int) ExchangeRates::convertMintUnitToSats(
+                $balance, $mintUnit,
+                $store['price_provider_primary'] ?? null,
+                $store['price_provider_secondary'] ?? null
+            );
+        } else {
+            $meltSats = (int)$balance;
+        }
+        // Match the existing auto-melt fee-reserve buffer so the mint
+        // doesn't reject for fee shortfall.
+        $feeBuffer = max(2, min(100, (int)ceil($meltSats * 0.01)));
+        $meltSats -= $feeBuffer;
+        if ($meltSats < 1) {
+            error_log("[lnurl-override] store {$storeId} balance below fee buffer; deferring to cron");
+            return;
+        }
+
+        $lastError = null;
+        foreach ($addresses as $priority => $address) {
+            try {
+                $result = LightningAddress::meltToAddress(
+                    $storeId,
+                    $address,
+                    $meltSats,
+                    'BareBits Lite override-triggered auto-withdrawal'
+                );
+                $networkFeeSats = (int)($result['fee'] ?? 0);
+                if ($isFiat && $networkFeeSats > 0) {
+                    $networkFeeSats = (int) ExchangeRates::convertMintUnitToSats(
+                        $networkFeeSats, $mintUnit,
+                        $store['price_provider_primary'] ?? null,
+                        $store['price_provider_secondary'] ?? null
+                    );
+                }
+                MeltLog::record(
+                    $storeId, $meltSats, $networkFeeSats, $address,
+                    $result['preimage'] ?? null, null
+                );
+                NotificationSender::queueAutoWithdrawSuccess($storeId, $meltSats, $address);
+                error_log(sprintf(
+                    '[lnurl-override] auto-melt ok store=%s amount_sats=%d to=%s priority=%d',
+                    $storeId, $meltSats, $address, $priority
+                ));
+                return;
+            } catch (Throwable $e) {
+                $lastError = $e;
+                error_log(sprintf(
+                    '[lnurl-override] auto-melt attempt failed store=%s priority=%d to=%s: %s',
+                    $storeId, $priority, $address, $e->getMessage()
+                ));
+            }
+        }
+
+        // Every address failed — notify against the primary so the operator
+        // sees the payout is wedged. Cron auto-melt will retry on the next tick.
+        error_log("[lnurl-override] all auto-melt addresses failed for store {$storeId}");
+        NotificationSender::queueAutoWithdrawFailure(
+            $storeId, $addresses[0],
+            $lastError ? $lastError->getMessage() : 'unknown error',
+            null
+        );
     }
 
     /**

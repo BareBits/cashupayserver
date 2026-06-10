@@ -24,6 +24,7 @@ require_once __DIR__ . '/includes/database.php';
 require_once __DIR__ . '/includes/config.php';
 require_once __DIR__ . '/includes/auth.php';
 require_once __DIR__ . '/includes/urls.php';
+require_once __DIR__ . '/includes/store_ln_addresses.php';
 
 // Initialize session early - needed for storing temp data during setup
 Auth::initSession();
@@ -486,18 +487,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         }
                         Database::update('stores', [
                             'auto_melt_enabled' => 1,
-                            'auto_melt_address' => $address,
                             'auto_melt_use_swap' => 0, // explicit Lightning mode
                         ], 'id = ?', [$storeId]);
+                        // The ordered Lightning-address chain lives in
+                        // store_ln_addresses; seed it with this one address.
+                        StoreLnAddresses::replaceForStore($storeId, [$address]);
                         $_SESSION['setup_auto_withdraw_mode'] = 'lightning';
                     } elseif ($autoMode === 'onchain') {
                         // On-chain mode: store the choice, the actual xpub
                         // gets validated and saved on step 8.
                         Database::update('stores', [
                             'auto_melt_enabled' => 1,
-                            'auto_melt_address' => null,
                             'auto_melt_use_swap' => 1, // submarine-swap to on-chain
                         ], 'id = ?', [$storeId]);
+                        // No Lightning address in on-chain mode — clear any chain.
+                        StoreLnAddresses::replaceForStore($storeId, []);
                         $_SESSION['setup_auto_withdraw_mode'] = 'onchain';
                     } else {
                         throw new Exception('Pick an auto-withdraw method or Skip');
