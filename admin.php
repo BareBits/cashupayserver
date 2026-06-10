@@ -17,6 +17,7 @@ require_once __DIR__ . '/includes/urls.php';
 require_once __DIR__ . '/includes/dev_fee.php';
 require_once __DIR__ . '/includes/stats.php';
 require_once __DIR__ . '/includes/updater.php';
+require_once __DIR__ . '/includes/offline_cashu.php';
 
 use Cashu\ProofState;
 
@@ -343,7 +344,7 @@ if (isset($_GET['api'])) {
 
             // Whitelist filter values so the UI can't slip arbitrary status
             // strings past the LIKE-style WHERE.
-            $allowedStatuses = ['New', 'Processing', 'Settled', 'Expired', 'Invalid'];
+            $allowedStatuses = ['New', 'Processing', 'Provisional', 'Settled', 'Expired', 'Invalid'];
             if ($status !== null && !in_array($status, $allowedStatuses, true)) {
                 $status = null;
             }
@@ -757,6 +758,26 @@ if (isset($_GET['api'])) {
                 $out[$u] = IpGeo::lookupCountry($u);
             }
             echo json_encode(['countries' => $out]);
+            break;
+
+        case 'get_offline_cashu':
+            $storeId = $_GET['store_id'] ?? null;
+            if (!$storeId) {
+                http_response_code(400);
+                echo json_encode(['error' => 'Store ID required']);
+                break;
+            }
+            echo json_encode([
+                'enabled' => OfflineCashu::isEnabled($storeId),
+                'policy' => OfflineCashu::policy($storeId),
+                'max_per_tx' => OfflineCashu::maxPerTx($storeId),
+                'max_outstanding' => OfflineCashu::maxOutstanding($storeId),
+                'accept_all_mints' => OfflineCashu::acceptAllMints($storeId),
+                'per_tx_override' => OfflineCashu::perTxOverrideEnabled($storeId),
+                'outstanding' => OfflineCashu::outstandingExposure($storeId),
+                'unit' => Config::getStoreMintUnit($storeId),
+                'mints' => OfflineCashu::allowlist($storeId),
+            ]);
             break;
 
         default:
@@ -2303,6 +2324,102 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
             break;
 
+        // ===== Offline Cashu acceptance (NUT-12) =====
+        case 'save_offline_cashu':
+            Auth::requireAdmin();
+            try {
+                $storeId = $_POST['store_id'] ?? '';
+                if (empty($storeId)) {
+                    throw new Exception('Store ID required');
+                }
+                $enabling = !empty($_POST['enabled']);
+                OfflineCashu::saveSettings($storeId, [
+                    'enabled' => $enabling,
+                    // P2PK is not yet available; never persist it as the floor.
+                    'policy' => 'dleq',
+                    'max_per_tx' => (int)($_POST['max_per_tx'] ?? 0),
+                    'max_outstanding' => (int)($_POST['max_outstanding'] ?? 0),
+                    'accept_all_mints' => !empty($_POST['accept_all_mints']),
+                    'per_tx_override' => !empty($_POST['per_tx_override']),
+                ]);
+                // Convenience: when first enabling and the allowlist is empty,
+                // seed it from the store's configured mints.
+                $seeded = 0;
+                if ($enabling && empty(OfflineCashu::allowlist($storeId))) {
+                    $seeded = OfflineCashu::seedAllowlistFromStoreMints($storeId);
+                }
+                echo json_encode(['success' => true, 'seeded' => $seeded]);
+            } catch (Exception $e) {
+                http_response_code(400);
+                echo json_encode(['error' => $e->getMessage()]);
+            }
+            break;
+
+        case 'set_invoice_allow_any_mint':
+            Auth::requireAdmin();
+            try {
+                $invoiceId = $_POST['invoice_id'] ?? '';
+                $allow = !empty($_POST['allow']) ? 1 : 0;
+                if ($invoiceId === '') {
+                    throw new Exception('Invoice ID required');
+                }
+                Database::update('invoices', ['cashu_offline_allow_any_mint' => $allow], 'id = ?', [$invoiceId]);
+                echo json_encode(['success' => true]);
+            } catch (Exception $e) {
+                http_response_code(400);
+                echo json_encode(['error' => $e->getMessage()]);
+            }
+            break;
+
+        case 'add_offline_mint':
+            Auth::requireAdmin();
+            try {
+                $storeId = $_POST['store_id'] ?? '';
+                $mintUrl = trim($_POST['mint_url'] ?? '');
+                if (empty($storeId) || $mintUrl === '') {
+                    throw new Exception('Store ID and mint URL required');
+                }
+                OfflineCashu::addAllowedMint($storeId, $mintUrl);
+                echo json_encode(['success' => true]);
+            } catch (Exception $e) {
+                http_response_code(400);
+                echo json_encode(['error' => $e->getMessage()]);
+            }
+            break;
+
+        case 'toggle_offline_mint':
+            Auth::requireAdmin();
+            try {
+                $storeId = $_POST['store_id'] ?? '';
+                $mintUrl = trim($_POST['mint_url'] ?? '');
+                $enabled = !empty($_POST['enabled']);
+                if (empty($storeId) || $mintUrl === '') {
+                    throw new Exception('Store ID and mint URL required');
+                }
+                OfflineCashu::setMintEnabled($storeId, $mintUrl, $enabled);
+                echo json_encode(['success' => true]);
+            } catch (Exception $e) {
+                http_response_code(400);
+                echo json_encode(['error' => $e->getMessage()]);
+            }
+            break;
+
+        case 'remove_offline_mint':
+            Auth::requireAdmin();
+            try {
+                $storeId = $_POST['store_id'] ?? '';
+                $mintUrl = trim($_POST['mint_url'] ?? '');
+                if (empty($storeId) || $mintUrl === '') {
+                    throw new Exception('Store ID and mint URL required');
+                }
+                OfflineCashu::removeAllowedMint($storeId, $mintUrl);
+                echo json_encode(['success' => true]);
+            } catch (Exception $e) {
+                http_response_code(400);
+                echo json_encode(['error' => $e->getMessage()]);
+            }
+            break;
+
         // ===== Mint reliability admin actions =====
         case 'admin_reenable_mint':
             Auth::requireAdmin();
@@ -3712,6 +3829,7 @@ $adminView = $rawAdminView;
         .inv-chip.status-Settled  { background: rgba(72, 187, 120, 0.2); color: #48bb78; }
         .inv-chip.status-New      { background: rgba(247, 147, 26, 0.2); color: #f7931a; }
         .inv-chip.status-Processing { background: rgba(247, 147, 26, 0.2); color: #f7931a; }
+        .inv-chip.status-Provisional { background: rgba(159, 122, 234, 0.2); color: #9f7aea; }
         .inv-chip.status-Expired  { background: rgba(229, 62, 62, 0.2); color: #e53e3e; }
         .inv-chip.status-Invalid  { background: rgba(229, 62, 62, 0.2); color: #e53e3e; }
         .inv-chip.swap-confirming { background: rgba(247, 147, 26, 0.2); color: #f7931a; }
@@ -4378,6 +4496,20 @@ $adminView = $rawAdminView;
                         </div>
                         <div id="store-api-keys">
                             <div class="loading"><div class="spinner"></div></div>
+                        </div>
+                    </div>
+
+                    <div class="card collapsible">
+                        <div class="card-header">
+                            <div class="card-title">Offline Cashu Acceptance</div>
+                        </div>
+                        <div class="card-body">
+                            <p class="form-help" style="margin-bottom: 0.75rem;">
+                                Keep taking Cashu ecash even when the mint is briefly unreachable. Tokens are
+                                verified by their built-in signature (NUT-12 DLEQ) and confirmed automatically
+                                once the mint is back online.
+                            </p>
+                            <div id="offline-cashu-body"><div class="loading"><div class="spinner"></div></div></div>
                         </div>
                     </div>
 
@@ -5114,6 +5246,15 @@ $adminView = $rawAdminView;
                            placeholder="Payment for...">
                 </div>
 
+                <div class="form-group" id="request-allow-any-mint-row" style="display:none;">
+                    <label style="display:flex; align-items:flex-start; gap:0.5rem; cursor:pointer;">
+                        <input type="checkbox" id="request-allow-any-mint" style="margin-top:0.15rem;">
+                        <span style="font-size:0.85rem;">Allow payment from any mint
+                            <span style="display:block; font-size:0.74rem; color:var(--text-secondary);">For offline Cashu acceptance on this payment only, accept a token from any mint (ignore the allowlist).</span>
+                        </span>
+                    </label>
+                </div>
+
                 <button class="btn btn-full" id="btn-generate-request">Go to Checkout</button>
             </div>
 
@@ -5518,8 +5659,8 @@ $adminView = $rawAdminView;
                 if (!ensureAdmin('Only admins can withdraw funds.')) return;
                 openModal('modal-withdraw');
             });
-            document.getElementById('btn-request').addEventListener('click', () => openModal('modal-request'));
-            document.getElementById('btn-new-invoice').addEventListener('click', () => openModal('modal-request'));
+            document.getElementById('btn-request').addEventListener('click', () => openRequestModal());
+            document.getElementById('btn-new-invoice').addEventListener('click', () => openRequestModal());
 
             // Invoices status filter: persist choice in the URL + refetch.
             const invStatusSel = document.getElementById('invoice-status-filter');
@@ -6780,6 +6921,9 @@ $adminView = $rawAdminView;
                 // Load API keys
                 loadStoreApiKeys();
 
+                // Load offline Cashu acceptance settings
+                loadOfflineCashu(currentStoreId);
+
             } catch (e) {
                 console.error(e);
                 showToast('Failed to load store settings', 'error');
@@ -6842,7 +6986,8 @@ $adminView = $rawAdminView;
             container.innerHTML = invoices.map(inv => {
                 const statusClass = inv.status.toLowerCase();
                 const icon = inv.status === 'Settled' ? '✓' :
-                             inv.status === 'New' ? '⏳' : '✕';
+                             inv.status === 'New' ? '⏳' :
+                             inv.status === 'Provisional' ? '◷' : '✕';
                 const date = new Date(inv.createdTime * 1000).toLocaleDateString();
                 const description = inv.metadata?.itemDesc || '';
 
@@ -6910,6 +7055,7 @@ $adminView = $rawAdminView;
                 mint:    { icon: '⚡', label: 'Lightning' },
                 onchain: { icon: '🔗', label: 'On-chain' },
                 swap:    { icon: '🔄', label: 'Swap' },
+                cashu:   { icon: '🥜', label: 'Cashu' },
             };
             const m = map[rail] || { icon: '', label: rail || '—' };
             return `<span class="inv-chip">${m.icon} ${escapeHtml(m.label)}</span>`;
@@ -7550,11 +7696,30 @@ $adminView = $rawAdminView;
             updateRequestAmountConstraints();
         }
 
+        // Open the Request modal, showing the per-transaction "allow any mint"
+        // checkbox only when the store has offline acceptance + the per-tx
+        // override enabled.
+        async function openRequestModal() {
+            const row = document.getElementById('request-allow-any-mint-row');
+            const box = document.getElementById('request-allow-any-mint');
+            if (row) row.style.display = 'none';
+            if (box) box.checked = false;
+            openModal('modal-request');
+            if (!currentStoreId || !row) return;
+            try {
+                const r = await fetch(`${adminUrl}?api=get_offline_cashu&store_id=${encodeURIComponent(currentStoreId)}`, { credentials: 'same-origin' });
+                const oc = await r.json();
+                if (oc && oc.enabled && oc.per_tx_override) row.style.display = '';
+            } catch (e) { /* leave hidden on failure */ }
+        }
+
         async function handleGenerateRequest() {
             const storeId = currentStoreId;
             const amount = parseFloat(document.getElementById('request-amount').value);
             const memo = document.getElementById('request-memo').value;
             const currency = document.getElementById('request-currency').value || 'sat';
+            const allowAnyMintBox = document.getElementById('request-allow-any-mint');
+            const allowAnyMint = allowAnyMintBox && allowAnyMintBox.checked;
 
             if (!storeId) {
                 showToast('Please select a store first', 'error');
@@ -7607,6 +7772,14 @@ $adminView = $rawAdminView;
                 const result = await response.json();
 
                 if (response.ok && result.checkoutLink) {
+                    // Persist the per-transaction "allow any mint" override on
+                    // the new invoice before sending the payer to checkout.
+                    if (allowAnyMint && result.id) {
+                        try {
+                            await postWithCsrf(adminUrl,
+                                `action=set_invoice_allow_any_mint&invoice_id=${encodeURIComponent(result.id)}&allow=1`);
+                        } catch (e) { /* non-fatal */ }
+                    }
                     // Redirect to checkout page
                     window.location.href = result.checkoutLink;
                 } else {
@@ -8853,6 +9026,34 @@ $adminView = $rawAdminView;
             return [...new Set(info.nuts[4].methods.map(m => m.unit).filter(Boolean))];
         }
 
+        // Whether the mint advertises a given NUT as supported in /v1/info.
+        // NUTs are keyed by number; optional NUTs expose {"supported": bool}.
+        function mintSupportsNut(info, nut) {
+            const n = info?.nuts?.[nut];
+            if (n === undefined || n === null) return false;
+            if (typeof n === 'object') return n.supported !== false;
+            return !!n;
+        }
+
+        // DLEQ (NUT-12) capability badge — required for offline acceptance —
+        // plus a P2PK (NUT-11) indicator. Pulled straight from /v1/info so the
+        // operator can see at a glance which mints are offline-capable.
+        function renderMintCapabilityBadges(info) {
+            if (!info) return '';
+            const dleq = mintSupportsNut(info, 12);
+            const p2pk = mintSupportsNut(info, 11);
+            const chip = (ok, label, title) =>
+                `<span title="${escapeAttr(title)}" style="display:inline-block; padding:0.12rem 0.4rem; border-radius:4px; font-size:0.68rem; font-weight:600; margin-right:0.3rem; `
+                + (ok
+                    ? 'background:rgba(72,187,120,0.18); color:#48bb78; border:1px solid rgba(72,187,120,0.4);">✓ '
+                    : 'background:rgba(160,160,160,0.15); color:var(--text-secondary); border:1px solid var(--border);">– ')
+                + escapeHtml(label) + '</span>';
+            return chip(dleq, 'DLEQ (offline-capable)', dleq
+                        ? 'Supports NUT-12 DLEQ — can be accepted offline'
+                        : 'No NUT-12 DLEQ — cannot be accepted offline')
+                 + chip(p2pk, 'P2PK', p2pk ? 'Supports NUT-11 P2PK' : 'No NUT-11 P2PK');
+        }
+
         function renderDiscoveryStars(rating) {
             if (rating === null || rating === undefined) return '---';
             const full = Math.floor(rating);
@@ -8929,9 +9130,10 @@ $adminView = $rawAdminView;
                         <div style="margin-bottom: 0.35rem;">${badge}<span class="mint-country-slot" data-mint-url="${escapeAttr(m.url)}"></span></div>
                         <h4 style="margin: 0 0 0.25rem 0; font-size: 1rem;">${escapeHtml(name)}</h4>
                         <p style="font-size: 0.8rem; color: var(--text-secondary); margin: 0 0 0.5rem 0; word-break: break-all;">${escapeHtml(m.url)}</p>
-                        <div style="font-size: 0.8rem; color: var(--text-secondary); margin-bottom: 0.75rem;">
+                        <div style="font-size: 0.8rem; color: var(--text-secondary); margin-bottom: 0.5rem;">
                             ${units.length > 0 ? units.map(u => escapeHtml(u.toUpperCase())).join(' \u2022 ') : 'Unknown units'}
                         </div>
+                        <div style="margin-bottom: 0.75rem;">${renderMintCapabilityBadges(m.info)}</div>
                         <button type="button" class="btn btn-full select-discovered-mint" data-mint-url="${escapeAttr(m.url)}" style="font-size: 0.85rem;">Select</button>
                     </div>
                 `;
@@ -9157,6 +9359,178 @@ $adminView = $rawAdminView;
             } catch (e) {
                 showToast('Failed to remove backup mint', 'error');
             }
+        }
+
+        // -------- Offline Cashu acceptance UI --------
+
+        async function loadOfflineCashu(storeId) {
+            const body = document.getElementById('offline-cashu-body');
+            if (!body) return;
+            let data;
+            try {
+                const r = await fetch(`${adminUrl}?api=get_offline_cashu&store_id=${encodeURIComponent(storeId)}`, { credentials: 'same-origin' });
+                data = await r.json();
+                if (!r.ok) throw new Error(data.error || 'Failed to load');
+            } catch (e) {
+                body.innerHTML = `<p style="color: var(--danger); font-size: 0.85rem;">Failed to load: ${escapeHtml(e.message)}</p>`;
+                return;
+            }
+
+            const unit = (data.unit || 'sat').toUpperCase();
+            const mintsHtml = (data.mints || []).length === 0
+                ? '<p style="color: var(--text-secondary); font-size: 0.8rem;">No mints on the offline allowlist yet.</p>'
+                : data.mints.map(m => `
+                    <div style="display:flex; align-items:center; gap:0.5rem; padding:0.4rem; background:rgba(0,0,0,0.2); border-radius:4px; margin-bottom:0.4rem;">
+                        <label style="display:flex; align-items:center; gap:0.35rem; flex:1; overflow:hidden; cursor:pointer;">
+                            <input type="checkbox" class="oc-mint-toggle" data-mint="${escapeAttr(m.mint_url)}" ${Number(m.enabled) ? 'checked' : ''}>
+                            <code style="font-size:0.7rem; word-break:break-all;">${escapeHtml(m.mint_url)}</code>
+                        </label>
+                        <button class="btn btn-danger oc-mint-remove" data-mint="${escapeAttr(m.mint_url)}" style="padding:0.2rem 0.4rem; font-size:0.7rem;">Remove</button>
+                    </div>`).join('');
+
+            body.innerHTML = `
+                <div style="background: rgba(237,137,54,0.12); border:1px solid rgba(237,137,54,0.5); border-radius:8px; padding:0.75rem; margin-bottom:0.85rem; font-size:0.8rem; color:#fbd38d;">
+                    <strong>⚠ Please read — this carries a small risk.</strong><br>
+                    Offline acceptance trusts a token's signature without checking the mint at the moment of
+                    payment. The signature proves the ecash is genuine, but it <b>cannot</b> guarantee the
+                    customer hasn't already spent it elsewhere. That can only be confirmed once the mint is
+                    reachable again. In the rare case a customer double-spends during an outage, that payment
+                    will fail to settle and is a loss. Use the limits below to cap your exposure.
+                </div>
+
+                <label style="display:flex; align-items:center; gap:0.5rem; margin-bottom:0.85rem; cursor:pointer;">
+                    <input type="checkbox" id="oc-enabled" ${data.enabled ? 'checked' : ''}>
+                    <span><strong>Enable offline acceptance</strong> for this store</span>
+                </label>
+
+                <div style="margin-bottom:0.75rem;">
+                    <label style="display:block; font-size:0.8rem; color:var(--text-secondary); margin-bottom:0.25rem;">Acceptance policy</label>
+                    <select id="oc-policy" class="form-input" style="font-size:0.85rem;">
+                        <option value="dleq" selected>Verified signature + trusted mints + limits (recommended)</option>
+                        <option value="p2pk" disabled>Require P2PK lock (coming soon — not yet available)</option>
+                    </select>
+                </div>
+
+                <label style="display:flex; align-items:flex-start; gap:0.5rem; margin-bottom:0.85rem; cursor:pointer;">
+                    <input type="checkbox" id="oc-accept-all" ${data.accept_all_mints ? 'checked' : ''} style="margin-top:0.15rem;">
+                    <span style="font-size:0.85rem;"><strong>Accept tokens from any mint</strong><br>
+                        <span style="font-size:0.74rem; color:var(--text-secondary);">Ignores the allowlist below and accepts offline payments from any mint whose signature can be verified. Higher risk — you may end up holding ecash from mints you don't know or trust.</span>
+                    </span>
+                </label>
+
+                <label style="display:flex; align-items:flex-start; gap:0.5rem; margin-bottom:0.85rem; cursor:pointer;">
+                    <input type="checkbox" id="oc-per-tx-override" ${data.per_tx_override ? 'checked' : ''} style="margin-top:0.15rem;">
+                    <span style="font-size:0.85rem;"><strong>Enable per-transaction override to allow all mints</strong><br>
+                        <span style="font-size:0.74rem; color:var(--text-secondary);">Adds an "allow payment from any mint" checkbox when creating a payment request, so you can lift the allowlist for a single payment instead of all of them.</span>
+                    </span>
+                </label>
+
+                <div style="display:flex; gap:0.5rem; margin-bottom:0.85rem;">
+                    <div style="flex:1;">
+                        <label style="display:block; font-size:0.8rem; color:var(--text-secondary); margin-bottom:0.25rem;">Max per payment (${escapeHtml(unit)})</label>
+                        <input type="number" id="oc-max-per-tx" class="form-input" min="0" step="1" value="${Number(data.max_per_tx) || 0}" style="font-size:0.85rem;">
+                    </div>
+                    <div style="flex:1;">
+                        <label style="display:block; font-size:0.8rem; color:var(--text-secondary); margin-bottom:0.25rem;">Max total outstanding (${escapeHtml(unit)})</label>
+                        <input type="number" id="oc-max-outstanding" class="form-input" min="0" step="1" value="${Number(data.max_outstanding) || 0}" style="font-size:0.85rem;">
+                    </div>
+                </div>
+                <p style="font-size:0.72rem; color:var(--text-secondary); margin:-0.5rem 0 0.85rem;">0 = no limit. Outstanding now: <strong>${Number(data.outstanding) || 0} ${escapeHtml(unit)}</strong>.</p>
+
+                <h5 style="margin:0 0 0.4rem;">Trusted mints for offline acceptance</h5>
+                <p id="oc-allowlist-note" style="font-size:0.72rem; color:var(--text-secondary); margin:0 0 0.5rem;">${data.accept_all_mints
+                    ? '<span style="color:#fbd38d;">Not enforced while “Accept tokens from any mint” is on.</span>'
+                    : 'Only tokens from these mints are accepted offline (a higher trust bar than your backup mints).'}</p>
+                <div id="oc-mints-list">${mintsHtml}</div>
+                <div style="display:flex; gap:0.5rem; margin:0.5rem 0;">
+                    <input type="url" id="oc-mint-url" class="form-input" placeholder="https://mint.example.com" style="flex:1; font-size:0.82rem;">
+                    <button class="btn btn-secondary" id="oc-add-mint" style="font-size:0.8rem; white-space:nowrap;">Add</button>
+                </div>
+                <button class="btn btn-secondary btn-full" id="oc-seed" style="font-size:0.8rem; margin-bottom:0.75rem;">Seed from my configured mints</button>
+
+                <button class="btn btn-full" id="oc-save" style="font-size:0.9rem;">Save offline settings</button>
+            `;
+
+            // Wire controls (self-contained; re-attached on every render).
+            body.querySelector('#oc-save').addEventListener('click', () => saveOfflineCashu(storeId));
+            const accAll = body.querySelector('#oc-accept-all');
+            if (accAll) accAll.addEventListener('change', () => {
+                const note = body.querySelector('#oc-allowlist-note');
+                if (note) note.innerHTML = accAll.checked
+                    ? '<span style="color:#fbd38d;">Not enforced while “Accept tokens from any mint” is on.</span>'
+                    : 'Only tokens from these mints are accepted offline (a higher trust bar than your backup mints).';
+            });
+            body.querySelector('#oc-add-mint').addEventListener('click', () => addOfflineMint(storeId));
+            body.querySelector('#oc-seed').addEventListener('click', () => seedOfflineMints(storeId));
+            body.querySelectorAll('.oc-mint-remove').forEach(b =>
+                b.addEventListener('click', () => removeOfflineMint(storeId, b.dataset.mint)));
+            body.querySelectorAll('.oc-mint-toggle').forEach(c =>
+                c.addEventListener('change', () => toggleOfflineMint(storeId, c.dataset.mint, c.checked)));
+        }
+
+        async function saveOfflineCashu(storeId) {
+            const enabled = document.getElementById('oc-enabled').checked ? 1 : 0;
+            const acceptAll = document.getElementById('oc-accept-all').checked ? 1 : 0;
+            const perTxOverride = document.getElementById('oc-per-tx-override').checked ? 1 : 0;
+            const maxPerTx = Math.max(0, parseInt(document.getElementById('oc-max-per-tx').value || '0', 10));
+            const maxOut = Math.max(0, parseInt(document.getElementById('oc-max-outstanding').value || '0', 10));
+            try {
+                const res = await postWithCsrf(adminUrl,
+                    `action=save_offline_cashu&store_id=${encodeURIComponent(storeId)}&enabled=${enabled}&accept_all_mints=${acceptAll}&per_tx_override=${perTxOverride}&max_per_tx=${maxPerTx}&max_outstanding=${maxOut}`);
+                const result = await res.json();
+                if (!res.ok) throw new Error(result.error || 'Save failed');
+                showToast(result.seeded > 0 ? `Saved. Seeded ${result.seeded} mint(s) into the allowlist.` : 'Offline settings saved', 'success');
+                loadOfflineCashu(storeId);
+            } catch (e) {
+                showToast(e.message || 'Save failed', 'error');
+            }
+        }
+
+        async function addOfflineMint(storeId) {
+            const url = document.getElementById('oc-mint-url').value.trim();
+            if (!url) { showToast('Enter a mint URL', 'error'); return; }
+            try {
+                const res = await postWithCsrf(adminUrl,
+                    `action=add_offline_mint&store_id=${encodeURIComponent(storeId)}&mint_url=${encodeURIComponent(url)}`);
+                if (!res.ok) throw new Error((await res.json()).error || 'Failed');
+                showToast('Mint added to offline allowlist', 'success');
+                loadOfflineCashu(storeId);
+            } catch (e) { showToast(e.message || 'Failed to add mint', 'error'); }
+        }
+
+        async function removeOfflineMint(storeId, mintUrl) {
+            try {
+                await postWithCsrf(adminUrl,
+                    `action=remove_offline_mint&store_id=${encodeURIComponent(storeId)}&mint_url=${encodeURIComponent(mintUrl)}`);
+                showToast('Mint removed', 'success');
+                loadOfflineCashu(storeId);
+            } catch (e) { showToast('Failed to remove mint', 'error'); }
+        }
+
+        async function toggleOfflineMint(storeId, mintUrl, enabled) {
+            try {
+                await postWithCsrf(adminUrl,
+                    `action=toggle_offline_mint&store_id=${encodeURIComponent(storeId)}&mint_url=${encodeURIComponent(mintUrl)}&enabled=${enabled ? 1 : 0}`);
+            } catch (e) { showToast('Failed to update mint', 'error'); loadOfflineCashu(storeId); }
+        }
+
+        async function seedOfflineMints(storeId) {
+            try {
+                // Seeding is a no-op save that triggers the server-side seed when empty,
+                // but we also expose it explicitly by adding each configured mint.
+                const r = await fetch(`${adminUrl}?api=get_backup_mints&store_id=${encodeURIComponent(storeId)}`, { credentials: 'same-origin' });
+                const backups = await r.json();
+                const store = dashboardData?.stores?.find(s => s.id === storeId);
+                const urls = [];
+                if (store?.mint_url) urls.push(store.mint_url);
+                (backups || []).forEach(b => urls.push(b.mint_url));
+                for (const u of [...new Set(urls)]) {
+                    await postWithCsrf(adminUrl,
+                        `action=add_offline_mint&store_id=${encodeURIComponent(storeId)}&mint_url=${encodeURIComponent(u)}`);
+                }
+                showToast('Seeded offline allowlist from configured mints', 'success');
+                loadOfflineCashu(storeId);
+            } catch (e) { showToast('Failed to seed mints', 'error'); }
         }
 
         // -------- Mint reliability + trusted-mints UI --------

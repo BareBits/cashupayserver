@@ -67,7 +67,7 @@ class WebhookSender {
         ];
 
         // Add invoice metadata for certain events
-        if (in_array($eventType, ['InvoiceSettled', 'InvoiceReceivedPayment', 'InvoiceCreated'])) {
+        if (in_array($eventType, ['InvoiceSettled', 'InvoiceReceivedPayment', 'InvoiceCreated', 'InvoiceProvisional'])) {
             if (isset($invoiceData['metadata'])) {
                 $metadata = is_string($invoiceData['metadata'])
                     ? json_decode($invoiceData['metadata'], true)

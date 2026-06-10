@@ -650,6 +650,34 @@ $baseUrl = Config::getBaseUrl();
             $shortOnchainAddr = $hasOnchain
                 ? htmlspecialchars($invoice['onchain_address'])
                 : '';
+
+            // Cashu ecash: any configured store can be paid by presenting a
+            // token. The request is built without contacting the mint, so it
+            // works even while the server is mint-offline (the whole point of
+            // offline acceptance). The NUT-18 request id is the invoice id so
+            // the receipt attaches back to THIS invoice.
+            $hasCashu = false;
+            $cashuRequest = '';
+            if (Config::isStoreConfigured($invoice['store_id'])
+                && in_array($invoice['status'], ['New', 'Provisional'], true)
+                && (int)($invoice['amount_sats'] ?? 0) > 0) {
+                try {
+                    $cMintUrl = Config::getStoreMintUrl($invoice['store_id']);
+                    $cUnit = Config::getStoreMintUnit($invoice['store_id']);
+                    $cWallet = new \Cashu\Wallet($cMintUrl, $cUnit);
+                    $cPr = $cWallet->createHttpPaymentRequest(
+                        (int)$invoice['amount_sats'],
+                        Urls::receive(),
+                        $invoiceNote !== '' ? $invoiceNote : null
+                    );
+                    $cPr->id = $invoice['id'];
+                    $cashuRequest = $cPr->serialize();
+                    $hasCashu = true;
+                } catch (\Throwable $e) {
+                    $hasCashu = false;
+                }
+            }
+            $methodCount = ($hasLightning ? 1 : 0) + ($hasOnchain ? 1 : 0) + ($hasCashu ? 1 : 0);
             ?>
             <div id="payment-pending" class="<?= $invoice['status'] !== 'New' ? 'hidden' : '' ?>">
                 <div class="amount"><?= htmlspecialchars($displayAmount) ?></div>
@@ -666,10 +694,19 @@ $baseUrl = Config::getBaseUrl();
                     <?php endif; ?>
                 </div>
 
-                <?php if ($hasLightning && $hasOnchain): ?>
+                <?php
+                $firstMethod = $hasLightning ? 'lightning' : ($hasOnchain ? 'onchain' : 'cashu');
+                if ($methodCount >= 2): ?>
                 <div class="method-tabs" role="tablist">
-                    <button type="button" class="method-tab active" data-method="lightning" role="tab">Lightning</button>
-                    <button type="button" class="method-tab" data-method="onchain" role="tab">On-chain</button>
+                    <?php if ($hasLightning): ?>
+                    <button type="button" class="method-tab <?= $firstMethod === 'lightning' ? 'active' : '' ?>" data-method="lightning" role="tab">Lightning</button>
+                    <?php endif; ?>
+                    <?php if ($hasOnchain): ?>
+                    <button type="button" class="method-tab <?= $firstMethod === 'onchain' ? 'active' : '' ?>" data-method="onchain" role="tab">On-chain</button>
+                    <?php endif; ?>
+                    <?php if ($hasCashu): ?>
+                    <button type="button" class="method-tab <?= $firstMethod === 'cashu' ? 'active' : '' ?>" data-method="cashu" role="tab">Cashu</button>
+                    <?php endif; ?>
                 </div>
                 <?php endif; ?>
 
@@ -721,10 +758,29 @@ $baseUrl = Config::getBaseUrl();
                 </div>
                 <?php endif; ?>
 
+                <?php if ($hasCashu): ?>
+                <div class="method-block <?= $firstMethod === 'cashu' ? '' : 'hidden' ?>" data-method-block="cashu">
+                    <div class="qr-container" id="qr-cashu"></div>
+                    <div class="invoice-input" data-copy="<?= htmlspecialchars($cashuRequest) ?>">
+                        <?= htmlspecialchars(substr($cashuRequest, 0, 40) . '…') ?>
+                    </div>
+                    <button type="button" class="btn btn-secondary" data-copy="<?= htmlspecialchars($cashuRequest) ?>">
+                        Copy Cashu Request
+                    </button>
+                    <div style="margin-top:0.75rem; text-align:left;">
+                        <label style="font-size:0.8rem; color:var(--text-secondary);">…or paste a Cashu token to pay</label>
+                        <textarea id="cashu-token-input" rows="3" placeholder="cashuB..."
+                                  style="width:100%; margin-top:0.35rem; padding:0.6rem; border-radius:8px; border:1px solid var(--border); background:rgba(0,0,0,0.2); color:inherit; font-size:0.75rem; resize:vertical;"></textarea>
+                        <button type="button" class="btn" id="cashu-submit" style="margin-top:0.5rem;">Pay with Cashu token</button>
+                        <div id="cashu-result" style="margin-top:0.6rem; font-size:0.82rem;"></div>
+                    </div>
+                </div>
+                <?php endif; ?>
+
                 <div class="timer" id="timer"></div>
 
                 <?php
-                $initialMethod = $hasLightning ? 'lightning' : 'onchain';
+                $initialMethod = $firstMethod;
                 $imgBase = Urls::images('payment-methods/');
                 ?>
                 <div class="payment-methods" id="payment-methods" data-method="<?= $initialMethod ?>">
@@ -808,6 +864,17 @@ $baseUrl = Config::getBaseUrl();
                     </a>
                 <?php endif; ?>
             </div>
+
+            <div id="payment-provisional" class="<?= $invoice['status'] === 'Provisional' ? '' : 'hidden' ?>">
+                <div class="status-badge processing">
+                    Accepted offline — pending settlement
+                </div>
+                <p style="color: var(--text-secondary); margin-top: 1rem;">
+                    This Cashu payment was accepted while the mint was unreachable. It is
+                    <strong>provisional</strong> and will be confirmed automatically once the mint
+                    is reachable again.
+                </p>
+            </div>
         </div>
     </div>
 
@@ -844,9 +911,55 @@ $baseUrl = Config::getBaseUrl();
             });
         }
 
+        const cashuRequest = <?= json_encode($cashuRequest) ?>;
+        const storeIdForCashu = <?= json_encode($invoice['store_id']) ?>;
+        const invoiceIdForCashu = <?= json_encode($invoice['id']) ?>;
+
         if (currentStatus === 'New') {
             if (invoice) renderQR('qr-lightning', 'lightning:' + invoice.toUpperCase());
             if (onchainBip21) renderQR('qr-onchain', onchainBip21);
+            if (cashuRequest) renderQR('qr-cashu', cashuRequest);
+        }
+
+        // Pay-with-Cashu-token: POST the pasted token to receive.php, keyed to
+        // this invoice. Online -> Settled; mint-unreachable -> Provisional. The
+        // normal status poller then flips the page.
+        const cashuSubmitBtn = document.getElementById('cashu-submit');
+        if (cashuSubmitBtn) {
+            cashuSubmitBtn.addEventListener('click', async () => {
+                const token = (document.getElementById('cashu-token-input').value || '').trim();
+                const resultEl = document.getElementById('cashu-result');
+                if (!token) { resultEl.style.color = 'var(--danger)'; resultEl.textContent = 'Paste a Cashu token first.'; return; }
+                cashuSubmitBtn.disabled = true;
+                resultEl.style.color = 'var(--text-secondary)';
+                resultEl.textContent = 'Submitting…';
+                try {
+                    const r = await fetch('receive.php', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ store_id: storeIdForCashu, id: invoiceIdForCashu, token })
+                    });
+                    const data = await r.json();
+                    if (r.ok && data.success) {
+                        if (data.settlement === 'offline_provisional') {
+                            resultEl.style.color = '#fbd38d';
+                            resultEl.textContent = '⚠ Accepted offline — provisional until the mint is reachable.';
+                        } else {
+                            resultEl.style.color = '#9ae6b4';
+                            resultEl.textContent = '✓ Payment received.';
+                        }
+                        pollStatus();
+                    } else {
+                        resultEl.style.color = 'var(--danger)';
+                        resultEl.textContent = data.error || 'Payment failed.';
+                        cashuSubmitBtn.disabled = false;
+                    }
+                } catch (e) {
+                    resultEl.style.color = 'var(--danger)';
+                    resultEl.textContent = 'Network error submitting token.';
+                    cashuSubmitBtn.disabled = false;
+                }
+            });
         }
 
         // Tab switching between Lightning and on-chain payment methods.
@@ -957,6 +1070,8 @@ $baseUrl = Config::getBaseUrl();
             document.getElementById('payment-processing').classList.add('hidden');
             document.getElementById('payment-success').classList.remove('show');
             document.getElementById('payment-expired').classList.add('hidden');
+            const provisionalEl = document.getElementById('payment-provisional');
+            if (provisionalEl) provisionalEl.classList.add('hidden');
 
             switch (status) {
                 case 'New':
@@ -964,6 +1079,9 @@ $baseUrl = Config::getBaseUrl();
                     break;
                 case 'Processing':
                     document.getElementById('payment-processing').classList.remove('hidden');
+                    break;
+                case 'Provisional':
+                    if (provisionalEl) provisionalEl.classList.remove('hidden');
                     break;
                 case 'Settled':
                     document.getElementById('payment-success').classList.add('show');
@@ -977,7 +1095,7 @@ $baseUrl = Config::getBaseUrl();
         }
 
         // Start polling and timer
-        if (currentStatus === 'New' || currentStatus === 'Processing') {
+        if (currentStatus === 'New' || currentStatus === 'Processing' || currentStatus === 'Provisional') {
             pollStatus();
             if (currentStatus === 'New') {
                 updateTimer();

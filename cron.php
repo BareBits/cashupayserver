@@ -23,6 +23,7 @@ require_once __DIR__ . '/includes/background.php';
 require_once __DIR__ . '/includes/onchain/payments.php';
 require_once __DIR__ . '/includes/swap/poller.php';
 require_once __DIR__ . '/includes/swap/auto_melt.php';
+require_once __DIR__ . '/includes/offline_cashu.php';
 require_once __DIR__ . '/includes/trusted_mints.php';
 require_once __DIR__ . '/includes/updater.php';
 require_once __DIR__ . '/includes/notification_sender.php';
@@ -162,6 +163,20 @@ if (!$swapOnly && !$skipNonEssential) {
             : 'skipped';
     } catch (Exception $e) {
         $results['tasks']['settle_fees'] = 'error: ' . $e->getMessage();
+    }
+}
+
+// Task 1b: Reconcile offline-accepted Cashu payments. Runs BEFORE auto-melt so
+// any newly-settled proofs are swept out to the merchant in the same tick. Each
+// Provisional invoice is swapped at its mint: success -> Settled, mint rejection
+// (double-spend) -> Invalid, still-offline -> left for the next pass.
+if (!$swapOnly && !$skipNonEssential) {
+    try {
+        $reconcile = OfflineCashu::reconcile();
+        $results['tasks']['offline_cashu_reconcile'] =
+            ($reconcile['processed'] > 0) ? $reconcile : 'skipped';
+    } catch (Exception $e) {
+        $results['tasks']['offline_cashu_reconcile'] = 'error: ' . $e->getMessage();
     }
 }
 

@@ -100,7 +100,7 @@ class Database {
             // that migration ran — getInstance() will then trigger runMigrations()
             // on existing installs that haven't yet picked it up. All migrations
             // are idempotent, so a fire is safe.
-            $hasLatestMigration = $hasConfig && self::columnExists(self::$instance, 'notification_queue', 'invoice_id');
+            $hasLatestMigration = $hasConfig && self::columnExists(self::$instance, 'invoices', 'cashu_offline_allow_any_mint');
 
             if ($hasConfig && (!$hasUsers || !$hasReliability || !$hasLatestMigration)) {
                 if (!$hasUsers) {
@@ -1033,6 +1033,87 @@ HTACCESS;
                     error_log("[migration] could not drop stores.{$deadCol} (old SQLite?); leaving unused: " . $e->getMessage());
                 }
             }
+        }
+
+        // Offline Cashu acceptance (NUT-12 DLEQ). Per-store opt-in + risk
+        // controls, the 'cashu' invoice rail, and the Provisional reconcile
+        // bookkeeping. See includes/offline_cashu.php.
+        if (!self::columnExists($pdo, 'stores', 'offline_cashu_enabled')) {
+            $pdo->exec("ALTER TABLE stores ADD COLUMN offline_cashu_enabled INTEGER NOT NULL DEFAULT 0");
+        }
+        // Policy floor: 'dleq' = DLEQ-verified + trusted-mint allowlist + caps
+        // (active). 'p2pk' = additionally require P2PK-locked tokens (NUT-11,
+        // not yet implemented; stored but treated as unavailable in the UI).
+        if (!self::columnExists($pdo, 'stores', 'offline_cashu_policy')) {
+            $pdo->exec("ALTER TABLE stores ADD COLUMN offline_cashu_policy TEXT NOT NULL DEFAULT 'dleq'");
+        }
+        // Per-transaction cap (mint smallest unit). 0 = no per-tx cap.
+        if (!self::columnExists($pdo, 'stores', 'offline_cashu_max_per_tx')) {
+            $pdo->exec("ALTER TABLE stores ADD COLUMN offline_cashu_max_per_tx INTEGER NOT NULL DEFAULT 0");
+        }
+        // Aggregate outstanding (un-reconciled) exposure cap. 0 = no cap.
+        if (!self::columnExists($pdo, 'stores', 'offline_cashu_max_outstanding')) {
+            $pdo->exec("ALTER TABLE stores ADD COLUMN offline_cashu_max_outstanding INTEGER NOT NULL DEFAULT 0");
+        }
+        // Accept offline tokens from ANY mint (bypass the allowlist). Still
+        // bounded by what can be DLEQ-verified — i.e. mints whose keys are
+        // cached or that are reachable to fetch keys at accept time.
+        if (!self::columnExists($pdo, 'stores', 'offline_cashu_accept_all_mints')) {
+            $pdo->exec("ALTER TABLE stores ADD COLUMN offline_cashu_accept_all_mints INTEGER NOT NULL DEFAULT 0");
+        }
+        // Allow a per-transaction "accept from any mint" override to be set at
+        // invoice-creation time (the request UI shows the checkbox only when
+        // this is on). The override itself is recorded per-invoice below.
+        if (!self::columnExists($pdo, 'stores', 'offline_cashu_per_tx_override')) {
+            $pdo->exec("ALTER TABLE stores ADD COLUMN offline_cashu_per_tx_override INTEGER NOT NULL DEFAULT 0");
+        }
+        // Per-invoice flag: accept this specific payment offline from any mint,
+        // bypassing the allowlist (only honored when the store enables the
+        // per-transaction override above).
+        if (!self::columnExists($pdo, 'invoices', 'cashu_offline_allow_any_mint')) {
+            $pdo->exec("ALTER TABLE invoices ADD COLUMN cashu_offline_allow_any_mint INTEGER NOT NULL DEFAULT 0");
+        }
+        // The raw cashu token captured for a Provisional invoice, swapped at the
+        // mint on reconnect to settle it.
+        if (!self::columnExists($pdo, 'invoices', 'cashu_offline_token')) {
+            $pdo->exec("ALTER TABLE invoices ADD COLUMN cashu_offline_token TEXT DEFAULT NULL");
+        }
+        // Reason an offline-accepted invoice failed reconciliation (e.g. double-spent).
+        if (!self::columnExists($pdo, 'invoices', 'cashu_offline_fail_reason')) {
+            $pdo->exec("ALTER TABLE invoices ADD COLUMN cashu_offline_fail_reason TEXT DEFAULT NULL");
+        }
+
+        // Per-store allowlist of mints whose tokens may be accepted offline.
+        // Intentionally distinct from store_mints (failover for issuing): a
+        // merchant can hold offline acceptance to a higher trust bar.
+        if (!self::tableExists($pdo, 'store_offline_mints')) {
+            $pdo->exec("
+                CREATE TABLE store_offline_mints (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    store_id TEXT NOT NULL,
+                    mint_url TEXT NOT NULL,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    created_at INTEGER NOT NULL,
+                    FOREIGN KEY (store_id) REFERENCES stores(id) ON DELETE CASCADE,
+                    UNIQUE(store_id, mint_url)
+                );
+            ");
+        }
+
+        // Replay guard + exposure ledger for offline-accepted proofs. The Y
+        // value (hash_to_curve of the secret) uniquely identifies a proof; the
+        // PRIMARY KEY makes re-presenting the same proof offline a no-op.
+        if (!self::tableExists($pdo, 'cashu_offline_locks')) {
+            $pdo->exec("
+                CREATE TABLE cashu_offline_locks (
+                    y TEXT PRIMARY KEY,
+                    invoice_id TEXT NOT NULL,
+                    store_id TEXT NOT NULL,
+                    amount INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL
+                );
+            ");
+            $pdo->exec("CREATE INDEX idx_offline_locks_invoice ON cashu_offline_locks(invoice_id);");
         }
 
         // Drop the legacy users.pin_hash column (PIN feature removed). Uses
