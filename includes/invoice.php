@@ -20,6 +20,7 @@ require_once __DIR__ . '/swap/quote_fetcher.php';
 require_once __DIR__ . '/crypto/secp256k1.php';
 require_once __DIR__ . '/crypto/taproot.php';
 require_once __DIR__ . '/lnurl_receive.php';
+require_once __DIR__ . '/store_ln_addresses.php';
 
 use Cashu\Wallet;
 use Cashu\WalletStorage;
@@ -77,15 +78,20 @@ class Invoice {
         $lnurlAttempt = null;          // ['bolt11','verify_url','amount_sats'] on success
         $lnurlOverrideReason = null;   // set when override-gate fired; recorded on the fallback invoice
         $lnAutoMeltEnabled = (int)($store['auto_melt_enabled'] ?? 0) === 1;
-        $lnAutoMeltAddress = trim((string)($store['auto_melt_address'] ?? ''));
-        $lnAddressLooksValid = $lnAutoMeltAddress !== ''
-            && (bool)preg_match('/^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$/', $lnAutoMeltAddress);
-        if ($lnAutoMeltEnabled && $lnAddressLooksValid) {
+        // Ordered fallback chain: try each address in priority order until one
+        // yields a usable invoice. The single auto_melt_address column was
+        // replaced by the store_ln_addresses table.
+        $lnAddresses = $lnAutoMeltEnabled
+            ? StoreLnAddresses::addressesForStore($storeId)
+            : [];
+        if (!empty($lnAddresses)) {
             $lnurlTargetSats = (int) ExchangeRates::convertToSats((string)$amount, $currency, 'sat');
             $feesDueSats = LnUrlReceive::feesDueSats($storeId);
             $decision = LnUrlReceive::shouldOverride($feesDueSats, $lnurlTargetSats);
             // Log every routing decision so the override mechanism is
             // auditable from production logs — both fired and skipped cases.
+            // The override gate is amount-vs-fees based, independent of which
+            // address is used, so it's decided once for the whole chain.
             error_log(sprintf(
                 '[lnurl-override] store=%s invoice_sats=%d fees_due_sats=%d override=%s reason=%s',
                 $storeId, $lnurlTargetSats, $feesDueSats,
@@ -98,24 +104,48 @@ class Invoice {
                 // can fire the immediate-settle-and-forward handler.
                 $lnurlOverrideReason = $decision['reason'];
             } elseif ($lnurlTargetSats > 0) {
-                try {
-                    $probed = LnUrlReceive::probeAndFetchInvoice(
-                        $lnAutoMeltAddress, $lnurlTargetSats
-                    );
-                } catch (Throwable $e) {
-                    error_log("[lnurl-receive] probe threw for store {$storeId}: " . $e->getMessage());
-                    $probed = null;
-                }
-                if ($probed !== null) {
-                    $lnurlAttempt = [
-                        'bolt11' => $probed['bolt11'],
-                        'verify_url' => $probed['verify_url'],
-                        'amount_sats' => $lnurlTargetSats,
-                    ];
-                } else {
+                // Walk the priority chain. First address to return a usable
+                // invoice wins; the rest are only tried when earlier ones are
+                // down / out of range / lack a LUD-21 verify URL.
+                foreach ($lnAddresses as $priority => $lnAddress) {
+                    if (!StoreLnAddresses::isValid($lnAddress)) {
+                        error_log(sprintf(
+                            '[lnurl-receive] skipping malformed address store=%s priority=%d address=%s',
+                            $storeId, $priority, $lnAddress
+                        ));
+                        continue;
+                    }
+                    try {
+                        $probed = LnUrlReceive::probeAndFetchInvoice(
+                            $lnAddress, $lnurlTargetSats
+                        );
+                    } catch (Throwable $e) {
+                        error_log("[lnurl-receive] probe threw for store {$storeId} address {$lnAddress}: " . $e->getMessage());
+                        $probed = null;
+                    }
+                    if ($probed !== null) {
+                        $lnurlAttempt = [
+                            'bolt11' => $probed['bolt11'],
+                            'verify_url' => $probed['verify_url'],
+                            'amount_sats' => $lnurlTargetSats,
+                        ];
+                        if ($priority > 0) {
+                            error_log(sprintf(
+                                '[lnurl-receive] using fallback address store=%s priority=%d address=%s',
+                                $storeId, $priority, $lnAddress
+                            ));
+                        }
+                        break;
+                    }
                     error_log(sprintf(
-                        '[lnurl-receive] probe failed for store=%s address=%s amount_sats=%d; falling back',
-                        $storeId, $lnAutoMeltAddress, $lnurlTargetSats
+                        '[lnurl-receive] probe failed for store=%s priority=%d address=%s amount_sats=%d; trying next',
+                        $storeId, $priority, $lnAddress, $lnurlTargetSats
+                    ));
+                }
+                if ($lnurlAttempt === null) {
+                    error_log(sprintf(
+                        '[lnurl-receive] all %d address(es) failed for store=%s amount_sats=%d; falling back to swap/mint/onchain',
+                        count($lnAddresses), $storeId, $lnurlTargetSats
                     ));
                 }
             }

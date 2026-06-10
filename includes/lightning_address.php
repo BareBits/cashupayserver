@@ -15,6 +15,7 @@ require_once __DIR__ . '/mint_reliability.php';
 require_once __DIR__ . '/notification_sender.php';
 require_once __DIR__ . '/safe_http.php';
 require_once __DIR__ . '/swap/auto_melt.php';
+require_once __DIR__ . '/store_ln_addresses.php';
 require_once __DIR__ . '/../cashu-wallet-php/CashuWallet.php';
 
 use Cashu\Wallet;
@@ -170,15 +171,16 @@ class LightningAddress {
         // the on-chain fields {@see SwapAutoMelt::modeForStore} needs, so we
         // can hand stores that opted into swap-mode auto-melt over to
         // SwapAutoMelt::checkAndExecute without re-querying.
+        // The set of LN addresses now lives in store_ln_addresses (ordered
+        // fallback chain), so we no longer filter on a single column here —
+        // stores with an empty chain are skipped per-iteration below.
         $stores = Database::fetchAll(
-            "SELECT id, name, mint_url, mint_unit, auto_melt_address, auto_melt_threshold,
+            "SELECT id, name, mint_url, mint_unit, auto_melt_threshold,
                     auto_melt_use_swap, onchain_address_mode, onchain_xpub,
                     swaps_enabled,
                     price_provider_primary, price_provider_secondary
              FROM stores
              WHERE auto_melt_enabled = 1
-               AND auto_melt_address IS NOT NULL
-               AND auto_melt_address != ''
                AND mint_url IS NOT NULL
                AND seed_phrase IS NOT NULL"
         );
@@ -193,6 +195,13 @@ class LightningAddress {
             if (SwapAutoMelt::modeForStore($store) === 'swap') {
                 continue;
             }
+            // Ordered fallback chain for this store; skip stores with none
+            // (replaces the old WHERE auto_melt_address IS NOT NULL filter).
+            $addresses = StoreLnAddresses::addressesForStore($store['id']);
+            if (empty($addresses)) {
+                continue;
+            }
+            $primaryAddress = $addresses[0];
             try {
                 // Check store balance from local storage (offline-first, no mint contact)
                 // This prevents crashes when mint is unreachable
@@ -232,20 +241,37 @@ class LightningAddress {
                         continue;
                     }
 
-                    // Perform melt to Lightning address (amount in SATS)
-                    // This is wrapped in try-catch to handle mint failures gracefully
-                    try {
-                        $result = self::meltToAddress(
-                            $store['id'],
-                            $store['auto_melt_address'],
-                            $meltAmountSats,
-                            'BareBits Lite auto-withdrawal'
-                        );
+                    // Perform melt to a Lightning address (amount in SATS),
+                    // walking the priority chain: the first address that accepts
+                    // the payment wins; the rest are tried only on failure.
+                    // Wrapped per-attempt to handle host/mint failures gracefully.
+                    $meltResult = null;
+                    $usedAddress = null;
+                    $lastMeltError = null;
+                    foreach ($addresses as $priority => $address) {
+                        try {
+                            $meltResult = self::meltToAddress(
+                                $store['id'],
+                                $address,
+                                $meltAmountSats,
+                                'BareBits Lite auto-withdrawal'
+                            );
+                            $usedAddress = $address;
+                            if ($priority > 0) {
+                                error_log("Auto-melt: used fallback address (priority {$priority}) {$address} for store {$store['id']}");
+                            }
+                            break;
+                        } catch (Exception $meltError) {
+                            $lastMeltError = $meltError;
+                            error_log("Auto-melt attempt to {$address} (priority {$priority}) failed for store {$store['id']}: " . $meltError->getMessage());
+                        }
+                    }
 
+                    if ($meltResult !== null) {
                         // Record successful melt for fee-base accounting + future stats.
                         // Network fee converted to sats for fiat mints so the dev-fee
                         // base shrinks honestly regardless of mint unit.
-                        $networkFeeSats = (int)($result['fee'] ?? 0);
+                        $networkFeeSats = (int)($meltResult['fee'] ?? 0);
                         if ($isFiatMint && $networkFeeSats > 0) {
                             $networkFeeSats = ExchangeRates::convertMintUnitToSats(
                                 $networkFeeSats,
@@ -259,8 +285,8 @@ class LightningAddress {
                             $store['id'],
                             $meltAmountSats,
                             $networkFeeSats,
-                            $store['auto_melt_address'],
-                            $result['preimage'] ?? null,
+                            $usedAddress,
+                            $meltResult['preimage'] ?? null,
                             null
                         );
 
@@ -276,25 +302,27 @@ class LightningAddress {
                         NotificationSender::queueAutoWithdrawSuccess(
                             $store['id'],
                             $meltAmountSats,
-                            $store['auto_melt_address']
+                            $usedAddress
                         );
 
-                        error_log("Auto-melt: Sent {$meltAmountSats} sats (~{$meltAmountInMintUnit} {$mintUnit}) from store {$store['name']} to {$store['auto_melt_address']}");
-                    } catch (Exception $meltError) {
-                        // Melt operation failed (mint unreachable, insufficient funds, etc.)
-                        // Log and continue - don't crash the entire admin page load
-                        error_log("Auto-melt operation failed for store {$store['id']}: " . $meltError->getMessage());
+                        error_log("Auto-melt: Sent {$meltAmountSats} sats (~{$meltAmountInMintUnit} {$mintUnit}) from store {$store['name']} to {$usedAddress}");
+                    } else {
+                        // Every address failed (mint unreachable, hosts down, insufficient
+                        // funds, etc.). Notify against the primary and continue — don't
+                        // crash the admin page load.
+                        $errMsg = $lastMeltError ? $lastMeltError->getMessage() : 'unknown error';
+                        error_log("Auto-melt operation failed for store {$store['id']} (all " . count($addresses) . " address(es)): " . $errMsg);
                         NotificationSender::queueAutoWithdrawFailure(
                             $store['id'],
-                            $store['auto_melt_address'],
-                            $meltError->getMessage(),
+                            $primaryAddress,
+                            $errMsg,
                             $meltAmountSats
                         );
                         $results[] = [
                             'store_id' => $store['id'],
                             'store_name' => $store['name'],
                             'success' => false,
-                            'error' => $meltError->getMessage(),
+                            'error' => $errMsg,
                         ];
                     }
                 }
@@ -302,10 +330,10 @@ class LightningAddress {
                 error_log("Auto-melt check failed for store {$store['id']}: " . $e->getMessage());
                 // Pre-flight failure (balance lookup, etc.) — still notify so
                 // operators see that auto-withdrawal is wedged.
-                if (!empty($store['auto_melt_address'])) {
+                if (!empty($primaryAddress)) {
                     NotificationSender::queueAutoWithdrawFailure(
                         $store['id'],
-                        $store['auto_melt_address'],
+                        $primaryAddress,
                         $e->getMessage(),
                         null
                     );

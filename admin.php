@@ -142,11 +142,20 @@ if (isset($_GET['api'])) {
                 ? (int)$store['auto_melt_use_swap']
                 : SwapAutoMelt::INHERIT;
             require_once __DIR__ . '/includes/lnurl_receive.php';
-            $lud21RawStored = array_key_exists('lnurl_supports_verify', $store)
-                ? $store['lnurl_supports_verify']
-                : null;
+            require_once __DIR__ . '/includes/store_ln_addresses.php';
+            // Ordered Lightning-address fallback chain. Each entry carries its
+            // own LUD-21 verify-URL support flag (null = not probed / unreachable,
+            // 0 = unsupported → payments route via the mint, 1 = direct-receive ok).
+            $lnAddressRows = StoreLnAddresses::listForStore($storeId);
+            $autoMeltAddresses = array_map(static function (array $r): array {
+                return [
+                    'address' => $r['address'],
+                    'lud21Support' => $r['supports_verify'],
+                ];
+            }, $lnAddressRows);
             $autoMelt = [
-                'address' => $store['auto_melt_address'] ?? '',
+                // Ordered list of {address, lud21Support}; priority = array order.
+                'addresses' => $autoMeltAddresses,
                 'enabled' => (bool)($store['auto_melt_enabled'] ?? 0),
                 'threshold' => (int)($store['auto_melt_threshold'] ?? 2000),
                 'modeOverride' => $autoMeltUseSwap,
@@ -154,10 +163,6 @@ if (isset($_GET['api'])) {
                 'siteSwapDefault' => SwapAutoMelt::siteDefault(),
                 'swapMinSats' => SwapAutoMelt::minSats(),
                 'swapMaxFeePct' => SwapAutoMelt::maxFeePct(),
-                // LUD-21 verify-URL support for the configured LN address:
-                // null = not probed / unreachable, 0 = unsupported (warn the
-                // operator that payments will route via the mint), 1 = ok.
-                'lud21Support' => $lud21RawStored === null ? null : (int)$lud21RawStored,
             ];
 
             $storeNotifications = [
@@ -1522,9 +1527,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             require_once __DIR__ . '/includes/swap/auto_melt.php';
             require_once __DIR__ . '/includes/swap/config.php';
             require_once __DIR__ . '/includes/lnurl_receive.php';
+            require_once __DIR__ . '/includes/store_ln_addresses.php';
             try {
                 $storeId = $_POST['store_id'] ?? '';
-                $address = $_POST['address'] ?? '';
+                // Ordered fallback chain. Accept addresses[] (preferred); fall
+                // back to a single `address` field for older callers.
+                $rawAddresses = $_POST['addresses'] ?? null;
+                if ($rawAddresses === null) {
+                    $single = trim((string)($_POST['address'] ?? ''));
+                    $rawAddresses = $single === '' ? [] : [$single];
+                } elseif (!is_array($rawAddresses)) {
+                    $rawAddresses = [(string)$rawAddresses];
+                }
                 $enabled = ($_POST['enabled'] ?? '0') === '1' ? 1 : 0;
                 $threshold = (int)($_POST['threshold'] ?? 2000);
                 // Tri-state per-store override: -1 inherit, 0 force LN, 1 force swap.
@@ -1538,11 +1552,24 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     throw new Exception('Store ID required');
                 }
 
-                // Validate Lightning address format if provided. When the
-                // resolved mode is "swap" we don't require an LN address —
-                // the operator has chosen the on-chain rail.
-                if (!empty($address) && !preg_match('/^[a-zA-Z0-9._-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/', $address)) {
-                    throw new Exception('Invalid Lightning address format');
+                // Normalize: trim, drop blanks, validate each, reject duplicates
+                // (case-insensitive) so the fallback chain never repeats a host.
+                $addresses = [];
+                $seen = [];
+                foreach ($rawAddresses as $raw) {
+                    $addr = trim((string)$raw);
+                    if ($addr === '') {
+                        continue;
+                    }
+                    if (!StoreLnAddresses::isValid($addr)) {
+                        throw new Exception("Invalid Lightning address format: {$addr}");
+                    }
+                    $key = strtolower($addr);
+                    if (isset($seen[$key])) {
+                        throw new Exception("Duplicate Lightning address: {$addr}");
+                    }
+                    $seen[$key] = true;
+                    $addresses[] = $addr;
                 }
 
                 // On-chain auto-withdraw requires the store to have an on-chain
@@ -1561,28 +1588,33 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     }
                 }
 
-                // Probe LUD-21 support whenever an LN address is provided.
-                // Result drives the receive-rail decision in Invoice::create
-                // and (when 0) the operator-facing warning that lightning
-                // payments will route via the mint instead of direct-receive.
-                // Null on unreachable host — treated as "unknown, runtime
-                // probe will retry" rather than blocking the save.
-                $lud21Support = null;
-                if (!empty($address)) {
+                // Probe LUD-21 support for each address. The result drives the
+                // receive-rail decision in Invoice::create and (when 0) the
+                // per-address operator warning that lightning payments will
+                // route via the mint instead of direct-receive. Null on an
+                // unreachable host — "unknown, runtime probe will retry" rather
+                // than blocking the save.
+                $entries = [];
+                $addressResults = [];
+                foreach ($addresses as $addr) {
+                    $support = null;
                     try {
-                        $lud21Support = LnUrlReceive::probeLud21Support($address);
+                        $support = LnUrlReceive::probeLud21Support($addr);
                     } catch (Throwable $e) {
                         error_log('[lnurl-receive] LUD-21 save-time probe threw: ' . $e->getMessage());
                     }
+                    $entries[] = ['address' => $addr, 'supports_verify' => $support];
+                    $addressResults[] = ['address' => $addr, 'lud21Support' => $support];
                 }
 
                 Database::update('stores', [
                     'auto_melt_enabled' => $enabled,
-                    'auto_melt_address' => $address ?: null,
                     'auto_melt_threshold' => $threshold,
                     'auto_melt_use_swap' => $modeOverride,
-                    'lnurl_supports_verify' => $lud21Support,
                 ], 'id = ?', [$storeId]);
+
+                // Replace the whole ordered chain in one transaction.
+                StoreLnAddresses::replaceForStore($storeId, $entries);
 
                 // Choosing on-chain auto-withdraw forces submarine swaps on for
                 // this store, and enables the site-wide master switch if it was
@@ -1596,7 +1628,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
                 echo json_encode([
                     'success' => true,
-                    'lnurl_supports_verify' => $lud21Support,
+                    // Per-address LUD-21 results, in priority order.
+                    'addresses' => $addressResults,
                 ]);
             } catch (Exception $e) {
                 http_response_code(400);
@@ -4035,25 +4068,17 @@ $adminView = $rawAdminView;
                             </p>
 
                             <div class="form-group" id="auto-melt-address-group">
-                                <label class="form-label">Lightning Address</label>
-                                <input type="text" class="form-input" id="auto-melt-address"
-                                       placeholder="user@wallet.com">
-                                <p class="form-help">e.g., yourname@walletofsatoshi.com, yourname@blink.sv</p>
-                                <p class="form-help" id="auto-melt-lud21-warning"
-                                   style="display: none; color: var(--warning, #b07b00);">
-                                    This Lightning address host does not advertise a LUD-21 verify URL.
-                                    Incoming Lightning payments will route through the mint and then
-                                    auto-withdraw to this address (the normal two-hop flow) instead of
-                                    going directly to the address.
+                                <label class="form-label">Lightning Addresses (priority order)</label>
+                                <p class="form-help">
+                                    Invoices are requested from the first address. If a host is down
+                                    or can&rsquo;t produce an invoice, the next address is tried
+                                    automatically. Use the arrows to set priority.
+                                    e.g., yourname@walletofsatoshi.com, yourname@blink.sv
                                 </p>
-                                <p class="form-help" id="auto-melt-lud21-ok"
-                                   style="display: none; color: var(--success, #2d7a3a);">
-                                    This Lightning address host supports LUD-21 verify URLs. Incoming
-                                    Lightning payments will route directly to this address, except
-                                    when an invoice is smaller than the accumulated upstream/dev/hosting
-                                    fees the store owes — in that case the payment routes through the
-                                    mint so the resulting balance can cover the owed fees.
-                                </p>
+                                <div id="auto-melt-address-list"></div>
+                                <button type="button" class="btn btn-secondary" id="btn-add-ln-address" style="margin-top: 0.5rem;">
+                                    + Add address
+                                </button>
                             </div>
 
                             <p class="form-help" id="auto-melt-swap-info" style="display: none;">
@@ -5514,6 +5539,8 @@ $adminView = $rawAdminView;
 
             // Settings
             document.getElementById('btn-save-auto-melt').addEventListener('click', saveAutoMelt);
+            const btnAddLnAddr = document.getElementById('btn-add-ln-address');
+            if (btnAddLnAddr) btnAddLnAddr.addEventListener('click', addLnAddressRow);
             // Live-update LN-address vs swap-mode hint pane when the operator
             // changes the dropdown, even before they save.
             const autoMeltModeSel = document.getElementById('auto-melt-mode-override');
@@ -6136,7 +6163,7 @@ $adminView = $rawAdminView;
 
                 // Update auto-melt settings (per-store)
                 if (dashboardData.autoMelt) {
-                    document.getElementById('auto-melt-address').value = dashboardData.autoMelt.address || '';
+                    setLnAddressRowsFromData();
                     document.getElementById('auto-melt-enabled').checked = dashboardData.autoMelt.enabled;
                     // Format threshold for display (fiat needs decimal)
                     const thresholdInput = document.getElementById('auto-melt-threshold');
@@ -6700,7 +6727,7 @@ $adminView = $rawAdminView;
                 // Load auto-melt settings from dashboard data
                 if (dashboardData && dashboardData.autoMelt) {
                     const mintUnit = dashboardData.mintUnit || 'sat';
-                    document.getElementById('auto-melt-address').value = dashboardData.autoMelt.address || '';
+                    setLnAddressRowsFromData();
                     document.getElementById('auto-melt-enabled').checked = dashboardData.autoMelt.enabled;
                     const thresholdInput = document.getElementById('auto-melt-threshold');
                     thresholdInput.value = isFiatUnit(mintUnit)
@@ -7856,18 +7883,33 @@ $adminView = $rawAdminView;
             }
             clearAwError('aw-store-error');
             const mintUnit = dashboardData?.mintUnit || 'sat';
-            const address = document.getElementById('auto-melt-address').value.trim();
             const enabled = document.getElementById('auto-melt-enabled').checked ? '1' : '0';
             const modeOverride = document.getElementById('auto-melt-mode-override').value;
+
+            // Pull the ordered, non-blank addresses straight from the live rows
+            // so what the operator sees is exactly what's saved.
+            syncLnAddressesFromInputs();
+            const addresses = awLnAddresses
+                .map(a => (a.address || '').trim())
+                .filter(a => a.length > 0);
 
             // Validate the chosen destination before saving so bad data surfaces
             // inline rather than failing silently on the server.
             if (modeOverride === '0') {
-                if (enabled === '1' && !address) {
-                    return awError('aw-store-error', 'Enter a lightning address to withdraw to.');
+                if (enabled === '1' && addresses.length === 0) {
+                    return awError('aw-store-error', 'Add at least one lightning address to withdraw to.');
                 }
-                if (address && !isValidLightningAddress(address)) {
-                    return awError('aw-store-error', "That doesn't look like a valid lightning address (expected name@domain.tld).");
+                for (const a of addresses) {
+                    if (!isValidLightningAddress(a)) {
+                        return awError('aw-store-error', `"${a}" doesn't look like a valid lightning address (expected name@domain.tld).`);
+                    }
+                }
+                // Reject duplicates (case-insensitive) — the chain should never
+                // contain the same host twice.
+                const lower = addresses.map(a => a.toLowerCase());
+                const dup = lower.find((a, i) => lower.indexOf(a) !== i);
+                if (dup) {
+                    return awError('aw-store-error', `Duplicate lightning address: ${dup}`);
                 }
             } else if (modeOverride === '1') {
                 if (!storeHasOnchain()) {
@@ -7879,25 +7921,33 @@ $adminView = $rawAdminView;
             const threshold = parseAmount(document.getElementById('auto-melt-threshold').value, mintUnit);
 
             try {
-                const response = await postWithCsrf(adminUrl,
-                    `action=save_auto_melt&store_id=${encodeURIComponent(currentStoreId)}`
-                    + `&address=${encodeURIComponent(address)}`
+                let body = `action=save_auto_melt&store_id=${encodeURIComponent(currentStoreId)}`
                     + `&enabled=${enabled}`
                     + `&threshold=${threshold}`
-                    + `&mode_override=${encodeURIComponent(modeOverride)}`
-                );
+                    + `&mode_override=${encodeURIComponent(modeOverride)}`;
+                // Send the ordered chain as addresses[]; an empty list clears it.
+                for (const a of addresses) {
+                    body += `&addresses%5B%5D=${encodeURIComponent(a)}`;
+                }
+
+                const response = await postWithCsrf(adminUrl, body);
 
                 const result = await response.json();
 
                 if (response.ok) {
                     showToast('Settings saved!', 'success');
-                    // Update the live LUD-21 warning from the save response so
-                    // the operator sees the probe result without a full reload.
-                    if (dashboardData && dashboardData.autoMelt) {
-                        dashboardData.autoMelt.lud21Support = (result && result.lnurl_supports_verify != null)
-                            ? Number(result.lnurl_supports_verify)
-                            : null;
-                        renderLud21Warning();
+                    // Update per-address LUD-21 hints from the save response so
+                    // the operator sees probe results without a full reload.
+                    if (Array.isArray(result.addresses)) {
+                        awLnAddresses = result.addresses.map(r => ({
+                            address: r.address,
+                            lud21Support: (r.lud21Support === null || r.lud21Support === undefined)
+                                ? null : Number(r.lud21Support),
+                        }));
+                        if (dashboardData && dashboardData.autoMelt) {
+                            dashboardData.autoMelt.addresses = awLnAddresses.map(a => ({ ...a }));
+                        }
+                        renderLnAddressRows();
                     }
                     // Reload dashboard so the effective-mode badge reflects the save.
                     if (typeof loadDashboard === 'function') loadDashboard();
@@ -8032,22 +8082,151 @@ $adminView = $rawAdminView;
          *   0     — probed and unsupported: show the warning
          *   1     — probed and supported: show the ok hint
          */
-        function renderLud21Warning() {
+        // ---- Ordered Lightning-address fallback chain ----
+        // Working copy of the chain: [{address, lud21Support}]. Priority is the
+        // array order; index 0 is the primary, the rest are fallbacks tried in
+        // turn when an earlier host is down / can't produce an invoice.
+        let awLnAddresses = [];
+
+        function setLnAddressRowsFromData() {
             const am = dashboardData && dashboardData.autoMelt;
-            const warn = document.getElementById('auto-melt-lud21-warning');
-            const ok = document.getElementById('auto-melt-lud21-ok');
-            if (!warn || !ok) return;
-            warn.style.display = 'none';
-            ok.style.display = 'none';
-            if (!am) return;
-            // Hide the hint entirely when the operator picked swap mode —
-            // LNURL-receive doesn't apply.
-            if (am.mode === 'swap') return;
-            if (am.lud21Support === 0) {
-                warn.style.display = '';
-            } else if (am.lud21Support === 1) {
-                ok.style.display = '';
+            const src = (am && Array.isArray(am.addresses)) ? am.addresses : [];
+            awLnAddresses = src.map(a => ({
+                address: a.address || '',
+                lud21Support: (a.lud21Support === null || a.lud21Support === undefined)
+                    ? null : Number(a.lud21Support),
+            }));
+            renderLnAddressRows();
+        }
+
+        // Read the current input values back into awLnAddresses (preserving the
+        // per-row probe result) so structural ops and save use live edits.
+        function syncLnAddressesFromInputs() {
+            const list = document.getElementById('auto-melt-address-list');
+            if (!list) return;
+            const inputs = list.querySelectorAll('input.ln-address-input');
+            const next = [];
+            inputs.forEach((inp, i) => {
+                next.push({
+                    address: inp.value,
+                    lud21Support: awLnAddresses[i] ? awLnAddresses[i].lud21Support : null,
+                });
+            });
+            awLnAddresses = next;
+        }
+
+        function addLnAddressRow() {
+            syncLnAddressesFromInputs();
+            awLnAddresses.push({ address: '', lud21Support: null });
+            renderLnAddressRows();
+            // Focus the freshly added input.
+            const list = document.getElementById('auto-melt-address-list');
+            if (list) {
+                const inputs = list.querySelectorAll('input.ln-address-input');
+                if (inputs.length) inputs[inputs.length - 1].focus();
             }
+        }
+
+        function removeLnAddressRow(index) {
+            syncLnAddressesFromInputs();
+            awLnAddresses.splice(index, 1);
+            renderLnAddressRows();
+        }
+
+        function moveLnAddressRow(index, delta) {
+            syncLnAddressesFromInputs();
+            const target = index + delta;
+            if (target < 0 || target >= awLnAddresses.length) return;
+            const tmp = awLnAddresses[index];
+            awLnAddresses[index] = awLnAddresses[target];
+            awLnAddresses[target] = tmp;
+            renderLnAddressRows();
+        }
+
+        // LUD-21 hint text for a single row (null hides it).
+        function lud21HintFor(support) {
+            if (support === 0) {
+                return { cls: 'warn', text: 'Host does not advertise a LUD-21 verify URL. '
+                    + 'Payments route through the mint, then auto-withdraw here (two-hop) '
+                    + 'instead of going directly to this address.' };
+            }
+            if (support === 1) {
+                return { cls: 'ok', text: 'Direct-receive supported (LUD-21 verify URL present). '
+                    + 'Payments go straight to this address, except when an invoice is smaller '
+                    + 'than the fees the store owes.' };
+            }
+            return null;
+        }
+
+        function renderLnAddressRows() {
+            const list = document.getElementById('auto-melt-address-list');
+            if (!list) return;
+            list.innerHTML = '';
+            awLnAddresses.forEach((entry, i) => {
+                const row = document.createElement('div');
+                row.className = 'ln-address-row';
+                row.style.cssText = 'display:flex; align-items:center; gap:0.4rem; margin-bottom:0.4rem;';
+
+                const prio = document.createElement('span');
+                prio.textContent = (i + 1) + '.';
+                prio.style.cssText = 'min-width:1.4rem; text-align:right; opacity:0.7; font-size:0.85rem;';
+                row.appendChild(prio);
+
+                const input = document.createElement('input');
+                input.type = 'text';
+                input.className = 'form-input ln-address-input';
+                input.placeholder = 'user@wallet.com';
+                input.value = entry.address || '';
+                input.style.flex = '1';
+                // Editing invalidates the cached probe result for that row.
+                input.addEventListener('input', () => {
+                    if (awLnAddresses[i]) awLnAddresses[i].lud21Support = null;
+                    const hintEl = row.querySelector('.ln-address-hint');
+                    if (hintEl) hintEl.style.display = 'none';
+                });
+                row.appendChild(input);
+
+                const mkBtn = (label, title, handler, disabled) => {
+                    const b = document.createElement('button');
+                    b.type = 'button';
+                    b.className = 'btn btn-secondary';
+                    b.textContent = label;
+                    b.title = title;
+                    b.style.cssText = 'padding:0.3rem 0.55rem; line-height:1;';
+                    if (disabled) { b.disabled = true; b.style.opacity = '0.4'; }
+                    else b.addEventListener('click', handler);
+                    return b;
+                };
+                row.appendChild(mkBtn('↑', 'Move up', () => moveLnAddressRow(i, -1), i === 0));
+                row.appendChild(mkBtn('↓', 'Move down', () => moveLnAddressRow(i, 1), i === awLnAddresses.length - 1));
+                row.appendChild(mkBtn('✕', 'Remove', () => removeLnAddressRow(i), false));
+
+                list.appendChild(row);
+
+                // Per-row LUD-21 hint, shown beneath the input.
+                const hint = lud21HintFor(entry.lud21Support);
+                const hintEl = document.createElement('p');
+                hintEl.className = 'form-help ln-address-hint';
+                hintEl.style.cssText = 'margin:0 0 0.5rem 1.8rem;';
+                if (hint) {
+                    hintEl.textContent = hint.text;
+                    hintEl.style.color = hint.cls === 'warn'
+                        ? 'var(--warning, #b07b00)' : 'var(--success, #2d7a3a)';
+                } else {
+                    hintEl.style.display = 'none';
+                }
+                list.appendChild(hintEl);
+            });
+        }
+
+        // Kept for callers that refresh the chain display after a mode change.
+        // Preserve any unsaved edits already typed into the rows before redrawing.
+        function renderLud21Warning() {
+            const list = document.getElementById('auto-melt-address-list');
+            if (list && list.querySelectorAll('input.ln-address-input').length === awLnAddresses.length) {
+                syncLnAddressesFromInputs();
+            }
+            renderLnAddressRows();
         }
 
         /**

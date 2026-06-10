@@ -34,6 +34,7 @@ fresh_db();
 require_once dirname(__DIR__, 2) . '/includes/lnurl_receive.php';
 require_once dirname(__DIR__, 2) . '/includes/invoice.php';
 require_once dirname(__DIR__, 2) . '/includes/dev_fee.php';
+require_once dirname(__DIR__, 2) . '/includes/store_ln_addresses.php';
 
 // Anchor fee tracking to the start so test-inserted "paid" invoices count.
 Config::set('fee_tracking_start_at', 0);
@@ -133,8 +134,8 @@ try {
     make_store($store1, $mintStub);
     Database::update('stores', [
         'auto_melt_enabled' => 1,
-        'auto_melt_address' => 'merchant@example.test',
     ], 'id = ?', [$store1]);
+    StoreLnAddresses::replaceForStore($store1, ['merchant@example.test']);
 
     reset_callbacks($serverDir);
     $inv = Invoice::create($store1, ['amount' => 5000, 'currency' => 'sat']);
@@ -149,8 +150,8 @@ try {
     make_store($store2, $mintStub);
     Database::update('stores', [
         'auto_melt_enabled' => 0,
-        'auto_melt_address' => 'merchant@example.test',
     ], 'id = ?', [$store2]);
+    StoreLnAddresses::replaceForStore($store2, ['merchant@example.test']);
 
     reset_callbacks($serverDir);
     $threw = false;
@@ -171,8 +172,8 @@ try {
     make_store($store3, $mintStub);
     Database::update('stores', [
         'auto_melt_enabled' => 1,
-        'auto_melt_address' => 'merchant@example.test',
     ], 'id = ?', [$store3]);
+    StoreLnAddresses::replaceForStore($store3, ['merchant@example.test']);
     paid_invoice($store3, 1_000_000);
 
     $owed = DevFee::computeOwed($store3);
@@ -206,8 +207,8 @@ try {
     make_store($store4, $mintStub);
     Database::update('stores', [
         'auto_melt_enabled' => 1,
-        'auto_melt_address' => 'merchant@example.test',
     ], 'id = ?', [$store4]);
+    StoreLnAddresses::replaceForStore($store4, ['merchant@example.test']);
 
     reset_callbacks($serverDir);
     $threw = false;

@@ -227,9 +227,10 @@ HTACCESS;
             exchange_fee_percent REAL NOT NULL DEFAULT 0,
             price_provider_primary TEXT NOT NULL DEFAULT 'coingecko',
             price_provider_secondary TEXT DEFAULT 'binance',
-            -- Auto-withdraw settings (per-store)
+            -- Auto-withdraw settings (per-store). The ordered list of Lightning
+            -- addresses (with priority/fallback) lives in store_ln_addresses;
+            -- there is intentionally no auto_melt_address column here.
             auto_melt_enabled INTEGER NOT NULL DEFAULT 0,
-            auto_melt_address TEXT,
             auto_melt_threshold INTEGER NOT NULL DEFAULT 2000,
             -- Default display/input currency for the merchant UI (sat or fiat code)
             default_currency TEXT NOT NULL DEFAULT 'sat',
@@ -970,6 +971,68 @@ HTACCESS;
             $pdo->exec(
                 "CREATE INDEX idx_invoices_lnaddress_pending ON invoices(status, payment_rail)"
             );
+        }
+
+        // Ordered, multi-address Lightning-address fallback. Replaces the single
+        // stores.auto_melt_address column: a merchant can list several addresses
+        // tried in priority order (position ASC) for both receiving (LNURL
+        // direct-receive invoice presentation) and withdrawing (auto-melt). The
+        // per-address supports_verify mirrors the old stores.lnurl_supports_verify
+        // cache (NULL=unknown, 0=no LUD-21 verify URL, 1=present).
+        if (!self::tableExists($pdo, 'store_ln_addresses')) {
+            $pdo->exec("
+                CREATE TABLE store_ln_addresses (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    store_id TEXT NOT NULL,
+                    position INTEGER NOT NULL,
+                    address TEXT NOT NULL,
+                    supports_verify INTEGER DEFAULT NULL,
+                    FOREIGN KEY (store_id) REFERENCES stores(id) ON DELETE CASCADE
+                );
+            ");
+        }
+        if (!self::indexExists($pdo, 'idx_store_ln_addresses_pos')) {
+            $pdo->exec("CREATE UNIQUE INDEX idx_store_ln_addresses_pos ON store_ln_addresses(store_id, position);");
+        }
+        if (!self::indexExists($pdo, 'idx_store_ln_addresses_addr')) {
+            $pdo->exec("CREATE UNIQUE INDEX idx_store_ln_addresses_addr ON store_ln_addresses(store_id, address);");
+        }
+        // Backfill the existing single address into position 0 before the
+        // legacy columns are dropped below. Guarded on columnExists so it only
+        // runs on databases upgrading from the single-address schema, and skips
+        // stores that already have rows (idempotent re-runs).
+        if (self::columnExists($pdo, 'stores', 'auto_melt_address')) {
+            $hasVerifyCol = self::columnExists($pdo, 'stores', 'lnurl_supports_verify');
+            $verifySelect = $hasVerifyCol ? 'lnurl_supports_verify' : 'NULL AS lnurl_supports_verify';
+            $rows = $pdo->query(
+                "SELECT id, auto_melt_address, {$verifySelect}
+                   FROM stores
+                  WHERE auto_melt_address IS NOT NULL AND auto_melt_address != ''"
+            )->fetchAll(\PDO::FETCH_ASSOC);
+            $ins = $pdo->prepare(
+                "INSERT OR IGNORE INTO store_ln_addresses (store_id, position, address, supports_verify)
+                 VALUES (?, 0, ?, ?)"
+            );
+            foreach ($rows as $row) {
+                $verify = $row['lnurl_supports_verify'];
+                $ins->execute([
+                    $row['id'],
+                    $row['auto_melt_address'],
+                    $verify === null ? null : (int)$verify,
+                ]);
+            }
+        }
+        // Drop the now-superseded single-address columns. SQLite 3.35+ supports
+        // ALTER TABLE DROP COLUMN; on older engines this throws — we tolerate
+        // that (the columns simply linger unused, since no code reads them).
+        foreach (['auto_melt_address', 'lnurl_supports_verify'] as $deadCol) {
+            if (self::columnExists($pdo, 'stores', $deadCol)) {
+                try {
+                    $pdo->exec("ALTER TABLE stores DROP COLUMN {$deadCol}");
+                } catch (\Throwable $e) {
+                    error_log("[migration] could not drop stores.{$deadCol} (old SQLite?); leaving unused: " . $e->getMessage());
+                }
+            }
         }
 
         // Drop the legacy users.pin_hash column (PIN feature removed). Uses
