@@ -571,6 +571,7 @@ class Invoice {
         // Fire appropriate webhook
         $eventType = match ($status) {
             'Processing' => 'InvoiceProcessing',
+            'Provisional' => 'InvoiceProvisional',
             'Settled' => 'InvoiceSettled',
             'Expired' => 'InvoiceExpired',
             'Invalid' => 'InvoiceInvalid',

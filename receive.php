@@ -13,12 +13,15 @@ require_once __DIR__ . '/includes/config.php';
 require_once __DIR__ . '/includes/auth.php';
 require_once __DIR__ . '/includes/urls.php';
 require_once __DIR__ . '/includes/rates.php';
+require_once __DIR__ . '/includes/invoice.php';
+require_once __DIR__ . '/includes/offline_cashu.php';
 require_once __DIR__ . '/cashu-wallet-php/CashuWallet.php';
 
 use Cashu\Wallet;
 use Cashu\PaymentRequest;
 use Cashu\Transport;
 use Cashu\TokenSerializer;
+use Cashu\CashuNetworkException;
 
 // Initialize database
 if (!Database::isInitialized()) {
@@ -78,10 +81,41 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         exit;
     }
 
+    // A presented token may correlate to an invoice via the request id — the
+    // Cashu request page OR the admin "Request Payment" modal. We settle that
+    // invoice by Cashu regardless of the rail it was originally created for.
+    $existingInvoice = null;
+    if ($requestId) {
+        $maybe = Invoice::getById($requestId);
+        if ($maybe && $maybe['store_id'] === $storeId
+            && in_array($maybe['status'], ['New', 'Provisional'], true)) {
+            $existingInvoice = $maybe;
+        }
+    }
+
+    $unit = Config::getStoreMintUnit($storeId);
+
+    // When paying a specific invoice, the token must cover its amount. Check the
+    // token's face value up-front (before any irreversible swap).
+    if ($existingInvoice !== null && !empty($existingInvoice['amount_sats'])) {
+        try {
+            $faceAmount = (int)(new Wallet(Config::getStoreMintUrl($storeId), $unit))
+                ->deserializeToken($tokenString)->getAmount();
+            if ($faceAmount < (int)$existingInvoice['amount_sats']) {
+                http_response_code(400);
+                echo json_encode(['error' => "Token amount ($faceAmount) is less than the invoice amount ({$existingInvoice['amount_sats']})"]);
+                exit;
+            }
+        } catch (Exception $e) {
+            http_response_code(400);
+            echo json_encode(['error' => 'Could not read token: ' . $e->getMessage()]);
+            exit;
+        }
+    }
+
     try {
         // Initialize wallet with store's configuration
         $mintUrl = Config::getStoreMintUrl($storeId);
-        $unit = Config::getStoreMintUnit($storeId);
         $seed = Config::getStoreSeedPhrase($storeId);
         $dbPath = Database::getDbPath();
 
@@ -89,23 +123,55 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $wallet->loadMint();
         $wallet->initFromMnemonic($seed);
 
-        // Receive the token
+        // Online path: swap the token at the mint immediately (no double-spend
+        // risk) and record a Settled cashu invoice.
         $proofs = $wallet->receive($tokenString);
         $amount = Wallet::sumProofs($proofs);
 
-        // Log the receipt if we have a request ID
-        if ($requestId) {
-            error_log("Payment received for request $requestId: $amount $unit");
-        }
+        $invoice = OfflineCashu::recordOnlineReceipt($storeId, (int)$amount, $mintUrl, $existingInvoice);
 
         echo json_encode([
             'success' => true,
+            'settlement' => 'online',
             'amount' => $amount,
             'unit' => $unit,
-            'proofs_count' => count($proofs)
+            'proofs_count' => count($proofs),
+            'invoice_id' => $invoice['id'] ?? null,
         ]);
 
+    } catch (CashuNetworkException $netEx) {
+        // The mint is unreachable. If the store has opted into offline
+        // acceptance, verify the token offline (NUT-12 DLEQ) and record it as a
+        // Provisional invoice to reconcile on reconnect. Otherwise surface the
+        // outage as an error (unchanged behavior).
+        if (!OfflineCashu::isEnabled($storeId)) {
+            http_response_code(503);
+            echo json_encode(['error' => 'Mint is currently unreachable. Please try again shortly.']);
+            exit;
+        }
+
+        $result = OfflineCashu::acceptOffline($storeId, $tokenString, ['invoice' => $existingInvoice]);
+        if ($result['ok']) {
+            echo json_encode([
+                'success' => true,
+                'settlement' => 'offline_provisional',
+                'amount' => $result['amount'],
+                'unit' => $unit,
+                'invoice_id' => $result['invoice']['id'] ?? null,
+                'warning' => 'Accepted OFFLINE — the mint was unreachable so this payment is '
+                    . 'provisional and not yet settled. It will be confirmed automatically when '
+                    . 'connectivity is restored. There is a small double-spend risk until then.',
+            ]);
+        } else {
+            http_response_code(400);
+            echo json_encode([
+                'error' => 'Offline acceptance failed: ' . $result['reason'],
+                'settlement' => 'rejected',
+            ]);
+        }
     } catch (Exception $e) {
+        // Mint responded and rejected (already spent, wrong mint, etc.) or any
+        // other error: never accept these offline.
         http_response_code(400);
         echo json_encode(['error' => $e->getMessage()]);
     }
@@ -467,6 +533,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
                 <label>Memo (optional)</label>
                 <input type="text" name="memo" placeholder="Payment for...">
             </div>
+            <?php if (OfflineCashu::isEnabled($storeId) && OfflineCashu::perTxOverrideEnabled($storeId)): ?>
+            <div class="form-group">
+                <label style="display:flex; align-items:flex-start; gap:0.5rem; font-weight:400;">
+                    <input type="checkbox" name="allow_any_mint" value="1" style="margin-top:0.2rem;">
+                    <span style="font-size:0.85rem;">Allow payment from any mint
+                        <span style="display:block; font-size:0.75rem; color:#a0aec0;">For offline acceptance on this payment only, accept a token from any mint (ignore the allowlist).</span>
+                    </span>
+                </label>
+            </div>
+            <?php endif; ?>
             <button type="submit" class="btn">Generate Request</button>
         </form>
         <script>
@@ -494,13 +570,33 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
         $wallet->loadMint();
 
         $pr = $wallet->createHttpPaymentRequest($amount, $receiveUrl, $memo);
+
+        // Back the request with a 'New' cashu invoice so the POS screen can
+        // poll for the outcome (online-settled vs offline-provisional) and the
+        // received token attaches to a persistent ledger row. The NUT-18
+        // request id is set to the invoice id so the paying wallet echoes it
+        // back on POST.
+        $allowAnyMint = OfflineCashu::perTxOverrideEnabled($storeId)
+            && !empty($_GET['allow_any_mint']);
+        $cashuInvoiceId = OfflineCashu::createPendingCashuInvoice(
+            $storeId,
+            $amountRaw !== '' ? $amountRaw : (string)$amount,
+            $requestCurrency !== '' ? $requestCurrency : $unit,
+            (int)$amount,
+            is_string($memo) ? $memo : null,
+            3600,
+            $allowAnyMint
+        );
+        $pr->id = $cashuInvoiceId;
         $prString = $pr->serialize();
+        $offlineEnabled = OfflineCashu::isEnabled($storeId);
 
         // Return based on format
         if ($format === 'json') {
             header('Content-Type: application/json');
             echo json_encode([
                 'id' => $pr->id,
+                'invoice_id' => $cashuInvoiceId,
                 'amount' => $pr->amount,
                 'unit' => $pr->unit,
                 'memo' => $pr->memo,
@@ -575,6 +671,26 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
         }
         .btn:hover { background: rgba(255,255,255,0.15); }
         .status { margin-top: 1rem; font-size: 0.9rem; color: #a0aec0; }
+        .result-banner {
+            margin-top: 1.25rem;
+            padding: 1rem;
+            border-radius: 12px;
+            font-size: 0.9rem;
+            line-height: 1.4;
+            display: none;
+        }
+        .result-banner.show { display: block; }
+        .result-banner.settled {
+            background: rgba(72, 187, 120, 0.15);
+            border: 1px solid rgba(72, 187, 120, 0.5);
+            color: #9ae6b4;
+        }
+        .result-banner.provisional {
+            background: rgba(237, 137, 54, 0.15);
+            border: 1px solid rgba(237, 137, 54, 0.6);
+            color: #fbd38d;
+        }
+        .result-banner strong { display: block; margin-bottom: 0.35rem; font-size: 1rem; }
     </style>
 </head>
 <body>
@@ -592,10 +708,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
         <button class="btn" onclick="copyRequest()">Copy Request</button>
 
         <div class="status" id="status">Scan with a Cashu wallet to pay</div>
+        <div class="result-banner" id="result-banner"></div>
     </div>
 
     <script>
         const prString = <?= json_encode($prString) ?>;
+        const invoiceId = <?= json_encode($cashuInvoiceId) ?>;
+        const offlineEnabled = <?= $offlineEnabled ? 'true' : 'false' ?>;
 
         // Generate QR code
         if (typeof QRious !== 'undefined') {
@@ -622,6 +741,43 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
                     document.getElementById('status').textContent = 'Scan with a Cashu wallet to pay';
                 }, 2000);
             });
+        }
+
+        // Poll for the receipt outcome and surface a clear banner — especially
+        // the offline/provisional warning so the merchant understands the
+        // double-spend risk before handing over goods.
+        let pollTimer = null;
+        function showBanner(kind, title, body) {
+            const el = document.getElementById('result-banner');
+            el.className = 'result-banner show ' + kind;
+            el.innerHTML = '<strong>' + title + '</strong>' + body;
+            document.getElementById('status').style.display = 'none';
+        }
+        async function poll() {
+            try {
+                const res = await fetch('payment.php?id=' + encodeURIComponent(invoiceId) + '&json=1', { cache: 'no-store' });
+                if (!res.ok) return;
+                const data = await res.json();
+                if (data.status === 'Settled') {
+                    showBanner('settled', '✓ Payment received',
+                        'The token was swapped at the mint and the payment is settled.');
+                    if (pollTimer) clearInterval(pollTimer);
+                } else if (data.status === 'Provisional') {
+                    showBanner('provisional', '⚠ Accepted OFFLINE — not yet settled',
+                        'The mint was unreachable, so this payment was accepted on the strength of its '
+                        + 'offline signature only. It is <b>provisional</b> and will be confirmed '
+                        + 'automatically once the mint is reachable again. There is a small risk it could '
+                        + 'fail to settle (double-spend) until then — take this into account before '
+                        + 'handing over goods.');
+                    if (pollTimer) clearInterval(pollTimer);
+                } else if (data.status === 'Invalid' || data.status === 'Expired') {
+                    if (pollTimer) clearInterval(pollTimer);
+                }
+            } catch (e) { /* keep polling */ }
+        }
+        if (invoiceId) {
+            pollTimer = setInterval(poll, 2000);
+            poll();
         }
     </script>
 </body>
