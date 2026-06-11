@@ -10,6 +10,7 @@ require_once __DIR__ . '/includes/config.php';
 require_once __DIR__ . '/includes/invoice.php';
 require_once __DIR__ . '/includes/background.php';
 require_once __DIR__ . '/includes/urls.php';
+require_once __DIR__ . '/includes/cart.php';
 
 // Check setup
 if (!Database::isInitialized() || !Config::isSetupComplete()) {
@@ -198,20 +199,28 @@ $baseUrl = Config::getBaseUrl();
             flex-direction: column;
             align-items: center;
             justify-content: center;
-            padding: 1rem;
-            max-width: 480px;
-            margin: 0 auto;
+            padding: 0;
             width: 100%;
         }
 
         .payment-card {
             background: var(--bg-card);
-            border-radius: 24px;
             padding: 2rem;
             width: 100%;
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
             backdrop-filter: blur(20px);
-            border: 1px solid rgba(255, 255, 255, 0.1);
             text-align: center;
+        }
+
+        /* Keep the checkout content readable on wide screens while the card
+           itself fills the full viewport. */
+        .payment-card > * {
+            width: 100%;
+            max-width: 480px;
         }
 
         .logo {
@@ -681,6 +690,41 @@ $baseUrl = Config::getBaseUrl();
             ?>
             <div id="payment-pending" class="<?= $invoice['status'] !== 'New' ? 'hidden' : '' ?>">
                 <div class="amount"><?= htmlspecialchars($displayAmount) ?></div>
+
+                <?php
+                // Itemized cart breakdown (when this invoice came from the cart
+                // checkout). Each line shows sats with the store-currency
+                // equivalent in parentheses, per the store's display currency.
+                $lineItems = Cart::getItems($invoice['id']);
+                if (!empty($lineItems)):
+                ?>
+                <div style="margin:0 0 1rem 0; text-align:left; border:1px solid rgba(0,0,0,0.08); border-radius:12px; overflow:hidden;">
+                    <?php foreach ($lineItems as $li):
+                        $itype = (string)($li['image_type'] ?? 'none');
+                        $ival = (string)($li['image_value'] ?? '');
+                        $paren = (!empty($li['display_amount']) && strtoupper((string)$li['display_currency']) !== 'SAT')
+                            ? ' (' . htmlspecialchars($li['display_amount']) . ' ' . htmlspecialchars(strtoupper((string)$li['display_currency'])) . ')'
+                            : '';
+                    ?>
+                    <div style="display:flex; align-items:center; gap:0.6rem; padding:0.55rem 0.7rem; border-bottom:1px solid rgba(0,0,0,0.06);">
+                        <div style="width:38px; height:38px; border-radius:8px; background:rgba(0,0,0,0.06); display:flex; align-items:center; justify-content:center; font-size:1.3rem; overflow:hidden; flex-shrink:0;"><?php
+                            if ($itype === 'upload' && $ival !== '') {
+                                echo '<img src="' . htmlspecialchars(Product::imageUrl($ival)) . '" alt="" style="width:100%;height:100%;object-fit:cover;">';
+                            } elseif ($itype === 'emoji' && $ival !== '') {
+                                echo htmlspecialchars($ival);
+                            } else {
+                                echo "\u{1F4E6}";
+                            }
+                        ?></div>
+                        <div style="flex:1; min-width:0;">
+                            <div style="font-weight:600; font-size:0.92rem;"><?= htmlspecialchars($li['title']) ?></div>
+                            <div style="font-size:0.8rem; color:#666;">&times;<?= (int)$li['quantity'] ?></div>
+                        </div>
+                        <div style="text-align:right; font-size:0.85rem; white-space:nowrap;"><?= number_format((int)$li['amount_sats']) ?> sats<span style="color:#666;"><?= $paren ?></span></div>
+                    </div>
+                    <?php endforeach; ?>
+                </div>
+                <?php endif; ?>
 
                 <div class="status-badge new">
                     <div class="spinner"></div>

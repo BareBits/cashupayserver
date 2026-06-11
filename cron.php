@@ -24,6 +24,7 @@ require_once __DIR__ . '/includes/onchain/payments.php';
 require_once __DIR__ . '/includes/swap/poller.php';
 require_once __DIR__ . '/includes/swap/auto_melt.php';
 require_once __DIR__ . '/includes/offline_cashu.php';
+require_once __DIR__ . '/includes/cart.php';
 require_once __DIR__ . '/includes/trusted_mints.php';
 require_once __DIR__ . '/includes/updater.php';
 require_once __DIR__ . '/includes/notification_sender.php';
@@ -461,6 +462,16 @@ if (!$swapOnly && !$skipNonEssential) try {
     $results['tasks']['notifications'] = "sent: {$drain['sent']}, failed: {$drain['failed']}";
 } catch (Throwable $e) {
     $results['tasks']['notifications'] = 'error: ' . $e->getMessage();
+}
+
+// Task 14: Reconcile product purchase counts. Settlement happens on several
+// rails with no shared choke-point, so we sweep here: every Settled cart
+// invoice not yet counted bumps its products' purchase_count exactly once.
+if (!$swapOnly && !$skipNonEssential) try {
+    $reconciled = Cart::reconcileSettledCounts();
+    $results['tasks']['cart_counts'] = "counted: {$reconciled}";
+} catch (Throwable $e) {
+    $results['tasks']['cart_counts'] = 'error: ' . $e->getMessage();
 }
 
 echo json_encode($results, JSON_PRETTY_PRINT);
