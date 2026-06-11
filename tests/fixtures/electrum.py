@@ -190,6 +190,39 @@ def start_electrum(workdir: Path, fulcrum: FulcrumHandle) -> ElectrumHandle:
     return handle
 
 
+def electrum_wait_synced(
+    handle: ElectrumHandle,
+    bitcoind: BitcoindHandle,
+    timeout: float = 60.0,
+) -> None:
+    """Block until Electrum has caught up to bitcoind's current chain tip.
+
+    Spending before the wallet has verified the blocks that confirm its own
+    funding/change UTXOs is what produces Electrum's "this transaction builds
+    on top of a local tx" / bitcoind's `bad-txns-inputs-missingorspent` errors:
+    `payto` picks a change output the wallet still treats as an unconfirmed
+    local tx, so the broadcast references inputs bitcoind doesn't have. Waiting
+    for the verified height to reach the tip closes that race (and tolerates a
+    slow Fulcrum sync under heavy machine load). Best-effort: returns when the
+    deadline lapses so the caller's retry can still take over.
+    """
+    target = bitcoind.block_count()
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            info = handle.cli("getinfo", expect_json=True)
+        except Exception:
+            info = {}
+        height = max(
+            int(info.get("blockchain_height") or 0),
+            int(info.get("server_height") or 0),
+        )
+        # `connected` flips False mid-sync; only trust a matched height.
+        if height >= target:
+            return
+        time.sleep(0.4)
+
+
 def electrum_send_onchain(
     handle: ElectrumHandle,
     bitcoind: BitcoindHandle,
@@ -206,23 +239,55 @@ def electrum_send_onchain(
     Used by the static-address iterate flow: the merchant has a single
     Bitcoin address and the customer (this Electrum wallet) pays the exact
     tweaked total for each invoice.
+
+    Retries across a sync barrier: under load Electrum can momentarily try to
+    spend an unconfirmed local parent (see electrum_wait_synced), which bitcoind
+    rejects. We wait for sync, and on a transient rejection mine + re-sync and
+    retry rather than aborting the whole iterate launch.
     """
     btc = f"{amount_sat / 100_000_000:.8f}"
-    # `payto` returns a complete serialized transaction (hex). It signs
-    # with the wallet's keys since the wallet is unencrypted in the
-    # iterate flow (no --password).
-    tx_hex = handle.cli(
-        "payto", address, btc,
-        f"--feerate={feerate_sat_per_vb}",
-    ).strip()
-    # Strip any leading/trailing whitespace and quotes — older Electrum
-    # versions wrap the hex in quotes.
-    tx_hex = tx_hex.strip('"').strip("'")
-    txid = handle.cli("broadcast", tx_hex).strip()
-    txid = txid.strip('"').strip("'")
-    if confirmations > 0:
-        bitcoind.mine(confirmations)
-    return txid
+    transient = (
+        "missingorspent",
+        "local transaction",
+        "builds on top",
+        "unconfirmed",
+        "not enough funds",
+        "txn-mempool-conflict",
+        "bad-txns-inputs",
+    )
+    last_err: Exception | None = None
+    for attempt in range(5):
+        electrum_wait_synced(handle, bitcoind)
+        try:
+            # `payto` returns a complete serialized transaction (hex). It signs
+            # with the wallet's keys since the wallet is unencrypted in the
+            # iterate flow (no --password).
+            tx_hex = handle.cli(
+                "payto", address, btc,
+                f"--feerate={feerate_sat_per_vb}",
+            ).strip()
+            # Strip any leading/trailing whitespace and quotes — older Electrum
+            # versions wrap the hex in quotes.
+            tx_hex = tx_hex.strip('"').strip("'")
+            txid = handle.cli("broadcast", tx_hex).strip()
+            txid = txid.strip('"').strip("'")
+            if confirmations > 0:
+                bitcoind.mine(confirmations)
+            return txid
+        except RuntimeError as e:
+            last_err = e
+            if attempt < 4 and any(k in str(e).lower() for k in transient):
+                # Confirm whatever is pending + give Electrum a moment to verify
+                # the new tip, then retry from a fully-synced state.
+                try:
+                    bitcoind.mine(1)
+                except Exception:
+                    pass
+                time.sleep(1.0)
+                continue
+            raise
+    assert last_err is not None
+    raise last_err
 
 
 def fund_electrum_from_bitcoind(
@@ -287,6 +352,10 @@ def open_electrum_channel_to_lnd(
         except RuntimeError:
             channels = []
         if any((c.get("state") or "").upper() in ("OPEN", "OPENING_DONE", "FUNDED") for c in channels):
+            # Make sure the wallet has verified the funding block before the
+            # caller spends the change output (avoids the "builds on a local
+            # tx" race in the static-address payments that follow).
+            electrum_wait_synced(handle, bitcoind)
             return channel_point
         time.sleep(1)
     raise TimeoutError(f"Electrum channel to {lnd_pubkey[:16]} did not open within 60s")

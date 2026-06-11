@@ -100,7 +100,7 @@ class Database {
             // that migration ran — getInstance() will then trigger runMigrations()
             // on existing installs that haven't yet picked it up. All migrations
             // are idempotent, so a fire is safe.
-            $hasLatestMigration = $hasConfig && self::columnExists(self::$instance, 'invoices', 'cashu_offline_allow_any_mint');
+            $hasLatestMigration = $hasConfig && self::columnExists(self::$instance, 'stores', 'product_sort');
 
             if ($hasConfig && (!$hasUsers || !$hasReliability || !$hasLatestMigration)) {
                 if (!$hasUsers) {
@@ -1134,6 +1134,74 @@ HTACCESS;
                 ALTER TABLE users_new RENAME TO users;
                 COMMIT;
             ");
+        }
+
+        // ---- Product catalog + shopping cart ----
+        // Products are per-store. Price is stored as a decimal string in the
+        // product's own `currency` (a snapshot of the store's display currency
+        // at creation: 'sat' or a fiat code). Mixed-currency products in one
+        // store/cart are fine — everything converts to sats at checkout.
+        if (!self::tableExists($pdo, 'products')) {
+            $pdo->exec("
+                CREATE TABLE products (
+                    id TEXT PRIMARY KEY,
+                    store_id TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    price TEXT NOT NULL,
+                    currency TEXT NOT NULL,
+                    image_type TEXT NOT NULL DEFAULT 'none',  -- 'none' | 'emoji' | 'upload'
+                    image_value TEXT,                         -- emoji grapheme or uploaded filename
+                    purchase_count INTEGER NOT NULL DEFAULT 0,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    FOREIGN KEY (store_id) REFERENCES stores(id) ON DELETE CASCADE
+                );
+            ");
+            $pdo->exec("CREATE INDEX idx_products_store ON products(store_id);");
+        }
+
+        // Per-invoice cart line items. product_id is nullable: custom line
+        // items have none, and a deleted product nulls it (SET NULL) while the
+        // snapshot title/price survive for the receipt. amount_sats is the
+        // line total in sats at checkout; display_amount/currency snapshot the
+        // store-currency equivalent shown in parentheses on the checkout page.
+        if (!self::tableExists($pdo, 'invoice_items')) {
+            $pdo->exec("
+                CREATE TABLE invoice_items (
+                    id TEXT PRIMARY KEY,
+                    invoice_id TEXT NOT NULL,
+                    store_id TEXT NOT NULL,
+                    product_id TEXT,
+                    title TEXT NOT NULL,
+                    unit_price TEXT NOT NULL,
+                    unit_currency TEXT NOT NULL,
+                    quantity INTEGER NOT NULL,
+                    amount_sats INTEGER NOT NULL,
+                    display_amount TEXT,
+                    display_currency TEXT,
+                    image_type TEXT,
+                    image_value TEXT,
+                    created_at INTEGER NOT NULL,
+                    FOREIGN KEY (invoice_id) REFERENCES invoices(id) ON DELETE CASCADE,
+                    FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE SET NULL
+                );
+            ");
+            $pdo->exec("CREATE INDEX idx_invoice_items_invoice ON invoice_items(invoice_id);");
+            $pdo->exec("CREATE INDEX idx_invoice_items_product ON invoice_items(product_id);");
+        }
+
+        // Per-store default sort for the product catalog in the request modal.
+        if (!self::columnExists($pdo, 'stores', 'product_sort')) {
+            $pdo->exec("ALTER TABLE stores ADD COLUMN product_sort TEXT NOT NULL DEFAULT 'most_purchased'");
+        }
+
+        // Idempotency flag for the settle-time purchase-count reconciliation
+        // (see Cart::reconcileSettledCounts). Settlement happens on several
+        // rails that don't share a choke-point, so we reconcile from cron and
+        // mark each cart invoice counted exactly once here.
+        if (!self::columnExists($pdo, 'invoices', 'cart_purchase_counted')) {
+            $pdo->exec("ALTER TABLE invoices ADD COLUMN cart_purchase_counted INTEGER NOT NULL DEFAULT 0");
         }
     }
 
