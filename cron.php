@@ -432,13 +432,23 @@ if (!$swapOnly && !$skipNonEssential) try {
     $results['tasks']['ipgeo'] = 'error: ' . $e->getMessage();
 }
 
-// Task 12: Auto-update check. Daily, no-op in WordPress mode. Skipped on
+// Task 12: Auto-update trigger. Daily, no-op in WordPress mode. Skipped on
 // internal background self-requests so checkout traffic doesn't trigger
-// a download — only the dedicated cron tick checks for updates.
+// a download — only the dedicated cron tick nudges the updater.
+//
+// This is the FALLBACK trigger for installs that only wired up the single
+// cron line. The crash-isolated work happens in the standalone update.php
+// endpoint (see its header) — we just fire a non-blocking self-request to it
+// rather than running the update inline here. Running it inline would defeat
+// the isolation: a bad update that fatals one of the heavy require_once's at
+// the top of THIS file would stop the updater from ever recovering. Operators
+// who want maximum resilience should also add the dedicated update.php cron
+// line (see user_config.example.php); that path runs even when cron.php's
+// bootstrap is broken.
 if (!$isInternal && !$swapOnly) {
     try {
-        $applied = Updater::checkAndApply();
-        $results['tasks']['updater'] = $applied ? 'update applied' : 'no update';
+        Updater::triggerSelfCheck();
+        $results['tasks']['updater'] = 'triggered';
     } catch (Throwable $e) {
         $results['tasks']['updater'] = 'error: ' . $e->getMessage();
     }

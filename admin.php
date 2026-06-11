@@ -325,15 +325,38 @@ if (isset($_GET['api'])) {
             $info = Updater::getLocalBuildInfo();
             $last = Config::get('updater_last_update');
             $dismissed = (bool)Config::get('updater_banner_dismissed', true);
+            // Recommended dedicated cron line for the isolated updater. Built
+            // here (admin-only) so the operator can copy it straight from the
+            // Auto-update card. Key travels via the X-CRON-KEY header, same as
+            // the main cron line, so it doesn't leak through access logs.
+            $updKey = Config::get('cron_key');
+            $updUrl = rtrim(Config::getBaseUrl(), '/') . '/update.php';
+            $recommendedCron = $updKey
+                ? "*/15 * * * * curl -fsS -H 'X-CRON-KEY: " . $updKey . "' " . $updUrl . ' > /dev/null'
+                : null;
             echo json_encode([
                 'channel' => Updater::getChannel(),
+                'recommended_cron' => $recommendedCron,
                 'current_version' => $info['VERSION'] ?? CASHUPAY_VERSION,
                 'current_sha' => $info['COMMIT_SHA'] ?? '',
                 'last_update' => $last,
                 'banner_dismissed' => $dismissed,
                 'backups' => Updater::listBackups(),
                 'htaccess_new_exists' => is_file(__DIR__ . '/.htaccess.new'),
+                // Crash-recovery state surfaced by the isolated updater:
+                // a build that failed its post-update health check is rolled
+                // back automatically and its SHA parked here.
+                'last_auto_rollback' => Config::get('updater_last_auto_rollback'),
+                'auto_rollback_dismissed' => (bool)Config::get('updater_auto_rollback_dismissed', true),
+                'blocked_shas' => Updater::getBlockedShas(),
+                'pending_verify' => Updater::getPendingVerify(),
             ]);
+            break;
+
+        case 'dismiss_auto_rollback':
+            Auth::requireAdmin();
+            Config::set('updater_auto_rollback_dismissed', true);
+            echo json_encode(['success' => true]);
             break;
 
         case 'invoices':
@@ -4703,11 +4726,14 @@ $adminView = $rawAdminView;
 
                 <!--
                     Auto-update — channel selector + last-update info + rollback.
-                    The cron tick (Task 12 in cron.php) fetches the latest
-                    cashupayserver.zip built by CI for the chosen channel and
-                    overlays it on the install. data/ and user_config.php are
-                    preserved. .htaccess is only overwritten if untouched.
-                    Skipped entirely in WordPress mode.
+                    The isolated update.php endpoint (nudged by Task 12 in
+                    cron.php, and by the optional dedicated cron line) fetches
+                    the latest cashupayserver.zip built by CI for the chosen
+                    channel and overlays it on the install. data/ and
+                    user_config.php are preserved. .htaccess is only overwritten
+                    if untouched. After applying, it probes health.php and
+                    auto-rolls-back any build that fails to boot. Skipped
+                    entirely in WordPress mode.
                 -->
                 <div class="card collapsible" data-admin-only="true" id="card-auto-update">
                     <div class="card-header">
@@ -4715,9 +4741,10 @@ $adminView = $rawAdminView;
                     </div>
                     <div class="card-body">
                         <p style="font-size: 0.85rem; color: var(--text-secondary); margin: 0 0 0.75rem 0;">
-                            Daily check against GitHub. Updates apply automatically. data/ and
-                            user_config.php are preserved. Backups of the last 3 versions are kept
-                            under data/updates/backup/.
+                            Daily check against GitHub. Updates apply automatically, then a health
+                            check verifies the new build boots — a broken update is rolled back on
+                            its own. data/ and user_config.php are preserved. Backups of the last 3
+                            versions are kept under data/updates/backup/.
                         </p>
                         <div class="form-group">
                             <label class="form-label">Current version</label>
@@ -4732,6 +4759,13 @@ $adminView = $rawAdminView;
                             <p class="form-help">Override the value set in user_config.php.</p>
                         </div>
                         <button class="btn btn-full" id="btn-save-update-channel" style="margin-bottom: 0.5rem;">Save channel</button>
+                        <div id="auto-update-rollback-warning" class="hidden" style="background: rgba(239,68,68,0.15); border: 1px solid rgba(239,68,68,0.45); padding: 0.6rem; border-radius: 6px; font-size: 0.85rem; margin-bottom: 0.5rem;">
+                            <strong>An update was automatically rolled back.</strong>
+                            <span id="auto-update-rollback-detail"></span>
+                            The failing build was blocked and will not be re-applied; updates resume
+                            when the channel ships a different build.
+                            <button class="btn btn-secondary" id="btn-dismiss-auto-rollback" style="margin-top: 0.5rem; font-size: 0.8rem; padding: 0.3rem 0.7rem;">Dismiss</button>
+                        </div>
                         <div id="auto-update-htaccess-warning" class="hidden" style="background: rgba(247,147,26,0.15); border: 1px solid rgba(247,147,26,0.4); padding: 0.6rem; border-radius: 6px; font-size: 0.85rem; margin-bottom: 0.5rem;">
                             A new .htaccess shipped with the latest update, but your live
                             .htaccess was edited — it was left untouched. The new version is
@@ -4739,6 +4773,16 @@ $adminView = $rawAdminView;
                         </div>
                         <button class="btn btn-secondary btn-full" id="btn-rollback-update" style="margin-bottom: 0.25rem;">Roll back to previous version</button>
                         <p class="form-help" id="auto-update-rollback-help">Restores the most recent backup. Disabled if no backup is available.</p>
+                        <div class="form-group" style="margin-top: 1rem;">
+                            <label class="form-label">Dedicated updater cron line (recommended)</label>
+                            <code id="auto-update-cron-line" style="display: block; background: rgba(0,0,0,0.2); padding: 0.6rem; border-radius: 8px; font-size: 0.8rem; word-break: break-all; user-select: all;">Loading…</code>
+                            <p class="form-help">
+                                Optional but recommended: a second cron line that hits the isolated
+                                update.php directly, so updates keep working even if a bad build
+                                crashes the main app. The main cron line already nudges it as a
+                                fallback. Harmless until you enable auto-update.
+                            </p>
+                        </div>
                     </div>
                 </div>
                 <?php endif; ?>
@@ -5729,6 +5773,8 @@ $adminView = $rawAdminView;
             if (saveChannelBtn) saveChannelBtn.addEventListener('click', saveUpdateChannel);
             const rollbackBtn = document.getElementById('btn-rollback-update');
             if (rollbackBtn) rollbackBtn.addEventListener('click', rollbackUpdate);
+            const dismissAutoRbBtn = document.getElementById('btn-dismiss-auto-rollback');
+            if (dismissAutoRbBtn) dismissAutoRbBtn.addEventListener('click', dismissAutoRollback);
             const dismissCronBtn = document.getElementById('btn-dismiss-cron-stale');
             if (dismissCronBtn) dismissCronBtn.addEventListener('click', dismissCronStaleBanner);
             document.getElementById('btn-logout').addEventListener('click', logout);
@@ -9945,6 +9991,29 @@ $adminView = $rawAdminView;
                 } else {
                     warn.classList.add('hidden');
                 }
+                // Auto-rollback alert: a build failed its post-update health
+                // check and was reverted. Show until the admin dismisses it.
+                const rbWarn = document.getElementById('auto-update-rollback-warning');
+                const rbDetail = document.getElementById('auto-update-rollback-detail');
+                if (rbWarn && data.last_auto_rollback && !data.auto_rollback_dismissed) {
+                    const ar = data.last_auto_rollback;
+                    const badSha = ar.bad_sha ? (' ' + ar.bad_sha.slice(0, 12)) : '';
+                    const ver = ar.version ? (' ' + ar.version) : '';
+                    const failed = ar.rolled_back === false
+                        ? ' The automatic rollback FAILED — use recover.php to restore manually.'
+                        : '';
+                    if (rbDetail) {
+                        rbDetail.textContent = ' Build' + ver + badSha + ' crashed the install and was reverted to ' +
+                            (ar.backup || 'the previous version') + '.' + failed + ' ';
+                    }
+                    rbWarn.classList.remove('hidden');
+                } else if (rbWarn) {
+                    rbWarn.classList.add('hidden');
+                }
+                const cronLine = document.getElementById('auto-update-cron-line');
+                if (cronLine) {
+                    cronLine.textContent = data.recommended_cron || 'Unavailable (set up the main cron first).';
+                }
                 const hasBackup = Array.isArray(data.backups) && data.backups.length > 0;
                 if (rollbackBtn) rollbackBtn.disabled = !hasBackup;
                 if (rollbackHelp) {
@@ -9970,6 +10039,16 @@ $adminView = $rawAdminView;
             // Best-effort dismiss so we don't re-toast on every settings open.
             try {
                 fetch(adminUrl + '?action=dismiss_update_banner', { method: 'POST', credentials: 'same-origin' });
+            } catch (e) {}
+        }
+
+        async function dismissAutoRollback() {
+            const warn = document.getElementById('auto-update-rollback-warning');
+            if (warn) warn.classList.add('hidden');
+            try {
+                await fetch(adminUrl + '?action=dismiss_auto_rollback', {
+                    method: 'POST', credentials: 'same-origin',
+                });
             } catch (e) {}
         }
 
