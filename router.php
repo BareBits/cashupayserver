@@ -129,6 +129,25 @@ if (preg_match('#^/recover$#', $uri)) {
 }
 
 // -----------------------------------------------------------------------------
+// Update: /update — isolated, crash-resilient auto-update endpoint. Kept
+// routable in front-controller mode so the dedicated cron line works without
+// URL rewrites. See update.php for the full flow.
+// -----------------------------------------------------------------------------
+if (preg_match('#^/update$#', $uri)) {
+    require __DIR__ . '/update.php';
+    exit;
+}
+
+// -----------------------------------------------------------------------------
+// Health: /health — bootstrap probe used by the updater to verify an applied
+// update before keeping it.
+// -----------------------------------------------------------------------------
+if (preg_match('#^/health$#', $uri)) {
+    require __DIR__ . '/health.php';
+    exit;
+}
+
+// -----------------------------------------------------------------------------
 // Static assets: /assets/*
 // -----------------------------------------------------------------------------
 if (preg_match('#^/assets/#', $uri)) {
@@ -168,7 +187,7 @@ if ($uri === '/' || $uri === '') {
 // Direct .php file access (for backwards compatibility)
 // Only allow specific public files
 // -----------------------------------------------------------------------------
-$allowedFiles = ['index.php', 'admin.php', 'setup.php', 'payment.php', 'api.php', 'cron.php', 'receive.php', 'recover.php'];
+$allowedFiles = ['index.php', 'admin.php', 'setup.php', 'payment.php', 'api.php', 'cron.php', 'receive.php', 'recover.php', 'update.php', 'health.php'];
 $requestedFile = basename($uri);
 
 if (in_array($requestedFile, $allowedFiles)) {

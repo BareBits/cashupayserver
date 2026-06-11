@@ -99,6 +99,35 @@
 //
 // define('CASHUPAY_AUTO_UPDATE_ENABLED', true);
 
+// -----------------------------------------------------------------------------
+// RECOMMENDED: dedicated auto-update cron line
+// -----------------------------------------------------------------------------
+// The auto-updater runs in its own isolated endpoint, update.php, so a bad
+// update that crashes the main application code cannot stop the updater from
+// running, detecting the breakage, and rolling it back. The normal cron line
+// (curl .../cron.php) already nudges update.php as a fallback, but that nudge
+// is fired from cron.php — which loads the whole application first. If an
+// update breaks that bootstrap, cron.php can't run, and the fallback nudge
+// never fires.
+//
+// For maximum resilience, add a SECOND cron line that hits update.php directly.
+// It depends on almost nothing in includes/, so it keeps working even when the
+// main code is broken — pulling the next (fixed) build and/or rolling back the
+// broken one automatically. Run it more often than daily (e.g. every 15 min):
+// the update check itself self-throttles to once a day, but a freshly-applied
+// build's health re-check (and any pending rollback) happens on the next tick.
+//
+//   */15 * * * * curl -fsS -H "X-CRON-KEY: YOUR_CRON_KEY" https://your-domain.com/update.php > /dev/null
+//
+// Find YOUR_CRON_KEY the same place as the main cron line (Settings → Cron).
+// update.php is a no-op unless CASHUPAY_AUTO_UPDATE_ENABLED is set, so it's
+// harmless to add even before you opt in.
+//
+// After applying an update, update.php verifies it by fetching health.php
+// (also bundled). If the new build fails to boot, update.php restores the most
+// recent backup, blocks the broken build's commit so it is never re-applied,
+// and emails the address in the notification settings (Settings → Email).
+
 // =============================================================================
 // EMAIL NOTIFICATIONS — SMTP (optional)
 // =============================================================================

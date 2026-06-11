@@ -94,6 +94,18 @@ class Updater {
             return false;
         }
 
+        // Forward-failure guard: a SHA that previously broke the install (its
+        // post-update health check failed and it was auto-rolled-back) is
+        // parked in updater_blocked_shas. Never re-apply it — otherwise we'd
+        // loop apply -> crash -> rollback -> apply on every tick until the
+        // maintainer ships a different build. The block clears itself simply
+        // by the channel moving on to a new COMMIT_SHA.
+        $remoteSha = (string)($remote['COMMIT_SHA'] ?? '');
+        if ($remoteSha !== '' && in_array($remoteSha, self::getBlockedShas(), true)) {
+            self::log("remote SHA $remoteSha is blocked (failed a prior health check), skipping");
+            return false;
+        }
+
         // Take the lock — concurrent cron runs must not race.
         $lockPath = self::installRoot() . '/data/updates/.lock';
         self::ensureDir(dirname($lockPath));
@@ -352,6 +364,19 @@ class Updater {
         ]);
         Config::set('updater_banner_dismissed', false);
 
+        // Mark this build as "applied but not yet proven healthy". update.php
+        // probes health.php right after this returns and clears the marker on
+        // success; if the probe fails (or the process dies before clearing it)
+        // the next update.php run sees the marker, re-probes, and auto-rolls
+        // back to `backup` while parking `sha` in updater_blocked_shas.
+        Config::set('updater_pending_verify', [
+            'sha' => $sha,
+            'version' => $newVersion,
+            'from_version' => $oldVersion,
+            'backup' => basename($backupDir),
+            'applied_at' => time(),
+        ]);
+
         self::log("update applied: $oldVersion -> $newVersion ($channel)");
         return true;
     }
@@ -547,6 +572,75 @@ class Updater {
     public static function consumeRecoveryToken(): void {
         $path = self::installRoot() . '/data/updates/recovery_token.txt';
         @unlink($path);
+    }
+
+    // ---------------- Health-verify / blocked SHAs ----------------
+    //
+    // The orchestration around these (probe health.php, decide healthy vs
+    // broken, roll back) lives in the standalone update.php so it keeps
+    // working when a bad update breaks includes/. These accessors are the
+    // shared, canonical readers/writers for the config keys update.php and
+    // the admin UI both touch, so the two never drift on key names or shape.
+
+    /** SHAs whose post-update health check failed — never auto-applied again. */
+    public static function getBlockedShas(): array {
+        $v = Config::get('updater_blocked_shas', []);
+        if (!is_array($v)) {
+            return [];
+        }
+        return array_values(array_filter($v, 'is_string'));
+    }
+
+    public static function blockSha(string $sha): void {
+        if ($sha === '') {
+            return;
+        }
+        $list = self::getBlockedShas();
+        if (!in_array($sha, $list, true)) {
+            $list[] = $sha;
+            Config::set('updater_blocked_shas', $list);
+        }
+    }
+
+    /** The "applied but not yet proven healthy" marker, or null. */
+    public static function getPendingVerify(): ?array {
+        $v = Config::get('updater_pending_verify');
+        return is_array($v) ? $v : null;
+    }
+
+    public static function clearPendingVerify(): void {
+        Config::set('updater_pending_verify', null);
+    }
+
+    /**
+     * Fire-and-forget self-request to the isolated update.php endpoint.
+     *
+     * Called from cron.php (Task 12) as the *fallback* trigger for installs
+     * that only wired up the single cron line. The dedicated `update.php`
+     * cron entry is the primary, crash-isolated path; this just nudges the
+     * same endpoint so single-cron installs keep updating. Mirrors
+     * Background::trigger(): short timeout, the server side runs to
+     * completion via ignore_user_abort() regardless of the early disconnect.
+     */
+    public static function triggerSelfCheck(): void {
+        if (self::isWordPressMode()) {
+            return;
+        }
+        $cronKey = Config::get('cron_key');
+        if (!$cronKey) {
+            return;
+        }
+        $url = rtrim(Config::getBaseUrl(), '/') . '/update.php';
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_TIMEOUT_MS => 200,
+            CURLOPT_NOSIGNAL => 1,
+            CURLOPT_SSL_VERIFYPEER => false, // localhost self-request; same as Background::trigger
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_HTTPHEADER => ['X-CRON-KEY: ' . $cronKey],
+        ]);
+        @curl_exec($ch);
     }
 
     // ---------------- HTTP ----------------
