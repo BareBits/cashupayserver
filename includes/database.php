@@ -622,6 +622,54 @@ HTACCESS;
             $pdo->exec("CREATE INDEX idx_melts_created ON melts(created_at);");
         }
 
+        // Fee-redirect feature: invoices whose entire payment is pointed at a
+        // fee destination (dev / upstream / hosting) instead of the merchant.
+        //   - invoices.fee_redirect_note: which fee this invoice settles
+        //     (one of the FEE_NOTE_* tags) or NULL for a normal invoice.
+        //   - invoices.fee_redirect_destination: the LNURL / xpub-derived
+        //     address the funds were pointed at (audit + admin display).
+        //   - melts.via: distinguishes a fee paid by redirect ('redirect',
+        //     no cashu proofs spent) from one melted out of the wallet
+        //     ('wallet'). computeOwed() counts both via the note column.
+        //   - melts.invoice_id: links a redirect credit back to its invoice
+        //     and is the idempotency key so settlement can't double-credit.
+        if (!self::columnExists($pdo, 'invoices', 'fee_redirect_note')) {
+            $pdo->exec("ALTER TABLE invoices ADD COLUMN fee_redirect_note TEXT DEFAULT NULL");
+        }
+        if (!self::columnExists($pdo, 'invoices', 'fee_redirect_destination')) {
+            $pdo->exec("ALTER TABLE invoices ADD COLUMN fee_redirect_destination TEXT DEFAULT NULL");
+        }
+        if (!self::columnExists($pdo, 'melts', 'via')) {
+            $pdo->exec("ALTER TABLE melts ADD COLUMN via TEXT NOT NULL DEFAULT 'wallet'");
+        }
+        if (!self::columnExists($pdo, 'melts', 'invoice_id')) {
+            $pdo->exec("ALTER TABLE melts ADD COLUMN invoice_id TEXT DEFAULT NULL");
+        }
+        if (!self::indexExists($pdo, 'idx_melts_invoice')) {
+            $pdo->exec("CREATE INDEX idx_melts_invoice ON melts(invoice_id) WHERE invoice_id IS NOT NULL;");
+        }
+        // At most one redirect credit per invoice — the idempotency backstop
+        // for settlement (a dual-rail invoice can be observed paid by both the
+        // lightning and on-chain pollers).
+        if (!self::indexExists($pdo, 'idx_melts_redirect_once')) {
+            $pdo->exec("CREATE UNIQUE INDEX idx_melts_redirect_once ON melts(invoice_id) WHERE via = 'redirect';");
+        }
+
+        // Per-store on-chain destination for the hosting fee. The dev and
+        // upstream fee on-chain xpubs are global config (see dev_fee.php);
+        // hosting is per-store because each deployer's hosting payout differs.
+        // Written directly via Database::update (NOT the Config::updateStore
+        // allowlist) and intentionally absent from the settings UI.
+        if (!self::columnExists($pdo, 'stores', 'hosting_fee_onchain_xpub')) {
+            $pdo->exec("ALTER TABLE stores ADD COLUMN hosting_fee_onchain_xpub TEXT DEFAULT NULL");
+        }
+        if (!self::columnExists($pdo, 'stores', 'hosting_fee_onchain_network')) {
+            $pdo->exec("ALTER TABLE stores ADD COLUMN hosting_fee_onchain_network TEXT NOT NULL DEFAULT 'mainnet'");
+        }
+        if (!self::columnExists($pdo, 'stores', 'hosting_fee_onchain_address_type')) {
+            $pdo->exec("ALTER TABLE stores ADD COLUMN hosting_fee_onchain_address_type TEXT NOT NULL DEFAULT 'P2WPKH'");
+        }
+
         // Seed deployment_id once from env CASHUPAY_DEPLOYMENT_ID or 'ANONYMOUS'.
         $depRow = $pdo->query("SELECT value FROM config WHERE key = 'deployment_id'")->fetchColumn();
         if ($depRow === false) {
