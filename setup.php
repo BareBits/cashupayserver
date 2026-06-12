@@ -648,7 +648,7 @@ function getDataDirHttpPath(): ?string {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>BareBits Lite Setup</title>
+    <title>BareBits Setup</title>
     <style>
         * {
             margin: 0;
@@ -1071,7 +1071,7 @@ function getDataDirHttpPath(): ?string {
                     <?php endfor; ?>
                 </div>
             <?php else: ?>
-                <h1>BareBits Lite Setup</h1>
+                <h1>BareBits Setup</h1>
                 <?php
                 $isWpMode = Urls::isWordPress();
                 // Internal step order:
@@ -1102,7 +1102,7 @@ function getDataDirHttpPath(): ?string {
                 <!-- Step 1: Welcome + Security Check (merged) -->
                 <h2 style="margin-bottom: 1rem;">Welcome</h2>
                 <p style="margin-bottom: 1.5rem;">
-                    BareBits Lite is a Lightning payment gateway that uses Cashu ecash.
+                    BareBits is a Lightning payment gateway that uses Cashu ecash.
                     Let's get you set up in a few minutes.
                 </p>
 
@@ -2024,7 +2024,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                 <h2 style="margin-bottom: 1rem;">Setup Complete!</h2>
 
                 <div class="success">
-                    BareBits Lite is ready to accept payments.
+                    BareBits is ready to accept payments.
                 </div>
 
                 <?php
@@ -2224,7 +2224,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                 </details>
 
                 <a href="<?= Urls::isWordPress() ? admin_url('admin.php?page=cashupay') : Urls::admin() ?>" class="btn" style="width: 100%; text-align: center; display: block;">
-                    Go to BareBits Lite Admin
+                    Go to BareBits Admin
                 </a>
                 <?php if (Urls::isWordPress()): ?>
                 <a href="<?= admin_url() ?>" class="btn btn-secondary" style="width: 100%; text-align: center; display: block; margin-top: 0.5rem;">

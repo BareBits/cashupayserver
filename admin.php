@@ -2142,7 +2142,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     if ($isBolt11) {
                         $bolt11ForQuote = $destination;
                     } else {
-                        $bolt11ForQuote = LightningAddress::getInvoice($destination, $amount, 'BareBits Lite withdrawal');
+                        $bolt11ForQuote = LightningAddress::getInvoice($destination, $amount, 'BareBits withdrawal');
                     }
                     $result = LightningAddress::meltToBolt11($storeId, $bolt11ForQuote);
                 } else {
@@ -2151,7 +2151,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         $result = LightningAddress::meltToBolt11($storeId, $destination, $amount);
                     } else {
                         // For Lightning address with sat mint, amount is already in sats
-                        $result = LightningAddress::meltToAddress($storeId, $destination, $amount, 'BareBits Lite withdrawal');
+                        $result = LightningAddress::meltToAddress($storeId, $destination, $amount, 'BareBits withdrawal');
                     }
                 }
 
@@ -2951,9 +2951,9 @@ header('Cache-Control: no-cache, must-revalidate');
     <meta name="theme-color" content="#0f0f23">
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-    <meta name="apple-mobile-web-app-title" content="BareBits Lite">
+    <meta name="apple-mobile-web-app-title" content="BareBits">
     <meta name="csrf-token" content="<?= htmlspecialchars(Auth::generateCsrfToken()) ?>">
-    <title>BareBits Lite Admin</title>
+    <title>BareBits Admin</title>
     <?php if (!$isWp): ?><link rel="manifest" href="manifest.json"><?php endif; ?>
     <link rel="apple-touch-icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect fill='%230f0f23' width='100' height='100' rx='20'/><text x='50' y='70' font-size='60' text-anchor='middle'>⚡</text></svg>">
     <style>
@@ -3006,7 +3006,9 @@ header('Cache-Control: no-cache, must-revalidate');
         }
 
         .lock-logo {
-            font-size: 4rem;
+            width: 280px;
+            max-width: 70vw;
+            height: auto;
             margin-bottom: 2rem;
         }
 
@@ -3076,9 +3078,15 @@ header('Cache-Control: no-cache, must-revalidate');
         .header-title {
             display: flex;
             align-items: center;
-            gap: 0.5rem;
+            gap: 0.6rem;
             font-weight: 600;
             flex-shrink: 0;
+        }
+
+        .header-logo {
+            height: 22px;
+            width: auto;
+            display: block;
         }
 
         .header-store-selector {
@@ -4208,8 +4216,7 @@ header('Cache-Control: no-cache, must-revalidate');
 <body>
     <!-- Lock Screen -->
     <div class="lock-screen<?= $isLoggedIn ? ' hidden' : '' ?>" id="lock-screen">
-        <div class="lock-logo">&#9889;</div>
-        <div class="lock-title">BareBits Lite</div>
+        <img class="lock-logo" src="<?= htmlspecialchars(Urls::assets('img/barebits-logo.svg')) ?>" alt="BareBits">
         <div class="lock-subtitle">Enter your password</div>
 
         <div class="password-fallback" id="password-fallback">
@@ -4226,7 +4233,7 @@ header('Cache-Control: no-cache, must-revalidate');
         <header class="header">
             <div class="header-left">
                 <div class="header-title">
-                    <span>&#9889;</span>
+                    <img class="header-logo" src="<?= htmlspecialchars(Urls::assets('img/barebits-logo.svg')) ?>" alt="BareBits">
                     <span id="header-text">Dashboard</span>
                 </div>
                 <div class="header-store-selector" id="header-store-selector">
@@ -5300,7 +5307,7 @@ header('Cache-Control: no-cache, must-revalidate');
                 </div>
 
                 <div style="text-align: center; padding: 1.5rem 0; color: var(--text-muted); font-size: 0.8rem;">
-                    BareBits Lite v<?= CASHUPAY_VERSION ?> &middot;
+                    BareBits v<?= CASHUPAY_VERSION ?> &middot;
                     Deployment ID: <code style="background: rgba(0,0,0,0.2); padding: 0.1rem 0.4rem; border-radius: 4px;"><?= htmlspecialchars((string) Config::get('deployment_id', 'ANONYMOUS')) ?></code> &middot;
                     <a href="https://github.com/jooray/cashupayserver/releases" target="_blank" rel="noopener"
                        style="color: var(--text-secondary); text-decoration: none;">Check for updates</a>
@@ -5309,6 +5316,9 @@ header('Cache-Control: no-cache, must-revalidate');
 
             <!-- Stats Dashboard View (admin-only) -->
             <div class="view" id="view-stats">
+                <div style="display: flex; justify-content: center; padding: 0.5rem 0 1.5rem;">
+                    <img src="<?= htmlspecialchars(Urls::assets('img/barebits-logo.svg')) ?>" alt="BareBits" style="height: 48px; width: auto; max-width: 80%;">
+                </div>
                 <div id="upgrade-banner" class="hidden" style="background: rgba(247, 147, 26, 0.12); border: 1px solid rgba(247, 147, 26, 0.4); border-radius: 8px; padding: 0.75rem 1rem; margin-bottom: 1rem; font-size: 0.9rem; display: flex; align-items: flex-start; gap: 0.75rem;" data-admin-only="true">
                     <span style="flex-shrink: 0; font-size: 1.1rem; line-height: 1.2;">🚀</span>
                     <span style="flex: 1;">

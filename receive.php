@@ -220,7 +220,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Request Payment - BareBits Lite</title>
+    <title>Request Payment - BareBits</title>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body {
@@ -436,7 +436,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Request Payment - BareBits Lite</title>
+    <title>Request Payment - BareBits</title>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body {
