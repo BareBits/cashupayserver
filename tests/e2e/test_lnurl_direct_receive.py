@@ -10,12 +10,14 @@ Exercises the full stack — cashupayserver, the LUD-21 mock LNURL host
    settled=true with a preimage, and marks the invoice Settled with
    settled_rail='lnaddress'.
 
-2. **Override gate**: when fees-due exceeds the next invoice amount
-   (seeded by inserting a settled-revenue invoice directly), the routing
-   logic skips the LNURL probe and records the invoice on the mint rail
-   with lnurl_override_reason='fees_due'. The pure-PHP unit tests cover
-   the truth table; this test confirms the gate is wired into the e2e
-   create-invoice flow and produces the expected DB state.
+2. **Fee redirect**: when a fee is owed >= the next invoice amount (seeded
+   by inserting a settled-revenue invoice directly), the fee-redirect path
+   supersedes the old mint-override gate — the whole invoice is pointed at
+   the dev fee LNURL (resolved through the mock host). The invoice rides the
+   lnaddress rail tagged with fee_redirect_note; paying it settles the
+   invoice and records a melts credit (via='redirect') instead of moving
+   funds to the merchant. The pure-PHP unit tests cover the decision truth
+   table + accounting; this confirms the path is wired end-to-end.
 
 3. **LUD-21 fallback**: when the LN address host doesn't advertise a
    verify URL, save_auto_melt records stores.lnurl_supports_verify=0 and
@@ -304,55 +306,107 @@ def test_lnurl_direct_receive_happy_path(
 
 
 # ---------------------------------------------------------------------------
-# Override gate: fees-due > FORCE_AMOUNT → invoice routes via mint
+# Fee redirect: fee owed >= invoice → whole payment routed to the fee
 # ---------------------------------------------------------------------------
 
 
-def test_lnurl_override_routes_via_mint_when_fees_due_exceeds_invoice(
+def _read_redirect_melt(payserver: PayserverHandle, invoice_id: str) -> dict | None:
+    """Return the melts row recorded for a settled fee-redirect invoice
+    (via='redirect'), or None if settlement hasn't credited it yet."""
+    db_path = payserver.data_dir / "cashupay.sqlite"
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM melts WHERE invoice_id = ? AND via = 'redirect'",
+            (invoice_id,),
+        ).fetchone()
+        return None if row is None else dict(row)
+
+
+def test_fee_redirect_lightning_supersedes_mint_override(
     configured_with_lnurlp: ConfiguredPayserver,
+    lnd_mint: LndHandle,
     lnurlp_server: LnurlpServer,
 ) -> None:
-    """When accumulated fees-due exceed the next invoice amount, the LNURL
-    probe is skipped and the invoice lands on the mint rail with
-    lnurl_override_reason='fees_due', so settlement can clear the owed
-    fees from the resulting mint balance."""
+    """When a fee is owed in an amount >= the next invoice, the whole invoice
+    is redirected to that fee instead of routing through the mint. Here the
+    largest owed fee is the dev fee; its LNURL resolves through the mock host,
+    so the invoice lands on the lnaddress rail tagged fee_redirect_note=DEV_FEE.
+    Paying it settles the invoice and records a via='redirect' melts credit —
+    the funds went to the fee payee, not the merchant."""
     configured = configured_with_lnurlp
 
     save_result = _enable_auto_melt(configured)
     assert save_result.get("success") is True
     assert _primary_lud21(save_result) == 1
 
-    # Seed enough revenue that the combined fee % (2% dev + 0.5% upstream
-    # + 0% hosting = 2.5%) yields owed sats above the upcoming invoice
-    # amount. 1_000_000 sats * 0.025 = 25_000 sats, comfortably larger
-    # than INVOICE_AMOUNT_SAT (5_000).
+    # Seed 1_000_000 sats revenue → dev fee owed = 2% = 20_000 sats, well above
+    # the 5_000-sat invoice, so the gate (owed >= invoice) lets the redirect fire.
     _seed_fee_revenue(configured.handle, configured.store_id, sats=1_000_000)
-
-    # Sanity check: the lnaddress-rail probe count must not increase for
-    # this invoice (the gate runs before the probe). We measure by snapshot.
-    pre_callbacks = len(lnurlp_server.issued_hashes)
 
     invoice = configured.greenfield.create_invoice(
         configured.store_id, amount=str(INVOICE_AMOUNT_SAT), currency="sat"
     )
     invoice_id = invoice["id"]
 
-    post_callbacks = len(lnurlp_server.issued_hashes)
-    assert post_callbacks == pre_callbacks, (
-        "override gate should skip the LNURL callback probe; "
-        f"issued_hashes grew by {post_callbacks - pre_callbacks}"
+    # The invoice is now a dev-fee payment on the lnaddress rail.
+    row = _read_invoice_row(configured.handle, invoice_id)
+    assert row["payment_rail"] == "lnaddress", (
+        f"fee redirect should use the lnaddress rail; got {row['payment_rail']!r}"
+    )
+    assert row["fee_redirect_note"] == "DEV_FEE", (
+        f"expected redirect to the dev fee; got {row['fee_redirect_note']!r}"
+    )
+    assert row["fee_redirect_destination"], "fee destination should be recorded"
+    assert row["lnurl_verify_url"], "verify URL needed to detect settlement"
+    assert row["lnurl_override_reason"] is None, (
+        "redirect path supersedes the override gate; no override reason expected"
     )
 
-    row = _read_invoice_row(configured.handle, invoice_id)
-    assert row["payment_rail"] == "mint", (
-        f"override should land invoice on mint rail; got {row['payment_rail']!r}"
+    # The API surfaces the badge payload for the admin invoice list.
+    assert (invoice.get("feeRedirect") or {}).get("note") == "DEV_FEE", (
+        f"create response should carry feeRedirect badge data; got {invoice.get('feeRedirect')!r}"
     )
-    assert row["lnurl_override_reason"] == "fees_due", (
-        f"expected fees_due override; got {row['lnurl_override_reason']!r}"
+
+    bolt11 = (
+        invoice.get("checkout", {})
+        .get("paymentMethods", {})
+        .get("BTC-LightningNetwork", {})
+        .get("destination")
     )
-    assert row["lnurl_verify_url"] is None, (
-        "mint-rail invoice should not have a verify URL"
+    assert bolt11 and bolt11.lower().startswith("lnbcrt"), (
+        f"expected the fee LNURL's regtest BOLT11; got {bolt11}"
     )
+
+    # Customer pays the fee LNURL's BOLT11 — funds land at the fee payee
+    # (lnd_payer behind the mock host), never at the merchant or our mint.
+    pay_result = lnd_mint.pay_invoice_sync(bolt11, timeout=30)
+    assert not pay_result.get("payment_error"), f"payment failed: {pay_result}"
+
+    # Poll until settled via the verify URL (same path the customer tab uses).
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        if _poll_payment_page(configured.handle, invoice_id).get("status") == "Settled":
+            break
+        time.sleep(0.5)
+    else:
+        raise AssertionError(
+            f"redirect invoice {invoice_id} did not settle within 30s"
+        )
+
+    final = _read_invoice_row(configured.handle, invoice_id)
+    assert final["status"] == "Settled"
+    assert final["settled_rail"] == "lnaddress"
+
+    # Settlement recorded a fee-paid credit via redirect (not a wallet melt),
+    # so DevFee::computeOwed will see the dev fee partially settled.
+    melt = _read_redirect_melt(configured.handle, invoice_id)
+    assert melt is not None, "expected a via='redirect' melts credit after settlement"
+    assert melt["note"] == "DEV_FEE", f"credit should carry the dev fee note; got {melt['note']!r}"
+    assert int(melt["amount_sats"]) == INVOICE_AMOUNT_SAT, (
+        f"credit amount should equal the invoice sats; got {melt['amount_sats']}"
+    )
+    assert int(melt["network_fee_sats"]) == 0, "a redirect spends no wallet proofs"
 
 
 # ---------------------------------------------------------------------------

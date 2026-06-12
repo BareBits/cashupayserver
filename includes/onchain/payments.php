@@ -239,6 +239,64 @@ class OnchainPayments {
     }
 
     /**
+     * Atomically derive the next receive address from an ARBITRARY xpub —
+     * used for fee-redirect invoices, where the payment is pointed at a fee
+     * payee's xpub (dev / upstream / hosting) rather than the merchant's.
+     *
+     * Shares the same per-xpub `onchain_xpub_state` counter as
+     * {@see allocateAddress}, so a fee xpub gets its own monotonic index
+     * stream and never re-derives a used address — even if the same xpub is
+     * also a merchant's receive xpub on another store. Unlike allocateAddress
+     * it does NOT touch any stores row (the fee xpub belongs to no store).
+     *
+     * @param array|null $tipProviderStore A store row whose provider config is
+     *        used for a best-effort chain-tip read (the redirect invoice is
+     *        polled with the paying store's provider, so tip filtering only
+     *        works when the fee xpub is on that store's network — callers
+     *        enforce a network match before getting here).
+     * @return array{address:string, index:int, tip_height:?int}
+     */
+    public static function allocateFeeAddress(
+        string $xpub,
+        string $network,
+        string $type,
+        ?array $tipProviderStore = null
+    ): array {
+        $pdo = Database::getInstance();
+        $pdo->beginTransaction();
+        try {
+            $xpubHash = hash('sha256', $xpub);
+            $now = time();
+            $pdo->prepare(
+                "INSERT INTO onchain_xpub_state (xpub_hash, next_index, updated_at)
+                 VALUES (?, 0, ?) ON CONFLICT(xpub_hash) DO NOTHING"
+            )->execute([$xpubHash, $now]);
+            $sel = $pdo->prepare(
+                "SELECT next_index FROM onchain_xpub_state WHERE xpub_hash = ?"
+            );
+            $sel->execute([$xpubHash]);
+            $index = (int)$sel->fetchColumn();
+            $pdo->prepare(
+                "UPDATE onchain_xpub_state SET next_index = next_index + 1, updated_at = ?
+                  WHERE xpub_hash = ?"
+            )->execute([$now, $xpubHash]);
+
+            $address = OnchainWallet::deriveAddress($xpub, $type ?: 'P2WPKH', $network ?: 'mainnet', $index);
+            $pdo->commit();
+        } catch (Throwable $e) {
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+            throw $e;
+        }
+
+        // Tip read is outside the txn (best-effort network call); failure
+        // leaves tip NULL which simply disables historical-UTXO filtering.
+        $tip = $tipProviderStore !== null ? self::currentTipBestEffort($tipProviderStore) : null;
+        return ['address' => $address, 'index' => $index, 'tip_height' => $tip];
+    }
+
+    /**
      * Poll the configured provider for an invoice's address and apply any
      * resulting lifecycle transitions.
      *

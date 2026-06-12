@@ -4081,6 +4081,17 @@ header('Cache-Control: no-cache, must-revalidate');
         .inv-chip.swap-confirming { background: rgba(247, 147, 26, 0.2); color: #f7931a; }
         .inv-chip.swap-waiting    { background: rgba(160, 174, 192, 0.2); color: var(--text-secondary); }
         .inv-chip.swap-failed     { background: rgba(229, 62, 62, 0.2); color: #e53e3e; }
+        .inv-fee-badge {
+            display: inline-block;
+            padding: 0.1rem 0.5rem;
+            border-radius: 999px;
+            font-size: 0.72rem;
+            font-weight: 600;
+            background: rgba(159, 122, 234, 0.2);
+            color: #9f7aea;
+            white-space: nowrap;
+            cursor: help;
+        }
         .inv-mono {
             font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
             font-size: 0.78rem;
@@ -7152,11 +7163,19 @@ header('Cache-Control: no-cache, must-revalidate');
                 if (note === 'HOSTING_FEE') return 'Hosting';
                 return note || '';
             };
+            // Fee paid by routing a customer invoice straight to the payee
+            // (via='redirect') vs melted out of the cashu wallet ('wallet').
+            const typeCell = (row) => {
+                const base = escapeHtml(noteLabel(row.note));
+                return row.via === 'redirect'
+                    ? `${base} <span class="inv-fee-badge" title="Paid by redirecting a customer invoice straight to the fee destination (no wallet melt).">redirect</span>`
+                    : base;
+            };
             const rows = data.rows.map(row => `
                 <tr>
                     <td>${new Date(row.created_at * 1000).toLocaleString()}</td>
                     <td class="truncate" title="${escapeHtml(row.destination || '')}">${escapeHtml(row.destination || '')}</td>
-                    ${showType ? `<td>${escapeHtml(noteLabel(row.note))}</td>` : ''}
+                    ${showType ? `<td>${typeCell(row)}</td>` : ''}
                     <td style="text-align:right">${formatStatsAmount(row.amount_sats)}</td>
                     <td style="text-align:right">${formatStatsAmount(row.network_fee_sats)}</td>
                 </tr>
@@ -7389,6 +7408,17 @@ header('Cache-Control: no-cache, must-revalidate');
         }
 
         // Rendering
+        // Badge for invoices whose payment was redirected to a fee payee
+        // instead of the merchant (see includes/fee_redirect.php). The tooltip
+        // names which fee and explains where the money went, so the merchant
+        // doesn't wonder why their balance didn't move for this invoice.
+        function feeRedirectBadge(fr) {
+            const label = (fr && fr.label) ? fr.label : 'fees';
+            const dest = fr && fr.destination ? '\nDestination: ' + fr.destination : '';
+            const title = 'This invoice was redirected to pay for ' + label + '.' + dest;
+            return ` <span class="inv-fee-badge" title="${escapeAttr(title)}">⚡ Fee payment</span>`;
+        }
+
         function renderInvoices(containerId, invoices) {
             const container = document.getElementById(containerId);
 
@@ -7409,12 +7439,13 @@ header('Cache-Control: no-cache, must-revalidate');
                              inv.status === 'Provisional' ? '◷' : '✕';
                 const date = new Date(inv.createdTime * 1000).toLocaleDateString();
                 const description = inv.metadata?.itemDesc || '';
+                const feeBadge = inv.feeRedirect ? feeRedirectBadge(inv.feeRedirect) : '';
 
                 return `
                     <div class="list-item">
                         <div class="list-icon ${statusClass}">${icon}</div>
                         <div class="list-content">
-                            <div class="list-title">${description ? escapeHtml(description) : inv.id}</div>
+                            <div class="list-title">${description ? escapeHtml(description) : inv.id}${feeBadge}</div>
                             <div class="list-subtitle">${date}${description ? ' · ' + inv.id : ''}</div>
                         </div>
                         <div class="list-amount">
@@ -7537,12 +7568,13 @@ header('Cache-Control: no-cache, must-revalidate');
                 // Note column: invoice description (metadata.itemDesc) plus a
                 // swap-status badge appended when the swap isn't fully settled.
                 // Em-dash when there's neither a description nor a badge.
+                const feeBadge = inv.feeRedirect ? feeRedirectBadge(inv.feeRedirect) : '';
                 // Cart invoices get an inline link to their itemized breakdown.
                 const itemsLink = inv.hasItems
                     ? ` <a href="#" onclick="openInvoiceItems('${idEsc}'); return false;" style="font-size:0.78rem; color:var(--accent,#60a5fa); white-space:nowrap;">🛒 items</a>`
                     : '';
-                const noteCell = (description || swapBadge || itemsLink)
-                    ? `<div>${description ? escapeHtml(description) : ''}${swapBadge}${itemsLink}</div>`
+                const noteCell = (description || swapBadge || itemsLink || feeBadge)
+                    ? `<div>${description ? escapeHtml(description) : ''}${swapBadge}${itemsLink}${feeBadge}</div>`
                     : '<span style="color: var(--text-secondary);">—</span>';
                 const destCell = inv.destination
                     ? `<span class="inv-mono">${renderMonoLink('address', inv.destination, network)}</span>`

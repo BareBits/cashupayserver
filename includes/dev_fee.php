@@ -61,6 +61,60 @@ if (!defined('CASHUPAY_FEE_SETTLE_THRESHOLD_SATS')) {
     define('CASHUPAY_FEE_SETTLE_THRESHOLD_SATS', 1000);
 }
 
+// ---------------------------------------------------------------------------
+// Fee-redirect destinations.
+//
+// When an invoice is created and a fee is owed >= the invoice amount, the
+// invoice's payment rails are pointed straight at the fee's destination
+// instead of the merchant (see includes/fee_redirect.php). The destination
+// used depends on how the customer pays:
+//   - Lightning  -> the fee's LNURL / Lightning address (must support LUD-21
+//                   so settlement is detectable without running an LN node).
+//   - On-chain   -> a fresh address derived from the fee's xpub.
+//
+// All values are env-overridable and default empty, so the on-chain redirect
+// rail stays OFF until a deployer configures an xpub. When a fee has no
+// usable destination for one of the store's offered rails, that fee simply
+// isn't redirect-eligible and the existing cashu-wallet settlement path
+// (cron) keeps collecting it as before.
+//
+// Dev + upstream destinations are global (one payee for the whole
+// deployment); the hosting fee's on-chain xpub is per-store (stores table).
+// ---------------------------------------------------------------------------
+$ff_env = static function (string $name, string $default): string {
+    $v = getenv($name);
+    return ($v !== false && $v !== '') ? $v : $default;
+};
+
+// Dev fee on-chain destination (LNURL already exists as CASHUPAY_DEV_FEE_LNURL).
+if (!defined('CASHUPAY_DEV_FEE_ONCHAIN_XPUB')) {
+    define('CASHUPAY_DEV_FEE_ONCHAIN_XPUB', $ff_env('CASHUPAY_DEV_FEE_ONCHAIN_XPUB', ''));
+}
+if (!defined('CASHUPAY_DEV_FEE_ONCHAIN_NETWORK')) {
+    define('CASHUPAY_DEV_FEE_ONCHAIN_NETWORK', $ff_env('CASHUPAY_DEV_FEE_ONCHAIN_NETWORK', 'mainnet'));
+}
+if (!defined('CASHUPAY_DEV_FEE_ONCHAIN_ADDRESS_TYPE')) {
+    define('CASHUPAY_DEV_FEE_ONCHAIN_ADDRESS_TYPE', $ff_env('CASHUPAY_DEV_FEE_ONCHAIN_ADDRESS_TYPE', 'P2WPKH'));
+}
+
+// Upstream dev fee destinations. The existing path POSTs a Cashu token to
+// CASHUPAY_UPSTREAM_DEV_FEE_SINK_URL; these add an LNURL + on-chain xpub so
+// the upstream fee can also be settled by redirect. Empty (default) = not
+// redirect-eligible; the token-sink path remains the fallback.
+if (!defined('CASHUPAY_UPSTREAM_DEV_FEE_LNURL')) {
+    define('CASHUPAY_UPSTREAM_DEV_FEE_LNURL', $ff_env('CASHUPAY_UPSTREAM_DEV_FEE_LNURL', ''));
+}
+if (!defined('CASHUPAY_UPSTREAM_DEV_FEE_ONCHAIN_XPUB')) {
+    define('CASHUPAY_UPSTREAM_DEV_FEE_ONCHAIN_XPUB', $ff_env('CASHUPAY_UPSTREAM_DEV_FEE_ONCHAIN_XPUB', ''));
+}
+if (!defined('CASHUPAY_UPSTREAM_DEV_FEE_ONCHAIN_NETWORK')) {
+    define('CASHUPAY_UPSTREAM_DEV_FEE_ONCHAIN_NETWORK', $ff_env('CASHUPAY_UPSTREAM_DEV_FEE_ONCHAIN_NETWORK', 'mainnet'));
+}
+if (!defined('CASHUPAY_UPSTREAM_DEV_FEE_ONCHAIN_ADDRESS_TYPE')) {
+    define('CASHUPAY_UPSTREAM_DEV_FEE_ONCHAIN_ADDRESS_TYPE', $ff_env('CASHUPAY_UPSTREAM_DEV_FEE_ONCHAIN_ADDRESS_TYPE', 'P2WPKH'));
+}
+unset($ff_env);
+
 // Melt note tags written to the `melts.note` column.
 const FEE_NOTE_UPSTREAM = 'UPSTREAM_DEV_FEE';
 const FEE_NOTE_DEV      = 'DEV_FEE';

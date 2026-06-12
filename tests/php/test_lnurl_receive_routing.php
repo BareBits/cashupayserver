@@ -11,9 +11,11 @@
  *   2. With auto_melt_enabled=0, the LNURL path is not even attempted —
  *      the routing falls through to the existing mint/onchain path.
  *
- *   3. When pre-existing settled invoices accumulate fees-due larger than
- *      the next invoice amount, the override gate fires and the LNURL
- *      probe is skipped; the resulting invoice records lnurl_override_reason.
+ *   3. When pre-existing settled invoices accumulate a fee owed >= the next
+ *      invoice amount, the fee-redirect path engages and supersedes the old
+ *      mint-override gate: the whole invoice is pointed at the fee (here the
+ *      dev fee LNURL, resolved through the mock host) and the resulting
+ *      invoice records fee_redirect_note + the LUD-21 verify URL.
  *
  *   4. When the mock host returns no verify URL, the LNURL probe fails
  *      and routing falls back transparently.
@@ -164,10 +166,13 @@ try {
     assert_eq(false, callback_was_hit($serverDir),
               'LNURL not probed when auto_melt_enabled=0');
 
-    // ---------- Scenario 3: override gate fires (fees_due) ----------
-    // Inflate revenue so feesDue exceeds the invoice we're about to create.
-    // With dev_fee 2% + upstream 0.5%, 1_000_000 sats revenue owes ~25_000
-    // sats, which is larger than the 5_000-sat invoice below.
+    // ---------- Scenario 3: fee owed >= invoice → payment redirected to fee ----------
+    // Inflate revenue so a dev fee is owed in an amount larger than the next
+    // invoice. The fee-redirect path supersedes the old mint-override gate:
+    // because a fee rail is reachable (the dev LNURL, resolved through the mock
+    // host), the whole 5_000-sat invoice is pointed straight at the dev fee
+    // instead of round-tripping through the mint. With 1_000_000 sats revenue
+    // the dev fee owes 20_000 sats (2%), comfortably above the invoice.
     $store3 = 'store_override_force';
     make_store($store3, $mintStub);
     Database::update('stores', [
@@ -177,25 +182,21 @@ try {
     paid_invoice($store3, 1_000_000);
 
     $owed = DevFee::computeOwed($store3);
-    $feesDue = (int)$owed['upstream_owed'] + (int)$owed['dev_owed'] + (int)$owed['hosting_owed'];
-    assert_true($feesDue > 5000,
-                "fees_due ($feesDue) must exceed the upcoming invoice amount for this scenario");
+    assert_true((int)$owed['dev_owed'] > 5000,
+                "dev fee owed ({$owed['dev_owed']}) must exceed the upcoming invoice amount");
 
     reset_callbacks($serverDir);
-    $threw = false;
-    $caught = null;
-    try {
-        Invoice::create($store3, ['amount' => 5000, 'currency' => 'sat']);
-    } catch (Throwable $e) {
-        $threw = true; $caught = $e;
-    }
-    // Even with mint-stub failure, the override decision was logged + the
-    // invoice that DID exist for the brief instant would have had
-    // lnurl_override_reason. But because create() throws after the mint
-    // call, no row was inserted. We instead assert the gate's observable
-    // side-effect: the LNURL callback was NOT probed.
-    assert_eq(false, callback_was_hit($serverDir),
-              'override fires → LNURL probe skipped (gate ran)');
+    $inv3 = Invoice::create($store3, ['amount' => 5000, 'currency' => 'sat']);
+    // The whole invoice is now a dev-fee payment (largest owed fee). It rides
+    // the lnaddress rail with the fee LNURL's bolt11 + verify URL, and carries
+    // the redirect tag that drives settlement accounting + the admin badge.
+    assert_eq('lnaddress', $inv3['payment_rail'], 'redirect uses the lnaddress rail');
+    assert_eq(FEE_NOTE_DEV, $inv3['fee_redirect_note'], 'redirected to the dev fee (largest owed)');
+    assert_true(!empty($inv3['fee_redirect_destination']), 'fee destination recorded');
+    assert_true(!empty($inv3['lnurl_verify_url']), 'verify URL recorded for settlement detection');
+    assert_true(str_starts_with((string)$inv3['bolt11'], 'lnbc'), 'fee LNURL bolt11 stored');
+    assert_eq(5000, (int)$inv3['amount_sats'], 'invoice amount unchanged');
+    assert_true(callback_was_hit($serverDir), 'fee LNURL was probed for the redirect');
 
     // ---------- Scenario 4: LUD-21 missing on the host → silent fallback ----------
     // Restart mock in no_verify mode.
