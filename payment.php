@@ -923,7 +923,7 @@ $baseUrl = Config::getBaseUrl();
     </div>
 
     <div class="footer">
-        Powered by <a href="#">BareBits Lite</a>
+        Powered by <a href="#">BareBits</a>
     </div>
 
     <div class="copy-toast" id="copy-toast">Copied to clipboard!</div>

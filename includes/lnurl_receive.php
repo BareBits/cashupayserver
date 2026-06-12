@@ -352,7 +352,7 @@ class LnUrlReceive {
                     $storeId,
                     $address,
                     $meltSats,
-                    'BareBits Lite override-triggered auto-withdrawal'
+                    'BareBits override-triggered auto-withdrawal'
                 );
                 $networkFeeSats = (int)($result['fee'] ?? 0);
                 if ($isFiat && $networkFeeSats > 0) {

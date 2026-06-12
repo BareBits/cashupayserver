@@ -268,7 +268,7 @@ $baseUrl = Config::getBaseUrl();
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Authorize <?= htmlspecialchars($applicationName) ?> - BareBits Lite</title>
+    <title>Authorize <?= htmlspecialchars($applicationName) ?> - BareBits</title>
     <style>
         * {
             margin: 0;
@@ -484,7 +484,7 @@ $baseUrl = Config::getBaseUrl();
             <h1>Sign In</h1>
             <p class="subtitle">
                 <span class="app-name"><?= htmlspecialchars($applicationName) ?></span>
-                wants to connect to your BareBits Lite
+                wants to connect to your BareBits
             </p>
 
             <?php if ($error): ?>
@@ -538,7 +538,7 @@ $baseUrl = Config::getBaseUrl();
             <h1>Authorize Application</h1>
             <p class="subtitle">
                 <span class="app-name"><?= htmlspecialchars($applicationName) ?></span>
-                is requesting access to your BareBits Lite
+                is requesting access to your BareBits
             </p>
 
             <?php if ($error): ?>

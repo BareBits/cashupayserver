@@ -254,7 +254,7 @@ class LightningAddress {
                                 $store['id'],
                                 $address,
                                 $meltAmountSats,
-                                'BareBits Lite auto-withdrawal'
+                                'BareBits auto-withdrawal'
                             );
                             $usedAddress = $address;
                             if ($priority > 0) {
