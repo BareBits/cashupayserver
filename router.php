@@ -148,6 +148,14 @@ if (preg_match('#^/health$#', $uri)) {
 }
 
 // -----------------------------------------------------------------------------
+// Product image: /product-image — serves uploaded product images (public).
+// -----------------------------------------------------------------------------
+if (preg_match('#^/product-image$#', $uri)) {
+    require __DIR__ . '/product-image.php';
+    exit;
+}
+
+// -----------------------------------------------------------------------------
 // Static assets: /assets/*
 // -----------------------------------------------------------------------------
 if (preg_match('#^/assets/#', $uri)) {
@@ -187,7 +195,7 @@ if ($uri === '/' || $uri === '') {
 // Direct .php file access (for backwards compatibility)
 // Only allow specific public files
 // -----------------------------------------------------------------------------
-$allowedFiles = ['index.php', 'admin.php', 'setup.php', 'payment.php', 'api.php', 'cron.php', 'receive.php', 'recover.php', 'update.php', 'health.php'];
+$allowedFiles = ['index.php', 'admin.php', 'setup.php', 'payment.php', 'api.php', 'cron.php', 'receive.php', 'recover.php', 'update.php', 'health.php', 'product-image.php'];
 $requestedFile = basename($uri);
 
 if (in_array($requestedFile, $allowedFiles)) {

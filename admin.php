@@ -18,6 +18,8 @@ require_once __DIR__ . '/includes/dev_fee.php';
 require_once __DIR__ . '/includes/stats.php';
 require_once __DIR__ . '/includes/updater.php';
 require_once __DIR__ . '/includes/offline_cashu.php';
+require_once __DIR__ . '/includes/products.php';
+require_once __DIR__ . '/includes/cart.php';
 
 use Cashu\ProofState;
 
@@ -359,6 +361,60 @@ if (isset($_GET['api'])) {
             echo json_encode(['success' => true]);
             break;
 
+        // Product catalog for the request modal — any logged-in user. Only
+        // enabled products, ordered by the store's configured default sort.
+        case 'products':
+            $storeId = $_GET['store_id'] ?? null;
+            if (!$storeId) {
+                http_response_code(400);
+                echo json_encode(['error' => 'store_id required']);
+                break;
+            }
+            $store = Config::getStore($storeId);
+            echo json_encode([
+                'products' => array_map(
+                    [Product::class, 'formatForApi'],
+                    Product::listByStore($storeId, null, true)
+                ),
+                'sort' => Product::storeSort($storeId),
+                'storeCurrency' => $store['default_currency'] ?? 'sat',
+            ]);
+            break;
+
+        // Full product list incl. disabled — admin management view only.
+        case 'products_manage':
+            Auth::requireAdmin();
+            $storeId = $_GET['store_id'] ?? null;
+            if (!$storeId) {
+                http_response_code(400);
+                echo json_encode(['error' => 'store_id required']);
+                break;
+            }
+            $store = Config::getStore($storeId);
+            echo json_encode([
+                'products' => array_map(
+                    [Product::class, 'formatForApi'],
+                    Product::listByStore($storeId, null, false)
+                ),
+                'sort' => Product::storeSort($storeId),
+                'sorts' => Product::SORTS,
+                'storeCurrency' => $store['default_currency'] ?? 'sat',
+            ]);
+            break;
+
+        // Cart line items for an invoice — used by the admin invoice detail.
+        case 'invoice_items':
+            $invoiceId = $_GET['id'] ?? '';
+            if ($invoiceId === '') {
+                http_response_code(400);
+                echo json_encode(['error' => 'id required']);
+                break;
+            }
+            echo json_encode([
+                'items' => Cart::formatItemsForApi(Cart::getItems($invoiceId)),
+            ]);
+            break;
+
         case 'invoices':
             $status = $_GET['status'] ?? null;
             $storeId = $_GET['store_id'] ?? null;
@@ -395,7 +451,25 @@ if (isset($_GET['api'])) {
             $params[] = $offset;
 
             $invoices = Database::fetchAll($sql, $params);
-            echo json_encode(array_map([Invoice::class, 'formatForApi'], $invoices));
+            $formatted = array_map([Invoice::class, 'formatForApi'], $invoices);
+            // Flag which invoices carry cart line items (one query for the page)
+            // so the UI can offer an itemized view only where it's meaningful.
+            $ids = array_column($invoices, 'id');
+            $withItems = [];
+            if (!empty($ids)) {
+                $placeholders = implode(',', array_fill(0, count($ids), '?'));
+                foreach (Database::fetchAll(
+                    "SELECT DISTINCT invoice_id FROM invoice_items WHERE invoice_id IN ($placeholders)",
+                    $ids
+                ) as $r) {
+                    $withItems[$r['invoice_id']] = true;
+                }
+            }
+            foreach ($formatted as &$inv) {
+                $inv['hasItems'] = isset($withItems[$inv['id']]);
+            }
+            unset($inv);
+            echo json_encode($formatted);
             break;
 
         case 'stores':
@@ -882,6 +956,151 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         case 'logout':
             Auth::logout();
             echo json_encode(['success' => true]);
+            break;
+
+        // ---- Product catalog management (admin only) ----
+        case 'create_product':
+            Auth::requireAdmin();
+            try {
+                $storeId = $_POST['store_id'] ?? '';
+                if ($storeId === '') {
+                    throw new InvalidArgumentException('store_id required');
+                }
+                $product = Product::create($storeId, [
+                    'title' => $_POST['title'] ?? '',
+                    'price' => $_POST['price'] ?? '',
+                    'image_type' => $_POST['image_type'] ?? 'none',
+                    'image_value' => $_POST['image_value'] ?? null,
+                ]);
+                echo json_encode(['success' => true, 'product' => Product::formatForApi($product)]);
+            } catch (InvalidArgumentException $e) {
+                http_response_code(400);
+                echo json_encode(['error' => $e->getMessage()]);
+            }
+            break;
+
+        case 'update_product':
+            Auth::requireAdmin();
+            try {
+                $storeId = $_POST['store_id'] ?? '';
+                $productId = $_POST['product_id'] ?? '';
+                if ($storeId === '' || $productId === '') {
+                    throw new InvalidArgumentException('store_id and product_id required');
+                }
+                // Only forward fields that were actually sent so a partial
+                // edit doesn't clobber untouched columns.
+                $data = [];
+                foreach (['title', 'price', 'image_type', 'image_value'] as $k) {
+                    if (array_key_exists($k, $_POST)) {
+                        $data[$k] = $_POST[$k];
+                    }
+                }
+                if (array_key_exists('enabled', $_POST)) {
+                    $data['enabled'] = ($_POST['enabled'] === '1' || $_POST['enabled'] === 'true');
+                }
+                $product = Product::update($productId, $storeId, $data);
+                echo json_encode(['success' => true, 'product' => Product::formatForApi($product)]);
+            } catch (InvalidArgumentException $e) {
+                http_response_code(400);
+                echo json_encode(['error' => $e->getMessage()]);
+            }
+            break;
+
+        case 'delete_product':
+            Auth::requireAdmin();
+            $storeId = $_POST['store_id'] ?? '';
+            $productId = $_POST['product_id'] ?? '';
+            if ($storeId === '' || $productId === '') {
+                http_response_code(400);
+                echo json_encode(['error' => 'store_id and product_id required']);
+                break;
+            }
+            Product::delete($productId, $storeId);
+            echo json_encode(['success' => true]);
+            break;
+
+        case 'save_product_sort':
+            Auth::requireAdmin();
+            $storeId = $_POST['store_id'] ?? '';
+            if ($storeId === '') {
+                http_response_code(400);
+                echo json_encode(['error' => 'store_id required']);
+                break;
+            }
+            Product::setStoreSort($storeId, $_POST['sort'] ?? Product::DEFAULT_SORT);
+            echo json_encode(['success' => true, 'sort' => Product::storeSort($storeId)]);
+            break;
+
+        case 'upload_product_image':
+            Auth::requireAdmin();
+            try {
+                $f = $_FILES['image'] ?? null;
+                if (!is_array($f)) {
+                    throw new InvalidArgumentException('No file uploaded');
+                }
+                if (($f['error'] ?? UPLOAD_ERR_NO_FILE) !== UPLOAD_ERR_OK) {
+                    throw new InvalidArgumentException('Upload failed');
+                }
+                if (($f['size'] ?? 0) <= 0 || $f['size'] > 2 * 1024 * 1024) {
+                    throw new InvalidArgumentException('Image must be 2 MB or smaller');
+                }
+                if (!is_uploaded_file($f['tmp_name'])) {
+                    throw new InvalidArgumentException('Invalid upload');
+                }
+                // Detect the real image type from content (not the client name),
+                // which also rejects non-image / polyglot files.
+                $info = @getimagesize($f['tmp_name']);
+                $extByType = [
+                    IMAGETYPE_PNG => 'png',
+                    IMAGETYPE_JPEG => 'jpg',
+                    IMAGETYPE_WEBP => 'webp',
+                ];
+                if ($info === false || !isset($extByType[$info[2]])) {
+                    throw new InvalidArgumentException('Only PNG, JPEG, or WebP images are allowed');
+                }
+                $dir = Product::uploadsDir();
+                if (!is_dir($dir) && !@mkdir($dir, 0755, true) && !is_dir($dir)) {
+                    throw new RuntimeException('Could not create uploads directory');
+                }
+                $filename = 'prod_' . bin2hex(random_bytes(12)) . '.' . $extByType[$info[2]];
+                $dest = $dir . '/' . $filename;
+                if (!move_uploaded_file($f['tmp_name'], $dest)) {
+                    throw new RuntimeException('Could not store uploaded image');
+                }
+                @chmod($dest, 0644);
+                echo json_encode([
+                    'success' => true,
+                    'filename' => $filename,
+                    'url' => Product::imageUrl($filename),
+                ]);
+            } catch (Throwable $e) {
+                http_response_code(400);
+                echo json_encode(['error' => $e->getMessage()]);
+            }
+            break;
+
+        // ---- Cart checkout (any logged-in user, like the request modal) ----
+        case 'cart_checkout':
+            try {
+                $storeId = $_POST['store_id'] ?? '';
+                if ($storeId === '') {
+                    throw new InvalidArgumentException('store_id required');
+                }
+                $items = json_decode((string)($_POST['items'] ?? ''), true);
+                if (!is_array($items) || empty($items)) {
+                    throw new InvalidArgumentException('Cart is empty');
+                }
+                $memo = isset($_POST['memo']) ? (string)$_POST['memo'] : null;
+                $redirect = isset($_POST['redirect']) ? (string)$_POST['redirect'] : null;
+                $result = Cart::checkout($storeId, $items, $memo, $redirect);
+                echo json_encode(['success' => true] + $result);
+            } catch (InvalidArgumentException $e) {
+                http_response_code(400);
+                echo json_encode(['error' => $e->getMessage()]);
+            } catch (Throwable $e) {
+                http_response_code(500);
+                echo json_encode(['error' => $e->getMessage()]);
+            }
             break;
 
         case 'dismiss_upgrade_banner':
@@ -2682,7 +2901,7 @@ $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
 // Unknown or empty view → 302 to <base>/dashboard so /admin canonicalizes to
 // /admin/dashboard and bookmarks of removed views still resolve sensibly.
 // -----------------------------------------------------------------------------
-const ADMIN_VIEWS = ['dashboard', 'invoices', 'stores', 'settings', 'stats'];
+const ADMIN_VIEWS = ['dashboard', 'invoices', 'stores', 'products', 'settings', 'stats'];
 
 if ($isWp) {
     $rawAdminView = (string)get_query_var('cashupay_admin_view');
@@ -2718,6 +2937,11 @@ if (!in_array($rawAdminView, ADMIN_VIEWS, true)) {
 }
 
 $adminView = $rawAdminView;
+
+// The admin SPA ships its CSS/JS inline in this document, so a stale cached
+// copy pins the old layout/styles until a hard refresh. Tell the browser to
+// always revalidate the page shell.
+header('Cache-Control: no-cache, must-revalidate');
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -3045,12 +3269,11 @@ $adminView = $rawAdminView;
             flex: 1;
             padding: 1rem;
             padding-bottom: calc(5rem + env(safe-area-inset-bottom));
-            max-width: 1100px;
-            margin: 0 auto;
+            /* Fill the full available width (right of the fixed sidebar on
+               desktop) rather than a centered, boxed column. */
+            max-width: none;
+            margin: 0;
             width: 100%;
-            /* Flex column so the active view can vertically center when it's
-               shorter than the viewport (auto margins collapse to 0 and the
-               view top-aligns + scrolls normally when it's taller). */
             display: flex;
             flex-direction: column;
         }
@@ -3062,9 +3285,9 @@ $adminView = $rawAdminView;
 
         .view.active {
             display: block;
-            /* Center vertically within .main when short; collapses to top-align
-               (margin 0) and scrolls when content is taller than the viewport. */
-            margin: auto 0;
+            /* Top-align so content fills from the top of the viewport rather
+               than floating in the vertical centre. */
+            margin: 0;
             width: 100%;
         }
 
@@ -4086,9 +4309,16 @@ $adminView = $rawAdminView;
                         </button>
                         <button class="balance-btn" id="btn-request">
                             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"></path>
+                                <circle cx="9" cy="21" r="1"></circle><circle cx="20" cy="21" r="1"></circle>
+                                <path d="M1 1h4l2.68 13.39a2 2 0 0 0 2 1.61h9.72a2 2 0 0 0 2-1.61L23 6H6"></path>
                             </svg>
                             Request
+                        </button>
+                        <button class="balance-btn" id="btn-request-simple">
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"></path>
+                            </svg>
+                            Request (simple)
                         </button>
                     </div>
                 </div>
@@ -4564,6 +4794,36 @@ $adminView = $rawAdminView;
                         <div class="empty-state-icon">🏪</div>
                         <p>No store selected</p>
                         <button class="btn" id="btn-create-store" style="margin-top: 1rem;">Create Store</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Products View (admin only; per-store catalog for the cart) -->
+            <div class="view" id="view-products">
+                <div class="card">
+                    <div class="card-header" style="display:flex; align-items:center; justify-content:space-between; gap:0.5rem; flex-wrap:wrap;">
+                        <div class="card-title">Products</div>
+                        <button class="btn" id="btn-new-product" style="width:auto; padding:0.4rem 0.9rem;">+ New product</button>
+                    </div>
+                    <div class="card-body">
+                        <p style="font-size:0.85rem; color:var(--text-secondary); margin:0 0 0.75rem 0;">
+                            Products for the selected store. They appear in the cart-based
+                            <strong>Request</strong> flow on the dashboard. Prices are in the store's
+                            display currency (<span id="products-currency-label">sat</span>).
+                        </p>
+                        <div class="form-group" style="max-width:260px;">
+                            <label class="form-label" for="products-default-sort">Default sort in request modal</label>
+                            <select class="form-input" id="products-default-sort">
+                                <option value="most_purchased">Most purchased</option>
+                                <option value="newest">Newest first</option>
+                                <option value="title_asc">Title A–Z</option>
+                                <option value="price_asc">Price: low to high</option>
+                                <option value="price_desc">Price: high to low</option>
+                            </select>
+                        </div>
+                        <div id="products-admin-list">
+                            <div class="loading"><div class="spinner"></div></div>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -5223,6 +5483,12 @@ $adminView = $rawAdminView;
                 </svg>
                 Store
             </button>
+            <button class="nav-item hidden" data-view="products" data-admin-only="true" id="nav-products">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4"></path>
+                </svg>
+                Products
+            </button>
             <button class="nav-item hidden" data-view="stats" data-admin-only="true" id="nav-stats">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                     <line x1="18" y1="20" x2="18" y2="10"></line>
@@ -5314,6 +5580,95 @@ $adminView = $rawAdminView;
             </div>
 
             <button class="btn btn-secondary btn-full" style="margin-top: 0.5rem;" onclick="closeModal('modal-request')">Cancel</button>
+        </div>
+    </div>
+
+    <!-- Cart-based request modal: pick products into a cart, then checkout. -->
+    <div class="modal-overlay" id="modal-cart">
+        <div class="modal" style="max-width: 600px;">
+            <div class="modal-handle"></div>
+            <div class="modal-title">Request payment</div>
+
+            <div style="display:flex; gap:0.5rem; margin-bottom:0.5rem;">
+                <input type="text" class="form-input" id="cart-search" placeholder="Search products…" style="flex:1;">
+                <select class="form-input" id="cart-sort" style="width:auto; flex:0 0 auto;">
+                    <option value="most_purchased">Most purchased</option>
+                    <option value="newest">Newest</option>
+                    <option value="title_asc">Title A–Z</option>
+                    <option value="price_asc">Price ↑</option>
+                    <option value="price_desc">Price ↓</option>
+                </select>
+            </div>
+
+            <div id="cart-catalog" style="max-height: 300px; overflow-y: auto; border: 1px solid var(--border, rgba(255,255,255,0.1)); border-radius: 10px;">
+                <div class="loading"><div class="spinner"></div></div>
+            </div>
+            <div id="cart-pagination" style="display:flex; align-items:center; justify-content:center; gap:0.75rem; margin:0.5rem 0; font-size:0.85rem;"></div>
+
+            <button class="btn btn-secondary btn-full" id="btn-add-custom-line" style="margin-bottom:0.5rem;">+ Add custom amount</button>
+            <div id="cart-custom-form" style="display:none; gap:0.5rem; margin-bottom:0.5rem;">
+                <div style="display:flex; gap:0.5rem;">
+                    <input type="text" class="form-input" id="cart-custom-label" placeholder="Label (optional)" style="flex:1;">
+                    <input type="number" class="form-input" id="cart-custom-amount" placeholder="Amount" min="0" step="any" style="width:120px;">
+                    <button class="btn" id="btn-add-custom-confirm" style="width:auto; padding:0.4rem 0.9rem;">Add</button>
+                </div>
+            </div>
+
+            <div class="card" style="padding:0.75rem; margin:0;">
+                <div class="card-title" style="font-size:0.95rem; margin-bottom:0.5rem;">Cart</div>
+                <div id="cart-items"><p style="color:var(--text-secondary); font-size:0.85rem; margin:0;">Cart is empty. Tap a product to add it.</p></div>
+                <div id="cart-total" style="font-weight:600; text-align:right; margin-top:0.5rem;"></div>
+            </div>
+
+            <input type="text" class="form-input" id="cart-memo" placeholder="Description (optional)" style="margin-top:0.5rem;">
+            <button class="btn btn-full" id="btn-cart-checkout" style="margin-top:0.5rem;" disabled>Checkout</button>
+            <button class="btn btn-secondary btn-full" style="margin-top: 0.5rem;" onclick="closeModal('modal-cart')">Cancel</button>
+        </div>
+    </div>
+
+    <!-- Product create/edit (admin) -->
+    <div class="modal-overlay" id="modal-product-edit">
+        <div class="modal">
+            <div class="modal-handle"></div>
+            <div class="modal-title" id="product-edit-title">New product</div>
+            <input type="hidden" id="product-edit-id">
+
+            <div class="form-group">
+                <label class="form-label">Title</label>
+                <input type="text" class="form-input" id="product-edit-title-input" maxlength="200" placeholder="Coffee">
+            </div>
+            <div class="form-group">
+                <label class="form-label">Price (<span id="product-edit-currency">sat</span>)</label>
+                <input type="number" class="form-input" id="product-edit-price" min="0" step="any" placeholder="100">
+            </div>
+            <div class="form-group">
+                <label class="form-label">Image</label>
+                <div style="display:flex; gap:0.5rem; align-items:center; flex-wrap:wrap;">
+                    <div id="product-edit-image-preview" style="width:56px; height:56px; border-radius:10px; display:flex; align-items:center; justify-content:center; font-size:2rem; background:rgba(0,0,0,0.2); overflow:hidden; flex-shrink:0;">📦</div>
+                    <input type="text" class="form-input" id="product-edit-emoji" placeholder="Emoji ☕" maxlength="8" style="width:120px;">
+                    <button type="button" class="btn btn-secondary" id="btn-product-emoji-pick" title="Pick an emoji" style="width:auto; padding:0.4rem 0.7rem; font-size:1.1rem; line-height:1;">＋</button>
+                    <button type="button" class="btn btn-secondary" id="btn-product-upload" style="width:auto; padding:0.4rem 0.8rem;">Upload</button>
+                    <button type="button" class="btn btn-secondary" id="btn-product-clear-image" style="width:auto; padding:0.4rem 0.8rem;">Clear</button>
+                    <input type="file" id="product-edit-file" accept="image/png,image/jpeg,image/webp" style="display:none;">
+                </div>
+                <div id="product-edit-emoji-picker" style="display:none; margin-top:0.5rem; padding:0.5rem; border:1px solid var(--border, rgba(255,255,255,0.1)); border-radius:10px; max-height:180px; overflow-y:auto;">
+                    <div style="display:grid; grid-template-columns:repeat(8, 1fr); gap:0.25rem;"></div>
+                </div>
+                <p class="form-help">Pick an emoji with ＋, type one, or upload a PNG/JPG/WebP (≤2&nbsp;MB). Defaults to 📦.</p>
+            </div>
+            <div id="product-edit-error" style="color:#ef4444; font-size:0.85rem; margin-bottom:0.5rem; display:none;"></div>
+            <button class="btn btn-full" id="btn-save-product">Save product</button>
+            <button class="btn btn-secondary btn-full" style="margin-top:0.5rem;" onclick="closeModal('modal-product-edit')">Cancel</button>
+        </div>
+    </div>
+
+    <!-- Admin invoice line-item detail -->
+    <div class="modal-overlay" id="modal-invoice-detail">
+        <div class="modal">
+            <div class="modal-handle"></div>
+            <div class="modal-title">Invoice items</div>
+            <div id="invoice-detail-content"><div class="loading"><div class="spinner"></div></div></div>
+            <button class="btn btn-secondary btn-full" style="margin-top:0.5rem;" onclick="closeModal('modal-invoice-detail')">Close</button>
         </div>
     </div>
 
@@ -5607,6 +5962,8 @@ $adminView = $rawAdminView;
             if (phpUser.role === 'admin') {
                 const navStats = document.getElementById('nav-stats');
                 if (navStats) navStats.classList.remove('hidden');
+                const navProducts = document.getElementById('nav-products');
+                if (navProducts) navProducts.classList.remove('hidden');
             }
 
             // Check for store_created parameter from setup.php redirect
@@ -5714,8 +6071,18 @@ $adminView = $rawAdminView;
                 if (!ensureAdmin('Only admins can withdraw funds.')) return;
                 openModal('modal-withdraw');
             });
-            document.getElementById('btn-request').addEventListener('click', () => openRequestModal());
+            document.getElementById('btn-request').addEventListener('click', () => openCartModal());
+            const btnReqSimple = document.getElementById('btn-request-simple');
+            if (btnReqSimple) btnReqSimple.addEventListener('click', () => openRequestModal());
             document.getElementById('btn-new-invoice').addEventListener('click', () => openRequestModal());
+
+            // Products admin view + cart modal wiring.
+            const btnNewProduct = document.getElementById('btn-new-product');
+            if (btnNewProduct) btnNewProduct.addEventListener('click', () => openProductEditModal(null));
+            const prodSortSel = document.getElementById('products-default-sort');
+            if (prodSortSel) prodSortSel.addEventListener('change', saveProductDefaultSort);
+            wireCartModal();
+            wireProductEditModal();
 
             // Invoices status filter: persist choice in the URL + refetch.
             const invStatusSel = document.getElementById('invoice-status-filter');
@@ -5904,7 +6271,7 @@ $adminView = $rawAdminView;
         // grow a duplicate history entry.
         function switchView(view, opts) {
             if (!ADMIN_VIEWS.includes(view)) view = 'dashboard';
-            if (view === 'stats' && phpUser.role !== 'admin') {
+            if ((view === 'stats' || view === 'products') && phpUser.role !== 'admin') {
                 showToast('Admin role required', 'error');
                 return;
             }
@@ -5918,6 +6285,7 @@ $adminView = $rawAdminView;
                 dashboard: 'Dashboard',
                 invoices: 'Invoices',
                 stores: 'Store Settings',
+                products: 'Products',
                 settings: 'Settings',
                 stats: 'Stats Dashboard'
             };
@@ -5943,6 +6311,7 @@ $adminView = $rawAdminView;
                 loadInvoices();
             }
             if (view === 'stores') loadStoreSettings();
+            if (view === 'products') loadProductsView();
             if (view === 'stats') loadStats();
             if (view === 'settings') {
                 renderAccountCard();
@@ -6221,6 +6590,10 @@ $adminView = $rawAdminView;
             // If on invoices view, reload invoices
             if (document.getElementById('view-invoices').classList.contains('active')) {
                 loadInvoices();
+            }
+            // If on products view, reload that store's catalog
+            if (document.getElementById('view-products').classList.contains('active')) {
+                loadProductsView();
             }
         }
 
@@ -7196,8 +7569,12 @@ $adminView = $rawAdminView;
                 // swap-status badge appended when the swap isn't fully settled.
                 // Em-dash when there's neither a description nor a badge.
                 const feeBadge = inv.feeRedirect ? feeRedirectBadge(inv.feeRedirect) : '';
-                const noteCell = description || swapBadge || feeBadge
-                    ? `<div>${description ? escapeHtml(description) : ''}${swapBadge}${feeBadge}</div>`
+                // Cart invoices get an inline link to their itemized breakdown.
+                const itemsLink = inv.hasItems
+                    ? ` <a href="#" onclick="openInvoiceItems('${idEsc}'); return false;" style="font-size:0.78rem; color:var(--accent,#60a5fa); white-space:nowrap;">🛒 items</a>`
+                    : '';
+                const noteCell = (description || swapBadge || itemsLink || feeBadge)
+                    ? `<div>${description ? escapeHtml(description) : ''}${swapBadge}${itemsLink}${feeBadge}</div>`
                     : '<span style="color: var(--text-secondary);">—</span>';
                 const destCell = inv.destination
                     ? `<span class="inv-mono">${renderMonoLink('address', inv.destination, network)}</span>`
@@ -10358,6 +10735,476 @@ $adminView = $rawAdminView;
         }
 
         // Modals
+        // ============================ Products + cart ============================
+
+        function currentStoreCurrency() {
+            const store = dashboardData?.stores?.find(s => s.id === currentStoreId);
+            return (store?.default_currency || dashboardData?.mintUnit || 'sat');
+        }
+
+        function formatMoney(amount, currency) {
+            const cur = String(currency || 'sat').toUpperCase();
+            if (cur === 'SAT' || cur === 'SATS') {
+                return Math.round(Number(amount)).toLocaleString() + ' sats';
+            }
+            return Number(amount).toFixed(2) + ' ' + cur;
+        }
+
+        // Inline markup for a product/line image: uploaded picture, emoji, or
+        // the default box.
+        function productImageHtml(imageType, imageValue, imageUrl, sizePx) {
+            const s = sizePx || 40;
+            const box = `width:${s}px;height:${s}px;border-radius:8px;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.18);overflow:hidden;flex-shrink:0;`;
+            if (imageType === 'upload' && imageUrl) {
+                return `<div style="${box}"><img src="${escapeHtml(imageUrl)}" alt="" style="width:100%;height:100%;object-fit:cover;"></div>`;
+            }
+            const glyph = (imageType === 'emoji' && imageValue) ? imageValue : '📦';
+            return `<div style="${box};font-size:${Math.round(s*0.55)}px;">${escapeHtml(glyph)}</div>`;
+        }
+
+        // ---- Admin Products view ----
+
+        let productsAdminCache = [];
+
+        async function loadProductsView() {
+            if (phpUser.role !== 'admin') return;
+            const list = document.getElementById('products-admin-list');
+            const curLabel = document.getElementById('products-currency-label');
+            if (curLabel) curLabel.textContent = String(currentStoreCurrency()).toUpperCase();
+            if (!currentStoreId) {
+                if (list) list.innerHTML = '<p style="color:var(--text-secondary);">Select a store first.</p>';
+                return;
+            }
+            if (list) list.innerHTML = '<div class="loading"><div class="spinner"></div></div>';
+            try {
+                const r = await fetch(`${adminUrl}?api=products_manage&store_id=${encodeURIComponent(currentStoreId)}`, { credentials: 'same-origin' });
+                const data = await r.json();
+                productsAdminCache = data.products || [];
+                const sortSel = document.getElementById('products-default-sort');
+                if (sortSel && data.sort) sortSel.value = data.sort;
+                renderProductsAdmin();
+            } catch (e) {
+                if (list) list.innerHTML = '<p style="color:#ef4444;">Failed to load products.</p>';
+            }
+        }
+
+        function renderProductsAdmin() {
+            const list = document.getElementById('products-admin-list');
+            if (!list) return;
+            if (!productsAdminCache.length) {
+                list.innerHTML = '<p style="color:var(--text-secondary);">No products yet. Click “New product”.</p>';
+                return;
+            }
+            list.innerHTML = productsAdminCache.map(p => `
+                <div style="display:flex; align-items:center; gap:0.75rem; padding:0.6rem 0; border-bottom:1px solid var(--border, rgba(255,255,255,0.08));">
+                    ${productImageHtml(p.imageType, p.imageValue, p.imageUrl, 44)}
+                    <div style="flex:1; min-width:0;">
+                        <div style="font-weight:600; ${p.enabled ? '' : 'opacity:0.5;'}">${escapeHtml(p.title)}${p.enabled ? '' : ' <span style="font-size:0.7rem;">(disabled)</span>'}</div>
+                        <div style="font-size:0.8rem; color:var(--text-secondary);">${escapeHtml(formatMoney(p.price, p.currency))} · ${p.purchaseCount} sold</div>
+                    </div>
+                    <button class="btn btn-secondary" style="width:auto; padding:0.3rem 0.7rem;" onclick="openProductEditModal('${p.id}')">Edit</button>
+                    <button class="btn btn-secondary" style="width:auto; padding:0.3rem 0.7rem;" onclick="toggleProductEnabled('${p.id}')">${p.enabled ? 'Disable' : 'Enable'}</button>
+                    <button class="btn btn-secondary" style="width:auto; padding:0.3rem 0.7rem; color:#ef4444;" onclick="deleteProduct('${p.id}')">Delete</button>
+                </div>
+            `).join('');
+        }
+
+        async function saveProductDefaultSort() {
+            if (!currentStoreId) return;
+            const sort = document.getElementById('products-default-sort').value;
+            try {
+                const r = await postWithCsrf(adminUrl, `action=save_product_sort&store_id=${encodeURIComponent(currentStoreId)}&sort=${encodeURIComponent(sort)}`);
+                const d = await r.json();
+                if (d.success) showToast('Default sort saved', 'success');
+                else showToast(d.error || 'Failed', 'error');
+            } catch (e) { showToast('Failed to save sort', 'error'); }
+        }
+
+        async function toggleProductEnabled(id) {
+            const p = productsAdminCache.find(x => x.id === id);
+            if (!p) return;
+            try {
+                const r = await postWithCsrf(adminUrl, `action=update_product&store_id=${encodeURIComponent(currentStoreId)}&product_id=${encodeURIComponent(id)}&enabled=${p.enabled ? '0' : '1'}`);
+                const d = await r.json();
+                if (d.success) loadProductsView();
+                else showToast(d.error || 'Failed', 'error');
+            } catch (e) { showToast('Failed', 'error'); }
+        }
+
+        async function deleteProduct(id) {
+            const p = productsAdminCache.find(x => x.id === id);
+            if (!confirm('Delete product “' + (p ? p.title : id) + '”? Past invoices keep their line items.')) return;
+            try {
+                const r = await postWithCsrf(adminUrl, `action=delete_product&store_id=${encodeURIComponent(currentStoreId)}&product_id=${encodeURIComponent(id)}`);
+                const d = await r.json();
+                if (d.success) { showToast('Product deleted', 'success'); loadProductsView(); }
+                else showToast(d.error || 'Failed', 'error');
+            } catch (e) { showToast('Failed to delete', 'error'); }
+        }
+
+        // ---- Product create/edit modal ----
+
+        let productEditImage = { type: 'none', value: null, url: null };
+
+        function refreshProductImagePreview() {
+            const prev = document.getElementById('product-edit-image-preview');
+            if (!prev) return;
+            if (productEditImage.type === 'upload' && productEditImage.url) {
+                prev.innerHTML = `<img src="${escapeHtml(productEditImage.url)}" alt="" style="width:100%;height:100%;object-fit:cover;">`;
+            } else if (productEditImage.type === 'emoji' && productEditImage.value) {
+                prev.textContent = productEditImage.value;
+            } else {
+                prev.textContent = '📦';
+            }
+        }
+
+        function openProductEditModal(id) {
+            if (!ensureAdmin('Only admins can manage products.')) return;
+            if (!currentStoreId) { showToast('Select a store first', 'error'); return; }
+            const p = id ? productsAdminCache.find(x => x.id === id) : null;
+            document.getElementById('product-edit-id').value = p ? p.id : '';
+            document.getElementById('product-edit-title').textContent = p ? 'Edit product' : 'New product';
+            document.getElementById('product-edit-title-input').value = p ? p.title : '';
+            document.getElementById('product-edit-price').value = p ? p.price : '';
+            document.getElementById('product-edit-currency').textContent = String(p ? p.currency : currentStoreCurrency()).toUpperCase();
+            document.getElementById('product-edit-emoji').value = (p && p.imageType === 'emoji') ? p.imageValue : '';
+            document.getElementById('product-edit-error').style.display = 'none';
+            productEditImage = p
+                ? { type: p.imageType || 'none', value: p.imageValue || null, url: p.imageUrl || null }
+                : { type: 'none', value: null, url: null };
+            refreshProductImagePreview();
+            const picker = document.getElementById('product-edit-emoji-picker');
+            if (picker) picker.style.display = 'none';
+            document.getElementById('modal-product-edit').classList.add('visible');
+        }
+
+        function wireProductEditModal() {
+            const emoji = document.getElementById('product-edit-emoji');
+            if (emoji) emoji.addEventListener('input', () => {
+                const v = emoji.value.trim();
+                if (v) productEditImage = { type: 'emoji', value: v, url: null };
+                else if (productEditImage.type === 'emoji') productEditImage = { type: 'none', value: null, url: null };
+                refreshProductImagePreview();
+            });
+            const uploadBtn = document.getElementById('btn-product-upload');
+            const fileInput = document.getElementById('product-edit-file');
+            if (uploadBtn && fileInput) {
+                uploadBtn.addEventListener('click', () => fileInput.click());
+                fileInput.addEventListener('change', handleProductImageUpload);
+            }
+            const clearBtn = document.getElementById('btn-product-clear-image');
+            if (clearBtn) clearBtn.addEventListener('click', () => {
+                productEditImage = { type: 'none', value: null, url: null };
+                document.getElementById('product-edit-emoji').value = '';
+                refreshProductImagePreview();
+            });
+            // Emoji picker: the "＋" button toggles a small grid of common
+            // emojis; clicking one fills the input + preview.
+            const pickBtn = document.getElementById('btn-product-emoji-pick');
+            const picker = document.getElementById('product-edit-emoji-picker');
+            if (pickBtn && picker) {
+                const grid = picker.querySelector('div');
+                grid.innerHTML = PRODUCT_EMOJIS.map(em =>
+                    `<button type="button" class="product-emoji-opt" data-emoji="${em}" style="background:none; border:0; cursor:pointer; font-size:1.4rem; padding:0.2rem; border-radius:6px;">${em}</button>`
+                ).join('');
+                grid.addEventListener('click', (e) => {
+                    const btn = e.target.closest('.product-emoji-opt');
+                    if (!btn) return;
+                    const em = btn.dataset.emoji;
+                    document.getElementById('product-edit-emoji').value = em;
+                    productEditImage = { type: 'emoji', value: em, url: null };
+                    refreshProductImagePreview();
+                    picker.style.display = 'none';
+                });
+                pickBtn.addEventListener('click', () => {
+                    picker.style.display = picker.style.display === 'none' ? 'block' : 'none';
+                });
+            }
+            const saveBtn = document.getElementById('btn-save-product');
+            if (saveBtn) saveBtn.addEventListener('click', handleProductSave);
+        }
+
+        // Curated emoji set for the product picker (commerce / food / goods).
+        const PRODUCT_EMOJIS = [
+            '📦','🛍️','🛒','🎁','🏷️','💳','💵','⭐','🔥','✨',
+            '☕','🍵','🧋','🍺','🍷','🥤','🍿','🍫','🍪','🍰',
+            '🍔','🍕','🌮','🥗','🍜','🍣','🥐','🍞','🧀','🍎',
+            '👕','👟','🧢','👜','💍','⌚','🕶️','🧴','💄','🧼',
+            '📱','💻','🎧','🎮','📷','🔋','💡','🔌','🖊️','📚',
+            '🌱','🌸','🪴','🐶','🐱','🎫','🎟️','🏠','🚲','🔧',
+        ];
+
+        async function handleProductImageUpload(e) {
+            const file = e.target.files && e.target.files[0];
+            e.target.value = '';
+            if (!file) return;
+            if (file.size > 2 * 1024 * 1024) { showToast('Image must be 2 MB or smaller', 'error'); return; }
+            const fd = new FormData();
+            fd.append('action', 'upload_product_image');
+            fd.append('image', file);
+            try {
+                const r = await fetch(adminUrl, { method: 'POST', credentials: 'same-origin', headers: { 'X-CSRF-Token': getCsrfToken() }, body: fd });
+                const d = await r.json();
+                if (d.success) {
+                    productEditImage = { type: 'upload', value: d.filename, url: d.url };
+                    document.getElementById('product-edit-emoji').value = '';
+                    refreshProductImagePreview();
+                } else {
+                    showToast(d.error || 'Upload failed', 'error');
+                }
+            } catch (err) { showToast('Upload failed', 'error'); }
+        }
+
+        async function handleProductSave() {
+            const id = document.getElementById('product-edit-id').value;
+            const title = document.getElementById('product-edit-title-input').value.trim();
+            const price = document.getElementById('product-edit-price').value.trim();
+            const errEl = document.getElementById('product-edit-error');
+            errEl.style.display = 'none';
+            if (!title) { errEl.textContent = 'Title is required'; errEl.style.display = 'block'; return; }
+            if (!price || Number(price) <= 0) { errEl.textContent = 'Enter a price greater than zero'; errEl.style.display = 'block'; return; }
+
+            let body = `store_id=${encodeURIComponent(currentStoreId)}`
+                + `&title=${encodeURIComponent(title)}`
+                + `&price=${encodeURIComponent(price)}`
+                + `&image_type=${encodeURIComponent(productEditImage.type)}`
+                + `&image_value=${encodeURIComponent(productEditImage.value || '')}`;
+            const action = id ? 'update_product' : 'create_product';
+            if (id) body += `&product_id=${encodeURIComponent(id)}`;
+            try {
+                const r = await postWithCsrf(adminUrl, `action=${action}&` + body);
+                const d = await r.json();
+                if (d.success) {
+                    closeModal('modal-product-edit');
+                    showToast(id ? 'Product updated' : 'Product created', 'success');
+                    loadProductsView();
+                } else {
+                    errEl.textContent = d.error || 'Failed to save'; errEl.style.display = 'block';
+                }
+            } catch (e) {
+                errEl.textContent = 'Failed to save'; errEl.style.display = 'block';
+            }
+        }
+
+        // ---- Cart request modal ----
+
+        let cartCatalog = [];
+        let cartItems = [];   // {productId|null, title, price, currency, quantity, image:{type,value,url}}
+        let cartPage = 1;
+        const CART_PAGE_SIZE = 10;
+
+        async function openCartModal() {
+            if (!currentStoreId) { showToast('Please select a store first', 'error'); return; }
+            cartItems = [];
+            cartPage = 1;
+            document.getElementById('cart-search').value = '';
+            document.getElementById('cart-memo').value = '';
+            const customForm = document.getElementById('cart-custom-form');
+            if (customForm) customForm.style.display = 'none';
+            renderCart();
+            document.getElementById('cart-catalog').innerHTML = '<div class="loading"><div class="spinner"></div></div>';
+            document.getElementById('modal-cart').classList.add('visible');
+            try {
+                const r = await fetch(`${adminUrl}?api=products&store_id=${encodeURIComponent(currentStoreId)}`, { credentials: 'same-origin' });
+                const data = await r.json();
+                cartCatalog = data.products || [];
+                const sortSel = document.getElementById('cart-sort');
+                if (sortSel && data.sort) sortSel.value = data.sort;
+                renderCartCatalog();
+            } catch (e) {
+                document.getElementById('cart-catalog').innerHTML = '<p style="padding:1rem; color:#ef4444;">Failed to load products.</p>';
+            }
+        }
+
+        function wireCartModal() {
+            const search = document.getElementById('cart-search');
+            if (search) search.addEventListener('input', () => { cartPage = 1; renderCartCatalog(); });
+            const sort = document.getElementById('cart-sort');
+            if (sort) sort.addEventListener('change', () => { cartPage = 1; renderCartCatalog(); });
+            const addCustom = document.getElementById('btn-add-custom-line');
+            if (addCustom) addCustom.addEventListener('click', () => {
+                const f = document.getElementById('cart-custom-form');
+                f.style.display = f.style.display === 'none' ? 'flex' : 'none';
+            });
+            const addCustomConfirm = document.getElementById('btn-add-custom-confirm');
+            if (addCustomConfirm) addCustomConfirm.addEventListener('click', addCustomCartLine);
+            const checkout = document.getElementById('btn-cart-checkout');
+            if (checkout) checkout.addEventListener('click', cartCheckout);
+        }
+
+        function sortCatalog(list, key) {
+            const arr = list.slice();
+            switch (key) {
+                case 'newest': arr.sort((a, b) => b.createdAt - a.createdAt); break;
+                case 'title_asc': arr.sort((a, b) => a.title.toLowerCase().localeCompare(b.title.toLowerCase())); break;
+                case 'price_asc': arr.sort((a, b) => Number(a.price) - Number(b.price)); break;
+                case 'price_desc': arr.sort((a, b) => Number(b.price) - Number(a.price)); break;
+                default: arr.sort((a, b) => (b.purchaseCount - a.purchaseCount) || (b.createdAt - a.createdAt));
+            }
+            return arr;
+        }
+
+        function renderCartCatalog() {
+            const container = document.getElementById('cart-catalog');
+            const pager = document.getElementById('cart-pagination');
+            const q = (document.getElementById('cart-search').value || '').trim().toLowerCase();
+            const sortKey = document.getElementById('cart-sort').value;
+            let filtered = cartCatalog.filter(p => p.title.toLowerCase().includes(q));
+            filtered = sortCatalog(filtered, sortKey);
+
+            const totalPages = Math.max(1, Math.ceil(filtered.length / CART_PAGE_SIZE));
+            if (cartPage > totalPages) cartPage = totalPages;
+            const start = (cartPage - 1) * CART_PAGE_SIZE;
+            const pageItems = filtered.slice(start, start + CART_PAGE_SIZE);
+
+            if (!filtered.length) {
+                container.innerHTML = '<p style="padding:1rem; color:var(--text-secondary); margin:0;">' +
+                    (cartCatalog.length ? 'No products match your search.' : 'No products for this store yet.') + '</p>';
+                pager.innerHTML = '';
+                return;
+            }
+            container.innerHTML = pageItems.map(p => `
+                <div role="button" tabindex="0" onclick="addToCart('${p.id}')" style="display:flex; align-items:center; gap:0.6rem; padding:0.55rem 0.6rem; cursor:pointer; border-bottom:1px solid var(--border, rgba(255,255,255,0.06));">
+                    ${productImageHtml(p.imageType, p.imageValue, p.imageUrl, 38)}
+                    <div style="flex:1; min-width:0;">
+                        <div style="font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${escapeHtml(p.title)}</div>
+                        <div style="font-size:0.8rem; color:var(--text-secondary);">${escapeHtml(formatMoney(p.price, p.currency))}</div>
+                    </div>
+                    <div style="font-size:1.3rem; color:var(--accent, #60a5fa);">＋</div>
+                </div>
+            `).join('');
+
+            pager.innerHTML = totalPages > 1 ? `
+                <button class="btn btn-secondary" style="width:auto; padding:0.25rem 0.7rem;" ${cartPage <= 1 ? 'disabled' : ''} onclick="cartGoPage(${cartPage - 1})">‹</button>
+                <span>Page ${cartPage} / ${totalPages}</span>
+                <button class="btn btn-secondary" style="width:auto; padding:0.25rem 0.7rem;" ${cartPage >= totalPages ? 'disabled' : ''} onclick="cartGoPage(${cartPage + 1})">›</button>
+            ` : '';
+        }
+
+        function cartGoPage(n) { cartPage = n; renderCartCatalog(); }
+
+        function addToCart(productId) {
+            const p = cartCatalog.find(x => x.id === productId);
+            if (!p) return;
+            const existing = cartItems.find(i => i.productId === productId);
+            if (existing) existing.quantity = Math.min(999, existing.quantity + 1);
+            else cartItems.push({ productId: p.id, title: p.title, price: p.price, currency: p.currency, quantity: 1, image: { type: p.imageType, value: p.imageValue, url: p.imageUrl } });
+            renderCart();
+        }
+
+        function addCustomCartLine() {
+            const amount = document.getElementById('cart-custom-amount').value.trim();
+            const label = document.getElementById('cart-custom-label').value.trim() || 'Custom amount';
+            if (!amount || Number(amount) <= 0) { showToast('Enter a custom amount', 'error'); return; }
+            cartItems.push({ productId: null, title: label, price: amount, currency: currentStoreCurrency(), quantity: 1, image: { type: 'none' } });
+            document.getElementById('cart-custom-amount').value = '';
+            document.getElementById('cart-custom-label').value = '';
+            document.getElementById('cart-custom-form').style.display = 'none';
+            renderCart();
+        }
+
+        function changeCartQty(index, delta) {
+            const it = cartItems[index];
+            if (!it) return;
+            it.quantity += delta;
+            if (it.quantity < 1) { cartItems.splice(index, 1); }
+            else if (it.quantity > 999) { it.quantity = 999; }
+            renderCart();
+        }
+
+        function renderCart() {
+            const wrap = document.getElementById('cart-items');
+            const totalEl = document.getElementById('cart-total');
+            const checkoutBtn = document.getElementById('btn-cart-checkout');
+            if (!cartItems.length) {
+                wrap.innerHTML = '<p style="color:var(--text-secondary); font-size:0.85rem; margin:0;">Cart is empty. Tap a product to add it.</p>';
+                totalEl.textContent = '';
+                if (checkoutBtn) checkoutBtn.disabled = true;
+                return;
+            }
+            wrap.innerHTML = cartItems.map((it, idx) => `
+                <div style="display:flex; align-items:center; gap:0.5rem; padding:0.4rem 0; border-bottom:1px solid var(--border, rgba(255,255,255,0.06));">
+                    ${productImageHtml(it.image && it.image.type, it.image && it.image.value, it.image && it.image.url, 32)}
+                    <div style="flex:1; min-width:0;">
+                        <div style="font-weight:500; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${escapeHtml(it.title)}</div>
+                        <div style="font-size:0.78rem; color:var(--text-secondary);">${escapeHtml(formatMoney(it.price, it.currency))} each</div>
+                    </div>
+                    <div style="display:flex; align-items:center; gap:0.3rem;">
+                        <button class="btn btn-secondary" style="width:28px; padding:0.1rem 0;" onclick="changeCartQty(${idx}, -1)">−</button>
+                        <span style="min-width:1.5rem; text-align:center;">${it.quantity}</span>
+                        <button class="btn btn-secondary" style="width:28px; padding:0.1rem 0;" onclick="changeCartQty(${idx}, 1)">＋</button>
+                    </div>
+                </div>
+            `).join('');
+
+            const totals = {};
+            cartItems.forEach(it => {
+                const cur = String(it.currency || 'sat').toUpperCase();
+                totals[cur] = (totals[cur] || 0) + Number(it.price) * it.quantity;
+            });
+            const parts = Object.keys(totals).map(c => formatMoney(totals[c], c));
+            totalEl.textContent = 'Total: ' + parts.join(' + ');
+            if (checkoutBtn) checkoutBtn.disabled = false;
+        }
+
+        async function cartCheckout() {
+            if (!cartItems.length) return;
+            const btn = document.getElementById('btn-cart-checkout');
+            btn.disabled = true;
+            const items = cartItems.map(it => it.productId
+                ? { product_id: it.productId, quantity: it.quantity }
+                : { title: it.title, price: it.price, currency: it.currency, quantity: it.quantity });
+            const memo = document.getElementById('cart-memo').value.trim();
+            let body = `store_id=${encodeURIComponent(currentStoreId)}`
+                + `&items=${encodeURIComponent(JSON.stringify(items))}`
+                + `&redirect=${encodeURIComponent(window.location.href.split('?')[0])}`;
+            if (memo) body += `&memo=${encodeURIComponent(memo)}`;
+            try {
+                const r = await postWithCsrf(adminUrl, `action=cart_checkout&` + body);
+                const d = await r.json();
+                if (d.success && d.checkoutLink) {
+                    window.location.href = d.checkoutLink;
+                } else {
+                    showToast(d.error || 'Checkout failed', 'error');
+                    btn.disabled = false;
+                }
+            } catch (e) {
+                showToast('Checkout failed', 'error');
+                btn.disabled = false;
+            }
+        }
+
+        // ---- Admin invoice line-item detail ----
+
+        async function openInvoiceItems(invoiceId) {
+            const content = document.getElementById('invoice-detail-content');
+            content.innerHTML = '<div class="loading"><div class="spinner"></div></div>';
+            document.getElementById('modal-invoice-detail').classList.add('visible');
+            try {
+                const r = await fetch(`${adminUrl}?api=invoice_items&id=${encodeURIComponent(invoiceId)}`, { credentials: 'same-origin' });
+                const d = await r.json();
+                const items = d.items || [];
+                if (!items.length) {
+                    content.innerHTML = '<p style="color:var(--text-secondary);">This invoice has no cart line items.</p>';
+                    return;
+                }
+                let totalSats = 0;
+                content.innerHTML = items.map(it => {
+                    totalSats += it.amountSats;
+                    const paren = (it.displayAmount && it.displayCurrency && String(it.displayCurrency).toUpperCase() !== 'SAT')
+                        ? ` <span style="color:var(--text-secondary);">(${escapeHtml(formatMoney(it.displayAmount, it.displayCurrency))})</span>` : '';
+                    return `<div style="display:flex; align-items:center; gap:0.6rem; padding:0.45rem 0; border-bottom:1px solid var(--border, rgba(255,255,255,0.06));">
+                        ${productImageHtml(it.imageType, it.imageValue, it.imageUrl, 34)}
+                        <div style="flex:1;"><div style="font-weight:500;">${escapeHtml(it.title)}</div>
+                        <div style="font-size:0.8rem; color:var(--text-secondary);">×${it.quantity}</div></div>
+                        <div style="text-align:right;">${it.amountSats.toLocaleString()} sats${paren}</div>
+                    </div>`;
+                }).join('') + `<div style="text-align:right; font-weight:600; margin-top:0.5rem;">Total: ${totalSats.toLocaleString()} sats</div>`;
+            } catch (e) {
+                content.innerHTML = '<p style="color:#ef4444;">Failed to load items.</p>';
+            }
+        }
+
         function openModal(id) {
             // Configure input attributes based on mint unit
             const mintUnit = dashboardData?.mintUnit || 'sat';
