@@ -160,6 +160,10 @@ class Invoice {
                             'bolt11' => $probed['bolt11'],
                             'verify_url' => $probed['verify_url'],
                             'amount_sats' => $lnurlTargetSats,
+                            // The LN address this bolt11 was fetched from. Persisted
+                            // as ln_destination so the admin invoice view can show
+                            // where a lightning payment was sent.
+                            'address' => $lnAddress,
                         ];
                         if ($priority > 0) {
                             error_log(sprintf(
@@ -308,6 +312,9 @@ class Invoice {
 
         // Decide payment_rail + final field values
         $lnurlVerifyUrl = null;
+        // The Lightning destination the bolt11 points at (LN address / LNURL).
+        // Only set for lnaddress-rail invoices; NULL for mint/swap/onchain.
+        $lnDestination = null;
         if ($feeLightning !== null) {
             // Fee-redirect lightning rail: the customer pays the fee LNURL's
             // bolt11 directly. Rides payment_rail='lnaddress' so the existing
@@ -319,6 +326,7 @@ class Invoice {
             $quoteIdFinal = null;
             $amountSatsFinal = $invoiceSats;
             $lnurlVerifyUrl = $feeLightning['verify_url'];
+            $lnDestination = $feeLightning['destination'] ?? null;
         } elseif ($lnurlAttempt !== null) {
             $paymentRail = 'lnaddress';
             $bolt11Final = $lnurlAttempt['bolt11'];
@@ -326,6 +334,7 @@ class Invoice {
             $quoteIdFinal = null;
             $amountSatsFinal = $lnurlAttempt['amount_sats'];
             $lnurlVerifyUrl = $lnurlAttempt['verify_url'];
+            $lnDestination = $lnurlAttempt['address'] ?? null;
         } elseif ($swapAttempt !== null) {
             $paymentRail = 'swap';
             $bolt11Final = $swapAttempt['swap']->invoice;
@@ -368,6 +377,7 @@ class Invoice {
             'payment_rail' => $paymentRail,
             'lnurl_verify_url' => $lnurlVerifyUrl,
             'lnurl_override_reason' => $lnurlOverrideReason,
+            'ln_destination' => $lnDestination,
             'fee_redirect_note' => $feeNote,
             'fee_redirect_destination' => $feeDestination,
             'fee_redirect_rails' => $feeRails ? implode(',', $feeRails) : null,
@@ -1108,6 +1118,18 @@ class Invoice {
                 if (!empty($sa['claim_txid'])) {
                     $result['claimTxid'] = $sa['claim_txid'];
                 }
+            }
+        } elseif (($rail === 'lnaddress' || $rail === 'mint') && !empty($invoice['bolt11'])) {
+            // Lightning rails have no block-chain txid; surface the bolt11 as the
+            // "TxID" (rendered copy-only, not as an explorer link) and the LN
+            // address / LNURL it was sent to as the destination. The mint rail
+            // has no lnurl destination (paid to the mint), so ln_destination is
+            // NULL there and the destination cell stays empty.
+            $result['txid'] = $invoice['bolt11'];
+            $result['txidIsLightning'] = true;
+            if (!empty($invoice['ln_destination'])) {
+                $result['destination'] = $invoice['ln_destination'];
+                $result['destinationIsLightning'] = true;
             }
         }
 

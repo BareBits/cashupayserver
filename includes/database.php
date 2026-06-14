@@ -649,6 +649,16 @@ HTACCESS;
         if (!self::columnExists($pdo, 'invoices', 'fee_redirect_rails')) {
             $pdo->exec("ALTER TABLE invoices ADD COLUMN fee_redirect_rails TEXT DEFAULT NULL");
         }
+        //   - invoices.ln_destination: the Lightning destination the bolt11 on
+        //     this invoice was fetched from — the merchant's LN address for a
+        //     normal lnaddress-rail payment, or the fee payee's LNURL when the
+        //     lightning rail is fee-routed. NULL for mint/onchain/swap rails
+        //     (the mint-rail bolt11 has no lnurl destination). Surfaced as the
+        //     "Destination" in the admin invoices view; the bolt11 itself is
+        //     shown as the lightning "TxID".
+        if (!self::columnExists($pdo, 'invoices', 'ln_destination')) {
+            $pdo->exec("ALTER TABLE invoices ADD COLUMN ln_destination TEXT DEFAULT NULL");
+        }
         if (!self::columnExists($pdo, 'melts', 'via')) {
             $pdo->exec("ALTER TABLE melts ADD COLUMN via TEXT NOT NULL DEFAULT 'wallet'");
         }

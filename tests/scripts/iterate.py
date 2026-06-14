@@ -63,6 +63,11 @@ from fixtures.lnd import (  # noqa: E402
     start_lnd,
     stop_lnd,
 )
+from fixtures.lnurlp_server import (  # noqa: E402
+    LnurlpServer,
+    start_lnurlp_server,
+    stop_lnurlp_server,
+)
 from fixtures.nutshell import MintHandle, NUTSHELL_VENV, start_mint, stop_mint  # noqa: E402
 from fixtures.onchain import (  # noqa: E402
     OnchainContext,
@@ -89,6 +94,18 @@ SINGLE_ONCHAIN_AMOUNT_SAT_A = 30000
 SINGLE_ONCHAIN_AMOUNT_SAT_B = 45000
 CASHU_AMOUNT_SAT = 800
 CASHU_FUNDING_SAT = 5000  # how much to mint into the auto-pay Cashu wallet
+
+# Lightning-address + fee-redirect demo (section 7b). These exercise the
+# lnaddress rail through the mock LNURL host so the admin invoices view shows
+# a real LN destination + bolt11 "txid", and a fee redirect so the fee badge
+# is visible. The domains are arbitrary — CASHU_LNURL_URL_TEMPLATE routes
+# every address through the local mock regardless of the @domain.
+STORE_FEEREDIRECT = "feeredirect"
+MERCHANT_LN_ADDRESS = "merchant@iterate.local"   # store auto-melt destination
+DEV_FEE_LN_ADDRESS = "dev-fee@iterate.local"     # CASHUPAY_DEV_FEE_LNURL override
+LNADDR_AMOUNT_SAT = 5000          # > fees owed, so it routes to the merchant LN address
+FEE_REDIRECT_AMOUNT_SAT = 2000    # << seeded dev-fee owed, so the invoice is redirected
+FEE_REDIRECT_SEED_REVENUE_SAT = 1_000_000  # 2% dev fee => ~20k sat owed, dwarfs the invoice
 # Customer-side wallet funding (the wallets handed off for manual play)
 ELECTRUM_FUNDING_SAT = 10_000_000   # 0.1 BTC on-chain
 ELECTRUM_CHANNEL_SAT = 200_000      # Lightning channel capacity to lnd_mint
@@ -251,6 +268,80 @@ def wait_for_status(gc: GreenfieldClient, store_id: str, invoice_id: str, expect
     raise AssertionError(f"{label or invoice_id} never reached {expected}; last={last}")
 
 
+def _enable_auto_melt(admin: AdminClient, store_id: str, address: str,
+                      threshold_sat: int = 1) -> dict:
+    """Configure a store's auto-withdraw (auto-melt) LN address via the same
+    admin endpoint the dashboard uses. The handler probes the address for
+    LUD-21 support through the mock LNURL host. With it set, a lightning
+    invoice on this store routes to the lnaddress rail."""
+    return admin._post_action(
+        "save_auto_melt",
+        store_id=store_id,
+        address=address,
+        enabled="1",
+        threshold=str(threshold_sat),
+    )
+
+
+def _seed_fee_revenue(payserver: PayserverHandle, store_id: str, sats: int) -> None:
+    """Insert a synthetic Settled invoice so DevFee::computeOwed sees revenue
+    without us having to pay it. Also zeroes fee_tracking_start_at so the row
+    falls inside the accounting window. Mirrors the e2e fee-redirect fixture —
+    used here to push the dev fee owed above the demo invoice so the redirect
+    fires deterministically."""
+    import sqlite3
+    db_path = payserver.data_dir / "cashupay.sqlite"
+    now = int(time.time())
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO config (key, value, created_at, updated_at) "
+            "VALUES ('fee_tracking_start_at', '0', ?, ?)",
+            (now, now),
+        )
+        conn.execute(
+            "INSERT INTO invoices "
+            "(id, store_id, status, amount, currency, amount_sats, "
+            " created_at, expiration_time, payment_rail, settled_rail, paid_at) "
+            "VALUES (?, ?, 'Settled', ?, 'sat', ?, ?, ?, 'lnaddress', 'lnaddress', ?)",
+            (
+                f"seed_{uuid.uuid4().hex[:8]}",
+                store_id,
+                str(sats),
+                sats,
+                now - 60,
+                now + 3600,
+                now - 60,
+            ),
+        )
+        conn.commit()
+
+
+def settle_lnaddress(payserver: PayserverHandle, gc: GreenfieldClient, store_id: str,
+                     invoice_id: str, timeout_s: float = 45.0, label: str = "") -> dict:
+    """Drive an lnaddress-rail invoice to Settled. The customer-side payment
+    is already done (the bolt11 was paid on the receiver LND); settlement is
+    detected by polling the LUD-21 verify URL. Hitting payment.php?json=1
+    dispatches Invoice::pollSingleLnAddress, the same poll the live payment
+    page runs, so we don't have to wait for the cron tick."""
+    import requests
+    deadline = time.monotonic() + timeout_s
+    last = None
+    while time.monotonic() < deadline:
+        try:
+            requests.get(
+                f"{payserver.url}/payment.php",
+                params={"id": invoice_id, "json": "1"},
+                timeout=15,
+            )
+        except requests.RequestException:
+            pass
+        last = gc.get_invoice(store_id, invoice_id)
+        if last.get("status") == "Settled":
+            return last
+        time.sleep(0.5)
+    raise AssertionError(f"{label or invoice_id} (lnaddress) never settled; last={last}")
+
+
 def _create_second_store(admin: AdminClient, db_path: Path, name: str, model_store_id: str) -> str:
     """Create a second store via the admin create_store action, then copy the
     wizard-created store's mint config (mint_url, mint_unit, seed_phrase) over
@@ -346,8 +437,25 @@ def main() -> int:
         backup_mint = start_mint(workdir, lnd_mint, name="nutshell-backup")
         handles.append(("backup_mint", stop_mint, backup_mint))
 
+        # Mock LNURL-pay host (LUD-16 + LUD-21), backed by lnd_mint so the
+        # customer (lnd_payer) can pay invoices it issues. Started before the
+        # payserver so its URL template can be injected via the environment.
+        print("[iterate] starting mock LNURL-pay host (backed by lnd_mint) ...")
+        lnurlp = start_lnurlp_server(lnd_mint, lud21=True)
+        handles.append(("lnurlp", stop_lnurlp_server, lnurlp))
+
         print("[iterate] starting cashupayserver ...")
-        payserver = start_payserver(workdir / "payserver")
+        payserver = start_payserver(
+            workdir / "payserver",
+            extra_env={
+                # Route every LN address (merchant + dev fee) through the mock.
+                "CASHU_LNURL_URL_TEMPLATE": lnurlp.url_template,
+                # Override the dev-fee LNURL so a fee redirect can be shown
+                # end-to-end without ever probing the real mainnet default
+                # (fees@getbarebits.com).
+                "CASHUPAY_DEV_FEE_LNURL": DEV_FEE_LN_ADDRESS,
+            },
+        )
         handles.append(("payserver", stop_payserver, payserver))
 
         onchain = make_onchain_context(bitcoind, f"cashupay-watch-iter-{uuid.uuid4().hex[:6]}")
@@ -538,6 +646,58 @@ def main() -> int:
                                       timeout_s=30, label=f"cashu {label}")
             results.append((label, "Cashu", inv["id"], settled["status"]))
 
+        # 7b. Lightning-address rail + fee-redirect examples. Both ride the
+        #     lnaddress rail through the mock LNURL host and are paid by
+        #     lnd_payer, so no customer wallet is needed yet.
+        print("\n[iterate] === Lightning-address + fee-redirect examples ===")
+
+        # (a) Normal LN-address payment: route a lightning invoice to the
+        #     merchant's auto-withdraw LN address. Surfaces the LN destination
+        #     (the address) + bolt11 "txid" in the admin invoices view, with
+        #     no fee badge. Amount is well above oneconf's owed fees so it is
+        #     neither redirected nor forced onto the mint rail.
+        save_res = _enable_auto_melt(admin, oneconf_store_id, MERCHANT_LN_ADDRESS)
+        print(f"  [lnaddr] auto-melt configured on oneconf -> {MERCHANT_LN_ADDRESS} "
+              f"(success={save_res.get('success')})")
+        lnaddr_inv = gc_oneconf.create_invoice(
+            oneconf_store_id, amount=str(LNADDR_AMOUNT_SAT), currency="sat",
+            metadata={"label": "lnaddress-iterate"},
+        )
+        print(f"  [lnaddr] {lnaddr_inv['id']} rail={lnaddr_inv.get('paymentRail')} "
+              f"-> paying {LNADDR_AMOUNT_SAT} sat via lnd_payer")
+        lnd_payer.pay_invoice_sync(bolt11_of(lnaddr_inv), timeout=30)
+        settled = settle_lnaddress(payserver, gc_oneconf, oneconf_store_id,
+                                   lnaddr_inv["id"], label=f"lnaddress oneconf")
+        results.append(("oneconf", "LN-address", lnaddr_inv["id"], settled["status"]))
+
+        # (b) Fee redirect: a dedicated store with the dev fee owed seeded well
+        #     above the invoice amount, so FeeRedirect::decide points the whole
+        #     (lightning-only) invoice at the dev fee LNURL. Paying it records a
+        #     redirect credit instead of crediting the merchant — the admin
+        #     invoices view shows the "Fee payment" badge + the fee destination.
+        print(f"  [fee] creating '{STORE_FEEREDIRECT}' store + seeding "
+              f"{FEE_REDIRECT_SEED_REVENUE_SAT:,} sat revenue ...")
+        feeredirect_store_id = _create_second_store(
+            admin, payserver.db_path, STORE_FEEREDIRECT, oneconf_store_id,
+        )
+        key_fee = admin.create_api_key(feeredirect_store_id, label="iterate-feeredirect")
+        gc_fee = GreenfieldClient(payserver.url, key_fee["key"])
+        _seed_fee_revenue(payserver, feeredirect_store_id, sats=FEE_REDIRECT_SEED_REVENUE_SAT)
+        fee_inv = gc_fee.create_invoice(
+            feeredirect_store_id, amount=str(FEE_REDIRECT_AMOUNT_SAT), currency="sat",
+            metadata={"label": "fee-redirect-iterate"},
+        )
+        fr = fee_inv.get("feeRedirect")
+        print(f"  [fee] {fee_inv['id']} rail={fee_inv.get('paymentRail')} "
+              f"feeRedirect={fr} -> paying {FEE_REDIRECT_AMOUNT_SAT} sat via lnd_payer")
+        if not fr:
+            print("  [fee] WARNING: invoice was NOT redirected to a fee — check "
+                  "seeded revenue / dev fee config")
+        lnd_payer.pay_invoice_sync(bolt11_of(fee_inv), timeout=30)
+        settled = settle_lnaddress(payserver, gc_fee, feeredirect_store_id,
+                                   fee_inv["id"], label="fee-redirect")
+        results.append((STORE_FEEREDIRECT, "Fee-redirect", fee_inv["id"], settled["status"]))
+
         # 8. Customer-side wallets: fund Electrum on-chain and open its LN
         #    channel. (Electrum + Fulcrum were started earlier so we could
         #    grab the vpub before configuring the stores.)
@@ -689,6 +849,10 @@ def main() -> int:
         print(f"oneconf API key:  {token_oneconf}")
         print(f"zeroconf store id:{zeroconf_store_id}    (on-chain min_confs=0)")
         print(f"zeroconf API key: {token_zeroconf}")
+        print(f"feeredirect store:{feeredirect_store_id}    (dev-fee redirect demo; LN-only)")
+        print(f"LNURL mock host:  {lnurlp.base_url}    (merchant + dev-fee LN addresses)")
+        print(f"                  oneconf has an LN-address payment ({MERCHANT_LN_ADDRESS});")
+        print(f"                  feeredirect store has a 'Fee payment' redirect to {DEV_FEE_LN_ADDRESS}")
         print(f"Workdir:          {workdir}")
         print(f"Auto-mine:        every {AUTOMINE_INTERVAL_SEC}s (so oneconf on-chain invoices settle)")
         print(f"\nElectrum:         GUI launched (regtest); vpub registered on both stores")
