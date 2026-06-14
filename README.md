@@ -27,7 +27,7 @@ Accept Bitcoin Lightning payments without running a full BTCPay Server instance.
 
 **You are responsible for your own funds. The developers are not liable for any losses.**
 
-**Important:** A selected Cashu mint takes custody of your funds until you withdraw. For maximum sovereignty, run your own mint or enable auto-withdrawal to move funds immediately to your Lightning wallet.
+**Important:** A selected Cashu mint takes custody of your funds until you withdraw. For maximum sovereignty, run your own mint or enable auto-cashout to move funds immediately to your Lightning wallet.
 
 ---
 
@@ -52,7 +52,7 @@ Cashu Mint ──► Lightning Network
 - **No accounts or KYC** - Your store talks to the mint's public API directly.
 - **Pure Lightning experience** - Customers see a normal Lightning invoice.
 - **On-chain Bitcoin payments** - Accept direct Bitcoin transactions alongside Lightning. Funds go straight to *your* wallet (xpub-derived addresses) — never to the mint. See [docs/onchain.md](docs/onchain.md).
-- **Auto-withdrawal** - Optionally send funds directly to your Lightning address.
+- **Auto-cashout** - Optionally send funds directly to your Lightning address.
 - **Open source** - Read every line of code. Fork it, audit it yourself. Dual-licensed MIT (pre-2026-05-30) and Modified MIT (post-2026-05-30). See [LICENSE.md](LICENSE.md) and [USE_POLICY.md](USE_POLICY.md).
 
 ### Trade-offs
@@ -221,7 +221,7 @@ After installation, configure WooCommerce to use BareBits:
 
 ### Recommended: Configure system cron
 
-BareBits's background tasks — invoice polling, auto-withdrawal, and
+BareBits's background tasks — invoice polling, auto-cashout, and
 fee settlement — run on a tight schedule when your hosting environment
 invokes `cron.php` once a minute. Without it, the same tasks still fire
 opportunistically when an admin or customer loads a page, but with
@@ -508,7 +508,7 @@ A PHP-only updater pulls release zips from a chosen channel (`main` or `testing`
 
 #### Email notifications
 
-Optional SMTP or `mail()`-based notifications for invoice-paid and auto-withdrawal events, with per-recipient resolution, dedupe, queue-drain, and a master kill-switch. Plugs into the existing cron loop.
+Optional SMTP or `mail()`-based notifications for invoice-paid and auto-cashout events, with per-recipient resolution, dedupe, queue-drain, and a master kill-switch. Plugs into the existing cron loop.
 
 #### Mint reliability tracking
 

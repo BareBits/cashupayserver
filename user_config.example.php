@@ -163,7 +163,7 @@
 // =============================================================================
 // AUTO-MELT VIA SUBMARINE SWAP
 // =============================================================================
-// When a store opts into "Auto-withdraw via submarine swap" (instead of the
+// When a store opts into "Auto-cashout via submarine swap" (instead of the
 // Lightning-address path), the cron sweeps the mint balance through a
 // reverse submarine swap to the store's on-chain xpub.
 //
@@ -194,14 +194,14 @@
 // define('CASHUPAY_AUTO_MELT_SWAP_MAX_FEE_PCT', 1.0);
 
 // CASHUPAY_STRIKE_URL — destination for the "get a free lightning address"
-// Strike links shown in the auto-withdrawal settings. Defaults to
+// Strike links shown in the auto-cashout settings. Defaults to
 // 'http://strike.me'. Override to point merchants at a referral/localized URL.
 //
 // define('CASHUPAY_STRIKE_URL', 'http://strike.me');
 
 // LNURL DIRECT-RECEIVE
 // --------------------
-// When a store has an auto-withdraw Lightning address configured and the
+// When a store has an auto-cashout Lightning address configured and the
 // host supports LUD-21 verify URLs, incoming Lightning payments route
 // directly to that address instead of through the cashu mint. An invoice
 // smaller than the accumulated upstream/dev/hosting fees the store owes

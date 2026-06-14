@@ -55,14 +55,14 @@ Database::update('stores', ['notifications_enabled' => 0], 'id = ?', [$store]);
 NotificationSender::queueInvoicePaid($invoice);
 assert_eq(1, pending_count(), 'store-disabled cannot be overridden by global on');
 
-// Re-enable store + queue auto-withdraw events behind their own switch.
+// Re-enable store + queue auto-cashout events behind their own switch.
 Database::update('stores', ['notifications_enabled' => 1], 'id = ?', [$store]);
-Config::set('notifications_auto_withdraw_enabled', false);
-NotificationSender::queueAutoWithdrawSuccess($store, 50000, 'user@dest.com');
-assert_eq(1, pending_count(), 'auto-withdraw success gated by its own switch');
+Config::set('notifications_auto_cashout_enabled', false);
+NotificationSender::queueAutoCashoutSuccess($store, 50000, 'user@dest.com');
+assert_eq(1, pending_count(), 'auto-cashout success gated by its own switch');
 
-Config::set('notifications_auto_withdraw_enabled', true);
-NotificationSender::queueAutoWithdrawSuccess($store, 50000, 'user@dest.com');
-assert_eq(2, pending_count(), 'auto-withdraw success enqueues when both switches on');
+Config::set('notifications_auto_cashout_enabled', true);
+NotificationSender::queueAutoCashoutSuccess($store, 50000, 'user@dest.com');
+assert_eq(2, pending_count(), 'auto-cashout success enqueues when both switches on');
 
 echo "test_notification_master_switch: ok\n";

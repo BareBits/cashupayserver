@@ -164,7 +164,7 @@ class LightningAddress {
 
     /**
      * Check and perform auto-melt for all stores with auto-melt enabled
-     * Called on each admin page load to check if any stores need auto-withdrawal
+     * Called on each admin page load to check if any stores need auto-cashout
      */
     public static function checkAutoMelt(): ?array {
         // Get all stores with auto-melt enabled. Includes auto_melt_use_swap +
@@ -254,7 +254,7 @@ class LightningAddress {
                                 $store['id'],
                                 $address,
                                 $meltAmountSats,
-                                'BareBits auto-withdrawal'
+                                'BareBits auto-cashout'
                             );
                             $usedAddress = $address;
                             if ($priority > 0) {
@@ -299,7 +299,7 @@ class LightningAddress {
                             'success' => true,
                         ];
 
-                        NotificationSender::queueAutoWithdrawSuccess(
+                        NotificationSender::queueAutoCashoutSuccess(
                             $store['id'],
                             $meltAmountSats,
                             $usedAddress
@@ -312,7 +312,7 @@ class LightningAddress {
                         // crash the admin page load.
                         $errMsg = $lastMeltError ? $lastMeltError->getMessage() : 'unknown error';
                         error_log("Auto-melt operation failed for store {$store['id']} (all " . count($addresses) . " address(es)): " . $errMsg);
-                        NotificationSender::queueAutoWithdrawFailure(
+                        NotificationSender::queueAutoCashoutFailure(
                             $store['id'],
                             $primaryAddress,
                             $errMsg,
@@ -329,9 +329,9 @@ class LightningAddress {
             } catch (Exception $e) {
                 error_log("Auto-melt check failed for store {$store['id']}: " . $e->getMessage());
                 // Pre-flight failure (balance lookup, etc.) — still notify so
-                // operators see that auto-withdrawal is wedged.
+                // operators see that auto-cashout is wedged.
                 if (!empty($primaryAddress)) {
-                    NotificationSender::queueAutoWithdrawFailure(
+                    NotificationSender::queueAutoCashoutFailure(
                         $store['id'],
                         $primaryAddress,
                         $e->getMessage(),

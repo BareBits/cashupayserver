@@ -60,17 +60,17 @@ final class SweepSwapSettlement implements SwapSettlementContext {
     public function onSettled(array $row): void {
         $amount = (int)($row['target_onchain_amount_sats'] ?? 0);
         $destination = $row['merchant_address'] ?? '';
-        NotificationSender::queueAutoWithdrawSuccess($row['store_id'], $amount, $destination);
+        NotificationSender::queueAutoCashoutSuccess($row['store_id'], $amount, $destination);
         error_log("SwapAutoMelt: sweep {$row['id']} settled — {$amount} sats to {$destination}");
     }
 
     public function onInvalid(array $row, string $providerStatus, string $message): void {
         $amount = (int)($row['target_onchain_amount_sats'] ?? 0);
         $destination = $row['merchant_address'] ?? '';
-        NotificationSender::queueAutoWithdrawFailure(
+        NotificationSender::queueAutoCashoutFailure(
             $row['store_id'],
             $destination,
-            "Swap-mode auto-withdrawal failed: {$providerStatus} — {$message}",
+            "Swap-mode auto-cashout failed: {$providerStatus} — {$message}",
             $amount
         );
         error_log("SwapAutoMelt: sweep {$row['id']} invalid — {$providerStatus}: {$message}");
@@ -423,10 +423,10 @@ final class SwapAutoMelt {
                     "UPDATE sweep_attempts SET status = 'error', error_message = ?, updated_at = ? WHERE id = ?",
                     [substr('melt failed: ' . $e->getMessage(), 0, 500), time(), $sweepId]
                 );
-                NotificationSender::queueAutoWithdrawFailure(
+                NotificationSender::queueAutoCashoutFailure(
                     $storeId,
                     $created['merchant_address'],
-                    'Swap-mode auto-withdrawal failed (cashu melt): ' . $e->getMessage(),
+                    'Swap-mode auto-cashout failed (cashu melt): ' . $e->getMessage(),
                     $balanceSats
                 );
                 throw $e;

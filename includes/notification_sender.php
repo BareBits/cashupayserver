@@ -2,11 +2,11 @@
 /**
  * CashuPayServer - Notification Sender Module
  *
- * Queues email notifications for invoice settlements and auto-withdrawal
+ * Queues email notifications for invoice settlements and auto-cashout
  * results, applying:
  *   - the site-wide master switch + per-type toggle gate,
  *   - per-store opt-in (with site-wide fallback "to" address),
- *   - 48h dedupe on identical auto-withdraw failures (store + destination).
+ *   - 48h dedupe on identical auto-cashout failures (store + destination).
  *
  * Emails sit in `notification_queue` until cron drains them — the request
  * path never blocks on SMTP. See includes/email_sender.php for transport.
@@ -18,11 +18,11 @@ require_once __DIR__ . '/email_sender.php';
 
 class NotificationSender {
     public const EVENT_INVOICE_PAID = 'InvoicePaid';
-    public const EVENT_AUTO_WITHDRAW_SUCCESS = 'AutoWithdrawSuccess';
-    public const EVENT_AUTO_WITHDRAW_FAILURE = 'AutoWithdrawFailure';
+    public const EVENT_AUTO_CASHOUT_SUCCESS = 'AutoCashoutSuccess';
+    public const EVENT_AUTO_CASHOUT_FAILURE = 'AutoCashoutFailure';
     public const EVENT_PAYER_RECEIPT = 'PayerReceipt';
 
-    // 48-hour window for suppressing identical auto-withdraw failure emails.
+    // 48-hour window for suppressing identical auto-cashout failure emails.
     private const FAILURE_DEDUPE_WINDOW_SEC = 48 * 60 * 60;
 
     // Cap drain work per cron tick. Real-world traffic is low, but a backlog
@@ -238,12 +238,12 @@ class NotificationSender {
         // identifier the payer can look up.
         return $lines;
     }
-    public static function queueAutoWithdrawSuccess(
+    public static function queueAutoCashoutSuccess(
         string $storeId,
         int $amountSats,
         string $destination
     ): void {
-        if (!self::isEventEnabled('notifications_auto_withdraw_enabled')) {
+        if (!self::isEventEnabled('notifications_auto_cashout_enabled')) {
             return;
         }
         $recipient = self::resolveRecipient($storeId);
@@ -251,34 +251,34 @@ class NotificationSender {
 
         $storeName = self::storeName($storeId);
         $sats = number_format($amountSats) . ' sats';
-        $subject = "Auto-withdrawal succeeded: {$sats} to {$destination}";
-        $body = "An auto-withdrawal completed successfully.\n\n"
+        $subject = "Auto-cashout succeeded: {$sats} to {$destination}";
+        $body = "An auto-cashout completed successfully.\n\n"
               . "Store:        {$storeName}\n"
               . "Amount:       {$sats}\n"
               . "Destination:  {$destination}\n";
 
-        // Successful withdrawals are not deduped — operators want to see each one.
-        self::enqueue($storeId, self::EVENT_AUTO_WITHDRAW_SUCCESS, $recipient, $subject, $body, null);
+        // Successful cashouts are not deduped — operators want to see each one.
+        self::enqueue($storeId, self::EVENT_AUTO_CASHOUT_SUCCESS, $recipient, $subject, $body, null);
     }
 
     /**
-     * Queue an auto-withdrawal failure email, with 48h dedupe on
+     * Queue an auto-cashout failure email, with 48h dedupe on
      * (store_id, destination). Identical repeats are silently dropped.
      */
-    public static function queueAutoWithdrawFailure(
+    public static function queueAutoCashoutFailure(
         string $storeId,
         string $destination,
         string $errorMessage,
         ?int $attemptedAmountSats = null
     ): void {
-        if (!self::isEventEnabled('notifications_auto_withdraw_enabled')) {
+        if (!self::isEventEnabled('notifications_auto_cashout_enabled')) {
             return;
         }
         $recipient = self::resolveRecipient($storeId);
         if ($recipient === null) return;
 
         $dedupeKey = self::failureDedupeKey($destination);
-        if (self::isWithinDedupeWindow($storeId, self::EVENT_AUTO_WITHDRAW_FAILURE, $dedupeKey)) {
+        if (self::isWithinDedupeWindow($storeId, self::EVENT_AUTO_CASHOUT_FAILURE, $dedupeKey)) {
             return;
         }
 
@@ -286,15 +286,15 @@ class NotificationSender {
         $amountLine = $attemptedAmountSats !== null
             ? number_format($attemptedAmountSats) . ' sats'
             : '(amount unavailable)';
-        $subject = "Auto-withdrawal failed: {$destination}";
-        $body = "An auto-withdrawal failed.\n\n"
+        $subject = "Auto-cashout failed: {$destination}";
+        $body = "An auto-cashout failed.\n\n"
               . "Store:        {$storeName}\n"
               . "Destination:  {$destination}\n"
               . "Amount:       {$amountLine}\n"
               . "Reason:       {$errorMessage}\n\n"
               . "Subsequent identical failures will be suppressed for 48 hours.\n";
 
-        self::enqueue($storeId, self::EVENT_AUTO_WITHDRAW_FAILURE, $recipient, $subject, $body, $dedupeKey);
+        self::enqueue($storeId, self::EVENT_AUTO_CASHOUT_FAILURE, $recipient, $subject, $body, $dedupeKey);
     }
 
     /**

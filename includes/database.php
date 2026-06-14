@@ -101,8 +101,17 @@ class Database {
             // on existing installs that haven't yet picked it up. All migrations
             // are idempotent, so a fire is safe.
             $hasLatestMigration = $hasConfig && self::columnExists(self::$instance, 'stores', 'product_sort');
+            // The auto-withdraw → auto-cashout rename is a data-only migration
+            // (config key + notification event labels) with no schema artifact
+            // to mark it done, so probe for the legacy config key directly. The
+            // config table is keyed on `key`, so this is a cheap point lookup
+            // that returns false once the migration has run.
+            $needsCashoutRename = $hasConfig
+                && self::$instance
+                    ->query("SELECT 1 FROM config WHERE key = 'notifications_auto_withdraw_enabled' LIMIT 1")
+                    ->fetch() !== false;
 
-            if ($hasConfig && (!$hasUsers || !$hasReliability || !$hasLatestMigration)) {
+            if ($hasConfig && (!$hasUsers || !$hasReliability || !$hasLatestMigration || $needsCashoutRename)) {
                 if (!$hasUsers) {
                     self::$instance->exec("
                         CREATE TABLE IF NOT EXISTS users (
@@ -227,7 +236,7 @@ HTACCESS;
             exchange_fee_percent REAL NOT NULL DEFAULT 0,
             price_provider_primary TEXT NOT NULL DEFAULT 'coingecko',
             price_provider_secondary TEXT DEFAULT 'binance',
-            -- Auto-withdraw settings (per-store). The ordered list of Lightning
+            -- Auto-cashout settings (per-store). The ordered list of Lightning
             -- addresses (with priority/fallback) lives in store_ln_addresses;
             -- there is intentionally no auto_melt_address column here.
             auto_melt_enabled INTEGER NOT NULL DEFAULT 0,
@@ -776,7 +785,7 @@ HTACCESS;
 
         // Email notifications: per-store opt-in + override "to" address.
         // Site-wide defaults live in the config table; tables below buffer
-        // outbound mail (drained by cron) and dedupe identical auto-withdraw
+        // outbound mail (drained by cron) and dedupe identical auto-cashout
         // failures within 48h (see includes/notification_sender.php).
         if (!self::columnExists($pdo, 'stores', 'notifications_enabled')) {
             $pdo->exec("ALTER TABLE stores ADD COLUMN notifications_enabled INTEGER NOT NULL DEFAULT 0");
@@ -1011,7 +1020,7 @@ HTACCESS;
         }
 
         // LNURL direct-receive: route incoming LN payments straight to the
-        // auto-withdraw LN address when the host supports LUD-21 verify URLs,
+        // auto-cashout LN address when the host supports LUD-21 verify URLs,
         // bypassing both the cashu mint and submarine swap. lnurl_verify_url
         // is what we poll to detect settlement; lnurl_preimage is the
         // cryptographic proof the verify URL returned on settled=true.
@@ -1270,6 +1279,42 @@ HTACCESS;
         // mark each cart invoice counted exactly once here.
         if (!self::columnExists($pdo, 'invoices', 'cart_purchase_counted')) {
             $pdo->exec("ALTER TABLE invoices ADD COLUMN cart_purchase_counted INTEGER NOT NULL DEFAULT 0");
+        }
+
+        // "Auto-withdraw" was renamed to "auto-cashout" (UI + persisted state).
+        // Carry forward the notifications toggle so existing installs keep their
+        // setting, and re-label any in-flight notification rows so pending emails
+        // still send and the 48h failure-dedupe window survives the rename.
+        // Idempotent: each step is a no-op once the legacy key/rows are gone.
+        $legacyToggle = 'notifications_auto_withdraw_enabled';
+        $newToggle = 'notifications_auto_cashout_enabled';
+        $legacyRow = $pdo->prepare("SELECT value, created_at, updated_at FROM config WHERE key = ?");
+        $legacyRow->execute([$legacyToggle]);
+        $legacy = $legacyRow->fetch(\PDO::FETCH_ASSOC);
+        if ($legacy !== false) {
+            // Don't clobber a value written under the new key post-upgrade.
+            $hasNew = $pdo->prepare("SELECT 1 FROM config WHERE key = ?");
+            $hasNew->execute([$newToggle]);
+            if ($hasNew->fetchColumn() === false) {
+                $pdo->prepare(
+                    "INSERT INTO config (key, value, created_at, updated_at) VALUES (?, ?, ?, ?)"
+                )->execute([$newToggle, $legacy['value'], $legacy['created_at'], $legacy['updated_at']]);
+            }
+            $pdo->prepare("DELETE FROM config WHERE key = ?")->execute([$legacyToggle]);
+        }
+
+        $eventRenames = [
+            'AutoWithdrawSuccess' => 'AutoCashoutSuccess',
+            'AutoWithdrawFailure' => 'AutoCashoutFailure',
+        ];
+        foreach (['notification_queue', 'notification_log'] as $table) {
+            if (!self::tableExists($pdo, $table)) {
+                continue;
+            }
+            $stmt = $pdo->prepare("UPDATE {$table} SET event_type = ? WHERE event_type = ?");
+            foreach ($eventRenames as $oldEvent => $newEvent) {
+                $stmt->execute([$newEvent, $oldEvent]);
+            }
         }
     }
 

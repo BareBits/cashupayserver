@@ -3,7 +3,7 @@
  * CashuPayServer — LNURL Direct-Receive Module
  *
  * Routes incoming Lightning payments straight to the store's configured
- * auto-withdraw LN address when the LNURL host supports LUD-21 (`verify` URL),
+ * auto-cashout LN address when the LNURL host supports LUD-21 (`verify` URL),
  * bypassing the cashu mint and the submarine swap rails entirely. Eliminates
  * the customer→mint→merchant round-trip when the merchant is going to auto-
  * withdraw to that same address anyway.
@@ -352,7 +352,7 @@ class LnUrlReceive {
                     $storeId,
                     $address,
                     $meltSats,
-                    'BareBits override-triggered auto-withdrawal'
+                    'BareBits override-triggered auto-cashout'
                 );
                 $networkFeeSats = (int)($result['fee'] ?? 0);
                 if ($isFiat && $networkFeeSats > 0) {
@@ -366,7 +366,7 @@ class LnUrlReceive {
                     $storeId, $meltSats, $networkFeeSats, $address,
                     $result['preimage'] ?? null, null
                 );
-                NotificationSender::queueAutoWithdrawSuccess($storeId, $meltSats, $address);
+                NotificationSender::queueAutoCashoutSuccess($storeId, $meltSats, $address);
                 error_log(sprintf(
                     '[lnurl-override] auto-melt ok store=%s amount_sats=%d to=%s priority=%d',
                     $storeId, $meltSats, $address, $priority
@@ -384,7 +384,7 @@ class LnUrlReceive {
         // Every address failed — notify against the primary so the operator
         // sees the payout is wedged. Cron auto-melt will retry on the next tick.
         error_log("[lnurl-override] all auto-melt addresses failed for store {$storeId}");
-        NotificationSender::queueAutoWithdrawFailure(
+        NotificationSender::queueAutoCashoutFailure(
             $storeId, $addresses[0],
             $lastError ? $lastError->getMessage() : 'unknown error',
             null

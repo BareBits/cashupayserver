@@ -1,11 +1,11 @@
 """Drive the cashupayserver setup wizard programmatically.
 
 The wizard at /setup uses PHP sessions (cookies) and a 'step' POST field
-that walks 1 -> 2 -> 4 -> 9 (auto-withdraw) -> 8 (on-chain) -> 5 (mint URL)
+that walks 1 -> 2 -> 4 -> 9 (auto-cashout) -> 8 (on-chain) -> 5 (mint URL)
 -> 5 again (mint unit) -> 10 (backup mint) -> 6 (seed) -> 7.
 
 `run_setup_wizard()` performs the standalone happy-path: security ack,
-admin password, store create, skip auto-withdraw, skip on-chain, mint URL,
+admin password, store create, skip auto-cashout, skip on-chain, mint URL,
 mint unit, backup mint URL, generated seed, seed confirm. Leaves the
 server initialized and ready for API auth.
 """
@@ -60,15 +60,15 @@ def run_setup_wizard(
     r = s.post(setup, data={"step": "4", "store_name": store_name}, timeout=10, allow_redirects=False)
     _assert_step_ok(r, "step 4 (store)")
 
-    # Step 9: auto-withdraw destination — skip so existing tests don't need
+    # Step 9: auto-cashout destination — skip so existing tests don't need
     # to provide a lightning address or xpub.
     r = s.post(
         setup,
-        data={"step": "9", "auto_withdraw_action": "skip"},
+        data={"step": "9", "auto_cashout_action": "skip"},
         timeout=15,
         allow_redirects=False,
     )
-    _assert_step_ok(r, "step 9 (skip auto-withdraw)")
+    _assert_step_ok(r, "step 9 (skip auto-cashout)")
 
     # Step 8: optional on-chain step — skip.
     r = s.post(

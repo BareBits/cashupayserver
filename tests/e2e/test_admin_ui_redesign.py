@@ -2,7 +2,7 @@
   - Export Token button removed.
   - Settings + store-settings cards are collapsible (default open) and toggle.
   - On-chain "Advanced" subsection is collapsed by default.
-  - Auto-withdrawal column selector renders (store: 3 cols, site: 2 cols) and
+  - Auto-cashout column selector renders (store: 3 cols, site: 2 cols) and
     selecting a column updates the underlying mode control.
   - Store-settings card order (Submarine Swaps under On-chain; API Keys near
     the bottom).
@@ -77,7 +77,7 @@ def test_onchain_advanced_collapsed_by_default(admin_page):
         assert page.eval_on_selector(f"#{fid}", "el => !!el.closest('#onchain-advanced')")
 
 
-def test_auto_withdraw_columns_and_selection(admin_page):
+def test_auto_cashout_columns_and_selection(admin_page):
     page, base = admin_page
     _goto(page, base, "stores")
 
