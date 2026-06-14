@@ -11,7 +11,7 @@
  * Step 5:  Connect Mint (URL → fetch keysets → select unit)
  * Step 10: Backup Mint (required, same unit as primary)
  * Step 6:  Generate Seed for Store
- * Step 9:  Configure Auto-Withdraw (lightning address or on-chain xpub)
+ * Step 9:  Configure Auto-Cashout (lightning address or on-chain xpub)
  * Step 8:  On-chain Bitcoin payment destinations (xpub or static address)
  * Step 7:  Complete
  *
@@ -239,7 +239,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 }
 
                 $_SESSION['setup_store_id'] = $storeId;
-                // New flow: ask about auto-withdraw destination first, then
+                // New flow: ask about auto-cashout destination first, then
                 // on-chain xpub, *then* mint URL / seed. The wallet operator
                 // typically knows where they want funds to end up before they
                 // pick the temporary holding mint.
@@ -437,9 +437,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     unset($_SESSION['temp_seed']);
 
                     // Seed confirmation is the last step of the wizard in the
-                    // new order (auto-withdraw + on-chain already happened
+                    // new order (auto-cashout + on-chain already happened
                     // earlier). Finalize the install or hand back to admin.
-                    unset($_SESSION['setup_auto_withdraw_mode']);
+                    unset($_SESSION['setup_auto_cashout_mode']);
                     if ($mode === 'add_store') {
                         $createdStoreId = $storeId;
                         unset($_SESSION['setup_store_id']);
@@ -451,27 +451,27 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 }
                 break;
 
-            case 9: // Auto-withdraw destination (lightning address or on-chain swap)
+            case 9: // Auto-cashout destination (lightning address or on-chain swap)
                 $storeId = $_SESSION['setup_store_id'] ?? null;
                 if (!$storeId) {
                     throw new Exception('Store not found. Please restart setup.');
                 }
 
-                $autoWithdrawAction = $_POST['auto_withdraw_action'] ?? '';
+                $autoCashoutAction = $_POST['auto_cashout_action'] ?? '';
 
                 // The auto_melt_* columns aren't in Config::updateStore's
                 // allowlist (kept intentionally tight), so save them via
                 // Database::update directly — same pattern admin.php uses
                 // in the save_auto_melt action.
-                if ($autoWithdrawAction === 'skip') {
+                if ($autoCashoutAction === 'skip') {
                     // Persist that the user explicitly skipped, so step 8 can
                     // adjust its copy and so we don't keep nagging them.
                     Database::update('stores', [
                         'auto_melt_enabled' => 0,
                     ], 'id = ?', [$storeId]);
-                    $_SESSION['setup_auto_withdraw_mode'] = 'skip';
-                } elseif ($autoWithdrawAction === 'save') {
-                    $autoMode = $_POST['auto_withdraw_mode'] ?? '';
+                    $_SESSION['setup_auto_cashout_mode'] = 'skip';
+                } elseif ($autoCashoutAction === 'save') {
+                    $autoMode = $_POST['auto_cashout_mode'] ?? '';
                     if ($autoMode === 'lightning') {
                         $address = trim($_POST['lightning_address'] ?? '');
                         // Lightning addresses are user@host — same shape as email,
@@ -492,7 +492,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         // The ordered Lightning-address chain lives in
                         // store_ln_addresses; seed it with this one address.
                         StoreLnAddresses::replaceForStore($storeId, [$address]);
-                        $_SESSION['setup_auto_withdraw_mode'] = 'lightning';
+                        $_SESSION['setup_auto_cashout_mode'] = 'lightning';
                     } elseif ($autoMode === 'onchain') {
                         // On-chain mode: store the choice, the actual xpub
                         // gets validated and saved on step 8.
@@ -502,9 +502,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         ], 'id = ?', [$storeId]);
                         // No Lightning address in on-chain mode — clear any chain.
                         StoreLnAddresses::replaceForStore($storeId, []);
-                        $_SESSION['setup_auto_withdraw_mode'] = 'onchain';
+                        $_SESSION['setup_auto_cashout_mode'] = 'onchain';
                     } else {
-                        throw new Exception('Pick an auto-withdraw method or Skip');
+                        throw new Exception('Pick an auto-cashout method or Skip');
                     }
                 } else {
                     // GET landing on step 9 — fall through to render the form.
@@ -520,14 +520,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     throw new Exception('Store not found. Please restart setup.');
                 }
                 $onchainAction = $_POST['onchain_action'] ?? '';
-                // The user picked on-chain auto-withdraw on step 9, so a real
+                // The user picked on-chain auto-cashout on step 9, so a real
                 // on-chain destination is mandatory here — there's no other
                 // place to point the swap output. Skip is blocked.
-                $autoWithdrawMode = $_SESSION['setup_auto_withdraw_mode'] ?? '';
+                $autoCashoutMode = $_SESSION['setup_auto_cashout_mode'] ?? '';
                 if ($onchainAction === 'skip') {
-                    if ($autoWithdrawMode === 'onchain') {
+                    if ($autoCashoutMode === 'onchain') {
                         throw new Exception(
-                            'On-chain auto-withdraw needs an xpub or static address. '
+                            'On-chain auto-cashout needs an xpub or static address. '
                             . 'Configure one below, or go back and pick Lightning / Skip on the previous step.'
                         );
                     }
@@ -543,12 +543,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
                     require_once __DIR__ . '/includes/onchain/wallet.php';
                     if ($onchainMode === 'static') {
-                        if ($autoWithdrawMode === 'onchain') {
+                        if ($autoCashoutMode === 'onchain') {
                             // Submarine-swap auto-melt needs an xpub to derive
                             // a fresh sweep destination per swap. A reused
                             // static address would leak the swap history.
                             throw new Exception(
-                                'On-chain auto-withdraw requires an xpub (not a static address). '
+                                'On-chain auto-cashout requires an xpub (not a static address). '
                                 . 'Static-address mode is fine for receiving customer payments, but '
                                 . 'submarine swaps derive a fresh address each time.'
                             );
@@ -1056,7 +1056,7 @@ function getDataDirHttpPath(): ?string {
             <?php if ($mode === 'add_store'): ?>
                 <h1>Add New Store</h1>
                 <?php
-                // add_store walks steps 4 → 9 (auto-withdraw) → 8 (on-chain)
+                // add_store walks steps 4 → 9 (auto-cashout) → 8 (on-chain)
                 // → 5 (mint URL) → 10 (backup mint) → 6 (seed) before
                 // redirecting to admin. Step 7 (Complete) is not reached.
                 $addStoreMapping = [4 => 1, 9 => 2, 8 => 3, 5 => 4, 10 => 5, 6 => 6];
@@ -1076,7 +1076,7 @@ function getDataDirHttpPath(): ?string {
                 $isWpMode = Urls::isWordPress();
                 // Internal step order:
                 //   1 (welcome+security), 2 (password, standalone only),
-                //   4 (store), 9 (auto-withdraw), 8 (on-chain),
+                //   4 (store), 9 (auto-cashout), 8 (on-chain),
                 //   5 (primary mint), 10 (backup mint), 6 (seed), 7 (complete).
                 // Step 3 was merged into step 1 and is unused.
                 $stepMapping = $isWpMode
@@ -1485,7 +1485,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
             <?php elseif ($step === 4): ?>
                 <!-- Step 4: Create Store (name only) -->
                 <h2 style="margin-bottom: 1rem;">Create Store</h2>
-                <p style="margin-bottom: 1.5rem;"><?= $mode === 'add_store' ? 'Create a new store. You\'ll set its auto-withdraw destination next, then connect a Cashu mint.' : 'Create your first store. You\'ll set its auto-withdraw destination next, then connect a Cashu mint.' ?></p>
+                <p style="margin-bottom: 1.5rem;"><?= $mode === 'add_store' ? 'Create a new store. You\'ll set its auto-cashout destination next, then connect a Cashu mint.' : 'Create your first store. You\'ll set its auto-cashout destination next, then connect a Cashu mint.' ?></p>
 
                 <form method="post">
                     <input type="hidden" name="step" value="4">
@@ -1711,25 +1711,25 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                 <?php endif; ?>
 
             <?php elseif ($step === 9): ?>
-                <!-- Step 9: Auto-withdraw destination -->
-                <h2 style="margin-bottom: 0.5rem;">Auto-withdraw destination</h2>
+                <!-- Step 9: Auto-cashout destination -->
+                <h2 style="margin-bottom: 0.5rem;">Auto-cashout destination</h2>
                 <p style="color: #a0aec0; margin-bottom: 1.25rem; font-size: 0.9rem;">
                     Where should incoming payments end up? Picking a destination
                     lets the server sweep funds out of the Cashu mint automatically
                     once the balance is high enough, so you don't have to.
                 </p>
 
-                <form id="auto-withdraw-form" method="POST" action="<?= htmlspecialchars(Urls::setup()) ?>" style="margin-bottom: 1rem;">
+                <form id="auto-cashout-form" method="POST" action="<?= htmlspecialchars(Urls::setup()) ?>" style="margin-bottom: 1rem;">
                     <input type="hidden" name="step" value="9">
-                    <input type="hidden" name="auto_withdraw_action" value="save">
+                    <input type="hidden" name="auto_cashout_action" value="save">
                     <?php if ($mode === 'add_store'): ?>
                         <input type="hidden" name="mode" value="add_store">
                     <?php endif; ?>
 
                     <label class="aw-choice" style="display: block; padding: 1rem; border: 1px solid #2d3748; border-radius: 8px; margin-bottom: 0.75rem; cursor: pointer;">
-                        <input type="radio" name="auto_withdraw_mode" value="lightning" checked
+                        <input type="radio" name="auto_cashout_mode" value="lightning" checked
                                onchange="document.getElementById('aw-ln-row').style.display = this.checked ? 'block' : 'none';">
-                        <strong>Auto-withdraw to Lightning</strong>
+                        <strong>Auto-cashout to Lightning</strong>
                         <p style="margin: 0.25rem 0 0 1.5rem; color: #a0aec0; font-size: 0.85rem;">
                             Fastest, lowest fees. Requires a Lightning address
                             like <code>awesomemerchant@strike.me</code>.
@@ -1744,9 +1744,9 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                     </div>
 
                     <label class="aw-choice" style="display: block; padding: 1rem; border: 1px solid #2d3748; border-radius: 8px; margin: 0.75rem 0; cursor: pointer;">
-                        <input type="radio" name="auto_withdraw_mode" value="onchain"
+                        <input type="radio" name="auto_cashout_mode" value="onchain"
                                onchange="document.getElementById('aw-ln-row').style.display = this.checked ? 'none' : 'block';">
-                        <strong>Auto-withdraw to on-chain (any wallet)</strong>
+                        <strong>Auto-cashout to on-chain (any wallet)</strong>
                         <p style="margin: 0.25rem 0 0 1.5rem; color: #a0aec0; font-size: 0.85rem;">
                             Submarine-swap sweep to the on-chain xpub you'll set up
                             next. Slower and a bit more expensive than Lightning,
@@ -1758,7 +1758,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                 </form>
 
                 <div class="warning" style="margin-bottom: 0.75rem;">
-                    <strong>Strongly recommended:</strong> set an auto-withdraw
+                    <strong>Strongly recommended:</strong> set an auto-cashout
                     destination. Without one, incoming funds sit on this server
                     and inside the third-party Cashu mint until you withdraw
                     manually &mdash; the safest place for your money is the
@@ -1767,7 +1767,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
 
                 <form method="POST" action="<?= htmlspecialchars(Urls::setup()) ?>">
                     <input type="hidden" name="step" value="9">
-                    <input type="hidden" name="auto_withdraw_action" value="skip">
+                    <input type="hidden" name="auto_cashout_action" value="skip">
                     <?php if ($mode === 'add_store'): ?>
                         <input type="hidden" name="mode" value="add_store">
                     <?php endif; ?>
@@ -1782,7 +1782,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                     // onchange on the radios above; this just ensures the
                     // server-redrawn state matches whichever option is checked
                     // (e.g. after a validation error redraws the form).
-                    var checked = document.querySelector('input[name="auto_withdraw_mode"]:checked');
+                    var checked = document.querySelector('input[name="auto_cashout_mode"]:checked');
                     if (checked) checked.dispatchEvent(new Event('change'));
                 })();
                 </script>
@@ -1790,7 +1790,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
             <?php elseif ($step === 8): ?>
                 <!-- Step 8: On-chain Bitcoin payment destination -->
                 <?php
-                $awMode = $_SESSION['setup_auto_withdraw_mode'] ?? '';
+                $awMode = $_SESSION['setup_auto_cashout_mode'] ?? '';
                 $onchainRequired = ($awMode === 'onchain');
                 ?>
                 <h2 style="margin-bottom: 0.5rem;">
@@ -1798,7 +1798,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                 </h2>
                 <p style="color: #a0aec0; margin-bottom: 1.25rem; font-size: 0.9rem;">
                     <?php if ($onchainRequired): ?>
-                        You picked on-chain auto-withdraw on the previous step, so the
+                        You picked on-chain auto-cashout on the previous step, so the
                         xpub you set here is also where your withdrawals will land.
                         Provide an extended public key (xpub / zpub / vpub / etc.)
                         from your wallet &mdash; the server derives a fresh receive
@@ -1834,7 +1834,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                         </select>
                         <?php if ($onchainRequired): ?>
                             <p style="font-size: 0.8rem; color: #fbd38d; margin-top: 0.35rem;">
-                                Static-address mode is hidden because on-chain auto-withdraw
+                                Static-address mode is hidden because on-chain auto-cashout
                                 derives a fresh address per swap and needs an xpub.
                             </p>
                         <?php endif; ?>

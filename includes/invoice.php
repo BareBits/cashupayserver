@@ -102,7 +102,7 @@ class Invoice {
         $feeOnchain     = $feeRoute['onchain'] ?? null;   // ['address','index','tip_height','destination']
 
         // ---- LNURL direct-receive path: route LN payment straight to the
-        // merchant's auto-withdraw LN address when the host supports LUD-21
+        // merchant's auto-cashout LN address when the host supports LUD-21
         // (verify URL) so we can detect settlement without running the LN
         // node ourselves. Wins over swap and mint when eligible. ----
         $lnurlAttempt = null;          // ['bolt11','verify_url','amount_sats'] on success

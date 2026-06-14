@@ -1,4 +1,4 @@
-"""End-to-end test for auto-withdraw via submarine swap.
+"""End-to-end test for auto-cashout via submarine swap.
 
 Verifies the full pipeline:
   1. Cashu wallet on the payserver is funded with proofs (via a mint-rail

@@ -270,7 +270,7 @@ def wait_for_status(gc: GreenfieldClient, store_id: str, invoice_id: str, expect
 
 def _enable_auto_melt(admin: AdminClient, store_id: str, address: str,
                       threshold_sat: int = 1) -> dict:
-    """Configure a store's auto-withdraw (auto-melt) LN address via the same
+    """Configure a store's auto-cashout (auto-melt) LN address via the same
     admin endpoint the dashboard uses. The handler probes the address for
     LUD-21 support through the mock LNURL host. With it set, a lightning
     invoice on this store routes to the lnaddress rail."""
@@ -482,14 +482,14 @@ def main() -> int:
             page.click("button[type=submit]")
             page.fill("#store_name", STORE_ONECONF)
             page.click("button[type=submit]")
-            # Step 9: auto-withdraw destination. The new flow asks for this
+            # Step 9: auto-cashout destination. The new flow asks for this
             # before the mint URL — skip it here so we still drive the rest
             # of the wizard the same way. Operator can configure
-            # auto-withdraw from admin once the stack is up.
+            # auto-cashout from admin once the stack is up.
             page.wait_for_selector("button:has-text('Skip for now')")
             page.click("button:has-text('Skip for now')")
             # Step 8: on-chain destination. Skip is offered because we
-            # skipped auto-withdraw above (so on-chain isn't required).
+            # skipped auto-cashout above (so on-chain isn't required).
             page.wait_for_selector("button:has-text('Skip for now')")
             page.click("button:has-text('Skip for now')")
             page.fill("#mint_url", mint.url)
@@ -652,7 +652,7 @@ def main() -> int:
         print("\n[iterate] === Lightning-address + fee-redirect examples ===")
 
         # (a) Normal LN-address payment: route a lightning invoice to the
-        #     merchant's auto-withdraw LN address. Surfaces the LN destination
+        #     merchant's auto-cashout LN address. Surfaces the LN destination
         #     (the address) + bolt11 "txid" in the admin invoices view, with
         #     no fee badge. Amount is well above oneconf's owed fees so it is
         #     neither redirected nor forced onto the mint rail.

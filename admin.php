@@ -1835,7 +1835,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $addresses[] = $addr;
                 }
 
-                // On-chain auto-withdraw requires the store to have an on-chain
+                // On-chain auto-cashout requires the store to have an on-chain
                 // xpub / static address — refuse to save otherwise so we never
                 // select a destination that can't actually receive funds.
                 if ($modeOverride === SwapAutoMelt::FORCE_SWAP) {
@@ -1879,7 +1879,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 // Replace the whole ordered chain in one transaction.
                 StoreLnAddresses::replaceForStore($storeId, $entries);
 
-                // Choosing on-chain auto-withdraw forces submarine swaps on for
+                // Choosing on-chain auto-cashout forces submarine swaps on for
                 // this store, and enables the site-wide master switch if it was
                 // off (without forcing swaps on for any other store).
                 if ($modeOverride === SwapAutoMelt::FORCE_SWAP) {
@@ -1933,7 +1933,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             echo json_encode([
                 'enabled' => Config::get('notifications_enabled', false) === true,
                 'invoicePaidEnabled' => Config::get('notifications_invoice_paid_enabled', false) === true,
-                'autoWithdrawEnabled' => Config::get('notifications_auto_withdraw_enabled', false) === true,
+                'autoCashoutEnabled' => Config::get('notifications_auto_cashout_enabled', false) === true,
                 'payerReceiptEnabled' => Config::get('notifications_payer_receipt_enabled', false) === true,
                 'toEmail' => (string)Config::get('notifications_to_email', ''),
                 'smtpConfigured' => EmailSender::isSmtpConfigured(),
@@ -1946,7 +1946,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             try {
                 $enabled = ($_POST['enabled'] ?? '0') === '1';
                 $invoicePaidEnabled = ($_POST['invoice_paid_enabled'] ?? '0') === '1';
-                $autoWithdrawEnabled = ($_POST['auto_withdraw_enabled'] ?? '0') === '1';
+                $autoCashoutEnabled = ($_POST['auto_cashout_enabled'] ?? '0') === '1';
                 $payerReceiptEnabled = ($_POST['payer_receipt_enabled'] ?? '0') === '1';
                 $toEmail = trim((string)($_POST['to_email'] ?? ''));
 
@@ -1956,7 +1956,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
                 Config::set('notifications_enabled', $enabled);
                 Config::set('notifications_invoice_paid_enabled', $invoicePaidEnabled);
-                Config::set('notifications_auto_withdraw_enabled', $autoWithdrawEnabled);
+                Config::set('notifications_auto_cashout_enabled', $autoCashoutEnabled);
                 Config::set('notifications_payer_receipt_enabled', $payerReceiptEnabled);
                 Config::set('notifications_to_email', $toEmail);
 
@@ -3443,7 +3443,7 @@ header('Cache-Control: no-cache, must-revalidate');
             display: none;
         }
 
-        /* Auto-withdrawal column selector */
+        /* Auto-cashout column selector */
         .aw-title {
             font-weight: 600;
             font-size: 0.95rem;
@@ -4298,7 +4298,7 @@ header('Cache-Control: no-cache, must-revalidate');
                     <span style="flex-shrink: 0; font-size: 1.1rem; line-height: 1.2;">⚡</span>
                     <span style="flex: 1;">
                         <strong style="display: block; margin-bottom: 0.15rem;">Heads up — no external cron in 24h+</strong>
-                        <span style="color: var(--text-secondary); font-size: 0.85rem;">Not required, but a one-line cron entry makes payment confirmations, auto-withdrawals, and fee settlements much faster.</span>
+                        <span style="color: var(--text-secondary); font-size: 0.85rem;">Not required, but a one-line cron entry makes payment confirmations, auto-cashouts, and fee settlements much faster.</span>
                     </span>
                     <a href="#" class="btn btn-secondary js-goto-settings" style="padding: 0.25rem 0.75rem; font-size: 0.8rem; flex-shrink: 0;">Settings · Copy cron URL</a>
                     <button id="btn-dismiss-cron-stale" aria-label="Dismiss" style="background: transparent; border: 0; color: var(--text-secondary); cursor: pointer; font-size: 1.2rem; line-height: 1; padding: 0 0.25rem; flex-shrink: 0;">×</button>
@@ -4417,11 +4417,11 @@ header('Cache-Control: no-cache, must-revalidate');
 
                     <div class="card collapsible">
                         <div class="card-header">
-                            <div class="card-title">Auto-Withdraw</div>
+                            <div class="card-title">Auto-Cashout</div>
                         </div>
                         <div class="card-body">
                             <div id="aw-store" data-aw data-aw-scope="store">
-                            <p class="aw-title">auto-withdrawal settings</p>
+                            <p class="aw-title">auto-cashout settings</p>
                             <div id="aw-store-warning" class="hidden" style="margin-bottom:0.75rem; padding:0.6rem 0.8rem; border-radius:8px; background:rgba(245,158,11,0.12); border:1px solid rgba(245,158,11,0.4); font-size:0.82rem;">
                                 &#9888; This store has no on-chain xpub or withdrawal address configured on the Bitcoin tab. On-chain withdrawal cannot be used until you add one.
                             </div>
@@ -4430,7 +4430,7 @@ header('Cache-Control: no-cache, must-revalidate');
                                 <div class="aw-col" data-aw-mode="-1" tabindex="0" role="button" aria-pressed="false">
                                     <span class="aw-col-check">&#10003;</span>
                                     <div class="aw-col-head"><span class="aw-col-name">Use global settings</span></div>
-                                    <div class="aw-col-desc">Follow the site-wide auto-withdrawal default (<strong id="auto-melt-mode-default-label">Lightning address</strong>).</div>
+                                    <div class="aw-col-desc">Follow the site-wide auto-cashout default (<strong id="auto-melt-mode-default-label">Lightning address</strong>).</div>
                                 </div>
                                 <div class="aw-col" data-aw-mode="0" tabindex="0" role="button" aria-pressed="false">
                                     <span class="aw-col-check">&#10003;</span>
@@ -4473,7 +4473,7 @@ header('Cache-Control: no-cache, must-revalidate');
 
                             <p class="form-help" id="auto-melt-swap-info" style="display: none;">
                                 Sweeps the mint balance through a reverse submarine swap to the store's
-                                on-chain xpub. May result in longer intervals between auto-withdrawals
+                                on-chain xpub. May result in longer intervals between auto-cashouts
                                 during high-fee periods. Minimum sweep:
                                 <strong id="auto-melt-mode-min-sats">5,000</strong> sats (~$5);
                                 swap cost must be ≤
@@ -4481,7 +4481,7 @@ header('Cache-Control: no-cache, must-revalidate');
                             </p>
 
                             <div class="toggle-container">
-                                <span>Auto-withdraw when balance reaches threshold</span>
+                                <span>Auto-cashout when balance reaches threshold</span>
                                 <label class="toggle">
                                     <input type="checkbox" id="auto-melt-enabled">
                                     <span class="toggle-slider"></span>
@@ -4666,7 +4666,7 @@ header('Cache-Control: no-cache, must-revalidate');
                         <div class="card-body">
                             <p style="font-size: 0.85rem; color: var(--text-secondary); margin: 0 0 0.75rem 0;">
                                 Send notification emails for this store's events (invoice paid,
-                                auto-withdrawal). Requires site-wide notifications to be enabled
+                                auto-cashout). Requires site-wide notifications to be enabled
                                 in the Settings page.
                             </p>
 
@@ -4840,7 +4840,7 @@ header('Cache-Control: no-cache, must-revalidate');
             <div class="view" id="view-settings">
                 <div id="settings-scope-note" style="margin-bottom: 1rem; padding: 0.85rem 1rem; border-radius: 12px; background: rgba(96, 165, 250, 0.1); border: 1px solid rgba(96, 165, 250, 0.3); font-size: 0.9rem; line-height: 1.45;">
                     <strong>These are site-wide settings and defaults.</strong>
-                    Most knobs operators want to tweak day-to-day &mdash; auto-withdraw destination,
+                    Most knobs operators want to tweak day-to-day &mdash; auto-cashout destination,
                     on-chain xpub, exchange-rate provider, hosting fee, per-store email &mdash;
                     live on the per-store settings page.
                     <a href="#" class="js-goto-stores"
@@ -4882,9 +4882,9 @@ header('Cache-Control: no-cache, must-revalidate');
                                 </label>
                             </div>
                             <div class="toggle-container" style="margin-top: 0.5rem;">
-                                <span>Auto-withdrawal (success &amp; failure)</span>
+                                <span>Auto-cashout (success &amp; failure)</span>
                                 <label class="toggle">
-                                    <input type="checkbox" id="notifications-auto-withdraw">
+                                    <input type="checkbox" id="notifications-auto-cashout">
                                     <span class="toggle-slider"></span>
                                 </label>
                             </div>
@@ -4972,7 +4972,7 @@ header('Cache-Control: no-cache, must-revalidate');
                     <div class="card-body">
                         <p style="font-size: 0.85rem; color: var(--text-secondary); margin: 0 0 0.75rem 0;">
                             Optional but recommended. Adding the line below to your hosting's system
-                            cron makes invoice polling, auto-withdrawal, and fee settlement run on a
+                            cron makes invoice polling, auto-cashout, and fee settlement run on a
                             tight, predictable schedule. Without it, background tasks fire
                             opportunistically when an admin or customer loads a page.
                         </p>
@@ -5155,7 +5155,7 @@ header('Cache-Control: no-cache, must-revalidate');
                         </div>
 
                         <div id="aw-site" data-aw data-aw-scope="site" style="margin-top: 1.5rem; padding-top: 1rem; border-top: 1px solid var(--border-color, rgba(255,255,255,0.08));">
-                            <p class="aw-title">auto-withdrawal settings (site-wide default for new stores)</p>
+                            <p class="aw-title">auto-cashout settings (site-wide default for new stores)</p>
                             <!-- Hidden boolean kept so the existing save_swaps flow keeps working:
                                  Lightning column => unchecked, On-chain column => checked. -->
                             <input type="checkbox" id="auto-melt-use-swap-default" style="display:none;">
@@ -6129,7 +6129,7 @@ header('Cache-Control: no-cache, must-revalidate');
                 dashboardData.autoMelt = { ...dashboardData.autoMelt, modeOverride: v, mode };
                 renderAutoMeltMode();
             });
-            // Wire collapsible cards/subsections and the auto-withdrawal column
+            // Wire collapsible cards/subsections and the auto-cashout column
             // selectors (both the store and site-wide instances).
             wireCollapsibles();
             wireAwSelectors();
@@ -8651,7 +8651,7 @@ header('Cache-Control: no-cache, must-revalidate');
             }
         }
 
-        // ---- Auto-withdrawal column selector + collapsible sections ----
+        // ---- Auto-cashout column selector + collapsible sections ----
 
         function isValidLightningAddress(addr) {
             // LUD-16 lightning address: local-part@domain.tld (basic shape check).
@@ -8839,7 +8839,7 @@ header('Cache-Control: no-cache, must-revalidate');
         function lud21HintFor(support) {
             if (support === 0) {
                 return { cls: 'warn', text: 'Host does not advertise a LUD-21 verify URL. '
-                    + 'Payments route through the mint, then auto-withdraw here (two-hop) '
+                    + 'Payments route through the mint, then auto-cashout here (two-hop) '
                     + 'instead of going directly to this address.' };
             }
             if (support === 1) {
@@ -8995,7 +8995,7 @@ header('Cache-Control: no-cache, must-revalidate');
                 const data = await response.json();
                 document.getElementById('notifications-enabled').checked = !!data.enabled;
                 document.getElementById('notifications-invoice-paid').checked = !!data.invoicePaidEnabled;
-                document.getElementById('notifications-auto-withdraw').checked = !!data.autoWithdrawEnabled;
+                document.getElementById('notifications-auto-cashout').checked = !!data.autoCashoutEnabled;
                 document.getElementById('notifications-payer-receipt').checked = !!data.payerReceiptEnabled;
                 document.getElementById('notifications-to-email').value = data.toEmail || '';
                 document.getElementById('notifications-smtp-warning').classList.toggle('hidden', !!data.smtpConfigured);
@@ -9013,12 +9013,12 @@ header('Cache-Control: no-cache, must-revalidate');
         async function saveNotificationSettings() {
             const enabled = document.getElementById('notifications-enabled').checked ? '1' : '0';
             const invoicePaid = document.getElementById('notifications-invoice-paid').checked ? '1' : '0';
-            const autoWithdraw = document.getElementById('notifications-auto-withdraw').checked ? '1' : '0';
+            const autoCashout = document.getElementById('notifications-auto-cashout').checked ? '1' : '0';
             const payerReceipt = document.getElementById('notifications-payer-receipt').checked ? '1' : '0';
             const toEmail = document.getElementById('notifications-to-email').value.trim();
             try {
                 const response = await postWithCsrf(adminUrl,
-                    `action=save_notifications_settings&enabled=${enabled}&invoice_paid_enabled=${invoicePaid}&auto_withdraw_enabled=${autoWithdraw}&payer_receipt_enabled=${payerReceipt}&to_email=${encodeURIComponent(toEmail)}`
+                    `action=save_notifications_settings&enabled=${enabled}&invoice_paid_enabled=${invoicePaid}&auto_cashout_enabled=${autoCashout}&payer_receipt_enabled=${payerReceipt}&to_email=${encodeURIComponent(toEmail)}`
                 );
                 const result = await response.json();
                 if (response.ok) {
@@ -9053,7 +9053,7 @@ header('Cache-Control: no-cache, must-revalidate');
                 if (thresholdEl) thresholdEl.value = data.autoSelectThresholdPct ?? 10;
                 const autoMeltSwapEl = document.getElementById('auto-melt-use-swap-default');
                 if (autoMeltSwapEl) autoMeltSwapEl.checked = !!data.autoMeltUseSwapDefault;
-                // Reflect the site default into the auto-withdrawal column selector.
+                // Reflect the site default into the auto-cashout column selector.
                 highlightAwColumn(awContainer('site'), data.autoMeltUseSwapDefault ? 1 : 0);
                 const minSatsDisp = document.getElementById('auto-melt-swap-min-sats-display');
                 if (minSatsDisp && data.autoMeltSwapMinSats != null) {

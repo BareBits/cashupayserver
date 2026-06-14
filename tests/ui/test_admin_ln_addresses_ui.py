@@ -1,6 +1,6 @@
 """Admin UI: ordered Lightning-address fallback chain.
 
-Drives the per-store Auto-Withdraw card: add several Lightning addresses,
+Drives the per-store Auto-Cashout card: add several Lightning addresses,
 reorder them with the up/down arrows, save, and verify the store_ln_addresses
 table reflects the on-screen priority order. Also checks that the save button
 enforces client-side validation (duplicate + malformed address).
@@ -32,7 +32,7 @@ def _ln_addresses(handle, store_id: str) -> list[str]:
     return [r[0] for r in rows]
 
 
-def _open_auto_withdraw(page, configured: ConfiguredPayserver) -> None:
+def _open_auto_cashout(page, configured: ConfiguredPayserver) -> None:
     page.set_default_timeout(15000)
     page.goto(f"{configured.handle.url}/admin")
     page.fill("#password-input", configured.admin_password)
@@ -54,7 +54,7 @@ def _fill_rows(page, addresses: list[str]) -> None:
 
 
 def test_add_reorder_and_save_chain(configured: ConfiguredPayserver, page) -> None:
-    _open_auto_withdraw(page, configured)
+    _open_auto_cashout(page, configured)
 
     # Add three addresses in order A, B, C.
     _fill_rows(page, [ADDR_A, ADDR_B, ADDR_C])
@@ -80,7 +80,7 @@ def test_add_reorder_and_save_chain(configured: ConfiguredPayserver, page) -> No
 
 
 def test_remove_row(configured: ConfiguredPayserver, page) -> None:
-    _open_auto_withdraw(page, configured)
+    _open_auto_cashout(page, configured)
     _fill_rows(page, [ADDR_A, ADDR_B])
     if not page.locator("#auto-melt-enabled").is_checked():
         page.locator("#auto-melt-enabled").check()
@@ -97,7 +97,7 @@ def test_remove_row(configured: ConfiguredPayserver, page) -> None:
 
 
 def test_duplicate_rejected_client_side(configured: ConfiguredPayserver, page) -> None:
-    _open_auto_withdraw(page, configured)
+    _open_auto_cashout(page, configured)
     _fill_rows(page, [ADDR_A, ADDR_A])
     if not page.locator("#auto-melt-enabled").is_checked():
         page.locator("#auto-melt-enabled").check()

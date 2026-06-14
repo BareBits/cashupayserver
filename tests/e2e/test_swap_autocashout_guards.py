@@ -1,12 +1,12 @@
-"""End-to-end tests for the auto-withdrawal / submarine-swap guard-rails added
-alongside the admin auto-withdrawal column-selector redesign.
+"""End-to-end tests for the auto-cashout / submarine-swap guard-rails added
+alongside the admin auto-cashout column-selector redesign.
 
 Covered behavior (all enforced server-side in admin.php):
   - Forcing submarine swaps on for a store with no on-chain xpub/address is
     refused (save_store_swaps).
-  - Selecting on-chain auto-withdraw (FORCE_SWAP) with no on-chain
+  - Selecting on-chain auto-cashout (FORCE_SWAP) with no on-chain
     xpub/address is refused (save_auto_melt).
-  - Selecting on-chain auto-withdraw on a store that DOES have on-chain
+  - Selecting on-chain auto-cashout on a store that DOES have on-chain
     configured succeeds AND auto-forces the store's submarine-swap override on
     + enables the site-wide swap master switch (without forcing other stores).
   - Forcing swaps on for a store that has on-chain configured succeeds.
@@ -84,7 +84,7 @@ def test_onchain_automelt_without_onchain_is_rejected(configured: ConfiguredPays
     assert "on-chain" in r.json()["error"].lower()
 
 
-# ---------- positive: on-chain auto-withdraw forces swaps on ----------
+# ---------- positive: on-chain auto-cashout forces swaps on ----------
 
 
 def test_onchain_automelt_forces_store_swap_and_enables_site(configured: ConfiguredPayserver) -> None:
