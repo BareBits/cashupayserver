@@ -7425,8 +7425,29 @@ header('Cache-Control: no-cache, must-revalidate');
         function feeRedirectBadge(fr) {
             const label = (fr && fr.label) ? fr.label : 'fees';
             const dest = fr && fr.destination ? '\nDestination: ' + fr.destination : '';
-            const title = 'This invoice was redirected to pay for ' + label + '.' + dest;
-            return ` <span class="inv-fee-badge" title="${escapeAttr(title)}">⚡ Fee payment</span>`;
+            // An invoice can be mixed: some rails go to the fee payee, the rest
+            // to the merchant. Until it settles we don't know which rail the
+            // customer will use, so the badge text depends on what we know.
+            let text, title;
+            if (fr && fr.settled) {
+                if (fr.settledToFee) {
+                    text = '⚡ Fee payment';
+                    title = 'The customer paid a rail routed to ' + label
+                        + ', so this payment covered that fee instead of the merchant.' + dest;
+                } else {
+                    // Mixed invoice where the customer chose the merchant rail —
+                    // no badge needed (the merchant was genuinely paid).
+                    return '';
+                }
+            } else if (fr && fr.mixed) {
+                text = '⚡ Fee-eligible';
+                title = 'If the customer pays the fee rail, this invoice covers '
+                    + label + '; if they pay the merchant rail, it is a normal payment.' + dest;
+            } else {
+                text = '⚡ Fee payment';
+                title = 'This invoice is routed to pay for ' + label + '.' + dest;
+            }
+            return ` <span class="inv-fee-badge" title="${escapeAttr(title)}">${text}</span>`;
         }
 
         function renderInvoices(containerId, invoices) {
