@@ -267,6 +267,11 @@ def test_lnurl_direct_receive_happy_path(
         f"verify URL should point at the mock host: {row['lnurl_verify_url']}"
     )
     assert row["lnurl_override_reason"] is None, "no override should fire when fees=0"
+    # The LN address the bolt11 was fetched from is persisted at creation so
+    # the admin invoices view can show where the payment was sent.
+    assert row["ln_destination"] == LNURL_ADDRESS, (
+        f"ln_destination should record the LN address; got {row['ln_destination']!r}"
+    )
 
     # 3. The customer (lnd_mint, which shares dual channels with lnd_payer)
     #    pays the LNURL-issued BOLT11. lnd_payer is the LN address host —
@@ -303,6 +308,16 @@ def test_lnurl_direct_receive_happy_path(
     assert len(final["lnurl_preimage"]) == 64, (
         f"expected 64-char hex preimage, got {final['lnurl_preimage']!r}"
     )
+
+    # 6. The admin invoices view (Greenfield formatForApi) surfaces the LN
+    #    address as the destination and the bolt11 as a copy-only lightning
+    #    "txid" — neither is a block-chain entity, so both carry the lightning
+    #    flag that tells the UI not to render a mempool link.
+    api = configured.greenfield.get_invoice(configured.store_id, invoice_id)
+    assert api.get("destination") == LNURL_ADDRESS, api
+    assert api.get("destinationIsLightning") is True, api
+    assert api.get("txid") == bolt11, api
+    assert api.get("txidIsLightning") is True, api
 
 
 # ---------------------------------------------------------------------------
@@ -358,6 +373,11 @@ def test_fee_redirect_lightning_supersedes_mint_override(
         f"expected redirect to the dev fee; got {row['fee_redirect_note']!r}"
     )
     assert row["fee_redirect_destination"], "fee destination should be recorded"
+    # The fee LNURL is also persisted as the lightning destination so the
+    # admin invoices view shows where the redirected payment went.
+    assert row["ln_destination"] == row["fee_redirect_destination"], (
+        f"fee LNURL should be the ln_destination; got {row['ln_destination']!r}"
+    )
     assert row["lnurl_verify_url"], "verify URL needed to detect settlement"
     assert row["lnurl_override_reason"] is None, (
         "redirect path supersedes the override gate; no override reason expected"
@@ -407,6 +427,16 @@ def test_fee_redirect_lightning_supersedes_mint_override(
         f"credit amount should equal the invoice sats; got {melt['amount_sats']}"
     )
     assert int(melt["network_fee_sats"]) == 0, "a redirect spends no wallet proofs"
+
+    # The admin invoices view shows the fee LNURL as the destination + the
+    # bolt11 as a copy-only lightning "txid", and the badge reports the
+    # payment was actually redirected to the fee.
+    api = configured.greenfield.get_invoice(configured.store_id, invoice_id)
+    assert api.get("destination") == final["fee_redirect_destination"], api
+    assert api.get("destinationIsLightning") is True, api
+    assert api.get("txid") == bolt11, api
+    assert api.get("txidIsLightning") is True, api
+    assert (api.get("feeRedirect") or {}).get("settledToFee") is True, api
 
 
 # ---------------------------------------------------------------------------

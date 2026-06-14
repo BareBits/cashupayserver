@@ -4109,6 +4109,7 @@ header('Cache-Control: no-cache, must-revalidate');
             text-decoration: none;
         }
         .inv-mono a:hover { text-decoration: underline; }
+        .inv-mono a.inv-copy { cursor: copy; }
         .inv-filter-row {
             display: flex;
             align-items: center;
@@ -7440,10 +7441,14 @@ header('Cache-Control: no-cache, must-revalidate');
                     return '';
                 }
             } else if (fr && fr.mixed) {
-                text = '⚡ Fee-eligible';
-                title = 'If the customer pays the fee rail, this invoice covers '
-                    + label + '; if they pay the merchant rail, it is a normal payment.' + dest;
+                // Mixed invoice not yet settled: the customer can still pay the
+                // merchant rail, so the payment hasn't actually been redirected
+                // to a fee. Show nothing until settlement decides (only actual
+                // redirects get a badge).
+                return '';
             } else {
+                // Pure fee invoice (every rail routes to the fee): the payment
+                // is redirected regardless of which rail the customer picks.
                 text = '⚡ Fee payment';
                 title = 'This invoice is routed to pay for ' + label + '.' + dest;
             }
@@ -7512,6 +7517,30 @@ header('Cache-Control: no-cache, must-revalidate');
             const url = mempoolUrl(kind, value, network);
             return `<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer" title="${title}">${escapeHtml(head)}...${escapeHtml(tail)}</a>`;
         }
+
+        // Render a value as "xxx...xxx" that copies the full value to the
+        // clipboard on click, with the full value in a hover tooltip. Used for
+        // Lightning destinations (LN address / LNURL) and bolt11 invoices,
+        // which have no block explorer to link to. The full value rides in a
+        // data attribute so it survives any character without breaking the
+        // inline handler.
+        function renderCopyMono(value, hint) {
+            if (!value) return '—';
+            const head = value.length > 6 ? value.slice(0, 3) : value;
+            const tail = value.length > 6 ? value.slice(-3) : '';
+            const title = (hint ? hint + '\n' : '') + value + '\n(click to copy)';
+            return `<a href="#" class="inv-copy" title="${escapeAttr(title)}" data-copy="${escapeAttr(value)}" onclick="copyMono(event, this); return false;">${escapeHtml(head)}...${escapeHtml(tail)}</a>`;
+        }
+
+        // Clipboard handler for renderCopyMono links.
+        window.copyMono = function (e, el) {
+            e.preventDefault();
+            e.stopPropagation();
+            const val = (el && el.getAttribute('data-copy')) || '';
+            navigator.clipboard.writeText(val).then(() => {
+                showToast('Copied to clipboard', 'success');
+            }).catch(() => showToast('Copy failed', 'error'));
+        };
 
         // Copy the full invoice id to the clipboard from the tooltip popup.
         // Flashes a "Copied!" toast and bumps the icon stroke briefly so the
@@ -7608,10 +7637,14 @@ header('Cache-Control: no-cache, must-revalidate');
                     ? `<div>${description ? escapeHtml(description) : ''}${swapBadge}${itemsLink}${feeBadge}</div>`
                     : '<span style="color: var(--text-secondary);">—</span>';
                 const destCell = inv.destination
-                    ? `<span class="inv-mono">${renderMonoLink('address', inv.destination, network)}</span>`
+                    ? `<span class="inv-mono">${inv.destinationIsLightning
+                        ? renderCopyMono(inv.destination, 'Lightning destination')
+                        : renderMonoLink('address', inv.destination, network)}</span>`
                     : '<span style="color: var(--text-secondary);">—</span>';
                 const txidCell = inv.txid
-                    ? `<span class="inv-mono">${renderMonoLink('tx', inv.txid, network, inv.claimTxid ? 'Claim: ' + inv.claimTxid : null)}</span>`
+                    ? `<span class="inv-mono">${inv.txidIsLightning
+                        ? renderCopyMono(inv.txid, 'Lightning invoice (bolt11)')
+                        : renderMonoLink('tx', inv.txid, network, inv.claimTxid ? 'Claim: ' + inv.claimTxid : null)}</span>`
                     : '<span style="color: var(--text-secondary);">—</span>';
 
                 // Display label for the status chip: "Settled" reads as
