@@ -639,6 +639,16 @@ HTACCESS;
         if (!self::columnExists($pdo, 'invoices', 'fee_redirect_destination')) {
             $pdo->exec("ALTER TABLE invoices ADD COLUMN fee_redirect_destination TEXT DEFAULT NULL");
         }
+        //   - invoices.fee_redirect_rails: CSV of the logical customer rails
+        //     ('lightning','onchain') that point at the fee payee on this
+        //     invoice. A mixed invoice routes some rails to the fee and the
+        //     rest to the merchant, so settlement attribution is decided by
+        //     which rail actually paid (see Invoice::railIsFeeRouted). NULL on
+        //     normal invoices; for a fee invoice it lists a subset (or all) of
+        //     the offered rails.
+        if (!self::columnExists($pdo, 'invoices', 'fee_redirect_rails')) {
+            $pdo->exec("ALTER TABLE invoices ADD COLUMN fee_redirect_rails TEXT DEFAULT NULL");
+        }
         if (!self::columnExists($pdo, 'melts', 'via')) {
             $pdo->exec("ALTER TABLE melts ADD COLUMN via TEXT NOT NULL DEFAULT 'wallet'");
         }

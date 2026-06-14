@@ -16,19 +16,23 @@
  *
  * Rules (locked in with the operator):
  *   - GATE (no overpay): a fee is only a candidate when its owed amount is
- *     >= the invoice amount in sats, so the whole payment is fully absorbed by
- *     existing debt and the payee is never overpaid.
- *   - PRECEDENCE: when several fees qualify, the one with the LARGEST owed
- *     amount wins (a single payment can only go to one destination).
- *   - ALL RAILS OR NONE: the chosen fee must be able to cover EVERY rail the
- *     store would otherwise offer (a LUD-21 Lightning address for the lightning
- *     rail, a network-matched xpub for the on-chain rail). If no qualifying fee
- *     covers all of the store's rails, we do NOT redirect — the invoice is
- *     created normally with all rails intact (so we never disable a payment
- *     type or misroute a customer to the merchant on a "fee" invoice).
+ *     >= the invoice amount in sats. The customer pays exactly one rail in
+ *     full, so a fee can only claim a rail if it is owed at least that much.
+ *   - PRECEDENCE: a single fee (the LARGEST owed that can cover at least one
+ *     offered rail) claims every rail it natively covers on this invoice.
+ *   - PER-RAIL (no all-rails requirement): the chosen fee routes the rails it
+ *     covers (a LUD-21 Lightning address for the lightning rail, a
+ *     network-matched xpub for the on-chain rail) to the fee payee; any
+ *     offered rail it cannot cover falls through to the MERCHANT on the same
+ *     invoice. So an invoice can be mixed — e.g. lightning -> dev fee,
+ *     on-chain -> merchant. Whichever rail the customer actually pays decides
+ *     whether this settlement is a fee payment or a merchant payment
+ *     (see Invoice::railIsFeeRouted). We never disable a payment type.
  *   - Upstream, dev and hosting all participate. Upstream/dev destinations are
  *     global config; hosting's are per-store. A fee with no destination for a
- *     given rail simply can't cover that rail.
+ *     given rail simply can't cover that rail (that rail goes to the merchant).
+ *   - We never split rails across DIFFERENT fee payees on one invoice; a
+ *     single fee owns whichever rails it covers, the merchant owns the rest.
  *
  * The lightning rail reuses {@see LnUrlReceive::probeAndFetchInvoice}, which
  * requires a LUD-21 `verify` URL — without it we couldn't detect settlement
@@ -90,18 +94,21 @@ class FeeRedirect {
     }
 
     /**
-     * Decide whether to redirect this invoice and, if so, build the rail
-     * destinations. Returns null to leave the invoice on the normal path.
+     * Decide how this invoice's rails should be routed. Returns null to leave
+     * the invoice fully on the normal (merchant) path. Otherwise returns the
+     * single chosen fee plus the subset of rails it claims; the caller routes
+     * those rails to the fee payee and builds the remaining offered rails for
+     * the merchant on the same invoice.
      *
      * @param string   $storeId
      * @param array    $store        Full stores row (Config::getStore).
      * @param int      $invoiceSats  Invoice amount in sats.
      * @param string[] $offeredRails Subset of ['lightning','onchain'] the store
-     *                               can present; the chosen fee must cover all.
+     *                               can present.
      * @return array{
-     *   note:string, fee_key:string, destination:string,
-     *   lightning:?array{bolt11:string,verify_url:string,amount_sats:int},
-     *   onchain:?array{address:string,index:int,tip_height:?int}
+     *   note:string, fee_key:string, rails:string[], destination:string,
+     *   lightning:?array{bolt11:string,verify_url:string,destination:string,amount_sats:int},
+     *   onchain:?array{address:string,index:int,tip_height:?int,destination:string}
      * }|null
      */
     public static function decide(string $storeId, array $store, int $invoiceSats, array $offeredRails): ?array {
@@ -113,29 +120,35 @@ class FeeRedirect {
         $storeNetwork = (string)($store['onchain_network'] ?? 'mainnet');
         // Free trial / no revenue => every owed is 0 => nothing qualifies.
         foreach (self::candidates($store, $owed) as $cand) {
-            // GATE: only redirect when the whole invoice is absorbed by debt.
+            // GATE: a fee can only claim a rail when its owed amount covers the
+            // whole invoice (the customer pays one rail in full -> no overpay).
             if ($cand['owed'] < $invoiceSats) {
                 continue;
             }
-            // COVERAGE: the chosen fee must (by config) be able to cover every
-            // rail the store offers — otherwise redirecting would drop a
-            // payment type. Cheap static check before any HTTP / derivation.
-            if (!self::staticallyCovers($cand, $offeredRails, $storeNetwork)) {
+            // Which offered rails can this fee cover by config? Pure, no I/O.
+            // Largest-owed-first: the first fee that covers >=1 rail wins, and
+            // it claims only the rails it covers (the rest go to the merchant).
+            $covered = self::coveredRails($cand, $offeredRails, $storeNetwork);
+            if (empty($covered)) {
                 continue;
             }
-            $built = self::buildRails($cand, $store, $invoiceSats, $offeredRails);
+            // Build destinations for the covered rails. A rail that fails to
+            // build at runtime (LNURL host down, derivation error) is dropped
+            // and falls back to the merchant rather than aborting the redirect.
+            $built = self::buildRails($cand, $store, $invoiceSats, $covered);
             if ($built === null) {
-                // This (largest-owed) candidate can't cover every offered
-                // rail — fall through to the next, smaller candidate.
+                // Every covered rail failed to build — try the next fee.
                 continue;
             }
             error_log(sprintf(
-                '[fee-redirect] store=%s fee=%s owed=%d invoice_sats=%d rails=%s',
-                $storeId, $cand['key'], $cand['owed'], $invoiceSats, implode('+', $offeredRails)
+                '[fee-redirect] store=%s fee=%s owed=%d invoice_sats=%d offered=%s fee_rails=%s',
+                $storeId, $cand['key'], $cand['owed'], $invoiceSats,
+                implode('+', $offeredRails), implode('+', $built['rails'])
             ));
             return [
                 'note'        => $cand['note'],
                 'fee_key'     => $cand['key'],
+                'rails'       => $built['rails'],
                 'destination' => $built['destination'],
                 'lightning'   => $built['lightning'],
                 'onchain'     => $built['onchain'],
@@ -145,95 +158,103 @@ class FeeRedirect {
     }
 
     /**
-     * Pure coverage check: does this candidate have a configured destination
-     * for every offered rail? Lightning needs a non-empty LNURL; on-chain
-     * needs a non-empty xpub on the SAME network as the paying store (the
-     * redirect invoice is polled with the store's provider). No I/O — the
+     * Pure: which of the offered rails can this candidate cover by config?
+     * Lightning needs a non-empty LNURL; on-chain needs a non-empty xpub on the
+     * SAME network as the paying store (the invoice is polled with the store's
+     * provider, so a different-network xpub would be unwatchable). No I/O — the
      * runtime confirmation (LNURL reachable, derivation works) happens in
      * buildRails. Exposed for unit testing.
      *
      * @param string[] $offeredRails
+     * @return string[] subset of $offeredRails this fee can route to itself
      */
-    public static function staticallyCovers(array $cand, array $offeredRails, string $storeNetwork): bool {
-        if (in_array('lightning', $offeredRails, true) && ($cand['lnurl'] ?? '') === '') {
-            return false;
+    public static function coveredRails(array $cand, array $offeredRails, string $storeNetwork): array {
+        $covered = [];
+        if (in_array('lightning', $offeredRails, true) && ($cand['lnurl'] ?? '') !== '') {
+            $covered[] = 'lightning';
         }
-        if (in_array('onchain', $offeredRails, true)) {
-            if (($cand['xpub'] ?? '') === '') {
-                return false;
-            }
-            if (($cand['network'] ?? 'mainnet') !== $storeNetwork) {
-                return false;
-            }
+        if (in_array('onchain', $offeredRails, true)
+            && ($cand['xpub'] ?? '') !== ''
+            && ($cand['network'] ?? 'mainnet') === $storeNetwork) {
+            $covered[] = 'onchain';
         }
-        return true;
+        return $covered;
     }
 
     /**
-     * Attempt to build destinations for every offered rail using one fee
-     * candidate. All-or-nothing: returns null if any offered rail can't be
-     * covered, so the caller never produces a partially-redirected invoice.
+     * Pure coverage check: can this candidate cover EVERY offered rail? Kept as
+     * a convenience predicate (decide() no longer requires it — see
+     * coveredRails for the per-rail subset). Exposed for unit testing.
      *
-     * @return array{destination:string, lightning:?array, onchain:?array}|null
+     * @param string[] $offeredRails
      */
-    private static function buildRails(array $cand, array $store, int $invoiceSats, array $offeredRails): ?array {
-        $wantLightning = in_array('lightning', $offeredRails, true);
-        $wantOnchain   = in_array('onchain', $offeredRails, true);
+    public static function staticallyCovers(array $cand, array $offeredRails, string $storeNetwork): bool {
+        return count(self::coveredRails($cand, $offeredRails, $storeNetwork)) === count($offeredRails);
+    }
+
+    /**
+     * Build fee destinations for the given rails using one fee candidate. Each
+     * rail is best-effort: a rail that can't be built (LNURL host down,
+     * derivation error) is simply omitted so the caller leaves it to the
+     * merchant. Returns null only when NO rail could be built.
+     *
+     * @param string[] $railsToBuild already known to be config-covered (see coveredRails)
+     * @return array{rails:string[], destination:string, lightning:?array, onchain:?array}|null
+     */
+    private static function buildRails(array $cand, array $store, int $invoiceSats, array $railsToBuild): ?array {
+        $wantLightning = in_array('lightning', $railsToBuild, true);
+        $wantOnchain   = in_array('onchain', $railsToBuild, true);
 
         $lightning = null;
         $onchain = null;
+        $rails = [];
         $labels = [];
 
-        if ($wantLightning) {
-            if ($cand['lnurl'] === '') {
-                return null;
-            }
+        if ($wantLightning && ($cand['lnurl'] ?? '') !== '') {
             // Live LUD-21 probe + bolt11 fetch for the exact amount. Null on
             // host down / no verify URL / amount out of LNURL range.
             $probe = LnUrlReceive::probeAndFetchInvoice($cand['lnurl'], $invoiceSats);
-            if ($probe === null) {
-                return null;
+            if ($probe !== null) {
+                $lightning = [
+                    'bolt11'      => $probe['bolt11'],
+                    'verify_url'  => $probe['verify_url'],
+                    'destination' => $cand['lnurl'],
+                    'amount_sats' => $invoiceSats,
+                ];
+                $rails[] = 'lightning';
+                $labels[] = $cand['lnurl'];
+            } else {
+                error_log('[fee-redirect] lightning rail unavailable for '
+                    . ($cand['key'] ?? '?') . ' (' . $cand['lnurl'] . '); rail falls back to merchant');
             }
-            $lightning = [
-                'bolt11'      => $probe['bolt11'],
-                'verify_url'  => $probe['verify_url'],
-                'amount_sats' => $invoiceSats,
-            ];
-            $labels[] = $cand['lnurl'];
         }
 
-        if ($wantOnchain) {
-            if ($cand['xpub'] === '') {
-                return null;
-            }
-            // The redirect invoice is polled with the PAYING store's on-chain
-            // provider, which is bound to the store's network. A fee xpub on a
-            // different network would be unwatchable, so require a match.
-            $storeNetwork = (string)($store['onchain_network'] ?? 'mainnet');
-            if ($cand['network'] !== $storeNetwork) {
-                return null;
-            }
+        if ($wantOnchain && ($cand['xpub'] ?? '') !== ''
+            && $cand['network'] === (string)($store['onchain_network'] ?? 'mainnet')) {
             try {
                 $alloc = OnchainPayments::allocateFeeAddress(
                     $cand['xpub'], $cand['network'], $cand['type'], $store
                 );
+                $onchain = [
+                    'address'     => $alloc['address'],
+                    'index'       => $alloc['index'],
+                    'tip_height'  => $alloc['tip_height'] ?? null,
+                    'destination' => $alloc['address'],
+                ];
+                $rails[] = 'onchain';
+                $labels[] = $alloc['address'];
             } catch (Throwable $e) {
-                error_log('[fee-redirect] fee-address derivation failed for '
-                    . ($cand['key'] ?? '?') . ': ' . $e->getMessage());
-                return null;
+                error_log('[fee-redirect] onchain rail derivation failed for '
+                    . ($cand['key'] ?? '?') . ': ' . $e->getMessage()
+                    . '; rail falls back to merchant');
             }
-            $onchain = [
-                'address'    => $alloc['address'],
-                'index'      => $alloc['index'],
-                'tip_height' => $alloc['tip_height'] ?? null,
-            ];
-            $labels[] = $alloc['address'];
         }
 
-        if ($lightning === null && $onchain === null) {
+        if (empty($rails)) {
             return null;
         }
         return [
+            'rails'       => $rails,
             'destination' => implode(' / ', $labels),
             'lightning'   => $lightning,
             'onchain'     => $onchain,

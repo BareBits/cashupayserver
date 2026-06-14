@@ -73,12 +73,14 @@ class Invoice {
         }
 
         // ---- Fee-redirect path: when a fee (dev / upstream / hosting) is
-        // already owed in an amount >= this invoice, point the whole payment
-        // at that fee's destination instead of the merchant. Decided up front
-        // so it fully supersedes the rail logic below (the existing cashu-
-        // wallet cron settlement is the fallback when this doesn't engage).
-        // The chosen fee must cover EVERY rail the store offers, so we never
-        // drop a payment type — see FeeRedirect::decide. ----
+        // already owed in an amount >= this invoice, route the rails that fee
+        // can cover straight to its destination instead of the merchant. The
+        // remaining offered rails fall through to the normal merchant logic
+        // below, so an invoice can be mixed (e.g. lightning -> fee payee,
+        // on-chain -> merchant). Whichever rail the customer actually pays
+        // decides attribution at settlement (see Invoice::railIsFeeRouted); any
+        // fee not collected this way is still melted out by the cron. A single
+        // fee owns whichever rails it covers — see FeeRedirect::decide. ----
         $invoiceSats = (int) ExchangeRates::convertToSats((string)$amount, $currency, 'sat');
         $lnAutoMeltForRedirect = (int)($store['auto_melt_enabled'] ?? 0) === 1;
         $lnAddrsForRedirect = $lnAutoMeltForRedirect
@@ -91,13 +93,13 @@ class Invoice {
         if ($lightningCapable)   { $offeredRails[] = 'lightning'; }
         if ($onchainConfigured)  { $offeredRails[] = 'onchain'; }
 
-        $redirect = FeeRedirect::decide($storeId, $store, $invoiceSats, $offeredRails);
-        if ($redirect !== null) {
-            return self::createRedirectInvoice(
-                $storeId, $amount, $currency, $exchangeRate,
-                $invoiceSats, $metadata, $checkout, $redirect
-            );
-        }
+        $feeRoute       = FeeRedirect::decide($storeId, $store, $invoiceSats, $offeredRails);
+        $feeNote        = $feeRoute['note'] ?? null;
+        $feeRails       = $feeRoute['rails'] ?? [];
+        $feeDestination = $feeRoute['destination'] ?? null;
+        // Per-rail fee destinations (null = that rail stays with the merchant).
+        $feeLightning   = $feeRoute['lightning'] ?? null; // ['bolt11','verify_url','destination']
+        $feeOnchain     = $feeRoute['onchain'] ?? null;   // ['address','index','tip_height','destination']
 
         // ---- LNURL direct-receive path: route LN payment straight to the
         // merchant's auto-withdraw LN address when the host supports LUD-21
@@ -112,7 +114,9 @@ class Invoice {
         $lnAddresses = $lnAutoMeltEnabled
             ? StoreLnAddresses::addressesForStore($storeId)
             : [];
-        if (!empty($lnAddresses)) {
+        // Skip the merchant lightning rail entirely when a fee owns it — the
+        // single lightning option on this invoice is the fee LNURL's bolt11.
+        if ($feeLightning === null && !empty($lnAddresses)) {
             $lnurlTargetSats = (int) ExchangeRates::convertToSats((string)$amount, $currency, 'sat');
             $feesDueSats = LnUrlReceive::feesDueSats($storeId);
             $decision = LnUrlReceive::shouldOverride($feesDueSats, $lnurlTargetSats);
@@ -181,8 +185,12 @@ class Invoice {
 
         // ---- Submarine-swap path: replaces the cashu mint with a non-custodial
         // LN→on-chain swap that settles directly to the merchant's xpub. ----
+        // Suppressed when a fee owns the lightning rail (the fee supplies the
+        // bolt11) or the on-chain rail (a swap invoice must stay lightning-only,
+        // so we don't pair it with a fee-owned on-chain address).
         $swapAttempt = null; // populated by self::trySwapCreate on success
-        if ($lnurlAttempt === null && SwapsConfig::isEnabledForStore($storeId) && $onchainConfigured) {
+        if ($lnurlAttempt === null && $feeLightning === null && $feeOnchain === null
+            && SwapsConfig::isEnabledForStore($storeId) && $onchainConfigured) {
             // Target = what the merchant wants to receive on-chain in sats.
             $targetSats = ExchangeRates::convertToSats((string)$amount, $currency, 'sat');
             $swapFailures = []; // per-provider reasons, populated by trySwapCreate
@@ -206,7 +214,8 @@ class Invoice {
         $quote = null;
         $usedMintUrl = null;
         $amountInMintUnit = null;
-        if ($cashuConfigured && $swapAttempt === null && $lnurlAttempt === null) {
+        if ($cashuConfigured && $swapAttempt === null && $lnurlAttempt === null
+            && $feeLightning === null) {
             $mintUnit = $store['mint_unit'];
             $amountInMintUnit = ExchangeRates::convertToMintUnit(
                 $amount, $currency, $mintUnit, $exchangeFee, $primaryProvider, $secondaryProvider
@@ -251,7 +260,8 @@ class Invoice {
         $onchainAmountSat = null;
         $onchainAmountTweakSats = null;
         $onchainCreatedTipHeight = null;
-        if ($onchainConfigured && $swapAttempt === null && $lnurlAttempt === null) {
+        if ($onchainConfigured && $swapAttempt === null && $lnurlAttempt === null
+            && $feeOnchain === null) {
             $baseAmountSat = (int)ExchangeRates::convertToSats((string)$amount, $currency, 'sat');
             try {
                 $allocation = OnchainPayments::allocateAddress($storeId, $baseAmountSat);
@@ -273,6 +283,18 @@ class Invoice {
             }
         }
 
+        // Fee-redirect on-chain rail: the fee payee's xpub-derived address
+        // (allocated in FeeRedirect::buildRails) replaces the merchant's
+        // on-chain rail on this invoice. The customer pays the exact invoice
+        // amount — no uniqueness tweak, since each fee address is fresh.
+        if ($feeOnchain !== null) {
+            $onchainAddress = $feeOnchain['address'];
+            $onchainIndex = $feeOnchain['index'] ?? null;
+            $onchainAmountSat = $invoiceSats;
+            $onchainAmountTweakSats = null;
+            $onchainCreatedTipHeight = $feeOnchain['tip_height'] ?? null;
+        }
+
         // Calculate expiration. Swap-rail invoices use the provider's BOLT11
         // expiration plus an extra grace window for cron to drive the claim;
         // mint-rail and onchain-rail use the existing default.
@@ -286,7 +308,18 @@ class Invoice {
 
         // Decide payment_rail + final field values
         $lnurlVerifyUrl = null;
-        if ($lnurlAttempt !== null) {
+        if ($feeLightning !== null) {
+            // Fee-redirect lightning rail: the customer pays the fee LNURL's
+            // bolt11 directly. Rides payment_rail='lnaddress' so the existing
+            // verify-URL poller detects settlement (the LNURL poller is the
+            // only one gated on payment_rail).
+            $paymentRail = 'lnaddress';
+            $bolt11Final = $feeLightning['bolt11'];
+            $mintUrlFinal = null;
+            $quoteIdFinal = null;
+            $amountSatsFinal = $invoiceSats;
+            $lnurlVerifyUrl = $feeLightning['verify_url'];
+        } elseif ($lnurlAttempt !== null) {
             $paymentRail = 'lnaddress';
             $bolt11Final = $lnurlAttempt['bolt11'];
             $mintUrlFinal = null;
@@ -305,6 +338,14 @@ class Invoice {
             $mintUrlFinal = $usedMintUrl;
             $quoteIdFinal = $quote ? $quote->quote : null;
             $amountSatsFinal = $amountInMintUnit;
+        }
+
+        // A fee invoice always carries the canonical sat value so revenue math
+        // and the fee credit (recordFeeRedirectCredit) reflect the amount the
+        // customer actually paid, independent of which rail/mint unit the
+        // merchant side used. Mirrors the previous createRedirectInvoice path.
+        if ($feeNote !== null) {
+            $amountSatsFinal = $invoiceSats;
         }
 
         Database::insert('invoices', [
@@ -327,6 +368,9 @@ class Invoice {
             'payment_rail' => $paymentRail,
             'lnurl_verify_url' => $lnurlVerifyUrl,
             'lnurl_override_reason' => $lnurlOverrideReason,
+            'fee_redirect_note' => $feeNote,
+            'fee_redirect_destination' => $feeDestination,
+            'fee_redirect_rails' => $feeRails ? implode(',', $feeRails) : null,
             'metadata' => $metadata ? json_encode($metadata) : null,
             'checkout_config' => $checkout ? json_encode($checkout) : null,
             'created_at' => $now,
@@ -343,74 +387,6 @@ class Invoice {
         // Fire InvoiceCreated webhook
         WebhookSender::fireEvent($storeId, 'InvoiceCreated', $invoice);
 
-        return $invoice;
-    }
-
-    /**
-     * Build + persist a fee-redirect invoice. The decision (which fee, which
-     * rails, with what destinations) was already made by {@see FeeRedirect}.
-     *
-     * Whichever rail the customer pays, the funds go to the fee payee — not
-     * the merchant — so:
-     *   - Lightning option (if present) is the fee LNURL's BOLT11 + LUD-21
-     *     verify URL; the invoice rides payment_rail='lnaddress' so the
-     *     existing verify-URL poller detects settlement.
-     *   - On-chain option (if present) is an address derived from the fee's
-     *     xpub; the existing on-chain poller detects payment to it.
-     * Both can be set on one invoice (the checkout shows both). amount_sats /
-     * onchain_amount_sat are the plain sat amount the customer pays.
-     *
-     * The invoice is tagged with fee_redirect_note so settlement records the
-     * fee-paid credit (see recordFeeRedirectCredit) and the admin UI badges it.
-     */
-    private static function createRedirectInvoice(
-        string $storeId,
-        $amount,
-        string $currency,
-        ?float $exchangeRate,
-        int $invoiceSats,
-        ?array $metadata,
-        ?array $checkout,
-        array $redirect
-    ): array {
-        $ln = $redirect['lightning'] ?? null;
-        $oc = $redirect['onchain'] ?? null;
-
-        $paymentRail = $ln !== null ? 'lnaddress' : 'onchain';
-        $invoiceId = Database::generateId('inv');
-        $now = Database::timestamp();
-        $expiration = time() + Config::getInvoiceExpiration();
-
-        Database::insert('invoices', [
-            'id' => $invoiceId,
-            'store_id' => $storeId,
-            'status' => 'New',
-            'additional_status' => 'None',
-            'amount' => $amount,
-            'currency' => $currency,
-            'amount_sats' => $invoiceSats,
-            'exchange_rate' => $exchangeRate,
-            'quote_id' => null,
-            'bolt11' => $ln['bolt11'] ?? null,
-            'mint_url' => null,
-            'onchain_address' => $oc['address'] ?? null,
-            'onchain_address_index' => $oc['index'] ?? null,
-            'onchain_amount_sat' => $oc !== null ? $invoiceSats : null,
-            'onchain_amount_tweak_sats' => null,
-            'onchain_created_tip_height' => $oc['tip_height'] ?? null,
-            'payment_rail' => $paymentRail,
-            'lnurl_verify_url' => $ln['verify_url'] ?? null,
-            'lnurl_override_reason' => null,
-            'fee_redirect_note' => $redirect['note'],
-            'fee_redirect_destination' => $redirect['destination'],
-            'metadata' => $metadata ? json_encode($metadata) : null,
-            'checkout_config' => $checkout ? json_encode($checkout) : null,
-            'created_at' => $now,
-            'expiration_time' => $expiration,
-        ]);
-
-        $invoice = self::getById($invoiceId);
-        WebhookSender::fireEvent($storeId, 'InvoiceCreated', $invoice);
         return $invoice;
     }
 
@@ -664,11 +640,15 @@ class Invoice {
         // Get updated invoice for webhook
         $invoice = self::getById($invoiceId);
 
-        // Fee-redirect invoices: record the fee-paid credit on settlement so
-        // the owed amount drops and the cron doesn't melt the same fee again.
-        // (This branch handles the on-chain + mint settlement paths; the
-        // lnaddress path settles via markLnAddressPaid and credits there.)
-        if ($status === 'Settled' && $invoice && !empty($invoice['fee_redirect_note'])) {
+        // Per-rail attribution: an invoice can be mixed (some rails point at a
+        // fee payee, the rest at the merchant). Whether THIS settlement is a
+        // fee payment depends on which rail actually paid (settled_rail), not
+        // on the invoice merely having a fee route. This branch covers the
+        // on-chain + mint settlement paths; the lnaddress path settles via
+        // markLnAddressPaid and attributes there.
+        $settledToFee = $status === 'Settled' && $invoice
+            && self::settledRailIsFeeRouted($invoice);
+        if ($settledToFee) {
             self::recordFeeRedirectCredit($invoice, $invoice['lnurl_preimage'] ?? null);
         }
 
@@ -684,23 +664,66 @@ class Invoice {
 
         if ($eventType && $invoice) {
             WebhookSender::fireEvent($invoice['store_id'], $eventType, $invoice);
-            // The InvoiceSettled webhook still fires for redirect invoices
-            // (the customer genuinely paid, so order fulfillment should
-            // proceed), but we suppress the merchant "you were paid"
-            // notification — the funds went to the fee payee, not the
-            // merchant, and the admin shows a fee-payment badge instead.
-            if ($status === 'Settled' && empty($invoice['fee_redirect_note'])) {
+            // The InvoiceSettled webhook always fires (the customer genuinely
+            // paid, so order fulfillment proceeds), but the merchant "you were
+            // paid" notification is suppressed only when the rail that paid
+            // went to the fee payee — for a merchant rail the merchant really
+            // was paid and should be notified.
+            if ($status === 'Settled' && !$settledToFee) {
                 NotificationSender::queueInvoicePaid($invoice);
             }
         }
     }
 
     /**
-     * Record the fee-paid credit for a settled fee-redirect invoice. The whole
-     * payment went straight to the fee payee (no cashu proofs spent), so we log
-     * a melts row tagged via='redirect' under the fee's note. DevFee::computeOwed
-     * sums melts by note, so this immediately reduces the owed amount and stops
-     * the cron from melting the same fee out of the wallet.
+     * Map the rail that actually settled an invoice to a logical customer rail.
+     * The on-chain poller reports 'onchain'; the mint, lnaddress and swap rails
+     * are all lightning from the customer's point of view.
+     */
+    private static function settledRailToLogical(?string $settledRail): ?string {
+        return match ($settledRail) {
+            'onchain' => 'onchain',
+            'mint', 'lnaddress', 'swap' => 'lightning',
+            default => null,
+        };
+    }
+
+    /**
+     * Does the given logical rail ('lightning' | 'onchain') point at the fee
+     * payee on this invoice? Reads the fee_redirect_rails CSV written at
+     * creation. A NULL/empty value means a normal (all-merchant) invoice.
+     */
+    public static function railIsFeeRouted(array $invoice, string $logicalRail): bool {
+        $raw = (string)($invoice['fee_redirect_rails'] ?? '');
+        if ($raw === '') {
+            return false;
+        }
+        $rails = array_map('trim', explode(',', $raw));
+        return in_array($logicalRail, $rails, true);
+    }
+
+    /**
+     * Was the rail that actually settled this invoice routed to the fee payee?
+     * Combines settled_rail -> logical rail mapping with the per-rail fee flags.
+     */
+    public static function settledRailIsFeeRouted(array $invoice): bool {
+        $logical = self::settledRailToLogical($invoice['settled_rail'] ?? null);
+        return $logical !== null && self::railIsFeeRouted($invoice, $logical);
+    }
+
+    /**
+     * Record the fee-paid credit for a fee-routed settlement. The rail the
+     * customer paid went straight to the fee payee (no cashu proofs spent), so
+     * we log a melts row tagged via='redirect' under the fee's note.
+     * DevFee::computeOwed sums melts by note, so this immediately reduces the
+     * owed amount and stops the cron from melting the same fee out of the
+     * wallet.
+     *
+     * Caller must have confirmed the SETTLED rail is fee-routed
+     * (see settledRailIsFeeRouted); we self-guard here too. The credited amount
+     * comes from the rail that actually paid: the on-chain rail credits
+     * onchain_amount_sat (what the customer sent on-chain), every lightning
+     * rail credits amount_sats.
      *
      * Idempotent: guarded by a SELECT and a UNIQUE partial index on
      * (invoice_id) WHERE via='redirect', so dual-rail settlement races can't
@@ -708,7 +731,7 @@ class Invoice {
      */
     private static function recordFeeRedirectCredit(array $invoice, ?string $preimage): void {
         $note = $invoice['fee_redirect_note'] ?? null;
-        if (empty($note)) {
+        if (empty($note) || !self::settledRailIsFeeRouted($invoice)) {
             return;
         }
         $invoiceId = (string)$invoice['id'];
@@ -719,10 +742,16 @@ class Invoice {
         if ($existing) {
             return;
         }
+        // Credit the amount the paying rail actually moved.
+        $logical = self::settledRailToLogical($invoice['settled_rail'] ?? null);
+        $amount = $logical === 'onchain'
+            ? (int)($invoice['onchain_amount_sat'] ?? $invoice['amount_sats'] ?? 0)
+            : (int)($invoice['amount_sats'] ?? 0);
+        $amount = max(0, $amount);
         try {
             Database::insert('melts', [
                 'store_id' => (string)$invoice['store_id'],
-                'amount_sats' => max(0, (int)($invoice['amount_sats'] ?? 0)),
+                'amount_sats' => $amount,
                 'network_fee_sats' => 0,
                 'destination' => (string)($invoice['fee_redirect_destination'] ?? ''),
                 'preimage' => $preimage ?: null,
@@ -738,8 +767,8 @@ class Invoice {
             return;
         }
         error_log(sprintf(
-            '[fee-redirect] credited %d sats to %s via redirect (invoice=%s)',
-            (int)($invoice['amount_sats'] ?? 0), (string)$note, $invoiceId
+            '[fee-redirect] credited %d sats to %s via redirect (invoice=%s rail=%s)',
+            $amount, (string)$note, $invoiceId, (string)($invoice['settled_rail'] ?? '?')
         ));
     }
 
@@ -991,14 +1020,17 @@ class Invoice {
 
         $updated = self::getById((string)$invoice['id']);
         if ($updated !== null) {
-            // Fee-redirect lightning invoice: the customer paid the fee LNURL
-            // directly. Record the credit and skip the merchant "paid" notice
-            // (the funds went to the fee payee, not the merchant).
-            if (!empty($updated['fee_redirect_note'])) {
+            // The lightning rail just settled (settled_rail='lnaddress'). If
+            // that rail was routed to a fee payee, the customer paid the fee
+            // LNURL directly: record the credit and skip the merchant "paid"
+            // notice. Otherwise it was the merchant's own LN address and the
+            // merchant should be notified.
+            $settledToFee = self::railIsFeeRouted($updated, 'lightning');
+            if ($settledToFee) {
                 self::recordFeeRedirectCredit($updated, $preimage);
             }
             WebhookSender::fireEvent($invoice['store_id'], 'InvoiceSettled', $updated);
-            if (empty($updated['fee_redirect_note'])) {
+            if (!$settledToFee) {
                 NotificationSender::queueInvoicePaid($updated);
             }
         }
@@ -1095,18 +1127,34 @@ class Invoice {
             $result['checkout'] = ['paymentMethods' => $methods];
         }
 
-        // Fee-redirect: surface the badge data for the admin invoice list.
-        // The whole payment went to a fee payee, not the merchant.
+        // Fee-redirect: surface the badge data for the admin invoice list. An
+        // invoice can be mixed — some rails go to a fee payee, the rest to the
+        // merchant — so we expose which rails are fee-routed and, once settled,
+        // whether the rail that actually paid was a fee rail.
         if (!empty($invoice['fee_redirect_note'])) {
             $feeLabels = [
                 'UPSTREAM_DEV_FEE' => 'upstream dev fee',
                 'DEV_FEE' => 'dev fee',
                 'HOSTING_FEE' => 'hosting fee',
             ];
+            $railsRaw = (string)($invoice['fee_redirect_rails'] ?? '');
+            $rails = $railsRaw === '' ? [] : array_map('trim', explode(',', $railsRaw));
+            $isSettled = ($invoice['status'] ?? '') === 'Settled';
+            // Mixed = the merchant still owns a rail that is actually present on
+            // this invoice (lightning bolt11 / on-chain address) but isn't
+            // fee-routed. Drives the "either / or" wording in the badge.
+            $merchantOwnsRail =
+                (!empty($invoice['bolt11']) && !in_array('lightning', $rails, true))
+                || (!empty($invoice['onchain_address']) && !in_array('onchain', $rails, true));
             $result['feeRedirect'] = [
                 'note' => $invoice['fee_redirect_note'],
                 'label' => $feeLabels[$invoice['fee_redirect_note']] ?? 'fees',
                 'destination' => $invoice['fee_redirect_destination'] ?? null,
+                'rails' => $rails,
+                'mixed' => $merchantOwnsRail,
+                // Decided only at settlement: did the paying rail go to the fee?
+                'settled' => $isSettled,
+                'settledToFee' => $isSettled && self::settledRailIsFeeRouted($invoice),
             ];
         }
 
