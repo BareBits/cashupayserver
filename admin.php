@@ -591,6 +591,29 @@ if (isset($_GET['api'])) {
             fclose($out);
             exit;
 
+        case 'export_diagnostic_report':
+            Auth::requireAdmin();
+            require_once __DIR__ . '/includes/diagnostics.php';
+
+            // range: 'all' (everything) or '1m' (past 30 days). anonymize
+            // defaults ON; only an explicit '0' opts into a full-fidelity dump.
+            $rangeArg  = ((string)($_GET['range'] ?? 'all')) === '1m' ? '1m' : null;
+            $anonymize = ((string)($_GET['anonymize'] ?? '1')) !== '0';
+
+            $stamp = date('Ymd-His');
+            $suffix = $anonymize ? 'anon' : 'full';
+            $scope  = $rangeArg === '1m' ? '30d' : 'all';
+            $filename = "diagnostic-report-{$scope}-{$suffix}-{$stamp}.json";
+
+            header('Content-Type: application/json; charset=utf-8');
+            header('Content-Disposition: attachment; filename="' . $filename . '"');
+            header('Cache-Control: no-store');
+
+            $out = fopen('php://output', 'w');
+            (new Diagnostics($anonymize, $rangeArg))->stream($out);
+            fclose($out);
+            exit;
+
         case 'api_keys':
             $storeId = $_GET['store_id'] ?? null;
             if (!$storeId) {
@@ -5307,6 +5330,38 @@ header('Cache-Control: no-cache, must-revalidate');
                     </div>
                 </div>
 
+                <div class="card collapsible" id="card-diagnostics" data-admin-only="true">
+                    <div class="card-header">
+                        <div class="card-title">Diagnostic Report</div>
+                    </div>
+                    <div class="card-body">
+                        <p style="font-size: 0.85rem; color: var(--text-secondary); margin: 0 0 0.75rem 0;">
+                            Download a diagnostic report to send to the developers when something is wrong.
+                            It bundles version &amp; build info, mint reliability and event logs, notification
+                            failures, and anonymized invoice/payment records into a single JSON file.
+                        </p>
+                        <div class="form-group" style="margin-bottom: 0.75rem;">
+                            <label class="form-label" style="display: flex; align-items: center; gap: 0.5rem; cursor: pointer;">
+                                <input type="checkbox" id="diagnostics-anonymize" checked style="width: auto; margin: 0;">
+                                Anonymize data
+                            </label>
+                            <p class="form-help">
+                                On by default. Removes product names, notes, addresses, txids, emails and other
+                                customer-identifying data. Server secrets (wallet keys, passwords, API keys) are
+                                never included.
+                            </p>
+                            <p class="form-help" id="diagnostics-deanon-warning" hidden style="color: var(--danger, #c0392b);">
+                                ⚠ Unchecked: the report will include customer addresses, notes, product names and
+                                emails in the clear. Only share it with developers you trust.
+                            </p>
+                        </div>
+                        <div style="display: flex; gap: 0.5rem;">
+                            <button class="btn" id="btn-export-diagnostics-all" style="flex: 1;">Export all</button>
+                            <button class="btn btn-secondary" id="btn-export-diagnostics-30d" style="flex: 1;">Export past 30 days</button>
+                        </div>
+                    </div>
+                </div>
+
                 <div style="text-align: center; padding: 1.5rem 0; color: var(--text-muted); font-size: 0.8rem;">
                     BareBits v<?= CASHUPAY_VERSION ?> &middot;
                     Deployment ID: <code style="background: rgba(0,0,0,0.2); padding: 0.1rem 0.4rem; border-radius: 4px;"><?= htmlspecialchars((string) Config::get('deployment_id', 'ANONYMOUS')) ?></code> &middot;
@@ -6220,6 +6275,27 @@ header('Cache-Control: no-cache, must-revalidate');
             if (btnSaveTm) btnSaveTm.addEventListener('click', saveTrustedMintsSettings);
             const btnRefreshTm = document.getElementById('btn-refresh-trusted-mints');
             if (btnRefreshTm) btnRefreshTm.addEventListener('click', refreshTrustedMintsNow);
+
+            // Diagnostic report export (admin-only card at the bottom of settings).
+            const diagAnon = document.getElementById('diagnostics-anonymize');
+            const diagWarning = document.getElementById('diagnostics-deanon-warning');
+            if (diagAnon && diagWarning) {
+                diagAnon.addEventListener('change', () => {
+                    diagWarning.hidden = diagAnon.checked;
+                });
+            }
+            const downloadDiagnostics = (range) => {
+                const params = new URLSearchParams({
+                    api: 'export_diagnostic_report',
+                    range: range,
+                    anonymize: (diagAnon && diagAnon.checked) ? '1' : '0',
+                });
+                window.location.href = adminUrl + '?' + params.toString();
+            };
+            const btnDiagAll = document.getElementById('btn-export-diagnostics-all');
+            if (btnDiagAll) btnDiagAll.addEventListener('click', () => downloadDiagnostics('all'));
+            const btnDiag30 = document.getElementById('btn-export-diagnostics-30d');
+            if (btnDiag30) btnDiag30.addEventListener('click', () => downloadDiagnostics('1m'));
 
             // Banner "Open settings" links — kept on a dedicated class instead
             // of sharing data-view="settings" with the sidebar nav button, so
