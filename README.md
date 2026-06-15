@@ -65,6 +65,18 @@ BareBits sits between custodial payment gateways and full self-hosting:
 | BTCPay Server | Full sovereignty | Needs VPS ($20+/mo), Docker, ongoing maintenance |
 | **BareBits** | Simple, cheap hosting | Trust mint with funds until withdrawal |
 
+## Payment Flow
+
+Generally speaking, BareBits tries to offer both on-chain and lightning as payment options to all customers. On-chain payments are always enabled, lightning payments are enabled depending on configuration. Here's what that decision tree looks like:
+```
+Is the invoice amount < fees due? Present on-chain and lightning invoice for fees. Payment gets transparently re-routed to fee payment.
+Is the customer paying on-chain? Send directly to merchant xpub wallet
+Does the merchant have a working LNURL? Present a lightning invoice
+If submarine swaps are NOT enabled and a cashu mint is NOT enabled, do not present a lightning invoice.
+If submarine swaps ARE enabled AND submarine swap fee is reasonable (defined as 1% of value of payment or less), present a lightning invoice that results in a payment to merchant's on-chain wallet
+If submarine swap is NOT enabled OR is too expensive, display lightning invoice to send payment to cashu mint. Funds will be emptied from mint -> merchant on-chain once a submarine swap becomes worth it.
+```
+
 ## Submarine Swaps (LN → on-chain, optional)
 
 When enabled, BareBits can route a customer's Lightning payment through a
