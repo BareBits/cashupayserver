@@ -153,18 +153,27 @@ class Auth {
      * Creates the seed 'admin' user if no admin exists, otherwise updates
      * the existing admin's password. The setup-reentry guard (separate
      * commit) is enforced at the setup.php caller, not here.
+     *
+     * $email is the optional recovery address collected in the same setup
+     * step; it powers the email-link reset mechanism. Pass null to leave it
+     * unset (the file-based reset still works without an address).
      */
-    public static function setAdminPassword(string $password): void {
+    public static function setAdminPassword(string $password, ?string $email = null): void {
         $hash = password_hash($password, PASSWORD_DEFAULT);
 
         $existing = self::getUserByUsername('admin');
         if ($existing) {
-            Database::update('users', ['password_hash' => $hash], 'id = ?', [$existing['id']]);
+            $fields = ['password_hash' => $hash];
+            if ($email !== null) {
+                $fields['email'] = $email !== '' ? $email : null;
+            }
+            Database::update('users', $fields, 'id = ?', [$existing['id']]);
         } else {
             Database::insert('users', [
                 'id'            => Database::generateId('user'),
                 'username'      => 'admin',
                 'password_hash' => $hash,
+                'email'         => ($email !== null && $email !== '') ? $email : null,
                 'role'          => self::ROLE_ADMIN,
                 'created_at'    => Database::timestamp(),
             ]);
@@ -176,7 +185,7 @@ class Auth {
 
     public static function getUserById(string $userId): ?array {
         $row = Database::fetchOne(
-            "SELECT id, username, role, created_at FROM users WHERE id = ?",
+            "SELECT id, username, role, email, created_at FROM users WHERE id = ?",
             [$userId]
         );
         return $row ?: null;
@@ -283,6 +292,223 @@ class Auth {
             'id = ?',
             [$userId]
         );
+    }
+
+    // =========================================================================
+    // Password recovery
+    //
+    // Two operator escape hatches for a lost admin password:
+    //   1. Email reset link  — createPasswordResetToken + resetPasswordWithToken
+    //   2. File-based reset   — fileResetRequested + completeFileReset
+    // Both are surfaced from the lock screen "Forgot password?" modal and
+    // documented in the README.
+    // =========================================================================
+
+    /** Lifetime of an emailed reset link, in seconds (1 hour). */
+    public const RESET_TOKEN_TTL = 3600;
+
+    /**
+     * Validate an email address. Returns null if OK, or an error message.
+     */
+    public static function validateEmail(string $email): ?string {
+        if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+            return 'Enter a valid email address';
+        }
+        return null;
+    }
+
+    /**
+     * Set (or clear, with null/'') a user's recovery email. Validates a
+     * non-empty address. Caller is responsible for authorization.
+     */
+    public static function setUserEmail(string $userId, ?string $email): void {
+        if (!self::getUserById($userId)) {
+            throw new \RuntimeException('User not found');
+        }
+        $value = null;
+        if ($email !== null && trim($email) !== '') {
+            $email = trim($email);
+            if ($err = self::validateEmail($email)) {
+                throw new \InvalidArgumentException($err);
+            }
+            $value = $email;
+        }
+        Database::update('users', ['email' => $value], 'id = ?', [$userId]);
+    }
+
+    /**
+     * The seed 'admin' account's recovery email, or null if unset.
+     */
+    public static function getAdminEmail(): ?string {
+        $row = Database::fetchOne(
+            "SELECT email FROM users WHERE username = 'admin' COLLATE NOCASE"
+        );
+        $email = $row['email'] ?? null;
+        return ($email !== null && $email !== '') ? $email : null;
+    }
+
+    /**
+     * Find the admin user whose recovery email matches (case-insensitive).
+     * Returns the full row or null. Used by the reset-link request flow.
+     */
+    public static function findAdminByEmail(string $email): ?array {
+        $email = trim($email);
+        if ($email === '') {
+            return null;
+        }
+        return Database::fetchOne(
+            "SELECT * FROM users
+              WHERE role = 'admin' AND email IS NOT NULL AND email != ''
+                AND email = ? COLLATE NOCASE
+              LIMIT 1",
+            [$email]
+        ) ?: null;
+    }
+
+    /**
+     * Mint a single-use, time-boxed password-reset token for a user. The raw
+     * token is returned to the caller (to embed in the emailed link); only its
+     * SHA-256 hash is persisted, so a leaked DB can't be used to reset. Any of
+     * the user's prior unused tokens are invalidated so only the newest link
+     * works.
+     */
+    public static function createPasswordResetToken(string $userId): string {
+        $raw  = bin2hex(random_bytes(32));
+        $hash = hash('sha256', $raw);
+        $now  = Database::timestamp();
+
+        // Burn older outstanding tokens for this user (newest link wins).
+        Database::update(
+            'password_reset_tokens',
+            ['used_at' => $now],
+            'user_id = ? AND used_at IS NULL',
+            [$userId]
+        );
+
+        Database::insert('password_reset_tokens', [
+            'user_id'    => $userId,
+            'token_hash' => $hash,
+            'created_at' => $now,
+            'expires_at' => $now + self::RESET_TOKEN_TTL,
+        ]);
+
+        return $raw;
+    }
+
+    /**
+     * Look up a reset token without consuming it. Returns the user row the
+     * token belongs to if the token is valid (exists, unused, unexpired),
+     * else null. Used to decide whether to render the set-password form.
+     */
+    public static function peekPasswordResetToken(string $rawToken): ?array {
+        if ($rawToken === '') {
+            return null;
+        }
+        $row = Database::fetchOne(
+            "SELECT * FROM password_reset_tokens WHERE token_hash = ?",
+            [hash('sha256', $rawToken)]
+        );
+        if (!$row || $row['used_at'] !== null) {
+            return null;
+        }
+        if ((int)$row['expires_at'] < Database::timestamp()) {
+            return null;
+        }
+        return self::getUserById($row['user_id']);
+    }
+
+    /**
+     * Consume a reset token and set the new password atomically-ish: the token
+     * is marked used first (so a concurrent retry can't reuse it), then the
+     * password is updated. Returns true on success, false if the token is
+     * invalid/expired/used. Throws InvalidArgumentException on a weak password
+     * (caller should surface the message and the token stays usable — we only
+     * mark it used once the password validates).
+     */
+    public static function resetPasswordWithToken(string $rawToken, string $newPassword): bool {
+        if ($err = self::validatePassword($newPassword)) {
+            throw new \InvalidArgumentException($err);
+        }
+        if ($rawToken === '') {
+            return false;
+        }
+        $row = Database::fetchOne(
+            "SELECT * FROM password_reset_tokens WHERE token_hash = ?",
+            [hash('sha256', $rawToken)]
+        );
+        if (!$row || $row['used_at'] !== null) {
+            return false;
+        }
+        if ((int)$row['expires_at'] < Database::timestamp()) {
+            return false;
+        }
+
+        // Mark used before changing the password so a racing second submit of
+        // the same link can't also go through.
+        $affected = Database::update(
+            'password_reset_tokens',
+            ['used_at' => Database::timestamp()],
+            'id = ? AND used_at IS NULL',
+            [$row['id']]
+        );
+        if ($affected < 1) {
+            return false; // lost the race
+        }
+
+        if (!self::getUserById($row['user_id'])) {
+            return false;
+        }
+        Database::update(
+            'users',
+            ['password_hash' => password_hash($newPassword, PASSWORD_DEFAULT)],
+            'id = ?',
+            [$row['user_id']]
+        );
+        return true;
+    }
+
+    /**
+     * Absolute path to the file-based reset trigger. Lives in the data
+     * directory (gitignored, not web-served), so writing it already proves
+     * filesystem access — the authorization for this escape hatch.
+     */
+    public static function fileResetPath(): string {
+        return Database::getDataDir() . '/reset-admin-password';
+    }
+
+    /**
+     * Whether the operator has dropped the file-based reset trigger.
+     */
+    public static function fileResetRequested(): bool {
+        return is_file(self::fileResetPath());
+    }
+
+    /**
+     * Complete a file-based reset: set a new password on the seed 'admin'
+     * account and delete the trigger file. The old password stays valid until
+     * this succeeds, and the trigger file must still be present (operator
+     * controls the window). Returns true on success; false if the trigger is
+     * gone or there is no 'admin' account. Throws on a weak password.
+     */
+    public static function completeFileReset(string $newPassword): bool {
+        if (!self::fileResetRequested()) {
+            return false;
+        }
+        if ($err = self::validatePassword($newPassword)) {
+            throw new \InvalidArgumentException($err);
+        }
+        $admin = self::getUserByUsername('admin');
+        if (!$admin) {
+            return false;
+        }
+        Database::update(
+            'users',
+            ['password_hash' => password_hash($newPassword, PASSWORD_DEFAULT)],
+            'id = ?',
+            [$admin['id']]
+        );
+        @unlink(self::fileResetPath());
+        return true;
     }
 
     /**

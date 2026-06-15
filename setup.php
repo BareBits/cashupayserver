@@ -195,6 +195,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
                 $password = $_POST['password'] ?? '';
                 $confirm = $_POST['confirm_password'] ?? '';
+                // Optional recovery email — powers the email-link password
+                // reset. Blank is fine (the file-based reset works without it).
+                $email = trim($_POST['admin_email'] ?? '');
 
                 if (strlen($password) < 8) {
                     throw new Exception('Password must be at least 8 characters');
@@ -202,8 +205,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if ($password !== $confirm) {
                     throw new Exception('Passwords do not match');
                 }
+                if ($email !== '' && ($emailErr = Auth::validateEmail($email)) !== null) {
+                    throw new Exception($emailErr);
+                }
 
-                Auth::setAdminPassword($password);
+                Auth::setAdminPassword($password, $email !== '' ? $email : null);
                 // Go directly to step 4 (create store) - step 3 is merged into step 1
                 $step = 4;
                 break;
@@ -1477,6 +1483,13 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                     <div class="form-group">
                         <label for="confirm_password">Confirm Password</label>
                         <input type="password" id="confirm_password" name="confirm_password" required>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="admin_email">Recovery Email <span style="color: var(--text-secondary); font-weight: normal;">(optional)</span></label>
+                        <input type="email" id="admin_email" name="admin_email"
+                               placeholder="you@example.com">
+                        <p class="help-text">Used to email you a password-reset link if you ever get locked out. Requires outbound email (SMTP) to be configured. You can add or change this later in Settings.</p>
                     </div>
 
                     <button type="submit" class="btn" style="width: 100%;">Continue</button>
