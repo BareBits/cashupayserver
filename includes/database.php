@@ -1316,6 +1316,32 @@ HTACCESS;
                 $stmt->execute([$newEvent, $oldEvent]);
             }
         }
+
+        // Admin password recovery. Two operator escape hatches when the admin
+        // password is lost (see Auth + admin.php):
+        //   1. Email reset link — needs an address on the admin account, which
+        //      users.email holds. Single-use, time-boxed tokens live (hashed)
+        //      in password_reset_tokens; the raw token only ever leaves in the
+        //      emailed link.
+        //   2. File-based reset — operator drops data/reset-admin-password on
+        //      the server (no DB column needed; detected on the filesystem).
+        if (!self::columnExists($pdo, 'users', 'email')) {
+            $pdo->exec("ALTER TABLE users ADD COLUMN email TEXT DEFAULT NULL");
+        }
+        if (!self::tableExists($pdo, 'password_reset_tokens')) {
+            $pdo->exec("
+                CREATE TABLE password_reset_tokens (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id     TEXT NOT NULL,
+                    token_hash  TEXT NOT NULL,
+                    created_at  INTEGER NOT NULL,
+                    expires_at  INTEGER NOT NULL,
+                    used_at     INTEGER DEFAULT NULL,
+                    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+                );
+            ");
+            $pdo->exec("CREATE INDEX idx_password_reset_tokens_hash ON password_reset_tokens(token_hash);");
+        }
     }
 
     private static function columnExists(\PDO $pdo, string $table, string $column): bool {

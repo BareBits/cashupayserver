@@ -27,6 +27,12 @@ function assert_true(bool $cond, string $msg = ''): void {
     }
 }
 
+function assert_false(bool $cond, string $msg = ''): void {
+    if ($cond) {
+        fail('assert_false failed: ' . $msg);
+    }
+}
+
 function assert_eq($expected, $actual, string $msg = ''): void {
     if ($expected !== $actual) {
         fail(sprintf(

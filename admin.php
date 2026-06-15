@@ -66,6 +66,82 @@ function checkDataDirectoryProtection(): ?string {
     return null;
 }
 
+// Password-reset landing page (Mechanism 1). The emailed link opens here as
+// ?action=reset&token=... No session required — the operator is locked out by
+// definition. Rendered as a standalone page (not the SPA) so it works even if
+// the cached SPA is stale. The form POSTs back to action=reset_with_token.
+if (($_GET['action'] ?? '') === 'reset') {
+    $token = (string)($_GET['token'] ?? '');
+    $valid = Auth::peekPasswordResetToken($token) !== null;
+    $tokenEsc  = htmlspecialchars($token, ENT_QUOTES, 'UTF-8');
+    $adminHref = htmlspecialchars(Urls::admin(), ENT_QUOTES, 'UTF-8');
+    header('Content-Type: text/html; charset=UTF-8');
+    ?><!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reset password</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font-family: -apple-system, system-ui, sans-serif; background:#0e0f13; color:#e7e7ea;
+         display:flex; align-items:center; justify-content:center; min-height:100vh; margin:0; padding:1.5rem; }
+  .box { width:100%; max-width:380px; background:#1a1c22; border:1px solid #2a2d36; border-radius:14px; padding:1.75rem; }
+  h1 { font-size:1.25rem; margin:0 0 0.5rem; }
+  p { color:#a4a6ad; font-size:0.9rem; line-height:1.5; margin:0 0 1rem; }
+  input { width:100%; box-sizing:border-box; padding:0.7rem 0.85rem; margin-bottom:0.75rem;
+          background:#0e0f13; border:1px solid #2a2d36; border-radius:8px; color:#e7e7ea; font-size:1rem; }
+  button { width:100%; padding:0.75rem; border:0; border-radius:8px; background:#f7931a; color:#1a1c22;
+           font-weight:600; font-size:1rem; cursor:pointer; }
+  a { color:#f7931a; }
+  .msg { font-size:0.9rem; margin-top:0.75rem; min-height:1.2em; }
+  .err { color:#ef4444; } .ok { color:#22c55e; }
+</style></head>
+<body>
+  <div class="box">
+    <h1>Reset admin password</h1>
+    <?php if (!$valid): ?>
+      <p>This reset link is invalid or has expired. Reset links are valid for one hour and can only be used once.</p>
+      <p><a href="<?= $adminHref ?>">Back to sign in</a></p>
+    <?php else: ?>
+      <p>Choose a new password for your admin account (minimum 8 characters).</p>
+      <input type="password" id="pw" placeholder="New password" autocomplete="new-password">
+      <input type="password" id="pw2" placeholder="Confirm new password" autocomplete="new-password">
+      <button id="submit">Set new password</button>
+      <div class="msg" id="msg"></div>
+      <script>
+        var postUrl = window.location.pathname;
+        var token = <?= json_encode($tokenEsc) ?>;
+        var adminHref = <?= json_encode($adminHref) ?>;
+        var msg = document.getElementById('msg');
+        function setMsg(t, cls) { msg.textContent = t; msg.className = 'msg ' + (cls || ''); }
+        document.getElementById('submit').addEventListener('click', async function () {
+          var pw = document.getElementById('pw').value;
+          var pw2 = document.getElementById('pw2').value;
+          if (pw.length < 8) { setMsg('Password must be at least 8 characters', 'err'); return; }
+          if (pw !== pw2) { setMsg('Passwords do not match', 'err'); return; }
+          setMsg('Saving...');
+          try {
+            var body = 'action=reset_with_token&token=' + encodeURIComponent(token)
+                     + '&new_password=' + encodeURIComponent(pw);
+            var r = await fetch(postUrl, { method: 'POST',
+              headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: body });
+            var data = await r.json().catch(function () { return {}; });
+            if (r.ok && data.success) {
+              setMsg('Password updated. Redirecting to sign in...', 'ok');
+              setTimeout(function () { window.location.href = adminHref; }, 1500);
+            } else {
+              setMsg(data.error || 'Could not reset password', 'err');
+            }
+          } catch (e) { setMsg('Network error, please try again', 'err'); }
+        });
+      </script>
+    <?php endif; ?>
+  </div>
+</body></html>
+<?php
+    exit;
+}
+
 // Handle API-style requests from the SPA
 if (isset($_GET['api'])) {
     header('Content-Type: application/json');
@@ -955,6 +1031,99 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             Security::recordFailedLogin($clientIp);
             http_response_code(401);
             echo json_encode(['error' => 'Invalid username or password']);
+        }
+        exit;
+    }
+
+    // ---- Password recovery (no existing session; the operator is locked out) ----
+
+    // Mechanism 1: request an emailed reset link. Always returns the same
+    // generic response so the endpoint can't be used to discover whether an
+    // address maps to an account (enumeration guard). Rate-limited per IP.
+    if ($action === 'request_password_reset') {
+        $clientIp = Security::getClientIp();
+        if (!Security::checkRateLimit('pwreset_request', $clientIp, 5)) {
+            http_response_code(429);
+            echo json_encode(['error' => 'Too many requests. Please wait a minute and try again.']);
+            exit;
+        }
+        $email = trim($_POST['email'] ?? '');
+        if ($email !== '' && Auth::validateEmail($email) === null) {
+            $admin = Auth::findAdminByEmail($email);
+            if ($admin) {
+                try {
+                    require_once __DIR__ . '/includes/email_sender.php';
+                    $raw  = Auth::createPasswordResetToken($admin['id']);
+                    $base = rtrim(Config::getBaseUrl(), '/');
+                    $adminAbs = Config::getUrlMode() === 'direct'
+                        ? $base . '/admin.php'
+                        : $base . '/router.php/admin.php';
+                    $link = $adminAbs . '?action=reset&token=' . urlencode($raw);
+                    $body = "A password reset was requested for your CashuPayServer admin account.\n\n"
+                          . "Open this link to choose a new password (valid for 1 hour, single use):\n\n"
+                          . $link . "\n\n"
+                          . "If you did not request this, you can ignore this email. The link does "
+                          . "nothing until used and expires on its own.\n";
+                    EmailSender::send($admin['email'], 'Reset your CashuPayServer admin password', $body);
+                } catch (\Throwable $e) {
+                    // Never surface SMTP/config detail to an unauthenticated
+                    // caller; log it for the operator instead.
+                    error_log('CashuPayServer: password-reset email failed: ' . $e->getMessage());
+                }
+            }
+        }
+        echo json_encode([
+            'success' => true,
+            'message' => 'If an admin account has that email, a reset link has been sent.',
+        ]);
+        exit;
+    }
+
+    // Mechanism 1 (cont.): consume an emailed token and set the new password.
+    if ($action === 'reset_with_token') {
+        $clientIp = Security::getClientIp();
+        if (!Security::checkRateLimit('pwreset_submit', $clientIp, 10)) {
+            http_response_code(429);
+            echo json_encode(['error' => 'Too many attempts. Please wait a minute and try again.']);
+            exit;
+        }
+        $token = $_POST['token'] ?? '';
+        $new   = $_POST['new_password'] ?? '';
+        try {
+            if (Auth::resetPasswordWithToken($token, $new)) {
+                echo json_encode(['success' => true]);
+            } else {
+                http_response_code(400);
+                echo json_encode(['error' => 'This reset link is invalid or has expired. Request a new one.']);
+            }
+        } catch (\InvalidArgumentException $e) {
+            http_response_code(400);
+            echo json_encode(['error' => $e->getMessage()]);
+        }
+        exit;
+    }
+
+    // Mechanism 2: complete a file-based reset. The trigger file must still be
+    // present (operator controls the window); it's deleted on success. Only the
+    // seed 'admin' account is reset. The old password stays valid until this
+    // succeeds.
+    if ($action === 'file_reset_set_password') {
+        if (!Auth::fileResetRequested()) {
+            http_response_code(409);
+            echo json_encode(['error' => 'No password-reset file is present.']);
+            exit;
+        }
+        $new = $_POST['new_password'] ?? '';
+        try {
+            if (Auth::completeFileReset($new)) {
+                echo json_encode(['success' => true]);
+            } else {
+                http_response_code(409);
+                echo json_encode(['error' => 'Reset could not be completed. Ensure the reset file is still present.']);
+            }
+        } catch (\InvalidArgumentException $e) {
+            http_response_code(400);
+            echo json_encode(['error' => $e->getMessage()]);
         }
         exit;
     }
@@ -2895,6 +3064,31 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
             break;
 
+        case 'set_recovery_email':
+            // Set/clear the current user's recovery email. Powers the email
+            // reset-link flow (only effective for admin accounts, which the
+            // reset request looks up by email). Admin-gated: only admins have
+            // a meaningful recovery path here.
+            Auth::requireAdmin();
+            try {
+                $self = Auth::currentUser();
+                if (!$self) {
+                    http_response_code(401);
+                    echo json_encode(['error' => 'Not authenticated']);
+                    break;
+                }
+                $email = trim($_POST['email'] ?? '');
+                Auth::setUserEmail($self['id'], $email === '' ? null : $email);
+                echo json_encode(['success' => true, 'email' => $email]);
+            } catch (\InvalidArgumentException $e) {
+                http_response_code(400);
+                echo json_encode(['error' => $e->getMessage()]);
+            } catch (\RuntimeException $e) {
+                http_response_code(404);
+                echo json_encode(['error' => $e->getMessage()]);
+            }
+            break;
+
         default:
             http_response_code(400);
             echo json_encode(['error' => 'Unknown action']);
@@ -2909,6 +3103,10 @@ $isLoggedIn = Auth::isLoggedIn();
 $currentUser = Auth::currentUser();   // null when WordPress mode or not logged in
 $currentRole = $currentUser['role'] ?? ($isLoggedIn ? Auth::ROLE_ADMIN : null);
 $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
+// Mechanism 2: surface the file-based reset on the lock screen when the trigger
+// file is present and nobody is signed in. Standalone mode only (WordPress
+// manages its own accounts).
+$fileResetRequested = !$isLoggedIn && !$isWp && Auth::fileResetRequested();
 
 // -----------------------------------------------------------------------------
 // SPA view routing
@@ -3818,6 +4016,14 @@ header('Cache-Control: no-cache, must-revalidate');
             visibility: visible;
         }
 
+        /* The forgot-password modal is opened from the lock screen, which sits
+           at z-index 1000 with an opaque background. Without a higher stacking
+           order the modal would render *behind* the lock screen (invisible).
+           Lift it (and its scrim) above the lock screen. */
+        #modal-forgot-password {
+            z-index: 1100;
+        }
+
         .modal {
             background: var(--bg-secondary);
             border-radius: 24px 24px 0 0;
@@ -4249,7 +4455,29 @@ header('Cache-Control: no-cache, must-revalidate');
             <input type="password" id="password-input" placeholder="Password"
                    autocomplete="current-password">
             <button class="btn btn-full" id="password-submit">Unlock</button>
+            <?php if (!$isWp): ?>
+            <button class="btn-link" id="forgot-password-link" type="button"
+                    style="background:none;border:0;color:var(--text-secondary);text-decoration:underline;cursor:pointer;margin-top:0.75rem;font-size:0.85rem;">
+                Forgot password?
+            </button>
+            <?php endif; ?>
         </div>
+
+        <?php if ($fileResetRequested): ?>
+        <!-- Mechanism 2: a reset trigger file (data/reset-admin-password) was
+             detected. Let the operator set a new admin password right here; the
+             file is deleted once the new password is saved. -->
+        <div class="file-reset-box" id="file-reset-box"
+             style="margin-top:1.25rem;max-width:360px;width:100%;background:rgba(247,147,26,0.1);border:1px solid rgba(247,147,26,0.4);border-radius:10px;padding:1rem;">
+            <div style="font-weight:600;margin-bottom:0.5rem;">Password-reset file detected</div>
+            <p style="color:var(--text-secondary);font-size:0.85rem;margin:0 0 0.75rem;">
+                Set a new password for the <strong>admin</strong> account. The reset file will be removed automatically once this succeeds.
+            </p>
+            <input type="password" id="file-reset-pw" placeholder="New password" autocomplete="new-password" style="margin-bottom:0.5rem;">
+            <input type="password" id="file-reset-pw2" placeholder="Confirm new password" autocomplete="new-password" style="margin-bottom:0.5rem;">
+            <button class="btn btn-full" id="file-reset-submit">Set new password</button>
+        </div>
+        <?php endif; ?>
     </div>
 
     <!-- App -->
@@ -5235,6 +5463,19 @@ header('Cache-Control: no-cache, must-revalidate');
                         <button class="btn btn-secondary btn-full" id="btn-change-own-password" style="margin-bottom: 0.5rem;">
                             Change my password
                         </button>
+                        <!-- Recovery email (admin only): powers the emailed
+                             password-reset link. Revealed by renderAccountCard. -->
+                        <div id="recovery-email-row" class="hidden" data-admin-only="true" style="margin-bottom: 0.5rem;">
+                            <label for="recovery-email-input" style="display:block;font-size:0.85rem;color:var(--text-secondary);margin-bottom:0.25rem;">
+                                Recovery email
+                            </label>
+                            <input type="email" id="recovery-email-input" class="form-input"
+                                   placeholder="you@example.com" autocomplete="email" style="margin-bottom:0.4rem;">
+                            <p style="font-size:0.75rem;color:var(--text-secondary);margin:0 0 0.5rem;">
+                                Used to email you a reset link if you're locked out. Requires SMTP to be configured.
+                            </p>
+                            <button class="btn btn-secondary btn-full" id="btn-save-recovery-email">Save recovery email</button>
+                        </div>
                         <button class="btn btn-danger btn-full" id="btn-logout">
                             Logout
                         </button>
@@ -5784,6 +6025,41 @@ header('Cache-Control: no-cache, must-revalidate');
         </div>
     </div>
 
+    <!-- Forgot password modal (lock screen). Documents both recovery paths. -->
+    <div class="modal-overlay" id="modal-forgot-password">
+        <div class="modal">
+            <div class="modal-handle"></div>
+            <div class="modal-title">Forgot your password?</div>
+
+            <p style="color: var(--text-secondary); margin-bottom: 0.75rem; font-size: 0.9rem;">
+                <strong>Option 1 — Email a reset link.</strong> If a recovery email is set on the admin
+                account and the server can send email, we'll send a one-hour reset link.
+            </p>
+            <div class="form-group">
+                <input type="email" class="form-input" id="fp-email"
+                       placeholder="Admin recovery email" autocomplete="email">
+            </div>
+            <button class="btn btn-full" id="btn-send-reset-link">Email me a reset link</button>
+            <div id="fp-message" style="font-size: 0.85rem; margin-top: 0.6rem; min-height: 1.1em;"></div>
+
+            <hr style="border:0;border-top:1px solid var(--border, #2a2d36);margin:1.1rem 0;">
+
+            <p style="color: var(--text-secondary); margin-bottom: 0.4rem; font-size: 0.9rem;">
+                <strong>Option 2 — Reset via a file on the server.</strong> If you have filesystem
+                access (SSH / SFTP / file manager) but no email, create an empty file named
+                <code>reset-admin-password</code> inside the server's <code>data/</code> directory:
+            </p>
+            <pre style="background:rgba(0,0,0,0.3);border-radius:6px;padding:0.6rem 0.75rem;font-size:0.8rem;overflow:auto;margin:0 0 0.5rem;">data/reset-admin-password</pre>
+            <p style="color: var(--text-secondary); margin: 0 0 1rem; font-size: 0.85rem;">
+                Then reload the sign-in page: it will prompt you to set a new admin password and
+                delete the file automatically. Remove the file yourself if you change your mind.
+            </p>
+
+            <button class="btn btn-secondary btn-full"
+                    onclick="closeModal('modal-forgot-password')">Close</button>
+        </div>
+    </div>
+
     <!-- Add User modal (admin) -->
     <div class="modal-overlay" id="modal-add-user">
         <div class="modal">
@@ -5910,6 +6186,7 @@ header('Cache-Control: no-cache, must-revalidate');
         const phpUser = {
             username: <?= json_encode($currentUsername) ?>,
             role:     <?= json_encode($currentRole) ?>,
+            email:    <?= json_encode($currentUser['email'] ?? null) ?>,
         };
         // Path-based SPA routing: adminBasePath is the URL prefix the user
         // reached the admin under (no trailing slash, no view tail). All view
@@ -6117,6 +6394,78 @@ header('Cache-Control: no-cache, must-revalidate');
                 });
             });
 
+            // ----- Password recovery (lock screen) -----
+            const forgotLink = document.getElementById('forgot-password-link');
+            if (forgotLink) {
+                forgotLink.addEventListener('click', () => {
+                    const m = document.getElementById('fp-message');
+                    if (m) { m.textContent = ''; m.className = ''; }
+                    openModal('modal-forgot-password');
+                });
+            }
+
+            const sendResetBtn = document.getElementById('btn-send-reset-link');
+            if (sendResetBtn) {
+                sendResetBtn.addEventListener('click', async () => {
+                    const email = (document.getElementById('fp-email').value || '').trim();
+                    const msg = document.getElementById('fp-message');
+                    if (!email) {
+                        msg.textContent = 'Enter the recovery email for the admin account.';
+                        msg.style.color = '#ef4444';
+                        return;
+                    }
+                    msg.textContent = 'Sending...';
+                    msg.style.color = 'var(--text-secondary)';
+                    try {
+                        const r = await fetch(adminUrl, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                            body: `action=request_password_reset&email=${encodeURIComponent(email)}`
+                        });
+                        const data = await r.json().catch(() => ({}));
+                        if (r.ok) {
+                            // Generic response — never reveals whether the address matched.
+                            msg.textContent = data.message || 'If an admin account has that email, a reset link has been sent.';
+                            msg.style.color = '#22c55e';
+                        } else {
+                            msg.textContent = data.error || 'Could not send reset link.';
+                            msg.style.color = '#ef4444';
+                        }
+                    } catch (e) {
+                        msg.textContent = 'Network error, please try again.';
+                        msg.style.color = '#ef4444';
+                    }
+                });
+            }
+
+            const fileResetBtn = document.getElementById('file-reset-submit');
+            if (fileResetBtn) {
+                fileResetBtn.addEventListener('click', async () => {
+                    const pw = document.getElementById('file-reset-pw').value;
+                    const pw2 = document.getElementById('file-reset-pw2').value;
+                    if (pw.length < 8) { showToast('Password must be at least 8 characters', 'error'); return; }
+                    if (pw !== pw2) { showToast('Passwords do not match', 'error'); return; }
+                    try {
+                        const r = await fetch(adminUrl, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                            body: `action=file_reset_set_password&new_password=${encodeURIComponent(pw)}`
+                        });
+                        const data = await r.json().catch(() => ({}));
+                        if (r.ok && data.success) {
+                            showToast('Password set. You can now sign in.', 'success');
+                            const box = document.getElementById('file-reset-box');
+                            if (box) box.remove();
+                            document.getElementById('password-input').value = pw;
+                        } else {
+                            showToast(data.error || 'Could not reset password', 'error');
+                        }
+                    } catch (e) {
+                        showToast('Network error, please try again', 'error');
+                    }
+                });
+            }
+
             // Navigation
             document.querySelectorAll('.nav-item').forEach(item => {
                 item.addEventListener('click', () => {
@@ -6228,6 +6577,10 @@ header('Cache-Control: no-cache, must-revalidate');
             if (btnChangePass) {
                 btnChangePass.addEventListener('click', () => openModal('modal-change-password'));
                 document.getElementById('btn-confirm-change-password').addEventListener('click', changeOwnPassword);
+            }
+            const btnSaveRecoveryEmail = document.getElementById('btn-save-recovery-email');
+            if (btnSaveRecoveryEmail) {
+                btnSaveRecoveryEmail.addEventListener('click', saveRecoveryEmail);
             }
             const btnAddUser = document.getElementById('btn-add-user');
             if (btnAddUser) {
@@ -6499,6 +6852,37 @@ header('Cache-Control: no-cache, must-revalidate');
             const badgeEl = document.getElementById('my-role-badge');
             if (usernameEl) usernameEl.textContent = u.username || '';
             if (badgeEl) badgeEl.textContent = u.role === 'admin' ? 'admin' : 'user';
+
+            // Recovery email is only meaningful for admins (the reset-link flow
+            // looks up admin accounts by email).
+            const row = document.getElementById('recovery-email-row');
+            if (row) {
+                if (u.role === 'admin') {
+                    row.classList.remove('hidden');
+                    const input = document.getElementById('recovery-email-input');
+                    if (input && document.activeElement !== input) input.value = u.email || '';
+                } else {
+                    row.classList.add('hidden');
+                }
+            }
+        }
+
+        async function saveRecoveryEmail() {
+            const input = document.getElementById('recovery-email-input');
+            const email = (input.value || '').trim();
+            try {
+                const response = await postWithCsrf(adminUrl,
+                    `action=set_recovery_email&email=${encodeURIComponent(email)}`);
+                const res = await response.json();
+                if (response.ok && res.success) {
+                    phpUser.email = email || null;
+                    showToast(email ? 'Recovery email saved' : 'Recovery email cleared', 'success');
+                } else {
+                    showToast(res.error || 'Failed to save recovery email', 'error');
+                }
+            } catch (e) {
+                showToast(e.message || 'Failed to save recovery email', 'error');
+            }
         }
 
         async function renderUsersCard() {
