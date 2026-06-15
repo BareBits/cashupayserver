@@ -100,7 +100,7 @@ class Database {
             // that migration ran — getInstance() will then trigger runMigrations()
             // on existing installs that haven't yet picked it up. All migrations
             // are idempotent, so a fire is safe.
-            $hasLatestMigration = $hasConfig && self::columnExists(self::$instance, 'stores', 'product_sort');
+            $hasLatestMigration = $hasConfig && self::columnExists(self::$instance, 'stores', 'smtp_override_enabled');
             // The auto-withdraw → auto-cashout rename is a data-only migration
             // (config key + notification event labels) with no schema artifact
             // to mark it done, so probe for the legacy config key directly. The
@@ -1341,6 +1341,40 @@ HTACCESS;
                 );
             ");
             $pdo->exec("CREATE INDEX idx_password_reset_tokens_hash ON password_reset_tokens(token_hash);");
+        }
+
+        // Per-store SMTP override. Global SMTP settings live in the config table
+        // (smtp_* keys, edited in the admin UI); these columns let a store send
+        // its notifications through its own mail server. EmailSender resolves
+        // each field per-store -> global -> user_config.php constant. The
+        // password is stored plaintext, consistent with seed_phrase and other
+        // secrets in this (.htaccess-protected) SQLite database.
+        //
+        // smtp_override_enabled doubles as this migration set's "latest" marker
+        // (see getInstance), so it must be the last stores column added here.
+        if (!self::columnExists($pdo, 'stores', 'smtp_host')) {
+            $pdo->exec("ALTER TABLE stores ADD COLUMN smtp_host TEXT DEFAULT NULL");
+        }
+        if (!self::columnExists($pdo, 'stores', 'smtp_port')) {
+            $pdo->exec("ALTER TABLE stores ADD COLUMN smtp_port INTEGER DEFAULT NULL");
+        }
+        if (!self::columnExists($pdo, 'stores', 'smtp_username')) {
+            $pdo->exec("ALTER TABLE stores ADD COLUMN smtp_username TEXT DEFAULT NULL");
+        }
+        if (!self::columnExists($pdo, 'stores', 'smtp_password')) {
+            $pdo->exec("ALTER TABLE stores ADD COLUMN smtp_password TEXT DEFAULT NULL");
+        }
+        if (!self::columnExists($pdo, 'stores', 'smtp_encryption')) {
+            $pdo->exec("ALTER TABLE stores ADD COLUMN smtp_encryption TEXT DEFAULT NULL");
+        }
+        if (!self::columnExists($pdo, 'stores', 'smtp_from_address')) {
+            $pdo->exec("ALTER TABLE stores ADD COLUMN smtp_from_address TEXT DEFAULT NULL");
+        }
+        if (!self::columnExists($pdo, 'stores', 'smtp_from_name')) {
+            $pdo->exec("ALTER TABLE stores ADD COLUMN smtp_from_name TEXT DEFAULT NULL");
+        }
+        if (!self::columnExists($pdo, 'stores', 'smtp_override_enabled')) {
+            $pdo->exec("ALTER TABLE stores ADD COLUMN smtp_override_enabled INTEGER NOT NULL DEFAULT 0");
         }
     }
 

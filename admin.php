@@ -66,6 +66,49 @@ function checkDataDirectoryProtection(): ?string {
     return null;
 }
 
+/**
+ * Parse and validate the SMTP server fields shared by the global notification
+ * settings and the per-store SMTP override. Returns trimmed scalars plus the
+ * raw password and a clear flag (the password is handled by the caller so the
+ * UI can keep it write-only). Throws on invalid port / encryption / from-address.
+ *
+ * Used by save_notifications_settings (global) and save_store_notifications
+ * (per-store); both POST the same smtp_* field names from separate forms.
+ */
+function smtpFieldsFromPost(array $post): array {
+    $host = trim((string)($post['smtp_host'] ?? ''));
+    $port = trim((string)($post['smtp_port'] ?? ''));
+    $username = trim((string)($post['smtp_username'] ?? ''));
+    $encryption = strtolower(trim((string)($post['smtp_encryption'] ?? '')));
+    $fromAddress = trim((string)($post['smtp_from_address'] ?? ''));
+    $fromName = trim((string)($post['smtp_from_name'] ?? ''));
+    // Password is intentionally not trimmed — leading/trailing spaces can be
+    // significant in a credential.
+    $password = (string)($post['smtp_password'] ?? '');
+    $passwordClear = ($post['smtp_password_clear'] ?? '0') === '1';
+
+    if ($port !== '' && (!ctype_digit($port) || (int)$port < 1 || (int)$port > 65535)) {
+        throw new Exception('SMTP port must be a number between 1 and 65535');
+    }
+    if ($encryption !== '' && !in_array($encryption, ['tls', 'ssl', 'none'], true)) {
+        throw new Exception('SMTP encryption must be tls, ssl, or none');
+    }
+    if ($fromAddress !== '' && !filter_var($fromAddress, FILTER_VALIDATE_EMAIL)) {
+        throw new Exception('Invalid From address');
+    }
+
+    return [
+        'host' => $host,
+        'port' => $port,
+        'username' => $username,
+        'encryption' => $encryption,
+        'from_address' => $fromAddress,
+        'from_name' => $fromName,
+        'password' => $password,
+        'password_clear' => $passwordClear,
+    ];
+}
+
 // Password-reset landing page (Mechanism 1). The emailed link opens here as
 // ?action=reset&token=... No session required — the operator is locked out by
 // definition. Rendered as a standalone page (not the SPA) so it works even if
@@ -247,6 +290,17 @@ if (isset($_GET['api'])) {
             $storeNotifications = [
                 'enabled' => (bool)($store['notifications_enabled'] ?? 0),
                 'email' => $store['notification_email'] ?? '',
+                // Per-store SMTP override. Password is never sent to the browser —
+                // only whether one is stored (write-only field, see the per-store
+                // notifications card).
+                'smtpOverrideEnabled' => (bool)($store['smtp_override_enabled'] ?? 0),
+                'smtpHost' => (string)($store['smtp_host'] ?? ''),
+                'smtpPort' => $store['smtp_port'] !== null ? (string)$store['smtp_port'] : '',
+                'smtpUsername' => (string)($store['smtp_username'] ?? ''),
+                'smtpEncryption' => (string)($store['smtp_encryption'] ?? ''),
+                'smtpFromAddress' => (string)($store['smtp_from_address'] ?? ''),
+                'smtpFromName' => (string)($store['smtp_from_name'] ?? ''),
+                'smtpPasswordSet' => ((string)($store['smtp_password'] ?? '')) !== '',
             ];
 
             // Submarine swap (LN→onchain) tri-state override:
@@ -2102,14 +2156,38 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if (empty($storeId)) {
                     throw new Exception('Store ID required');
                 }
+                if (!Config::getStore($storeId)) {
+                    throw new Exception('Store not found');
+                }
                 if ($email !== '' && !filter_var($email, FILTER_VALIDATE_EMAIL)) {
                     throw new Exception('Invalid email address');
                 }
 
-                Database::update('stores', [
+                // Per-store SMTP override (same fields/validation as the global
+                // settings). Written via Database::update directly rather than
+                // Config::updateStore, keeping the updateStore allowlist tight.
+                $smtpOverride = ($_POST['smtp_override_enabled'] ?? '0') === '1' ? 1 : 0;
+                $smtp = smtpFieldsFromPost($_POST);
+
+                $update = [
                     'notifications_enabled' => $enabled,
                     'notification_email' => $email !== '' ? $email : null,
-                ], 'id = ?', [$storeId]);
+                    'smtp_override_enabled' => $smtpOverride,
+                    'smtp_host' => $smtp['host'] !== '' ? $smtp['host'] : null,
+                    'smtp_port' => $smtp['port'] !== '' ? (int)$smtp['port'] : null,
+                    'smtp_username' => $smtp['username'] !== '' ? $smtp['username'] : null,
+                    'smtp_encryption' => $smtp['encryption'] !== '' ? $smtp['encryption'] : null,
+                    'smtp_from_address' => $smtp['from_address'] !== '' ? $smtp['from_address'] : null,
+                    'smtp_from_name' => $smtp['from_name'] !== '' ? $smtp['from_name'] : null,
+                ];
+                // Password: preserve on blank, overwrite on new value, wipe on clear.
+                if ($smtp['password_clear']) {
+                    $update['smtp_password'] = null;
+                } elseif ($smtp['password'] !== '') {
+                    $update['smtp_password'] = $smtp['password'];
+                }
+
+                Database::update('stores', $update, 'id = ?', [$storeId]);
 
                 echo json_encode(['success' => true]);
             } catch (Exception $e) {
@@ -2130,6 +2208,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'toEmail' => (string)Config::get('notifications_to_email', ''),
                 'smtpConfigured' => EmailSender::isSmtpConfigured(),
                 'pendingQueueCount' => NotificationSender::pendingCount(),
+                // Global SMTP server settings. The password is never sent to the
+                // browser — only whether one is stored, so the field can show a
+                // "leave blank to keep" placeholder.
+                'smtpHost' => (string)Config::get('smtp_host', ''),
+                'smtpPort' => (string)Config::get('smtp_port', ''),
+                'smtpUsername' => (string)Config::get('smtp_username', ''),
+                'smtpEncryption' => (string)Config::get('smtp_encryption', ''),
+                'smtpFromAddress' => (string)Config::get('smtp_from_address', ''),
+                'smtpFromName' => (string)Config::get('smtp_from_name', ''),
+                'smtpPasswordSet' => ((string)Config::get('smtp_password', '')) !== '',
             ]);
             break;
 
@@ -2146,11 +2234,29 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     throw new Exception('Invalid email address');
                 }
 
+                // Global SMTP server settings. Validation is shared with the
+                // per-store override (save_store_notifications) via smtpFieldsFromPost().
+                $smtp = smtpFieldsFromPost($_POST);
+
                 Config::set('notifications_enabled', $enabled);
                 Config::set('notifications_invoice_paid_enabled', $invoicePaidEnabled);
                 Config::set('notifications_auto_cashout_enabled', $autoCashoutEnabled);
                 Config::set('notifications_payer_receipt_enabled', $payerReceiptEnabled);
                 Config::set('notifications_to_email', $toEmail);
+
+                Config::set('smtp_host', $smtp['host']);
+                Config::set('smtp_port', $smtp['port']);
+                Config::set('smtp_username', $smtp['username']);
+                Config::set('smtp_encryption', $smtp['encryption']);
+                Config::set('smtp_from_address', $smtp['from_address']);
+                Config::set('smtp_from_name', $smtp['from_name']);
+                // Password: preserve on blank, overwrite on new value, wipe on
+                // explicit clear (so the field never has to echo the secret back).
+                if ($smtp['password_clear']) {
+                    Config::set('smtp_password', '');
+                } elseif ($smtp['password'] !== '') {
+                    Config::set('smtp_password', $smtp['password']);
+                }
 
                 echo json_encode(['success' => true]);
             } catch (Exception $e) {
@@ -2272,11 +2378,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if ($to === '' || !filter_var($to, FILTER_VALIDATE_EMAIL)) {
                     throw new Exception('Provide a valid recipient email');
                 }
+                // Optional store_id tests that store's resolved SMTP config
+                // (its override, if enabled, else the global settings). Blank
+                // tests the global config.
+                $testStoreId = trim((string)($_POST['store_id'] ?? ''));
+                if ($testStoreId !== '' && !Config::getStore($testStoreId)) {
+                    throw new Exception('Store not found');
+                }
+                $scope = $testStoreId !== '' ? ' (store override)' : '';
                 EmailSender::send(
                     $to,
                     'CashuPayServer test email',
-                    "This is a test email from CashuPayServer.\n\n"
-                    . "If you received this, SMTP delivery is working.\n"
+                    "This is a test email from CashuPayServer{$scope}.\n\n"
+                    . "If you received this, SMTP delivery is working.\n",
+                    $testStoreId !== '' ? $testStoreId : null
                 );
                 echo json_encode(['success' => true]);
             } catch (Throwable $e) {
@@ -4936,9 +5051,76 @@ header('Cache-Control: no-cache, must-revalidate');
                                 <p class="form-help">If blank, the site-wide notification address from Settings is used.</p>
                             </div>
 
-                            <button class="btn btn-full" id="btn-save-store-notifications" style="margin-top: 0.5rem;">
+                            <div class="toggle-container" style="margin-top: 1rem;">
+                                <span>Use a custom SMTP server for this store</span>
+                                <label class="toggle">
+                                    <input type="checkbox" id="store-smtp-override-enabled">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
+
+                            <div id="store-smtp-fields" class="hidden" style="margin-top: 0.75rem; padding: 0.75rem; background: rgba(0,0,0,0.2); border-radius: 8px;">
+                                <p class="form-help" style="margin-top: 0;">
+                                    Any field left blank falls back to the global SMTP settings, then to
+                                    <code>user_config.php</code>.
+                                </p>
+                                <div class="form-group" style="margin-top: 0.75rem;">
+                                    <label class="form-label">Host</label>
+                                    <input type="text" class="form-input" id="store-smtp-host"
+                                           placeholder="smtp.example.com" autocomplete="off">
+                                </div>
+                                <div style="display: flex; gap: 0.5rem;">
+                                    <div class="form-group" style="flex: 1;">
+                                        <label class="form-label">Port</label>
+                                        <input type="number" class="form-input" id="store-smtp-port"
+                                               placeholder="587" min="1" max="65535">
+                                    </div>
+                                    <div class="form-group" style="flex: 1;">
+                                        <label class="form-label">Encryption</label>
+                                        <select class="form-input" id="store-smtp-encryption">
+                                            <option value="">Default (STARTTLS on 587)</option>
+                                            <option value="tls">STARTTLS (tls)</option>
+                                            <option value="ssl">SSL/TLS (ssl)</option>
+                                            <option value="none">None</option>
+                                        </select>
+                                    </div>
+                                </div>
+                                <div class="form-group">
+                                    <label class="form-label">Username</label>
+                                    <input type="text" class="form-input" id="store-smtp-username"
+                                           placeholder="leave blank for no authentication" autocomplete="off">
+                                </div>
+                                <div class="form-group">
+                                    <label class="form-label">Password</label>
+                                    <input type="password" class="form-input" id="store-smtp-password"
+                                           autocomplete="new-password">
+                                    <label style="display: flex; align-items: center; gap: 0.4rem; margin-top: 0.4rem; font-size: 0.85rem;">
+                                        <input type="checkbox" id="store-smtp-password-clear"> Clear saved password
+                                    </label>
+                                    <p class="form-help" id="store-smtp-password-help">Leave blank to keep the saved password.</p>
+                                </div>
+                                <div class="form-group">
+                                    <label class="form-label">From address</label>
+                                    <input type="email" class="form-input" id="store-smtp-from-address"
+                                           placeholder="noreply@example.com">
+                                </div>
+                                <div class="form-group" style="margin-bottom: 0;">
+                                    <label class="form-label">From name</label>
+                                    <input type="text" class="form-input" id="store-smtp-from-name"
+                                           placeholder="CashuPayServer">
+                                </div>
+                            </div>
+
+                            <button class="btn btn-full" id="btn-save-store-notifications" style="margin-top: 0.75rem;">
                                 Save notification settings
                             </button>
+
+                            <div style="display: flex; gap: 0.5rem; align-items: center; margin-top: 0.5rem;">
+                                <input type="email" class="form-input" id="store-notifications-test-email"
+                                       placeholder="test@example.com" style="flex: 1;">
+                                <button class="btn btn-secondary" id="btn-send-store-test-notification">Send test</button>
+                            </div>
+                            <p class="form-help">Sends using this store's resolved SMTP config. Save first to test unsaved changes.</p>
                         </div>
                     </div>
 
@@ -5151,6 +5333,61 @@ header('Cache-Control: no-cache, must-revalidate');
                                 optionally enter an email address to receive a payment
                                 confirmation. Receipts are queued to the same SMTP server.
                             </p>
+                        </div>
+
+                        <div style="margin-top: 1rem; padding: 0.75rem; background: rgba(0,0,0,0.2); border-radius: 8px;">
+                            <div style="font-weight: 500; margin-bottom: 0.5rem;">SMTP server</div>
+                            <p class="form-help" style="margin-top: 0;">
+                                Outgoing mail server. Any field left blank falls back to
+                                <code>user_config.php</code> (<code>CASHUPAY_SMTP_*</code>); a value
+                                here overrides the matching constant. Leave the whole section blank to
+                                use <code>user_config.php</code> alone.
+                            </p>
+                            <div class="form-group" style="margin-top: 0.75rem;">
+                                <label class="form-label">Host</label>
+                                <input type="text" class="form-input" id="smtp-host"
+                                       placeholder="smtp.example.com" autocomplete="off">
+                            </div>
+                            <div style="display: flex; gap: 0.5rem;">
+                                <div class="form-group" style="flex: 1;">
+                                    <label class="form-label">Port</label>
+                                    <input type="number" class="form-input" id="smtp-port"
+                                           placeholder="587" min="1" max="65535">
+                                </div>
+                                <div class="form-group" style="flex: 1;">
+                                    <label class="form-label">Encryption</label>
+                                    <select class="form-input" id="smtp-encryption">
+                                        <option value="">Default (STARTTLS on 587)</option>
+                                        <option value="tls">STARTTLS (tls)</option>
+                                        <option value="ssl">SSL/TLS (ssl)</option>
+                                        <option value="none">None</option>
+                                    </select>
+                                </div>
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">Username</label>
+                                <input type="text" class="form-input" id="smtp-username"
+                                       placeholder="leave blank for no authentication" autocomplete="off">
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">Password</label>
+                                <input type="password" class="form-input" id="smtp-password"
+                                       autocomplete="new-password">
+                                <label style="display: flex; align-items: center; gap: 0.4rem; margin-top: 0.4rem; font-size: 0.85rem;">
+                                    <input type="checkbox" id="smtp-password-clear"> Clear saved password
+                                </label>
+                                <p class="form-help" id="smtp-password-help">Leave blank to keep the saved password.</p>
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">From address</label>
+                                <input type="email" class="form-input" id="smtp-from-address"
+                                       placeholder="noreply@example.com">
+                            </div>
+                            <div class="form-group" style="margin-bottom: 0;">
+                                <label class="form-label">From name</label>
+                                <input type="text" class="form-input" id="smtp-from-name"
+                                       placeholder="CashuPayServer">
+                            </div>
                         </div>
 
                         <div class="form-group" style="margin-top: 1rem;">
@@ -6543,6 +6780,10 @@ header('Cache-Control: no-cache, must-revalidate');
             if (storeNotifsToggle) storeNotifsToggle.addEventListener('change', () => {
                 if (storeNotifsToggle.checked) warnIfSiteEmailUnavailable();
             });
+            const storeSmtpToggle = document.getElementById('store-smtp-override-enabled');
+            if (storeSmtpToggle) storeSmtpToggle.addEventListener('change', updateStoreSmtpFieldsVisibility);
+            const storeTestBtn = document.getElementById('btn-send-store-test-notification');
+            if (storeTestBtn) storeTestBtn.addEventListener('click', sendStoreTestNotification);
             const saveNotifsBtn = document.getElementById('btn-save-notifications');
             if (saveNotifsBtn) saveNotifsBtn.addEventListener('click', saveNotificationSettings);
             const testNotifsBtn = document.getElementById('btn-send-test-notification');
@@ -7800,10 +8041,31 @@ header('Cache-Control: no-cache, must-revalidate');
 
                 // Load per-store notification settings
                 if (dashboardData && dashboardData.notifications) {
+                    const n = dashboardData.notifications;
                     const enabledEl = document.getElementById('store-notifications-enabled');
                     const emailEl = document.getElementById('store-notification-email');
-                    if (enabledEl) enabledEl.checked = !!dashboardData.notifications.enabled;
-                    if (emailEl) emailEl.value = dashboardData.notifications.email || '';
+                    if (enabledEl) enabledEl.checked = !!n.enabled;
+                    if (emailEl) emailEl.value = n.email || '';
+                    // Per-store SMTP override (password write-only, never returned).
+                    const ov = document.getElementById('store-smtp-override-enabled');
+                    if (ov) ov.checked = !!n.smtpOverrideEnabled;
+                    const set = (id, v) => { const el = document.getElementById(id); if (el) el.value = v || ''; };
+                    set('store-smtp-host', n.smtpHost);
+                    set('store-smtp-port', n.smtpPort);
+                    set('store-smtp-username', n.smtpUsername);
+                    set('store-smtp-encryption', n.smtpEncryption);
+                    set('store-smtp-from-address', n.smtpFromAddress);
+                    set('store-smtp-from-name', n.smtpFromName);
+                    set('store-smtp-password', '');
+                    const clearEl = document.getElementById('store-smtp-password-clear');
+                    if (clearEl) clearEl.checked = false;
+                    const help = document.getElementById('store-smtp-password-help');
+                    if (help) help.textContent = n.smtpPasswordSet
+                        ? 'A password is saved. Leave blank to keep it.'
+                        : 'No password saved.';
+                    const prefill = document.getElementById('store-notifications-test-email');
+                    if (prefill) prefill.value = n.email || '';
+                    if (typeof updateStoreSmtpFieldsVisibility === 'function') updateStoreSmtpFieldsVisibility();
                 }
 
                 // Load exchange rate settings from store data
@@ -9430,19 +9692,73 @@ header('Cache-Control: no-cache, must-revalidate');
             }
             const enabled = document.getElementById('store-notifications-enabled').checked ? '1' : '0';
             const email = document.getElementById('store-notification-email').value.trim();
+            const passwordCleared = document.getElementById('store-smtp-password-clear').checked;
+            const passwordTyped = document.getElementById('store-smtp-password').value !== '';
+            const params = new URLSearchParams({
+                action: 'save_store_notifications',
+                store_id: currentStoreId,
+                enabled, email,
+                smtp_override_enabled: document.getElementById('store-smtp-override-enabled').checked ? '1' : '0',
+                smtp_host: document.getElementById('store-smtp-host').value.trim(),
+                smtp_port: document.getElementById('store-smtp-port').value.trim(),
+                smtp_username: document.getElementById('store-smtp-username').value.trim(),
+                smtp_encryption: document.getElementById('store-smtp-encryption').value,
+                smtp_from_address: document.getElementById('store-smtp-from-address').value.trim(),
+                smtp_from_name: document.getElementById('store-smtp-from-name').value.trim(),
+                smtp_password: document.getElementById('store-smtp-password').value,
+                smtp_password_clear: passwordCleared ? '1' : '0',
+            });
             try {
-                const response = await postWithCsrf(adminUrl,
-                    `action=save_store_notifications&store_id=${encodeURIComponent(currentStoreId)}&enabled=${enabled}&email=${encodeURIComponent(email)}`
-                );
+                const response = await postWithCsrf(adminUrl, params.toString());
                 const result = await response.json();
                 if (response.ok) {
                     showToast('Notification settings saved!', 'success');
                     if (enabled === '1') warnIfSiteEmailUnavailable();
+                    // Reset the write-only password UI to reflect the new state.
+                    document.getElementById('store-smtp-password').value = '';
+                    document.getElementById('store-smtp-password-clear').checked = false;
+                    const help = document.getElementById('store-smtp-password-help');
+                    if (help) help.textContent = (passwordCleared || (!passwordTyped && help.textContent.indexOf('No password') === 0))
+                        ? 'No password saved.'
+                        : 'A password is saved. Leave blank to keep it.';
                 } else {
                     showToast(result.error || 'Failed to save', 'error');
                 }
             } catch (e) {
                 showToast('Failed to save notification settings', 'error');
+            }
+        }
+
+        // Show/hide the per-store SMTP override fields based on the toggle.
+        function updateStoreSmtpFieldsVisibility() {
+            const ov = document.getElementById('store-smtp-override-enabled');
+            const fields = document.getElementById('store-smtp-fields');
+            if (ov && fields) fields.classList.toggle('hidden', !ov.checked);
+        }
+
+        async function sendStoreTestNotification() {
+            if (!currentStoreId) {
+                showToast('No store selected', 'error');
+                return;
+            }
+            const to = document.getElementById('store-notifications-test-email').value.trim()
+                || document.getElementById('store-notification-email').value.trim();
+            if (!to) {
+                showToast('Enter a recipient email', 'error');
+                return;
+            }
+            try {
+                const response = await postWithCsrf(adminUrl,
+                    `action=send_test_notification&store_id=${encodeURIComponent(currentStoreId)}&to=${encodeURIComponent(to)}`
+                );
+                const result = await response.json();
+                if (response.ok) {
+                    showToast('Test email sent', 'success');
+                } else {
+                    showToast(result.error || 'Failed to send', 'error');
+                }
+            } catch (e) {
+                showToast('Failed to send test email', 'error');
             }
         }
 
@@ -9459,6 +9775,19 @@ header('Cache-Control: no-cache, must-revalidate');
                 document.getElementById('notifications-payer-receipt').checked = !!data.payerReceiptEnabled;
                 document.getElementById('notifications-to-email').value = data.toEmail || '';
                 document.getElementById('notifications-smtp-warning').classList.toggle('hidden', !!data.smtpConfigured);
+                // Global SMTP server fields. Password is write-only: it's never
+                // returned, so we only reflect whether one is stored.
+                document.getElementById('smtp-host').value = data.smtpHost || '';
+                document.getElementById('smtp-port').value = data.smtpPort || '';
+                document.getElementById('smtp-username').value = data.smtpUsername || '';
+                document.getElementById('smtp-encryption').value = data.smtpEncryption || '';
+                document.getElementById('smtp-from-address').value = data.smtpFromAddress || '';
+                document.getElementById('smtp-from-name').value = data.smtpFromName || '';
+                document.getElementById('smtp-password').value = '';
+                document.getElementById('smtp-password-clear').checked = false;
+                document.getElementById('smtp-password-help').textContent = data.smtpPasswordSet
+                    ? 'A password is saved. Leave blank to keep it.'
+                    : 'No password saved.';
                 const pending = document.getElementById('notifications-pending');
                 if (pending) {
                     pending.textContent = data.pendingQueueCount > 0
@@ -9476,13 +9805,26 @@ header('Cache-Control: no-cache, must-revalidate');
             const autoCashout = document.getElementById('notifications-auto-cashout').checked ? '1' : '0';
             const payerReceipt = document.getElementById('notifications-payer-receipt').checked ? '1' : '0';
             const toEmail = document.getElementById('notifications-to-email').value.trim();
+            const params = new URLSearchParams({
+                action: 'save_notifications_settings',
+                enabled, invoice_paid_enabled: invoicePaid,
+                auto_cashout_enabled: autoCashout, payer_receipt_enabled: payerReceipt,
+                to_email: toEmail,
+                smtp_host: document.getElementById('smtp-host').value.trim(),
+                smtp_port: document.getElementById('smtp-port').value.trim(),
+                smtp_username: document.getElementById('smtp-username').value.trim(),
+                smtp_encryption: document.getElementById('smtp-encryption').value,
+                smtp_from_address: document.getElementById('smtp-from-address').value.trim(),
+                smtp_from_name: document.getElementById('smtp-from-name').value.trim(),
+                smtp_password: document.getElementById('smtp-password').value,
+                smtp_password_clear: document.getElementById('smtp-password-clear').checked ? '1' : '0',
+            });
             try {
-                const response = await postWithCsrf(adminUrl,
-                    `action=save_notifications_settings&enabled=${enabled}&invoice_paid_enabled=${invoicePaid}&auto_cashout_enabled=${autoCashout}&payer_receipt_enabled=${payerReceipt}&to_email=${encodeURIComponent(toEmail)}`
-                );
+                const response = await postWithCsrf(adminUrl, params.toString());
                 const result = await response.json();
                 if (response.ok) {
                     showToast('Notification settings saved!', 'success');
+                    loadNotificationSettings();
                 } else {
                     showToast(result.error || 'Failed to save', 'error');
                 }
