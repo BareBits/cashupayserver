@@ -70,30 +70,95 @@ final class SwapPoller {
         $polled = 0;
         $errors = 0;
         foreach ($rowList as $row) {
-            // Atomic claim: only proceed if we successfully stamp last_polled_at.
-            $upd = $pdo->prepare(
-                "UPDATE {$table}
-                    SET last_polled_at = ?, updated_at = ?
-                  WHERE id = ?
-                    AND (last_polled_at IS NULL OR (CAST(? AS INTEGER) - last_polled_at) >= {$mi})"
-            );
-            $upd->execute([$now, $now, $row['id'], $now]);
-            if ($upd->rowCount() !== 1) {
+            $res = self::tryAdvanceRow($row, $ctx, $mi, $now);
+            if ($res === null) {
                 continue; // another poller has this row
             }
-
-            try {
-                self::processRow($row, $ctx);
-                $polled++;
-            } catch (Throwable $e) {
+            $polled++;
+            if ($res === false) {
                 $errors++;
-                error_log("SwapPoller ({$table}) row {$row['id']}: " . $e->getMessage());
-                $pdo->prepare(
-                    "UPDATE {$table} SET error_message = ?, updated_at = ? WHERE id = ?"
-                )->execute([substr($e->getMessage(), 0, 500), time(), $row['id']]);
             }
         }
         return ['polled' => $polled, 'errors' => $errors];
+    }
+
+    /**
+     * Advance a single swap row keyed by its parent invoice. Lets the
+     * customer-facing checkout poll drive settlement directly instead of
+     * waiting for cron (Task 4c), so the invoice flips to Settled within a
+     * checkout poll or two of the provider reporting invoice.settled.
+     *
+     * Customer flow only (swap_attempts). Shares pollPending()'s atomic
+     * last_polled_at gate, so it's safe against the cron task and other
+     * concurrent checkout polls touching the same swap — and $minInterval
+     * keeps us from hitting the provider API on every 2s checkout tick.
+     *
+     * @return array{polled:int, errors:int}
+     */
+    public static function pollByInvoiceId(string $invoiceId, int $minInterval = 8): array {
+        $ctx = new CustomerSwapSettlement();
+        $table = $ctx->tableName();
+        $now = time();
+        $mi = (int)$minInterval;
+        $pdo = Database::getInstance();
+        $placeholders = implode(',', array_fill(0, count(self::TERMINAL_STATUSES), '?'));
+        $params = array_merge([$invoiceId], self::TERMINAL_STATUSES);
+
+        $stmt = $pdo->prepare(
+            "SELECT * FROM {$table}
+              WHERE invoice_id = ?
+                AND status NOT IN ({$placeholders})
+              ORDER BY id ASC
+              LIMIT 1"
+        );
+        $stmt->execute($params);
+        $row = $stmt->fetch(PDO::FETCH_ASSOC);
+        if (!$row) {
+            return ['polled' => 0, 'errors' => 0];
+        }
+
+        $res = self::tryAdvanceRow($row, $ctx, $mi, $now);
+        if ($res === null) {
+            return ['polled' => 0, 'errors' => 0]; // gated, or another poller has it
+        }
+        return ['polled' => 1, 'errors' => $res === false ? 1 : 0];
+    }
+
+    /**
+     * Atomically claim one swap row via the last_polled_at gate, then drive
+     * it through one tick of state. Shared by pollPending() (batch) and
+     * pollByInvoiceId() (single). Returns null if another poller holds the
+     * row (gate lost), true on a clean tick, false if the tick errored.
+     *
+     * $mi is a trusted int inlined into SQL (not bound) to dodge a
+     * PDO+SQLite quirk that coerces bound integer params to TEXT and breaks
+     * the numeric comparison — same reason pollPending() inlines it.
+     */
+    private static function tryAdvanceRow(array $row, SwapSettlementContext $ctx, int $mi, int $now): ?bool {
+        $pdo = Database::getInstance();
+        $table = $ctx->tableName();
+        // Atomic claim: only proceed if we successfully stamp last_polled_at.
+        $upd = $pdo->prepare(
+            "UPDATE {$table}
+                SET last_polled_at = ?, updated_at = ?
+              WHERE id = ?
+                AND (last_polled_at IS NULL OR (CAST(? AS INTEGER) - last_polled_at) >= {$mi})"
+        );
+        $upd->execute([$now, $now, $row['id'], $now]);
+        if ($upd->rowCount() !== 1) {
+            return null; // another poller has this row
+        }
+
+        try {
+            self::processRow($row, $ctx);
+            return true;
+        } catch (Throwable $e) {
+            error_log("SwapPoller ({$table}) row {$row['id']}: " . $e->getMessage());
+            $pdo->prepare(
+                "UPDATE {$table} SET error_message = ?, updated_at = ? WHERE id = ?"
+            )->execute([substr($e->getMessage(), 0, 500), time(), $row['id']]);
+            return false;
+        }
     }
 
     /**

@@ -577,6 +577,40 @@ def drive_swap_to_terminal(payserver: PayserverProc, invoice_id: str,
     raise TimeoutError(f"Swap {invoice_id} did not reach a terminal state within {timeout}s")
 
 
+def poll_checkout(payserver: PayserverProc, invoice_id: str) -> dict:
+    """Hit the customer checkout poll endpoint (payment.php?json=1) exactly as
+    the checkout page's JS does. This drives swap settlement inline via
+    Invoice::pollSingleQuote → SwapPoller::pollByInvoiceId. Returns the status
+    JSON payload (empty dict on transport error)."""
+    status, body = http_json(
+        f"{payserver.url}/payment.php?id={invoice_id}&json=1", method="GET")
+    return body if isinstance(body, dict) else {}
+
+
+def drive_swap_to_terminal_via_checkout(payserver: PayserverProc, invoice_id: str,
+                                        boltz: BoltzRegtestHandle,
+                                        timeout: float = 180.0) -> dict:
+    """Same as drive_swap_to_terminal, but advances the swap by polling the
+    customer checkout endpoint instead of firing cron — exercising the inline
+    SwapPoller::pollByInvoiceId path. Block mining still stands in for external
+    block production (the checkout poll never mines); cron is never invoked.
+    """
+    terminal = {"invoice.settled", "swap.expired", "transaction.refunded",
+                "transaction.failed", "invoice.expired", "claim.confirmed", "error"}
+    deadline = time.monotonic() + timeout
+    tick = 0
+    while time.monotonic() < deadline:
+        poll_checkout(payserver, invoice_id)
+        tick += 1
+        if tick % 3 == 0:
+            boltz.mine_blocks(1)
+        row = fetch_swap_row(payserver, invoice_id)
+        if row and row["status"] in terminal:
+            return row
+        time.sleep(2)
+    raise TimeoutError(f"Swap {invoice_id} did not reach a terminal state within {timeout}s")
+
+
 # ===========================================================================
 # Sweep / auto-melt helpers
 # ===========================================================================
