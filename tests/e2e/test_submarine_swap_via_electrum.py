@@ -31,6 +31,7 @@ from fixtures import swap_stack
 from fixtures.swap_stack import (
     create_swap_invoice,
     drive_swap_to_terminal,
+    drive_swap_to_terminal_via_checkout,
     fetch_invoice_row,
     fetch_swap_row,
     fund_electrum,
@@ -156,3 +157,74 @@ def test_submarine_swap_via_electrum_lightning(boltz_regtest: BoltzRegtestHandle
         if fulcrum is not None:
             stop_fulcrum(fulcrum)
         # Boltz regtest is tear-down via fixture finalizer at session end
+
+
+@pytest.mark.slow
+def test_submarine_swap_settles_via_checkout_poll(boltz_regtest: BoltzRegtestHandle, tmp_path: Path) -> None:
+    """Same swap topology as above, but the swap is driven to settlement by
+    polling the customer checkout endpoint (payment.php?json=1) instead of
+    cron. Proves Invoice::pollSingleQuote → SwapPoller::pollByInvoiceId flips
+    the invoice to Settled end-to-end without the cron poller running."""
+    workdir = tmp_path / f"swap-checkout-{uuid.uuid4().hex[:6]}"
+    workdir.mkdir()
+
+    fulcrum = None
+    electrum = None
+    payserver = None
+    try:
+        fulcrum = start_fulcrum(workdir, boltz_regtest)
+        electrum = start_electrum(workdir, fulcrum.port)
+        assert electrum.vpub and electrum.vpub.startswith(("vpub", "tpub", "xpub")), \
+            f"unexpected vpub: {electrum.vpub!r}"
+
+        fund_electrum(electrum, boltz_regtest, 5_000_000)
+        open_channel_to_boltz_receiver(electrum, boltz_regtest, capacity_sat=300_000)
+        wait_for_lightning_route(electrum, boltz_regtest.cln2_pubkey, timeout=10)
+
+        payserver = setup_payserver(workdir, electrum.vpub, boltz_regtest.api_url,
+                                     strict_no_mint_fallback=True)
+
+        target_sats = 100_000
+        invoice = create_swap_invoice(payserver, target_sats, currency="sat")
+        invoice_id = invoice["id"]
+        bolt11 = invoice["checkout"]["paymentMethods"]["BTC-LightningNetwork"]["destination"]
+        assert bolt11.startswith("lnbcrt"), f"expected lnbcrt invoice, got {bolt11[:20]}…"
+
+        swap_row = fetch_swap_row(payserver, invoice_id)
+        assert swap_row is not None and swap_row["status"] == "swap.created"
+
+        import threading
+        pay_error: list[Exception] = []
+
+        def _do_pay():
+            try:
+                pay_bolt11(electrum, bolt11, timeout=180)
+            except Exception as e:
+                pay_error.append(e)
+
+        pay_thread = threading.Thread(target=_do_pay, daemon=True)
+        pay_thread.start()
+
+        # Drive via the checkout poll — NOT cron.
+        final = drive_swap_to_terminal_via_checkout(payserver, invoice_id, boltz_regtest, timeout=180)
+        pay_thread.join(timeout=30)
+
+        assert final["status"] == "invoice.settled", \
+            f"expected invoice.settled, got {final['status']} (error_message={final.get('error_message')})"
+        assert final["claim_txid"], "claim_txid should be populated"
+        if pay_error:
+            raise AssertionError(f"lnpay raised: {pay_error[0]}")
+
+        inv_final = fetch_invoice_row(payserver, invoice_id)
+        assert inv_final is not None
+        assert inv_final["status"] == "Settled", f"invoice status {inv_final['status']}"
+        assert inv_final["payment_rail"] == "swap"
+        assert inv_final["settled_rail"] == "swap"
+
+    finally:
+        if payserver is not None:
+            stop_payserver(payserver)
+        if electrum is not None:
+            stop_electrum(electrum)
+        if fulcrum is not None:
+            stop_fulcrum(fulcrum)

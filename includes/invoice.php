@@ -17,6 +17,7 @@ require_once __DIR__ . '/onchain/payments.php';
 require_once __DIR__ . '/swap/factory.php';
 require_once __DIR__ . '/swap/config.php';
 require_once __DIR__ . '/swap/quote_fetcher.php';
+require_once __DIR__ . '/swap/poller.php';
 require_once __DIR__ . '/crypto/secp256k1.php';
 require_once __DIR__ . '/crypto/taproot.php';
 require_once __DIR__ . '/lnurl_receive.php';
@@ -1297,6 +1298,24 @@ class Invoice {
 
         // Only process New or Processing invoices
         if (!in_array($invoice['status'], ['New', 'Processing'])) {
+            return;
+        }
+
+        // Submarine-swap rail: advance the swap state machine inline so
+        // settlement isn't dependent on the cron poller (Task 4c). The
+        // single-row poll reuses SwapPoller's atomic last_polled_at gate, so
+        // it's safe against the cron task and other concurrent checkout polls
+        // hitting the same swap, and the gate's min-interval keeps us off the
+        // provider API on every 2s checkout tick. Cron's expireStale() remains
+        // the backstop (incl. HTLC cancellation) for customers who close the
+        // page before invoice.settled. A swap invoice has no Cashu quote or
+        // on-chain pay-to-address, so none of the rails below apply.
+        if (($invoice['payment_rail'] ?? null) === 'swap') {
+            try {
+                SwapPoller::pollByInvoiceId($invoiceId);
+            } catch (Throwable $e) {
+                error_log("swap poll failed for {$invoiceId}: " . $e->getMessage());
+            }
             return;
         }
 
