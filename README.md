@@ -72,8 +72,8 @@ Generally speaking, BareBits tries to offer both on-chain and lightning as payme
 - Is the customer paying on-chain? Send directly to merchant xpub wallet
 - Does the merchant have a working LNURL? Present a lightning invoice
 - If submarine swaps are NOT enabled and a cashu mint is NOT enabled, do not present a lightning invoice.
-- If submarine swaps ARE enabled AND submarine swap fee is reasonable (defined as 1% of value of payment or less), present a lightning invoice that results in a payment to merchant's on-chain wallet
-- If submarine swap is NOT enabled OR is too expensive, display lightning invoice to send payment to cashu mint. Funds will be emptied from mint -> merchant on-chain once a submarine swap becomes worth it.
+- If submarine swaps ARE enabled AND the invoice amount falls within the swap provider's min/max limits, present a lightning invoice that settles directly to the merchant's on-chain wallet. When several providers are configured, the preferred (first reachable) provider is used unless another is cheaper by more than the auto-select threshold (`swaps_auto_select_threshold_pct`, default 10%).
+- If submarine swaps are NOT enabled, or no provider can serve the amount, display a lightning invoice that sends payment to the cashu mint — unless strict mode is on, in which case the invoice is rejected instead. Funds are later emptied from the mint to the merchant's on-chain wallet by auto-cashout once it's worth it (auto-cashout caps the swap fee at 1% of the amount by default).
 
 
 ## Submarine Swaps (LN → on-chain, optional)
@@ -278,7 +278,7 @@ If you're locked out of the admin dashboard there are two ways to recover, both 
 **Option 1 — Email a reset link.** Requires two things to be set up in advance:
 
 - A **recovery email** on the admin account. Set it during the setup wizard (the optional "Recovery email" field on the password step) or later under **Settings → My Account → Recovery email**.
-- **Outbound email (SMTP)** configured via the `CASHUPAY_SMTP_*` settings in `user_config.php` (see `user_config.example.php`). Without working email this option cannot deliver the link.
+- **Outbound email (SMTP)** configured under **Settings → Email Notifications** in the admin UI (global, with an optional per-store override). As a fallback, SMTP can also be set via the `CASHUPAY_SMTP_*` settings in `user_config.php` (see `user_config.example.php`). Without working email this option cannot deliver the link.
 
 Click **Forgot password? → Email me a reset link**, enter the admin recovery email, and open the link that arrives. The link is valid for **one hour** and can be used **once**. (For privacy, the page always reports success regardless of whether the address matched an account.)
 
@@ -468,7 +468,7 @@ curl -X POST "https://yoursite.com/api/v1/stores/{storeId}/webhooks" \
   }'
 ```
 
-Webhook events: `InvoiceCreated`, `InvoiceReceivedPayment`, `InvoiceSettled`, `InvoiceExpired`, `InvoiceInvalid`
+Webhook events: `InvoiceCreated`, `InvoiceReceivedPayment`, `InvoiceProcessing`, `InvoiceProvisional`, `InvoiceSettled`, `InvoiceExpired`, `InvoiceInvalid`
 
 ## Troubleshooting
 

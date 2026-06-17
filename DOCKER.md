@@ -59,7 +59,7 @@ docker run -d --name cashupay-wordpress -p 80:80 cashupayserver-wordpress
 2. Open `http://localhost/wp-admin` (login: `admin` / `admin`)
 3. CashuPay appears in the WordPress admin menu
 4. WooCommerce → Settings → Payments → BTCPay Server
-5. Set Server URL to `http://localhost/cashupay-api/` and configure the API key
+5. Set Server URL to `http://localhost/cashupay` (the plugin appends `/api/v1/...`, served by the `^cashupay/api/v1/` rewrite rule) and configure the API key
 
 ## Default Credentials
 
