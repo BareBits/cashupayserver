@@ -337,7 +337,27 @@ class Updater {
             return false;
         }
 
-        // Overlay.
+        // Mark this build "applied but not yet proven healthy" BEFORE we touch
+        // any live file. The overlay below is the one window where a crash can
+        // leave the install half-old/half-new; writing the recovery breadcrumb
+        // first guarantees the next update.php run finds it and rolls back from
+        // `backup`, even if we die mid-overlay. (update.php clears this marker
+        // once health.php probes green; if the probe fails or the process dies,
+        // the next run re-probes and auto-rolls-back to `backup`, parking `sha`
+        // in updater_blocked_shas.) The marker lives in the DB under data/,
+        // which the overlay never touches.
+        $newVersion = (string)($remote['VERSION'] ?? 'unknown');
+        Config::set('updater_pending_verify', [
+            'sha' => $sha,
+            'version' => $newVersion,
+            'from_version' => $oldVersion,
+            'backup' => basename($backupDir),
+            'applied_at' => time(),
+        ]);
+
+        // Overlay. Each file is replaced atomically (staged to a temp path in
+        // the destination dir, then renamed into place) so no live file is ever
+        // observed truncated/half-written even if we crash mid-copy.
         $oldHtaccessSha = self::getLocalBuildInfo()['HTACCESS_SHA256'] ?? '';
         $htaccessUntouched = self::overlayInstall($sourceDir, $root, $oldHtaccessSha, $remote);
 
@@ -348,7 +368,6 @@ class Updater {
         self::pruneBackups($updatesDir . '/backup', self::BACKUPS_TO_KEEP);
 
         // Record the result.
-        $newVersion = (string)($remote['VERSION'] ?? 'unknown');
         $token = bin2hex(random_bytes(32));
         file_put_contents($updatesDir . '/recovery_token.txt', $token);
         @chmod($updatesDir . '/recovery_token.txt', 0600);
@@ -363,19 +382,9 @@ class Updater {
             'htaccess_held_back' => !$htaccessUntouched,
         ]);
         Config::set('updater_banner_dismissed', false);
-
-        // Mark this build as "applied but not yet proven healthy". update.php
-        // probes health.php right after this returns and clears the marker on
-        // success; if the probe fails (or the process dies before clearing it)
-        // the next update.php run sees the marker, re-probes, and auto-rolls
-        // back to `backup` while parking `sha` in updater_blocked_shas.
-        Config::set('updater_pending_verify', [
-            'sha' => $sha,
-            'version' => $newVersion,
-            'from_version' => $oldVersion,
-            'backup' => basename($backupDir),
-            'applied_at' => time(),
-        ]);
+        // updater_pending_verify was written before the overlay (above) so a
+        // mid-overlay crash still leaves the rollback breadcrumb; update.php
+        // clears it once health.php probes green.
 
         self::log("update applied: $oldVersion -> $newVersion ($channel)");
         return true;
@@ -441,12 +450,12 @@ class Updater {
                     if ($liveSha !== $oldHtaccessSha) {
                         // User modified .htaccess — write new version as
                         // .htaccess.new and leave the live file alone.
-                        @copy($item->getPathname(), $root . '/.htaccess.new');
+                        self::atomicCopy($item->getPathname(), $root . '/.htaccess.new');
                         $htaccessHeldBack = true;
                         continue;
                     }
                 }
-                @copy($item->getPathname(), $dest);
+                self::atomicCopy($item->getPathname(), $dest);
                 continue;
             }
 
@@ -454,11 +463,37 @@ class Updater {
                 self::ensureDir($dest);
             } else {
                 self::ensureDir(dirname($dest));
-                @copy($item->getPathname(), $dest);
+                self::atomicCopy($item->getPathname(), $dest);
             }
         }
 
         return !$htaccessHeldBack;
+    }
+
+    /**
+     * Replace $dest with the contents of $src atomically: copy to a temp file
+     * in the SAME directory (so rename stays on one filesystem), preserve the
+     * source's permission bits, then rename over the destination. rename() is
+     * atomic on POSIX, so a concurrent reader / a crash never sees a partially
+     * written destination — it sees either the old file or the complete new one.
+     * Best-effort (mirrors the previous @copy): returns false on failure without
+     * throwing, leaving the existing file intact.
+     */
+    private static function atomicCopy(string $src, string $dest): bool {
+        $tmp = $dest . '.tmp-' . bin2hex(random_bytes(6));
+        if (!@copy($src, $tmp)) {
+            @unlink($tmp);
+            return false;
+        }
+        $perms = @fileperms($src);
+        if ($perms !== false) {
+            @chmod($tmp, $perms & 0777);
+        }
+        if (!@rename($tmp, $dest)) {
+            @unlink($tmp);
+            return false;
+        }
+        return true;
     }
 
     private static function isPreserved(string $rel): bool {
@@ -690,12 +725,16 @@ class Updater {
         curl_setopt_array($ch, [
             CURLOPT_FILE => $fp,
             CURLOPT_FOLLOWLOCATION => true,
+            // Cap the redirect chain so a misbehaving / hostile mirror can't
+            // bounce us through an unbounded sequence of hops.
+            CURLOPT_MAXREDIRS => 10,
             CURLOPT_TIMEOUT => 300,
             CURLOPT_CONNECTTIMEOUT => 10,
             CURLOPT_USERAGENT => self::HTTP_USER_AGENT,
             CURLOPT_PROTOCOLS => CURLPROTO_HTTP | CURLPROTO_HTTPS,
             CURLOPT_REDIR_PROTOCOLS => CURLPROTO_HTTP | CURLPROTO_HTTPS,
             CURLOPT_SSL_VERIFYPEER => true,
+            CURLOPT_SSL_VERIFYHOST => 2,
             CURLOPT_RESOLVE => $validated['resolve'],
         ]);
         $ok = curl_exec($ch);

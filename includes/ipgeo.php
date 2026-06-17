@@ -172,13 +172,14 @@ class IpGeo {
 
         $path = self::getCsvPath();
         if (!is_file($path)) {
-            // Fetch-on-first-use fallback. Refresh resets $loadAttempted,
-            // so a second call here would loop — short-circuit by tracking.
-            if (!self::fetchCsvSafely()) {
-                return false;
-            }
-            self::$loadAttempted = true;
-            if (!is_file($path)) return false;
+            // Degrade gracefully: never download the (multi-MB) geo DB on the
+            // request thread — that could block a customer-facing request for up
+            // to the 60s download timeout plus a full ~700K-row parse. The DB is
+            // populated out-of-band by the cron task (IpGeo::refresh) and
+            // scripts/refresh-ipgeo.php; until then, geo lookups simply return
+            // null (no country) rather than stalling the request.
+            error_log('IpGeo: geo DB not present; skipping lookup (run cron / refresh-ipgeo.php to populate)');
+            return false;
         }
 
         $fh = @gzopen($path, 'rb');
@@ -388,14 +389,5 @@ class IpGeo {
             return false;
         }
         return true;
-    }
-
-    private static function fetchCsvSafely(): bool {
-        try {
-            return self::refresh();
-        } catch (\Throwable $e) {
-            error_log('IpGeo refresh failed: ' . $e->getMessage());
-            return false;
-        }
     }
 }

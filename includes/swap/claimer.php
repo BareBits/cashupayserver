@@ -13,8 +13,10 @@
  */
 
 require_once __DIR__ . '/../database.php';
+require_once __DIR__ . '/../config.php';
 require_once __DIR__ . '/../safe_http.php';
 require_once __DIR__ . '/../onchain/wallet.php';
+require_once __DIR__ . '/../onchain/provider.php';
 require_once __DIR__ . '/../crypto/secp256k1.php';
 require_once __DIR__ . '/../crypto/schnorr.php';
 require_once __DIR__ . '/../crypto/taproot.php';
@@ -23,6 +25,19 @@ require_once __DIR__ . '/factory.php';
 require_once __DIR__ . '/settlement_context.php';
 
 final class SwapClaimer {
+    // Approximate vsize of a reverse-swap claim tx (1 Taproot script-path input
+    // with [sig, preimage, script, control-block] witness, 1 output) — used to
+    // turn a sat/vB feerate into an absolute claim fee. Rounded up slightly so
+    // we err toward overpaying rather than stranding the tx in the mempool.
+    private const CLAIM_TX_VSIZE = 150;
+
+    // Sane band for the derived feerate (sat/vB). A bad feerate can neither
+    // strand the claim (too low to confirm) nor burn the output to miners (too
+    // high). DEFAULT is the absolute last resort when neither Esplora nor the
+    // cache yields a value.
+    private const FEERATE_MIN_SAT_VB = 1.0;
+    private const FEERATE_MAX_SAT_VB = 100.0;
+    private const FEERATE_DEFAULT_SAT_VB = 2.0;
     /**
      * Build, sign, and broadcast the claim transaction. Returns the txid on
      * success and stores it in the row's table (swap_attempts or
@@ -118,8 +133,16 @@ final class SwapClaimer {
             error_log("swap claimer: pair re-fetch failed, using stored estimate: " . $e->getMessage());
         }
         if ($claimFeeEstimate <= 0 || $claimFeeEstimate >= $lockupAmount) {
-            // Sane fallback: ~1 sat/vB on a ~136 vB tx == 150 sats
-            $claimFeeEstimate = 200;
+            // Provider estimate unusable: derive the fee from the live mempool
+            // feerate (Esplora /fee-estimates) applied to the claim tx vsize.
+            // Falls back to the last cached feerate when Esplora is unreachable,
+            // then a conservative default — all clamped to a sane band. Replaces
+            // the old flat 200-sat guess that could strand the claim in any
+            // non-trivial fee environment.
+            $claimFeeEstimate = self::estimateClaimFeeSats($row['network'] ?? 'mainnet', self::CLAIM_TX_VSIZE);
+        }
+        if ($claimFeeEstimate >= $lockupAmount) {
+            throw new RuntimeException('Claim fee estimate exceeds lockup amount');
         }
         $claimOutAmount = $lockupAmount - $claimFeeEstimate;
         if ($claimOutAmount < 546) {
@@ -179,30 +202,67 @@ final class SwapClaimer {
         $finalTx = TxBuilder::attachWitness($unsigned, [$sig, $preimage, $claimScript, $controlBlock]);
         $finalHex = bin2hex($finalTx);
 
-        $txid = self::broadcastWithFallback($row, $finalHex);
+        // The claim txid is the double-SHA256 of the NON-witness serialization
+        // ($unsigned has no witness), so we can compute it without the network.
+        $claimTxid = bin2hex(strrev(hash('sha256', hash('sha256', $unsigned, true), true)));
 
-        // Also persist the raw signed claim tx hex. If something goes wrong
-        // post-broadcast (chain reorg, dropped by mempool, fee bump needed),
-        // the operator has the exact bytes to re-broadcast from any node.
-        Database::getInstance()->prepare(
-            "UPDATE {$table} SET claim_txid = ?, claim_tx_hex = ?, status = ?, updated_at = ?
-              WHERE id = ?"
-        )->execute([$txid, $finalHex, 'claim.broadcast', time(), $row['id']]);
+        // Atomic claim gate. cron (30s) and the checkout poll (8s) can both
+        // reach this for the same row, because the last_polled_at gate's window
+        // elapses during the multi-second build above. We record claim_txid +
+        // the signed hex and flip to claim.broadcast in ONE conditional UPDATE,
+        // BEFORE broadcasting:
+        //   - claim_txid (not status) is the gate, because processRow() mirrors
+        //     the provider status over our status column every tick and would
+        //     clobber any status sentinel.
+        //   - persisting before broadcast means a relayed-but-timed-out
+        //     broadcast still leaves the txid on record, so we never blindly
+        //     rebuild+rebroadcast.
+        // A poller that loses the race here must NOT broadcast.
+        $claim = Database::getInstance()->prepare(
+            "UPDATE {$table}
+                SET claim_txid = ?, claim_tx_hex = ?, status = 'claim.broadcast', updated_at = ?
+              WHERE id = ? AND claim_txid IS NULL"
+        );
+        $claim->execute([$claimTxid, $finalHex, time(), $row['id']]);
+        if ($claim->rowCount() !== 1) {
+            // Another poller already owns/finished the claim for this row.
+            $existing = Database::fetchOne("SELECT claim_txid FROM {$table} WHERE id = ?", [$row['id']]);
+            return (string)($existing['claim_txid'] ?? $claimTxid);
+        }
 
-        return $txid;
+        try {
+            self::broadcastWithFallback($row, $finalHex, $claimTxid);
+        } catch (Throwable $e) {
+            // A genuine broadcast failure (not an "already known" race): release
+            // the claim gate so the next poll retries. The tx is deterministic,
+            // so a retry rebroadcasts identical bytes (same txid). We restore the
+            // provider-mirrored status the row had on entry.
+            Database::getInstance()->prepare(
+                "UPDATE {$table} SET claim_txid = NULL, status = ?, updated_at = ? WHERE id = ?"
+            )->execute([(string)($row['status'] ?? 'transaction.mempool'), time(), $row['id']]);
+            throw $e;
+        }
+
+        return $claimTxid;
     }
 
     /**
      * Try the provider's broadcast endpoint first; fall back to Esplora if
      * the provider call fails. Last resort raises.
      */
-    private static function broadcastWithFallback(array $row, string $rawTxHex): string {
+    private static function broadcastWithFallback(array $row, string $rawTxHex, string $expectedTxid): string {
         $provider = SwapProviderFactory::byName($row['provider']);
         $network = $row['network'] ?? 'mainnet';
         if ($provider) {
             try {
                 return $provider->broadcastTx($network, $rawTxHex);
             } catch (Throwable $e) {
+                // The claim tx is deterministic, so on a retry after a relayed-
+                // but-timed-out broadcast the node reports it as already known —
+                // treat that as success rather than failing the row forever.
+                if (self::isAlreadyKnownError($e->getMessage())) {
+                    return $expectedTxid;
+                }
                 error_log("swap broadcast via {$row['provider']} failed: " . $e->getMessage());
             }
         }
@@ -221,9 +281,111 @@ final class SwapClaimer {
             if ($result['error'] === '' && $result['status'] < 400) {
                 return trim($result['body']);
             }
+            if (self::isAlreadyKnownError($result['body'])) {
+                return $expectedTxid;
+            }
             error_log("swap broadcast via esplora failed: HTTP {$result['status']}: " . substr($result['body'], 0, 200));
         }
         throw new RuntimeException('All broadcast paths failed for swap claim');
+    }
+
+    /**
+     * Recognise the various "this transaction is already in the mempool / chain"
+     * responses from Bitcoin nodes and block explorers. On a retry of a
+     * deterministic claim tx these are the expected (benign) outcome, not a
+     * failure — otherwise a relayed-but-timed-out first broadcast would wedge
+     * the row into a permanent error loop.
+     */
+    private static function isAlreadyKnownError(string $msg): bool {
+        $m = strtolower($msg);
+        foreach ([
+            'already in mempool',
+            'already known',
+            'txn-already-known',
+            'txn-already-in-mempool',
+            'transaction already in block chain',
+            'already in block chain',
+            'duplicate transaction',
+        ] as $needle) {
+            if (strpos($m, $needle) !== false) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Estimate the absolute claim fee (sats) for a $vsize-vByte claim tx on
+     * $network. Order of preference:
+     *   1. live mempool feerate from Esplora /fee-estimates (and cache it),
+     *   2. the most recently cached feerate (Esplora unreachable / no public
+     *      endpoint, e.g. regtest),
+     *   3. a conservative default.
+     * The feerate is clamped to a sane band before being applied so a bad value
+     * can neither strand the tx (too low) nor burn the output (too high).
+     */
+    public static function estimateClaimFeeSats(string $network, int $vsize): int {
+        $rate = null;
+        $esploraUrl = EsploraProvider::defaultUrlForNetwork($network);
+        if ($esploraUrl !== null) {
+            $rate = self::fetchFeerateSatPerVb($esploraUrl);
+            if ($rate !== null) {
+                self::cacheFeerate($network, $rate); // remember last good
+            }
+        }
+        if ($rate === null) {
+            $rate = self::cachedFeerate($network); // Esplora unavailable -> cache
+        }
+        if ($rate === null) {
+            $rate = self::FEERATE_DEFAULT_SAT_VB; // absolute last resort
+        }
+        $rate = max(self::FEERATE_MIN_SAT_VB, min($rate, self::FEERATE_MAX_SAT_VB));
+        return max(1, (int)ceil($rate * $vsize));
+    }
+
+    /**
+     * Fetch a sat/vB feerate from an Esplora-style /fee-estimates endpoint.
+     * Returns the rate for a moderate confirmation target (≈3 blocks, falling
+     * back to faster targets, then any positive value), or null on any failure.
+     */
+    public static function fetchFeerateSatPerVb(string $esploraBaseUrl): ?float {
+        $url = rtrim($esploraBaseUrl, '/') . '/fee-estimates';
+        $result = \SafeHttp::request($url, [
+            'timeout' => 10,
+            'allowPrivate' => \SafeHttp::privateEndpointsAllowed(),
+        ]);
+        if ($result['error'] !== '' || $result['status'] < 200 || $result['status'] >= 300) {
+            return null;
+        }
+        $data = json_decode($result['body'], true);
+        if (!is_array($data)) {
+            return null;
+        }
+        foreach (['3', '2', '1'] as $target) {
+            if (isset($data[$target]) && is_numeric($data[$target]) && (float)$data[$target] > 0) {
+                return (float)$data[$target];
+            }
+        }
+        // No standard target present — take any positive estimate.
+        foreach ($data as $v) {
+            if (is_numeric($v) && (float)$v > 0) {
+                return (float)$v;
+            }
+        }
+        return null;
+    }
+
+    private static function cacheFeerate(string $network, float $rate): void {
+        Config::set('swap_claim_feerate_' . $network, ['rate' => $rate, 'timestamp' => time()]);
+    }
+
+    private static function cachedFeerate(string $network): ?float {
+        $d = Config::get('swap_claim_feerate_' . $network);
+        if (!is_array($d) || !isset($d['rate'])) {
+            return null;
+        }
+        $r = (float)$d['rate'];
+        return $r > 0 ? $r : null;
     }
 
     private static function scriptForMerchantAddress(string $addr, string $type, string $network): string {

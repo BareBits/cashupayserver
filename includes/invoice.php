@@ -646,7 +646,19 @@ class Invoice {
             }
         }
 
-        Database::update('invoices', $updates, 'id = ?', [$invoiceId]);
+        // Settlement is terminal and fires InvoiceSettled + a merchant
+        // notification, so guard the transition: only the caller that actually
+        // flips the row to Settled proceeds. The on-chain poller, mint poll,
+        // and offline reconcile can all reach this concurrently. Non-settlement
+        // transitions keep their previous unconditional behaviour.
+        if ($status === 'Settled') {
+            $changed = Database::update('invoices', $updates, 'id = ? AND status != ?', [$invoiceId, 'Settled']);
+            if ($changed !== 1) {
+                return; // already settled by another path
+            }
+        } else {
+            Database::update('invoices', $updates, 'id = ?', [$invoiceId]);
+        }
 
         // Get updated invoice for webhook
         $invoice = self::getById($invoiceId);
@@ -873,12 +885,24 @@ class Invoice {
         try {
             self::queueWebhook($invoice['store_id'], 'InvoiceReceivedPayment', $invoice);
 
-            Database::update(
+            // Status-guarded settle: the customer browser polls every ~2s while
+            // cron and the API can poll the same invoice concurrently. Only the
+            // caller that actually flips the row New/Processing -> Settled may
+            // fire InvoiceSettled + the merchant notification; without this gate
+            // every racing poller re-fires them. rowCount()===0 means another
+            // path already settled, so we bail (the mint() above is idempotent
+            // via the library's deterministic secrets / pending-op rebuild).
+            $settled = Database::update(
                 'invoices',
                 ['status' => 'Settled', 'paid_at' => time(), 'settled_rail' => 'mint'],
-                'id = ?',
-                [$invoice['id']]
+                'id = ? AND status != ?',
+                [$invoice['id'], 'Settled']
             );
+            if ($settled !== 1) {
+                Database::rollback();
+                self::clearWebhookQueue();
+                return;
+            }
             $updatedInvoice = self::getById($invoice['id']);
             self::queueWebhook($invoice['store_id'], 'InvoiceSettled', $updatedInvoice);
 
@@ -1012,7 +1036,11 @@ class Invoice {
     private static function markLnAddressPaid(array $invoice, ?string $preimage): void {
         Database::beginTransaction();
         try {
-            Database::update(
+            // Status-guarded settle (see mintAndStoreTokens): the lnaddress poll
+            // can run from the checkout poll, cron, and the API at once. Only the
+            // winner of the New/Processing -> Settled transition records the fee
+            // credit + fires webhooks/notifications below.
+            $settled = Database::update(
                 'invoices',
                 [
                     'status' => 'Settled',
@@ -1020,13 +1048,17 @@ class Invoice {
                     'settled_rail' => 'lnaddress',
                     'lnurl_preimage' => $preimage ?: null,
                 ],
-                'id = ?',
-                [$invoice['id']]
+                'id = ? AND status != ?',
+                [$invoice['id'], 'Settled']
             );
             Database::commit();
         } catch (Throwable $e) {
             Database::rollback();
             throw $e;
+        }
+
+        if ($settled !== 1) {
+            return; // already settled by another poller
         }
 
         $updated = self::getById((string)$invoice['id']);
@@ -1396,13 +1428,20 @@ class Invoice {
             if (!empty($proofs)) {
                 Database::beginTransaction();
                 try {
-                    Database::update(
+                    // Status-guarded settle (see mintAndStoreTokens): only fire
+                    // webhooks/notifications if this caller actually settled the
+                    // row, so concurrent pollers don't double-fire.
+                    $settled = Database::update(
                         'invoices',
                         ['status' => 'Settled', 'paid_at' => time(), 'settled_rail' => 'mint'],
-                        'id = ?',
-                        [$invoice['id']]
+                        'id = ? AND status != ?',
+                        [$invoice['id'], 'Settled']
                     );
                     Database::commit();
+
+                    if ($settled !== 1) {
+                        return; // already settled by another poller
+                    }
 
                     $updatedInvoice = self::getById($invoice['id']);
                     WebhookSender::fireEvent($invoice['store_id'], 'InvoiceSettled', $updatedInvoice);
@@ -1440,12 +1479,18 @@ class Invoice {
                 if ($wallet->hasStorage() && $invoice['quote_id']) {
                     $proofs = $wallet->getStorage()->getProofsByQuoteId($invoice['quote_id']);
                     if (!empty($proofs)) {
-                        Database::update(
+                        // Status-guarded settle: a regular poller may settle this
+                        // row between our SELECT and here. Only fire webhooks/
+                        // notifications if we actually won the transition.
+                        $settled = Database::update(
                             'invoices',
                             ['status' => 'Settled', 'paid_at' => time(), 'settled_rail' => 'mint'],
-                            'id = ?',
-                            [$invoice['id']]
+                            'id = ? AND status != ?',
+                            [$invoice['id'], 'Settled']
                         );
+                        if ($settled !== 1) {
+                            continue; // already settled elsewhere
+                        }
                         $recovered[] = $invoice['id'];
 
                         $updatedInvoice = self::getById($invoice['id']);

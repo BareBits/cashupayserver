@@ -225,18 +225,68 @@ class ExchangeRates {
         foreach ($order as $provider) {
             try {
                 $rate = $provider->getBtcPrice($currency);
-                if ($rate !== null) {
+                if ($rate !== null && self::isSaneRate($rate)) {
                     self::saveToCache($currency, $rate, $provider->getName());
                     return $rate;
                 }
-            } catch (Exception $e) {
+                if ($rate !== null) {
+                    // Provider returned a non-positive / non-finite price. This
+                    // is observed during upstream outages (e.g. CoinGecko briefly
+                    // serving 0). Caching it would price invoices at 0 sats or
+                    // divide-by-zero downstream, so treat it as a failure and
+                    // fall through to the next provider.
+                    error_log("ExchangeRates: {$provider->getName()} returned insane rate for {$currency}: {$rate}");
+                }
+            } catch (\Throwable $e) {
+                // Catch \Throwable (not just Exception) so a provider-side Error
+                // — e.g. a TypeError from a malformed response — doesn't abort
+                // the whole price lookup and 500 the payment.
                 error_log("ExchangeRates: {$provider->getName()} failed for {$currency}: " . $e->getMessage());
                 continue;
             }
         }
 
-        // Fall back to stale cache as last resort
-        return self::getCached($currency, true);
+        // Fall back to the stale cache (<= STALE_TTL) first.
+        $stale = self::getCached($currency, true);
+        if ($stale !== null) {
+            return $stale;
+        }
+
+        // Last resort: the last known-good rate we ever cached, regardless of
+        // age. Pricing off an old-but-real rate is far better than hard-failing
+        // the invoice — a thrown exception here means the customer cannot pay at
+        // all. Staleness remains visible to callers via isStale()/getRateAge().
+        $lastGood = self::getLastGood($currency);
+        if ($lastGood !== null) {
+            error_log("ExchangeRates: all providers + fresh/stale cache unavailable for {$currency}; using last-good rate {$lastGood}");
+            return $lastGood;
+        }
+
+        return null;
+    }
+
+    /**
+     * A usable BTC price must be a positive, finite number. Anything else
+     * (0, negative, NaN, INF — all observed from flaky upstreams) would corrupt
+     * pricing (0-sat invoices, divide-by-zero), so we reject it and fall through
+     * to the next provider / cache.
+     */
+    private static function isSaneRate(float $rate): bool {
+        return is_finite($rate) && $rate > 0;
+    }
+
+    /**
+     * The last sane rate we ever cached for this currency, ignoring age. Used
+     * only as the final fallback in getBtcPrice() when live providers and the
+     * TTL/stale cache are all unavailable.
+     */
+    private static function getLastGood(string $currency): ?float {
+        $data = Config::get('rate_lastgood_' . strtolower($currency));
+        if ($data === null || !isset($data['rate'])) {
+            return null;
+        }
+        $rate = (float)$data['rate'];
+        return self::isSaneRate($rate) ? $rate : null;
     }
 
     /**
@@ -303,9 +353,11 @@ class ExchangeRates {
             return bcdiv($amount, '100000000000', 11);
         }
 
-        // Fiat currency - divide by BTC price
+        // Fiat currency - divide by BTC price. Guard the divisor: getBtcPrice
+        // only ever returns a sane (>0) rate or null, but a defensive check here
+        // keeps bcdiv from ever dividing by zero.
         $btcPrice = self::getBtcPrice($currency, $primary, $secondary);
-        if ($btcPrice === null) {
+        if ($btcPrice === null || $btcPrice <= 0) {
             throw new Exception("Cannot get exchange rate for {$currency}");
         }
 
@@ -330,9 +382,9 @@ class ExchangeRates {
             return bcmul($btcAmount, '100000000000', 0);
         }
 
-        // Fiat currency - multiply by BTC price
+        // Fiat currency - multiply by BTC price.
         $btcPrice = self::getBtcPrice($currency, $primary, $secondary);
-        if ($btcPrice === null) {
+        if ($btcPrice === null || $btcPrice <= 0) {
             throw new Exception("Cannot get exchange rate for {$currency}");
         }
 
@@ -392,7 +444,7 @@ class ExchangeRates {
 
         // Convert fiat to sats
         $btcPrice = self::getBtcPrice($currency);
-        if ($btcPrice === null) {
+        if ($btcPrice === null || $btcPrice <= 0) {
             throw new Exception("Cannot get exchange rate for {$currency}");
         }
 
@@ -413,7 +465,7 @@ class ExchangeRates {
         }
 
         $btcPrice = self::getBtcPrice($currency);
-        if ($btcPrice === null) {
+        if ($btcPrice === null || $btcPrice <= 0) {
             return null;
         }
 
@@ -447,12 +499,16 @@ class ExchangeRates {
      * Save rate to cache
      */
     private static function saveToCache(string $currency, float $rate, string $provider = 'unknown'): void {
-        $key = 'rate_' . $currency;
-        Config::set($key, [
+        $payload = [
             'rate' => $rate,
             'timestamp' => time(),
             'provider' => $provider,
-        ]);
+        ];
+        Config::set('rate_' . $currency, $payload);
+        // Persist a never-expiring last-known-good copy for getBtcPrice()'s
+        // graceful fallback when every provider and the TTL/stale cache fail.
+        // Only sane rates reach here, so last-good is always usable.
+        Config::set('rate_lastgood_' . $currency, $payload);
     }
 
     /**

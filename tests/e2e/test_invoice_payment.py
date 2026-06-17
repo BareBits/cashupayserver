@@ -57,6 +57,16 @@ def test_invoice_payment_settles_end_to_end(
     settled = _poll_invoice_until(configured, invoice_id, "Settled", timeout_s=30)
     assert settled["status"] == "Settled"
 
-    captured = webhook_sink.wait_for("/hook/settle", count=1, timeout_s=15)
-    delivered_types = {r.json().get("type") for r in captured}
+    # Webhook delivery is now an async outbox (enqueue -> background drain), so
+    # InvoiceSettled arrives a beat after the invoice flips to Settled rather
+    # than synchronously within the settling request. Wait for the specific
+    # event type rather than just "any delivery" — the /hook/settle path already
+    # holds the earlier InvoiceCreated delivery.
+    deadline = time.monotonic() + 20
+    delivered_types: set = set()
+    while time.monotonic() < deadline:
+        delivered_types = {r.json().get("type") for r in webhook_sink.by_path("/hook/settle")}
+        if "InvoiceSettled" in delivered_types:
+            break
+        time.sleep(0.5)
     assert "InvoiceSettled" in delivered_types, f"missing InvoiceSettled in {delivered_types}"

@@ -28,6 +28,16 @@ require_once __DIR__ . '/includes/cart.php';
 require_once __DIR__ . '/includes/trusted_mints.php';
 require_once __DIR__ . '/includes/updater.php';
 require_once __DIR__ . '/includes/notification_sender.php';
+require_once __DIR__ . '/includes/webhook_sender.php';
+
+// Marks "we are inside a cron run" so code that would otherwise fire an
+// opportunistic Background::trigger() (e.g. WebhookSender::fireEvent) skips it —
+// this run already drains that work, and the cron lock would bounce the nested
+// self-request anyway. Guarded so in-process callers (tests requiring cron.php
+// more than once) don't trip a "constant already defined" warning.
+if (!defined('CASHUPAY_IN_CRON')) {
+    define('CASHUPAY_IN_CRON', true);
+}
 
 // Check if setup is complete
 if (!Database::isInitialized() || !Config::isSetupComplete()) {
@@ -117,6 +127,36 @@ if ($swapOnly) {
     $mode = 'all';
 }
 
+// Overlap protection: a slow tick must not pile up behind the next cron
+// invocation (external cron + page-load self-triggers can fire concurrently,
+// and a run that overruns its interval would otherwise duplicate every poll
+// and contend on SQLite writes). Take a non-blocking, per-mode advisory lock
+// and bail early if another run of the same mode is still working. Swap-only
+// and full runs use separate locks because they cover different task sets; the
+// per-row last_polled_at gate in SwapPoller already prevents the two from
+// double-driving the same swap. The lock releases automatically when the
+// request ends (handle close).
+$lockPath = dirname(Database::getDbPath()) . '/' . ($swapOnly ? 'cron-swaps.lock' : 'cron.lock');
+$cronLockHandle = @fopen($lockPath, 'c');
+if ($cronLockHandle === false || !flock($cronLockHandle, LOCK_EX | LOCK_NB)) {
+    // Another run of this mode is active. We still drain the webhook outbox
+    // before bailing: it's the latency-sensitive task that opportunistic
+    // triggers (WebhookSender::fireEvent -> Background::trigger) exist to
+    // serve, and it's concurrency-safe on its own (per-row lease claim), so it
+    // doesn't need the overlap lock. Without this, a nudge that loses the lock
+    // to an in-progress run that already passed its drain step would leave the
+    // just-enqueued delivery waiting for the next external cron tick.
+    if (!$swapOnly) {
+        try {
+            WebhookSender::drainPending();
+        } catch (\Throwable $e) {
+            // best-effort
+        }
+    }
+    echo json_encode(['skipped' => 'another cron run in progress', 'mode' => $mode]);
+    exit;
+}
+
 $results = [
     'timestamp' => time(),
     'mode' => $mode,
@@ -128,7 +168,7 @@ if (!$swapOnly) {
     try {
         Invoice::pollPendingQuotes();
         $results['tasks']['poll_quotes'] = 'success';
-    } catch (Exception $e) {
+    } catch (\Throwable $e) {
         $results['tasks']['poll_quotes'] = 'error: ' . $e->getMessage();
     }
 }
@@ -140,7 +180,7 @@ if (!$swapOnly) {
     try {
         Invoice::pollPendingLnAddress();
         $results['tasks']['poll_lnaddress'] = 'success';
-    } catch (Exception $e) {
+    } catch (\Throwable $e) {
         $results['tasks']['poll_lnaddress'] = 'error: ' . $e->getMessage();
     }
 }
@@ -162,7 +202,7 @@ if (!$swapOnly && !$skipNonEssential) {
         $results['tasks']['settle_fees'] = count($feeResults) > 0
             ? ['stores_processed' => count($feeResults)]
             : 'skipped';
-    } catch (Exception $e) {
+    } catch (\Throwable $e) {
         $results['tasks']['settle_fees'] = 'error: ' . $e->getMessage();
     }
 }
@@ -176,7 +216,7 @@ if (!$swapOnly && !$skipNonEssential) {
         $reconcile = OfflineCashu::reconcile();
         $results['tasks']['offline_cashu_reconcile'] =
             ($reconcile['processed'] > 0) ? $reconcile : 'skipped';
-    } catch (Exception $e) {
+    } catch (\Throwable $e) {
         $results['tasks']['offline_cashu_reconcile'] = 'error: ' . $e->getMessage();
     }
 }
@@ -196,7 +236,7 @@ if (!$swapOnly && !$skipNonEssential) {
         } else {
             $results['tasks']['auto_melt'] = 'skipped';
         }
-    } catch (Exception $e) {
+    } catch (\Throwable $e) {
         $results['tasks']['auto_melt'] = 'error: ' . $e->getMessage();
     }
     try {
@@ -204,7 +244,7 @@ if (!$swapOnly && !$skipNonEssential) {
         $results['tasks']['auto_melt_swap'] = $sweepResult
             ? ['stores_processed' => count($sweepResult)]
             : 'skipped';
-    } catch (Exception $e) {
+    } catch (\Throwable $e) {
         $results['tasks']['auto_melt_swap'] = 'error: ' . $e->getMessage();
     }
 }
@@ -214,7 +254,7 @@ if (!$swapOnly && !$skipNonEssential) {
     try {
         Security::cleanCache();
         $results['tasks']['clean_cache'] = 'success';
-    } catch (Exception $e) {
+    } catch (\Throwable $e) {
         $results['tasks']['clean_cache'] = 'error: ' . $e->getMessage();
     }
 }
@@ -225,7 +265,7 @@ if (!$swapOnly) {
     try {
         $expired = Invoice::markExpiredInvoices();
         $results['tasks']['expire_invoices'] = "expired {$expired} invoices";
-    } catch (Exception $e) {
+    } catch (\Throwable $e) {
         $results['tasks']['expire_invoices'] = 'error: ' . $e->getMessage();
     }
 }
@@ -245,7 +285,7 @@ if (!$swapOnly) {
             }
         }
         $results['tasks']['poll_onchain'] = "polled {$polled} invoice(s)" . ($errored ? ", {$errored} errored" : '');
-    } catch (Exception $e) {
+    } catch (\Throwable $e) {
         $results['tasks']['poll_onchain'] = 'error: ' . $e->getMessage();
     }
 }
@@ -258,13 +298,13 @@ try {
     $swapResults = SwapPoller::pollPending(30, 20);
     $results['tasks']['poll_swaps'] = "polled {$swapResults['polled']} swap(s)"
         . ($swapResults['errors'] ? ", {$swapResults['errors']} errored" : '');
-} catch (Exception $e) {
+} catch (\Throwable $e) {
     $results['tasks']['poll_swaps'] = 'error: ' . $e->getMessage();
 }
 try {
     SwapPoller::expireStale();
     $results['tasks']['expire_swaps'] = 'ok';
-} catch (Exception $e) {
+} catch (\Throwable $e) {
     $results['tasks']['expire_swaps'] = 'error: ' . $e->getMessage();
 }
 
@@ -276,8 +316,23 @@ try {
     $sweepResults = SwapPoller::pollPending(30, 20, new SweepSwapSettlement());
     $results['tasks']['poll_sweeps'] = "polled {$sweepResults['polled']} sweep(s)"
         . ($sweepResults['errors'] ? ", {$sweepResults['errors']} errored" : '');
-} catch (Exception $e) {
+} catch (\Throwable $e) {
     $results['tasks']['poll_sweeps'] = 'error: ' . $e->getMessage();
+}
+
+// Task 4e: Drain the webhook delivery outbox (enqueue-then-send with retry).
+// Runs on every non-swap-only tick — including internal page-load triggers —
+// so deliveries fire promptly without waiting for the next external cron, and
+// transient merchant-endpoint outages are retried with backoff. The actual
+// HTTP send happens here, off the customer's checkout/settlement request path.
+if (!$swapOnly) {
+    try {
+        $wh = WebhookSender::drainPending();
+        $results['tasks']['deliver_webhooks'] =
+            "sent={$wh['sent']} retry={$wh['failed']} gave_up={$wh['gave_up']}";
+    } catch (\Throwable $e) {
+        $results['tasks']['deliver_webhooks'] = 'error: ' . $e->getMessage();
+    }
 }
 
 // Task 5: C1 - Sync proof states with mint (if not synced recently)
@@ -294,7 +349,7 @@ if (!$swapOnly && !$skipNonEssential) try {
                     // Sync would verify proofs are still valid on mint
                     $syncCount++;
                 }
-            } catch (Exception $e) {
+            } catch (\Throwable $e) {
                 error_log("Sync failed for store {$store['id']}: " . $e->getMessage());
             }
         }
@@ -303,7 +358,7 @@ if (!$swapOnly && !$skipNonEssential) try {
     } else {
         $results['tasks']['sync_proofs'] = 'skipped (recently synced)';
     }
-} catch (Exception $e) {
+} catch (\Throwable $e) {
     $results['tasks']['sync_proofs'] = 'error: ' . $e->getMessage();
 }
 
@@ -312,8 +367,40 @@ if (!$swapOnly) try {
     $recovered = Invoice::recoverOrphanedInvoices();
     $count = count($recovered);
     $results['tasks']['recover_orphaned'] = $count > 0 ? "recovered {$count}" : 'none';
-} catch (Exception $e) {
+} catch (\Throwable $e) {
     $results['tasks']['recover_orphaned'] = 'error: ' . $e->getMessage();
+}
+
+// Task 6b: Reconcile interrupted melt/swap operations against the mint. A
+// melt or swap the mint actually processed but whose response we never stored
+// leaves proofs stuck PENDING (melt) or the swap outputs unrecorded (swap) —
+// both are fund-loss windows. recoverPendingMelts()/recoverPendingSwaps() query
+// the mint (NUT-07 checkstate / NUT-09 restore) and reconcile local state; both
+// early-return cheaply when a store has no pending operations. Previously the
+// melt recovery routine existed but was never invoked.
+if (!$swapOnly && !$skipNonEssential) try {
+    $stores = Database::fetchAll(
+        "SELECT id FROM stores WHERE mint_url IS NOT NULL AND seed_phrase IS NOT NULL"
+    );
+    $meltPaid = 0; $meltRestored = 0; $swapRecovered = 0; $swapRestored = 0;
+    foreach ($stores as $store) {
+        try {
+            $wallet = Invoice::getWalletInstance($store['id']);
+            if (!$wallet->hasStorage()) {
+                continue;
+            }
+            $m = $wallet->recoverPendingMelts();
+            $meltPaid += $m['paid']; $meltRestored += $m['restored'];
+            $s = $wallet->recoverPendingSwaps();
+            $swapRecovered += $s['recovered']; $swapRestored += $s['restored'];
+        } catch (\Throwable $e) {
+            error_log("Pending-op recovery failed for store {$store['id']}: " . $e->getMessage());
+        }
+    }
+    $results['tasks']['recover_pending_ops'] =
+        "melts(paid={$meltPaid},restored={$meltRestored}) swaps(recovered={$swapRecovered},restored={$swapRestored})";
+} catch (\Throwable $e) {
+    $results['tasks']['recover_pending_ops'] = 'error: ' . $e->getMessage();
 }
 
 // Task 7: H3 - Auto-expire very old invoices (older than 30 days)
@@ -325,7 +412,7 @@ if (!$swapOnly && !$skipNonEssential) try {
     )->rowCount();
 
     $results['tasks']['expire_old_invoices'] = "expired {$veryOld} old invoices";
-} catch (Exception $e) {
+} catch (\Throwable $e) {
     $results['tasks']['expire_old_invoices'] = 'error: ' . $e->getMessage();
 }
 
@@ -338,7 +425,7 @@ if (!$swapOnly && !$skipNonEssential) try {
     )->rowCount();
 
     $results['tasks']['cleanup_invoices'] = "deleted {$deleted} old invoices";
-} catch (Exception $e) {
+} catch (\Throwable $e) {
     $results['tasks']['cleanup_invoices'] = 'error: ' . $e->getMessage();
 }
 
@@ -355,12 +442,12 @@ if (!$swapOnly && !$skipNonEssential) try {
                 $cleaned = $wallet->getStorage()->cleanExpiredPendingOperations();
                 $totalCleaned += $cleaned;
             }
-        } catch (Exception $e) {
+        } catch (\Throwable $e) {
             error_log("Cleanup failed for store {$store['id']}: " . $e->getMessage());
         }
     }
     $results['tasks']['cleanup_pending_ops'] = "cleaned {$totalCleaned}";
-} catch (Exception $e) {
+} catch (\Throwable $e) {
     $results['tasks']['cleanup_pending_ops'] = 'error: ' . $e->getMessage();
 }
 
@@ -368,7 +455,7 @@ if (!$swapOnly && !$skipNonEssential) try {
 if (!$swapOnly && !$skipNonEssential) try {
     $trimmed = SwapAutoMelt::cleanupQuoteHistory();
     $results['tasks']['cleanup_swap_quote_history'] = "deleted {$trimmed}";
-} catch (Exception $e) {
+} catch (\Throwable $e) {
     $results['tasks']['cleanup_swap_quote_history'] = 'error: ' . $e->getMessage();
 }
 
@@ -392,7 +479,7 @@ if (!$swapOnly && !$skipNonEssential) try {
     } else {
         $results['tasks']['cleanup_webhooks'] = 'skipped (under limit)';
     }
-} catch (Exception $e) {
+} catch (\Throwable $e) {
     $results['tasks']['cleanup_webhooks'] = 'error: ' . $e->getMessage();
 }
 
@@ -412,7 +499,7 @@ if (!$swapOnly && !$skipNonEssential) try {
     } else {
         $results['tasks']['trusted_mints'] = 'skipped (no URL configured)';
     }
-} catch (Exception $e) {
+} catch (\Throwable $e) {
     $results['tasks']['trusted_mints'] = 'error: ' . $e->getMessage();
 }
 
@@ -429,7 +516,7 @@ if (!$swapOnly && !$skipNonEssential) try {
     } else {
         $results['tasks']['ipgeo'] = 'skipped (fresh)';
     }
-} catch (Exception $e) {
+} catch (\Throwable $e) {
     $results['tasks']['ipgeo'] = 'error: ' . $e->getMessage();
 }
 
