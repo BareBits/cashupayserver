@@ -911,7 +911,11 @@ class Invoice {
             self::flushWebhookQueue();
             NotificationSender::queueInvoicePaid($updatedInvoice);
             self::maybeFireOverrideSettled($updatedInvoice);
-        } catch (Exception $e) {
+        } catch (\Throwable $e) {
+            // Catch \Throwable, not Exception: a \TypeError/\Error thrown
+            // mid-transaction (PDO is a process-wide singleton) would otherwise
+            // leave the transaction open and wedge every later write in this
+            // request/cron pass with "active transaction already".
             Database::rollback();
             self::clearWebhookQueue();
             throw $e;
@@ -1448,7 +1452,9 @@ class Invoice {
                     NotificationSender::queueInvoicePaid($updatedInvoice);
                     self::maybeFireOverrideSettled($updatedInvoice);
                     return;
-                } catch (Exception $e) {
+                } catch (\Throwable $e) {
+                    // \Throwable (not Exception): a \TypeError/\Error must not
+                    // leave the singleton PDO's transaction open for later code.
                     Database::rollback();
                     throw $e;
                 }

@@ -321,7 +321,13 @@ class OnchainPayments {
         }
 
         $provider = OnchainProviderFactory::forStore($store);
-        $observations = $provider->addressTransactions($address);
+        // Pass the invoice's allocation tip as a paging hint: any tx confirmed
+        // before the invoice existed is filtered out below, so the provider can
+        // stop walking chain history once it pages below that height.
+        $createdTipHint = isset($invoice['onchain_created_tip_height'])
+            ? (int)$invoice['onchain_created_tip_height']
+            : null;
+        $observations = $provider->addressTransactions($address, $createdTipHint);
 
         $minConfs = (int)($store['onchain_min_confs'] ?? 1);
         $now = time();

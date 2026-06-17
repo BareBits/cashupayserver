@@ -324,37 +324,64 @@ final class Taproot {
      */
     public static function parseUnsignedTx(string $raw): array {
         $pos = 0;
-        $version = unpack('V', substr($raw, $pos, 4))[1]; $pos += 4;
+        $len = strlen($raw);
+        $version = unpack('V', self::readSlice($raw, $pos, 4, $len))[1]; $pos += 4;
         // No segwit marker/flag in unsigned tx body
-        $numIn = self::readCompactSize($raw, $pos);
+        $numIn = self::readCompactSize($raw, $pos, $len);
+        // A count can't exceed the remaining bytes (each input is >= 41 bytes,
+        // each output >= 9), so a bogus huge compactSize from a malformed /
+        // hostile provider tx is rejected instead of driving a giant loop.
+        if ($numIn > $len - $pos) {
+            throw new InvalidArgumentException('parseUnsignedTx: input count exceeds buffer');
+        }
         $inputs = [];
         for ($i = 0; $i < $numIn; $i++) {
-            $txidLE = substr($raw, $pos, 32); $pos += 32;
-            $vout = unpack('V', substr($raw, $pos, 4))[1]; $pos += 4;
-            $sLen = self::readCompactSize($raw, $pos);
-            $script = substr($raw, $pos, $sLen); $pos += $sLen;
-            $sequence = unpack('V', substr($raw, $pos, 4))[1]; $pos += 4;
+            $txidLE = self::readSlice($raw, $pos, 32, $len); $pos += 32;
+            $vout = unpack('V', self::readSlice($raw, $pos, 4, $len))[1]; $pos += 4;
+            $sLen = self::readCompactSize($raw, $pos, $len);
+            $script = self::readSlice($raw, $pos, $sLen, $len); $pos += $sLen;
+            $sequence = unpack('V', self::readSlice($raw, $pos, 4, $len))[1]; $pos += 4;
             $inputs[] = ['txid' => strrev($txidLE), 'vout' => $vout, 'sequence' => $sequence, 'script_sig' => $script];
         }
-        $numOut = self::readCompactSize($raw, $pos);
+        $numOut = self::readCompactSize($raw, $pos, $len);
+        if ($numOut > $len - $pos) {
+            throw new InvalidArgumentException('parseUnsignedTx: output count exceeds buffer');
+        }
         $outputs = [];
         for ($i = 0; $i < $numOut; $i++) {
-            $valLE = substr($raw, $pos, 8); $pos += 8;
+            $valLE = self::readSlice($raw, $pos, 8, $len); $pos += 8;
             $value = unpack('P', $valLE)[1];
-            $sLen = self::readCompactSize($raw, $pos);
-            $script = substr($raw, $pos, $sLen); $pos += $sLen;
+            $sLen = self::readCompactSize($raw, $pos, $len);
+            $script = self::readSlice($raw, $pos, $sLen, $len); $pos += $sLen;
             $outputs[] = ['value' => $value, 'script' => $script];
         }
-        $locktime = unpack('V', substr($raw, $pos, 4))[1];
+        $locktime = unpack('V', self::readSlice($raw, $pos, 4, $len))[1];
         return ['version' => $version, 'locktime' => $locktime, 'inputs' => $inputs, 'outputs' => $outputs];
     }
 
-    private static function readCompactSize(string $raw, int &$pos): int {
+    /**
+     * Read exactly $n bytes at $pos, throwing if the buffer is too short.
+     * Centralizes the bounds check so a truncated/malformed tx surfaces a
+     * clear error instead of an "undefined array key" off a short unpack().
+     */
+    private static function readSlice(string $raw, int $pos, int $n, ?int $len = null): string {
+        $len = $len ?? strlen($raw);
+        if ($n < 0 || $pos < 0 || $pos + $n > $len) {
+            throw new InvalidArgumentException("parseUnsignedTx: truncated read ({$n} bytes at {$pos}, len {$len})");
+        }
+        return substr($raw, $pos, $n);
+    }
+
+    private static function readCompactSize(string $raw, int &$pos, ?int $len = null): int {
+        $len = $len ?? strlen($raw);
+        if ($pos + 1 > $len) {
+            throw new InvalidArgumentException('readCompactSize: truncated');
+        }
         $b = ord($raw[$pos]); $pos++;
         if ($b < 0xFD) return $b;
-        if ($b === 0xFD) { $v = unpack('v', substr($raw, $pos, 2))[1]; $pos += 2; return $v; }
-        if ($b === 0xFE) { $v = unpack('V', substr($raw, $pos, 4))[1]; $pos += 4; return $v; }
-        $v = unpack('P', substr($raw, $pos, 8))[1]; $pos += 8;
+        if ($b === 0xFD) { $v = unpack('v', self::readSlice($raw, $pos, 2, $len))[1]; $pos += 2; return $v; }
+        if ($b === 0xFE) { $v = unpack('V', self::readSlice($raw, $pos, 4, $len))[1]; $pos += 4; return $v; }
+        $v = unpack('P', self::readSlice($raw, $pos, 8, $len))[1]; $pos += 8;
         return $v;
     }
 

@@ -88,6 +88,18 @@ abstract class BoltzLikeProvider implements SwapProvider {
         if (!$claimOutHex || !$refundOutHex) {
             throw new RuntimeException($this->getName() . ': swapTree missing claim/refund leaf output');
         }
+        // hex2bin() returns false (coerced to "") on odd-length/non-hex input,
+        // which would persist empty leaf scripts and make the on-chain claim
+        // permanently unbuildable AFTER the HTLC is funded. Reject up front so
+        // the swap is never created against malformed tree data.
+        if (!ctype_xdigit($claimOutHex) || strlen($claimOutHex) % 2 !== 0
+            || !ctype_xdigit($refundOutHex) || strlen($refundOutHex) % 2 !== 0) {
+            throw new RuntimeException($this->getName() . ': swapTree leaf output is not valid hex');
+        }
+        $refundPubHex = (string)$resp['refundPublicKey'];
+        if (!ctype_xdigit($refundPubHex) || strlen($refundPubHex) !== 66) {
+            throw new RuntimeException($this->getName() . ': refundPublicKey is not a 33-byte hex key');
+        }
 
         // Boltz returns the actual LN invoice amount in the response, but the
         // field name varies. We decode it from the BOLT11 if not present.

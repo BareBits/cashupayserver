@@ -506,6 +506,27 @@ final class SwapAutoMelt {
         }
 
         $lockupFee = $quote->lockupFeeSats;
+
+        // Bound the invoice we're about to pay against the quoted economics.
+        // invoiceAmountSats is provider-controlled (response field or BOLT11
+        // decode); the percent-cap gate earlier validated the QUOTE, not the
+        // issued invoice. Without this, a provider that returns an invoice
+        // charging far more than quoted would have us melt up to the whole
+        // wallet balance to pay it. Expected max = target + lockup fee +
+        // ceil(target * feePercent) + tolerance.
+        $expectedMaxInvoice = $targetSats
+            + $lockupFee
+            + (int)ceil($targetSats * $quote->feePercent / 100.0);
+        $tolerance = max(2, (int)ceil($expectedMaxInvoice * 0.005));
+        if ($swap->invoiceAmountSats > $expectedMaxInvoice + $tolerance) {
+            error_log(sprintf(
+                'SwapAutoMelt: %s issued invoice %d sat exceeds quoted max %d (+%d tol) for target %d — aborting sweep',
+                $name, $swap->invoiceAmountSats, $expectedMaxInvoice, $tolerance, $targetSats
+            ));
+            self::cancelSwapBestEffort($provider, $network, $swap->swapId);
+            return null;
+        }
+
         $percentFee = max(0, $swap->invoiceAmountSats - $targetSats - $lockupFee);
 
         return [
@@ -634,6 +655,25 @@ final class SwapAutoMelt {
                 throw $e;
             }
 
+            // Last line of defense before funds leave: the mint independently
+            // decoded the actual BOLT11 into $meltQuote->amount. Refuse if it
+            // exceeds the amount we expected for this swap (the provider's
+            // claimed invoiceAmount, already bounded against the quote at
+            // create time). Catches a provider that returns a benign
+            // invoiceAmount field but a BOLT11 charging more. Pre-flight
+            // failure => cancel the swap, release the held HTLC.
+            if ($expectedInvoiceSats > 0) {
+                $tolerance = max(2, (int)ceil($expectedInvoiceSats * 0.005));
+                if ($meltQuote->amount > $expectedInvoiceSats + $tolerance) {
+                    $e = new Exception(sprintf(
+                        'Melt quote amount %d sat exceeds expected swap invoice amount %d (+%d tol)',
+                        $meltQuote->amount, $expectedInvoiceSats, $tolerance
+                    ));
+                    self::recordMeltFailure($mintUrl, $bolt11, $storeId, $e, 'requestMeltQuote', $meltQuoteId, $wallet);
+                    throw $e;
+                }
+            }
+
             $totalNeeded = $meltQuote->amount + $meltQuote->feeReserve;
             $proofs = Invoice::getUnspentProofs($storeId);
             $balance = Wallet::sumProofs($proofs);
@@ -723,6 +763,10 @@ final class SwapAutoMelt {
             'Invalid Lightning address',
             'getInvoice failed',
             'no active keyset',
+            // Amount-bound rejection thrown by meltAgainstInvoice BEFORE any
+            // melt — no LN payment was sent, so cancel the swap and release
+            // the held HTLC rather than leaving the row for the poller.
+            'exceeds expected swap invoice amount',
         ];
         foreach ($needles as $needle) {
             if (stripos($msg, $needle) !== false) return true;

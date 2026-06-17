@@ -1514,10 +1514,27 @@ HTACCESS;
     }
 
     /**
-     * Rollback transaction
+     * Returns true if a transaction is currently active on the shared PDO.
+     */
+    public static function inTransaction(): bool {
+        return self::getInstance()->inTransaction();
+    }
+
+    /**
+     * Rollback transaction.
+     *
+     * Guarded by inTransaction(): callers in catch blocks may run when no
+     * transaction is open (e.g. the failure happened before beginTransaction,
+     * or a \Throwable unwound past an already-committed point). PDO::rollBack()
+     * throws "There is no active transaction" in that case, which would mask
+     * the original error — so we no-op instead.
      */
     public static function rollback(): bool {
-        return self::getInstance()->rollBack();
+        $pdo = self::getInstance();
+        if (!$pdo->inTransaction()) {
+            return false;
+        }
+        return $pdo->rollBack();
     }
 
     /**

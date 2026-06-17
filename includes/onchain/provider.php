@@ -28,9 +28,13 @@ interface BlockchainProvider {
      * Return every output across all transactions that pay $address. Includes
      * mempool transactions (confirmations = 0).
      *
+     * @param ?int $sinceHeight Optional optimization hint: the caller only
+     *   cares about txs confirmed at or after this block height (older ones
+     *   are filtered out anyway). Implementations may stop paging once they
+     *   pass below it. Null = no hint (enumerate everything available).
      * @return OnchainTxObservation[]
      */
-    public function addressTransactions(string $address): array;
+    public function addressTransactions(string $address, ?int $sinceHeight = null): array;
 
     /**
      * Return the current best-known block height. Used as a sanity check and
@@ -68,33 +72,96 @@ final class EsploraProvider implements BlockchainProvider {
         return self::DEFAULTS[$network] ?? null;
     }
 
-    public function addressTransactions(string $address): array {
-        $txs = $this->httpJson('/address/' . rawurlencode($address) . '/txs');
+    // Esplora returns confirmed transactions 25 per page. A page with fewer
+    // than this many confirmed entries is the last page of chain history.
+    private const ESPLORA_CHAIN_PAGE = 25;
+    // Hard ceiling on pages walked (25 confirmed each) so a hot, heavily
+    // re-used address can't make a single poll page forever.
+    private const ESPLORA_MAX_PAGES = 40;
+
+    public function addressTransactions(string $address, ?int $sinceHeight = null): array {
         $tip = $this->currentTipHeight();
         $out = [];
-        foreach ($txs as $tx) {
-            $confirmed = (bool)($tx['status']['confirmed'] ?? false);
-            $blockHeight = $confirmed ? ($tx['status']['block_height'] ?? null) : null;
-            $confs = ($confirmed && $blockHeight !== null) ? max(0, $tip - $blockHeight + 1) : 0;
-            foreach ($tx['vout'] ?? [] as $voutIdx => $vout) {
-                if (($vout['scriptpubkey_address'] ?? null) !== $address) {
-                    continue;
+
+        // Esplora paginates /address/{a}/txs: the base call returns mempool txs
+        // plus only the FIRST 25 confirmed; older confirmed txs require walking
+        // /txs/chain/{last_seen_txid}. Without this loop, a re-used address with
+        // >25 confirmed txs would silently drop older payments and an invoice
+        // paid to it would never settle. We stop once a page is short, once we
+        // page below $sinceHeight (older txs are filtered out anyway), or at a
+        // hard page cap.
+        $enc = rawurlencode($address);
+        $lastSeenTxid = null;
+        for ($page = 0; $page < self::ESPLORA_MAX_PAGES; $page++) {
+            $path = $lastSeenTxid === null
+                ? "/address/{$enc}/txs"
+                : "/address/{$enc}/txs/chain/" . rawurlencode($lastSeenTxid);
+            $txs = $this->httpJson($path);
+            if (empty($txs)) {
+                break;
+            }
+
+            $confirmedInPage = 0;
+            $minHeightInPage = null;
+            foreach ($txs as $tx) {
+                $confirmed = (bool)($tx['status']['confirmed'] ?? false);
+                $blockHeight = $confirmed ? ($tx['status']['block_height'] ?? null) : null;
+                if ($confirmed) {
+                    $confirmedInPage++;
+                    if ($blockHeight !== null && ($minHeightInPage === null || $blockHeight < $minHeightInPage)) {
+                        $minHeightInPage = $blockHeight;
+                    }
                 }
-                $out[] = new OnchainTxObservation(
-                    txid: $tx['txid'],
-                    vout: $voutIdx,
-                    amountSat: (int)($vout['value'] ?? 0),
-                    confirmations: $confs,
-                    blockHeight: $blockHeight,
-                );
+                $confs = ($confirmed && $blockHeight !== null) ? max(0, $tip - $blockHeight + 1) : 0;
+                foreach ($tx['vout'] ?? [] as $voutIdx => $vout) {
+                    if (($vout['scriptpubkey_address'] ?? null) !== $address) {
+                        continue;
+                    }
+                    $out[] = new OnchainTxObservation(
+                        txid: $tx['txid'],
+                        vout: $voutIdx,
+                        amountSat: (int)($vout['value'] ?? 0),
+                        confirmations: $confs,
+                        blockHeight: $blockHeight,
+                    );
+                }
+                if (isset($tx['txid'])) {
+                    $lastSeenTxid = $tx['txid'];
+                }
+            }
+
+            // Fewer than a full confirmed page => no more chain history.
+            if ($confirmedInPage < self::ESPLORA_CHAIN_PAGE) {
+                break;
+            }
+            // We've paged past the caller's window; older txs are irrelevant.
+            if ($sinceHeight !== null && $minHeightInPage !== null && $minHeightInPage < $sinceHeight) {
+                break;
+            }
+            if ($page === self::ESPLORA_MAX_PAGES - 1) {
+                error_log("EsploraProvider::addressTransactions({$address}): hit max page cap; older history not walked");
             }
         }
         return $out;
     }
 
     public function currentTipHeight(): int {
-        $body = $this->httpRaw('/blocks/tip/height');
-        return (int)trim($body);
+        $body = trim($this->httpRaw('/blocks/tip/height'));
+        // Esplora returns the height as a bare decimal string. Reject anything
+        // else: an empty body, a proxy/error HTML page, or whitespace must NOT
+        // collapse to (int)0 — a 0 tip poisons the historical-UTXO filter at
+        // allocation time (a stored created-tip of 0 disables the filter, so a
+        // pre-existing UTXO on a re-used address could wrongly settle an
+        // invoice). Throwing lets currentTipBestEffort() degrade to null
+        // (skip-filter) instead of a false 0.
+        if ($body === '' || !ctype_digit($body)) {
+            throw new RuntimeException('Esplora /blocks/tip/height: non-numeric body: ' . substr($body, 0, 80));
+        }
+        $height = (int)$body;
+        if ($height <= 0) {
+            throw new RuntimeException("Esplora /blocks/tip/height: non-positive height {$height}");
+        }
+        return $height;
     }
 
     private function httpRaw(string $path): string {
@@ -144,7 +211,9 @@ final class BitcoindRpcProvider implements BlockchainProvider {
         private readonly int $timeoutSec = 15,
     ) {}
 
-    public function addressTransactions(string $address): array {
+    public function addressTransactions(string $address, ?int $sinceHeight = null): array {
+        // $sinceHeight is unused here: listreceivedbyaddress already returns the
+        // full history for the watched address in one call (no pagination).
         // Make sure the wallet is watching the address (idempotent).
         $this->ensureWatchAddress($address);
 

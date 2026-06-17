@@ -25,6 +25,34 @@ use Cashu\LightningAddress as CashuLightningAddress;
 
 class LightningAddress {
     /**
+     * Absolute floor (in the mint's smallest unit) under which a fee reserve
+     * is always considered plausible, so tiny payments aren't rejected over a
+     * legitimate base routing fee. Above this floor, a reserve may not exceed
+     * the payment amount itself.
+     */
+    private const FEE_RESERVE_SANITY_FLOOR = 1000;
+
+    /**
+     * Reject a mint-supplied melt quote whose fee reserve is implausibly large.
+     * A real Lightning routing reserve is a small fraction of the payment; a
+     * reserve larger than the payment itself (beyond a small-payment floor)
+     * indicates a buggy or hostile mint trying to drain extra balance into
+     * "fees". This is intentionally generous — it never trips on normal
+     * routing, only on egregious values.
+     *
+     * @throws Exception if the reserve fails the sanity bound
+     */
+    private static function assertSaneFeeReserve(int $amount, int $feeReserve): void {
+        $maxReserve = max($amount, self::FEE_RESERVE_SANITY_FLOOR);
+        if ($feeReserve > $maxReserve) {
+            throw new Exception(
+                "Melt fee reserve {$feeReserve} exceeds sanity bound {$maxReserve} "
+                . "(payment amount {$amount}); refusing to melt"
+            );
+        }
+    }
+
+    /**
      * Validate a Lightning address format
      */
     public static function isValid(string $address): bool {
@@ -87,6 +115,13 @@ class LightningAddress {
                 $meltQuoteId = $meltQuote->quote ?? null;
             } catch (Exception $e) {
                 self::recordMeltFailure($mintUrl, $address, $storeId, $e, 'requestMeltQuote', null, $wallet);
+                throw $e;
+            }
+
+            try {
+                self::assertSaneFeeReserve($meltQuote->amount, $meltQuote->feeReserve);
+            } catch (Exception $e) {
+                self::recordMeltFailure($mintUrl, $address, $storeId, $e, 'requestMeltQuote', $meltQuoteId, $wallet);
                 throw $e;
             }
 
@@ -494,6 +529,28 @@ class LightningAddress {
             $meltQuoteId = $meltQuote->quote ?? null;
         } catch (Exception $e) {
             self::recordMeltFailure($mintUrl, $addressForRecord, $storeId, $e, 'requestMeltQuote', null, $wallet);
+            throw $e;
+        }
+
+        // Bound the amount the mint says this BOLT11 demands against what the
+        // caller expected to pay (e.g. the fee owed). Catches a fetched
+        // invoice that encodes a larger amount than requested before any funds
+        // leave. Tolerance absorbs rounding between fiat conversion and sats.
+        if ($expectedAmount !== null && $expectedAmount > 0) {
+            $tolerance = max(2, (int)ceil($expectedAmount * 0.01));
+            if ($meltQuote->amount > $expectedAmount + $tolerance) {
+                $e = new Exception(
+                    "BOLT11 amount {$meltQuote->amount} exceeds expected {$expectedAmount} (+{$tolerance} tol)"
+                );
+                self::recordMeltFailure($mintUrl, $addressForRecord, $storeId, $e, 'requestMeltQuote', $meltQuoteId, $wallet);
+                throw $e;
+            }
+        }
+
+        try {
+            self::assertSaneFeeReserve($meltQuote->amount, $meltQuote->feeReserve);
+        } catch (Exception $e) {
+            self::recordMeltFailure($mintUrl, $addressForRecord, $storeId, $e, 'requestMeltQuote', $meltQuoteId, $wallet);
             throw $e;
         }
 
