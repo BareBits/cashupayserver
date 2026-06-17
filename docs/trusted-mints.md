@@ -42,13 +42,15 @@ Field rules:
 - `version` — optional integer, currently always `1`. Reject the list if you
   publish a different version than the server knows about.
 - `mints` — required array.
-- `mints[].url` — required HTTPS URL. Trailing slashes are normalized.
+- `mints[].url` — required `http(s)://` URL. HTTPS is strongly recommended;
+  plain HTTP is accepted but offers no transport security for a list that
+  drives where funds are sent. Trailing slashes are normalized.
 - `mints[].disabled` — optional boolean. When `true`, the mint is flagged as
   trusted-list-disabled in `mint_reliability` for every store on the instance.
 - `mints[].reason` — optional free-form string; surfaced in the diagnostic UI.
 
-The server will not accept the list if any entry has a non-HTTPS URL or any
-field has the wrong type.
+The server will not accept the list if any entry's `url` is missing, empty, or
+not an `http(s)://` URL, or if `disabled` is present but not a boolean.
 
 A sample valid list lives at [trusted-mints-example.json](trusted-mints-example.json).
 
@@ -78,8 +80,9 @@ no-op — the trusted list is additive/blacklist-only, never a sync.
 
 ## Hosting tips
 
-- Serve the file over HTTPS with a valid certificate; the fetcher refuses
-  non-HTTPS URLs and enforces peer verification.
+- Serve the file over HTTPS with a valid certificate. The fetcher enforces
+  TLS peer verification for HTTPS URLs; plain HTTP is permitted but provides
+  no transport security, so HTTPS is strongly recommended.
 - Send `Content-Type: application/json`. The fetcher requests JSON via the
   `Accept` header.
 - Keep the list small — every entry is loaded into memory on each refresh.

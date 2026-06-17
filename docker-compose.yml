@@ -23,10 +23,12 @@ services:
     environment:
       TZ: UTC
       # Uncomment and set as needed:
-      # CASHUPAY_BASE_URL: https://pay.example.com
       # CASHUPAY_AUTO_UPDATE_ENABLED: "1"    # default 1; "0" pins to image tag
-      # CASHUPAY_UPDATE_CHANNEL: main        # 'main' or 'testing'
       # CRON_INTERVAL_SECONDS: "60"          # "0" disables in-container cron
+      # Note: the public base URL is auto-detected from the request Host header
+      # (no CASHUPAY_BASE_URL env var) and the update channel is set in the
+      # admin UI or via the CASHUPAY_UPDATE_CHANNEL constant in user_config.php
+      # (not read from the environment). See docs/docker-production.md.
       # CASHUPAY_SMTP_HOST: smtp.example.com
       # CASHUPAY_SMTP_PORT: "587"
       # CASHUPAY_SMTP_USERNAME: apikey

@@ -89,7 +89,7 @@ Two related settings per store:
   for it to reach the required confirmation count. If the window passes
   without enough confirmations, the invoice transitions to `Invalid`.
 
-The standard `invoice_expiration` (default 15 min, global) still applies as
+The standard `invoice_expiration` (default 1 hour, global) still applies as
 the "time to broadcast" window: if no mempool sighting happens before it
 elapses, the invoice expires.
 

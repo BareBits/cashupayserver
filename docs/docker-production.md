@@ -63,22 +63,33 @@ you don't set falls back to the in-app defaults or the admin UI.
 | Variable | Default | Notes |
 |----------|---------|-------|
 | `TZ` | `UTC` | Standard Debian tz database name. |
-| `CASHUPAY_BASE_URL` | (auto-detect) | Set when behind a reverse proxy so generated URLs use your public hostname. |
 | `CASHUPAY_AUTO_UPDATE_ENABLED` | `1` | Set to `0` to pin to the image tag (immutable infra). |
-| `CASHUPAY_UPDATE_CHANNEL` | `main` | `main` (stable) or `testing` (pre-release). |
 | `CRON_INTERVAL_SECONDS` | `60` | `0` disables the in-container cron loop. |
 | `CASHUPAY_SMTP_*` | unset | See `user_config.example.php` for the full SMTP set. |
 | `CASHUPAY_FREE_TRIAL_*` | unset | Seeded once on first migration; see `user_config.example.php`. |
 
+Only a subset of settings are read from the environment: the variables in the
+table above plus `CASHUPAY_UPDATER_DISABLED`, `CASHUPAY_DATA_DIR`,
+`CASHUPAY_DEPLOYMENT_ID`, `CASHUPAY_DEV_FEE_LNURL`,
+`CASHUPAY_TRUSTED_MINTS_URL`, and `CASHUPAY_TRUSTED_MINTS_REFRESH_MINUTES`.
 Any other constant documented in [`user_config.example.php`](../user_config.example.php)
-can be set via the equivalent env var (same name).
+is **not** picked up from the environment — set it as a PHP constant in
+`user_config.php` or from the admin UI. Two common cases:
+
+- **Update channel.** Choose `main`/`testing` in the admin UI (Settings) or via
+  the `CASHUPAY_UPDATE_CHANNEL` constant in `user_config.php`. There is no
+  `CASHUPAY_UPDATE_CHANNEL` env var.
+- **Public base URL.** Auto-detected from the request `Host` header; there is
+  no `CASHUPAY_BASE_URL` env var. Put the app behind a reverse proxy that
+  forwards the `Host` header (see below).
 
 ### Reverse-proxy headers
 
-The app reads `X-Forwarded-Proto` and `X-Forwarded-Host` from
-`includes/auth.php` and `includes/security.php`. Make sure your proxy
-forwards both — otherwise checkout-page URLs and HTTPS-only cookies
-won't behave correctly.
+For HTTPS detection — so HTTPS-only cookies are set and generated URLs use
+`https://` — the app honors the `X-Forwarded-Proto` header
+(`includes/auth.php`). The public hostname is taken from the `Host` header
+(there is no separate `X-Forwarded-Host` handling), so your proxy must forward
+that too. Make sure both reach the container.
 
 Caddy example:
 
@@ -88,7 +99,8 @@ pay.example.com {
 }
 ```
 
-Caddy sets `X-Forwarded-Proto` and `X-Forwarded-Host` automatically.
+Caddy sets `X-Forwarded-Proto` and forwards the upstream `Host` header
+automatically.
 
 ## Upgrading
 
