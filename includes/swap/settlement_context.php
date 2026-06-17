@@ -48,11 +48,18 @@ final class CustomerSwapSettlement implements SwapSettlementContext {
 
     public function onSettled(array $row): void {
         $pdo = Database::getInstance();
-        $pdo->prepare(
+        // Status-guarded settle: only fire InvoiceSettled if we actually flip
+        // the invoice to Settled. Concurrent pollers (cron + checkout poll both
+        // drive swap_attempts) could otherwise each fire the webhook.
+        $stmt = $pdo->prepare(
             "UPDATE invoices SET status = 'Settled', additional_status = 'PaidNormal',
                                  paid_at = ?, settled_rail = 'swap'
-             WHERE id = ?"
-        )->execute([time(), $row['invoice_id']]);
+             WHERE id = ? AND status != 'Settled'"
+        );
+        $stmt->execute([time(), $row['invoice_id']]);
+        if ($stmt->rowCount() !== 1) {
+            return; // already settled
+        }
         $invoice = Database::fetchOne("SELECT * FROM invoices WHERE id = ?", [$row['invoice_id']]);
         if ($invoice) {
             WebhookSender::fireEvent($invoice['store_id'], 'InvoiceSettled', $invoice);
@@ -62,11 +69,17 @@ final class CustomerSwapSettlement implements SwapSettlementContext {
     public function onInvalid(array $row, string $providerStatus, string $message): void {
         $pdo = Database::getInstance();
         // Only flip if still in a non-terminal state — a late-arriving
-        // expiry tick shouldn't downgrade an already-Settled invoice.
-        $pdo->prepare(
+        // expiry tick shouldn't downgrade an already-Settled invoice. Only fire
+        // the webhook when we actually performed the transition (rowCount===1),
+        // so a no-op tick doesn't re-fire InvoiceInvalid.
+        $stmt = $pdo->prepare(
             "UPDATE invoices SET status = 'Invalid', additional_status = 'PaidLate'
               WHERE id = ? AND status = 'New'"
-        )->execute([$row['invoice_id']]);
+        );
+        $stmt->execute([$row['invoice_id']]);
+        if ($stmt->rowCount() !== 1) {
+            return;
+        }
         $invoice = Database::fetchOne("SELECT * FROM invoices WHERE id = ?", [$row['invoice_id']]);
         if ($invoice) {
             WebhookSender::fireEvent($invoice['store_id'], 'InvoiceInvalid', $invoice);
