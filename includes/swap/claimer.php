@@ -79,6 +79,40 @@ final class SwapClaimer {
             throw new RuntimeException('Lockup output not found in provider lockup tx');
         }
 
+        // Cross-check the on-chain amount the provider actually locked up
+        // against the swap's agreed economics, before signing over it:
+        //   * lower bound: it must cover target_onchain_amount_sats (the
+        //     onchainAmount we requested). A lockup below that means the
+        //     provider under-funded and we'd claim less than we paid the LN
+        //     invoice for — a direct loss.
+        //   * upper bound: it must not exceed invoice_amount_sats (what we
+        //     paid over Lightning). The provider always takes a fee, so the
+        //     on-chain side can never legitimately exceed the LN side; a larger
+        //     value indicates a parser misread/overflow (the BIP341 sighash
+        //     commits to $lockupAmount, so a wrong value invalidates the claim
+        //     anyway — fail loudly rather than broadcast a dead tx).
+        // A small tolerance absorbs rounding.
+        $targetLockup  = (int)($row['target_onchain_amount_sats'] ?? 0);
+        $invoiceAmount = (int)($row['invoice_amount_sats'] ?? 0);
+        if ($targetLockup > 0) {
+            $lowTol = max(1, (int)ceil($targetLockup * 0.001));
+            if ($lockupAmount < $targetLockup - $lowTol) {
+                throw new RuntimeException(
+                    "Lockup amount {$lockupAmount} sat is below agreed on-chain amount "
+                    . "{$targetLockup} sat (provider under-funded)"
+                );
+            }
+        }
+        if ($invoiceAmount > 0) {
+            $highTol = max(1, (int)ceil($invoiceAmount * 0.001));
+            if ($lockupAmount > $invoiceAmount + $highTol) {
+                throw new RuntimeException(
+                    "Lockup amount {$lockupAmount} sat exceeds paid invoice amount "
+                    . "{$invoiceAmount} sat (possible parse error)"
+                );
+            }
+        }
+
         // 2. Compute lockup txid (double-sha256 of NO-WITNESS serialization, displayed big-endian).
         $lockupTxidLE = hash('sha256', hash('sha256', $lockupRawNoWit, true), true);
         $lockupTxidBE = strrev($lockupTxidLE);
@@ -441,7 +475,9 @@ final class SwapClaimer {
 
     private static function stripWitnessIfPresent(string $raw): string {
         // A segwit tx has marker=0x00 flag=0x01 at offset 4 (after version).
-        if (strlen($raw) >= 6 && $raw[4] === "\x00" && $raw[5] === "\x01") {
+        // Need at least version(4)+marker+flag(2)+locktime(4) to be parseable.
+        if (strlen($raw) >= 10 && $raw[4] === "\x00" && $raw[5] === "\x01") {
+            $rawLen = strlen($raw);
             // Reparse to find where the witness section starts/ends, and rebuild
             // without it. Easier: serialize the inputs/outputs ourselves.
             // We do a minimal parse: skip marker+flag, parse inputs+outputs into
@@ -449,6 +485,9 @@ final class SwapClaimer {
             $pos = 6;
             $version = substr($raw, 0, 4);
             $numIn = self::readCompactSize($raw, $pos);
+            if ($numIn > $rawLen) {
+                throw new RuntimeException('stripWitness: implausible input count');
+            }
             $inputs = [];
             for ($i = 0; $i < $numIn; $i++) {
                 $startIn = $pos;
@@ -456,14 +495,23 @@ final class SwapClaimer {
                 $sLen = self::readCompactSize($raw, $pos);
                 $pos += $sLen;
                 $pos += 4; // sequence
+                if ($pos > $rawLen) {
+                    throw new RuntimeException('stripWitness: input overruns buffer');
+                }
                 $inputs[] = substr($raw, $startIn, $pos - $startIn);
             }
             $numOut = self::readCompactSize($raw, $pos);
+            if ($numOut > $rawLen) {
+                throw new RuntimeException('stripWitness: implausible output count');
+            }
             $outputsStart = $pos;
             for ($i = 0; $i < $numOut; $i++) {
                 $pos += 8;
                 $sLen = self::readCompactSize($raw, $pos);
                 $pos += $sLen;
+                if ($pos > $rawLen) {
+                    throw new RuntimeException('stripWitness: output overruns buffer');
+                }
             }
             $outputsRaw = substr($raw, $outputsStart, $pos - $outputsStart);
             // Skip the witness section (variable length); locktime is the
@@ -477,11 +525,20 @@ final class SwapClaimer {
     }
 
     private static function readCompactSize(string $raw, int &$pos): int {
+        $len = strlen($raw);
+        if ($pos < 0 || $pos + 1 > $len) {
+            throw new RuntimeException('stripWitness: truncated compactSize');
+        }
         $b = ord($raw[$pos]); $pos++;
+        $need = function (int $n) use ($pos, $len) {
+            if ($pos + $n > $len) {
+                throw new RuntimeException('stripWitness: truncated compactSize value');
+            }
+        };
         if ($b < 0xFD) return $b;
-        if ($b === 0xFD) { $v = unpack('v', substr($raw, $pos, 2))[1]; $pos += 2; return $v; }
-        if ($b === 0xFE) { $v = unpack('V', substr($raw, $pos, 4))[1]; $pos += 4; return $v; }
-        $v = unpack('P', substr($raw, $pos, 8))[1]; $pos += 8;
+        if ($b === 0xFD) { $need(2); $v = unpack('v', substr($raw, $pos, 2))[1]; $pos += 2; return $v; }
+        if ($b === 0xFE) { $need(4); $v = unpack('V', substr($raw, $pos, 4))[1]; $pos += 4; return $v; }
+        $need(8); $v = unpack('P', substr($raw, $pos, 8))[1]; $pos += 8;
         return $v;
     }
 
