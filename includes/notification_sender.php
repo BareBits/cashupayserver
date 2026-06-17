@@ -315,7 +315,12 @@ class NotificationSender {
         $failed = 0;
         foreach ($rows as $row) {
             try {
-                EmailSender::send($row['to_email'], $row['subject'], $row['body']);
+                EmailSender::send(
+                    $row['to_email'],
+                    $row['subject'],
+                    $row['body'],
+                    !empty($row['store_id']) ? (string)$row['store_id'] : null
+                );
                 $now = time();
                 Database::update(
                     'notification_queue',

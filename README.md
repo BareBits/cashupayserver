@@ -65,6 +65,17 @@ BareBits sits between custodial payment gateways and full self-hosting:
 | BTCPay Server | Full sovereignty | Needs VPS ($20+/mo), Docker, ongoing maintenance |
 | **BareBits** | Simple, cheap hosting | Trust mint with funds until withdrawal |
 
+## Payment Flow
+
+Generally speaking, BareBits tries to offer both on-chain and lightning as payment options to all customers. On-chain payments are always enabled, lightning payments are enabled depending on configuration. Here's what that decision tree looks like:
+- Is the invoice amount < fees due? Present on-chain and lightning invoice for fees. Payment gets transparently re-routed to fee payment.
+- Is the customer paying on-chain? Send directly to merchant xpub wallet
+- Does the merchant have a working LNURL? Present a lightning invoice
+- If submarine swaps are NOT enabled and a cashu mint is NOT enabled, do not present a lightning invoice.
+- If submarine swaps ARE enabled AND submarine swap fee is reasonable (defined as 1% of value of payment or less), present a lightning invoice that results in a payment to merchant's on-chain wallet
+- If submarine swap is NOT enabled OR is too expensive, display lightning invoice to send payment to cashu mint. Funds will be emptied from mint -> merchant on-chain once a submarine swap becomes worth it.
+
+
 ## Submarine Swaps (LN → on-chain, optional)
 
 When enabled, BareBits can route a customer's Lightning payment through a
@@ -259,6 +270,27 @@ define('CASHUPAY_DATA_DIR', '/home/user/cashupay-data');
 Your seed phrase is your backup. Write it down and store it safely. If you lose access to your server, you can recover your funds with the seed phrase.
 
 **Warning**: Do not import the seed phrase into another wallet you use actively. Using the same seed in multiple wallets causes coin loss.
+
+### Resetting a lost admin password
+
+If you're locked out of the admin dashboard there are two ways to recover, both reachable from the **Forgot password?** link on the sign-in screen.
+
+**Option 1 — Email a reset link.** Requires two things to be set up in advance:
+
+- A **recovery email** on the admin account. Set it during the setup wizard (the optional "Recovery email" field on the password step) or later under **Settings → My Account → Recovery email**.
+- **Outbound email (SMTP)** configured via the `CASHUPAY_SMTP_*` settings in `user_config.php` (see `user_config.example.php`). Without working email this option cannot deliver the link.
+
+Click **Forgot password? → Email me a reset link**, enter the admin recovery email, and open the link that arrives. The link is valid for **one hour** and can be used **once**. (For privacy, the page always reports success regardless of whether the address matched an account.)
+
+**Option 2 — Reset via a file on the server.** Use this when you have filesystem access (SSH / SFTP / your host's file manager) but no working email. Create an **empty** file named `reset-admin-password` inside the server's data directory:
+
+```bash
+touch data/reset-admin-password
+```
+
+If you've relocated the data directory with `CASHUPAY_DATA_DIR`, create the file there instead (e.g. `/home/user/cashupay-data/reset-admin-password`). The data directory is not web-served, so creating this file already requires the same server access an attacker would need to read the database — that filesystem access *is* the authorization.
+
+Then reload the sign-in page. It detects the file and shows a **"Set a new admin password"** form. Your existing password keeps working until you complete the form; once you submit a new password the trigger file is **deleted automatically**. Only the primary `admin` account is reset. If you created the file by mistake, just delete it.
 
 ## Development
 

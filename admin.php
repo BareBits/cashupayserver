@@ -66,6 +66,125 @@ function checkDataDirectoryProtection(): ?string {
     return null;
 }
 
+/**
+ * Parse and validate the SMTP server fields shared by the global notification
+ * settings and the per-store SMTP override. Returns trimmed scalars plus the
+ * raw password and a clear flag (the password is handled by the caller so the
+ * UI can keep it write-only). Throws on invalid port / encryption / from-address.
+ *
+ * Used by save_notifications_settings (global) and save_store_notifications
+ * (per-store); both POST the same smtp_* field names from separate forms.
+ */
+function smtpFieldsFromPost(array $post): array {
+    $host = trim((string)($post['smtp_host'] ?? ''));
+    $port = trim((string)($post['smtp_port'] ?? ''));
+    $username = trim((string)($post['smtp_username'] ?? ''));
+    $encryption = strtolower(trim((string)($post['smtp_encryption'] ?? '')));
+    $fromAddress = trim((string)($post['smtp_from_address'] ?? ''));
+    $fromName = trim((string)($post['smtp_from_name'] ?? ''));
+    // Password is intentionally not trimmed — leading/trailing spaces can be
+    // significant in a credential.
+    $password = (string)($post['smtp_password'] ?? '');
+    $passwordClear = ($post['smtp_password_clear'] ?? '0') === '1';
+
+    if ($port !== '' && (!ctype_digit($port) || (int)$port < 1 || (int)$port > 65535)) {
+        throw new Exception('SMTP port must be a number between 1 and 65535');
+    }
+    if ($encryption !== '' && !in_array($encryption, ['tls', 'ssl', 'none'], true)) {
+        throw new Exception('SMTP encryption must be tls, ssl, or none');
+    }
+    if ($fromAddress !== '' && !filter_var($fromAddress, FILTER_VALIDATE_EMAIL)) {
+        throw new Exception('Invalid From address');
+    }
+
+    return [
+        'host' => $host,
+        'port' => $port,
+        'username' => $username,
+        'encryption' => $encryption,
+        'from_address' => $fromAddress,
+        'from_name' => $fromName,
+        'password' => $password,
+        'password_clear' => $passwordClear,
+    ];
+}
+
+// Password-reset landing page (Mechanism 1). The emailed link opens here as
+// ?action=reset&token=... No session required — the operator is locked out by
+// definition. Rendered as a standalone page (not the SPA) so it works even if
+// the cached SPA is stale. The form POSTs back to action=reset_with_token.
+if (($_GET['action'] ?? '') === 'reset') {
+    $token = (string)($_GET['token'] ?? '');
+    $valid = Auth::peekPasswordResetToken($token) !== null;
+    $tokenEsc  = htmlspecialchars($token, ENT_QUOTES, 'UTF-8');
+    $adminHref = htmlspecialchars(Urls::admin(), ENT_QUOTES, 'UTF-8');
+    header('Content-Type: text/html; charset=UTF-8');
+    ?><!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reset password</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font-family: -apple-system, system-ui, sans-serif; background:#0e0f13; color:#e7e7ea;
+         display:flex; align-items:center; justify-content:center; min-height:100vh; margin:0; padding:1.5rem; }
+  .box { width:100%; max-width:380px; background:#1a1c22; border:1px solid #2a2d36; border-radius:14px; padding:1.75rem; }
+  h1 { font-size:1.25rem; margin:0 0 0.5rem; }
+  p { color:#a4a6ad; font-size:0.9rem; line-height:1.5; margin:0 0 1rem; }
+  input { width:100%; box-sizing:border-box; padding:0.7rem 0.85rem; margin-bottom:0.75rem;
+          background:#0e0f13; border:1px solid #2a2d36; border-radius:8px; color:#e7e7ea; font-size:1rem; }
+  button { width:100%; padding:0.75rem; border:0; border-radius:8px; background:#f7931a; color:#1a1c22;
+           font-weight:600; font-size:1rem; cursor:pointer; }
+  a { color:#f7931a; }
+  .msg { font-size:0.9rem; margin-top:0.75rem; min-height:1.2em; }
+  .err { color:#ef4444; } .ok { color:#22c55e; }
+</style></head>
+<body>
+  <div class="box">
+    <h1>Reset admin password</h1>
+    <?php if (!$valid): ?>
+      <p>This reset link is invalid or has expired. Reset links are valid for one hour and can only be used once.</p>
+      <p><a href="<?= $adminHref ?>">Back to sign in</a></p>
+    <?php else: ?>
+      <p>Choose a new password for your admin account (minimum 8 characters).</p>
+      <input type="password" id="pw" placeholder="New password" autocomplete="new-password">
+      <input type="password" id="pw2" placeholder="Confirm new password" autocomplete="new-password">
+      <button id="submit">Set new password</button>
+      <div class="msg" id="msg"></div>
+      <script>
+        var postUrl = window.location.pathname;
+        var token = <?= json_encode($tokenEsc) ?>;
+        var adminHref = <?= json_encode($adminHref) ?>;
+        var msg = document.getElementById('msg');
+        function setMsg(t, cls) { msg.textContent = t; msg.className = 'msg ' + (cls || ''); }
+        document.getElementById('submit').addEventListener('click', async function () {
+          var pw = document.getElementById('pw').value;
+          var pw2 = document.getElementById('pw2').value;
+          if (pw.length < 8) { setMsg('Password must be at least 8 characters', 'err'); return; }
+          if (pw !== pw2) { setMsg('Passwords do not match', 'err'); return; }
+          setMsg('Saving...');
+          try {
+            var body = 'action=reset_with_token&token=' + encodeURIComponent(token)
+                     + '&new_password=' + encodeURIComponent(pw);
+            var r = await fetch(postUrl, { method: 'POST',
+              headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: body });
+            var data = await r.json().catch(function () { return {}; });
+            if (r.ok && data.success) {
+              setMsg('Password updated. Redirecting to sign in...', 'ok');
+              setTimeout(function () { window.location.href = adminHref; }, 1500);
+            } else {
+              setMsg(data.error || 'Could not reset password', 'err');
+            }
+          } catch (e) { setMsg('Network error, please try again', 'err'); }
+        });
+      </script>
+    <?php endif; ?>
+  </div>
+</body></html>
+<?php
+    exit;
+}
+
 // Handle API-style requests from the SPA
 if (isset($_GET['api'])) {
     header('Content-Type: application/json');
@@ -171,6 +290,17 @@ if (isset($_GET['api'])) {
             $storeNotifications = [
                 'enabled' => (bool)($store['notifications_enabled'] ?? 0),
                 'email' => $store['notification_email'] ?? '',
+                // Per-store SMTP override. Password is never sent to the browser —
+                // only whether one is stored (write-only field, see the per-store
+                // notifications card).
+                'smtpOverrideEnabled' => (bool)($store['smtp_override_enabled'] ?? 0),
+                'smtpHost' => (string)($store['smtp_host'] ?? ''),
+                'smtpPort' => $store['smtp_port'] !== null ? (string)$store['smtp_port'] : '',
+                'smtpUsername' => (string)($store['smtp_username'] ?? ''),
+                'smtpEncryption' => (string)($store['smtp_encryption'] ?? ''),
+                'smtpFromAddress' => (string)($store['smtp_from_address'] ?? ''),
+                'smtpFromName' => (string)($store['smtp_from_name'] ?? ''),
+                'smtpPasswordSet' => ((string)($store['smtp_password'] ?? '')) !== '',
             ];
 
             // Submarine swap (LN→onchain) tri-state override:
@@ -591,6 +721,29 @@ if (isset($_GET['api'])) {
             fclose($out);
             exit;
 
+        case 'export_diagnostic_report':
+            Auth::requireAdmin();
+            require_once __DIR__ . '/includes/diagnostics.php';
+
+            // range: 'all' (everything) or '1m' (past 30 days). anonymize
+            // defaults ON; only an explicit '0' opts into a full-fidelity dump.
+            $rangeArg  = ((string)($_GET['range'] ?? 'all')) === '1m' ? '1m' : null;
+            $anonymize = ((string)($_GET['anonymize'] ?? '1')) !== '0';
+
+            $stamp = date('Ymd-His');
+            $suffix = $anonymize ? 'anon' : 'full';
+            $scope  = $rangeArg === '1m' ? '30d' : 'all';
+            $filename = "diagnostic-report-{$scope}-{$suffix}-{$stamp}.json";
+
+            header('Content-Type: application/json; charset=utf-8');
+            header('Content-Disposition: attachment; filename="' . $filename . '"');
+            header('Cache-Control: no-store');
+
+            $out = fopen('php://output', 'w');
+            (new Diagnostics($anonymize, $rangeArg))->stream($out);
+            fclose($out);
+            exit;
+
         case 'api_keys':
             $storeId = $_GET['store_id'] ?? null;
             if (!$storeId) {
@@ -932,6 +1085,99 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             Security::recordFailedLogin($clientIp);
             http_response_code(401);
             echo json_encode(['error' => 'Invalid username or password']);
+        }
+        exit;
+    }
+
+    // ---- Password recovery (no existing session; the operator is locked out) ----
+
+    // Mechanism 1: request an emailed reset link. Always returns the same
+    // generic response so the endpoint can't be used to discover whether an
+    // address maps to an account (enumeration guard). Rate-limited per IP.
+    if ($action === 'request_password_reset') {
+        $clientIp = Security::getClientIp();
+        if (!Security::checkRateLimit('pwreset_request', $clientIp, 5)) {
+            http_response_code(429);
+            echo json_encode(['error' => 'Too many requests. Please wait a minute and try again.']);
+            exit;
+        }
+        $email = trim($_POST['email'] ?? '');
+        if ($email !== '' && Auth::validateEmail($email) === null) {
+            $admin = Auth::findAdminByEmail($email);
+            if ($admin) {
+                try {
+                    require_once __DIR__ . '/includes/email_sender.php';
+                    $raw  = Auth::createPasswordResetToken($admin['id']);
+                    $base = rtrim(Config::getBaseUrl(), '/');
+                    $adminAbs = Config::getUrlMode() === 'direct'
+                        ? $base . '/admin.php'
+                        : $base . '/router.php/admin.php';
+                    $link = $adminAbs . '?action=reset&token=' . urlencode($raw);
+                    $body = "A password reset was requested for your CashuPayServer admin account.\n\n"
+                          . "Open this link to choose a new password (valid for 1 hour, single use):\n\n"
+                          . $link . "\n\n"
+                          . "If you did not request this, you can ignore this email. The link does "
+                          . "nothing until used and expires on its own.\n";
+                    EmailSender::send($admin['email'], 'Reset your CashuPayServer admin password', $body);
+                } catch (\Throwable $e) {
+                    // Never surface SMTP/config detail to an unauthenticated
+                    // caller; log it for the operator instead.
+                    error_log('CashuPayServer: password-reset email failed: ' . $e->getMessage());
+                }
+            }
+        }
+        echo json_encode([
+            'success' => true,
+            'message' => 'If an admin account has that email, a reset link has been sent.',
+        ]);
+        exit;
+    }
+
+    // Mechanism 1 (cont.): consume an emailed token and set the new password.
+    if ($action === 'reset_with_token') {
+        $clientIp = Security::getClientIp();
+        if (!Security::checkRateLimit('pwreset_submit', $clientIp, 10)) {
+            http_response_code(429);
+            echo json_encode(['error' => 'Too many attempts. Please wait a minute and try again.']);
+            exit;
+        }
+        $token = $_POST['token'] ?? '';
+        $new   = $_POST['new_password'] ?? '';
+        try {
+            if (Auth::resetPasswordWithToken($token, $new)) {
+                echo json_encode(['success' => true]);
+            } else {
+                http_response_code(400);
+                echo json_encode(['error' => 'This reset link is invalid or has expired. Request a new one.']);
+            }
+        } catch (\InvalidArgumentException $e) {
+            http_response_code(400);
+            echo json_encode(['error' => $e->getMessage()]);
+        }
+        exit;
+    }
+
+    // Mechanism 2: complete a file-based reset. The trigger file must still be
+    // present (operator controls the window); it's deleted on success. Only the
+    // seed 'admin' account is reset. The old password stays valid until this
+    // succeeds.
+    if ($action === 'file_reset_set_password') {
+        if (!Auth::fileResetRequested()) {
+            http_response_code(409);
+            echo json_encode(['error' => 'No password-reset file is present.']);
+            exit;
+        }
+        $new = $_POST['new_password'] ?? '';
+        try {
+            if (Auth::completeFileReset($new)) {
+                echo json_encode(['success' => true]);
+            } else {
+                http_response_code(409);
+                echo json_encode(['error' => 'Reset could not be completed. Ensure the reset file is still present.']);
+            }
+        } catch (\InvalidArgumentException $e) {
+            http_response_code(400);
+            echo json_encode(['error' => $e->getMessage()]);
         }
         exit;
     }
@@ -1910,14 +2156,38 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if (empty($storeId)) {
                     throw new Exception('Store ID required');
                 }
+                if (!Config::getStore($storeId)) {
+                    throw new Exception('Store not found');
+                }
                 if ($email !== '' && !filter_var($email, FILTER_VALIDATE_EMAIL)) {
                     throw new Exception('Invalid email address');
                 }
 
-                Database::update('stores', [
+                // Per-store SMTP override (same fields/validation as the global
+                // settings). Written via Database::update directly rather than
+                // Config::updateStore, keeping the updateStore allowlist tight.
+                $smtpOverride = ($_POST['smtp_override_enabled'] ?? '0') === '1' ? 1 : 0;
+                $smtp = smtpFieldsFromPost($_POST);
+
+                $update = [
                     'notifications_enabled' => $enabled,
                     'notification_email' => $email !== '' ? $email : null,
-                ], 'id = ?', [$storeId]);
+                    'smtp_override_enabled' => $smtpOverride,
+                    'smtp_host' => $smtp['host'] !== '' ? $smtp['host'] : null,
+                    'smtp_port' => $smtp['port'] !== '' ? (int)$smtp['port'] : null,
+                    'smtp_username' => $smtp['username'] !== '' ? $smtp['username'] : null,
+                    'smtp_encryption' => $smtp['encryption'] !== '' ? $smtp['encryption'] : null,
+                    'smtp_from_address' => $smtp['from_address'] !== '' ? $smtp['from_address'] : null,
+                    'smtp_from_name' => $smtp['from_name'] !== '' ? $smtp['from_name'] : null,
+                ];
+                // Password: preserve on blank, overwrite on new value, wipe on clear.
+                if ($smtp['password_clear']) {
+                    $update['smtp_password'] = null;
+                } elseif ($smtp['password'] !== '') {
+                    $update['smtp_password'] = $smtp['password'];
+                }
+
+                Database::update('stores', $update, 'id = ?', [$storeId]);
 
                 echo json_encode(['success' => true]);
             } catch (Exception $e) {
@@ -1938,6 +2208,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'toEmail' => (string)Config::get('notifications_to_email', ''),
                 'smtpConfigured' => EmailSender::isSmtpConfigured(),
                 'pendingQueueCount' => NotificationSender::pendingCount(),
+                // Global SMTP server settings. The password is never sent to the
+                // browser — only whether one is stored, so the field can show a
+                // "leave blank to keep" placeholder.
+                'smtpHost' => (string)Config::get('smtp_host', ''),
+                'smtpPort' => (string)Config::get('smtp_port', ''),
+                'smtpUsername' => (string)Config::get('smtp_username', ''),
+                'smtpEncryption' => (string)Config::get('smtp_encryption', ''),
+                'smtpFromAddress' => (string)Config::get('smtp_from_address', ''),
+                'smtpFromName' => (string)Config::get('smtp_from_name', ''),
+                'smtpPasswordSet' => ((string)Config::get('smtp_password', '')) !== '',
             ]);
             break;
 
@@ -1954,11 +2234,29 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     throw new Exception('Invalid email address');
                 }
 
+                // Global SMTP server settings. Validation is shared with the
+                // per-store override (save_store_notifications) via smtpFieldsFromPost().
+                $smtp = smtpFieldsFromPost($_POST);
+
                 Config::set('notifications_enabled', $enabled);
                 Config::set('notifications_invoice_paid_enabled', $invoicePaidEnabled);
                 Config::set('notifications_auto_cashout_enabled', $autoCashoutEnabled);
                 Config::set('notifications_payer_receipt_enabled', $payerReceiptEnabled);
                 Config::set('notifications_to_email', $toEmail);
+
+                Config::set('smtp_host', $smtp['host']);
+                Config::set('smtp_port', $smtp['port']);
+                Config::set('smtp_username', $smtp['username']);
+                Config::set('smtp_encryption', $smtp['encryption']);
+                Config::set('smtp_from_address', $smtp['from_address']);
+                Config::set('smtp_from_name', $smtp['from_name']);
+                // Password: preserve on blank, overwrite on new value, wipe on
+                // explicit clear (so the field never has to echo the secret back).
+                if ($smtp['password_clear']) {
+                    Config::set('smtp_password', '');
+                } elseif ($smtp['password'] !== '') {
+                    Config::set('smtp_password', $smtp['password']);
+                }
 
                 echo json_encode(['success' => true]);
             } catch (Exception $e) {
@@ -2080,11 +2378,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if ($to === '' || !filter_var($to, FILTER_VALIDATE_EMAIL)) {
                     throw new Exception('Provide a valid recipient email');
                 }
+                // Optional store_id tests that store's resolved SMTP config
+                // (its override, if enabled, else the global settings). Blank
+                // tests the global config.
+                $testStoreId = trim((string)($_POST['store_id'] ?? ''));
+                if ($testStoreId !== '' && !Config::getStore($testStoreId)) {
+                    throw new Exception('Store not found');
+                }
+                $scope = $testStoreId !== '' ? ' (store override)' : '';
                 EmailSender::send(
                     $to,
                     'CashuPayServer test email',
-                    "This is a test email from CashuPayServer.\n\n"
-                    . "If you received this, SMTP delivery is working.\n"
+                    "This is a test email from CashuPayServer{$scope}.\n\n"
+                    . "If you received this, SMTP delivery is working.\n",
+                    $testStoreId !== '' ? $testStoreId : null
                 );
                 echo json_encode(['success' => true]);
             } catch (Throwable $e) {
@@ -2872,6 +3179,31 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
             break;
 
+        case 'set_recovery_email':
+            // Set/clear the current user's recovery email. Powers the email
+            // reset-link flow (only effective for admin accounts, which the
+            // reset request looks up by email). Admin-gated: only admins have
+            // a meaningful recovery path here.
+            Auth::requireAdmin();
+            try {
+                $self = Auth::currentUser();
+                if (!$self) {
+                    http_response_code(401);
+                    echo json_encode(['error' => 'Not authenticated']);
+                    break;
+                }
+                $email = trim($_POST['email'] ?? '');
+                Auth::setUserEmail($self['id'], $email === '' ? null : $email);
+                echo json_encode(['success' => true, 'email' => $email]);
+            } catch (\InvalidArgumentException $e) {
+                http_response_code(400);
+                echo json_encode(['error' => $e->getMessage()]);
+            } catch (\RuntimeException $e) {
+                http_response_code(404);
+                echo json_encode(['error' => $e->getMessage()]);
+            }
+            break;
+
         default:
             http_response_code(400);
             echo json_encode(['error' => 'Unknown action']);
@@ -2886,6 +3218,10 @@ $isLoggedIn = Auth::isLoggedIn();
 $currentUser = Auth::currentUser();   // null when WordPress mode or not logged in
 $currentRole = $currentUser['role'] ?? ($isLoggedIn ? Auth::ROLE_ADMIN : null);
 $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
+// Mechanism 2: surface the file-based reset on the lock screen when the trigger
+// file is present and nobody is signed in. Standalone mode only (WordPress
+// manages its own accounts).
+$fileResetRequested = !$isLoggedIn && !$isWp && Auth::fileResetRequested();
 
 // -----------------------------------------------------------------------------
 // SPA view routing
@@ -3795,6 +4131,14 @@ header('Cache-Control: no-cache, must-revalidate');
             visibility: visible;
         }
 
+        /* The forgot-password modal is opened from the lock screen, which sits
+           at z-index 1000 with an opaque background. Without a higher stacking
+           order the modal would render *behind* the lock screen (invisible).
+           Lift it (and its scrim) above the lock screen. */
+        #modal-forgot-password {
+            z-index: 1100;
+        }
+
         .modal {
             background: var(--bg-secondary);
             border-radius: 24px 24px 0 0;
@@ -4226,7 +4570,29 @@ header('Cache-Control: no-cache, must-revalidate');
             <input type="password" id="password-input" placeholder="Password"
                    autocomplete="current-password">
             <button class="btn btn-full" id="password-submit">Unlock</button>
+            <?php if (!$isWp): ?>
+            <button class="btn-link" id="forgot-password-link" type="button"
+                    style="background:none;border:0;color:var(--text-secondary);text-decoration:underline;cursor:pointer;margin-top:0.75rem;font-size:0.85rem;">
+                Forgot password?
+            </button>
+            <?php endif; ?>
         </div>
+
+        <?php if ($fileResetRequested): ?>
+        <!-- Mechanism 2: a reset trigger file (data/reset-admin-password) was
+             detected. Let the operator set a new admin password right here; the
+             file is deleted once the new password is saved. -->
+        <div class="file-reset-box" id="file-reset-box"
+             style="margin-top:1.25rem;max-width:360px;width:100%;background:rgba(247,147,26,0.1);border:1px solid rgba(247,147,26,0.4);border-radius:10px;padding:1rem;">
+            <div style="font-weight:600;margin-bottom:0.5rem;">Password-reset file detected</div>
+            <p style="color:var(--text-secondary);font-size:0.85rem;margin:0 0 0.75rem;">
+                Set a new password for the <strong>admin</strong> account. The reset file will be removed automatically once this succeeds.
+            </p>
+            <input type="password" id="file-reset-pw" placeholder="New password" autocomplete="new-password" style="margin-bottom:0.5rem;">
+            <input type="password" id="file-reset-pw2" placeholder="Confirm new password" autocomplete="new-password" style="margin-bottom:0.5rem;">
+            <button class="btn btn-full" id="file-reset-submit">Set new password</button>
+        </div>
+        <?php endif; ?>
     </div>
 
     <!-- App -->
@@ -4685,9 +5051,76 @@ header('Cache-Control: no-cache, must-revalidate');
                                 <p class="form-help">If blank, the site-wide notification address from Settings is used.</p>
                             </div>
 
-                            <button class="btn btn-full" id="btn-save-store-notifications" style="margin-top: 0.5rem;">
+                            <div class="toggle-container" style="margin-top: 1rem;">
+                                <span>Use a custom SMTP server for this store</span>
+                                <label class="toggle">
+                                    <input type="checkbox" id="store-smtp-override-enabled">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
+
+                            <div id="store-smtp-fields" class="hidden" style="margin-top: 0.75rem; padding: 0.75rem; background: rgba(0,0,0,0.2); border-radius: 8px;">
+                                <p class="form-help" style="margin-top: 0;">
+                                    Any field left blank falls back to the global SMTP settings, then to
+                                    <code>user_config.php</code>.
+                                </p>
+                                <div class="form-group" style="margin-top: 0.75rem;">
+                                    <label class="form-label">Host</label>
+                                    <input type="text" class="form-input" id="store-smtp-host"
+                                           placeholder="smtp.example.com" autocomplete="off">
+                                </div>
+                                <div style="display: flex; gap: 0.5rem;">
+                                    <div class="form-group" style="flex: 1;">
+                                        <label class="form-label">Port</label>
+                                        <input type="number" class="form-input" id="store-smtp-port"
+                                               placeholder="587" min="1" max="65535">
+                                    </div>
+                                    <div class="form-group" style="flex: 1;">
+                                        <label class="form-label">Encryption</label>
+                                        <select class="form-input" id="store-smtp-encryption">
+                                            <option value="">Default (STARTTLS on 587)</option>
+                                            <option value="tls">STARTTLS (tls)</option>
+                                            <option value="ssl">SSL/TLS (ssl)</option>
+                                            <option value="none">None</option>
+                                        </select>
+                                    </div>
+                                </div>
+                                <div class="form-group">
+                                    <label class="form-label">Username</label>
+                                    <input type="text" class="form-input" id="store-smtp-username"
+                                           placeholder="leave blank for no authentication" autocomplete="off">
+                                </div>
+                                <div class="form-group">
+                                    <label class="form-label">Password</label>
+                                    <input type="password" class="form-input" id="store-smtp-password"
+                                           autocomplete="new-password">
+                                    <label style="display: flex; align-items: center; gap: 0.4rem; margin-top: 0.4rem; font-size: 0.85rem;">
+                                        <input type="checkbox" id="store-smtp-password-clear"> Clear saved password
+                                    </label>
+                                    <p class="form-help" id="store-smtp-password-help">Leave blank to keep the saved password.</p>
+                                </div>
+                                <div class="form-group">
+                                    <label class="form-label">From address</label>
+                                    <input type="email" class="form-input" id="store-smtp-from-address"
+                                           placeholder="noreply@example.com">
+                                </div>
+                                <div class="form-group" style="margin-bottom: 0;">
+                                    <label class="form-label">From name</label>
+                                    <input type="text" class="form-input" id="store-smtp-from-name"
+                                           placeholder="CashuPayServer">
+                                </div>
+                            </div>
+
+                            <button class="btn btn-full" id="btn-save-store-notifications" style="margin-top: 0.75rem;">
                                 Save notification settings
                             </button>
+
+                            <div style="display: flex; gap: 0.5rem; align-items: center; margin-top: 0.5rem;">
+                                <input type="email" class="form-input" id="store-notifications-test-email"
+                                       placeholder="test@example.com" style="flex: 1;">
+                                <button class="btn btn-secondary" id="btn-send-store-test-notification">Send test</button>
+                            </div>
+                            <p class="form-help">Sends using this store's resolved SMTP config. Save first to test unsaved changes.</p>
                         </div>
                     </div>
 
@@ -4900,6 +5333,61 @@ header('Cache-Control: no-cache, must-revalidate');
                                 optionally enter an email address to receive a payment
                                 confirmation. Receipts are queued to the same SMTP server.
                             </p>
+                        </div>
+
+                        <div style="margin-top: 1rem; padding: 0.75rem; background: rgba(0,0,0,0.2); border-radius: 8px;">
+                            <div style="font-weight: 500; margin-bottom: 0.5rem;">SMTP server</div>
+                            <p class="form-help" style="margin-top: 0;">
+                                Outgoing mail server. Any field left blank falls back to
+                                <code>user_config.php</code> (<code>CASHUPAY_SMTP_*</code>); a value
+                                here overrides the matching constant. Leave the whole section blank to
+                                use <code>user_config.php</code> alone.
+                            </p>
+                            <div class="form-group" style="margin-top: 0.75rem;">
+                                <label class="form-label">Host</label>
+                                <input type="text" class="form-input" id="smtp-host"
+                                       placeholder="smtp.example.com" autocomplete="off">
+                            </div>
+                            <div style="display: flex; gap: 0.5rem;">
+                                <div class="form-group" style="flex: 1;">
+                                    <label class="form-label">Port</label>
+                                    <input type="number" class="form-input" id="smtp-port"
+                                           placeholder="587" min="1" max="65535">
+                                </div>
+                                <div class="form-group" style="flex: 1;">
+                                    <label class="form-label">Encryption</label>
+                                    <select class="form-input" id="smtp-encryption">
+                                        <option value="">Default (STARTTLS on 587)</option>
+                                        <option value="tls">STARTTLS (tls)</option>
+                                        <option value="ssl">SSL/TLS (ssl)</option>
+                                        <option value="none">None</option>
+                                    </select>
+                                </div>
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">Username</label>
+                                <input type="text" class="form-input" id="smtp-username"
+                                       placeholder="leave blank for no authentication" autocomplete="off">
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">Password</label>
+                                <input type="password" class="form-input" id="smtp-password"
+                                       autocomplete="new-password">
+                                <label style="display: flex; align-items: center; gap: 0.4rem; margin-top: 0.4rem; font-size: 0.85rem;">
+                                    <input type="checkbox" id="smtp-password-clear"> Clear saved password
+                                </label>
+                                <p class="form-help" id="smtp-password-help">Leave blank to keep the saved password.</p>
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">From address</label>
+                                <input type="email" class="form-input" id="smtp-from-address"
+                                       placeholder="noreply@example.com">
+                            </div>
+                            <div class="form-group" style="margin-bottom: 0;">
+                                <label class="form-label">From name</label>
+                                <input type="text" class="form-input" id="smtp-from-name"
+                                       placeholder="CashuPayServer">
+                            </div>
                         </div>
 
                         <div class="form-group" style="margin-top: 1rem;">
@@ -5212,6 +5700,19 @@ header('Cache-Control: no-cache, must-revalidate');
                         <button class="btn btn-secondary btn-full" id="btn-change-own-password" style="margin-bottom: 0.5rem;">
                             Change my password
                         </button>
+                        <!-- Recovery email (admin only): powers the emailed
+                             password-reset link. Revealed by renderAccountCard. -->
+                        <div id="recovery-email-row" class="hidden" data-admin-only="true" style="margin-bottom: 0.5rem;">
+                            <label for="recovery-email-input" style="display:block;font-size:0.85rem;color:var(--text-secondary);margin-bottom:0.25rem;">
+                                Recovery email
+                            </label>
+                            <input type="email" id="recovery-email-input" class="form-input"
+                                   placeholder="you@example.com" autocomplete="email" style="margin-bottom:0.4rem;">
+                            <p style="font-size:0.75rem;color:var(--text-secondary);margin:0 0 0.5rem;">
+                                Used to email you a reset link if you're locked out. Requires SMTP to be configured.
+                            </p>
+                            <button class="btn btn-secondary btn-full" id="btn-save-recovery-email">Save recovery email</button>
+                        </div>
                         <button class="btn btn-danger btn-full" id="btn-logout">
                             Logout
                         </button>
@@ -5304,6 +5805,38 @@ header('Cache-Control: no-cache, must-revalidate');
                         </div>
                         <div id="trusted-mints-status" style="margin-top: 0.75rem; font-size: 0.85rem; color: var(--text-secondary);"></div>
                         <div id="trusted-mints-cached" style="margin-top: 0.75rem;"></div>
+                    </div>
+                </div>
+
+                <div class="card collapsible" id="card-diagnostics" data-admin-only="true">
+                    <div class="card-header">
+                        <div class="card-title">Diagnostic Report</div>
+                    </div>
+                    <div class="card-body">
+                        <p style="font-size: 0.85rem; color: var(--text-secondary); margin: 0 0 0.75rem 0;">
+                            Download a diagnostic report to send to the developers when something is wrong.
+                            It bundles version &amp; build info, mint reliability and event logs, notification
+                            failures, and anonymized invoice/payment records into a single JSON file.
+                        </p>
+                        <div class="form-group" style="margin-bottom: 0.75rem;">
+                            <label class="form-label" style="display: flex; align-items: center; gap: 0.5rem; cursor: pointer;">
+                                <input type="checkbox" id="diagnostics-anonymize" checked style="width: auto; margin: 0;">
+                                Anonymize data
+                            </label>
+                            <p class="form-help">
+                                On by default. Removes product names, notes, addresses, txids, emails and other
+                                customer-identifying data. Server secrets (wallet keys, passwords, API keys) are
+                                never included.
+                            </p>
+                            <p class="form-help" id="diagnostics-deanon-warning" hidden style="color: var(--danger, #c0392b);">
+                                ⚠ Unchecked: the report will include customer addresses, notes, product names and
+                                emails in the clear. Only share it with developers you trust.
+                            </p>
+                        </div>
+                        <div style="display: flex; gap: 0.5rem;">
+                            <button class="btn" id="btn-export-diagnostics-all" style="flex: 1;">Export all</button>
+                            <button class="btn btn-secondary" id="btn-export-diagnostics-30d" style="flex: 1;">Export past 30 days</button>
+                        </div>
                     </div>
                 </div>
 
@@ -5729,6 +6262,41 @@ header('Cache-Control: no-cache, must-revalidate');
         </div>
     </div>
 
+    <!-- Forgot password modal (lock screen). Documents both recovery paths. -->
+    <div class="modal-overlay" id="modal-forgot-password">
+        <div class="modal">
+            <div class="modal-handle"></div>
+            <div class="modal-title">Forgot your password?</div>
+
+            <p style="color: var(--text-secondary); margin-bottom: 0.75rem; font-size: 0.9rem;">
+                <strong>Option 1 — Email a reset link.</strong> If a recovery email is set on the admin
+                account and the server can send email, we'll send a one-hour reset link.
+            </p>
+            <div class="form-group">
+                <input type="email" class="form-input" id="fp-email"
+                       placeholder="Admin recovery email" autocomplete="email">
+            </div>
+            <button class="btn btn-full" id="btn-send-reset-link">Email me a reset link</button>
+            <div id="fp-message" style="font-size: 0.85rem; margin-top: 0.6rem; min-height: 1.1em;"></div>
+
+            <hr style="border:0;border-top:1px solid var(--border, #2a2d36);margin:1.1rem 0;">
+
+            <p style="color: var(--text-secondary); margin-bottom: 0.4rem; font-size: 0.9rem;">
+                <strong>Option 2 — Reset via a file on the server.</strong> If you have filesystem
+                access (SSH / SFTP / file manager) but no email, create an empty file named
+                <code>reset-admin-password</code> inside the server's <code>data/</code> directory:
+            </p>
+            <pre style="background:rgba(0,0,0,0.3);border-radius:6px;padding:0.6rem 0.75rem;font-size:0.8rem;overflow:auto;margin:0 0 0.5rem;">data/reset-admin-password</pre>
+            <p style="color: var(--text-secondary); margin: 0 0 1rem; font-size: 0.85rem;">
+                Then reload the sign-in page: it will prompt you to set a new admin password and
+                delete the file automatically. Remove the file yourself if you change your mind.
+            </p>
+
+            <button class="btn btn-secondary btn-full"
+                    onclick="closeModal('modal-forgot-password')">Close</button>
+        </div>
+    </div>
+
     <!-- Add User modal (admin) -->
     <div class="modal-overlay" id="modal-add-user">
         <div class="modal">
@@ -5855,6 +6423,7 @@ header('Cache-Control: no-cache, must-revalidate');
         const phpUser = {
             username: <?= json_encode($currentUsername) ?>,
             role:     <?= json_encode($currentRole) ?>,
+            email:    <?= json_encode($currentUser['email'] ?? null) ?>,
         };
         // Path-based SPA routing: adminBasePath is the URL prefix the user
         // reached the admin under (no trailing slash, no view tail). All view
@@ -6062,6 +6631,78 @@ header('Cache-Control: no-cache, must-revalidate');
                 });
             });
 
+            // ----- Password recovery (lock screen) -----
+            const forgotLink = document.getElementById('forgot-password-link');
+            if (forgotLink) {
+                forgotLink.addEventListener('click', () => {
+                    const m = document.getElementById('fp-message');
+                    if (m) { m.textContent = ''; m.className = ''; }
+                    openModal('modal-forgot-password');
+                });
+            }
+
+            const sendResetBtn = document.getElementById('btn-send-reset-link');
+            if (sendResetBtn) {
+                sendResetBtn.addEventListener('click', async () => {
+                    const email = (document.getElementById('fp-email').value || '').trim();
+                    const msg = document.getElementById('fp-message');
+                    if (!email) {
+                        msg.textContent = 'Enter the recovery email for the admin account.';
+                        msg.style.color = '#ef4444';
+                        return;
+                    }
+                    msg.textContent = 'Sending...';
+                    msg.style.color = 'var(--text-secondary)';
+                    try {
+                        const r = await fetch(adminUrl, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                            body: `action=request_password_reset&email=${encodeURIComponent(email)}`
+                        });
+                        const data = await r.json().catch(() => ({}));
+                        if (r.ok) {
+                            // Generic response — never reveals whether the address matched.
+                            msg.textContent = data.message || 'If an admin account has that email, a reset link has been sent.';
+                            msg.style.color = '#22c55e';
+                        } else {
+                            msg.textContent = data.error || 'Could not send reset link.';
+                            msg.style.color = '#ef4444';
+                        }
+                    } catch (e) {
+                        msg.textContent = 'Network error, please try again.';
+                        msg.style.color = '#ef4444';
+                    }
+                });
+            }
+
+            const fileResetBtn = document.getElementById('file-reset-submit');
+            if (fileResetBtn) {
+                fileResetBtn.addEventListener('click', async () => {
+                    const pw = document.getElementById('file-reset-pw').value;
+                    const pw2 = document.getElementById('file-reset-pw2').value;
+                    if (pw.length < 8) { showToast('Password must be at least 8 characters', 'error'); return; }
+                    if (pw !== pw2) { showToast('Passwords do not match', 'error'); return; }
+                    try {
+                        const r = await fetch(adminUrl, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                            body: `action=file_reset_set_password&new_password=${encodeURIComponent(pw)}`
+                        });
+                        const data = await r.json().catch(() => ({}));
+                        if (r.ok && data.success) {
+                            showToast('Password set. You can now sign in.', 'success');
+                            const box = document.getElementById('file-reset-box');
+                            if (box) box.remove();
+                            document.getElementById('password-input').value = pw;
+                        } else {
+                            showToast(data.error || 'Could not reset password', 'error');
+                        }
+                    } catch (e) {
+                        showToast('Network error, please try again', 'error');
+                    }
+                });
+            }
+
             // Navigation
             document.querySelectorAll('.nav-item').forEach(item => {
                 item.addEventListener('click', () => {
@@ -6139,6 +6780,10 @@ header('Cache-Control: no-cache, must-revalidate');
             if (storeNotifsToggle) storeNotifsToggle.addEventListener('change', () => {
                 if (storeNotifsToggle.checked) warnIfSiteEmailUnavailable();
             });
+            const storeSmtpToggle = document.getElementById('store-smtp-override-enabled');
+            if (storeSmtpToggle) storeSmtpToggle.addEventListener('change', updateStoreSmtpFieldsVisibility);
+            const storeTestBtn = document.getElementById('btn-send-store-test-notification');
+            if (storeTestBtn) storeTestBtn.addEventListener('click', sendStoreTestNotification);
             const saveNotifsBtn = document.getElementById('btn-save-notifications');
             if (saveNotifsBtn) saveNotifsBtn.addEventListener('click', saveNotificationSettings);
             const testNotifsBtn = document.getElementById('btn-send-test-notification');
@@ -6173,6 +6818,10 @@ header('Cache-Control: no-cache, must-revalidate');
             if (btnChangePass) {
                 btnChangePass.addEventListener('click', () => openModal('modal-change-password'));
                 document.getElementById('btn-confirm-change-password').addEventListener('click', changeOwnPassword);
+            }
+            const btnSaveRecoveryEmail = document.getElementById('btn-save-recovery-email');
+            if (btnSaveRecoveryEmail) {
+                btnSaveRecoveryEmail.addEventListener('click', saveRecoveryEmail);
             }
             const btnAddUser = document.getElementById('btn-add-user');
             if (btnAddUser) {
@@ -6220,6 +6869,27 @@ header('Cache-Control: no-cache, must-revalidate');
             if (btnSaveTm) btnSaveTm.addEventListener('click', saveTrustedMintsSettings);
             const btnRefreshTm = document.getElementById('btn-refresh-trusted-mints');
             if (btnRefreshTm) btnRefreshTm.addEventListener('click', refreshTrustedMintsNow);
+
+            // Diagnostic report export (admin-only card at the bottom of settings).
+            const diagAnon = document.getElementById('diagnostics-anonymize');
+            const diagWarning = document.getElementById('diagnostics-deanon-warning');
+            if (diagAnon && diagWarning) {
+                diagAnon.addEventListener('change', () => {
+                    diagWarning.hidden = diagAnon.checked;
+                });
+            }
+            const downloadDiagnostics = (range) => {
+                const params = new URLSearchParams({
+                    api: 'export_diagnostic_report',
+                    range: range,
+                    anonymize: (diagAnon && diagAnon.checked) ? '1' : '0',
+                });
+                window.location.href = adminUrl + '?' + params.toString();
+            };
+            const btnDiagAll = document.getElementById('btn-export-diagnostics-all');
+            if (btnDiagAll) btnDiagAll.addEventListener('click', () => downloadDiagnostics('all'));
+            const btnDiag30 = document.getElementById('btn-export-diagnostics-30d');
+            if (btnDiag30) btnDiag30.addEventListener('click', () => downloadDiagnostics('1m'));
 
             // Banner "Open settings" links — kept on a dedicated class instead
             // of sharing data-view="settings" with the sidebar nav button, so
@@ -6423,6 +7093,37 @@ header('Cache-Control: no-cache, must-revalidate');
             const badgeEl = document.getElementById('my-role-badge');
             if (usernameEl) usernameEl.textContent = u.username || '';
             if (badgeEl) badgeEl.textContent = u.role === 'admin' ? 'admin' : 'user';
+
+            // Recovery email is only meaningful for admins (the reset-link flow
+            // looks up admin accounts by email).
+            const row = document.getElementById('recovery-email-row');
+            if (row) {
+                if (u.role === 'admin') {
+                    row.classList.remove('hidden');
+                    const input = document.getElementById('recovery-email-input');
+                    if (input && document.activeElement !== input) input.value = u.email || '';
+                } else {
+                    row.classList.add('hidden');
+                }
+            }
+        }
+
+        async function saveRecoveryEmail() {
+            const input = document.getElementById('recovery-email-input');
+            const email = (input.value || '').trim();
+            try {
+                const response = await postWithCsrf(adminUrl,
+                    `action=set_recovery_email&email=${encodeURIComponent(email)}`);
+                const res = await response.json();
+                if (response.ok && res.success) {
+                    phpUser.email = email || null;
+                    showToast(email ? 'Recovery email saved' : 'Recovery email cleared', 'success');
+                } else {
+                    showToast(res.error || 'Failed to save recovery email', 'error');
+                }
+            } catch (e) {
+                showToast(e.message || 'Failed to save recovery email', 'error');
+            }
         }
 
         async function renderUsersCard() {
@@ -7340,10 +8041,31 @@ header('Cache-Control: no-cache, must-revalidate');
 
                 // Load per-store notification settings
                 if (dashboardData && dashboardData.notifications) {
+                    const n = dashboardData.notifications;
                     const enabledEl = document.getElementById('store-notifications-enabled');
                     const emailEl = document.getElementById('store-notification-email');
-                    if (enabledEl) enabledEl.checked = !!dashboardData.notifications.enabled;
-                    if (emailEl) emailEl.value = dashboardData.notifications.email || '';
+                    if (enabledEl) enabledEl.checked = !!n.enabled;
+                    if (emailEl) emailEl.value = n.email || '';
+                    // Per-store SMTP override (password write-only, never returned).
+                    const ov = document.getElementById('store-smtp-override-enabled');
+                    if (ov) ov.checked = !!n.smtpOverrideEnabled;
+                    const set = (id, v) => { const el = document.getElementById(id); if (el) el.value = v || ''; };
+                    set('store-smtp-host', n.smtpHost);
+                    set('store-smtp-port', n.smtpPort);
+                    set('store-smtp-username', n.smtpUsername);
+                    set('store-smtp-encryption', n.smtpEncryption);
+                    set('store-smtp-from-address', n.smtpFromAddress);
+                    set('store-smtp-from-name', n.smtpFromName);
+                    set('store-smtp-password', '');
+                    const clearEl = document.getElementById('store-smtp-password-clear');
+                    if (clearEl) clearEl.checked = false;
+                    const help = document.getElementById('store-smtp-password-help');
+                    if (help) help.textContent = n.smtpPasswordSet
+                        ? 'A password is saved. Leave blank to keep it.'
+                        : 'No password saved.';
+                    const prefill = document.getElementById('store-notifications-test-email');
+                    if (prefill) prefill.value = n.email || '';
+                    if (typeof updateStoreSmtpFieldsVisibility === 'function') updateStoreSmtpFieldsVisibility();
                 }
 
                 // Load exchange rate settings from store data
@@ -8970,19 +9692,73 @@ header('Cache-Control: no-cache, must-revalidate');
             }
             const enabled = document.getElementById('store-notifications-enabled').checked ? '1' : '0';
             const email = document.getElementById('store-notification-email').value.trim();
+            const passwordCleared = document.getElementById('store-smtp-password-clear').checked;
+            const passwordTyped = document.getElementById('store-smtp-password').value !== '';
+            const params = new URLSearchParams({
+                action: 'save_store_notifications',
+                store_id: currentStoreId,
+                enabled, email,
+                smtp_override_enabled: document.getElementById('store-smtp-override-enabled').checked ? '1' : '0',
+                smtp_host: document.getElementById('store-smtp-host').value.trim(),
+                smtp_port: document.getElementById('store-smtp-port').value.trim(),
+                smtp_username: document.getElementById('store-smtp-username').value.trim(),
+                smtp_encryption: document.getElementById('store-smtp-encryption').value,
+                smtp_from_address: document.getElementById('store-smtp-from-address').value.trim(),
+                smtp_from_name: document.getElementById('store-smtp-from-name').value.trim(),
+                smtp_password: document.getElementById('store-smtp-password').value,
+                smtp_password_clear: passwordCleared ? '1' : '0',
+            });
             try {
-                const response = await postWithCsrf(adminUrl,
-                    `action=save_store_notifications&store_id=${encodeURIComponent(currentStoreId)}&enabled=${enabled}&email=${encodeURIComponent(email)}`
-                );
+                const response = await postWithCsrf(adminUrl, params.toString());
                 const result = await response.json();
                 if (response.ok) {
                     showToast('Notification settings saved!', 'success');
                     if (enabled === '1') warnIfSiteEmailUnavailable();
+                    // Reset the write-only password UI to reflect the new state.
+                    document.getElementById('store-smtp-password').value = '';
+                    document.getElementById('store-smtp-password-clear').checked = false;
+                    const help = document.getElementById('store-smtp-password-help');
+                    if (help) help.textContent = (passwordCleared || (!passwordTyped && help.textContent.indexOf('No password') === 0))
+                        ? 'No password saved.'
+                        : 'A password is saved. Leave blank to keep it.';
                 } else {
                     showToast(result.error || 'Failed to save', 'error');
                 }
             } catch (e) {
                 showToast('Failed to save notification settings', 'error');
+            }
+        }
+
+        // Show/hide the per-store SMTP override fields based on the toggle.
+        function updateStoreSmtpFieldsVisibility() {
+            const ov = document.getElementById('store-smtp-override-enabled');
+            const fields = document.getElementById('store-smtp-fields');
+            if (ov && fields) fields.classList.toggle('hidden', !ov.checked);
+        }
+
+        async function sendStoreTestNotification() {
+            if (!currentStoreId) {
+                showToast('No store selected', 'error');
+                return;
+            }
+            const to = document.getElementById('store-notifications-test-email').value.trim()
+                || document.getElementById('store-notification-email').value.trim();
+            if (!to) {
+                showToast('Enter a recipient email', 'error');
+                return;
+            }
+            try {
+                const response = await postWithCsrf(adminUrl,
+                    `action=send_test_notification&store_id=${encodeURIComponent(currentStoreId)}&to=${encodeURIComponent(to)}`
+                );
+                const result = await response.json();
+                if (response.ok) {
+                    showToast('Test email sent', 'success');
+                } else {
+                    showToast(result.error || 'Failed to send', 'error');
+                }
+            } catch (e) {
+                showToast('Failed to send test email', 'error');
             }
         }
 
@@ -8999,6 +9775,19 @@ header('Cache-Control: no-cache, must-revalidate');
                 document.getElementById('notifications-payer-receipt').checked = !!data.payerReceiptEnabled;
                 document.getElementById('notifications-to-email').value = data.toEmail || '';
                 document.getElementById('notifications-smtp-warning').classList.toggle('hidden', !!data.smtpConfigured);
+                // Global SMTP server fields. Password is write-only: it's never
+                // returned, so we only reflect whether one is stored.
+                document.getElementById('smtp-host').value = data.smtpHost || '';
+                document.getElementById('smtp-port').value = data.smtpPort || '';
+                document.getElementById('smtp-username').value = data.smtpUsername || '';
+                document.getElementById('smtp-encryption').value = data.smtpEncryption || '';
+                document.getElementById('smtp-from-address').value = data.smtpFromAddress || '';
+                document.getElementById('smtp-from-name').value = data.smtpFromName || '';
+                document.getElementById('smtp-password').value = '';
+                document.getElementById('smtp-password-clear').checked = false;
+                document.getElementById('smtp-password-help').textContent = data.smtpPasswordSet
+                    ? 'A password is saved. Leave blank to keep it.'
+                    : 'No password saved.';
                 const pending = document.getElementById('notifications-pending');
                 if (pending) {
                     pending.textContent = data.pendingQueueCount > 0
@@ -9016,13 +9805,26 @@ header('Cache-Control: no-cache, must-revalidate');
             const autoCashout = document.getElementById('notifications-auto-cashout').checked ? '1' : '0';
             const payerReceipt = document.getElementById('notifications-payer-receipt').checked ? '1' : '0';
             const toEmail = document.getElementById('notifications-to-email').value.trim();
+            const params = new URLSearchParams({
+                action: 'save_notifications_settings',
+                enabled, invoice_paid_enabled: invoicePaid,
+                auto_cashout_enabled: autoCashout, payer_receipt_enabled: payerReceipt,
+                to_email: toEmail,
+                smtp_host: document.getElementById('smtp-host').value.trim(),
+                smtp_port: document.getElementById('smtp-port').value.trim(),
+                smtp_username: document.getElementById('smtp-username').value.trim(),
+                smtp_encryption: document.getElementById('smtp-encryption').value,
+                smtp_from_address: document.getElementById('smtp-from-address').value.trim(),
+                smtp_from_name: document.getElementById('smtp-from-name').value.trim(),
+                smtp_password: document.getElementById('smtp-password').value,
+                smtp_password_clear: document.getElementById('smtp-password-clear').checked ? '1' : '0',
+            });
             try {
-                const response = await postWithCsrf(adminUrl,
-                    `action=save_notifications_settings&enabled=${enabled}&invoice_paid_enabled=${invoicePaid}&auto_cashout_enabled=${autoCashout}&payer_receipt_enabled=${payerReceipt}&to_email=${encodeURIComponent(toEmail)}`
-                );
+                const response = await postWithCsrf(adminUrl, params.toString());
                 const result = await response.json();
                 if (response.ok) {
                     showToast('Notification settings saved!', 'success');
+                    loadNotificationSettings();
                 } else {
                     showToast(result.error || 'Failed to save', 'error');
                 }
