@@ -259,9 +259,61 @@ def start_boltz_regtest(repo_dir: Path | None = None, ready_timeout: int = 180) 
     _write_override(repo_dir)
 
     handle = BoltzRegtestHandle(repo_dir=repo_dir)
-    # Bring up. `compose up -d` reuses containers whose config didn't
-    # change, restarts the ones that did, creates the missing ones.
-    handle.docker_compose("up", "-d", "--remove-orphans", timeout=600)
+
+    def _pull() -> None:
+        # Refresh floating `:latest` images so they match the freshly-cloned
+        # HEAD config. The compose file pins every service to `:latest` and the
+        # repo is cloned at upstream HEAD, but `docker compose up` reuses cached
+        # images and never re-pulls. When HEAD adds a flag only a newer image
+        # supports — e.g. BoltzExchange/regtest 97d2c11 (2026-06-06) added
+        # `--protocol.no-onion-messages` for LND v0.21.0-beta — a stale cached
+        # `boltz/lnd:latest` crash-loops with "unknown flag". Best-effort: a
+        # failed pull falls back to cached images.
+        pull = handle.docker_compose("pull", check=False, timeout=600)
+        if pull.returncode != 0:
+            print(
+                "[boltz-regtest] warning: `docker compose pull` failed; using cached "
+                f"images (may be stale): {pull.stderr.strip()[:300]}",
+                file=sys.stderr,
+            )
+
+    def _up() -> subprocess.CompletedProcess[str]:
+        return handle.docker_compose("up", "-d", "--remove-orphans", check=False, timeout=600)
+
+    # Only pull on a *fresh* bring-up (nothing running). Pulling against a live
+    # stack updates other floating-tag images (boltz/bitcoind, boltz/electrs)
+    # and the subsequent `up` recreates only those — and recreating bitcoind
+    # rotates its RPC cookie out from under the running lnd/cln nodes
+    # ("incorrect password" → cln crash-loop → health-gated `up` fails). On a
+    # fresh bring-up every container (and one consistent cookie) is created
+    # together, so pulling there is safe.
+    running = handle.docker_compose("ps", "--status", "running", "-q", check=False, timeout=60)
+    already_up = running.returncode == 0 and bool(running.stdout.strip())
+    if not already_up:
+        _pull()
+
+    up = _up()
+    if up.returncode != 0:
+        # `up` failed. The usual cause is the cookie cascade above: a prior
+        # test (or a selective recreate) left the stack in a partial state, so
+        # this `up` recreates bitcoind alone and rotates the cookie, leaving
+        # cln/lnd unable to authenticate. Recover by tearing everything down
+        # and bringing it up fresh, which creates all containers — and a single
+        # consistent cookie — together. This is the proven-good path; regtest
+        # re-sync is cheap. We do it once; a second failure is a real error.
+        print(
+            f"[boltz-regtest] `up` failed (rc={up.returncode}); recovering via clean "
+            f"down + fresh up. stderr: {up.stderr.strip()[:300]}",
+            file=sys.stderr,
+        )
+        handle.docker_compose("down", "-v", "--remove-orphans", check=False, timeout=300)
+        _pull()
+        up = _up()
+        if up.returncode != 0:
+            raise RuntimeError(
+                "Boltz regtest `up` failed even after a clean down + up: "
+                f"{up.stderr.strip()[:500]}"
+            )
 
     # Wait for the Boltz API to respond with healthy pair info.
     deadline = time.monotonic() + ready_timeout
