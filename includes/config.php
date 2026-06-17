@@ -374,6 +374,23 @@ class Config {
                 $result[] = $mintUrl;
             }
         }
+
+        if (empty($result) && !empty($candidates)) {
+            // Every configured mint is gated, so invoice creation will fail for
+            // this store. Emit a loud, distinct alarm so the operator can act
+            // (re-enable a mint / add a backup) — previously this returned an
+            // empty list with no signal at all.
+            //
+            // We deliberately do NOT auto-override the gate here: a mint gated
+            // by a withdraw failure (LIGHTNING_WALLET_ERROR) must not be
+            // re-admitted for NEW invoices, or we'd accept customer deposits
+            // into a mint we've already shown we cannot withdraw from.
+            // MINT_UNREACHABLE gates already self-heal after a retry interval in
+            // MintReliability::isAvailableForNewInvoices().
+            error_log("[mint-reliability] ALARM: all " . count($candidates)
+                . " mint(s) for store {$storeId} are gated; cannot issue new invoices");
+        }
+
         return $result;
     }
 

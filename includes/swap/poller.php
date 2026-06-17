@@ -266,6 +266,11 @@ final class SwapPoller {
             $pdo->prepare(
                 "UPDATE {$table} SET status = 'invoice.settled', updated_at = ? WHERE id = ?"
             )->execute([time(), $row['id']]);
+            // Idempotency lives in the context's onSettled(), which only fires
+            // InvoiceSettled / the sweep notification when it actually flips the
+            // target row (rowCount===1). We can't gate on the swap row's status
+            // here because processRow() already mirrored the provider's
+            // 'invoice.settled' onto it before we run.
             $ctx->onSettled($row);
             $pdo->commit();
         } catch (Throwable $e) {

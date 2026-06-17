@@ -298,13 +298,19 @@ HTACCESS;
             FOREIGN KEY (store_id) REFERENCES stores(id) ON DELETE CASCADE
         );
 
-        -- Webhook deliveries (for retry/debug)
+        -- Webhook deliveries: outbox + delivery log. Rows are enqueued
+        -- 'pending' and drained (with retry/backoff) by the cron
+        -- deliver_webhooks task; see WebhookSender.
         CREATE TABLE IF NOT EXISTS webhook_deliveries (
             id TEXT PRIMARY KEY,
             webhook_id TEXT NOT NULL,
             invoice_id TEXT,
             event_type TEXT NOT NULL,
             payload TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',   -- pending | delivered | failed
+            attempts INTEGER NOT NULL DEFAULT 0,
+            next_retry_at INTEGER,                     -- when this row is next eligible
+            delivered_at INTEGER,
             status_code INTEGER,
             response TEXT,
             created_at INTEGER NOT NULL,
@@ -1314,6 +1320,34 @@ HTACCESS;
             $stmt = $pdo->prepare("UPDATE {$table} SET event_type = ? WHERE event_type = ?");
             foreach ($eventRenames as $oldEvent => $newEvent) {
                 $stmt->execute([$newEvent, $oldEvent]);
+            }
+        }
+
+        // Webhook delivery outbox columns. Delivery used to be synchronous and
+        // logged after the send; it's now an enqueue-then-drain outbox with
+        // retry/backoff (see WebhookSender). Existing rows were already
+        // delivered under the old model, so backfill them to a terminal status
+        // (keyed on their recorded status_code) the moment we add the column —
+        // otherwise the new drainer would re-send the entire history.
+        if (self::tableExists($pdo, 'webhook_deliveries')) {
+            if (!self::columnExists($pdo, 'webhook_deliveries', 'status')) {
+                $pdo->exec("ALTER TABLE webhook_deliveries ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'");
+                $pdo->exec(
+                    "UPDATE webhook_deliveries
+                        SET status = CASE
+                            WHEN status_code >= 200 AND status_code < 300 THEN 'delivered'
+                            ELSE 'failed' END"
+                );
+            }
+            if (!self::columnExists($pdo, 'webhook_deliveries', 'attempts')) {
+                $pdo->exec("ALTER TABLE webhook_deliveries ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0");
+                $pdo->exec("UPDATE webhook_deliveries SET attempts = 1");
+            }
+            if (!self::columnExists($pdo, 'webhook_deliveries', 'next_retry_at')) {
+                $pdo->exec("ALTER TABLE webhook_deliveries ADD COLUMN next_retry_at INTEGER");
+            }
+            if (!self::columnExists($pdo, 'webhook_deliveries', 'delivered_at')) {
+                $pdo->exec("ALTER TABLE webhook_deliveries ADD COLUMN delivered_at INTEGER");
             }
         }
 
