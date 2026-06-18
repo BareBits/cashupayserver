@@ -230,6 +230,24 @@ class Cart {
             $invId = (string)$row['id'];
             try {
                 Database::beginTransaction();
+                // Claim the invoice FIRST with a conditional flip, and only
+                // apply the increments when this pass is the one that won the
+                // 0 -> 1 transition. The outer SELECT is not a lock, so two
+                // reconcile passes (cron overlapping a retry, or two cron
+                // invocations) can both see cart_purchase_counted = 0; without
+                // this gate both would bump purchase_count. The CAS is the
+                // first (write) statement, so the transaction takes the write
+                // lock immediately — no read-before-write upgrade window.
+                $claimed = Database::update(
+                    'invoices',
+                    ['cart_purchase_counted' => 1],
+                    'id = ? AND cart_purchase_counted = 0',
+                    [$invId]
+                );
+                if ($claimed !== 1) {
+                    Database::rollback();
+                    continue; // another pass already counted this invoice
+                }
                 $items = Database::fetchAll(
                     'SELECT product_id, quantity FROM invoice_items WHERE invoice_id = ?',
                     [$invId]
@@ -242,10 +260,6 @@ class Cart {
                         );
                     }
                 }
-                Database::query(
-                    'UPDATE invoices SET cart_purchase_counted = 1 WHERE id = ?',
-                    [$invId]
-                );
                 Database::commit();
                 $counted++;
             } catch (Throwable $e) {

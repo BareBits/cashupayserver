@@ -330,8 +330,20 @@ class OfflineCashu {
         $unit = Config::getStoreMintUnit($storeId);
         $now = Database::timestamp();
 
-        Database::beginTransaction();
+        // beginImmediate (not beginTransaction): take the write lock up front so
+        // the exposure re-check below is authoritative. The pre-transaction cap
+        // check above is racy — two concurrent acceptances of distinct tokens
+        // can both read the same exposure and both pass, overshooting the cap.
+        Database::beginImmediate();
         try {
+            // Authoritative cap re-check under the write lock. With acceptances
+            // serialized by beginImmediate, this sees every already-committed
+            // acceptance, so concurrent accepts can no longer jointly overshoot.
+            if ($maxOut > 0 && (self::outstandingExposure($storeId) + $amount) > $maxOut) {
+                Database::rollback();
+                return ['ok' => false, 'status' => 'rejected',
+                        'reason' => "Accepting this would exceed the outstanding offline exposure limit ({$maxOut})"];
+            }
             if ($existing !== null) {
                 $invoiceId = $existing['id'];
                 Database::update('invoices', [

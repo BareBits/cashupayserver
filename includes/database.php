@@ -100,7 +100,7 @@ class Database {
             // that migration ran — getInstance() will then trigger runMigrations()
             // on existing installs that haven't yet picked it up. All migrations
             // are idempotent, so a fire is safe.
-            $hasLatestMigration = $hasConfig && self::columnExists(self::$instance, 'stores', 'smtp_override_enabled');
+            $hasLatestMigration = $hasConfig && self::columnExists(self::$instance, 'notification_queue', 'next_attempt_at');
             // The auto-withdraw → auto-cashout rename is a data-only migration
             // (config key + notification event labels) with no schema artifact
             // to mark it done, so probe for the legacy config key directly. The
@@ -812,7 +812,12 @@ HTACCESS;
                     created_at INTEGER NOT NULL,
                     sent_at INTEGER,
                     attempts INTEGER NOT NULL DEFAULT 0,
-                    last_error TEXT
+                    last_error TEXT,
+                    -- Delivery lease: NotificationSender::drainQueue claims a row
+                    -- by pushing next_attempt_at into the future before sending,
+                    -- so concurrent drainers can't double-send. Mirrors
+                    -- webhook_deliveries.next_retry_at. NULL = due now.
+                    next_attempt_at INTEGER DEFAULT NULL
                 );
             ");
             $pdo->exec("CREATE INDEX idx_notification_queue_pending ON notification_queue(sent_at) WHERE sent_at IS NULL;");
@@ -1384,8 +1389,6 @@ HTACCESS;
         // password is stored plaintext, consistent with seed_phrase and other
         // secrets in this (.htaccess-protected) SQLite database.
         //
-        // smtp_override_enabled doubles as this migration set's "latest" marker
-        // (see getInstance), so it must be the last stores column added here.
         if (!self::columnExists($pdo, 'stores', 'smtp_host')) {
             $pdo->exec("ALTER TABLE stores ADD COLUMN smtp_host TEXT DEFAULT NULL");
         }
@@ -1409,6 +1412,14 @@ HTACCESS;
         }
         if (!self::columnExists($pdo, 'stores', 'smtp_override_enabled')) {
             $pdo->exec("ALTER TABLE stores ADD COLUMN smtp_override_enabled INTEGER NOT NULL DEFAULT 0");
+        }
+
+        // Delivery lease for the notification outbox (see notification_queue
+        // CREATE above and NotificationSender::drainQueue). next_attempt_at
+        // doubles as this migration set's "latest" marker (see getInstance), so
+        // it must be the last column added in runMigrations().
+        if (!self::columnExists($pdo, 'notification_queue', 'next_attempt_at')) {
+            $pdo->exec("ALTER TABLE notification_queue ADD COLUMN next_attempt_at INTEGER DEFAULT NULL");
         }
     }
 
@@ -1504,6 +1515,50 @@ HTACCESS;
      */
     public static function beginTransaction(): bool {
         return self::getInstance()->beginTransaction();
+    }
+
+    /**
+     * Begin a transaction that takes the write lock immediately, i.e. SQLite's
+     * `BEGIN IMMEDIATE` semantics.
+     *
+     * PDO's beginTransaction() issues a plain `BEGIN`, which SQLite treats as
+     * DEFERRED: no lock is acquired until the first WRITE. That is unsafe for
+     * "read, decide, then write" flows — two processes can both run the SELECT,
+     * both decide, and both proceed (interleaving), and the SHARED->RESERVED
+     * upgrade on the first write can return SQLITE_BUSY *immediately* (the
+     * busy_timeout does NOT retry a lock-upgrade deadlock).
+     *
+     * Use this whenever a transaction does a SELECT before its first write and
+     * the decision depends on that read (allocators, counters, reconcilers).
+     * The write lock is held from the start, so concurrent writers queue on
+     * busy_timeout instead of racing or dead-locking; commit()/rollback()/
+     * inTransaction() behave exactly as with beginTransaction().
+     *
+     * Implementation note: issuing `BEGIN IMMEDIATE` via exec() does NOT set
+     * PDO's internal in-transaction flag, which breaks PDO::commit()/rollBack()
+     * ("There is no active transaction"). So we start a normal PDO transaction
+     * (sets the flag, emits a deferred BEGIN) and then force the RESERVED lock
+     * with a no-op header write — re-setting `user_version` to its current
+     * value. SQLite takes the write lock when a write statement begins
+     * executing, regardless of whether it changes any bytes, so this upgrades
+     * the lock up front while leaving every value untouched. (user_version is
+     * unused by this app.)
+     */
+    public static function beginImmediate(): bool {
+        $pdo = self::getInstance();
+        $pdo->beginTransaction();
+        try {
+            $ver = (int)$pdo->query('PRAGMA user_version')->fetchColumn();
+            $pdo->exec('PRAGMA user_version = ' . $ver);
+        } catch (\Throwable $e) {
+            // If the lock can't be taken (e.g. busy_timeout exhausted), don't
+            // leave a half-open deferred transaction behind.
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+            throw $e;
+        }
+        return true;
     }
 
     /**

@@ -37,7 +37,7 @@ class OnchainPayments {
      */
     public static function allocateAddress(string $storeId, ?int $baseAmountSat = null): ?array {
         $pdo = Database::getInstance();
-        $pdo->beginTransaction();
+        Database::beginImmediate(); // write lock up front: read-before-write allocator (see Database::beginImmediate)
         try {
             $stmt = $pdo->prepare(
                 "SELECT * FROM stores WHERE id = ?"
@@ -191,7 +191,7 @@ class OnchainPayments {
      */
     public static function allocateClaimAddress(string $storeId): ?array {
         $pdo = Database::getInstance();
-        $pdo->beginTransaction();
+        Database::beginImmediate(); // write lock up front: read-before-write allocator (see Database::beginImmediate)
         try {
             $stmt = $pdo->prepare("SELECT * FROM stores WHERE id = ?");
             $stmt->execute([$storeId]);
@@ -263,7 +263,7 @@ class OnchainPayments {
         ?array $tipProviderStore = null
     ): array {
         $pdo = Database::getInstance();
-        $pdo->beginTransaction();
+        Database::beginImmediate(); // write lock up front: read-before-write allocator (see Database::beginImmediate)
         try {
             $xpubHash = hash('sha256', $xpub);
             $now = time();
@@ -538,17 +538,29 @@ class OnchainPayments {
 
         $now = time();
         if (!$existing) {
-            Database::insert('onchain_payments', [
-                'id' => Database::generateId('och'),
-                'invoice_id' => $invoiceId,
-                'txid' => $txid,
-                'vout' => $vout,
-                'amount_sat' => (int)$match['amount_sat'],
-                'confirmations' => (int)($match['confirmations'] ?? 0),
-                'block_height' => $match['block_height'] ?? null,
-                'first_seen_at' => (int)($match['first_seen_at'] ?? $now),
-                'last_seen_at' => $now,
-            ]);
+            // ON CONFLICT DO NOTHING: a background poller can observe and insert
+            // this same (txid, vout) for the same invoice between the SELECT
+            // above and here. The old plain INSERT threw an uncaught constraint
+            // violation in that window; the (txid, vout) UNIQUE plus the
+            // already-attributed guard above keep attribution correct, so a
+            // racing duplicate is simply a no-op.
+            Database::query(
+                "INSERT INTO onchain_payments
+                    (id, invoice_id, txid, vout, amount_sat, confirmations, block_height, first_seen_at, last_seen_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 ON CONFLICT(txid, vout) DO NOTHING",
+                [
+                    Database::generateId('och'),
+                    $invoiceId,
+                    $txid,
+                    $vout,
+                    (int)$match['amount_sat'],
+                    (int)($match['confirmations'] ?? 0),
+                    $match['block_height'] ?? null,
+                    (int)($match['first_seen_at'] ?? $now),
+                    $now,
+                ]
+            );
         }
 
         // Clear the candidate from every invoice that listed it (this one
@@ -680,22 +692,43 @@ class OnchainPayments {
 
     /**
      * Add a candidate to an invoice's list if not already present.
+     *
+     * Atomic read-modify-write. This JSON column is written from three racing
+     * places: the owning invoice's own poll (setManualCandidates), other
+     * competitors' polls (this append), and manual attribution
+     * (scrubCandidateGlobally). A bare SELECT-then-UPDATE would let two of them
+     * read the same list and clobber each other's write — a candidate UTXO then
+     * silently vanishes from the operator's manual-confirmation queue. Holding
+     * the write lock across the read and the write (beginImmediate) serialises
+     * them: a lone setManualCandidates UPDATE can only land fully before or
+     * fully after this block, never between its read and its write.
      */
     private static function appendManualCandidate(string $invoiceId, array $candidate): void {
-        $row = Database::fetchOne(
-            "SELECT onchain_manual_candidates FROM invoices WHERE id = ?",
-            [$invoiceId]
-        );
-        if (!$row) return;
-        $list = self::decodeCandidates($row['onchain_manual_candidates'] ?? null);
-        foreach ($list as $existing) {
-            if (($existing['txid'] ?? '') === $candidate['txid']
-                && (int)($existing['vout'] ?? -1) === (int)$candidate['vout']) {
-                return; // already present
+        Database::beginImmediate();
+        try {
+            $row = Database::fetchOne(
+                "SELECT onchain_manual_candidates FROM invoices WHERE id = ?",
+                [$invoiceId]
+            );
+            if (!$row) {
+                Database::rollback();
+                return;
             }
+            $list = self::decodeCandidates($row['onchain_manual_candidates'] ?? null);
+            foreach ($list as $existing) {
+                if (($existing['txid'] ?? '') === $candidate['txid']
+                    && (int)($existing['vout'] ?? -1) === (int)$candidate['vout']) {
+                    Database::rollback(); // already present; nothing to write
+                    return;
+                }
+            }
+            $list[] = $candidate;
+            self::setManualCandidates($invoiceId, $list); // inner UPDATE joins this tx
+            Database::commit();
+        } catch (\Throwable $e) {
+            Database::rollback();
+            throw $e;
         }
-        $list[] = $candidate;
-        self::setManualCandidates($invoiceId, $list);
     }
 
     /**
@@ -704,46 +737,62 @@ class OnchainPayments {
      * offered as a candidate elsewhere.
      */
     private static function scrubCandidateGlobally(string $txid, int $vout): void {
-        $rows = Database::fetchAll(
-            "SELECT id, onchain_manual_candidates FROM invoices
-              WHERE onchain_needs_manual_confirmation = 1"
-        );
-        foreach ($rows as $r) {
-            $list = self::decodeCandidates($r['onchain_manual_candidates'] ?? null);
-            $filtered = array_values(array_filter($list, function ($c) use ($txid, $vout) {
-                return !(($c['txid'] ?? '') === $txid && (int)($c['vout'] ?? -1) === $vout);
-            }));
-            if (count($filtered) !== count($list)) {
-                self::setManualCandidates($r['id'], $filtered);
+        // Atomic read-modify-write across every candidate list (see
+        // appendManualCandidate). The whole scan + rewrite runs under the write
+        // lock so a concurrent poll's append can't be lost between this read and
+        // its write-back.
+        Database::beginImmediate();
+        try {
+            $rows = Database::fetchAll(
+                "SELECT id, onchain_manual_candidates FROM invoices
+                  WHERE onchain_needs_manual_confirmation = 1"
+            );
+            foreach ($rows as $r) {
+                $list = self::decodeCandidates($r['onchain_manual_candidates'] ?? null);
+                $filtered = array_values(array_filter($list, function ($c) use ($txid, $vout) {
+                    return !(($c['txid'] ?? '') === $txid && (int)($c['vout'] ?? -1) === $vout);
+                }));
+                if (count($filtered) !== count($list)) {
+                    self::setManualCandidates($r['id'], $filtered);
+                }
             }
+            Database::commit();
+        } catch (\Throwable $e) {
+            Database::rollback();
+            throw $e;
         }
     }
 
     private static function upsertObservation(string $invoiceId, OnchainTxObservation $obs, int $now): void {
-        $existing = Database::fetchOne(
-            "SELECT id, first_seen_at FROM onchain_payments WHERE txid = ? AND vout = ?",
-            [$obs->txid, $obs->vout]
+        // Single atomic upsert keyed on UNIQUE(txid, vout). The old
+        // SELECT-then-INSERT/UPDATE was racy: two concurrent pollers (the
+        // customer's ~2s browser poll and the cron pass) both observe the same
+        // new UTXO, both miss the SELECT, and both fall through to a plain
+        // INSERT — the loser then threw an uncaught SQLITE_CONSTRAINT, which in
+        // the browser-driven path surfaced a 500 mid-payment. ON CONFLICT makes
+        // the second observer a no-op-style update instead. first_seen_at and
+        // invoice_id are left untouched on conflict (the first observer's
+        // attribution wins), matching the previous UPDATE branch.
+        Database::query(
+            "INSERT INTO onchain_payments
+                (id, invoice_id, txid, vout, amount_sat, confirmations, block_height, first_seen_at, last_seen_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(txid, vout) DO UPDATE SET
+                confirmations = excluded.confirmations,
+                block_height  = excluded.block_height,
+                last_seen_at  = excluded.last_seen_at",
+            [
+                Database::generateId('och'),
+                $invoiceId,
+                $obs->txid,
+                $obs->vout,
+                $obs->amountSat,
+                $obs->confirmations,
+                $obs->blockHeight,
+                $now,
+                $now,
+            ]
         );
-        if ($existing) {
-            Database::query(
-                "UPDATE onchain_payments
-                    SET confirmations = ?, block_height = ?, last_seen_at = ?
-                  WHERE id = ?",
-                [$obs->confirmations, $obs->blockHeight, $now, $existing['id']]
-            );
-            return;
-        }
-        Database::insert('onchain_payments', [
-            'id' => Database::generateId('och'),
-            'invoice_id' => $invoiceId,
-            'txid' => $obs->txid,
-            'vout' => $obs->vout,
-            'amount_sat' => $obs->amountSat,
-            'confirmations' => $obs->confirmations,
-            'block_height' => $obs->blockHeight,
-            'first_seen_at' => $now,
-            'last_seen_at' => $now,
-        ]);
     }
 
     /**
