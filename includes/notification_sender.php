@@ -29,6 +29,14 @@ class NotificationSender {
     // of failed deliveries shouldn't be able to wedge the whole cron run.
     private const DRAIN_BATCH = 25;
 
+    // Delivery lease, mirroring WebhookSender's claim lease. When a drainer
+    // claims a row it pushes next_attempt_at this far into the future, so any
+    // concurrent drainer's SELECT skips the row while the (possibly multi-second
+    // SMTP) send is in flight. Comfortably exceeds a normal send; if the sender
+    // dies mid-send, the row simply becomes due again after the lease expires
+    // and is retried — at-least-once, never lost.
+    private const CLAIM_LEASE_SEC = 120;
+
     // Per-invoice cap on payer receipts. The endpoint that calls
     // queuePayerReceipt is public (anyone with the invoice URL can hit it),
     // so without a limit it becomes a small open relay for paste-the-invoice
@@ -116,9 +124,6 @@ class NotificationSender {
     public static function queuePayerReceipt(array $invoice, string $payerEmail): bool {
         $invoiceId = $invoice['id'] ?? null;
         if (!$invoiceId) return false;
-        if (self::payerReceiptCountForInvoice($invoiceId) >= self::PAYER_RECEIPT_MAX_PER_INVOICE) {
-            return false;
-        }
 
         $storeId = $invoice['store_id'] ?? '';
         $storeName = $storeId !== '' ? self::storeName($storeId) : '';
@@ -126,7 +131,22 @@ class NotificationSender {
         $subject = "Payment receipt: invoice {$invoiceId}";
         $body = self::buildPayerReceiptBody($invoice, $storeName);
 
-        self::enqueue($storeId, self::EVENT_PAYER_RECEIPT, $payerEmail, $subject, $body, null, $invoiceId);
+        // Serialize the count + insert under the write lock. This is a public
+        // endpoint that "can be hit concurrently" — two simultaneous requests
+        // for the same invoice could otherwise both read count < cap and both
+        // insert, overshooting PAYER_RECEIPT_MAX_PER_INVOICE (open-relay abuse).
+        Database::beginImmediate();
+        try {
+            if (self::payerReceiptCountForInvoice($invoiceId) >= self::PAYER_RECEIPT_MAX_PER_INVOICE) {
+                Database::rollback();
+                return false;
+            }
+            self::enqueue($storeId, self::EVENT_PAYER_RECEIPT, $payerEmail, $subject, $body, null, $invoiceId);
+            Database::commit();
+        } catch (\Throwable $e) {
+            Database::rollback();
+            throw $e;
+        }
         return true;
     }
 
@@ -303,17 +323,37 @@ class NotificationSender {
      * status JSON: ['sent' => N, 'failed' => N].
      */
     public static function drainQueue(): array {
+        $now = time();
         $rows = Database::fetchAll(
             "SELECT * FROM notification_queue
              WHERE sent_at IS NULL
+               AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
              ORDER BY id ASC
              LIMIT ?",
-            [self::DRAIN_BATCH]
+            [$now, self::DRAIN_BATCH]
         );
 
         $sent = 0;
         $failed = 0;
         foreach ($rows as $row) {
+            // Atomic lease claim BEFORE sending. The SELECT above is not a lock,
+            // so two drainers (cron racing a future request-path drain, or two
+            // cron passes) can read the same due row and both send the email —
+            // a double delivery. The claim pushes next_attempt_at CLAIM_LEASE_SEC
+            // into the future, gated on the row still being due; SQLite
+            // serializes the two UPDATEs so only one drainer wins (rowCount===1)
+            // and the loser's WHERE no longer matches. While the winner sends,
+            // the row is leased out of every other drainer's SELECT. Mirrors
+            // WebhookSender::drainPending.
+            $claimed = Database::update(
+                'notification_queue',
+                ['next_attempt_at' => $now + self::CLAIM_LEASE_SEC, 'attempts' => (int)$row['attempts'] + 1],
+                'id = ? AND sent_at IS NULL AND (next_attempt_at IS NULL OR next_attempt_at <= ?)',
+                [$row['id'], $now]
+            );
+            if ($claimed !== 1) {
+                continue; // another drainer leased this row
+            }
             try {
                 EmailSender::send(
                     $row['to_email'],
@@ -321,25 +361,27 @@ class NotificationSender {
                     $row['body'],
                     !empty($row['store_id']) ? (string)$row['store_id'] : null
                 );
-                $now = time();
+                $sentAt = time();
                 Database::update(
                     'notification_queue',
-                    ['sent_at' => $now, 'last_error' => null],
-                    'id = ?',
+                    ['sent_at' => $sentAt, 'last_error' => null],
+                    'id = ? AND sent_at IS NULL',
                     [$row['id']]
                 );
                 // Record into the dedupe log so failure-suppression can see it.
                 if (!empty($row['dedupe_key']) && !empty($row['store_id'])) {
-                    self::recordDedupe($row['store_id'], $row['event_type'], $row['dedupe_key'], $now);
+                    self::recordDedupe($row['store_id'], $row['event_type'], $row['dedupe_key'], $sentAt);
                 }
                 $sent++;
             } catch (Throwable $e) {
+                // attempts was already bumped at claim time. Release the lease
+                // (next_attempt_at = NULL) so the row is due again on the next
+                // drain — the lease exists only to guard the in-flight send, not
+                // to back off retries; failed rows retry on the next tick as
+                // before.
                 Database::update(
                     'notification_queue',
-                    [
-                        'attempts' => (int)$row['attempts'] + 1,
-                        'last_error' => substr($e->getMessage(), 0, 500),
-                    ],
+                    ['last_error' => substr($e->getMessage(), 0, 500), 'next_attempt_at' => null],
                     'id = ?',
                     [$row['id']]
                 );

@@ -54,26 +54,17 @@ class Config {
         $now = Database::timestamp();
         $jsonValue = is_string($value) ? $value : json_encode($value);
 
-        $existing = Database::fetchOne(
-            "SELECT key FROM config WHERE key = ?",
-            [$key]
+        // Single atomic upsert. The old SELECT-then-INSERT/UPDATE could throw a
+        // PRIMARY KEY violation when two requests set a brand-new key at the
+        // same instant (both miss the SELECT, both INSERT). ON CONFLICT keeps
+        // created_at and overwrites value/updated_at — identical to the former
+        // update branch.
+        Database::query(
+            "INSERT INTO config (key, value, created_at, updated_at)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+            [$key, $jsonValue, $now, $now]
         );
-
-        if ($existing) {
-            Database::update(
-                'config',
-                ['value' => $jsonValue, 'updated_at' => $now],
-                'key = ?',
-                [$key]
-            );
-        } else {
-            Database::insert('config', [
-                'key' => $key,
-                'value' => $jsonValue,
-                'created_at' => $now,
-                'updated_at' => $now,
-            ]);
-        }
 
         self::$cache[$key] = $value;
     }
