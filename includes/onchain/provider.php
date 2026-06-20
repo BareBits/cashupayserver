@@ -316,7 +316,19 @@ final class BitcoindRpcProvider implements BlockchainProvider {
  * Build the configured provider for a store.
  */
 final class OnchainProviderFactory {
+    /**
+     * Test seam: when set, forStore() returns this provider instead of building
+     * a real network-backed one. Production code never assigns it (null), so the
+     * normal path is unchanged. Tests use it to drive pollInvoice() with a
+     * scripted set of observations (e.g. to exercise reorg reconciliation)
+     * without contacting Esplora/bitcoind.
+     */
+    public static ?BlockchainProvider $testProvider = null;
+
     public static function forStore(array $store): BlockchainProvider {
+        if (self::$testProvider !== null) {
+            return self::$testProvider;
+        }
         $kind = $store['onchain_provider'] ?? 'esplora';
         $network = $store['onchain_network'] ?? 'mainnet';
         $url = $store['onchain_provider_url'] ?: null;

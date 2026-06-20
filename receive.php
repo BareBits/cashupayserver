@@ -95,20 +95,31 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     $unit = Config::getStoreMintUnit($storeId);
 
-    // When paying a specific invoice, the token must cover its amount. Check the
-    // token's face value up-front (before any irreversible swap).
+    // Read the token once for pre-swap validation, BEFORE any irreversible swap:
+    //   1. Reject a unit mismatch. The token's amount is later credited 1:1 in
+    //      the store's unit, so a msat (1000x) or usd token would otherwise
+    //      corrupt the recorded settlement.
+    //   2. When paying a specific invoice, verify the face value covers it.
+    try {
+        $probeToken = (new Wallet(Config::getStoreMintUrl($storeId), $unit))
+            ->deserializeToken($tokenString);
+    } catch (Exception $e) {
+        http_response_code(400);
+        echo json_encode(['error' => 'Could not read token: ' . $e->getMessage()]);
+        exit;
+    }
+    $tokenUnit = OfflineCashu::normUnit($probeToken->unit ?? null);
+    $wantUnit = OfflineCashu::normUnit($unit);
+    if ($tokenUnit !== $wantUnit) {
+        http_response_code(400);
+        echo json_encode(['error' => "Token unit ({$tokenUnit}) does not match this store's unit ({$wantUnit})"]);
+        exit;
+    }
     if ($existingInvoice !== null && !empty($existingInvoice['amount_sats'])) {
-        try {
-            $faceAmount = (int)(new Wallet(Config::getStoreMintUrl($storeId), $unit))
-                ->deserializeToken($tokenString)->getAmount();
-            if ($faceAmount < (int)$existingInvoice['amount_sats']) {
-                http_response_code(400);
-                echo json_encode(['error' => "Token amount ($faceAmount) is less than the invoice amount ({$existingInvoice['amount_sats']})"]);
-                exit;
-            }
-        } catch (Exception $e) {
+        $faceAmount = (int)$probeToken->getAmount();
+        if ($faceAmount < (int)$existingInvoice['amount_sats']) {
             http_response_code(400);
-            echo json_encode(['error' => 'Could not read token: ' . $e->getMessage()]);
+            echo json_encode(['error' => "Token amount ($faceAmount) is less than the invoice amount ({$existingInvoice['amount_sats']})"]);
             exit;
         }
     }

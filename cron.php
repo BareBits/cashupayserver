@@ -459,28 +459,31 @@ if (!$swapOnly && !$skipNonEssential) try {
     $results['tasks']['cleanup_swap_quote_history'] = 'error: ' . $e->getMessage();
 }
 
-// Task 10: L4 - Webhook delivery cleanup (keep only last 1000)
+// Task 10: L4 - Webhook delivery cleanup (keep last 1000 TERMINAL rows).
+// Only prune rows in a terminal state (delivered or permanently failed); a
+// 'pending' row is still scheduled for retry, so evicting it would silently
+// drop an undelivered event — exactly the loss the outbox exists to prevent.
+// Counting/ordering over terminal rows only means a burst or sustained
+// merchant outage that piles up pending rows can't push deliverable events
+// out of the table.
 if (!$swapOnly && !$skipNonEssential) try {
-    // First get the count
-    $countResult = Database::fetchOne("SELECT COUNT(*) as cnt FROM webhook_deliveries");
-    $totalCount = (int)($countResult['cnt'] ?? 0);
-
-    if ($totalCount > 1000) {
-        // Delete oldest entries beyond 1000
-        $deleteCount = $totalCount - 1000;
-        Database::query("
-            DELETE FROM webhook_deliveries
-            WHERE id IN (
-                SELECT id FROM webhook_deliveries
-                ORDER BY created_at ASC LIMIT ?
-            )
-        ", [$deleteCount]);
-        $results['tasks']['cleanup_webhooks'] = "deleted {$deleteCount} old deliveries";
-    } else {
-        $results['tasks']['cleanup_webhooks'] = 'skipped (under limit)';
-    }
+    $deleted = WebhookSender::pruneDeliveries(1000);
+    $results['tasks']['cleanup_webhooks'] = $deleted > 0
+        ? "deleted {$deleted} old deliveries"
+        : 'skipped (under limit)';
 } catch (\Throwable $e) {
     $results['tasks']['cleanup_webhooks'] = 'error: ' . $e->getMessage();
+}
+
+// Task 10b: Notification queue cleanup. drainQueue marks rows sent_at (success)
+// or failed_at (gave up after MAX_ATTEMPTS) but never deletes them, so without
+// this the queue grows unbounded. Delete terminal rows older than 30 days;
+// still-pending rows (both timestamps NULL) are always kept.
+if (!$swapOnly && !$skipNonEssential) try {
+    $deleted = NotificationSender::cleanup(30 * 24 * 3600);
+    $results['tasks']['cleanup_notifications'] = "deleted {$deleted} old notifications";
+} catch (\Throwable $e) {
+    $results['tasks']['cleanup_notifications'] = 'error: ' . $e->getMessage();
 }
 
 // Task 11: Refresh trusted mints list (default 24h interval).
