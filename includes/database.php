@@ -100,7 +100,7 @@ class Database {
             // that migration ran — getInstance() will then trigger runMigrations()
             // on existing installs that haven't yet picked it up. All migrations
             // are idempotent, so a fire is safe.
-            $hasLatestMigration = $hasConfig && self::columnExists(self::$instance, 'notification_queue', 'next_attempt_at');
+            $hasLatestMigration = $hasConfig && self::columnExists(self::$instance, 'notification_queue', 'failed_at');
             // The auto-withdraw → auto-cashout rename is a data-only migration
             // (config key + notification event labels) with no schema artifact
             // to mark it done, so probe for the legacy config key directly. The
@@ -817,7 +817,10 @@ HTACCESS;
                     -- by pushing next_attempt_at into the future before sending,
                     -- so concurrent drainers can't double-send. Mirrors
                     -- webhook_deliveries.next_retry_at. NULL = due now.
-                    next_attempt_at INTEGER DEFAULT NULL
+                    next_attempt_at INTEGER DEFAULT NULL,
+                    -- Terminal-failure marker: set after MAX_ATTEMPTS so the row
+                    -- is given up on and never retried again. NULL = still live.
+                    failed_at INTEGER DEFAULT NULL
                 );
             ");
             $pdo->exec("CREATE INDEX idx_notification_queue_pending ON notification_queue(sent_at) WHERE sent_at IS NULL;");
@@ -843,6 +846,13 @@ HTACCESS;
         }
         if (!self::indexExists($pdo, 'idx_notification_queue_invoice')) {
             $pdo->exec("CREATE INDEX idx_notification_queue_invoice ON notification_queue(invoice_id) WHERE invoice_id IS NOT NULL");
+        }
+        // Terminal-failure marker. drainQueue gives up after MAX_ATTEMPTS and
+        // stamps failed_at so the row is never retried again (and is excluded
+        // from the due-set). Without this a permanently-bad recipient/SMTP
+        // misconfig would be re-sent every cron tick forever. NULL = still live.
+        if (!self::columnExists($pdo, 'notification_queue', 'failed_at')) {
+            $pdo->exec("ALTER TABLE notification_queue ADD COLUMN failed_at INTEGER DEFAULT NULL");
         }
 
         // Submarine swaps (LN→on-chain via Boltz/Zeus). Replaces the cashu

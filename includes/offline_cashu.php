@@ -197,6 +197,15 @@ class OfflineCashu {
      * cached keyset keys when the mint is unreachable. No seed needed (we only
      * verify, never swap here).
      */
+    /**
+     * Normalize a Cashu unit string for case-insensitive comparison. An empty
+     * or missing unit is treated as 'sat' (the Cashu token default).
+     */
+    public static function normUnit(?string $u): string {
+        $u = strtolower(trim((string)$u));
+        return $u === '' ? 'sat' : $u;
+    }
+
     private static function verifyWallet(string $mintUrl, string $unit): Wallet {
         $wallet = new Wallet(rtrim($mintUrl, '/'), $unit, Database::getDbPath());
         try {
@@ -237,6 +246,17 @@ class OfflineCashu {
             $token = (new Wallet('https://placeholder.invalid', $unit))->deserializeToken($tokenString);
         } catch (\Throwable $e) {
             return $fail('Could not parse token');
+        }
+
+        // Reject a unit mismatch BEFORE crediting anything. The token's amount is
+        // taken raw below; a token denominated in a different unit (msat = 1000x,
+        // usd = arbitrary) would otherwise be credited 1:1 in the store's unit,
+        // corrupting the exposure cap, the cover check, and the recorded
+        // settlement. Empty unit means 'sat' per the Cashu token default.
+        $tokenUnit = self::normUnit($token->unit ?? null);
+        $wantUnit = self::normUnit($unit);
+        if ($tokenUnit !== $wantUnit) {
+            return $fail("Token unit ({$tokenUnit}) does not match store unit ({$wantUnit})");
         }
 
         $mintUrl = rtrim($token->mint ?? '', '/');

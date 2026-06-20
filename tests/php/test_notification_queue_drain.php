@@ -1,7 +1,9 @@
 <?php
 /**
- * Queue drain: marks rows sent on success; on failure, increments attempts
- * and records last_error without marking sent (so the next tick retries).
+ * Queue drain: marks rows sent on success; on failure, increments attempts and
+ * records last_error without marking sent, and schedules a BACKOFF retry
+ * (next_attempt_at pushed into the future) rather than retrying every tick. Once
+ * the backoff window elapses and the transport recovers, the rows send.
  */
 declare(strict_types=1);
 require __DIR__ . '/harness.php';
@@ -35,16 +37,24 @@ $result = NotificationSender::drainQueue();
 assert_eq(0, $result['sent']);
 assert_eq(2, $result['failed']);
 
-$rows = Database::fetchAll("SELECT id, attempts, sent_at, last_error FROM notification_queue ORDER BY id");
+$now = time();
+$rows = Database::fetchAll("SELECT id, attempts, sent_at, last_error, next_attempt_at, failed_at FROM notification_queue ORDER BY id");
 assert_eq(2, count($rows));
 foreach ($rows as $r) {
     assert_eq(1, (int)$r['attempts'], 'attempts incremented to 1');
     assert_eq(null, $r['sent_at'], 'sent_at still null on failure');
+    assert_eq(null, $r['failed_at'], 'not given up after one failure');
+    assert_true((int)$r['next_attempt_at'] > $now, 'backoff: next_attempt_at scheduled in the future');
     assert_true(str_contains($r['last_error'] ?? '', 'transient failure'), 'last_error captured');
 }
 
-// Second drain with a healthy transport: both rows sent.
+// An immediate re-drain finds nothing due yet (backoff in effect).
 EmailSender::$transportOverride = function($to, $subject, $body) { /* ok */ };
+$result = NotificationSender::drainQueue();
+assert_eq(0, $result['sent'], 'nothing sent while backoff window is open');
+
+// Simulate the backoff window elapsing, then drain with a healthy transport.
+Database::query("UPDATE notification_queue SET next_attempt_at = NULL");
 $result = NotificationSender::drainQueue();
 assert_eq(2, $result['sent']);
 assert_eq(0, $result['failed']);

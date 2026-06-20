@@ -15,7 +15,11 @@
  *   - reject hostnames that resolve to private/loopback/link-local IPs
  *   - pin curl to the resolved IP (CURLOPT_RESOLVE) so a follow-up DNS
  *     re-resolve can't swap to a private address mid-connection
- *   - follow redirects only when the caller asks for it
+ *   - follow redirects only when the caller asks for it, and then ONLY by
+ *     re-validating every hop ourselves (curl's own follow is disabled): a
+ *     cross-host Location is re-resolved and re-checked against the private-IP
+ *     policy, so a 302 -> 169.254.169.254 can't bypass the check the way it
+ *     would if curl followed it (the RESOLVE pin covers only the first host)
  *   - cap response size (default 5 MB) so a hostile peer can't OOM us
  *   - verify TLS peer
  *
@@ -66,24 +70,65 @@ class SafeHttp {
      */
     public static function request(string $url, array $opts = []): array {
         $allowPrivate = (bool)($opts['allowPrivate'] ?? false);
+        $followRedirects = (bool)($opts['followRedirects'] ?? false);
+        $maxRedirects = max(0, (int)($opts['maxRedirects'] ?? 3));
 
-        try {
-            $validated = self::validateUrl($url, $allowPrivate);
-        } catch (\Throwable $e) {
-            return ['status' => 0, 'body' => '', 'error' => $e->getMessage(), 'effectiveUrl' => $url];
+        // We follow redirects MANUALLY (curl's CURLOPT_FOLLOWLOCATION is always
+        // off in executeOnce) so that EVERY hop is re-validated against the
+        // private-IP policy. curl's own follow would re-resolve a cross-host
+        // Location with no isPrivateIp check — a classic SSRF bypass, since the
+        // CURLOPT_RESOLVE pin only covers the ORIGINAL host. By looping here and
+        // calling validateUrl() on each Location, a redirect to 169.254.169.254
+        // (or any private/reserved IP) is rejected just like the initial URL.
+        $currentUrl = $url;
+        $redirectsLeft = $followRedirects ? $maxRedirects : 0;
+
+        while (true) {
+            try {
+                $validated = self::validateUrl($currentUrl, $allowPrivate);
+            } catch (\Throwable $e) {
+                return ['status' => 0, 'body' => '', 'error' => $e->getMessage(), 'effectiveUrl' => $currentUrl];
+            }
+
+            $result = self::executeOnce($currentUrl, $validated, $opts);
+
+            $status = $result['status'];
+            $location = $result['_redirectLocation'] ?? '';
+            unset($result['_redirectLocation']);
+
+            // Not a redirect (or we're not following / out of hops): return.
+            if ($redirectsLeft <= 0 || $status < 300 || $status >= 400 || $location === '') {
+                return $result;
+            }
+
+            $next = self::resolveRedirectTarget($currentUrl, $location);
+            if ($next === null) {
+                return $result; // unparseable Location -> hand back the 3xx as-is
+            }
+            $currentUrl = $next;
+            $redirectsLeft--;
+            // Loop: the next iteration validates $currentUrl (private-IP check)
+            // before connecting.
         }
+    }
 
+    /**
+     * Perform a SINGLE HTTP request (no redirect following) against an already
+     * validated URL. Returns the same shape as request() plus a private
+     * '_redirectLocation' key carrying the raw Location header (empty when the
+     * response was not a redirect), which request() uses to drive its manual,
+     * re-validating redirect loop.
+     */
+    private static function executeOnce(string $url, array $validated, array $opts): array {
         $ch = curl_init($validated['url']);
         if ($ch === false) {
-            return ['status' => 0, 'body' => '', 'error' => 'curl_init failed', 'effectiveUrl' => $url];
+            return ['status' => 0, 'body' => '', 'error' => 'curl_init failed', 'effectiveUrl' => $url, '_redirectLocation' => ''];
         }
 
         $method = strtoupper((string)($opts['method'] ?? 'GET'));
         $timeout = (int)($opts['timeout'] ?? self::DEFAULT_TIMEOUT_SEC);
         $connectTimeout = (int)($opts['connectTimeout'] ?? self::DEFAULT_CONNECT_TIMEOUT_SEC);
         $userAgent = (string)($opts['userAgent'] ?? 'CashuPayServer/1.0');
-        $followRedirects = (bool)($opts['followRedirects'] ?? false);
-        $maxRedirects = (int)($opts['maxRedirects'] ?? 3);
         $maxBytes = (int)($opts['maxBytes'] ?? self::DEFAULT_MAX_RESPONSE_BYTES);
         $verifyTls = (bool)($opts['verifyTls'] ?? true);
         $headers = $opts['headers'] ?? [];
@@ -95,16 +140,16 @@ class SafeHttp {
             CURLOPT_USERAGENT => $userAgent,
             CURLOPT_PROTOCOLS => CURLPROTO_HTTP | CURLPROTO_HTTPS,
             CURLOPT_REDIR_PROTOCOLS => CURLPROTO_HTTP | CURLPROTO_HTTPS,
-            CURLOPT_FOLLOWLOCATION => $followRedirects,
-            CURLOPT_MAXREDIRS => $maxRedirects,
+            // Always off: redirects are followed by request() so each hop is
+            // re-validated. Letting curl follow would skip the private-IP check.
+            CURLOPT_FOLLOWLOCATION => false,
             CURLOPT_SSL_VERIFYPEER => $verifyTls,
             CURLOPT_SSL_VERIFYHOST => $verifyTls ? 2 : 0,
             CURLOPT_NOSIGNAL => 1,
         ];
 
-        // Pin curl to the validated IP so a re-resolve (or a redirect when
-        // followRedirects is on) cannot swap to a private address between
-        // our check and the connect.
+        // Pin curl to the validated IP so a re-resolve can't swap to a private
+        // address between our check and the connect.
         if (!empty($validated['resolve'])) {
             $curlOpts[CURLOPT_RESOLVE] = $validated['resolve'];
         }
@@ -129,6 +174,18 @@ class SafeHttp {
                 }
                 break;
         }
+
+        // Capture the Location header (last one wins) so request() can follow
+        // it after re-validation. Case-insensitive per RFC 7230.
+        $redirectLocation = '';
+        $curlOpts[CURLOPT_HEADERFUNCTION] = function ($_ch, string $header) use (&$redirectLocation) {
+            $len = strlen($header);
+            $pos = strpos($header, ':');
+            if ($pos !== false && strcasecmp(substr($header, 0, $pos), 'Location') === 0) {
+                $redirectLocation = trim(substr($header, $pos + 1));
+            }
+            return $len;
+        };
 
         // Enforce response size cap. Bail mid-stream as soon as the
         // accumulated body exceeds $maxBytes so a 500 MB hostile response
@@ -164,7 +221,58 @@ class SafeHttp {
             'body' => $bodyBuf,
             'error' => $error,
             'effectiveUrl' => $effectiveUrl !== '' ? $effectiveUrl : $url,
+            '_redirectLocation' => $redirectLocation,
         ];
+    }
+
+    /**
+     * Resolve a (possibly relative) Location header against the URL it came
+     * from, per the common cases of RFC 3986 reference resolution: absolute
+     * URLs are returned as-is; protocol-relative (//host/path), absolute-path
+     * (/path) and relative-path references are resolved against the base.
+     * Returns null when the result can't be formed.
+     */
+    public static function resolveRedirectTarget(string $baseUrl, string $location): ?string {
+        $location = trim($location);
+        if ($location === '') {
+            return null;
+        }
+        $base = parse_url($baseUrl);
+        if ($base === false || empty($base['scheme']) || empty($base['host'])) {
+            return null;
+        }
+
+        $loc = parse_url($location);
+        if ($loc === false) {
+            return null;
+        }
+
+        // Absolute URL with its own scheme: use as-is.
+        if (!empty($loc['scheme'])) {
+            return $location;
+        }
+
+        $scheme = $base['scheme'];
+        $authority = $base['host'] . (isset($base['port']) ? ':' . $base['port'] : '');
+
+        // Protocol-relative: //host/path
+        if (strpos($location, '//') === 0) {
+            return $scheme . ':' . $location;
+        }
+
+        // Authority inherited from base; resolve the path.
+        if (isset($location[0]) && $location[0] === '/') {
+            // Absolute path on the same authority.
+            return $scheme . '://' . $authority . $location;
+        }
+
+        // Relative path: resolve against the base path's directory.
+        $basePath = $base['path'] ?? '/';
+        $dir = substr($basePath, 0, strrpos($basePath, '/') + 1);
+        if ($dir === '') {
+            $dir = '/';
+        }
+        return $scheme . '://' . $authority . $dir . $location;
     }
 
     /**

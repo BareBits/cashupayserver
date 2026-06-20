@@ -37,6 +37,13 @@ class NotificationSender {
     // and is retried — at-least-once, never lost.
     private const CLAIM_LEASE_SEC = 120;
 
+    // Give up after this many delivery attempts (initial + retries), mirroring
+    // WebhookSender::MAX_ATTEMPTS. Past this the row is stamped failed_at and
+    // never retried — otherwise a permanently-bad recipient or SMTP misconfig
+    // would be re-sent every cron tick forever (a retry storm against SMTP and
+    // endless error_log spam).
+    private const MAX_ATTEMPTS = 6;
+
     // Per-invoice cap on payer receipts. The endpoint that calls
     // queuePayerReceipt is public (anyone with the invoice URL can hit it),
     // so without a limit it becomes a small open relay for paste-the-invoice
@@ -327,6 +334,7 @@ class NotificationSender {
         $rows = Database::fetchAll(
             "SELECT * FROM notification_queue
              WHERE sent_at IS NULL
+               AND failed_at IS NULL
                AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
              ORDER BY id ASC
              LIMIT ?",
@@ -348,7 +356,7 @@ class NotificationSender {
             $claimed = Database::update(
                 'notification_queue',
                 ['next_attempt_at' => $now + self::CLAIM_LEASE_SEC, 'attempts' => (int)$row['attempts'] + 1],
-                'id = ? AND sent_at IS NULL AND (next_attempt_at IS NULL OR next_attempt_at <= ?)',
+                'id = ? AND sent_at IS NULL AND failed_at IS NULL AND (next_attempt_at IS NULL OR next_attempt_at <= ?)',
                 [$row['id'], $now]
             );
             if ($claimed !== 1) {
@@ -374,19 +382,31 @@ class NotificationSender {
                 }
                 $sent++;
             } catch (Throwable $e) {
-                // attempts was already bumped at claim time. Release the lease
-                // (next_attempt_at = NULL) so the row is due again on the next
-                // drain — the lease exists only to guard the in-flight send, not
-                // to back off retries; failed rows retry on the next tick as
-                // before.
-                Database::update(
-                    'notification_queue',
-                    ['last_error' => substr($e->getMessage(), 0, 500), 'next_attempt_at' => null],
-                    'id = ?',
-                    [$row['id']]
-                );
+                // attempts was already bumped to this value at claim time.
+                $attempts = (int)$row['attempts'] + 1;
+                $lastError = substr($e->getMessage(), 0, 500);
+                if ($attempts >= self::MAX_ATTEMPTS) {
+                    // Give up permanently: stamp failed_at so the row leaves the
+                    // due-set for good instead of retrying every tick forever.
+                    Database::update(
+                        'notification_queue',
+                        ['last_error' => $lastError, 'failed_at' => time(), 'next_attempt_at' => null],
+                        'id = ?',
+                        [$row['id']]
+                    );
+                } else {
+                    // Back off the retry instead of releasing the lease to NULL
+                    // (immediately due). Mirrors WebhookSender's backoff so a
+                    // transient SMTP outage doesn't get hammered every cron pass.
+                    Database::update(
+                        'notification_queue',
+                        ['last_error' => $lastError, 'next_attempt_at' => time() + self::backoffSeconds($attempts)],
+                        'id = ?',
+                        [$row['id']]
+                    );
+                }
                 error_log(
-                    "NotificationSender: send failed for queue row {$row['id']}: " . $e->getMessage()
+                    "NotificationSender: send failed for queue row {$row['id']} (attempt {$attempts}): " . $e->getMessage()
                 );
                 $failed++;
             }
@@ -396,11 +416,40 @@ class NotificationSender {
     }
 
     /**
-     * Lightweight check used by the admin UI: are there any unsent rows?
+     * Exponential-ish backoff (seconds) keyed by the number of attempts made.
+     * Mirrors WebhookSender::backoffSeconds so the two outboxes pace retries
+     * identically.
+     */
+    private static function backoffSeconds(int $attempts): int {
+        $schedule = [15, 60, 300, 1800, 3600];
+        $idx = max(0, min($attempts - 1, count($schedule) - 1));
+        return $schedule[$idx];
+    }
+
+    /**
+     * Delete terminal queue rows (delivered or permanently failed) older than
+     * $retentionSec. Still-pending rows (both timestamps NULL) are always kept.
+     * drainQueue marks rows but never deletes them, so without this the queue
+     * grows unbounded. Mirrors WebhookSender::pruneDeliveries.
+     *
+     * @return int number of rows deleted
+     */
+    public static function cleanup(int $retentionSec = 2592000): int {
+        return Database::query(
+            "DELETE FROM notification_queue
+              WHERE (sent_at IS NOT NULL OR failed_at IS NOT NULL)
+                AND created_at < ?",
+            [time() - $retentionSec]
+        )->rowCount();
+    }
+
+    /**
+     * Lightweight check used by the admin UI: are there any rows still pending
+     * delivery? Excludes rows that have been given up on (failed_at set).
      */
     public static function pendingCount(): int {
         $row = Database::fetchOne(
-            "SELECT COUNT(*) AS c FROM notification_queue WHERE sent_at IS NULL"
+            "SELECT COUNT(*) AS c FROM notification_queue WHERE sent_at IS NULL AND failed_at IS NULL"
         );
         return (int)($row['c'] ?? 0);
     }

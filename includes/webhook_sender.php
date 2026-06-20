@@ -237,6 +237,37 @@ class WebhookSender {
     }
 
     /**
+     * Prune old delivery rows for audit-log hygiene, keeping the most recent
+     * $keep TERMINAL rows. Only 'delivered' and 'failed' rows are eligible:
+     * a 'pending' row is still scheduled for retry, so it is never counted or
+     * evicted here — otherwise a burst or a sustained merchant outage that
+     * piles up pending rows could push deliverable events out of the outbox,
+     * silently losing them (the exact failure the outbox exists to prevent).
+     *
+     * @return int number of rows deleted
+     */
+    public static function pruneDeliveries(int $keep = 1000): int {
+        $row = Database::fetchOne(
+            "SELECT COUNT(*) AS cnt FROM webhook_deliveries WHERE status IN ('delivered', 'failed')"
+        );
+        $total = (int)($row['cnt'] ?? 0);
+        if ($total <= $keep) {
+            return 0;
+        }
+        $deleteCount = $total - $keep;
+        Database::query(
+            "DELETE FROM webhook_deliveries
+              WHERE id IN (
+                  SELECT id FROM webhook_deliveries
+                  WHERE status IN ('delivered', 'failed')
+                  ORDER BY created_at ASC LIMIT ?
+              )",
+            [$deleteCount]
+        );
+        return $deleteCount;
+    }
+
+    /**
      * Calculate HMAC signature (BTCPay format)
      */
     private static function calculateSignature(string $payload, string $secret): string {

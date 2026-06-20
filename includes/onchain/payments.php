@@ -21,6 +21,18 @@ class OnchainPayments {
     public const ERR_TWEAK_SLOTS_EXHAUSTED = 'onchain_static_tweak_slots_exhausted';
 
     /**
+     * A confirmed payment buried at least this many blocks is treated as
+     * final: the reorg reconciliation in pollInvoice() will NOT drop it even
+     * if the provider transiently stops reporting it. Shallower observations
+     * that vanish from the provider's view are assumed reorged-out / evicted
+     * and are removed so their (now phantom) value stops counting toward the
+     * invoice total. We deliberately do not attempt to catch reorgs deeper
+     * than this; operators who need settlement to survive deeper reorgs should
+     * raise onchain_min_confs.
+     */
+    public const REORG_SAFETY_DEPTH = 5;
+
+    /**
      * Atomically allocate the next receive address for a store.
      *
      * For xpub-mode stores: derives a fresh address at m/0/{next_index}.
@@ -38,6 +50,14 @@ class OnchainPayments {
     public static function allocateAddress(string $storeId, ?int $baseAmountSat = null): ?array {
         $pdo = Database::getInstance();
         Database::beginImmediate(); // write lock up front: read-before-write allocator (see Database::beginImmediate)
+        // The allocation itself (slot/index reservation) happens under the write
+        // lock; the chain-tip read is deferred until AFTER commit so we never
+        // hold the SQLite write lock across a provider network round-trip — that
+        // would block every other writer for the whole HTTP timeout and 500 them
+        // on a slow provider. Mirrors allocateFeeAddress. $result stays null for
+        // the "no on-chain method configured" early returns.
+        $result = null;
+        $storeRow = null;
         try {
             $stmt = $pdo->prepare(
                 "SELECT * FROM stores WHERE id = ?"
@@ -48,6 +68,7 @@ class OnchainPayments {
                 $pdo->commit();
                 return null;
             }
+            $storeRow = $row;
 
             $mode = $row['onchain_address_mode'] ?? 'xpub';
             $now = time();
@@ -67,58 +88,58 @@ class OnchainPayments {
                     $pdo->rollBack();
                     throw new RuntimeException(self::ERR_TWEAK_SLOTS_EXHAUSTED);
                 }
-                $tip = self::currentTipBestEffort($row);
+                $result = ['address' => $address, 'index' => null, 'tweak' => $tweak];
                 $pdo->commit();
-                return ['address' => $address, 'index' => null, 'tip_height' => $tip, 'tweak' => $tweak];
-            }
-
-            // xpub mode (default)
-            if (empty($row['onchain_xpub'])) {
+            } elseif (empty($row['onchain_xpub'])) {
+                // xpub mode (default) but no xpub configured.
                 $pdo->commit();
                 return null;
+            } else {
+                // Counter is keyed by xpub, not by store, so two stores sharing
+                // the same xpub never derive the same address, and re-pasting a
+                // previously used xpub resumes from where it left off.
+                $xpubHash = hash('sha256', $row['onchain_xpub']);
+                $pdo->prepare(
+                    "INSERT INTO onchain_xpub_state (xpub_hash, next_index, updated_at)
+                     VALUES (?, 0, ?) ON CONFLICT(xpub_hash) DO NOTHING"
+                )->execute([$xpubHash, $now]);
+                $sel = $pdo->prepare(
+                    "SELECT next_index FROM onchain_xpub_state WHERE xpub_hash = ?"
+                );
+                $sel->execute([$xpubHash]);
+                $index = (int)$sel->fetchColumn();
+                $pdo->prepare(
+                    "UPDATE onchain_xpub_state SET next_index = next_index + 1, updated_at = ?
+                      WHERE xpub_hash = ?"
+                )->execute([$now, $xpubHash]);
+
+                // Mirror the index back to the stores row too, for backwards-
+                // compat reporting (admin dashboard surfaces it as nextIndex).
+                $pdo->prepare(
+                    "UPDATE stores SET onchain_next_index = ? WHERE id = ?"
+                )->execute([$index + 1, $storeId]);
+
+                $address = OnchainWallet::deriveAddress(
+                    $row['onchain_xpub'],
+                    $row['onchain_address_type'] ?: 'P2WPKH',
+                    $row['onchain_network'] ?: 'mainnet',
+                    $index
+                );
+
+                $result = ['address' => $address, 'index' => $index, 'tweak' => null];
+                $pdo->commit();
             }
-
-            // Counter is keyed by xpub, not by store, so two stores sharing
-            // the same xpub never derive the same address, and re-pasting a
-            // previously used xpub resumes from where it left off.
-            $xpubHash = hash('sha256', $row['onchain_xpub']);
-            $pdo->prepare(
-                "INSERT INTO onchain_xpub_state (xpub_hash, next_index, updated_at)
-                 VALUES (?, 0, ?) ON CONFLICT(xpub_hash) DO NOTHING"
-            )->execute([$xpubHash, $now]);
-            $sel = $pdo->prepare(
-                "SELECT next_index FROM onchain_xpub_state WHERE xpub_hash = ?"
-            );
-            $sel->execute([$xpubHash]);
-            $index = (int)$sel->fetchColumn();
-            $pdo->prepare(
-                "UPDATE onchain_xpub_state SET next_index = next_index + 1, updated_at = ?
-                  WHERE xpub_hash = ?"
-            )->execute([$now, $xpubHash]);
-
-            // Mirror the index back to the stores row too, for backwards-
-            // compat reporting (admin dashboard surfaces it as nextIndex).
-            $pdo->prepare(
-                "UPDATE stores SET onchain_next_index = ? WHERE id = ?"
-            )->execute([$index + 1, $storeId]);
-
-            $address = OnchainWallet::deriveAddress(
-                $row['onchain_xpub'],
-                $row['onchain_address_type'] ?: 'P2WPKH',
-                $row['onchain_network'] ?: 'mainnet',
-                $index
-            );
-
-            $tip = self::currentTipBestEffort($row);
-
-            $pdo->commit();
-            return ['address' => $address, 'index' => $index, 'tip_height' => $tip, 'tweak' => null];
         } catch (Throwable $e) {
             if ($pdo->inTransaction()) {
                 $pdo->rollBack();
             }
             throw $e;
         }
+
+        // Tip read outside the txn (best-effort network call); failure leaves
+        // tip NULL which simply disables historical-UTXO filtering.
+        $result['tip_height'] = self::currentTipBestEffort($storeRow);
+        return $result;
     }
 
     /**
@@ -409,6 +430,36 @@ class OnchainPayments {
             foreach ($observations as $obs) {
                 self::upsertObservation($invoiceId, $obs, $now);
             }
+        }
+
+        // Reorg / dropped-tx reconciliation. The provider's response is the
+        // address's CURRENT view; a (txid,vout) we previously persisted but that
+        // is no longer reported has been reorged out or evicted from the mempool.
+        // Without this, onchain_payments rows are only ever inserted/updated, so
+        // a stale row keeps counting toward the total forever — a reorged +
+        // double-spent payment would leave the invoice settled on phantom funds.
+        // We cap the rollback at REORG_SAFETY_DEPTH: a payment already buried
+        // >= that many blocks is treated as final, so a transient provider hiccup
+        // that omits it can't drop a deeply confirmed payment. $observations is
+        // the post-historical-filter set, which is exactly what the upserts above
+        // were drawn from, so a live UTXO is always present here.
+        $observedKeys = [];
+        foreach ($observations as $obs) {
+            $observedKeys[$obs->txid . ':' . $obs->vout] = true;
+        }
+        $persistedRows = Database::fetchAll(
+            "SELECT id, txid, vout, confirmations FROM onchain_payments WHERE invoice_id = ?",
+            [$invoiceId]
+        );
+        foreach ($persistedRows as $p) {
+            if (isset($observedKeys[$p['txid'] . ':' . (int)$p['vout']])) {
+                continue; // still live; its confirmations were just refreshed above
+            }
+            if ((int)$p['confirmations'] >= self::REORG_SAFETY_DEPTH) {
+                continue; // deeply buried -> treat as final, ignore provider omission
+            }
+            // Vanished while still shallow: reorged out or dropped. Stop counting it.
+            Database::query("DELETE FROM onchain_payments WHERE id = ?", [$p['id']]);
         }
 
         // Recompute totals from the persisted state (canonical source).
