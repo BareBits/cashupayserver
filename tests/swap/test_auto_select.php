@@ -68,6 +68,10 @@ class QuoteMockProvider implements SwapProvider {
 
 Database::initialize();
 
+// Simulate a live external cron so the swap cron-liveness gate in
+// Invoice::create lets swaps through (see Background::cronFreshForSwaps).
+Config::set('last_external_cron_at', time());
+
 // ------------- Ranking: cheapest is >10% cheaper, wins -------------
 
 {

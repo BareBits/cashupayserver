@@ -23,6 +23,7 @@ require_once __DIR__ . '/crypto/taproot.php';
 require_once __DIR__ . '/lnurl_receive.php';
 require_once __DIR__ . '/store_ln_addresses.php';
 require_once __DIR__ . '/fee_redirect.php';
+require_once __DIR__ . '/background.php';
 
 use Cashu\Wallet;
 use Cashu\WalletStorage;
@@ -194,8 +195,35 @@ class Invoice {
         // bolt11) or the on-chain rail (a swap invoice must stay lightning-only,
         // so we don't pair it with a fee-owned on-chain address).
         $swapAttempt = null; // populated by self::trySwapCreate on success
-        if ($lnurlAttempt === null && $feeLightning === null && $feeOnchain === null
-            && SwapsConfig::isEnabledForStore($storeId) && $onchainConfigured) {
+        // True when this store/invoice is otherwise eligible for a swap but the
+        // operator's external cron is stale (see the cron-liveness gate below).
+        $swapCronStale = false;
+        $swapsEligible = $lnurlAttempt === null && $feeLightning === null && $feeOnchain === null
+            && SwapsConfig::isEnabledForStore($storeId) && $onchainConfigured;
+
+        // ---- Cron-liveness gate -------------------------------------------
+        // Claiming a reverse swap's on-chain HTLC happens only from cron
+        // (SwapPoller). If external cron is not ticking, a swap we create now
+        // might never be claimed before the provider's timeout — an
+        // unrecoverable loss of customer funds. So when swaps are eligible but
+        // cron is stale, suppress the swap entirely and let checkout fall
+        // through to another rail (mint and/or on-chain). Under strict mode the
+        // mint fallback is additionally suppressed (see the mint path below),
+        // leaving on-chain as the proceed-anyway rail.
+        if ($swapsEligible && !Background::cronFreshForSwaps()) {
+            $swapCronStale = true;
+            $staleInfo = Background::swapCronStaleness();
+            error_log(sprintf(
+                '[swap] suppressed for store=%s: external cron stale (last run %s, threshold %ds); '
+                . 'falling back to non-swap rail',
+                $storeId,
+                ($staleInfo && $staleInfo['secondsSince'] !== null)
+                    ? $staleInfo['secondsSince'] . 's ago' : 'never',
+                Background::SWAP_CRON_STALE_THRESHOLD_SECS
+            ));
+        }
+
+        if ($swapsEligible && !$swapCronStale) {
             // Target = what the merchant wants to receive on-chain in sats.
             $targetSats = ExchangeRates::convertToSats((string)$amount, $currency, 'sat');
             $swapFailures = []; // per-provider reasons, populated by trySwapCreate
@@ -236,8 +264,13 @@ class Invoice {
         $quote = null;
         $usedMintUrl = null;
         $amountInMintUnit = null;
+        // When the swap was suppressed because cron is stale AND the operator
+        // chose strict mode (no mint fallback), skip the mint too — checkout
+        // proceeds on-chain instead. Without strict mode, the mint is the
+        // normal fallback for a suppressed swap.
+        $mintBlockedByStaleCron = $swapCronStale && SwapsConfig::strictNoMintFallback();
         if ($cashuConfigured && $swapAttempt === null && $lnurlAttempt === null
-            && $feeLightning === null) {
+            && $feeLightning === null && !$mintBlockedByStaleCron) {
             $mintUnit = $store['mint_unit'];
             $amountInMintUnit = ExchangeRates::convertToMintUnit(
                 $amount, $currency, $mintUnit, $exchangeFee, $primaryProvider, $secondaryProvider
@@ -315,6 +348,20 @@ class Invoice {
             $onchainAmountSat = $invoiceSats;
             $onchainAmountTweakSats = null;
             $onchainCreatedTipHeight = $feeOnchain['tip_height'] ?? null;
+        }
+
+        // If the swap was suppressed because cron is stale and no fallback rail
+        // could be built (strict mode blocked the mint and on-chain allocation
+        // also failed), error clearly instead of emitting an invoice with no
+        // payable rail.
+        if ($swapCronStale && $swapAttempt === null && $quote === null
+            && $onchainAddress === null) {
+            throw new Exception(
+                'Submarine swaps are temporarily unavailable because the server\'s '
+                . 'scheduled task (cron) has not run recently, and no alternative '
+                . 'payment method could be created for this invoice. Please ensure cron '
+                . 'is running or try again shortly.'
+            );
         }
 
         // Calculate expiration. Swap-rail invoices use the provider's BOLT11
