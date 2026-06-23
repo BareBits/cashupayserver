@@ -307,10 +307,19 @@ if (isset($_GET['api'])) {
             //   -1=inherit site default, 0=force off, 1=force on.
             require_once __DIR__ . '/includes/swap/config.php';
             $swapOverride = isset($store['swaps_enabled']) ? (int)$store['swaps_enabled'] : SwapsConfig::INHERIT;
+            $swapFeeEff = SwapsConfig::effectiveFeeFallbackForStore($storeId);
             $storeSwaps = [
                 'override' => $swapOverride,             // tri-state
                 'siteDefault' => SwapsConfig::siteEnabled(),
                 'effective' => SwapsConfig::isEnabledForStore($storeId),
+                // Per-store fee-fallback overrides (null = inherit) for the
+                // input boxes, plus the resolved effective values for help text.
+                'feeFallbackMaxPct' => ($store['swaps_fee_fallback_max_pct'] ?? null) !== null
+                    ? (float)$store['swaps_fee_fallback_max_pct'] : null,
+                'feeFallbackMaxSats' => ($store['swaps_fee_fallback_max_sats'] ?? null) !== null
+                    ? (int)$store['swaps_fee_fallback_max_sats'] : null,
+                'feeFallbackEffectivePct' => $swapFeeEff['pct'],
+                'feeFallbackEffectiveSats' => $swapFeeEff['sats'],
             ];
 
             // On-chain Bitcoin payment settings.
@@ -2280,6 +2289,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'minimumTargetSats'      => SwapsConfig::minimumTargetSats(),
                 'autoSelectCheapest'     => SwapsConfig::autoSelectCheapest(),
                 'autoSelectThresholdPct' => SwapsConfig::autoSelectThresholdPct(),
+                // Raw site values (null = inherit the config-file constant) for
+                // the input boxes, plus the resolved config-file/built-in
+                // default for the placeholder/help text.
+                'feeFallbackMaxPct'         => Config::get('swaps_fee_fallback_max_pct', null),
+                'feeFallbackMaxSats'        => Config::get('swaps_fee_fallback_max_sats', null),
+                'feeFallbackMaxPctDefault'  => SwapsConfig::configFileFeeFallbackMaxPct(),
+                'feeFallbackMaxSatsDefault' => SwapsConfig::configFileFeeFallbackMaxSats(),
                 'autoMeltUseSwapDefault' => SwapAutoMelt::siteDefault(),
                 'autoMeltSwapMinSats'    => SwapAutoMelt::minSats(),
                 'autoMeltSwapMaxFeePct'  => SwapAutoMelt::maxFeePct(),
@@ -2329,6 +2345,33 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 SwapsConfig::setMinimumTargetSats($minSats);
                 SwapsConfig::setAutoSelectCheapest($autoSelect);
                 SwapsConfig::setAutoSelectThresholdPct($autoThreshold);
+
+                // Fee-too-high → mint fallback thresholds. Blank clears the site
+                // value so it inherits the config-file constant; 0 explicitly
+                // disables that check.
+                $rawFeePct = trim((string)($_POST['fee_fallback_max_pct'] ?? ''));
+                if ($rawFeePct === '') {
+                    SwapsConfig::setFeeFallbackMaxPct(null);
+                } else {
+                    if (!is_numeric($rawFeePct)) {
+                        throw new Exception('Fee % threshold must be a number');
+                    }
+                    $feePct = (float)$rawFeePct;
+                    if ($feePct < 0 || $feePct > 100) {
+                        throw new Exception('Fee % threshold must be between 0 and 100');
+                    }
+                    SwapsConfig::setFeeFallbackMaxPct($feePct);
+                }
+                $rawFeeSats = trim((string)($_POST['fee_fallback_max_sats'] ?? ''));
+                if ($rawFeeSats === '') {
+                    SwapsConfig::setFeeFallbackMaxSats(null);
+                } else {
+                    if (!ctype_digit($rawFeeSats)) {
+                        throw new Exception('Fee sats threshold must be a whole number ≥ 0');
+                    }
+                    SwapsConfig::setFeeFallbackMaxSats((int)$rawFeeSats);
+                }
+
                 SwapAutoMelt::setSiteDefault($autoMeltUseSwap);
 
                 echo json_encode(['success' => true]);
@@ -2363,6 +2406,28 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     }
                 }
                 SwapsConfig::setStoreOverride($storeId, $override);
+
+                // Per-store fee-too-high → mint fallback overrides. Blank on a
+                // field clears the override so it inherits the site/config-file
+                // value; 0 explicitly disables that check for this store.
+                $rawPct = trim((string)($_POST['fee_fallback_max_pct'] ?? ''));
+                $rawSats = trim((string)($_POST['fee_fallback_max_sats'] ?? ''));
+                $pct = null;
+                $sats = null;
+                if ($rawPct !== '') {
+                    if (!is_numeric($rawPct) || (float)$rawPct < 0 || (float)$rawPct > 100) {
+                        throw new Exception('Fee % threshold must be between 0 and 100');
+                    }
+                    $pct = (float)$rawPct;
+                }
+                if ($rawSats !== '') {
+                    if (!ctype_digit($rawSats)) {
+                        throw new Exception('Fee sats threshold must be a whole number ≥ 0');
+                    }
+                    $sats = (int)$rawSats;
+                }
+                SwapsConfig::setStoreFeeFallback($storeId, $pct, $sats);
+
                 echo json_encode(['success' => true]);
             } catch (Exception $e) {
                 http_response_code(400);
@@ -5022,6 +5087,28 @@ header('Cache-Control: no-cache, must-revalidate');
                                 </p>
                             </div>
 
+                            <div class="form-group" style="margin-top: 0.75rem; padding-top: 0.75rem; border-top: 1px solid var(--border-color, rgba(255,255,255,0.08));">
+                                <label class="form-label">Fee-too-high mint fallback (this store)</label>
+                                <p class="form-help" style="margin-top: -0.25rem;">
+                                    Override the site thresholds for skipping an expensive swap in
+                                    favour of a mint Lightning invoice (requires a mint on this store).
+                                    Leave blank to inherit; 0 disables a check.
+                                    Effective now: <strong id="store-swaps-fee-effective">&mdash;</strong>
+                                </p>
+                                <div style="display: flex; gap: 1rem; flex-wrap: wrap;">
+                                    <div>
+                                        <label class="form-label" for="store-swaps-fee-pct">Max fee (%)</label>
+                                        <input type="number" class="form-input" id="store-swaps-fee-pct"
+                                               min="0" max="100" step="0.1" placeholder="inherit" style="max-width: 8rem;">
+                                    </div>
+                                    <div>
+                                        <label class="form-label" for="store-swaps-fee-sats">Max fee (sats)</label>
+                                        <input type="number" class="form-input" id="store-swaps-fee-sats"
+                                               min="0" step="1" placeholder="inherit" style="max-width: 8rem;">
+                                    </div>
+                                </div>
+                            </div>
+
                             <div id="store-swaps-error" class="hidden" style="margin-top:0.5rem; color: var(--error); font-size: 0.85rem;"></div>
                             <button class="btn btn-full" id="btn-save-store-swaps" style="margin-top: 0.5rem;">
                                 Save
@@ -5644,6 +5731,30 @@ header('Cache-Control: no-cache, must-revalidate');
                                 Local floor in addition to the provider's own minimum. Leave blank
                                 to use the provider's minimum (Boltz mainnet: 10,000 sats).
                             </p>
+                        </div>
+
+                        <div class="form-group" style="margin-top: 1rem; padding-top: 1rem; border-top: 1px solid var(--border-color, rgba(255,255,255,0.08));">
+                            <label class="form-label">Fall back to mint when swap fees are too high</label>
+                            <p class="form-help" style="margin-top: -0.25rem;">
+                                For small payments a swap can cost more than it's worth. When a store
+                                has a cashu mint enabled, a swap whose total cost (provider fee +
+                                miner fees) exceeds <em>either</em> threshold below is skipped and the
+                                customer is shown a mint Lightning invoice instead. Leave blank to
+                                inherit the config-file value; set 0 to disable a check. (No effect
+                                when strict mode above is on.)
+                            </p>
+                            <div style="display: flex; gap: 1rem; flex-wrap: wrap;">
+                                <div>
+                                    <label class="form-label" for="swaps-fee-max-pct">Max fee (% of amount)</label>
+                                    <input type="number" class="form-input" id="swaps-fee-max-pct"
+                                           min="0" max="100" step="0.1" style="max-width: 9rem;">
+                                </div>
+                                <div>
+                                    <label class="form-label" for="swaps-fee-max-sats">Max fee (sats)</label>
+                                    <input type="number" class="form-input" id="swaps-fee-max-sats"
+                                           min="0" step="1" style="max-width: 9rem;">
+                                </div>
+                            </div>
                         </div>
 
                         <div id="aw-site" data-aw data-aw-scope="site" style="margin-top: 1.5rem; padding-top: 1rem; border-top: 1px solid var(--border-color, rgba(255,255,255,0.08));">
@@ -9901,6 +10012,21 @@ header('Cache-Control: no-cache, must-revalidate');
                 if (minEl) minEl.value = data.minimumTargetSats ?? '';
                 if (autoEl) autoEl.checked = data.autoSelectCheapest !== false; // default true
                 if (thresholdEl) thresholdEl.value = data.autoSelectThresholdPct ?? 10;
+                // Fee-too-high → mint fallback. Show the raw site value (blank
+                // when inheriting); reflect the config-file/built-in default in
+                // the placeholder so operators see what "blank" resolves to.
+                const feePctEl = document.getElementById('swaps-fee-max-pct');
+                const feeSatsEl = document.getElementById('swaps-fee-max-sats');
+                if (feePctEl) {
+                    feePctEl.value = (data.feeFallbackMaxPct ?? '') === '' ? '' : data.feeFallbackMaxPct;
+                    feePctEl.placeholder = data.feeFallbackMaxPctDefault > 0
+                        ? `inherit (${data.feeFallbackMaxPctDefault})` : 'off';
+                }
+                if (feeSatsEl) {
+                    feeSatsEl.value = (data.feeFallbackMaxSats ?? '') === '' ? '' : data.feeFallbackMaxSats;
+                    feeSatsEl.placeholder = data.feeFallbackMaxSatsDefault > 0
+                        ? `inherit (${data.feeFallbackMaxSatsDefault})` : 'off';
+                }
                 const autoMeltSwapEl = document.getElementById('auto-melt-use-swap-default');
                 if (autoMeltSwapEl) autoMeltSwapEl.checked = !!data.autoMeltUseSwapDefault;
                 // Reflect the site default into the auto-cashout column selector.
@@ -9962,6 +10088,8 @@ header('Cache-Control: no-cache, must-revalidate');
                 .map(cb => cb.value);
             const order = checked.join(',');
             const minSats = document.getElementById('swaps-min-sats').value.trim();
+            const feeMaxPct = document.getElementById('swaps-fee-max-pct').value.trim();
+            const feeMaxSats = document.getElementById('swaps-fee-max-sats').value.trim();
             const autoMeltSwapDefault = document.getElementById('auto-melt-use-swap-default').checked ? '1' : '0';
             try {
                 const response = await postWithCsrf(adminUrl,
@@ -9972,6 +10100,8 @@ header('Cache-Control: no-cache, must-revalidate');
                     + `&minimum_target_sats=${encodeURIComponent(minSats)}`
                     + `&auto_select_cheapest=${autoSelect}`
                     + `&auto_select_threshold_pct=${encodeURIComponent(threshold)}`
+                    + `&fee_fallback_max_pct=${encodeURIComponent(feeMaxPct)}`
+                    + `&fee_fallback_max_sats=${encodeURIComponent(feeMaxSats)}`
                     + `&auto_melt_use_swap_default=${autoMeltSwapDefault}`
                 );
                 const result = await response.json();
@@ -9994,6 +10124,18 @@ header('Cache-Control: no-cache, must-revalidate');
             if (sel) sel.value = String(dashboardData.swaps.override);
             if (eff) eff.textContent = dashboardData.swaps.effective ? 'on' : 'off';
             if (def) def.textContent = dashboardData.swaps.siteDefault ? 'on' : 'off';
+            // Fee-too-high → mint fallback per-store overrides.
+            const s = dashboardData.swaps;
+            const fpct = document.getElementById('store-swaps-fee-pct');
+            const fsats = document.getElementById('store-swaps-fee-sats');
+            const feff = document.getElementById('store-swaps-fee-effective');
+            if (fpct) fpct.value = (s.feeFallbackMaxPct ?? null) === null ? '' : s.feeFallbackMaxPct;
+            if (fsats) fsats.value = (s.feeFallbackMaxSats ?? null) === null ? '' : s.feeFallbackMaxSats;
+            if (feff) {
+                const pctTxt = s.feeFallbackEffectivePct > 0 ? (s.feeFallbackEffectivePct + '%') : 'off';
+                const satsTxt = s.feeFallbackEffectiveSats > 0 ? (Number(s.feeFallbackEffectiveSats).toLocaleString() + ' sat') : 'off';
+                feff.textContent = `${pctTxt} / ${satsTxt}`;
+            }
         }
 
         async function saveStoreSwaps() {
@@ -10007,9 +10149,13 @@ header('Cache-Control: no-cache, must-revalidate');
             if (override === '1' && !storeHasOnchain()) {
                 return awError('store-swaps-error', 'Submarine swaps require an on-chain xpub or address on the Bitcoin tab.');
             }
+            const feePct = document.getElementById('store-swaps-fee-pct').value.trim();
+            const feeSats = document.getElementById('store-swaps-fee-sats').value.trim();
             try {
                 const response = await postWithCsrf(adminUrl,
                     `action=save_store_swaps&store_id=${encodeURIComponent(currentStoreId)}&override=${encodeURIComponent(override)}`
+                    + `&fee_fallback_max_pct=${encodeURIComponent(feePct)}`
+                    + `&fee_fallback_max_sats=${encodeURIComponent(feeSats)}`
                 );
                 const result = await response.json();
                 if (response.ok) {

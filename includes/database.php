@@ -863,6 +863,17 @@ HTACCESS;
             // Tri-state: -1 inherit site default, 0 force off, 1 force on.
             $pdo->exec("ALTER TABLE stores ADD COLUMN swaps_enabled INTEGER NOT NULL DEFAULT -1");
         }
+        // Fee-too-high → mint fallback thresholds. When a store has a cashu
+        // mint enabled, a prospective swap whose total cost exceeds either
+        // threshold is skipped in favour of a mint-issued LN invoice. NULL on
+        // either column = inherit the site-wide / config-file value. Nullable
+        // with no default so behaviour is unchanged until an operator opts in.
+        if (!self::columnExists($pdo, 'stores', 'swaps_fee_fallback_max_pct')) {
+            $pdo->exec("ALTER TABLE stores ADD COLUMN swaps_fee_fallback_max_pct REAL DEFAULT NULL");
+        }
+        if (!self::columnExists($pdo, 'stores', 'swaps_fee_fallback_max_sats')) {
+            $pdo->exec("ALTER TABLE stores ADD COLUMN swaps_fee_fallback_max_sats INTEGER DEFAULT NULL");
+        }
         if (!self::columnExists($pdo, 'invoices', 'payment_rail')) {
             // 'mint' (cashu mint, existing default) / 'swap' (submarine swap) /
             // 'onchain' (pay-to-address only). Set once at invoice create time.

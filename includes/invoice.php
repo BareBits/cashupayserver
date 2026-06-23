@@ -199,7 +199,24 @@ class Invoice {
             // Target = what the merchant wants to receive on-chain in sats.
             $targetSats = ExchangeRates::convertToSats((string)$amount, $currency, 'sat');
             $swapFailures = []; // per-provider reasons, populated by trySwapCreate
-            $swapAttempt = self::trySwapCreate($storeId, $store, $targetSats, $swapFailures);
+
+            // Fee-too-high → mint fallback thresholds. Only meaningful when this
+            // store has a cashu mint to fall back to, and only when strict mode
+            // is OFF — strict_no_mint_fallback means "never fall back to mint",
+            // so the fee thresholds are intentionally inert under it. When
+            // inactive we pass 0/0, which disables the gate in trySwapCreate
+            // (swap proceeds regardless of fee, preserving prior behaviour).
+            $feeMaxPct = 0.0;
+            $feeMaxSats = 0;
+            if ($cashuConfigured && !SwapsConfig::strictNoMintFallback()) {
+                $thresholds = SwapsConfig::effectiveFeeFallbackForStore($storeId);
+                $feeMaxPct = $thresholds['pct'];
+                $feeMaxSats = $thresholds['sats'];
+            }
+
+            $swapAttempt = self::trySwapCreate(
+                $storeId, $store, $targetSats, $swapFailures, $feeMaxPct, $feeMaxSats
+            );
             if ($swapAttempt === null && SwapsConfig::strictNoMintFallback()) {
                 // Surface each provider's reason so the operator can act
                 // (typically: "Boltz: amount 10000 sat outside range [50000, 5000000]").
@@ -419,9 +436,16 @@ class Invoice {
      *    'merchant_address_index' => int,
      *    'lockup_fee_sats' => int,
      *    'percent_fee_sats' => int]
+     *
+     * $maxFeePct / $maxFeeSats gate the fee-too-high → mint fallback: a
+     * provider whose prospective total cost exceeds either active threshold
+     * (0 = that check disabled) is skipped. Because providers are ranked
+     * cheapest-first, when the cheapest is too expensive they all are, so this
+     * method returns null and Invoice::create falls through to the mint path.
      */
     private static function trySwapCreate(string $storeId, array $store, int $targetSats,
-                                          ?array &$failureReasons = null): ?array {
+                                          ?array &$failureReasons = null,
+                                          float $maxFeePct = 0.0, int $maxFeeSats = 0): ?array {
         if ($failureReasons === null) $failureReasons = [];
         if ($targetSats <= 0) return null;
         $localMin = SwapsConfig::minimumTargetSats();
@@ -446,6 +470,22 @@ class Invoice {
                         $name, $targetSats, $pairInfo->minSats, $pairInfo->maxSats
                     );
                     continue;
+                }
+
+                // Fee-too-high → mint fallback gate. Evaluate the prospective
+                // total cost from the (cached) quote BEFORE creating the swap on
+                // the provider side, so we never create-then-discard a swap.
+                if ($maxFeePct > 0 || $maxFeeSats > 0) {
+                    $totalCost = SwapQuoteFetcher::totalCostSats($pairInfo, $targetSats);
+                    if (SwapsConfig::swapFeeExceedsThreshold($totalCost, $targetSats, $maxFeePct, $maxFeeSats)) {
+                        $failureReasons[] = sprintf(
+                            "%s: total fee %d sat over mint-fallback threshold (pct=%s, sats=%s)",
+                            $name, $totalCost,
+                            $maxFeePct > 0 ? $maxFeePct : 'off',
+                            $maxFeeSats > 0 ? $maxFeeSats : 'off'
+                        );
+                        continue;
+                    }
                 }
 
                 // Allocate destination address (shared xpub counter).
