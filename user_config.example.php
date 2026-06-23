@@ -193,6 +193,33 @@
 //
 // define('CASHUPAY_AUTO_MELT_SWAP_MAX_FEE_PCT', 1.0);
 
+// =============================================================================
+// SUBMARINE-SWAP FEE → MINT FALLBACK (customer checkout)
+// =============================================================================
+// At checkout, a customer paying via Lightning while the merchant receives
+// on-chain normally goes through a submarine swap. For small payments the swap
+// cost can dwarf the payment. When the store has a cashu mint enabled (and
+// strict-no-mint-fallback is OFF), a prospective swap whose TOTAL cost (percent
+// fee + lockup miner fee + claim miner-fee estimate) exceeds EITHER threshold
+// below is skipped, and the customer is shown a mint-issued Lightning invoice
+// instead.
+//
+// These are the lowest-precedence defaults. Each layers: per-store column →
+// site-wide setting (admin UI) → these config-file constants → 0 (disabled).
+// A value of 0 disables that particular check; with both unset/0 there is no
+// fee-based fallback (historical behaviour). Edit this file and restart PHP-FPM
+// to change the config-file layer.
+
+// CASHUPAY_SWAPS_FEE_FALLBACK_MAX_PCT — fall back to the mint when the swap's
+// total cost exceeds this percent of the invoice amount. Float; 0/unset off.
+//
+// define('CASHUPAY_SWAPS_FEE_FALLBACK_MAX_PCT', 5.0);
+
+// CASHUPAY_SWAPS_FEE_FALLBACK_MAX_SATS — fall back to the mint when the swap's
+// total cost exceeds this many sats. Integer; 0/unset off.
+//
+// define('CASHUPAY_SWAPS_FEE_FALLBACK_MAX_SATS', 1000);
+
 // CASHUPAY_STRIKE_URL — destination for the "get a free lightning address"
 // Strike links shown in the auto-cashout settings. Defaults to
 // 'http://strike.me'. Override to point merchants at a referral/localized URL.
