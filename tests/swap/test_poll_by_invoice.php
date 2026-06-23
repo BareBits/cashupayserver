@@ -122,6 +122,9 @@ class MockSwapProvider implements SwapProvider {
 // ------------- Wire up DB + config + store -------------
 
 Database::initialize();
+// Simulate a live external cron so the swap cron-liveness gate in
+// Invoice::create lets swaps through (see Background::cronFreshForSwaps).
+Config::set('last_external_cron_at', time());
 SwapsConfig::setSiteEnabled(true);
 SwapsConfig::setProviderOrder(['mock']);
 SwapsConfig::setStrictNoMintFallback(true);

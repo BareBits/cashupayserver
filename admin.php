@@ -2299,6 +2299,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'autoMeltUseSwapDefault' => SwapAutoMelt::siteDefault(),
                 'autoMeltSwapMinSats'    => SwapAutoMelt::minSats(),
                 'autoMeltSwapMaxFeePct'  => SwapAutoMelt::maxFeePct(),
+                // Null when external cron is fresh; otherwise the staleness
+                // detail so the UI can warn that swaps are currently suppressed.
+                'cronStale'              => Background::swapCronStaleness(),
+                'cronStaleThresholdSecs' => Background::SWAP_CRON_STALE_THRESHOLD_SECS,
             ]);
             break;
 
@@ -5677,6 +5681,23 @@ header('Cache-Control: no-cache, must-revalidate');
                                 <input type="checkbox" id="swaps-enabled">
                                 <span class="toggle-slider"></span>
                             </label>
+                        </div>
+
+                        <!-- Stale-cron warning: shown by loadSwapSettings() when external
+                             cron has not run within the threshold. Swaps are only claimed
+                             from cron, so they are suppressed at checkout while cron is stale. -->
+                        <div id="swaps-cron-stale-warning" style="display: none; margin-top: 0.85rem;
+                             padding: 0.75rem 0.9rem; border: 1px solid #d97706;
+                             border-radius: 6px; background: rgba(217, 119, 6, 0.12);">
+                            <strong style="color: #d97706;">⚠ Cron is not running — submarine swaps are disabled.</strong>
+                            <p style="font-size: 0.85rem; margin: 0.4rem 0 0 0; color: var(--text-secondary);">
+                                <span id="swaps-cron-stale-detail"></span>
+                                Swaps lock customer funds on-chain that <em>only cron can claim in time</em>,
+                                so new invoices will <strong>not</strong> offer a swap (they fall back to
+                                on-chain or the mint) until cron has run again.
+                                Set up the scheduled task in the
+                                <a href="#card-cron-url" id="swaps-cron-stale-link">Cron URL</a> section.
+                            </p>
                         </div>
 
                         <div class="form-group" style="margin-top: 1rem;">
@@ -10008,6 +10029,32 @@ header('Cache-Control: no-cache, must-revalidate');
                 const autoEl = document.getElementById('swaps-auto-select');
                 const thresholdEl = document.getElementById('swaps-auto-threshold');
                 if (enabledEl) enabledEl.checked = !!data.enabled;
+
+                // Stale-cron warning: swaps are claimed only from cron, so when
+                // external cron is stale they are suppressed at checkout.
+                const cronWarnEl = document.getElementById('swaps-cron-stale-warning');
+                if (cronWarnEl) {
+                    if (data.cronStale) {
+                        const secs = data.cronStale.secondsSince;
+                        const thresholdMin = Math.round((data.cronStaleThresholdSecs || 3600) / 60);
+                        let when;
+                        if (secs == null) {
+                            when = 'Cron has never run on this server.';
+                        } else {
+                            const mins = Math.floor(secs / 60);
+                            const ago = mins >= 60
+                                ? `${Math.floor(mins / 60)}h ${mins % 60}m`
+                                : `${mins}m`;
+                            when = `Cron last ran ${ago} ago (threshold: ${thresholdMin} minutes).`;
+                        }
+                        const detailEl = document.getElementById('swaps-cron-stale-detail');
+                        if (detailEl) detailEl.textContent = when + ' ';
+                        cronWarnEl.style.display = 'block';
+                    } else {
+                        cronWarnEl.style.display = 'none';
+                    }
+                }
+
                 if (strictEl) strictEl.checked = !!data.strictNoMintFallback;
                 if (minEl) minEl.value = data.minimumTargetSats ?? '';
                 if (autoEl) autoEl.checked = data.autoSelectCheapest !== false; // default true

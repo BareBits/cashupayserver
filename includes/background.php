@@ -167,4 +167,67 @@ class Background {
         $lastSync = Config::get('last_proof_sync', 0);
         return time() - $lastSync;
     }
+
+    // ========================================================================
+    // Submarine-swap cron-liveness gate
+    //
+    // Reverse submarine swaps lock customer funds in an on-chain HTLC that
+    // payserver can only recover by broadcasting a preimage claim before the
+    // provider's timeout — and that claim is fired exclusively from cron
+    // (SwapPoller::pollPending, run in every cron mode). The refund key belongs
+    // to the provider, so a missed claim is an unrecoverable loss of funds the
+    // customer has already paid. If the operator's external cron is not
+    // ticking we must NOT hand out new swap invoices.
+    //
+    // Liveness is judged from the freshest of the two external-cron stamps
+    // (`last_external_cron_at` from the main cron, `last_external_cron_swaps_at`
+    // from the optional fast-lane). Both are written only on real external
+    // invocations — internal page-load self-requests never stamp them — so a
+    // fresh stamp is genuine proof the operator's cron is alive. The threshold
+    // is deliberately well inside the provider's multi-hour on-chain timeout:
+    // it stops new doomed invoices early while leaving any already-locked swap
+    // ample headroom to be claimed once cron is restored.
+    // ========================================================================
+
+    public const SWAP_CRON_STALE_THRESHOLD_SECS = 3600; // 60 minutes
+
+    /**
+     * Unix timestamp of the most recent external cron run relevant to swaps
+     * (max of the main and swap-fast-lane stamps), or 0 if neither has run.
+     */
+    public static function lastExternalCronForSwaps(): int {
+        return max(
+            (int) Config::get('last_external_cron_at', 0),
+            (int) Config::get('last_external_cron_swaps_at', 0)
+        );
+    }
+
+    /**
+     * True when external cron has run recently enough that we can trust a swap
+     * we create now will be claimed. False when it has never run or is stale.
+     */
+    public static function cronFreshForSwaps(): bool {
+        $last = self::lastExternalCronForSwaps();
+        if ($last === 0) {
+            return false;
+        }
+        return (time() - $last) < self::SWAP_CRON_STALE_THRESHOLD_SECS;
+    }
+
+    /**
+     * Staleness detail for the settings UI, or null when cron is fresh.
+     *
+     * @return array{lastExternalCronAt: ?int, secondsSince: ?int, thresholdSecs: int}|null
+     */
+    public static function swapCronStaleness(): ?array {
+        if (self::cronFreshForSwaps()) {
+            return null;
+        }
+        $last = self::lastExternalCronForSwaps();
+        return [
+            'lastExternalCronAt' => $last > 0 ? $last : null,
+            'secondsSince'       => $last > 0 ? (time() - $last) : null,
+            'thresholdSecs'      => self::SWAP_CRON_STALE_THRESHOLD_SECS,
+        ];
+    }
 }
