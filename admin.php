@@ -4380,6 +4380,10 @@ header('Cache-Control: no-cache, must-revalidate');
                             <option value="Expired">Expired</option>
                             <option value="Invalid">Invalid</option>
                         </select>
+                        <label for="invoice-store-filter">Store:</label>
+                        <select id="invoice-store-filter">
+                            <option value="__all__">All stores</option>
+                        </select>
                     </div>
                     <div id="all-invoices">
                         <div class="loading"><div class="spinner"></div></div>
@@ -6104,6 +6108,22 @@ header('Cache-Control: no-cache, must-revalidate');
                 });
             }
 
+            // Invoices store filter: picking a concrete store keeps the global
+            // header selector in sync; "All stores" is an invoices-only view.
+            const invStoreSel = document.getElementById('invoice-store-filter');
+            if (invStoreSel) {
+                invStoreSel.addEventListener('change', () => {
+                    const val = invStoreSel.value;
+                    if (val && val !== '__all__') {
+                        currentStoreId = val;
+                        localStorage.setItem('selectedStoreId', currentStoreId);
+                        const header = document.getElementById('store-select');
+                        if (header) header.value = currentStoreId;
+                    }
+                    loadInvoices();
+                });
+            }
+
             // Withdraw modal
             document.getElementById('btn-confirm-withdraw').addEventListener('click', handleWithdraw);
             document.getElementById('withdraw-amount').addEventListener('input', updateWithdrawInfo);
@@ -6319,7 +6339,9 @@ header('Cache-Control: no-cache, must-revalidate');
 
             if (view === 'invoices') {
                 setInvoiceStatusFilter(readInvoiceFilterFromUrl());
-                loadInvoices();
+                // Populate (and default to the current store) before loading so
+                // the list matches the dropdown selection on first entry.
+                populateInvoiceStoreFilter().then(loadInvoices);
             }
             if (view === 'stores') loadStoreSettings();
             if (view === 'products') loadProductsView();
@@ -6598,8 +6620,10 @@ header('Cache-Control: no-cache, must-revalidate');
             if (document.getElementById('view-stores').classList.contains('active')) {
                 loadStoreSettings();
             }
-            // If on invoices view, reload invoices
+            // If on invoices view, keep its store filter in sync and reload
             if (document.getElementById('view-invoices').classList.contains('active')) {
+                const invStoreSel = document.getElementById('invoice-store-filter');
+                if (invStoreSel) invStoreSel.value = currentStoreId || '__all__';
                 loadInvoices();
             }
             // If on products view, reload that store's catalog
@@ -6815,11 +6839,35 @@ header('Cache-Control: no-cache, must-revalidate');
             history.replaceState({ view: 'invoices' }, '', url);
         }
 
+        // The invoices store filter mirrors the global header store selector
+        // (so the default view is the currently selected store) but adds an
+        // "All stores" option that drops the store_id filter entirely.
+        async function populateInvoiceStoreFilter() {
+            const sel = document.getElementById('invoice-store-filter');
+            if (!sel) return;
+            try {
+                const r = await fetch(adminUrl + '?api=stores');
+                const stores = await r.json();
+                sel.innerHTML = '<option value="__all__">All stores</option>'
+                    + stores.map(s => `<option value="${s.id}">${escapeHtml(s.name || s.id)}</option>`).join('');
+                const desired = currentStoreId || '__all__';
+                sel.value = [...sel.options].some(o => o.value === desired) ? desired : '__all__';
+            } catch (e) {
+                // Leave the existing "All stores" option in place on failure.
+            }
+        }
+
+        function getInvoiceStoreFilter() {
+            const sel = document.getElementById('invoice-store-filter');
+            return sel ? sel.value : (currentStoreId || '__all__');
+        }
+
         async function loadInvoices() {
             try {
                 let url = adminUrl + '?api=invoices&limit=100';
-                if (currentStoreId) {
-                    url += `&store_id=${encodeURIComponent(currentStoreId)}`;
+                const storeFilter = getInvoiceStoreFilter();
+                if (storeFilter && storeFilter !== '__all__') {
+                    url += `&store_id=${encodeURIComponent(storeFilter)}`;
                 }
                 const status = getInvoiceStatusFilter();
                 if (status) {
