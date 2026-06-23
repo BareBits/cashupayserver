@@ -6,12 +6,11 @@
 </p>
 
 # BareBits
-## ⚠️ DO NOT USE THIS WE ARE MOVING FAST AND BREAKING THINGS IN THIS CODE, THERE IS A SIGNIFICANT RISK OF FUNDS LOSS ⚠️
 > **A BTCPay-compatible payment gateway that runs on any PHP hosting.**
 
-Accept Bitcoin Lightning payments without running a full BTCPay Server instance. No Docker, no VPS, no command line. Just upload and go.
+Accept Bitcoin Lightning payments without running a full BTCPay Server instance. No Docker, no VPS, no command line. Just upload and go. **Low 1% fee**. 
 
-**Forked from [cashupayserver.org](https://cashupayserver.org/)**
+**Are you a web developer? Re-sell this software to your customers at a custom fee rate. Your customers pay a x% fee, payments go directly to your LNURL.** Just modify the appropriate settings in the config file.
 
 ---
 
@@ -33,27 +32,28 @@ Accept Bitcoin Lightning payments without running a full BTCPay Server instance.
 
 ## What is BareBits?
 
-BareBits is a PHP-based Bitcoin Lightning payment gateway that implements BTCPay Server's Greenfield API. It uses [Cashu](https://cashu.space/) mints to handle Lightning payments, so you don't need to run your own Lightning node.
+BareBits is a PHP-based Bitcoin Lightning payment gateway that implements BTCPay Server's Greenfield API. Any e-commerce software that works with BTCPay Server can work with BareBits. 
 
-```
-E-commerce (WooCommerce, etc.)
-    │
-    ▼ (Greenfield API)
-BareBits (PHP)
-    │
-    ▼ (Cashu Protocol)
-Cashu Mint ──► Lightning Network
-```
+BareBits supports a number of payment types, risk/trust levels, and capabilities including:
+ 
 
 ### Key Features
-
 - **Any PHP hosting** - Works on $3/month shared hosting. If it runs WordPress, it runs this.
+- **No accounts or KYC**
+- **Self-custody** - A fully self-custody solution, or add Cashu mint support for increased convenience
+- **Multiple stores** - Each store can have it's own invoice settings, cashout addresses, etc.
 - **BTCPay-compatible API** - WooCommerce and other BTCPay plugins work by changing one URL.
-- **No accounts or KYC** - Your store talks to the mint's public API directly.
-- **Pure Lightning experience** - Customers see a normal Lightning invoice.
-- **On-chain Bitcoin payments** - Accept direct Bitcoin transactions alongside Lightning. Funds go straight to *your* wallet (xpub-derived addresses) — never to the mint. See [docs/onchain.md](docs/onchain.md).
-- **Auto-cashout** - Optionally send funds directly to your Lightning address.
+- **User management** - Admin users can modify store settings and products and withdraw funds, regular users can only take payments.
+- **Product management** - Add commonly-used products to your store to make invoicing fast and clear
+- **Receipts** E-mail receipts to your customers (optional)
+ - **On-chain payments** to an off-server wallet using xpub addresses
+ - **Lightning payments** to an LNURL lightning address and/or a cashu mint (no need to manage liquidity). No LNURL? Don't want to rely on a cashu mint? You can use dubmarine swaps so your customer's can pay in lightning but you receive the funds on-chain. Your customer pays the swap fee
+ - **Cashu token** payments immediately melded to lightning. 
+ - **Offline** payments powered by Cashu tokens (optional)
 - **Open source** - Read every line of code. Fork it, audit it yourself. Dual-licensed MIT (pre-2026-05-30) and Modified MIT (post-2026-05-30). See [LICENSE.md](LICENSE.md) and [USE_POLICY.md](USE_POLICY.md).
+
+### BareBits vs CashuPayServer
+BareBits adds a number of enhancements to the original CashuPayServer software including on-chain payments, accepting cashu tokens, offline payments, automatic submarine swaps, automatic updates, security enhancements, LNURL support, user management, product management, a stats menu, and more. BareBits charges a **1% fee** for usage
 
 ### Trade-offs
 
@@ -62,13 +62,13 @@ BareBits sits between custodial payment gateways and full self-hosting:
 | Solution | Pros | Cons |
 |----------|------|------|
 | Custodial gateways | Easy setup | KYC, can freeze funds, geographic restrictions |
-| BTCPay Server | Full sovereignty | Needs VPS ($20+/mo), Docker, ongoing maintenance |
-| **BareBits** | Simple, cheap hosting | Trust mint with funds until withdrawal |
+| [BTCPay Server](https://btcpayserver.org/) | Full sovereignty | Needs VPS ($20+/mo), Docker, ongoing maintenance |
+| [Bitcart](https://bitcart.ai/) | Full sovereignty, limited lightning support | Needs VPS ($10+/mo), Docker, ongoing maintenance |
+| **BareBits** | Simple, cheap hosting | Trust mint with funds until withdrawal, or go full self-custody |
 
 ## Payment Flow
 
 Generally speaking, BareBits tries to offer both on-chain and lightning as payment options to all customers. On-chain payments are always enabled, lightning payments are enabled depending on configuration. Here's what that decision tree looks like:
-- Is the invoice amount < fees due? Present on-chain and lightning invoice for fees. Payment gets transparently re-routed to fee payment.
 - Is the customer paying on-chain? Send directly to merchant xpub wallet
 - Does the merchant have a working LNURL? Present a lightning invoice
 - If submarine swaps are NOT enabled and a cashu mint is NOT enabled, do not present a lightning invoice.
@@ -76,37 +76,37 @@ Generally speaking, BareBits tries to offer both on-chain and lightning as payme
 - If submarine swaps are NOT enabled, or no provider can serve the amount, display a lightning invoice that sends payment to the cashu mint — unless strict mode is on, in which case the invoice is rejected instead. Funds are later emptied from the mint to the merchant's on-chain wallet by auto-cashout once it's worth it (auto-cashout caps the swap fee at 1% of the amount by default).
 
 
+## Fee Payments and Structure
+
+The BareBits software charges a 1% fee for usage. If you are a web developer, you can sell this service to your clients and charge an additional fee on top. Fees are paid in a number of ways.
+
+ - When any invoice is generated where the invoice amount is < the fee due, the payment will be automatically redirected to the fee destination.
+ - If any funds are in the cash mint and a fee is due, those funds will be used to pay the fee
+
 ## Submarine Swaps (LN → on-chain, optional)
 
 When enabled, BareBits can route a customer's Lightning payment through a
 third-party submarine-swap provider (Zeus or Boltz) and settle the proceeds
 **directly on-chain to the merchant's xpub** — without the cashu mint ever
-holding the funds.
+holding the funds. This is useful for merchants who DON'T have a lightning address, 
+DON'T want to trust a cashu mint, and DON'T want to manage their own liquidity. 
+This can also be used as a fallback option if your lightning address is offline or
+has no inbound liquidity.
 
 The customer's experience is unchanged: they pay the same single BOLT11 invoice
-on the checkout page. Behind the scenes, the provider holds the LN payment
-until BareBits has claimed the corresponding on-chain output via a
-Taproot HTLC; the held LN invoice is then settled atomically with the on-chain
-claim.
+on the checkout page.
 
 **Pros**
 
-- **Non-custodial.** Customer's funds never touch a mint. The provider holds the
-  LN payment for at most the swap window (typically tens of minutes); on success
-  the LN payment settles only when the on-chain claim completes. On failure the
-  LN HTLC times out and the customer's wallet refunds itself automatically.
-- **Direct on-chain settlement.** Funds land at an xpub-derived address you
-  control, discoverable by any standard wallet that scans the xpub.
-- **Provider-agnostic.** Site-wide preference order across multiple providers;
-  if the primary is unreachable at invoice creation, the next one is tried.
-- **Customer pays the fees.** Swap fees (provider percent + on-chain lockup
-  miner fee) are bundled into the LN invoice amount; the merchant receives the
+- **Non-custodial.** Customer's funds never touch a mint, instead, funds go directly to your on-chain wallet
+- **Provider-agnostic.** Both Boltz and Zeus are automatically enabled, Zeus is preferred but Boltz is used if significantly cheaper than Zeus.
+- **Customer pays the fees.** Swap fees (provider percent + on-chain lockup  miner fee) are bundled into the LN invoice amount; the merchant receives the
   target sat amount on-chain net of fees.
 
 **Cons**
 
 - **Per-invoice fees.** Boltz currently charges ~0.5% + the lockup miner fee.
-  Stats dashboard tracks both as a "Swap fees" line item.
+  Stats dashboard tracks both as a "Swap fees" line item. This means it's not adviseable for smaller invoice amounts.
 - **Min/max amount limits.** Boltz mainnet currently enforces 10,000 sats min
   and 5,000,000 sats max per swap; invoices outside this range can't use the
   swap rail.
@@ -117,7 +117,7 @@ claim.
   nothing.
 - **Optional mint fallback.** By default, if all configured providers are
   unreachable or the amount is out-of-range, BareBits falls back to the
-  cashu mint. You can enable "strict mode" in settings to disable the fallback
+  cashu mint (if enabled). You can enable "strict mode" in settings to disable the fallback
   and reject the invoice instead — useful for operators who want to eliminate
   the mint entirely from their payment flow.
 
@@ -138,13 +138,6 @@ claim.
 | Zeus     | `https://swaps.zeuslsp.com/api`       | `https://testnet-swaps.zeuslsp.com/api` | — |
 | Boltz    | `https://api.boltz.exchange`          | — (discontinued upstream)               | configurable (`swaps_boltz_regtest_url`) |
 
-**Out of scope for this version (planned follow-ups)**
-
-- Cooperative musig2 keypath claim (currently script-path only — slightly less
-  private on-chain, otherwise functionally identical).
-- On-chain → LN direction (only LN → on-chain is implemented; interface is
-  designed to accommodate it later).
-
 ## Requirements
 
 - PHP 8.0 or higher
@@ -159,7 +152,7 @@ if you're building from source (see Development below).
 
 ### Standalone (Any PHP Hosting)
 
-1. **Download** the latest `cashupayserver.zip` from [GitHub Releases](https://github.com/jooray/cashupayserver/releases)
+1. **Download** the latest `cashupayserver.zip` from [GitHub Releases](https://github.com/BareBits/cashupayserver/releases)
 2. **Extract** the zip file
 3. **Upload** to your web hosting via FTP or file manager
 4. **Open** the URL in your browser (e.g., `https://yourdomain.com/cashupayserver/`)
@@ -167,68 +160,15 @@ if you're building from source (see Development below).
 
 ### WordPress Plugin
 
-1. **Download** `cashupay-wordpress.zip` from [GitHub Releases](https://github.com/jooray/cashupayserver/releases)
+1. **Download** `cashupay-wordpress.zip` from [GitHub Releases](https://github.com/BareBits/cashupayserver/releases)
 2. In WordPress admin, go to **Plugins → Add New → Upload Plugin**
 3. **Upload** the zip file and activate
 4. Go to **Tools → BareBits** to configure
 5. Optionally integrates with the BTCPay for WooCommerce plugin if installed (configured during setup), or paste the pairing URL into BTCPay plugin settings manually
 
-### Deployment Options
+### Other e-commerce integrations
 
-#### Option 1: Shared Hosting (No Server Configuration)
-
-Upload files to your hosting and use the **front controller URL**:
-
-```
-Server URL: https://yoursite.com/cashupayserver/router.php
-```
-
-This works on any PHP host without server configuration. The e-commerce plugin will access URLs like:
-- `https://yoursite.com/cashupayserver/router.php/api/v1/stores/.../invoices`
-
-#### Option 2: Apache with mod_rewrite
-
-If your host supports `.htaccess` and mod_rewrite (most do), use clean URLs:
-
-```
-Server URL: https://yoursite.com/cashupayserver
-```
-
-The included `.htaccess` handles URL rewriting automatically.
-
-#### Option 3: nginx
-
-Add to your server block:
-
-```nginx
-location /cashupayserver/ {
-    # API routing
-    location ~ ^/cashupayserver/api/v1/ {
-        try_files $uri /cashupayserver/api.php$is_args$args;
-    }
-
-    # Block sensitive directories
-    location ~ ^/cashupayserver/(data|includes|cashu-wallet-php)/ {
-        deny all;
-        return 403;
-    }
-}
-```
-
-Then use:
-```
-Server URL: https://yoursite.com/cashupayserver
-```
-
-### Connecting to WooCommerce
-
-After installation, configure WooCommerce to use BareBits:
-
-1. Install the [BTCPay for WooCommerce](https://wordpress.org/plugins/btcpay-greenfield-for-woocommerce/) plugin
-2. In WooCommerce → Settings → Payments → BTCPay, set:
-   - **BTCPay Server URL**: Your BareBits URL
-   - Click **Connect to BTCPay** to start the pairing flow
-3. Save and test with a small purchase
+Any e-commerce website which support BTCPay Server will work with BareBits, just change the BTCPay Server URL to your BareBits URL. [Supported platforms include Drupal, Magneto, Presto Shop, and more](https://docs.btcpayserver.org/FAQ/Integrations/#what-e-commerce-integrations-are-available). 
 
 ### Recommended: Configure system cron
 
@@ -236,7 +176,8 @@ BareBits's background tasks — invoice polling, auto-cashout, and
 fee settlement — run on a tight schedule when your hosting environment
 invokes `cron.php` once a minute. Without it, the same tasks still fire
 opportunistically when an admin or customer loads a page, but with
-multi-minute latency.
+multi-minute latency. 
+**This is particularly critical for submarine swaps: without cron, payments may not be claimed in time and may be refunded to the customer!**
 
 Open **Settings** in the admin UI to copy the suggested entry, then add it
 to your system crontab (or your host's cron panel). The admin dashboard
@@ -288,7 +229,7 @@ Click **Forgot password? → Email me a reset link**, enter the admin recovery e
 touch data/reset-admin-password
 ```
 
-If you've relocated the data directory with `CASHUPAY_DATA_DIR`, create the file there instead (e.g. `/home/user/cashupay-data/reset-admin-password`). The data directory is not web-served, so creating this file already requires the same server access an attacker would need to read the database — that filesystem access *is* the authorization.
+If you've relocated the data directory with `CASHUPAY_DATA_DIR`, create the file there instead (e.g. `/home/user/cashupay-data/reset-admin-password`). 
 
 Then reload the sign-in page. It detects the file and shows a **"Set a new admin password"** form. Your existing password keeps working until you complete the form; once you submit a new password the trigger file is **deleted automatically**. Only the primary `admin` account is reset. If you created the file by mistake, just delete it.
 
@@ -489,80 +430,17 @@ Check that the web server can read PHP executables.
 2. Click the refresh button in your dashboard
 3. Enable PHP error logging to see detailed errors
 
-## Related Projects
-
-- **[cashu-wallet-php](https://github.com/jooray/cashu-wallet-php)** - Standalone PHP library for Cashu protocol
-- **[btcpay-greenfield-test](https://github.com/jooray/btcpay-greenfield-test)** - Minimalistic PHP page to test BTCPay Server's Greenfield API integrations
-- **[BTCPay Server](https://btcpayserver.org/)** - The gold standard for self-hosted Bitcoin payments
-- **[Cashu](https://cashu.space/)** - Ecash protocol for Bitcoin
-
 ## Contributing
 
-Contributions are welcome! Please:
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Test thoroughly
-5. Submit a pull request
-
-## Support and Value4Value
-
-If you like this project, I would appreciate if you contributed time, talent, or treasure.
-
-**Time and talent** can be used in testing it out, fixing bugs, or submitting pull requests.
-
-**Treasure** can be [donated here](https://cashupayserver.org/#donate). The
-software also pays a small built-in upstream development fee on revenue routed
-through it; see [LICENSE.md](LICENSE.md) for details.
+Contributions are welcome! Please discuss with us first prior to committing and making a PR.
 
 ## Forked from CashuPayServer
 
 BareBits is a fork of [CashuPayServer](https://github.com/jooray/cashupayserver) by Juraj Bednár. The original project established the core idea: a PHP-only Bitcoin payment gateway built on Cashu mints, speaking the BTCPay Greenfield API. BareBits preserves that foundation and adds direct on-chain support, multi-user administration, security hardening, an in-app updater, a sustainable revenue model, and a comprehensive test suite — all while keeping the "upload and go" deployment story on any PHP host.
 
-### Major changes since the fork
+#### Brand rename to BareBits, CashuPayServer origin
 
-#### On-chain Bitcoin payments
-
-Accept native Bitcoin transactions alongside Lightning. Funds derive from your own xpub — never the mint — so on-chain payments go straight to your wallet. Built on `bitwasp/bitcoin`, with pluggable blockchain providers (Esplora HTTP and `bitcoind` RPC), per-xpub derivation counters that survive address reuse, and a setup-wizard step plus an admin settings card. See [docs/onchain.md](docs/onchain.md).
-
-#### Multi-user admin with role-based access
-
-A real account system replaces the original single-password model. Admins can create users, assign roles, and manage their own account from a header user-menu. Non-admin surfaces are gated server-side, not just hidden in the UI.
-
-#### Authentication & security hardening
-
-CSRF protection on login/approve/deny POSTs, hardened session cookies, XSS fixes across pairing, payment, and admin surfaces (including escaped API-key labels in Settings), removal of the legacy client-side PIN in favor of server-side session checks, and a setup-flow guard that refuses to create a second admin when one already exists.
-
-#### Auto-update from main/testing channels
-
-A PHP-only updater pulls release zips from a chosen channel (`main` or `testing`) and overlays them on the install in place, preserving local data, user config, and the updater itself. Includes backups, a reachable `recover.php` that accepts POST tokens, and a cron integration so updates can run unattended.
-
-#### Email notifications
-
-Optional SMTP or `mail()`-based notifications for invoice-paid and auto-cashout events, with per-recipient resolution, dedupe, queue-drain, and a master kill-switch. Plugs into the existing cron loop.
-
-#### Mint reliability tracking
-
-A trusted-mints list and per-mint reliability tracking. Mints marked `MINT_UNREACHABLE` are temporarily gated and automatically re-admitted after a retry interval, so a single flaky mint doesn't permanently break the dashboard.
-
-#### Free trial, dev fee, and license restructure
-
-A deployment-time free trial waives platform fees for new installs. After the trial, a small built-in upstream development fee is collected on revenue routed through the instance. Licensing was restructured to a dual MIT / Modified MIT model documented in [LICENSE.md](LICENSE.md) and the [BareBits Use Policy](USE_POLICY.md).
-
-#### Stats dashboard
-
-An admin stats view with CSV export, including a fix for the `dev_fee` status bug that previously misclassified some entries.
-
-#### Stale-cron warning + Settings cron URL
-
-The admin dashboard shows a dismissable banner if external cron hasn't fired in 24+ hours, and the Settings page displays the exact cron entry to copy into your host's crontab.
-
-#### Comprehensive test infrastructure
-
-The fork added an end-to-end test framework covering the Greenfield API surface (38+ tests), an auto-melt LNURL-pay path, a Playwright-driven UI tier, a WordPress-hosted plugin tier, an on-chain tier against `bitcoind` regtest, and GitHub Actions CI that runs the suite on push and PR. Customer-wallet fixtures cover Electrum, cashu.me, and Fulcrum.
-
-#### Brand rename to BareBits
+**Forked from [cashupayserver.org](https://cashupayserver.org/)**
 
 User-facing surfaces (page titles, headings, footers, button labels, PWA manifest, WordPress admin labels, withdrawal-memo descriptions, API "setup not complete" error) were renamed to "BareBits". Code identifiers, file paths, the composer package name, the `isCashuPayServer` BTCPay-compat API flag, and the WordPress menu slug are kept as-is to preserve compatibility.
 
@@ -597,4 +475,3 @@ separate written Service Agreement.
 ## Links
 
 - **Website**: [cashupayserver.org](https://cashupayserver.org/)
-- **Issues**: [GitHub Issues](https://github.com/jooray/cashupayserver/issues)
