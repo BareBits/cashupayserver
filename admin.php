@@ -329,6 +329,19 @@ if (isset($_GET['api'])) {
                 'feeFallbackEffectiveSats' => $swapFeeEff['sats'],
             ];
 
+            // Self-serve invoice tri-state override + per-store max override.
+            require_once __DIR__ . '/includes/selfserve.php';
+            $storeSelfServe = [
+                'override'         => SelfServe::storeOverride($storeId),  // tri-state
+                'siteDefault'      => SelfServe::siteEnabled(),
+                'effective'        => SelfServe::isEnabledForStore($storeId),
+                'paymentCapable'   => SelfServe::storeIsPaymentCapable($store),
+                'maxSatsOverride'  => SelfServe::storeMaxSats($storeId),   // null = inherit
+                'effectiveMaxSats' => SelfServe::effectiveMaxSats($storeId),
+                'siteMaxSats'      => SelfServe::siteMaxSats(),
+                'payUrl'           => Urls::selfServe($storeId),
+            ];
+
             // On-chain Bitcoin payment settings.
             $onchainXpub = $store['onchain_xpub'] ?? '';
             $onchainMode = $store['onchain_address_mode'] ?? 'xpub';
@@ -416,6 +429,7 @@ if (isset($_GET['api'])) {
                 'notifications' => $storeNotifications,
                 'onchain' => $onchain,
                 'swaps' => $storeSwaps,
+                'selfserve' => $storeSelfServe,
                 'reliability' => (function() {
                     require_once __DIR__ . '/includes/mint_reliability.php';
                     $disabled = MintReliability::listDisabledMints();
@@ -2562,6 +2576,85 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $sats = (int)$rawSats;
                 }
                 SwapsConfig::setStoreFeeFallback($storeId, $pct, $sats);
+
+                echo json_encode(['success' => true]);
+            } catch (Exception $e) {
+                http_response_code(400);
+                echo json_encode(['error' => $e->getMessage()]);
+            }
+            break;
+
+        // ----- Self-serve invoice settings -----
+
+        case 'get_selfserve_settings':
+            Auth::requireAdmin();
+            require_once __DIR__ . '/includes/selfserve.php';
+            echo json_encode([
+                'enabled' => SelfServe::siteEnabled(),
+                // Raw site max (null when inheriting the built-in default) for
+                // the input box, plus the built-in default for the placeholder.
+                'maxSats'        => Config::get('selfserve_max_sats', null),
+                'maxSatsDefault' => SelfServe::DEFAULT_MAX_SATS,
+            ]);
+            break;
+
+        case 'save_selfserve_settings':
+            Auth::requireAdmin();
+            require_once __DIR__ . '/includes/selfserve.php';
+            try {
+                $enabled = ($_POST['enabled'] ?? '0') === '1';
+                SelfServe::setSiteEnabled($enabled);
+
+                // Blank clears the site max back to the built-in default; a
+                // positive whole number sets it.
+                $rawMax = trim((string)($_POST['max_sats'] ?? ''));
+                if ($rawMax === '') {
+                    SelfServe::setSiteMaxSats(null);
+                } else {
+                    if (!ctype_digit($rawMax) || (int)$rawMax <= 0) {
+                        throw new Exception('Maximum must be a positive whole number of sats');
+                    }
+                    SelfServe::setSiteMaxSats((int)$rawMax);
+                }
+
+                echo json_encode(['success' => true]);
+            } catch (Exception $e) {
+                http_response_code(400);
+                echo json_encode(['error' => $e->getMessage()]);
+            }
+            break;
+
+        case 'save_store_selfserve':
+            Auth::requireAdmin();
+            require_once __DIR__ . '/includes/selfserve.php';
+            try {
+                $storeId = $_POST['store_id'] ?? '';
+                if (empty($storeId)) {
+                    throw new Exception('Store ID required');
+                }
+                $store = Config::getStore($storeId);
+                if (!$store) {
+                    throw new Exception('Store not found');
+                }
+                $override = (int)($_POST['override'] ?? SelfServe::INHERIT);
+                // Forcing self-serve on only makes sense if the store can take a
+                // payment — otherwise every customer submission would error.
+                if ($override === SelfServe::FORCE_ON && !SelfServe::storeIsPaymentCapable($store)) {
+                    throw new Exception('This store has no payment method configured (add a Cashu mint or on-chain address first).');
+                }
+                SelfServe::setStoreOverride($storeId, $override);
+
+                // Per-store max override. Blank clears it (inherit the site
+                // value); a positive whole number sets it.
+                $rawMax = trim((string)($_POST['max_sats'] ?? ''));
+                if ($rawMax === '') {
+                    SelfServe::setStoreMaxSats($storeId, null);
+                } else {
+                    if (!ctype_digit($rawMax) || (int)$rawMax <= 0) {
+                        throw new Exception('Maximum must be a positive whole number of sats');
+                    }
+                    SelfServe::setStoreMaxSats($storeId, (int)$rawMax);
+                }
 
                 echo json_encode(['success' => true]);
             } catch (Exception $e) {
@@ -5031,6 +5124,23 @@ header('Cache-Control: no-cache, must-revalidate');
                         </div>
                     </div>
                 </div>
+                <!-- Self-serve link banner. Surfaces the public /pay/<store> link
+                     for the selected store so the operator knows the feature
+                     exists and can share it. Shown only when self-serve is
+                     effectively enabled for the current store; the toggle itself
+                     lives in the store's Settings card. -->
+                <div class="card hidden" id="card-selfserve-link">
+                    <div class="card-body" style="display:flex; align-items:center; gap:0.75rem; flex-wrap:wrap;">
+                        <span style="flex:1 1 240px; min-width:200px;">
+                            &#9889; <strong>Self-serve payments are on.</strong>
+                            Share this link so customers can create and pay their own invoice:
+                        </span>
+                        <input type="text" class="form-input" id="invoices-selfserve-link" readonly
+                               style="flex:2 1 260px; min-width:200px; font-size:0.8rem;">
+                        <button class="btn btn-secondary" id="btn-copy-invoices-selfserve-link" style="width:auto; flex:0 0 auto;">Copy</button>
+                        <a class="btn" id="invoices-selfserve-open" target="_blank" rel="noopener" style="width:auto; flex:0 0 auto;">Open</a>
+                    </div>
+                </div>
                 <div class="card view-fill">
                     <div class="card-header">
                         <div class="card-title">All Invoices</div>
@@ -5379,6 +5489,57 @@ header('Cache-Control: no-cache, must-revalidate');
 
                             <div id="store-swaps-error" class="hidden" style="margin-top:0.5rem; color: var(--error); font-size: 0.85rem;"></div>
                             <button class="btn btn-full" id="btn-save-store-swaps" style="margin-top: 0.5rem;">
+                                Save
+                            </button>
+                        </div>
+                    </div>
+
+                    <div class="card collapsible" id="card-store-selfserve">
+                        <div class="card-header">
+                            <div class="card-title">Self-Serve Invoices</div>
+                        </div>
+                        <div class="card-body">
+                            <p style="font-size: 0.85rem; color: var(--text-secondary); margin: 0 0 0.75rem 0;">
+                                Let customers create and pay their own invoice (no login) from a public
+                                link, choosing the amount and an optional note. Requires a payment method
+                                on this store. Site default: <strong id="store-selfserve-site-default">&mdash;</strong>.
+                            </p>
+
+                            <div class="form-group">
+                                <label class="form-label">Mode</label>
+                                <select class="form-input" id="store-selfserve-override">
+                                    <option value="-1">Inherit site default</option>
+                                    <option value="1">Force on for this store</option>
+                                    <option value="0">Force off for this store</option>
+                                </select>
+                                <p class="form-help">
+                                    Currently effective: <strong id="store-selfserve-effective">&mdash;</strong>
+                                </p>
+                            </div>
+
+                            <div class="form-group">
+                                <label class="form-label" for="store-selfserve-max">Maximum invoice (sats)</label>
+                                <input type="number" class="form-input" id="store-selfserve-max"
+                                       min="1" step="1" placeholder="inherit site default">
+                                <p class="form-help">
+                                    Leave blank to inherit the site-wide maximum. Effective now:
+                                    <strong id="store-selfserve-max-effective">&mdash;</strong> sats.
+                                </p>
+                            </div>
+
+                            <div class="form-group" id="store-selfserve-link-row" style="display:none;">
+                                <label class="form-label">Public payment link</label>
+                                <div style="display:flex; gap:0.5rem;">
+                                    <input type="text" class="form-input" id="store-selfserve-link" readonly
+                                           style="flex:1; font-size:0.8rem;">
+                                    <button type="button" class="btn btn-secondary" id="btn-copy-selfserve-link"
+                                            style="width:auto; flex:0 0 auto;">Copy</button>
+                                </div>
+                                <p class="form-help">Share this link with your customers.</p>
+                            </div>
+
+                            <div id="store-selfserve-error" class="hidden" style="margin-top:0.5rem; color: var(--error); font-size: 0.85rem;"></div>
+                            <button class="btn btn-full" id="btn-save-store-selfserve" style="margin-top: 0.5rem;">
                                 Save
                             </button>
                         </div>
@@ -6102,6 +6263,46 @@ header('Cache-Control: no-cache, must-revalidate');
 
                         <button class="btn btn-full" id="btn-save-swaps" style="margin-top: 1rem;">
                             Save swap settings
+                        </button>
+                    </div>
+                </div>
+
+                <!--
+                    Self-serve invoices — site-wide master switch + per-invoice
+                    maximum. Per-store override lives in that store's settings card.
+                -->
+                <div class="card collapsible" data-admin-only="true" id="card-selfserve">
+                    <div class="card-header">
+                        <div class="card-title">Self-Serve Invoices</div>
+                    </div>
+                    <div class="card-body">
+                        <p style="font-size: 0.85rem; color: var(--text-secondary); margin: 0 0 0.75rem 0;">
+                            Let customers create and pay their own invoice from a public link
+                            (/pay/&lt;store&gt;), without logging in. They choose the amount, currency
+                            and an optional note. Disabled by default. Each store can override this in
+                            its own settings card; the link is shown there once enabled.
+                        </p>
+
+                        <div class="toggle-container">
+                            <span><strong>Enable self-serve invoices</strong> (site-wide default)</span>
+                            <label class="toggle">
+                                <input type="checkbox" id="selfserve-enabled">
+                                <span class="toggle-slider"></span>
+                            </label>
+                        </div>
+
+                        <div class="form-group" style="margin-top: 1rem;">
+                            <label class="form-label" for="selfserve-max-sats">Maximum invoice (sats)</label>
+                            <input type="number" class="form-input" id="selfserve-max-sats"
+                                   min="1" step="1" placeholder="500000">
+                            <p class="form-help">
+                                Caps how much a single self-serve invoice can lock up. Leave blank for
+                                the default (500,000 sats).
+                            </p>
+                        </div>
+
+                        <button class="btn btn-full" id="btn-save-selfserve" style="margin-top: 1rem;">
+                            Save self-serve settings
                         </button>
                     </div>
                 </div>
@@ -7270,6 +7471,19 @@ header('Cache-Control: no-cache, must-revalidate');
             if (saveSwapsBtn) saveSwapsBtn.addEventListener('click', saveSwapSettings);
             const saveStoreSwapsBtn = document.getElementById('btn-save-store-swaps');
             if (saveStoreSwapsBtn) saveStoreSwapsBtn.addEventListener('click', saveStoreSwaps);
+            const saveSelfServeBtn = document.getElementById('btn-save-selfserve');
+            if (saveSelfServeBtn) saveSelfServeBtn.addEventListener('click', saveSelfServeSettings);
+            const saveStoreSelfServeBtn = document.getElementById('btn-save-store-selfserve');
+            if (saveStoreSelfServeBtn) saveStoreSelfServeBtn.addEventListener('click', saveStoreSelfServe);
+            const copySelfServeLinkBtn = document.getElementById('btn-copy-selfserve-link');
+            if (copySelfServeLinkBtn) copySelfServeLinkBtn.addEventListener('click', copySelfServeLink);
+            const copyInvoicesSelfServeLinkBtn = document.getElementById('btn-copy-invoices-selfserve-link');
+            if (copyInvoicesSelfServeLinkBtn) copyInvoicesSelfServeLinkBtn.addEventListener('click', () => {
+                const el = document.getElementById('invoices-selfserve-link');
+                if (!el || !el.value) return;
+                navigator.clipboard.writeText(el.value).then(() => showToast('Link copied!', 'success'))
+                    .catch(() => showToast('Could not copy link', 'error'));
+            });
             document.getElementById('btn-validate-onchain').addEventListener('click', validateOnchainXpub);
             document.getElementById('btn-test-onchain').addEventListener('click', testOnchainCurrent);
             document.getElementById('btn-save-onchain').addEventListener('click', saveOnchain);
@@ -7495,6 +7709,7 @@ header('Cache-Control: no-cache, must-revalidate');
                     loadAutoUpdateCard();
                     loadNotificationSettings();
                     loadSwapSettings();
+                    loadSelfServeSettings();
                 }
             }
         }
@@ -7975,6 +8190,9 @@ header('Cache-Control: no-cache, must-revalidate');
 
                 // Per-store swap override + effective indicator.
                 refreshStoreSwapsCard();
+
+                // Per-store self-serve override, max + public link.
+                refreshStoreSelfServeCard();
 
             } catch (e) {
                 console.error(e);
@@ -10681,6 +10899,130 @@ header('Cache-Control: no-cache, must-revalidate');
                 }
             } catch (e) {
                 showToast('Failed to save store swap setting', 'error');
+            }
+        }
+
+        // -------- Self-serve invoice settings --------
+
+        async function loadSelfServeSettings() {
+            try {
+                const response = await postWithCsrf(adminUrl, 'action=get_selfserve_settings');
+                if (!response.ok) return;
+                const data = await response.json();
+                const enabledEl = document.getElementById('selfserve-enabled');
+                const maxEl = document.getElementById('selfserve-max-sats');
+                if (enabledEl) enabledEl.checked = !!data.enabled;
+                if (maxEl) {
+                    // Blank when inheriting the built-in default; show the default
+                    // in the placeholder so operators see what "blank" resolves to.
+                    maxEl.value = (data.maxSats ?? '') === '' ? '' : data.maxSats;
+                    maxEl.placeholder = String(data.maxSatsDefault ?? 500000);
+                }
+            } catch (e) {
+                console.error('Failed to load self-serve settings', e);
+            }
+        }
+
+        async function saveSelfServeSettings() {
+            const enabled = document.getElementById('selfserve-enabled').checked ? '1' : '0';
+            const maxSats = document.getElementById('selfserve-max-sats').value.trim();
+            try {
+                const response = await postWithCsrf(adminUrl,
+                    `action=save_selfserve_settings`
+                    + `&enabled=${enabled}`
+                    + `&max_sats=${encodeURIComponent(maxSats)}`
+                );
+                const result = await response.json();
+                if (response.ok) {
+                    showToast('Self-serve settings saved!', 'success');
+                    // Refresh the per-store card's "site default" + effective text.
+                    if (currentStoreId) { await loadDashboardData(); refreshStoreSelfServeCard(); }
+                } else {
+                    showToast(result.error || 'Failed to save', 'error');
+                }
+            } catch (e) {
+                showToast('Failed to save self-serve settings', 'error');
+            }
+        }
+
+        function refreshStoreSelfServeCard() {
+            // Driven by dashboardData.selfserve once loaded.
+            if (!dashboardData || !dashboardData.selfserve) return;
+            const s = dashboardData.selfserve;
+            const sel = document.getElementById('store-selfserve-override');
+            const eff = document.getElementById('store-selfserve-effective');
+            const def = document.getElementById('store-selfserve-site-default');
+            const maxEl = document.getElementById('store-selfserve-max');
+            const maxEff = document.getElementById('store-selfserve-max-effective');
+            const linkRow = document.getElementById('store-selfserve-link-row');
+            const linkEl = document.getElementById('store-selfserve-link');
+            if (sel) sel.value = String(s.override);
+            if (eff) eff.textContent = s.effective ? 'on' : 'off';
+            if (def) def.textContent = s.siteDefault ? 'on' : 'off';
+            if (maxEl) maxEl.value = (s.maxSatsOverride ?? null) === null ? '' : s.maxSatsOverride;
+            if (maxEl) maxEl.placeholder = 'inherit (' + Number(s.siteMaxSats).toLocaleString() + ')';
+            if (maxEff) maxEff.textContent = Number(s.effectiveMaxSats).toLocaleString();
+            // Show the shareable public link only when self-serve is effectively on.
+            if (linkRow && linkEl) {
+                if (s.effective && s.payUrl) {
+                    linkEl.value = s.payUrl;
+                    linkRow.style.display = '';
+                } else {
+                    linkRow.style.display = 'none';
+                }
+            }
+
+            // Mirror the link onto the Invoices view banner so the feature is
+            // discoverable from where operators manage invoices.
+            const banner = document.getElementById('card-selfserve-link');
+            const bannerLink = document.getElementById('invoices-selfserve-link');
+            const bannerOpen = document.getElementById('invoices-selfserve-open');
+            if (banner && bannerLink) {
+                if (s.effective && s.payUrl) {
+                    bannerLink.value = s.payUrl;
+                    if (bannerOpen) bannerOpen.href = s.payUrl;
+                    banner.classList.remove('hidden');
+                } else {
+                    banner.classList.add('hidden');
+                }
+            }
+        }
+
+        function copySelfServeLink() {
+            const linkEl = document.getElementById('store-selfserve-link');
+            if (!linkEl || !linkEl.value) return;
+            navigator.clipboard.writeText(linkEl.value).then(() => {
+                showToast('Link copied!', 'success');
+            }).catch(() => showToast('Could not copy link', 'error'));
+        }
+
+        async function saveStoreSelfServe() {
+            if (!currentStoreId) {
+                showToast('No store selected', 'error');
+                return;
+            }
+            clearAwError('store-selfserve-error');
+            const override = document.getElementById('store-selfserve-override').value;
+            const maxSats = document.getElementById('store-selfserve-max').value.trim();
+            // Forcing self-serve on requires a payment method on the store.
+            if (override === '1' && dashboardData?.selfserve && !dashboardData.selfserve.paymentCapable) {
+                return awError('store-selfserve-error', 'This store has no payment method configured (add a Cashu mint or on-chain address first).');
+            }
+            try {
+                const response = await postWithCsrf(adminUrl,
+                    `action=save_store_selfserve&store_id=${encodeURIComponent(currentStoreId)}&override=${encodeURIComponent(override)}`
+                    + `&max_sats=${encodeURIComponent(maxSats)}`
+                );
+                const result = await response.json();
+                if (response.ok) {
+                    showToast('Store self-serve setting saved', 'success');
+                    await loadDashboardData();
+                    refreshStoreSelfServeCard();
+                } else {
+                    awError('store-selfserve-error', result.error || 'Failed to save');
+                }
+            } catch (e) {
+                showToast('Failed to save store self-serve setting', 'error');
             }
         }
 

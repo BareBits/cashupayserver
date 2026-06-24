@@ -13,7 +13,7 @@ if (!defined('ABSPATH')) {
 // compares it to the cashupay_rewrite_version option and flushes once on
 // mismatch — so an in-place update doesn't require deactivate/reactivate or a
 // manual Settings → Permalinks → Save Changes to pick up new routes.
-const CASHUPAY_REWRITE_VERSION = '2';
+const CASHUPAY_REWRITE_VERSION = '3';
 
 // Register rewrite rules on init
 add_action('init', 'cashupay_add_rewrite_rules');
@@ -36,6 +36,8 @@ function cashupay_disable_trailing_slash_redirect($redirect_url, $requested_url)
 function cashupay_add_rewrite_rules(): void {
     add_rewrite_rule('^cashupay/api/v1/(.*)$', 'index.php?cashupay_api=1&cashupay_path=$matches[1]', 'top');
     add_rewrite_rule('^cashupay/payment/(.*)$', 'index.php?cashupay_payment=$matches[1]', 'top');
+    // Public self-serve invoice page: /cashupay/pay/{storeId}
+    add_rewrite_rule('^cashupay/pay/([^/]+)/?$', 'index.php?cashupay_pay=$matches[1]', 'top');
     // Admin SPA: capture optional view slug (e.g. /cashupay-admin/invoices) so
     // a refresh restores the operator's current page.
     add_rewrite_rule('^cashupay-admin(?:/([^/]+))?/?$', 'index.php?cashupay_admin=1&cashupay_admin_view=$matches[1]', 'top');
@@ -60,6 +62,7 @@ function cashupay_query_vars(array $vars): array {
     $vars[] = 'cashupay_api';
     $vars[] = 'cashupay_path';
     $vars[] = 'cashupay_payment';
+    $vars[] = 'cashupay_pay';
     $vars[] = 'cashupay_admin';
     $vars[] = 'cashupay_admin_view';
     $vars[] = 'cashupay_setup';
@@ -89,6 +92,13 @@ function cashupay_handle_request(): void {
     if ($payment) {
         $_GET['id'] = $payment;
         require CASHUPAY_PLUGIN_DIR . '/payment.php';
+        exit;
+    }
+
+    $pay = get_query_var('cashupay_pay');
+    if ($pay) {
+        $_GET['store'] = $pay;
+        require CASHUPAY_PLUGIN_DIR . '/pay.php';
         exit;
     }
 

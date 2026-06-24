@@ -91,6 +91,16 @@ if (preg_match('#^/payment(?:/(.+))?$#', $uri, $matches)) {
 }
 
 // -----------------------------------------------------------------------------
+// Self-serve invoice page: /pay/{storeId} — public, unauthenticated page where
+// a customer creates and pays their own invoice (gated per store; see pay.php).
+// -----------------------------------------------------------------------------
+if (preg_match('#^/pay/([^/]+)$#', $uri, $matches)) {
+    $_GET['store'] = $matches[1];
+    require __DIR__ . '/pay.php';
+    exit;
+}
+
+// -----------------------------------------------------------------------------
 // Admin: /admin, /admin.php, or /admin[.php]/<view> (e.g. /admin/invoices)
 // The sub-path is the SPA view slug — forwarded via PATH_INFO so admin.php
 // can pick it up uniformly. The optional .php form keeps router-mode links
@@ -195,7 +205,7 @@ if ($uri === '/' || $uri === '') {
 // Direct .php file access (for backwards compatibility)
 // Only allow specific public files
 // -----------------------------------------------------------------------------
-$allowedFiles = ['index.php', 'admin.php', 'setup.php', 'payment.php', 'api.php', 'cron.php', 'receive.php', 'recover.php', 'update.php', 'health.php', 'product-image.php'];
+$allowedFiles = ['index.php', 'admin.php', 'setup.php', 'payment.php', 'pay.php', 'api.php', 'cron.php', 'receive.php', 'recover.php', 'update.php', 'health.php', 'product-image.php'];
 $requestedFile = basename($uri);
 
 if (in_array($requestedFile, $allowedFiles)) {

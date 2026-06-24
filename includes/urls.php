@@ -127,6 +127,24 @@ class Urls {
     }
 
     /**
+     * Get the public self-serve invoice page URL for a store (/pay/{storeId}).
+     *
+     * Mirrors setup(): in router mode the pretty path is served through
+     * router.php; in direct mode we link straight to the file with a query
+     * param so it works without any URL rewrites.
+     */
+    public static function selfServe(string $storeId): string {
+        if (self::isWordPress()) {
+            return site_url('/cashupay/pay/' . rawurlencode($storeId));
+        }
+        $base = rtrim(Config::getBaseUrl(), '/');
+        $mode = Config::getUrlMode();
+        return $mode === 'direct'
+            ? $base . '/pay.php?store=' . urlencode($storeId)
+            : $base . '/router.php/pay/' . rawurlencode($storeId);
+    }
+
+    /**
      * Get the API key authorization (pairing) URL
      *
      * @param array $params Query parameters for the authorization request
