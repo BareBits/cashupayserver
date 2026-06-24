@@ -72,9 +72,12 @@ $store = Database::fetchOne(
 $storeName = $store['name'] ?? 'Payment';
 
 // Public POST endpoint: payer enters their email on the payment-complete
-// modal and requests a receipt. No CSRF token because there's no auth
-// context to abuse — the page itself is unauthenticated. The per-invoice
-// send cap inside NotificationSender is what bounds abuse.
+// modal. We persist the email + newsletter opt-in on the invoice (always, for
+// the merchant's customer list) and, when payer receipts are enabled, also
+// queue a confirmation email. No CSRF token because there's no auth context to
+// abuse — the page itself is unauthenticated. The per-invoice send cap inside
+// NotificationSender bounds receipt-email abuse; the email column is a single
+// overwrite, so capture itself is harmless to spam.
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'send_receipt') {
     require_once __DIR__ . '/includes/notification_sender.php';
     header('Content-Type: application/json');
@@ -84,11 +87,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'send_
         echo json_encode(['error' => 'Invoice is not paid yet.']);
         exit;
     }
-    if (!NotificationSender::isPayerReceiptOffered()) {
-        http_response_code(403);
-        echo json_encode(['error' => 'Payment receipts are not available on this server.']);
-        exit;
-    }
 
     $email = trim((string)($_POST['email'] ?? ''));
     if ($email === '' || !filter_var($email, FILTER_VALIDATE_EMAIL)) {
@@ -96,23 +94,38 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'send_
         echo json_encode(['error' => 'Please enter a valid email address.']);
         exit;
     }
+    $newsletterOptIn = ($_POST['newsletter'] ?? '0') === '1' ? 1 : 0;
 
-    if (NotificationSender::payerReceiptCountForInvoice($invoice['id'])
-            >= NotificationSender::PAYER_RECEIPT_MAX_PER_INVOICE) {
-        http_response_code(429);
-        echo json_encode(['error' => 'Receipt limit reached for this invoice.']);
-        exit;
+    // Persist the customer's email + newsletter choice on the invoice. Last
+    // submission wins — the payer may resubmit with a changed choice. This is
+    // decoupled from receipt sending so it works even without SMTP/receipts.
+    Database::update(
+        'invoices',
+        ['customer_email' => $email, 'newsletter_opt_in' => $newsletterOptIn],
+        'id = ?',
+        [$invoice['id']]
+    );
+
+    // Queue a payment-confirmation email only when receipts are offered. The
+    // per-invoice cap still bounds how many receipts can be sent.
+    $receiptQueued = false;
+    if (NotificationSender::isPayerReceiptOffered()) {
+        if (NotificationSender::payerReceiptCountForInvoice($invoice['id'])
+                >= NotificationSender::PAYER_RECEIPT_MAX_PER_INVOICE) {
+            http_response_code(429);
+            echo json_encode(['error' => 'Receipt limit reached for this invoice.']);
+            exit;
+        }
+        $receiptQueued = NotificationSender::queuePayerReceipt($invoice, $email);
+        if (!$receiptQueued) {
+            // Race: the cap was reached between the check above and the call.
+            http_response_code(429);
+            echo json_encode(['error' => 'Receipt limit reached for this invoice.']);
+            exit;
+        }
     }
 
-    $queued = NotificationSender::queuePayerReceipt($invoice, $email);
-    if (!$queued) {
-        // Race: the cap was reached between the check above and the call.
-        http_response_code(429);
-        echo json_encode(['error' => 'Receipt limit reached for this invoice.']);
-        exit;
-    }
-
-    echo json_encode(['success' => true]);
+    echo json_encode(['success' => true, 'receiptQueued' => $receiptQueued]);
     exit;
 }
 
@@ -132,6 +145,11 @@ $invoiceNote = is_array($invoiceMetadata) ? trim((string)($invoiceMetadata['item
 // modal shows a "screenshot this page" fallback instead.
 require_once __DIR__ . '/includes/notification_sender.php';
 $payerReceiptOffered = NotificationSender::isPayerReceiptOffered();
+
+// Resolve the newsletter checkbox's initial state for this store (per-store
+// override → site-wide default). The email/newsletter capture form is shown
+// regardless of whether receipts are offered.
+$newsletterDefaultChecked = Config::getNewsletterDefaultChecked($invoice['store_id']);
 
 // Format amount for display - use store's mint unit
 $mintUnit = Config::getStoreMintUnit($invoice['store_id']);
@@ -578,6 +596,22 @@ $baseUrl = Config::getBaseUrl();
             outline: none;
             border-color: var(--accent);
         }
+        .receipt-form .receipt-newsletter {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            margin: 0 0 0.6rem;
+            color: var(--text-secondary);
+            font-size: 0.82rem;
+            cursor: pointer;
+        }
+        .receipt-form .receipt-newsletter input {
+            width: 1rem;
+            height: 1rem;
+            accent-color: var(--accent);
+            cursor: pointer;
+            flex-shrink: 0;
+        }
         .receipt-form .receipt-skip {
             display: block;
             margin-top: 0.75rem;
@@ -871,19 +905,22 @@ $baseUrl = Config::getBaseUrl();
                     <div><span class="label">Note:</span><span class="invoice-note-value"><?= htmlspecialchars($invoiceNote) ?></span></div>
                     <?php endif; ?>
                 </div>
-                <?php if ($payerReceiptOffered): ?>
-                <form class="receipt-form" id="receipt-form" novalidate>
+                <form class="receipt-form" id="receipt-form" data-receipt-offered="<?= $payerReceiptOffered ? '1' : '0' ?>" novalidate>
                     <div class="receipt-prompt">
-                        Email me a payment confirmation
+                        <?= $payerReceiptOffered ? 'Email me a payment confirmation' : 'Leave your email' ?>
                         <small>Optional</small>
                     </div>
                     <input type="email" class="form-input" id="receipt-email"
                            placeholder="you@example.com" autocomplete="email" required>
-                    <button type="submit" class="btn" id="receipt-submit">Send receipt</button>
+                    <label class="receipt-newsletter" for="receipt-newsletter">
+                        <input type="checkbox" id="receipt-newsletter" <?= $newsletterDefaultChecked ? 'checked' : '' ?>>
+                        Subscribe to our newsletter
+                    </label>
+                    <button type="submit" class="btn" id="receipt-submit"><?= $payerReceiptOffered ? 'Send receipt' : 'Submit' ?></button>
                     <button type="button" class="receipt-skip" id="receipt-skip">No thanks</button>
                     <div class="receipt-status hidden" id="receipt-status"></div>
                 </form>
-                <?php else: ?>
+                <?php if (!$payerReceiptOffered): ?>
                 <div class="receipt-fallback">
                     Screenshot this page or save your invoice ID for your records.
                 </div>
@@ -1173,7 +1210,9 @@ $baseUrl = Config::getBaseUrl();
             const submitBtn = document.getElementById('receipt-submit');
             const skipBtn = document.getElementById('receipt-skip');
             const emailInput = document.getElementById('receipt-email');
+            const newsletterInput = document.getElementById('receipt-newsletter');
             const statusEl = document.getElementById('receipt-status');
+            const receiptOffered = form.getAttribute('data-receipt-offered') === '1';
 
             function setStatus(msg, kind) {
                 statusEl.textContent = msg;
@@ -1190,11 +1229,12 @@ $baseUrl = Config::getBaseUrl();
                 const email = emailInput.value.trim();
                 if (!email) { setStatus('Please enter an email address.', 'error'); return; }
                 submitBtn.disabled = true;
-                setStatus('Sending…', null);
+                setStatus(receiptOffered ? 'Sending…' : 'Saving…', null);
                 try {
                     const body = new URLSearchParams();
                     body.set('action', 'send_receipt');
                     body.set('email', email);
+                    body.set('newsletter', (newsletterInput && newsletterInput.checked) ? '1' : '0');
                     const pollUrl = new URL(window.location.href);
                     pollUrl.searchParams.set('id', invoiceId);
                     const response = await fetch(pollUrl.toString(), {
@@ -1204,12 +1244,15 @@ $baseUrl = Config::getBaseUrl();
                     });
                     const data = await response.json().catch(() => ({}));
                     if (response.ok && data.success) {
-                        setStatus('Receipt queued — check your inbox.', 'success');
+                        setStatus(data.receiptQueued
+                            ? 'Receipt queued — check your inbox.'
+                            : 'Thanks — your email has been saved.', 'success');
                         emailInput.disabled = true;
+                        if (newsletterInput) newsletterInput.disabled = true;
                         submitBtn.style.display = 'none';
                         skipBtn.style.display = 'none';
                     } else {
-                        setStatus(data.error || 'Could not send receipt.', 'error');
+                        setStatus(data.error || 'Could not save your email.', 'error');
                         submitBtn.disabled = false;
                     }
                 } catch (err) {

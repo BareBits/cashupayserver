@@ -236,6 +236,22 @@ class Config {
     }
 
     /**
+     * Resolve whether the "Subscribe to our newsletter" checkbox on the
+     * payment-complete screen should start checked for a given store. The
+     * per-store override (stores.newsletter_default_checked, 0/1) wins when set;
+     * otherwise fall back to the site-wide default (config key
+     * newsletter_default_checked, defaulting to true / checked).
+     */
+    public static function getNewsletterDefaultChecked(string $storeId): bool {
+        $store = self::getStore($storeId);
+        $override = $store['newsletter_default_checked'] ?? null;
+        if ($override !== null && $override !== '') {
+            return (int)$override === 1;
+        }
+        return self::get('newsletter_default_checked', true) === true;
+    }
+
+    /**
      * Currencies that may be offered as a default display/input currency in
      * addition to the mint's native unit.
      */

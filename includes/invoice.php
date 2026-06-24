@@ -1151,6 +1151,12 @@ class Invoice {
             // path that marks Settled without knowing the rail.
             'paymentRail' => $invoice['settled_rail'] ?: ($invoice['payment_rail'] ?? null),
             'checkoutLink' => Urls::payment($invoice['id']),
+            // Customer-supplied email + newsletter opt-in (entered on the
+            // payment-complete screen). null until the payer submits the form.
+            'customerEmail' => $invoice['customer_email'] ?? null,
+            'newsletterOptIn' => isset($invoice['newsletter_opt_in']) && $invoice['newsletter_opt_in'] !== null
+                ? (bool)$invoice['newsletter_opt_in']
+                : null,
         ];
 
         // Per-store network drives mempool.space URLs in the admin UI. We
