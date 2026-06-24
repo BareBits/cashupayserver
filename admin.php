@@ -3693,11 +3693,63 @@ header('Cache-Control: no-cache, must-revalidate');
         }
 
         .view.active {
-            display: block;
+            /* Flex column so the view fills the full height of .main (which is
+               itself flex:1 inside the .app column). Without this the view is
+               only as tall as its content, leaving empty space below on short
+               pages such as Settings. */
+            display: flex;
+            flex-direction: column;
+            flex: 1;
             /* Top-align so content fills from the top of the viewport rather
                than floating in the vertical centre. */
             margin: 0;
             width: 100%;
+        }
+
+        /* List-style views (dashboard / invoices / products): the primary
+           content card absorbs the remaining vertical space so a short list
+           fills the viewport instead of leaving a gap below it. min-height
+           defaults to auto, so a long list still grows the card and scrolls. */
+        .view-fill {
+            flex: 1 1 auto;
+        }
+
+        /* Stacked-card views (settings / stats / stores): pin a trailing
+           footer/version line to the bottom of the viewport. The view flexes
+           to full height above it while the cards keep their natural size. */
+        .view-footer {
+            margin-top: auto;
+        }
+
+        /* Settings: on desktop the card list scrolls inside its own region
+           (.settings-scroll) while the version footer stays fixed at the bottom
+           and always visible. An inner scroll region needs a definite height,
+           so the app is capped to the viewport ONLY while Settings is the active
+           view (via :has); every other view keeps normal whole-page scrolling.
+           On mobile this rule does not apply — .settings-scroll is a plain block
+           and the footer keeps margin-top:auto, scrolling with the page above
+           the fixed bottom nav. */
+        @media (min-width: 768px) {
+            .app:has(#view-settings.active) {
+                height: 100vh;
+                height: 100dvh;
+            }
+            .app:has(#view-settings.active) .main {
+                min-height: 0;
+            }
+            #view-settings.active {
+                min-height: 0;
+            }
+            #view-settings.active .settings-scroll {
+                flex: 1 1 auto;
+                min-height: 0;
+                overflow-y: auto;
+            }
+            #view-settings.active .view-footer {
+                flex-shrink: 0;
+                margin-top: 0;
+                border-top: 1px solid var(--border);
+            }
         }
 
         /* Generic visibility helper — used by the Users / Settings UI so JS
@@ -4762,7 +4814,7 @@ header('Cache-Control: no-cache, must-revalidate');
                     </div>
                 </div>
 
-                <div class="card">
+                <div class="card view-fill">
                     <div class="card-header">
                         <div class="card-title">Recent Invoices</div>
                     </div>
@@ -4793,7 +4845,7 @@ header('Cache-Control: no-cache, must-revalidate');
                         </div>
                     </div>
                 </div>
-                <div class="card">
+                <div class="card view-fill">
                     <div class="card-header">
                         <div class="card-title">All Invoices</div>
                         <div style="display: flex; gap: 0.5rem;">
@@ -5332,7 +5384,7 @@ header('Cache-Control: no-cache, must-revalidate');
 
             <!-- Products View (admin only; per-store catalog for the cart) -->
             <div class="view" id="view-products">
-                <div class="card">
+                <div class="card view-fill">
                     <div class="card-header" style="display:flex; align-items:center; justify-content:space-between; gap:0.5rem; flex-wrap:wrap;">
                         <div class="card-title">Products</div>
                         <button class="btn" id="btn-new-product" style="width:auto; padding:0.4rem 0.9rem;">+ New product</button>
@@ -5362,6 +5414,11 @@ header('Cache-Control: no-cache, must-revalidate');
 
             <!-- Settings View (Global) -->
             <div class="view" id="view-settings">
+                <!-- On desktop the cards scroll inside .settings-scroll while
+                     the version footer below stays fixed and always visible;
+                     on mobile this is a plain block and the footer scrolls with
+                     the page (the bottom nav owns the bottom edge there). -->
+                <div class="settings-scroll">
                 <div id="settings-scope-note" style="margin-bottom: 1rem; padding: 0.85rem 1rem; border-radius: 12px; background: rgba(96, 165, 250, 0.1); border: 1px solid rgba(96, 165, 250, 0.3); font-size: 0.9rem; line-height: 1.45;">
                     <strong>These are site-wide settings and defaults.</strong>
                     Most knobs operators want to tweak day-to-day &mdash; auto-cashout destination,
@@ -5955,7 +6012,8 @@ header('Cache-Control: no-cache, must-revalidate');
                     </div>
                 </div>
 
-                <div style="text-align: center; padding: 1.5rem 0; color: var(--text-muted); font-size: 0.8rem;">
+                </div><!-- /.settings-scroll -->
+                <div class="view-footer" style="text-align: center; padding: 1.5rem 0; color: var(--text-muted); font-size: 0.8rem;">
                     BareBits v<?= CASHUPAY_VERSION ?> &middot;
                     Deployment ID: <code style="background: rgba(0,0,0,0.2); padding: 0.1rem 0.4rem; border-radius: 4px;"><?= htmlspecialchars((string) Config::get('deployment_id', 'ANONYMOUS')) ?></code> &middot;
                     <a href="https://github.com/jooray/cashupayserver/releases" target="_blank" rel="noopener"
