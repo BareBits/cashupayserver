@@ -290,6 +290,13 @@ if (isset($_GET['api'])) {
             $storeNotifications = [
                 'enabled' => (bool)($store['notifications_enabled'] ?? 0),
                 'email' => $store['notification_email'] ?? '',
+                // Newsletter checkbox default override. '' = inherit site default,
+                // '1'/'0' = force checked/unchecked. siteDefault lets the UI show
+                // what "inherit" currently resolves to.
+                'newsletterDefault' => isset($store['newsletter_default_checked']) && $store['newsletter_default_checked'] !== null
+                    ? (string)(int)$store['newsletter_default_checked']
+                    : '',
+                'newsletterSiteDefault' => Config::get('newsletter_default_checked', true) === true,
                 // Per-store SMTP override. Password is never sent to the browser —
                 // only whether one is stored (write-only field, see the per-store
                 // notifications card).
@@ -581,9 +588,17 @@ if (isset($_GET['api'])) {
                 $params[] = $storeId;
             }
 
-            if (count($conditions) > 0) {
-                $sql .= " WHERE " . implode(" AND ", $conditions);
-            }
+            $whereClause = count($conditions) > 0 ? (" WHERE " . implode(" AND ", $conditions)) : "";
+            $sql .= $whereClause;
+
+            // Total matching count drives the list's pagination controls. Sent
+            // as a header so the JSON body stays a bare array (its only consumer
+            // is loadInvoices, but other tooling may rely on the shape).
+            $total = (int)(Database::fetchOne(
+                "SELECT COUNT(*) AS c FROM invoices" . $whereClause,
+                $params
+            )['c'] ?? 0);
+            header('X-Total-Count: ' . $total);
 
             $sql .= " ORDER BY created_at DESC LIMIT ? OFFSET ?";
             $params[] = $limit;
@@ -609,6 +624,47 @@ if (isset($_GET['api'])) {
             }
             unset($inv);
             echo json_encode($formatted);
+            break;
+
+        case 'customers':
+            // Aggregated customer list: one row per distinct email, scoped by
+            // store + subscription filter, paginated. Admin-only — it's a bulk
+            // PII/marketing surface (same gate as the CSV exports).
+            Auth::requireAdmin();
+            require_once __DIR__ . '/includes/customers.php';
+            [$custStore, $custSub] = Customers::filterArgs($_GET);
+            $limit = min(max((int)($_GET['limit'] ?? 50), 1), 100);
+            $offset = max((int)($_GET['offset'] ?? 0), 0);
+
+            $total = Customers::count($custStore, $custSub);
+            $rows = Customers::page($custStore, $custSub, $limit, $offset);
+
+            // Resolve store names once for the page.
+            $storeNames = [];
+            foreach (Database::fetchAll("SELECT id, name FROM stores") as $s) {
+                $storeNames[$s['id']] = $s['name'];
+            }
+
+            $customers = array_map(function (array $r) use ($storeNames) {
+                return [
+                    'email' => $r['email'],
+                    'invoiceId' => $r['invoice_id'],
+                    'storeId' => $r['store_id'],
+                    'storeName' => $storeNames[$r['store_id']] ?? '(unknown store)',
+                    'paidTime' => $r['paid_ts'] !== null ? (int)$r['paid_ts'] : null,
+                    'newsletterOptIn' => (int)($r['newsletter_opt_in'] ?? 0) === 1,
+                    // Link target for "most recent invoice": the public payment
+                    // page, which shows the settled invoice.
+                    'checkoutLink' => Urls::payment($r['invoice_id']),
+                ];
+            }, $rows);
+
+            echo json_encode([
+                'customers' => $customers,
+                'total' => $total,
+                'limit' => $limit,
+                'offset' => $offset,
+            ]);
             break;
 
         case 'stores':
@@ -750,6 +806,39 @@ if (isset($_GET['api'])) {
 
             $out = fopen('php://output', 'w');
             (new Diagnostics($anonymize, $rangeArg))->stream($out);
+            fclose($out);
+            exit;
+
+        case 'export_customers_csv':
+            // CSV of the customers list, honoring the same store + subscription
+            // filters as the on-screen list (but every matching row, not just the
+            // current page). Admin-only, like the other exports.
+            Auth::requireAdmin();
+            require_once __DIR__ . '/includes/customers.php';
+            [$custStore, $custSub] = Customers::filterArgs($_GET);
+            [$base, $baseParams] = Customers::baseQuery($custStore, $custSub);
+
+            $storeNames = [];
+            foreach (Database::fetchAll("SELECT id, name FROM stores") as $s) {
+                $storeNames[$s['id']] = $s['name'];
+            }
+
+            $stamp = date('Ymd-His');
+            header('Content-Type: text/csv; charset=utf-8');
+            header('Content-Disposition: attachment; filename="customers-' . $stamp . '.csv"');
+            header('Cache-Control: no-store');
+
+            $out = fopen('php://output', 'w');
+            fputcsv($out, ['Email', 'Subscribed', 'Store', 'Most recent invoice', 'Paid at (UTC)']);
+            foreach (Database::fetchAll($base . " ORDER BY paid_ts DESC, email ASC", $baseParams) as $r) {
+                fputcsv($out, [
+                    $r['email'],
+                    (int)($r['newsletter_opt_in'] ?? 0) === 1 ? 'yes' : 'no',
+                    $storeNames[$r['store_id']] ?? '',
+                    $r['invoice_id'],
+                    $r['paid_ts'] !== null ? gmdate('Y-m-d H:i:s', (int)$r['paid_ts']) : '',
+                ]);
+            }
             fclose($out);
             exit;
 
@@ -2178,9 +2267,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $smtpOverride = ($_POST['smtp_override_enabled'] ?? '0') === '1' ? 1 : 0;
                 $smtp = smtpFieldsFromPost($_POST);
 
+                // Per-store newsletter checkbox default. Tri-state: '' = inherit
+                // the site-wide default (stored NULL); '1'/'0' = force checked/
+                // unchecked. See Config::getNewsletterDefaultChecked().
+                $newsletterDefault = (string)($_POST['newsletter_default_checked'] ?? '');
+                $newsletterDefaultVal = ($newsletterDefault === '1' || $newsletterDefault === '0')
+                    ? (int)$newsletterDefault
+                    : null;
+
                 $update = [
                     'notifications_enabled' => $enabled,
                     'notification_email' => $email !== '' ? $email : null,
+                    'newsletter_default_checked' => $newsletterDefaultVal,
                     'smtp_override_enabled' => $smtpOverride,
                     'smtp_host' => $smtp['host'] !== '' ? $smtp['host'] : null,
                     'smtp_port' => $smtp['port'] !== '' ? (int)$smtp['port'] : null,
@@ -2214,6 +2312,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'invoicePaidEnabled' => Config::get('notifications_invoice_paid_enabled', false) === true,
                 'autoCashoutEnabled' => Config::get('notifications_auto_cashout_enabled', false) === true,
                 'payerReceiptEnabled' => Config::get('notifications_payer_receipt_enabled', false) === true,
+                // Site-wide default for the payment-screen newsletter checkbox.
+                // Independent of receipt sending — email/newsletter capture works
+                // even when receipts are off. Per-store override lives on stores.
+                'newsletterDefaultChecked' => Config::get('newsletter_default_checked', true) === true,
                 'toEmail' => (string)Config::get('notifications_to_email', ''),
                 'smtpConfigured' => EmailSender::isSmtpConfigured(),
                 'pendingQueueCount' => NotificationSender::pendingCount(),
@@ -2237,6 +2339,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $invoicePaidEnabled = ($_POST['invoice_paid_enabled'] ?? '0') === '1';
                 $autoCashoutEnabled = ($_POST['auto_cashout_enabled'] ?? '0') === '1';
                 $payerReceiptEnabled = ($_POST['payer_receipt_enabled'] ?? '0') === '1';
+                $newsletterDefaultChecked = ($_POST['newsletter_default_checked'] ?? '0') === '1';
                 $toEmail = trim((string)($_POST['to_email'] ?? ''));
 
                 if ($toEmail !== '' && !filter_var($toEmail, FILTER_VALIDATE_EMAIL)) {
@@ -2251,6 +2354,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 Config::set('notifications_invoice_paid_enabled', $invoicePaidEnabled);
                 Config::set('notifications_auto_cashout_enabled', $autoCashoutEnabled);
                 Config::set('notifications_payer_receipt_enabled', $payerReceiptEnabled);
+                Config::set('newsletter_default_checked', $newsletterDefaultChecked);
                 Config::set('notifications_to_email', $toEmail);
 
                 Config::set('smtp_host', $smtp['host']);
@@ -3302,7 +3406,7 @@ $fileResetRequested = !$isLoggedIn && !$isWp && Auth::fileResetRequested();
 // Unknown or empty view → 302 to <base>/dashboard so /admin canonicalizes to
 // /admin/dashboard and bookmarks of removed views still resolve sensibly.
 // -----------------------------------------------------------------------------
-const ADMIN_VIEWS = ['dashboard', 'invoices', 'stores', 'products', 'settings', 'stats'];
+const ADMIN_VIEWS = ['dashboard', 'invoices', 'customers', 'stores', 'products', 'settings', 'stats'];
 
 if ($isWp) {
     $rawAdminView = (string)get_query_var('cashupay_admin_view');
@@ -3568,6 +3672,21 @@ header('Cache-Control: no-cache, must-revalidate');
 
             .store-selector-label {
                 display: none;
+            }
+
+            /* The fixed bottom nav must fit every item across a narrow viewport
+               without overflowing (which would push the last items off-screen).
+               Equal flex basis + min-width:0 lets the items shrink to share the
+               width as more views (e.g. Customers) are added. */
+            .nav-item {
+                flex: 1 1 0;
+                min-width: 0;
+                padding: 0.5rem 0.25rem;
+                font-size: 0.68rem;
+            }
+            .nav-item svg {
+                width: 22px;
+                height: 22px;
             }
         }
 
@@ -4601,6 +4720,25 @@ header('Cache-Control: no-cache, must-revalidate');
             background-color: var(--bg-secondary);
             color: var(--text-primary);
         }
+        /* Prev/next pagination footer shared by the invoices + customers lists. */
+        .list-pagination {
+            display: flex;
+            align-items: center;
+            justify-content: flex-end;
+            gap: 0.75rem;
+            padding: 0.75rem 0 0;
+        }
+        .list-pagination:empty {
+            display: none;
+        }
+        .list-pagination .list-pagination-info {
+            color: var(--text-secondary);
+            font-size: 0.85rem;
+        }
+        .list-pagination button[disabled] {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
         .inv-filter-row select:focus {
             outline: none;
             border-color: var(--accent);
@@ -4871,6 +5009,36 @@ header('Cache-Control: no-cache, must-revalidate');
                     <div id="all-invoices">
                         <div class="loading"><div class="spinner"></div></div>
                     </div>
+                    <div id="invoices-pagination" class="list-pagination"></div>
+                </div>
+            </div>
+
+            <!-- Customers View: aggregated list of customer emails captured on
+                 the payment screen. Admin-only (same gate as the API). -->
+            <div class="view" id="view-customers">
+                <div class="card view-fill">
+                    <div class="card-header">
+                        <div class="card-title">Customers</div>
+                        <div style="display: flex; gap: 0.5rem;">
+                            <button class="btn btn-secondary" id="btn-export-customers-csv">Export CSV</button>
+                        </div>
+                    </div>
+                    <div class="inv-filter-row">
+                        <label for="customer-subscription-filter">Newsletter:</label>
+                        <select id="customer-subscription-filter">
+                            <option value="">All</option>
+                            <option value="subscribed">Subscribed</option>
+                            <option value="unsubscribed">Not subscribed</option>
+                        </select>
+                        <label for="customer-store-filter">Store:</label>
+                        <select id="customer-store-filter">
+                            <option value="__all__">All stores</option>
+                        </select>
+                    </div>
+                    <div id="all-customers">
+                        <div class="loading"><div class="spinner"></div></div>
+                    </div>
+                    <div id="customers-pagination" class="list-pagination"></div>
                 </div>
             </div>
 
@@ -5194,6 +5362,19 @@ header('Cache-Control: no-cache, must-revalidate');
                                 <p class="form-help">If blank, the site-wide notification address from Settings is used.</p>
                             </div>
 
+                            <div class="form-group" style="margin-top: 1rem;">
+                                <label class="form-label">Newsletter checkbox default</label>
+                                <select class="form-input" id="store-newsletter-default">
+                                    <option value="">Use site-wide default</option>
+                                    <option value="1">Checked</option>
+                                    <option value="0">Unchecked</option>
+                                </select>
+                                <p class="form-help" id="store-newsletter-default-help">
+                                    Initial state of the newsletter opt-in checkbox on this store's
+                                    payment page.
+                                </p>
+                            </div>
+
                             <div class="toggle-container" style="margin-top: 1rem;">
                                 <span>Use a custom SMTP server for this store</span>
                                 <label class="toggle">
@@ -5480,6 +5661,19 @@ header('Cache-Control: no-cache, must-revalidate');
                                 When enabled, after an invoice is paid the customer can
                                 optionally enter an email address to receive a payment
                                 confirmation. Receipts are queued to the same SMTP server.
+                            </p>
+                            <div class="toggle-container" style="margin-top: 0.75rem;">
+                                <span>Newsletter checkbox checked by default</span>
+                                <label class="toggle">
+                                    <input type="checkbox" id="notifications-newsletter-default">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
+                            <p class="form-help" style="margin-top: 0.5rem;">
+                                Default state of the &ldquo;Subscribe to our newsletter&rdquo;
+                                checkbox on the payment page. The email/newsletter prompt is
+                                shown regardless of whether receipts are enabled. Individual
+                                stores can override this default in their store settings.
                             </p>
                         </div>
 
@@ -6214,6 +6408,15 @@ header('Cache-Control: no-cache, must-revalidate');
                 </svg>
                 Stats
             </button>
+            <button class="nav-item hidden" data-view="customers" data-admin-only="true" id="nav-customers">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path>
+                    <circle cx="9" cy="7" r="4"></circle>
+                    <path d="M23 21v-2a4 4 0 0 0-3-3.87"></path>
+                    <path d="M16 3.13a4 4 0 0 1 0 7.75"></path>
+                </svg>
+                Customers
+            </button>
             <button class="nav-item" data-view="settings">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                     <circle cx="12" cy="12" r="3"></circle>
@@ -6717,6 +6920,8 @@ header('Cache-Control: no-cache, must-revalidate');
                 if (navStats) navStats.classList.remove('hidden');
                 const navProducts = document.getElementById('nav-products');
                 if (navProducts) navProducts.classList.remove('hidden');
+                const navCustomers = document.getElementById('nav-customers');
+                if (navCustomers) navCustomers.classList.remove('hidden');
             }
 
             // Check for store_created parameter from setup.php redirect
@@ -6914,6 +7119,7 @@ header('Cache-Control: no-cache, must-revalidate');
             if (invStatusSel) {
                 invStatusSel.addEventListener('change', () => {
                     writeInvoiceFilterToUrl(getInvoiceStatusFilter());
+                    invoicesState.offset = 0;
                     loadInvoices();
                 });
             }
@@ -6930,7 +7136,35 @@ header('Cache-Control: no-cache, must-revalidate');
                         const header = document.getElementById('store-select');
                         if (header) header.value = currentStoreId;
                     }
+                    invoicesState.offset = 0;
                     loadInvoices();
+                });
+            }
+
+            // Customers view: newsletter + store filters and CSV export.
+            const custSubSel = document.getElementById('customer-subscription-filter');
+            if (custSubSel) {
+                custSubSel.addEventListener('change', () => {
+                    customersState.offset = 0;
+                    loadCustomers();
+                });
+            }
+            const custStoreSel = document.getElementById('customer-store-filter');
+            if (custStoreSel) {
+                custStoreSel.addEventListener('change', () => {
+                    customersState.offset = 0;
+                    loadCustomers();
+                });
+            }
+            const custExportBtn = document.getElementById('btn-export-customers-csv');
+            if (custExportBtn) {
+                custExportBtn.addEventListener('click', () => {
+                    const params = new URLSearchParams({ api: 'export_customers_csv' });
+                    const store = getCustomerStoreFilter();
+                    if (store && store !== '__all__') params.set('store_id', store);
+                    const sub = getCustomerSubscriptionFilter();
+                    if (sub) params.set('subscription', sub);
+                    window.location = adminUrl + '?' + params.toString();
                 });
             }
 
@@ -7141,7 +7375,7 @@ header('Cache-Control: no-cache, must-revalidate');
         // grow a duplicate history entry.
         function switchView(view, opts) {
             if (!ADMIN_VIEWS.includes(view)) view = 'dashboard';
-            if ((view === 'stats' || view === 'products') && phpUser.role !== 'admin') {
+            if ((view === 'stats' || view === 'products' || view === 'customers') && phpUser.role !== 'admin') {
                 showToast('Admin role required', 'error');
                 return;
             }
@@ -7154,6 +7388,7 @@ header('Cache-Control: no-cache, must-revalidate');
             const titles = {
                 dashboard: 'Dashboard',
                 invoices: 'Invoices',
+                customers: 'Customers',
                 stores: 'Store Settings',
                 products: 'Products',
                 settings: 'Settings',
@@ -7164,7 +7399,7 @@ header('Cache-Control: no-cache, must-revalidate');
             // Show/hide store selector based on view (hide on global settings
             // and on the stats page, which has its own per-page selector).
             const storeSelector = document.getElementById('header-store-selector');
-            if (view === 'settings' || view === 'stats') {
+            if (view === 'settings' || view === 'stats' || view === 'customers') {
                 storeSelector.style.display = 'none';
             } else {
                 storeSelector.style.display = 'flex';
@@ -7178,9 +7413,14 @@ header('Cache-Control: no-cache, must-revalidate');
 
             if (view === 'invoices') {
                 setInvoiceStatusFilter(readInvoiceFilterFromUrl());
+                invoicesState.offset = 0;
                 // Populate (and default to the current store) before loading so
                 // the list matches the dropdown selection on first entry.
                 populateInvoiceStoreFilter().then(loadInvoices);
+            }
+            if (view === 'customers') {
+                customersState.offset = 0;
+                populateCustomerStoreFilter().then(loadCustomers);
             }
             if (view === 'stores') loadStoreSettings();
             if (view === 'products') loadProductsView();
@@ -7732,9 +7972,35 @@ header('Cache-Control: no-cache, must-revalidate');
             return sel ? sel.value : (currentStoreId || '__all__');
         }
 
+        // Shared list pagination state + footer renderer for the invoices and
+        // customers lists. Page size is fixed; the backend reports the total
+        // matching count so we can offer prev/next and a "X–Y of N" readout.
+        const LIST_PAGE_SIZE = 50;
+        const invoicesState = { offset: 0, total: 0 };
+        const customersState = { offset: 0, total: 0 };
+
+        function renderListPagination(containerId, state, onNavigate) {
+            const el = document.getElementById(containerId);
+            if (!el) return;
+            const { offset, total } = state;
+            if (!total || total <= LIST_PAGE_SIZE) { el.innerHTML = ''; return; }
+            const from = total === 0 ? 0 : offset + 1;
+            const to = Math.min(offset + LIST_PAGE_SIZE, total);
+            const prevDisabled = offset <= 0 ? 'disabled' : '';
+            const nextDisabled = offset + LIST_PAGE_SIZE >= total ? 'disabled' : '';
+            el.innerHTML =
+                `<button class="btn btn-secondary" data-nav="prev" ${prevDisabled}>Previous</button>`
+                + `<span class="list-pagination-info">${from}–${to} of ${total}</span>`
+                + `<button class="btn btn-secondary" data-nav="next" ${nextDisabled}>Next</button>`;
+            const prevBtn = el.querySelector('[data-nav="prev"]');
+            const nextBtn = el.querySelector('[data-nav="next"]');
+            if (prevBtn && !prevDisabled) prevBtn.addEventListener('click', () => onNavigate(Math.max(0, offset - LIST_PAGE_SIZE)));
+            if (nextBtn && !nextDisabled) nextBtn.addEventListener('click', () => onNavigate(offset + LIST_PAGE_SIZE));
+        }
+
         async function loadInvoices() {
             try {
-                let url = adminUrl + '?api=invoices&limit=100';
+                let url = adminUrl + `?api=invoices&limit=${LIST_PAGE_SIZE}&offset=${invoicesState.offset}`;
                 const storeFilter = getInvoiceStoreFilter();
                 if (storeFilter && storeFilter !== '__all__') {
                     url += `&store_id=${encodeURIComponent(storeFilter)}`;
@@ -7745,10 +8011,118 @@ header('Cache-Control: no-cache, must-revalidate');
                 }
                 const response = await fetch(url);
                 const invoices = await response.json();
+                invoicesState.total = parseInt(response.headers.get('X-Total-Count') || '0', 10) || 0;
                 renderInvoicesTable('all-invoices', invoices);
+                renderListPagination('invoices-pagination', invoicesState, (off) => {
+                    invoicesState.offset = off;
+                    loadInvoices();
+                });
             } catch (e) {
                 showToast('Failed to load invoices', 'error');
             }
+        }
+
+        // ===== Customers view =====
+        function getCustomerStoreFilter() {
+            const sel = document.getElementById('customer-store-filter');
+            return sel ? sel.value : '__all__';
+        }
+
+        function getCustomerSubscriptionFilter() {
+            const sel = document.getElementById('customer-subscription-filter');
+            const v = sel ? sel.value : '';
+            return (v === 'subscribed' || v === 'unsubscribed') ? v : '';
+        }
+
+        async function populateCustomerStoreFilter() {
+            const sel = document.getElementById('customer-store-filter');
+            if (!sel) return;
+            try {
+                const r = await fetch(adminUrl + '?api=stores');
+                const stores = await r.json();
+                const prev = sel.value || '__all__';
+                sel.innerHTML = '<option value="__all__">All stores</option>'
+                    + stores.map(s => `<option value="${s.id}">${escapeHtml(s.name || s.id)}</option>`).join('');
+                sel.value = [...sel.options].some(o => o.value === prev) ? prev : '__all__';
+            } catch (e) {
+                // Leave the existing "All stores" option in place on failure.
+            }
+        }
+
+        async function loadCustomers() {
+            try {
+                let url = adminUrl + `?api=customers&limit=${LIST_PAGE_SIZE}&offset=${customersState.offset}`;
+                const store = getCustomerStoreFilter();
+                if (store && store !== '__all__') {
+                    url += `&store_id=${encodeURIComponent(store)}`;
+                }
+                const sub = getCustomerSubscriptionFilter();
+                if (sub) {
+                    url += `&subscription=${encodeURIComponent(sub)}`;
+                }
+                const response = await fetch(url);
+                if (!response.ok) { showToast('Failed to load customers', 'error'); return; }
+                const data = await response.json();
+                customersState.total = data.total || 0;
+                renderCustomersTable('all-customers', data.customers || []);
+                renderListPagination('customers-pagination', customersState, (off) => {
+                    customersState.offset = off;
+                    loadCustomers();
+                });
+            } catch (e) {
+                showToast('Failed to load customers', 'error');
+            }
+        }
+
+        function renderCustomersTable(containerId, customers) {
+            const container = document.getElementById(containerId);
+            if (!container) return;
+
+            if (!customers || customers.length === 0) {
+                container.innerHTML = `
+                    <div class="empty-state">
+                        <div class="empty-state-icon">👥</div>
+                        <p>No customers match this filter</p>
+                    </div>
+                `;
+                return;
+            }
+
+            const rows = customers.map(c => {
+                const sub = c.newsletterOptIn
+                    ? '<span title="Subscribed to newsletter" style="color: var(--success, #48bb78);">✓</span>'
+                    : '<span title="Not subscribed" style="color: var(--text-secondary);">—</span>';
+                const invShort = c.invoiceId && c.invoiceId.length > 4 ? '..' + c.invoiceId.slice(-4) : (c.invoiceId || '');
+                const invLink = c.checkoutLink
+                    ? `<a href="${escapeHtml(c.checkoutLink)}" target="_blank" rel="noopener" class="inv-mono" title="${escapeHtml(c.invoiceId || '')}" style="color: var(--accent, #60a5fa);">${escapeHtml(invShort)}</a>`
+                    : '<span style="color: var(--text-secondary);">—</span>';
+                return `
+                    <tr>
+                        <td>${escapeHtml(c.email || '')}</td>
+                        <td style="text-align: center;">${sub}</td>
+                        <td>${escapeHtml(c.storeName || '')}</td>
+                        <td>${invLink}</td>
+                        <td>${formatPaidTime(c.paidTime)}</td>
+                    </tr>
+                `;
+            }).join('');
+
+            container.innerHTML = `
+                <div style="overflow-x: auto;">
+                    <table class="inv-table">
+                        <thead>
+                            <tr>
+                                <th>Email</th>
+                                <th style="text-align: center;">Newsletter</th>
+                                <th>Store</th>
+                                <th>Most recent invoice</th>
+                                <th>Paid</th>
+                            </tr>
+                        </thead>
+                        <tbody>${rows}</tbody>
+                    </table>
+                </div>
+            `;
         }
 
         // ===== Stats Dashboard =====
@@ -8263,6 +8637,13 @@ header('Cache-Control: no-cache, must-revalidate');
                     const emailEl = document.getElementById('store-notification-email');
                     if (enabledEl) enabledEl.checked = !!n.enabled;
                     if (emailEl) emailEl.value = n.email || '';
+                    // Newsletter checkbox default override ('' inherit | '1' | '0').
+                    const nlEl = document.getElementById('store-newsletter-default');
+                    if (nlEl) nlEl.value = n.newsletterDefault || '';
+                    const nlHelp = document.getElementById('store-newsletter-default-help');
+                    if (nlHelp) nlHelp.textContent = 'Initial state of the newsletter opt-in checkbox on this '
+                        + 'store’s payment page. Site-wide default is currently '
+                        + (n.newsletterSiteDefault ? 'checked' : 'unchecked') + '.';
                     // Per-store SMTP override (password write-only, never returned).
                     const ov = document.getElementById('store-smtp-override-enabled');
                     if (ov) ov.checked = !!n.smtpOverrideEnabled;
@@ -8575,6 +8956,11 @@ header('Cache-Control: no-cache, must-revalidate');
                 const noteCell = (description || swapBadge || itemsLink || feeBadge)
                     ? `<div>${description ? escapeHtml(description) : ''}${swapBadge}${itemsLink}${feeBadge}</div>`
                     : '<span style="color: var(--text-secondary);">—</span>';
+                // Customer email captured on the payment screen, with a checkmark
+                // when they opted into the newsletter.
+                const emailCell = inv.customerEmail
+                    ? `<span class="inv-mono">${escapeHtml(inv.customerEmail)}</span>${inv.newsletterOptIn ? ' <span title="Subscribed to newsletter" style="color: var(--success, #48bb78);">✓</span>' : ''}`
+                    : '<span style="color: var(--text-secondary);">—</span>';
                 const destCell = inv.destination
                     ? `<span class="inv-mono">${inv.destinationIsLightning
                         ? renderCopyMono(inv.destination, 'Lightning destination')
@@ -8597,6 +8983,7 @@ header('Cache-Control: no-cache, must-revalidate');
                         <td>${renderPaymentMethod(inv.paymentRail)}</td>
                         <td>${idCell}</td>
                         <td>${noteCell}</td>
+                        <td>${emailCell}</td>
                         <td>${formatPaidTime(inv.paidTime)}</td>
                         <td>${destCell}</td>
                         <td>${txidCell}</td>
@@ -8614,6 +9001,7 @@ header('Cache-Control: no-cache, must-revalidate');
                                 <th>Method</th>
                                 <th>Invoice</th>
                                 <th>Note</th>
+                                <th>Customer</th>
                                 <th>Paid</th>
                                 <th>Destination</th>
                                 <th>TxID</th>
@@ -9915,6 +10303,7 @@ header('Cache-Control: no-cache, must-revalidate');
                 action: 'save_store_notifications',
                 store_id: currentStoreId,
                 enabled, email,
+                newsletter_default_checked: document.getElementById('store-newsletter-default').value,
                 smtp_override_enabled: document.getElementById('store-smtp-override-enabled').checked ? '1' : '0',
                 smtp_host: document.getElementById('store-smtp-host').value.trim(),
                 smtp_port: document.getElementById('store-smtp-port').value.trim(),
@@ -9990,6 +10379,7 @@ header('Cache-Control: no-cache, must-revalidate');
                 document.getElementById('notifications-invoice-paid').checked = !!data.invoicePaidEnabled;
                 document.getElementById('notifications-auto-cashout').checked = !!data.autoCashoutEnabled;
                 document.getElementById('notifications-payer-receipt').checked = !!data.payerReceiptEnabled;
+                document.getElementById('notifications-newsletter-default').checked = !!data.newsletterDefaultChecked;
                 document.getElementById('notifications-to-email').value = data.toEmail || '';
                 document.getElementById('notifications-smtp-warning').classList.toggle('hidden', !!data.smtpConfigured);
                 // Global SMTP server fields. Password is write-only: it's never
@@ -10021,11 +10411,13 @@ header('Cache-Control: no-cache, must-revalidate');
             const invoicePaid = document.getElementById('notifications-invoice-paid').checked ? '1' : '0';
             const autoCashout = document.getElementById('notifications-auto-cashout').checked ? '1' : '0';
             const payerReceipt = document.getElementById('notifications-payer-receipt').checked ? '1' : '0';
+            const newsletterDefault = document.getElementById('notifications-newsletter-default').checked ? '1' : '0';
             const toEmail = document.getElementById('notifications-to-email').value.trim();
             const params = new URLSearchParams({
                 action: 'save_notifications_settings',
                 enabled, invoice_paid_enabled: invoicePaid,
                 auto_cashout_enabled: autoCashout, payer_receipt_enabled: payerReceipt,
+                newsletter_default_checked: newsletterDefault,
                 to_email: toEmail,
                 smtp_host: document.getElementById('smtp-host').value.trim(),
                 smtp_port: document.getElementById('smtp-port').value.trim(),

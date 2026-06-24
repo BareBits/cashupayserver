@@ -100,7 +100,7 @@ class Database {
             // that migration ran — getInstance() will then trigger runMigrations()
             // on existing installs that haven't yet picked it up. All migrations
             // are idempotent, so a fire is safe.
-            $hasLatestMigration = $hasConfig && self::columnExists(self::$instance, 'notification_queue', 'failed_at');
+            $hasLatestMigration = $hasConfig && self::columnExists(self::$instance, 'invoices', 'newsletter_opt_in');
             // The auto-withdraw → auto-cashout rename is a data-only migration
             // (config key + notification event labels) with no schema artifact
             // to mark it done, so probe for the legacy config key directly. The
@@ -243,6 +243,10 @@ HTACCESS;
             auto_melt_threshold INTEGER NOT NULL DEFAULT 2000,
             -- Default display/input currency for the merchant UI (sat or fiat code)
             default_currency TEXT NOT NULL DEFAULT 'sat',
+            -- Per-store override for the newsletter checkbox default state on the
+            -- payment-complete screen. NULL = inherit the site-wide default
+            -- (config key newsletter_default_checked); 0/1 = force unchecked/checked.
+            newsletter_default_checked INTEGER DEFAULT NULL,
             -- Timestamps
             created_at INTEGER NOT NULL
         );
@@ -283,6 +287,11 @@ HTACCESS;
             last_polled_at INTEGER DEFAULT NULL,
             paid_at INTEGER DEFAULT NULL,
             settled_rail TEXT DEFAULT NULL,
+            -- Customer-supplied email (entered on the payment-complete screen)
+            -- and newsletter opt-in. newsletter_opt_in is NULL until the payer
+            -- submits the form; 0/1 once they do. See payment.php capture path.
+            customer_email TEXT DEFAULT NULL,
+            newsletter_opt_in INTEGER DEFAULT NULL,
             FOREIGN KEY (store_id) REFERENCES stores(id) ON DELETE CASCADE
         );
 
@@ -1436,11 +1445,25 @@ HTACCESS;
         }
 
         // Delivery lease for the notification outbox (see notification_queue
-        // CREATE above and NotificationSender::drainQueue). next_attempt_at
-        // doubles as this migration set's "latest" marker (see getInstance), so
-        // it must be the last column added in runMigrations().
+        // CREATE above and NotificationSender::drainQueue).
         if (!self::columnExists($pdo, 'notification_queue', 'next_attempt_at')) {
             $pdo->exec("ALTER TABLE notification_queue ADD COLUMN next_attempt_at INTEGER DEFAULT NULL");
+        }
+
+        // Customer email capture + newsletter opt-in. customer_email and
+        // newsletter_opt_in are populated when the payer submits the email form
+        // on the payment-complete screen (payment.php); newsletter_default_checked
+        // is the per-store override for that checkbox's initial state. The last
+        // column added here (invoices.newsletter_opt_in) doubles as this migration
+        // set's "latest" marker (see getInstance), so it must stay last.
+        if (!self::columnExists($pdo, 'stores', 'newsletter_default_checked')) {
+            $pdo->exec("ALTER TABLE stores ADD COLUMN newsletter_default_checked INTEGER DEFAULT NULL");
+        }
+        if (!self::columnExists($pdo, 'invoices', 'customer_email')) {
+            $pdo->exec("ALTER TABLE invoices ADD COLUMN customer_email TEXT DEFAULT NULL");
+        }
+        if (!self::columnExists($pdo, 'invoices', 'newsletter_opt_in')) {
+            $pdo->exec("ALTER TABLE invoices ADD COLUMN newsletter_opt_in INTEGER DEFAULT NULL");
         }
     }
 
