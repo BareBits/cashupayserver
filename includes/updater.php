@@ -53,30 +53,42 @@ class Updater {
     ];
 
     /**
-     * Top-level entry point called from cron.php.
+     * Top-level entry point called from cron.php (auto path) and from the
+     * isolated update.php manual path.
+     *
+     * $force = true is the OPERATOR-INITIATED ("Update now") path: clicking
+     * the button IS the consent, so it bypasses the CASHUPAY_AUTO_UPDATE_ENABLED
+     * opt-in and the daily throttle. It still honours WordPress mode, the
+     * test/dev kill switch, the blocked-SHA forward-failure guard, the lock,
+     * the pre-overlay backup, and the post-apply health verify — a manual
+     * update is just as recoverable as an automatic one.
+     *
      * Returns true if an update was applied, false otherwise.
      */
-    public static function checkAndApply(): bool {
+    public static function checkAndApply(bool $force = false): bool {
         if (self::isWordPressMode()) {
             return false;
         }
         // Operator opt-in. Auto-update is OFF by default for fresh installs;
         // an operator who wants it has to set CASHUPAY_AUTO_UPDATE_ENABLED in
         // user_config.php (or as an env var). See user_config.example.php.
-        if (!self::isAutoUpdateEnabled()) {
+        // A manual ("Update now") run skips this gate — the click is the opt-in.
+        if (!$force && !self::isAutoUpdateEnabled()) {
             return false;
         }
-        // Test-harness kill switch. Honoured when running under iterate.py
-        // or the pytest payserver fixture so a long-running stack doesn't
-        // overlay an in-progress dev branch with the latest channel-main
-        // build mid-iteration.
+        // Test-harness kill switch. Honoured for BOTH auto and manual paths:
+        // when running under iterate.py or the pytest payserver fixture a
+        // manual click must not overlay an in-progress dev branch with the
+        // latest channel-main build.
         if (self::isDisabledForTests()) {
             return false;
         }
 
         $now = time();
+        // The daily throttle protects the automatic path from re-checking on
+        // every cron tick; a manual run is explicitly requested, so it skips it.
         $lastCheck = (int)Config::get('updater_last_check', 0);
-        if ($lastCheck && ($now - $lastCheck) < self::CHECK_INTERVAL_SECONDS) {
+        if (!$force && $lastCheck && ($now - $lastCheck) < self::CHECK_INTERVAL_SECONDS) {
             return false;
         }
         Config::set('updater_last_check', $now);
@@ -273,6 +285,95 @@ class Updater {
             $out[$key] = $val;
         }
         return $out;
+    }
+
+    // ---------------- Update-available probe (banner / Update-now button) ----------------
+    //
+    // A lightweight "is a newer build out?" check, deliberately INDEPENDENT of
+    // the auto-update opt-in: the dashboard banner has to nudge operators who
+    // have NOT enabled auto-update, since they're exactly the ones who need
+    // reminding. It never downloads or applies anything — it only compares the
+    // remote channel's COMMIT_SHA to the local one and caches the verdict.
+
+    /**
+     * Refresh (or return cached) availability verdict for the current channel.
+     * Result shape (also what getAvailableUpdate() returns):
+     *   ['available' => bool, 'channel' => string, 'current_version' => string,
+     *    'current_sha' => string, 'latest_version' => string, 'latest_sha' => string,
+     *    'blocked' => bool, 'checked_at' => int, 'error' => ?string]
+     *
+     * Self-throttled to CHECK_INTERVAL_SECONDS unless $force. No-op (returns the
+     * last cached verdict, or an "unavailable" stub) in WordPress mode and under
+     * the test/dev kill switch so the dev stack never phones GitHub or shows a
+     * bogus "update available" for an in-progress branch.
+     */
+    public static function checkForUpdate(bool $force = false): array {
+        if (self::isWordPressMode() || self::isDisabledForTests()) {
+            return self::getAvailableUpdate() ?? ['available' => false];
+        }
+
+        $cached = self::getAvailableUpdate();
+        $now = time();
+        if (!$force && is_array($cached) && isset($cached['checked_at'])
+            && ($now - (int)$cached['checked_at']) < self::CHECK_INTERVAL_SECONDS) {
+            return $cached;
+        }
+
+        $channel = self::getChannel();
+        $remote = self::fetchRemoteBuildInfo($channel);
+        if ($remote === null) {
+            // Couldn't reach the release API. Keep any prior verdict but stamp
+            // the attempt so we back off for the throttle window rather than
+            // hammering a flaky endpoint on every cron tick.
+            $result = is_array($cached) ? $cached : ['available' => false];
+            $result['checked_at'] = $now;
+            $result['error'] = 'fetch_failed';
+            Config::set('updater_available', $result);
+            return $result;
+        }
+
+        $remoteSha = (string)($remote['COMMIT_SHA'] ?? '');
+        $localSha = self::getLocalCommitSha();
+        // A build that already failed a prior health check is parked in
+        // updater_blocked_shas — never advertise it as an available update.
+        $blocked = $remoteSha !== '' && in_array($remoteSha, self::getBlockedShas(), true);
+        $available = $remoteSha !== '' && $remoteSha !== $localSha && !$blocked;
+
+        $result = [
+            'available' => $available,
+            'channel' => $channel,
+            'current_version' => (string)(self::getLocalBuildInfo()['VERSION'] ?? ''),
+            'current_sha' => $localSha,
+            'latest_version' => (string)($remote['VERSION'] ?? ''),
+            'latest_sha' => $remoteSha,
+            'blocked' => $blocked,
+            'checked_at' => $now,
+            'error' => null,
+        ];
+        Config::set('updater_available', $result);
+        return $result;
+    }
+
+    /** Last cached availability verdict, or null if never checked. */
+    public static function getAvailableUpdate(): ?array {
+        $v = Config::get('updater_available');
+        return is_array($v) ? $v : null;
+    }
+
+    /**
+     * Why a manual ("Update now") run cannot proceed in this environment, or
+     * null if it can. Used by admin.php to give the operator a clear message
+     * instead of a silent no-op. 'wordpress' — WP has its own update path;
+     * 'disabled' — the dev/test kill switch (iterate.py / pytest) is active.
+     */
+    public static function manualUpdateBlockedReason(): ?string {
+        if (self::isWordPressMode()) {
+            return 'wordpress';
+        }
+        if (self::isDisabledForTests()) {
+            return 'disabled';
+        }
+        return null;
     }
 
     // ---------------- Apply update ----------------
@@ -656,8 +757,12 @@ class Updater {
      * same endpoint so single-cron installs keep updating. Mirrors
      * Background::trigger(): short timeout, the server side runs to
      * completion via ignore_user_abort() regardless of the early disconnect.
+     *
+     * $manual = true appends ?manual=1, which tells update.php to apply the
+     * update even when the auto-update opt-in is off and the daily throttle
+     * has not elapsed. Used by the admin "Update now" button.
      */
-    public static function triggerSelfCheck(): void {
+    public static function triggerSelfCheck(bool $manual = false): void {
         if (self::isWordPressMode()) {
             return;
         }
@@ -666,6 +771,9 @@ class Updater {
             return;
         }
         $url = rtrim(Config::getBaseUrl(), '/') . '/update.php';
+        if ($manual) {
+            $url .= '?manual=1';
+        }
         $ch = curl_init($url);
         curl_setopt_array($ch, [
             CURLOPT_RETURNTRANSFER => true,
