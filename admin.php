@@ -498,13 +498,16 @@ if (isset($_GET['api'])) {
                 'auto_rollback_dismissed' => (bool)Config::get('updater_auto_rollback_dismissed', true),
                 'blocked_shas' => Updater::getBlockedShas(),
                 'pending_verify' => Updater::getPendingVerify(),
+                // "Update available" verdict for the dashboard banner + card.
+                // Cached daily by cron (Task 12c), independent of the
+                // auto-update opt-in. null until the first cron check runs.
+                'available' => Updater::getAvailableUpdate(),
+                // In-flight / last manual ("Update now") run, polled by the UI.
+                'manual_run' => Config::get('updater_manual_run'),
+                // Why a manual update can't run here (WordPress / dev kill
+                // switch), or null if it can. Drives the button's enabled state.
+                'manual_blocked' => Updater::manualUpdateBlockedReason(),
             ]);
-            break;
-
-        case 'dismiss_auto_rollback':
-            Auth::requireAdmin();
-            Config::set('updater_auto_rollback_dismissed', true);
-            echo json_encode(['success' => true]);
             break;
 
         // Product catalog for the request modal — any logged-in user. Only
@@ -1493,6 +1496,34 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         case 'dismiss_update_banner':
             Auth::requireAdmin();
             Config::set('updater_banner_dismissed', true);
+            echo json_encode(['success' => true]);
+            break;
+
+        case 'dismiss_auto_rollback':
+            Auth::requireAdmin();
+            Config::set('updater_auto_rollback_dismissed', true);
+            echo json_encode(['success' => true]);
+            break;
+
+        // Operator-initiated "Update now". The click is the consent, so this
+        // bypasses the auto-update opt-in. Fire-and-forget: set a "running"
+        // marker and nudge the crash-isolated update.php with ?manual=1, which
+        // downloads/backs-up/overlays, health-verifies, and auto-rolls-back a
+        // bad build exactly like the automatic path. The UI polls update_status
+        // (manual_run) for the outcome.
+        case 'start_manual_update':
+            Auth::requireAdmin();
+            $blocked = Updater::manualUpdateBlockedReason();
+            if ($blocked !== null) {
+                echo json_encode(['success' => false, 'error' => $blocked]);
+                break;
+            }
+            if (!Config::get('cron_key')) {
+                echo json_encode(['success' => false, 'error' => 'no_cron_key']);
+                break;
+            }
+            Config::set('updater_manual_run', ['state' => 'running', 'started_at' => time()]);
+            Updater::triggerSelfCheck(true);
             echo json_encode(['success' => true]);
             break;
 
@@ -4907,6 +4938,23 @@ header('Cache-Control: no-cache, must-revalidate');
 
             <!-- Dashboard View -->
             <div class="view active" id="view-dashboard">
+                <!-- Update-available banner. Non-dismissible by design: an
+                     available update may carry critical security fixes, so it
+                     stays until the operator actually updates. Populated by JS
+                     from update_status `available`. Admin-only. The "Update now"
+                     button kicks off the crash-isolated manual update and the
+                     banner switches to a live progress line. -->
+                <div id="update-available-banner" class="hidden" style="background: rgba(247, 147, 26, 0.12); border: 1px solid rgba(247, 147, 26, 0.4); border-radius: 8px; padding: 0.75rem 1rem; margin-bottom: 1rem; font-size: 0.9rem; display: flex; align-items: flex-start; gap: 0.75rem;" data-admin-only="true">
+                    <span style="flex-shrink: 0; font-size: 1.1rem; line-height: 1.2;">&#9888;</span>
+                    <span style="flex: 1;">
+                        <strong id="update-available-text">A software update is available.</strong>
+                        <span style="display: block; color: var(--text-secondary); font-size: 0.85rem; margin-top: 0.15rem;">
+                            Updates deliver new features and critical security enhancements. Please don't delay — apply it as soon as you can to keep your server secure.
+                        </span>
+                        <span id="update-available-progress" class="hidden" style="display: block; margin-top: 0.4rem; font-size: 0.85rem;"></span>
+                    </span>
+                    <button id="btn-update-now-banner" class="btn" style="padding: 0.3rem 0.9rem; font-size: 0.85rem; flex-shrink: 0;">Update now</button>
+                </div>
                 <div id="reliability-banner" class="hidden" style="background: rgba(220, 53, 69, 0.15); border: 1px solid rgba(220, 53, 69, 0.5); border-radius: 8px; padding: 0.75rem 1rem; margin-bottom: 1rem; font-size: 0.9rem; display: flex; align-items: center; gap: 0.75rem;" data-admin-only="true">
                     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="flex-shrink: 0;">
                         <path d="M12 9v4M12 17h.01"></path>
@@ -5858,6 +5906,13 @@ header('Cache-Control: no-cache, must-revalidate');
                         <div class="form-group">
                             <label class="form-label">Current version</label>
                             <code id="auto-update-current" style="display: block; background: rgba(0,0,0,0.2); padding: 0.6rem; border-radius: 8px; font-size: 0.85rem; user-select: all;">Loading…</code>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Update status</label>
+                            <p id="auto-update-availability" class="form-help" style="margin-top: 0;">Checking…</p>
+                            <p id="auto-update-progress" class="form-help hidden" style="margin-top: 0.25rem;"></p>
+                            <button class="btn btn-full" id="btn-update-now" style="margin-top: 0.4rem;">Update now</button>
+                            <p class="form-help">Downloads and applies the latest build for the selected channel, then verifies it boots and rolls back automatically if it doesn't. data/ and user_config.php are preserved.</p>
                         </div>
                         <div class="form-group">
                             <label class="form-label" for="auto-update-channel">Channel</label>
@@ -7232,6 +7287,10 @@ header('Cache-Control: no-cache, must-revalidate');
             if (rollbackBtn) rollbackBtn.addEventListener('click', rollbackUpdate);
             const dismissAutoRbBtn = document.getElementById('btn-dismiss-auto-rollback');
             if (dismissAutoRbBtn) dismissAutoRbBtn.addEventListener('click', dismissAutoRollback);
+            const updateNowBtn = document.getElementById('btn-update-now');
+            if (updateNowBtn) updateNowBtn.addEventListener('click', startManualUpdate);
+            const updateNowBannerBtn = document.getElementById('btn-update-now-banner');
+            if (updateNowBannerBtn) updateNowBannerBtn.addEventListener('click', startManualUpdate);
             const dismissCronBtn = document.getElementById('btn-dismiss-cron-stale');
             if (dismissCronBtn) dismissCronBtn.addEventListener('click', dismissCronStaleBanner);
             document.getElementById('btn-logout').addEventListener('click', logout);
@@ -7909,6 +7968,10 @@ header('Cache-Control: no-cache, must-revalidate');
                 // detailed queue lives on the invoices view.
                 updateOnchainManualBanner(dashboardData.onchain);
                 loadOnchainManualList();
+
+                // Update-available banner (admin-only). Reads the cached
+                // availability verdict + any in-flight manual run.
+                fetchAndRenderUpdateState();
 
                 // Per-store swap override + effective indicator.
                 refreshStoreSwapsCard();
@@ -11889,6 +11952,208 @@ header('Cache-Control: no-cache, must-revalidate');
             }
         }
 
+        // ---- Manual ("Update now") + update-available banner ----------------
+        //
+        // update_status returns `available` (cached daily-by-cron verdict) and
+        // `manual_run` (the in-flight / last "Update now" run). These helpers
+        // render both the dashboard banner and the Auto-update card from that
+        // payload, and drive the click → poll-until-done flow.
+
+        let manualUpdatePollTimer = null;
+        let manualUpdatePollDeadline = 0;
+
+        // A manual_run record is only "active" (worth surfacing) for a few
+        // minutes, so a stale record from an old session doesn't pin the
+        // banner open or show a phantom "Updating…".
+        function manualRunRecent(run) {
+            if (!run || !run.state) return false;
+            const stamp = run.state === 'running' ? run.started_at : run.finished_at;
+            if (!stamp) return run.state === 'running';
+            return (Math.floor(Date.now() / 1000) - parseInt(stamp, 10)) < 600;
+        }
+
+        // Map a manual_run state to a user-facing {text, color, busy, done}.
+        function manualRunView(run) {
+            if (!run || !manualRunRecent(run)) return null;
+            switch (run.state) {
+                case 'running':
+                    return { busy: true, text: 'Updating… downloading and verifying the new build. This can take a minute — keep this page open.', color: 'var(--text-secondary)' };
+                case 'success': {
+                    const v = (run.from_version && run.to_version) ? (' (' + run.from_version + ' → ' + run.to_version + ')') : '';
+                    return { busy: false, done: 'success', text: 'Update applied' + v + '. Reload the page to use the new version.', color: '#22c55e' };
+                }
+                case 'applied_unverified':
+                    return { busy: false, done: 'success', text: 'Update applied. Reload the page; the new build is being health-checked automatically.', color: '#22c55e' };
+                case 'up_to_date':
+                    return { busy: false, done: 'noop', text: 'You’re already on the latest version.', color: 'var(--text-secondary)' };
+                case 'failed': {
+                    const rb = run.rolled_back === false
+                        ? ' The automatic rollback FAILED — restore manually via recover.php.'
+                        : ' It was rolled back, so you’re still on the previous version.';
+                    return { busy: false, done: 'failed', text: 'The update failed its health check.' + rb, color: '#ef4444' };
+                }
+                case 'error':
+                    return { busy: false, done: 'failed', text: 'The update could not be applied' + (run.message ? (': ' + run.message) : '.'), color: '#ef4444' };
+                case 'blocked':
+                    return { busy: false, done: 'blocked', text: run.reason === 'wordpress'
+                        ? 'Updates here are managed by WordPress.'
+                        : 'Updates are disabled in this environment.', color: 'var(--text-secondary)' };
+                default:
+                    return null;
+            }
+        }
+
+        // Render both the dashboard banner and the settings-card status line
+        // from an update_status payload. Safe to call on any view (it no-ops on
+        // elements that aren't present).
+        function applyUpdateState(data) {
+            const avail = data && data.available && data.available.available === true;
+            const run = data ? data.manual_run : null;
+            const view = manualRunView(run);
+            const busy = !!(view && view.busy);
+
+            // --- Dashboard banner ---
+            const banner = document.getElementById('update-available-banner');
+            if (banner) {
+                const txt = document.getElementById('update-available-text');
+                const prog = document.getElementById('update-available-progress');
+                const btn = document.getElementById('btn-update-now-banner');
+                // Show while an update is available OR while a manual run is
+                // active (so the operator sees progress / the outcome).
+                if (avail || view) {
+                    banner.classList.remove('hidden');
+                    if (txt) {
+                        const lv = (data.available && data.available.latest_version) ? (' (version ' + data.available.latest_version + ')') : '';
+                        txt.textContent = avail ? ('A software update is available' + lv + '.') : 'Software update';
+                    }
+                    if (prog) {
+                        if (view) {
+                            prog.classList.remove('hidden');
+                            prog.textContent = view.text;
+                            prog.style.color = view.color;
+                        } else {
+                            prog.classList.add('hidden');
+                        }
+                    }
+                    if (btn) {
+                        btn.disabled = busy;
+                        btn.textContent = busy ? 'Updating…' : 'Update now';
+                    }
+                } else {
+                    banner.classList.add('hidden');
+                }
+            }
+
+            // --- Settings card ---
+            const availLine = document.getElementById('auto-update-availability');
+            if (availLine) {
+                if (avail) {
+                    const lv = (data.available && data.available.latest_version) ? data.available.latest_version : 'a newer build';
+                    availLine.textContent = 'Update available: ' + lv + '. Click “Update now” to install it.';
+                    availLine.style.color = '#f7931a';
+                } else if (data && data.available && data.available.available === false) {
+                    availLine.textContent = 'You’re on the latest version for this channel.';
+                    availLine.style.color = 'var(--text-secondary)';
+                } else {
+                    availLine.textContent = 'Update check pending — runs on the next cron tick.';
+                    availLine.style.color = 'var(--text-secondary)';
+                }
+            }
+            const cardProg = document.getElementById('auto-update-progress');
+            if (cardProg) {
+                if (view) {
+                    cardProg.classList.remove('hidden');
+                    cardProg.textContent = view.text;
+                    cardProg.style.color = view.color;
+                } else {
+                    cardProg.classList.add('hidden');
+                }
+            }
+            const cardBtn = document.getElementById('btn-update-now');
+            if (cardBtn) {
+                cardBtn.disabled = busy || (data && data.manual_blocked);
+                cardBtn.textContent = busy ? 'Updating…' : 'Update now';
+                if (data && data.manual_blocked && !view) {
+                    if (cardProg) {
+                        cardProg.classList.remove('hidden');
+                        cardProg.textContent = data.manual_blocked === 'wordpress'
+                            ? 'Updates here are managed by WordPress.'
+                            : 'Updates are disabled in this environment (dev/test).';
+                        cardProg.style.color = 'var(--text-secondary)';
+                    }
+                }
+            }
+        }
+
+        async function fetchAndRenderUpdateState() {
+            try {
+                const r = await fetch(adminUrl + '?api=update_status', { credentials: 'same-origin' });
+                const data = await r.json();
+                applyUpdateState(data);
+                return data;
+            } catch (e) {
+                return null;
+            }
+        }
+
+        // Kick off a manual update: confirm, POST start_manual_update, then poll
+        // update_status until the manual_run reaches a terminal state.
+        async function startManualUpdate() {
+            if (manualUpdatePollTimer) return; // already in flight
+            if (!confirm('Download and apply the latest update now? Your data and configuration are preserved, and a failed update is rolled back automatically.')) {
+                return;
+            }
+            // Optimistically reflect the running state immediately.
+            applyUpdateState({ manual_run: { state: 'running', started_at: Math.floor(Date.now() / 1000) } });
+            try {
+                const r = await postWithCsrf(adminUrl, 'action=start_manual_update');
+                const data = await r.json();
+                if (!data || !data.success) {
+                    const reason = data && data.error;
+                    const msg = reason === 'wordpress' ? 'Updates here are managed by WordPress.'
+                        : reason === 'disabled' ? 'Updates are disabled in this environment (dev/test).'
+                        : reason === 'no_cron_key' ? 'Set up the cron job first — the updater needs the cron key.'
+                        : 'Could not start the update.';
+                    showToast(msg, 'error');
+                    await fetchAndRenderUpdateState();
+                    return;
+                }
+                showToast('Update started…', 'success');
+                manualUpdatePollDeadline = Date.now() + 180000; // 3 min cap
+                pollManualUpdate();
+            } catch (e) {
+                showToast('Could not start the update', 'error');
+                await fetchAndRenderUpdateState();
+            }
+        }
+
+        function pollManualUpdate() {
+            if (manualUpdatePollTimer) clearTimeout(manualUpdatePollTimer);
+            manualUpdatePollTimer = setTimeout(async () => {
+                const data = await fetchAndRenderUpdateState();
+                const run = data ? data.manual_run : null;
+                const stillRunning = run && run.state === 'running';
+                if (stillRunning && Date.now() < manualUpdatePollDeadline) {
+                    pollManualUpdate();
+                    return;
+                }
+                manualUpdatePollTimer = null;
+                if (stillRunning) {
+                    // Timed out waiting. The update may still finish server-side.
+                    showToast('Still working… reload in a minute to check the result.', 'error');
+                    return;
+                }
+                const view = manualRunView(run);
+                if (view && view.done === 'success') {
+                    showToast('Update applied — reload the page.', 'success');
+                } else if (view && view.done === 'failed') {
+                    showToast('Update failed and was rolled back.', 'error');
+                } else if (view && view.done === 'noop') {
+                    showToast('Already up to date.', 'success');
+                }
+            }, 3000);
+        }
+
         // Auto-update card: fetch current channel/version/backups and wire
         // up the channel selector + rollback button.
         async function loadAutoUpdateCard() {
@@ -11945,6 +12210,8 @@ header('Cache-Control: no-cache, must-revalidate');
                 if (data.last_update && !data.banner_dismissed) {
                     showAutoUpdateBanner(data.last_update);
                 }
+                // Availability line + manual-run progress + Update-now button.
+                applyUpdateState(data);
             } catch (e) {
                 cur.textContent = 'Unable to load update status';
             }
@@ -11956,8 +12223,11 @@ header('Cache-Control: no-cache, must-revalidate');
             const to = last.to_version || 'unknown';
             showToast('Updated ' + from + ' → ' + to, 'success');
             // Best-effort dismiss so we don't re-toast on every settings open.
+            // POST actions carry `action` in the body + the CSRF token (the
+            // shared postWithCsrf helper) — the query-string form returns
+            // "Unknown action" since the handler reads $_POST['action'].
             try {
-                fetch(adminUrl + '?action=dismiss_update_banner', { method: 'POST', credentials: 'same-origin' });
+                postWithCsrf(adminUrl, 'action=dismiss_update_banner');
             } catch (e) {}
         }
 
@@ -11965,9 +12235,7 @@ header('Cache-Control: no-cache, must-revalidate');
             const warn = document.getElementById('auto-update-rollback-warning');
             if (warn) warn.classList.add('hidden');
             try {
-                await fetch(adminUrl + '?action=dismiss_auto_rollback', {
-                    method: 'POST', credentials: 'same-origin',
-                });
+                await postWithCsrf(adminUrl, 'action=dismiss_auto_rollback');
             } catch (e) {}
         }
 
@@ -11975,12 +12243,9 @@ header('Cache-Control: no-cache, must-revalidate');
             const sel = document.getElementById('auto-update-channel');
             if (!sel) return;
             const channel = sel.value === 'testing' ? 'testing' : 'main';
-            const fd = new FormData();
-            fd.append('channel', channel);
             try {
-                const r = await fetch(adminUrl + '?action=save_update_channel', {
-                    method: 'POST', body: fd, credentials: 'same-origin',
-                });
+                const r = await postWithCsrf(adminUrl,
+                    'action=save_update_channel&channel=' + encodeURIComponent(channel));
                 const data = await r.json();
                 if (data && data.success) {
                     showToast('Channel set to ' + data.channel, 'success');
@@ -11997,9 +12262,7 @@ header('Cache-Control: no-cache, must-revalidate');
                 return;
             }
             try {
-                const r = await fetch(adminUrl + '?action=rollback_update', {
-                    method: 'POST', credentials: 'same-origin',
-                });
+                const r = await postWithCsrf(adminUrl, 'action=rollback_update');
                 const data = await r.json();
                 if (data && data.success) {
                     showToast('Rolled back. Reload the page.', 'success');

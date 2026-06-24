@@ -545,6 +545,21 @@ if (!$isInternal && !$swapOnly) {
     }
 }
 
+// Task 12c: Refresh the "update available" cache that powers the dashboard
+// update banner + the Auto-update card's status line. Deliberately INDEPENDENT
+// of the auto-update opt-in — the banner has to nudge operators who have NOT
+// enabled auto-update. This only compares the remote channel's COMMIT_SHA to
+// the local one; it never downloads or applies anything. Self-throttled to a
+// daily check and a no-op in WordPress / test-disabled environments.
+if (!$isInternal && !$swapOnly && !$skipNonEssential) {
+    try {
+        $av = Updater::checkForUpdate();
+        $results['tasks']['update_check'] = !empty($av['available']) ? 'available' : 'current';
+    } catch (Throwable $e) {
+        $results['tasks']['update_check'] = 'error: ' . $e->getMessage();
+    }
+}
+
 // Task 13: Drain queued notification emails. Runs on every tick so backlogs
 // from a temporarily-unreachable SMTP server self-heal on the next cron pass.
 if (!$swapOnly && !$skipNonEssential) try {

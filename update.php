@@ -284,6 +284,50 @@ function upd_block_sha(string $sha): void {
     }
 }
 
+// ---------------- Manual ("Update now") run state ----------------
+//
+// The admin "Update now" button is fire-and-forget: admin.php sets
+// updater_manual_run = {state:'running'} and nudges this endpoint with
+// ?manual=1; the browser then polls update_status until it sees a terminal
+// state. update.php writes that terminal state here so the poll can report
+// the outcome. States: running -> success | up_to_date | applied_unverified
+// | failed | error | blocked.
+
+function upd_set_manual_run(string $state, array $extra = []): void {
+    $prev = upd_config_get('updater_manual_run');
+    $rec = is_array($prev) ? $prev : [];
+    $rec['state'] = $state;
+    $rec['finished_at'] = time();
+    foreach ($extra as $k => $v) {
+        $rec[$k] = $v;
+    }
+    upd_config_set('updater_manual_run', $rec);
+}
+
+/** Translate an upd_verify_pending() verdict into a manual-run terminal state. */
+function upd_set_manual_run_from_verify(array $vr): void {
+    $result = (string)($vr['result'] ?? '');
+    if ($result === 'healthy') {
+        $last = upd_config_get('updater_last_update');
+        $extra = [];
+        if (is_array($last)) {
+            $extra['from_version'] = (string)($last['from_version'] ?? '');
+            $extra['to_version'] = (string)($last['to_version'] ?? '');
+        }
+        upd_set_manual_run('success', $extra);
+    } elseif ($result === 'rolled_back') {
+        upd_set_manual_run('failed', [
+            'rolled_back' => (bool)($vr['rolled_back'] ?? false),
+            'backup' => (string)($vr['backup'] ?? ''),
+        ]);
+    } else {
+        // 'inconclusive' — applied, but health probe couldn't confirm yet. The
+        // pending marker stays; the next update.php run (cron or a re-trigger)
+        // re-probes and settles it to success/failed.
+        upd_set_manual_run('applied_unverified');
+    }
+}
+
 // ---------------- Inline rollback (mirrors recover.php / Updater::rollbackTo) ----------------
 
 function upd_is_preserved(string $rel): bool {
@@ -513,54 +557,89 @@ if (!$cronKey || !is_string($providedKey) || !hash_equals((string)$cronKey, (str
     exit;
 }
 
-// Gating — identical policy to Updater::checkAndApply().
+// Manual ("Update now") run? Authed by the cron key above, so only admin.php
+// (which holds the key) can set it. A manual run bypasses the auto-update
+// opt-in and the daily throttle for the FORWARD apply; the verify/recover
+// phase runs regardless of this flag.
+$manual = isset($_GET['manual']) && $_GET['manual'] !== '' && $_GET['manual'] !== '0';
+
+// Hard stops for BOTH auto and manual. WordPress has its own update path, and
+// the test/dev kill switch must never let a manual click overlay an
+// in-progress dev branch.
 if (upd_is_wordpress()) {
+    if ($manual) {
+        upd_set_manual_run('blocked', ['reason' => 'wordpress']);
+    }
     echo json_encode(['ok' => true, 'skipped' => 'wordpress']);
     exit;
 }
-if (!upd_is_enabled()) {
-    echo json_encode(['ok' => true, 'skipped' => 'auto_update_disabled']);
-    exit;
-}
 if (upd_is_disabled_for_tests()) {
+    if ($manual) {
+        upd_set_manual_run('blocked', ['reason' => 'disabled']);
+    }
     echo json_encode(['ok' => true, 'skipped' => 'updater_disabled']);
     exit;
 }
 
-// Phase 1: verify any pending update FIRST, regardless of the daily interval.
-// This is the self-contained recovery path that must work even if includes/
-// is broken — so it never touches the Updater class.
+// Phase 1: verify any pending update FIRST — ALWAYS, regardless of the opt-in,
+// the throttle, or the manual flag. This self-contained recovery path must work
+// even if includes/ is broken (so it never touches the Updater class), and it's
+// what lets a manually-triggered update on an install that never enabled
+// auto-update still get health-verified and auto-rolled-back.
 $pending = upd_config_get('updater_pending_verify');
 if (is_array($pending) && !empty($pending['sha'])) {
-    echo json_encode(['ok' => true] + upd_verify_pending($pending, (string)$cronKey));
+    $vr = upd_verify_pending($pending, (string)$cronKey);
+    if ($manual) {
+        upd_set_manual_run_from_verify($vr);
+    }
+    echo json_encode(['ok' => true] + $vr);
     exit;
 }
 
-// Daily throttle for the *forward* check (the verify path above bypasses it).
-$now = time();
-$lastCheck = (int)upd_config_get('updater_last_check', 0);
-if ($lastCheck && ($now - $lastCheck) < UPD_CHECK_INTERVAL_SECONDS) {
-    echo json_encode(['ok' => true, 'skipped' => 'not_due']);
+// Forward-apply opt-in gate. The auto path requires CASHUPAY_AUTO_UPDATE_ENABLED;
+// a manual click is its own consent and skips it.
+if (!$manual && !upd_is_enabled()) {
+    echo json_encode(['ok' => true, 'skipped' => 'auto_update_disabled']);
     exit;
+}
+
+// Daily throttle for the *forward* check. The verify path above always bypasses
+// it; a manual run does too — the operator explicitly asked to update now.
+if (!$manual) {
+    $now = time();
+    $lastCheck = (int)upd_config_get('updater_last_check', 0);
+    if ($lastCheck && ($now - $lastCheck) < UPD_CHECK_INTERVAL_SECONDS) {
+        echo json_encode(['ok' => true, 'skipped' => 'not_due']);
+        exit;
+    }
 }
 
 // Phase 2: forward apply. Safe to load the canonical engine now — no pending
 // marker means the current install was proven healthy (or is fresh), so
 // includes/ is known-good. Updater::checkAndApply() handles the blocked-SHA
 // skip, download, backup and overlay, and sets the pending-verify marker.
+// $manual forces past the opt-in + throttle inside checkAndApply too.
 require_once upd_root() . '/includes/updater.php';
 
 $applied = false;
 try {
-    $applied = Updater::checkAndApply();
+    $applied = Updater::checkAndApply($manual);
 } catch (Throwable $e) {
     upd_log('checkAndApply error: ' . $e->getMessage());
+    if ($manual) {
+        upd_set_manual_run('error', ['message' => $e->getMessage()]);
+    }
     http_response_code(500);
     echo json_encode(['ok' => false, 'error' => 'apply_failed', 'message' => $e->getMessage()]);
     exit;
 }
 
 if (!$applied) {
+    // Nothing newer to apply (already current, or the only newer build is
+    // blocked). For a manual run that's a successful "you're up to date".
+    if ($manual) {
+        upd_set_manual_run('up_to_date');
+    }
     echo json_encode(['ok' => true, 'result' => 'no_update']);
     exit;
 }
@@ -570,8 +649,15 @@ if (!$applied) {
 // and the next run re-checks.
 $pending = upd_config_get('updater_pending_verify');
 if (is_array($pending) && !empty($pending['sha'])) {
-    echo json_encode(['ok' => true, 'applied' => true] + upd_verify_pending($pending, (string)$cronKey));
+    $vr = upd_verify_pending($pending, (string)$cronKey);
+    if ($manual) {
+        upd_set_manual_run_from_verify($vr);
+    }
+    echo json_encode(['ok' => true, 'applied' => true] + $vr);
     exit;
 }
 
+if ($manual) {
+    upd_set_manual_run('applied_unverified');
+}
 echo json_encode(['ok' => true, 'result' => 'applied_no_marker']);
