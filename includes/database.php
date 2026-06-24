@@ -100,7 +100,7 @@ class Database {
             // that migration ran — getInstance() will then trigger runMigrations()
             // on existing installs that haven't yet picked it up. All migrations
             // are idempotent, so a fire is safe.
-            $hasLatestMigration = $hasConfig && self::columnExists(self::$instance, 'invoices', 'newsletter_opt_in');
+            $hasLatestMigration = $hasConfig && self::columnExists(self::$instance, 'stores', 'selfserve_max_sats');
             // The auto-withdraw → auto-cashout rename is a data-only migration
             // (config key + notification event labels) with no schema artifact
             // to mark it done, so probe for the legacy config key directly. The
@@ -247,6 +247,13 @@ HTACCESS;
             -- payment-complete screen. NULL = inherit the site-wide default
             -- (config key newsletter_default_checked); 0/1 = force unchecked/checked.
             newsletter_default_checked INTEGER DEFAULT NULL,
+            -- Self-serve invoices (public, unauthenticated /pay/{storeId} page).
+            -- selfserve_enabled is a tri-state override: -1 inherit the site
+            -- default (config key selfserve_enabled), 0 force off, 1 force on.
+            -- selfserve_max_sats overrides the site-wide per-invoice max in sats
+            -- (NULL = inherit config key selfserve_max_sats).
+            selfserve_enabled INTEGER NOT NULL DEFAULT -1,
+            selfserve_max_sats INTEGER DEFAULT NULL,
             -- Timestamps
             created_at INTEGER NOT NULL
         );
@@ -1453,9 +1460,7 @@ HTACCESS;
         // Customer email capture + newsletter opt-in. customer_email and
         // newsletter_opt_in are populated when the payer submits the email form
         // on the payment-complete screen (payment.php); newsletter_default_checked
-        // is the per-store override for that checkbox's initial state. The last
-        // column added here (invoices.newsletter_opt_in) doubles as this migration
-        // set's "latest" marker (see getInstance), so it must stay last.
+        // is the per-store override for that checkbox's initial state.
         if (!self::columnExists($pdo, 'stores', 'newsletter_default_checked')) {
             $pdo->exec("ALTER TABLE stores ADD COLUMN newsletter_default_checked INTEGER DEFAULT NULL");
         }
@@ -1464,6 +1469,19 @@ HTACCESS;
         }
         if (!self::columnExists($pdo, 'invoices', 'newsletter_opt_in')) {
             $pdo->exec("ALTER TABLE invoices ADD COLUMN newsletter_opt_in INTEGER DEFAULT NULL");
+        }
+
+        // Self-serve invoices (public /pay/{storeId} page). selfserve_enabled is
+        // a tri-state override (-1 inherit / 0 off / 1 on); selfserve_max_sats
+        // overrides the site-wide per-invoice max (NULL = inherit). The last
+        // column added here (stores.selfserve_max_sats) doubles as this
+        // migration set's "latest" marker (see getInstance), so it must stay
+        // last.
+        if (!self::columnExists($pdo, 'stores', 'selfserve_enabled')) {
+            $pdo->exec("ALTER TABLE stores ADD COLUMN selfserve_enabled INTEGER NOT NULL DEFAULT -1");
+        }
+        if (!self::columnExists($pdo, 'stores', 'selfserve_max_sats')) {
+            $pdo->exec("ALTER TABLE stores ADD COLUMN selfserve_max_sats INTEGER DEFAULT NULL");
         }
     }
 
