@@ -11,6 +11,9 @@
  *   MOCK_CLINK_BOLT11     bolt11 to return on success
  *   MOCK_CLINK_ERROR_CODE if set, reply with this NIP-69 error code instead
  *   MOCK_CLINK_SEND_RECEIPT if "1", also send a {res:'ok'} receipt after the reply
+ *   MOCK_CLINK_DUMP      if set, decrypt the payer's request and write the
+ *                        plaintext JSON payload to this path (lets a test assert
+ *                        what the payer actually sent, e.g. the description memo)
  *
  * Not a general-purpose relay — just enough of NIP-01 framing to exercise the
  * client's subscribe-before-publish round trip.
@@ -73,6 +76,19 @@ $server->onText(function (Server $srv, $conn, Text $message) use (
         $payerPk = (string)($reqEvent['pubkey'] ?? '');
         $reqId = (string)($reqEvent['id'] ?? '');
         $sub = $conn->getMeta('sub') ?? 'sub';
+
+        // Optionally decrypt + dump the payer's request payload so a test can
+        // assert what was sent (e.g. the NIP-69 description memo). Best-effort.
+        $dump = getenv('MOCK_CLINK_DUMP');
+        if ($dump !== false && $dump !== '') {
+            try {
+                $ck = Nip44::getConversationKey($merchantSk, $payerPk);
+                $plain = Nip44::decrypt((string)($reqEvent['content'] ?? ''), $ck);
+                file_put_contents($dump, $plain);
+            } catch (\Throwable $e) {
+                file_put_contents($dump, json_encode(['decrypt_error' => $e->getMessage()]));
+            }
+        }
 
         // Acknowledge the publish (relay OK).
         $conn->send(new Text(json_encode(['OK', $reqId, true, ''])));

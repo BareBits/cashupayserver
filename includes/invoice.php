@@ -32,6 +32,39 @@ use Cashu\ProofState;
 
 class Invoice {
     /**
+     * Best-effort, spec-compliant memo for an externally-minted Lightning
+     * invoice we request as the payer — currently the CLINK noffer rail's
+     * NIP-69 `description`. We surface the store name plus the invoice's
+     * payer-facing note (metadata.itemDesc) when present, so the receiving
+     * wallet *can* label the payment in its history, mirroring the text the
+     * payment page shows the customer.
+     *
+     * This is only a request: per NIP-69 the receiving service may honor or
+     * ignore the description and has the final say on the invoice's actual
+     * memo. Capped at 100 chars to stay within the CLINK spec (the reference
+     * @shocknet/clink-sdk rejects longer descriptions); mb-safe so multibyte
+     * store names aren't cut mid-character. Returns '' when there's nothing
+     * to say, so callers can omit the field entirely.
+     */
+    public static function nofferMemo(array $store, ?array $metadata = null): string {
+        $name = trim((string)($store['name'] ?? ''));
+        $note = '';
+        if (is_array($metadata)) {
+            // itemDesc is the payer-facing note convention used across the app
+            // (see payment.php / pay.php); reuse it so the LN memo matches.
+            $note = trim((string)($metadata['itemDesc'] ?? ''));
+        }
+        $parts = [];
+        if ($name !== '') { $parts[] = $name; }
+        if ($note !== '') { $parts[] = $note; }
+        $memo = implode(' - ', $parts);
+        if (mb_strlen($memo) > 100) {
+            $memo = rtrim(mb_substr($memo, 0, 100));
+        }
+        return $memo;
+    }
+
+    /**
      * Create a new invoice
      *
      * Uses per-store mint configuration and supports multi-mint fallback.
@@ -149,8 +182,16 @@ class Invoice {
                         // CLINK noffer: act as the payer toward the merchant's
                         // Nostr service and fetch a BOLT11. Settlement is later
                         // confirmed by a kind-21001 receipt (payment page + cron).
+                        // Send a best-effort, spec-compliant memo (NIP-69
+                        // description) so the receiving wallet can label the
+                        // payment with the store name; the wallet may ignore it.
+                        $nofferMemo = self::nofferMemo($store, $metadata);
                         try {
-                            $resolved = ClinkClient::requestInvoice($dest['value'], $lnurlTargetSats);
+                            $resolved = ClinkClient::requestInvoice(
+                                $dest['value'],
+                                $lnurlTargetSats,
+                                $nofferMemo !== '' ? $nofferMemo : null
+                            );
                         } catch (Throwable $e) {
                             error_log(sprintf(
                                 '[clink-receive] noffer fetch failed store=%s priority=%d: %s; trying next',
