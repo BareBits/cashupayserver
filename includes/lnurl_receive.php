@@ -310,10 +310,11 @@ class LnUrlReceive {
         }
 
         // Step 2: auto-melt the remaining balance to the operator's LN address,
-        // regardless of auto_melt_enabled toggle. The LNURL-receive feature only
-        // engages when auto_melt_enabled=1 at invoice creation, so this is
-        // expected to be on; we re-check defensively. The address list is tried
-        // in priority order — the first that accepts the payment wins.
+        // regardless of the auto_melt_enabled toggle. Direct-receive engages
+        // whenever a destination is configured (the toggle only gates cron
+        // threshold-melt), so a store reaching this forward path always has at
+        // least one destination. The address list is tried in priority order —
+        // the first that accepts the payment wins.
         $destinations = StoreLnAddresses::destinationsForStore($storeId);
         if (empty($destinations)) {
             error_log("[lnurl-override] no payout destinations for store {$storeId}; skipping auto-melt");

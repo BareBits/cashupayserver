@@ -84,10 +84,12 @@ class Invoice {
         // fee not collected this way is still melted out by the cron. A single
         // fee owns whichever rails it covers — see FeeRedirect::decide. ----
         $invoiceSats = (int) ExchangeRates::convertToSats((string)$amount, $currency, 'sat');
-        $lnAutoMeltForRedirect = (int)($store['auto_melt_enabled'] ?? 0) === 1;
-        $lnAddrsForRedirect = $lnAutoMeltForRedirect
-            ? StoreLnAddresses::addressesForStore($storeId)
-            : [];
+        // Direct-receive destinations (LNURL addresses / CLINK noffers) make the
+        // store lightning-capable independent of the auto-cashout toggle: an
+        // invoice can fetch a bolt11 from a destination whether or not
+        // threshold-based cashout is enabled. The toggle only governs the cron
+        // threshold-melt of accumulated mint balance, not invoice creation.
+        $lnAddrsForRedirect = StoreLnAddresses::addressesForStore($storeId);
         $lightningCapable = $cashuConfigured
             || !empty($lnAddrsForRedirect)
             || (SwapsConfig::isEnabledForStore($storeId) && $onchainConfigured);
@@ -110,14 +112,13 @@ class Invoice {
         $lnurlAttempt = null;          // ['bolt11','verify_url','amount_sats'] on success
         $nofferAttempt = null;         // CLINK noffer receive context on success
         $lnurlOverrideReason = null;   // set when override-gate fired; recorded on the fallback invoice
-        $lnAutoMeltEnabled = (int)($store['auto_melt_enabled'] ?? 0) === 1;
         // Ordered fallback chain: try each destination (Lightning address via
         // LNURL, or CLINK noffer via Nostr) in priority order until one yields a
-        // usable invoice. The single auto_melt_address column was replaced by the
-        // store_ln_addresses table.
-        $destinations = $lnAutoMeltEnabled
-            ? StoreLnAddresses::destinationsForStore($storeId)
-            : [];
+        // usable invoice. Loaded regardless of the auto-cashout (threshold-melt)
+        // toggle — configuring a destination is enough to direct-receive to it;
+        // the toggle only governs the cron threshold-melt of mint balance. The
+        // single auto_melt_address column was replaced by store_ln_addresses.
+        $destinations = StoreLnAddresses::destinationsForStore($storeId);
         // Skip the merchant lightning rail entirely when a fee owns it — the
         // single lightning option on this invoice is the fee LNURL's bolt11.
         if ($feeLightning === null && !empty($destinations)) {

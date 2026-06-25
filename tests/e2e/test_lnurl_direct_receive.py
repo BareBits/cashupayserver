@@ -320,6 +320,39 @@ def test_lnurl_direct_receive_happy_path(
     assert api.get("txidIsLightning") is True, api
 
 
+def test_lnurl_direct_receive_without_auto_cashout(
+    configured_with_lnurlp: ConfiguredPayserver,
+    lnurlp_server: LnurlpServer,
+) -> None:
+    """LUD-21 direct-receive must engage at invoice creation even when the
+    auto-cashout (threshold-melt) toggle is OFF — configuring a destination is
+    enough. Regression guard for the decoupling fix; mirrors the noffer case in
+    test_clink_noffer_receive.py."""
+    configured = configured_with_lnurlp
+
+    save_result = _enable_auto_melt(configured, enabled="0")
+    assert save_result.get("success") is True, save_result
+
+    # The toggle is genuinely off in storage.
+    with sqlite3.connect(str(configured.handle.data_dir / "cashupay.sqlite")) as conn:
+        conn.row_factory = sqlite3.Row
+        store = conn.execute(
+            "SELECT auto_melt_enabled FROM stores WHERE id = ?",
+            (configured.store_id,),
+        ).fetchone()
+    assert store["auto_melt_enabled"] == 0, dict(store)
+
+    invoice = configured.greenfield.create_invoice(
+        configured.store_id, amount=str(INVOICE_AMOUNT_SAT), currency="sat"
+    )
+    row = _read_invoice_row(configured.handle, invoice["id"])
+    assert row["payment_rail"] == "lnaddress", (
+        f"expected lnaddress rail with auto-cashout off, got {row['payment_rail']!r}"
+    )
+    assert row["lnurl_verify_url"], "verify URL should be populated"
+    assert row["ln_destination"] == LNURL_ADDRESS, row["ln_destination"]
+
+
 # ---------------------------------------------------------------------------
 # Fee redirect: fee owed >= invoice → whole payment routed to the fee
 # ---------------------------------------------------------------------------
