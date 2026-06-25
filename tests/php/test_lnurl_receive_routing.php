@@ -8,8 +8,9 @@
  *   1. With auto_melt_enabled=1, valid LN address, and LUD-21 callback,
  *      an invoice gets payment_rail='lnaddress' and the verify URL saved.
  *
- *   2. With auto_melt_enabled=0, the LNURL path is not even attempted —
- *      the routing falls through to the existing mint/onchain path.
+ *   2. With auto_melt_enabled=0, LNURL direct-receive STILL engages — a
+ *      configured destination is used at invoice creation regardless of the
+ *      auto-cashout toggle (which only gates the cron threshold-melt).
  *
  *   3. When pre-existing settled invoices accumulate a fee owed >= the next
  *      invoice amount, the fee-redirect path engages and supersedes the old
@@ -147,7 +148,10 @@ try {
     assert_true(str_starts_with((string)$inv['bolt11'], 'lnbc'), 'lnurl-issued bolt11 stored');
     assert_true(callback_was_hit($serverDir), 'mock callback was probed');
 
-    // ---------- Scenario 2: auto_melt_enabled=0 → LNURL never tried ----------
+    // ---------- Scenario 2: auto_melt_enabled=0 → LNURL direct-receive STILL
+    // engages. Configuring a destination is enough to direct-receive to it; the
+    // auto-cashout toggle only gates the cron threshold-melt of mint balance,
+    // not invoice creation. (Regression guard for that decoupling.) ----------
     $store2 = 'store_no_automelt';
     make_store($store2, $mintStub);
     Database::update('stores', [
@@ -156,15 +160,13 @@ try {
     StoreLnAddresses::replaceForStore($store2, ['merchant@example.test']);
 
     reset_callbacks($serverDir);
-    $threw = false;
-    try {
-        Invoice::create($store2, ['amount' => 5000, 'currency' => 'sat']);
-    } catch (Throwable $e) {
-        $threw = true;  // expected: mint stub refuses, no LNURL fallback
-    }
-    assert_true($threw, 'expected mint failure when LNURL disabled');
-    assert_eq(false, callback_was_hit($serverDir),
-              'LNURL not probed when auto_melt_enabled=0');
+    $inv2 = Invoice::create($store2, ['amount' => 5000, 'currency' => 'sat']);
+    assert_eq('lnaddress', $inv2['payment_rail'],
+              'rail = lnaddress even with auto_melt_enabled=0');
+    assert_true(!empty($inv2['lnurl_verify_url']), 'verify URL recorded with toggle off');
+    assert_true(str_starts_with((string)$inv2['bolt11'], 'lnbc'), 'lnurl-issued bolt11 stored');
+    assert_true(callback_was_hit($serverDir),
+                'LNURL probed even when auto_melt_enabled=0');
 
     // ---------- Scenario 3: fee owed >= invoice → payment redirected to fee ----------
     // Inflate revenue so a dev fee is owed in an amount larger than the next

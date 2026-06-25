@@ -130,13 +130,16 @@ def clink_stack(
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-def _save_noffer_destination(admin: AdminClient, store_id: str, noffer: str) -> dict:
-    """Enable auto-cashout with a single noffer destination, mirroring the
-    dashboard's addresses[] chain (see test_clink_noffer.py)."""
+def _save_noffer_destination(admin: AdminClient, store_id: str, noffer: str,
+                             enabled: str = "1") -> dict:
+    """Configure a single noffer destination, mirroring the dashboard's
+    addresses[] chain (see test_clink_noffer.py). ``enabled`` controls the
+    auto-cashout (threshold-melt) toggle — direct-receive at invoice creation
+    must work independent of it, so tests pass enabled="0" to assert that."""
     data = [
         ("action", "save_auto_melt"),
         ("store_id", store_id),
-        ("enabled", "1"),
+        ("enabled", enabled),
         ("threshold", "100"),
         ("mode_override", "0"),
         ("addresses[]", noffer),
@@ -283,6 +286,39 @@ def test_clink_noffer_receive_round_trip(
     assert settled["status"] == "Settled"
     final_row = _invoice_row(payserver, invoice_id)
     assert final_row["settled_rail"] == "noffer", final_row
+
+
+def test_clink_noffer_direct_receive_without_auto_cashout(
+    configured: ConfiguredPayserver, clink_stack: ClinkStack
+) -> None:
+    """Direct-receive over a noffer must work at invoice creation even when the
+    auto-cashout (threshold-melt) toggle is OFF. Configuring a destination is
+    enough — the toggle only governs the cron melt of accumulated mint balance.
+    Regression guard for the fix that decoupled the two."""
+    admin = configured.admin
+    store_id = configured.store_id
+    payserver = configured.handle
+
+    # Save the noffer destination with auto-cashout explicitly disabled.
+    save = _save_noffer_destination(admin, store_id, clink_stack.noffer, enabled="0")
+    assert (save.get("addresses") or [])[0]["type"] == "noffer", save
+
+    # Sanity-check the toggle is actually off in storage, so a green test can't
+    # be explained by auto-cashout being on.
+    with sqlite3.connect(str(payserver.data_dir / "cashupay.sqlite")) as conn:
+        conn.row_factory = sqlite3.Row
+        store = conn.execute(
+            "SELECT auto_melt_enabled FROM stores WHERE id = ?", (store_id,)
+        ).fetchone()
+    assert store["auto_melt_enabled"] == 0, dict(store)
+
+    # The invoice still dials the noffer and rides the noffer rail.
+    invoice = configured.greenfield.create_invoice(
+        store_id, amount=str(INVOICE_AMOUNT_SAT), currency="sat"
+    )
+    row = _invoice_row(payserver, invoice["id"])
+    assert row["payment_rail"] == "noffer", row
+    assert row["noffer_request_event_id"], row
 
 
 def test_clink_noffer_receipt_via_cron(

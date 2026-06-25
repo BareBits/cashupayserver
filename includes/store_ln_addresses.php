@@ -50,6 +50,49 @@ class StoreLnAddresses {
     }
 
     /**
+     * Build an ordered, validated destination chain from two separate operator
+     * lists kept apart in the admin UI: Lightning addresses first, then CLINK
+     * noffers as fallback. This is both the order the UI presents (a dedicated
+     * noffer section below the lightning-address section) and the order
+     * Invoice::create walks at runtime.
+     *
+     * Each value is trimmed and blanks are dropped; each is validated against
+     * its declared type (so a noffer pasted into the address list, or an
+     * address pasted into the noffer list, is rejected with a clear message);
+     * duplicates across both lists (case-insensitive) throw. Returns
+     * [['type'=>string,'value'=>string], ...] in priority order — the shape the
+     * save handler's probe loop and replaceForStore() consume.
+     */
+    public static function chainFromLists(array $lnAddresses, array $noffers): array {
+        $typed = [];
+        foreach ($lnAddresses as $v) {
+            $typed[] = [self::TYPE_LNADDRESS, (string)$v];
+        }
+        foreach ($noffers as $v) {
+            $typed[] = [self::TYPE_NOFFER, (string)$v];
+        }
+        $out = [];
+        $seen = [];
+        foreach ($typed as [$type, $raw]) {
+            $val = trim($raw);
+            if ($val === '') {
+                continue;
+            }
+            if (!self::isValidEntry($type, $val)) {
+                $label = $type === self::TYPE_NOFFER ? 'noffer' : 'Lightning address';
+                throw new InvalidArgumentException("Invalid {$label} format: {$val}");
+            }
+            $key = strtolower($val);
+            if (isset($seen[$key])) {
+                throw new InvalidArgumentException("Duplicate destination: {$val}");
+            }
+            $seen[$key] = true;
+            $out[] = ['type' => $type, 'value' => $val];
+        }
+        return $out;
+    }
+
+    /**
      * Full ordered list for a store: [['id'=>int,'address'=>string,
      * 'type'=>string,'supports_verify'=>?int], ...] sorted by priority
      * (position ASC).

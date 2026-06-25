@@ -2183,15 +2183,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             require_once __DIR__ . '/includes/store_ln_addresses.php';
             try {
                 $storeId = $_POST['store_id'] ?? '';
-                // Ordered fallback chain. Accept addresses[] (preferred); fall
-                // back to a single `address` field for older callers.
-                $rawAddresses = $_POST['addresses'] ?? null;
-                if ($rawAddresses === null) {
-                    $single = trim((string)($_POST['address'] ?? ''));
-                    $rawAddresses = $single === '' ? [] : [$single];
-                } elseif (!is_array($rawAddresses)) {
-                    $rawAddresses = [(string)$rawAddresses];
-                }
                 $enabled = ($_POST['enabled'] ?? '0') === '1' ? 1 : 0;
                 $threshold = (int)($_POST['threshold'] ?? 2000);
                 // Tri-state per-store override: -1 inherit, 0 force LN, 1 force swap.
@@ -2205,32 +2196,53 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     throw new Exception('Store ID required');
                 }
 
-                // Normalize: trim, drop blanks, classify each entry as either a
-                // Lightning address or a CLINK noffer (auto-detected by shape —
-                // a noffer is bech32 'noffer1…', an address is local@host), then
-                // validate and reject duplicates (case-insensitive) so the chain
-                // never repeats a destination. Admins add a noffer the same way
-                // they add an LNURL: paste it into the same list.
-                $destinations = [];
-                $seen = [];
-                foreach ($rawAddresses as $raw) {
-                    $val = trim((string)$raw);
-                    if ($val === '') {
-                        continue;
+                // Destination chain. Preferred contract: two separate operator
+                // lists kept apart in the UI — ln_addresses[] (tried first) and
+                // noffers[] (fallback). chainFromLists validates each value
+                // against its declared type, dedups across both lists, and
+                // returns the ordered LN-first chain. Older callers may still
+                // send a single auto-detected addresses[] / address; honour that
+                // by classifying each entry by shape ('noffer1…' vs local@host).
+                if (isset($_POST['ln_addresses']) || isset($_POST['noffers'])) {
+                    $lnList = $_POST['ln_addresses'] ?? [];
+                    $nofferList = $_POST['noffers'] ?? [];
+                    if (!is_array($lnList)) {
+                        $lnList = [(string)$lnList];
                     }
-                    $type = ClinkNoffer::isValid($val)
-                        ? StoreLnAddresses::TYPE_NOFFER
-                        : StoreLnAddresses::TYPE_LNADDRESS;
-                    if (!StoreLnAddresses::isValidEntry($type, $val)) {
-                        $label = $type === StoreLnAddresses::TYPE_NOFFER ? 'noffer' : 'Lightning address';
-                        throw new Exception("Invalid {$label} format: {$val}");
+                    if (!is_array($nofferList)) {
+                        $nofferList = [(string)$nofferList];
                     }
-                    $key = strtolower($val);
-                    if (isset($seen[$key])) {
-                        throw new Exception("Duplicate destination: {$val}");
+                    $destinations = StoreLnAddresses::chainFromLists($lnList, $nofferList);
+                } else {
+                    // Legacy single auto-detected chain.
+                    $rawAddresses = $_POST['addresses'] ?? null;
+                    if ($rawAddresses === null) {
+                        $single = trim((string)($_POST['address'] ?? ''));
+                        $rawAddresses = $single === '' ? [] : [$single];
+                    } elseif (!is_array($rawAddresses)) {
+                        $rawAddresses = [(string)$rawAddresses];
                     }
-                    $seen[$key] = true;
-                    $destinations[] = ['type' => $type, 'value' => $val];
+                    $destinations = [];
+                    $seen = [];
+                    foreach ($rawAddresses as $raw) {
+                        $val = trim((string)$raw);
+                        if ($val === '') {
+                            continue;
+                        }
+                        $type = ClinkNoffer::isValid($val)
+                            ? StoreLnAddresses::TYPE_NOFFER
+                            : StoreLnAddresses::TYPE_LNADDRESS;
+                        if (!StoreLnAddresses::isValidEntry($type, $val)) {
+                            $label = $type === StoreLnAddresses::TYPE_NOFFER ? 'noffer' : 'Lightning address';
+                            throw new Exception("Invalid {$label} format: {$val}");
+                        }
+                        $key = strtolower($val);
+                        if (isset($seen[$key])) {
+                            throw new Exception("Duplicate destination: {$val}");
+                        }
+                        $seen[$key] = true;
+                        $destinations[] = ['type' => $type, 'value' => $val];
+                    }
                 }
 
                 // On-chain auto-cashout requires the store to have an on-chain
@@ -5300,6 +5312,20 @@ header('Cache-Control: no-cache, must-revalidate');
                                 </button>
                             </div>
 
+                            <div class="form-group" id="auto-melt-noffer-group">
+                                <label class="form-label">CLINK noffers (priority order)</label>
+                                <p class="form-help">
+                                    CLINK noffers (NIP-69) request a Lightning invoice over Nostr and
+                                    settle via the merchant&rsquo;s payment receipt. They are tried
+                                    <em>after</em> the lightning addresses above, in order, if those
+                                    can&rsquo;t produce an invoice. Paste a <code>noffer1&hellip;</code> string.
+                                </p>
+                                <div id="auto-melt-noffer-list"></div>
+                                <button type="button" class="btn btn-secondary" id="btn-add-noffer" style="margin-top: 0.5rem;">
+                                    + Add noffer
+                                </button>
+                            </div>
+
                             <p class="form-help" id="auto-melt-swap-info" style="display: none;">
                                 Sweeps the mint balance through a reverse submarine swap to the store's
                                 on-chain xpub. May result in longer intervals between auto-cashouts
@@ -7451,6 +7477,8 @@ header('Cache-Control: no-cache, must-revalidate');
             document.getElementById('btn-save-auto-melt').addEventListener('click', saveAutoMelt);
             const btnAddLnAddr = document.getElementById('btn-add-ln-address');
             if (btnAddLnAddr) btnAddLnAddr.addEventListener('click', addLnAddressRow);
+            const btnAddNoffer = document.getElementById('btn-add-noffer');
+            if (btnAddNoffer) btnAddNoffer.addEventListener('click', addNofferRow);
             // Live-update LN-address vs swap-mode hint pane when the operator
             // changes the dropdown, even before they save.
             const autoMeltModeSel = document.getElementById('auto-melt-mode-override');
@@ -10205,27 +10233,39 @@ header('Cache-Control: no-cache, must-revalidate');
             // Pull the ordered, non-blank addresses straight from the live rows
             // so what the operator sees is exactly what's saved.
             syncLnAddressesFromInputs();
-            const addresses = awLnAddresses
+            syncNoffersFromInputs();
+            const lnAddresses = awLnAddresses
+                .map(a => (a.address || '').trim())
+                .filter(a => a.length > 0);
+            const noffers = awNoffers
                 .map(a => (a.address || '').trim())
                 .filter(a => a.length > 0);
 
-            // Validate the chosen destination before saving so bad data surfaces
-            // inline rather than failing silently on the server.
+            // Validate each section against its own type before saving so bad
+            // data surfaces inline rather than failing silently on the server.
             if (modeOverride === '0') {
-                if (enabled === '1' && addresses.length === 0) {
+                if (enabled === '1' && lnAddresses.length === 0 && noffers.length === 0) {
                     return awError('aw-store-error', 'Add at least one lightning address or noffer to withdraw to.');
                 }
-                for (const a of addresses) {
-                    if (!isNofferValue(a) && !isValidLightningAddress(a)) {
-                        return awError('aw-store-error', `"${a}" doesn't look like a valid lightning address (name@domain.tld) or CLINK noffer (noffer1…).`);
+                for (const a of lnAddresses) {
+                    if (isNofferValue(a)) {
+                        return awError('aw-store-error', `"${a}" is a CLINK noffer — add it in the CLINK noffers section, not Lightning Addresses.`);
+                    }
+                    if (!isValidLightningAddress(a)) {
+                        return awError('aw-store-error', `"${a}" doesn't look like a valid lightning address (name@domain.tld).`);
                     }
                 }
-                // Reject duplicates (case-insensitive) — the chain should never
-                // contain the same host twice.
-                const lower = addresses.map(a => a.toLowerCase());
-                const dup = lower.find((a, i) => lower.indexOf(a) !== i);
+                for (const n of noffers) {
+                    if (!isNofferValue(n)) {
+                        return awError('aw-store-error', `"${n}" doesn't look like a valid CLINK noffer (noffer1…).`);
+                    }
+                }
+                // Reject duplicates (case-insensitive) across both lists — the
+                // combined chain should never contain the same destination twice.
+                const all = lnAddresses.concat(noffers).map(a => a.toLowerCase());
+                const dup = all.find((a, i) => all.indexOf(a) !== i);
                 if (dup) {
-                    return awError('aw-store-error', `Duplicate lightning address: ${dup}`);
+                    return awError('aw-store-error', `Duplicate destination: ${dup}`);
                 }
             } else if (modeOverride === '1') {
                 if (!storeHasOnchain()) {
@@ -10241,9 +10281,14 @@ header('Cache-Control: no-cache, must-revalidate');
                     + `&enabled=${enabled}`
                     + `&threshold=${threshold}`
                     + `&mode_override=${encodeURIComponent(modeOverride)}`;
-                // Send the ordered chain as addresses[]; an empty list clears it.
-                for (const a of addresses) {
-                    body += `&addresses%5B%5D=${encodeURIComponent(a)}`;
+                // Send the two ordered lists separately; the server appends
+                // noffers after the addresses (LN first, noffers as fallback).
+                // Empty lists clear the chain.
+                for (const a of lnAddresses) {
+                    body += `&ln_addresses%5B%5D=${encodeURIComponent(a)}`;
+                }
+                for (const n of noffers) {
+                    body += `&noffers%5B%5D=${encodeURIComponent(n)}`;
                 }
 
                 const response = await postWithCsrf(adminUrl, body);
@@ -10255,16 +10300,19 @@ header('Cache-Control: no-cache, must-revalidate');
                     // Update per-address LUD-21 hints from the save response so
                     // the operator sees probe results without a full reload.
                     if (Array.isArray(result.addresses)) {
-                        awLnAddresses = result.addresses.map(r => ({
+                        const mapped = result.addresses.map(r => ({
                             address: r.address,
                             type: r.type || (isNofferValue(r.address) ? 'noffer' : 'lnaddress'),
                             lud21Support: (r.lud21Support === null || r.lud21Support === undefined)
                                 ? null : Number(r.lud21Support),
                         }));
+                        awLnAddresses = mapped.filter(a => a.type !== 'noffer');
+                        awNoffers = mapped.filter(a => a.type === 'noffer');
                         if (dashboardData && dashboardData.autoMelt) {
-                            dashboardData.autoMelt.addresses = awLnAddresses.map(a => ({ ...a }));
+                            dashboardData.autoMelt.addresses = mapped.map(a => ({ ...a }));
                         }
                         renderLnAddressRows();
+                        renderNofferRows();
                     }
                     // Reload dashboard so the effective-mode badge reflects the save.
                     if (typeof loadDashboard === 'function') loadDashboard();
@@ -10404,6 +10452,10 @@ header('Cache-Control: no-cache, must-revalidate');
         // array order; index 0 is the primary, the rest are fallbacks tried in
         // turn when an earlier host is down / can't produce an invoice.
         let awLnAddresses = [];
+        // CLINK noffers are kept in their own list, rendered in a dedicated
+        // section below the lightning addresses. On save they are appended
+        // after the addresses (LN first, noffers as fallback).
+        let awNoffers = [];
 
         // A destination is a CLINK noffer if it's a bech32 'noffer1…' string
         // (optionally lightning:-prefixed), otherwise it's a Lightning address.
@@ -10415,13 +10467,19 @@ header('Cache-Control: no-cache, must-revalidate');
         function setLnAddressRowsFromData() {
             const am = dashboardData && dashboardData.autoMelt;
             const src = (am && Array.isArray(am.addresses)) ? am.addresses : [];
-            awLnAddresses = src.map(a => ({
+            // The stored chain mixes both types in priority order. Split it back
+            // into the two UI lists by type, preserving each type's relative
+            // order, so addresses and noffers render in their own sections.
+            const mapped = src.map(a => ({
                 address: a.address || '',
                 type: a.type || (isNofferValue(a.address) ? 'noffer' : 'lnaddress'),
                 lud21Support: (a.lud21Support === null || a.lud21Support === undefined)
                     ? null : Number(a.lud21Support),
             }));
+            awLnAddresses = mapped.filter(a => a.type !== 'noffer');
+            awNoffers = mapped.filter(a => a.type === 'noffer');
             renderLnAddressRows();
+            renderNofferRows();
         }
 
         // Read the current input values back into awLnAddresses (preserving the
@@ -10502,7 +10560,7 @@ header('Cache-Control: no-cache, must-revalidate');
                 const input = document.createElement('input');
                 input.type = 'text';
                 input.className = 'form-input ln-address-input';
-                input.placeholder = 'user@wallet.com or noffer1…';
+                input.placeholder = 'user@wallet.com';
                 input.value = entry.address || '';
                 input.style.flex = '1';
                 // Editing invalidates the cached probe result for that row and
@@ -10557,6 +10615,87 @@ header('Cache-Control: no-cache, must-revalidate');
             });
         }
 
+        // ---- CLINK noffer list (own section, mirrors the LN address list) ----
+
+        function syncNoffersFromInputs() {
+            const list = document.getElementById('auto-melt-noffer-list');
+            if (!list) return;
+            const inputs = list.querySelectorAll('input.noffer-input');
+            const next = [];
+            inputs.forEach((inp) => {
+                next.push({ address: inp.value, type: 'noffer', lud21Support: null });
+            });
+            awNoffers = next;
+        }
+
+        function addNofferRow() {
+            syncNoffersFromInputs();
+            awNoffers.push({ address: '', type: 'noffer', lud21Support: null });
+            renderNofferRows();
+            const list = document.getElementById('auto-melt-noffer-list');
+            if (list) {
+                const inputs = list.querySelectorAll('input.noffer-input');
+                if (inputs.length) inputs[inputs.length - 1].focus();
+            }
+        }
+
+        function removeNofferRow(index) {
+            syncNoffersFromInputs();
+            awNoffers.splice(index, 1);
+            renderNofferRows();
+        }
+
+        function moveNofferRow(index, delta) {
+            syncNoffersFromInputs();
+            const target = index + delta;
+            if (target < 0 || target >= awNoffers.length) return;
+            const tmp = awNoffers[index];
+            awNoffers[index] = awNoffers[target];
+            awNoffers[target] = tmp;
+            renderNofferRows();
+        }
+
+        function renderNofferRows() {
+            const list = document.getElementById('auto-melt-noffer-list');
+            if (!list) return;
+            list.innerHTML = '';
+            awNoffers.forEach((entry, i) => {
+                const row = document.createElement('div');
+                row.className = 'noffer-row';
+                row.style.cssText = 'display:flex; align-items:center; gap:0.4rem; margin-bottom:0.4rem;';
+
+                const prio = document.createElement('span');
+                prio.textContent = (i + 1) + '.';
+                prio.style.cssText = 'min-width:1.4rem; text-align:right; opacity:0.7; font-size:0.85rem;';
+                row.appendChild(prio);
+
+                const input = document.createElement('input');
+                input.type = 'text';
+                input.className = 'form-input noffer-input';
+                input.placeholder = 'noffer1…';
+                input.value = entry.address || '';
+                input.style.flex = '1';
+                row.appendChild(input);
+
+                const mkBtn = (label, title, handler, disabled) => {
+                    const b = document.createElement('button');
+                    b.type = 'button';
+                    b.className = 'btn btn-secondary';
+                    b.textContent = label;
+                    b.title = title;
+                    b.style.cssText = 'padding:0.3rem 0.55rem; line-height:1;';
+                    if (disabled) { b.disabled = true; b.style.opacity = '0.4'; }
+                    else b.addEventListener('click', handler);
+                    return b;
+                };
+                row.appendChild(mkBtn('↑', 'Move up', () => moveNofferRow(i, -1), i === 0));
+                row.appendChild(mkBtn('↓', 'Move down', () => moveNofferRow(i, 1), i === awNoffers.length - 1));
+                row.appendChild(mkBtn('✕', 'Remove', () => removeNofferRow(i), false));
+
+                list.appendChild(row);
+            });
+        }
+
         // Kept for callers that refresh the chain display after a mode change.
         // Preserve any unsaved edits already typed into the rows before redrawing.
         function renderLud21Warning() {
@@ -10583,12 +10722,15 @@ header('Cache-Control: no-cache, must-revalidate');
             const effLabel = document.getElementById('auto-melt-mode-effective');
             if (effLabel) effLabel.textContent = (am.mode === 'swap') ? 'On-chain via submarine swap' : 'Lightning address';
             const addrGroup = document.getElementById('auto-melt-address-group');
+            const nofferGroup = document.getElementById('auto-melt-noffer-group');
             const swapInfo = document.getElementById('auto-melt-swap-info');
             if (am.mode === 'swap') {
                 if (addrGroup) addrGroup.style.display = 'none';
+                if (nofferGroup) nofferGroup.style.display = 'none';
                 if (swapInfo) swapInfo.style.display = 'block';
             } else {
                 if (addrGroup) addrGroup.style.display = '';
+                if (nofferGroup) nofferGroup.style.display = '';
                 if (swapInfo) swapInfo.style.display = 'none';
             }
             const minSatsEl = document.getElementById('auto-melt-mode-min-sats');
