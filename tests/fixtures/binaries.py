@@ -140,6 +140,25 @@ ELECTRUM = FileSpec(
     env_override="CASHUPAY_TEST_ELECTRUM",
 )
 
+# CLINK Electrum plugin (BareBits/electrum_clink), distributed as an external
+# plugin zip on the GitHub release. The dev iterate.py rig + the noffer-receive
+# e2e inject this into the extracted Electrum AppImage as an internal plugin so
+# a wallet can act as a CLINK noffer service (see tests/fixtures/electrum.py).
+#
+# Caveat: the upstream release tag is the rolling `latest`, so the asset URL is
+# stable but its bytes can change when the plugin is rebuilt. The sha256 below
+# pins the build we tested against; if a rebuild lands upstream the download
+# will fail the checksum and this needs re-pinning (or point
+# CASHUPAY_TEST_CLINK_PLUGIN at a local zip).
+CLINK_PLUGIN = FileSpec(
+    name="electrum-clink-plugin",
+    version="0.0.1",
+    url="https://github.com/BareBits/electrum_clink/releases/download/latest/clink-0.0.1.zip",
+    sha256="df17456e9dfd6ffc197d62c8acd81a3d60407c0aa85b8a33d30fb707037863ee",
+    filename="clink-plugin.zip",
+    env_override="CASHUPAY_TEST_CLINK_PLUGIN",
+)
+
 
 def ensure_file(spec: FileSpec) -> Path:
     """Download a single file (e.g. wp-cli.phar) into tests/bin/<name>-<version>/."""

@@ -22,6 +22,7 @@ require_once __DIR__ . '/crypto/secp256k1.php';
 require_once __DIR__ . '/crypto/taproot.php';
 require_once __DIR__ . '/lnurl_receive.php';
 require_once __DIR__ . '/store_ln_addresses.php';
+require_once __DIR__ . '/clink/client.php';
 require_once __DIR__ . '/fee_redirect.php';
 
 use Cashu\Wallet;
@@ -107,17 +108,19 @@ class Invoice {
         // (verify URL) so we can detect settlement without running the LN
         // node ourselves. Wins over swap and mint when eligible. ----
         $lnurlAttempt = null;          // ['bolt11','verify_url','amount_sats'] on success
+        $nofferAttempt = null;         // CLINK noffer receive context on success
         $lnurlOverrideReason = null;   // set when override-gate fired; recorded on the fallback invoice
         $lnAutoMeltEnabled = (int)($store['auto_melt_enabled'] ?? 0) === 1;
-        // Ordered fallback chain: try each address in priority order until one
-        // yields a usable invoice. The single auto_melt_address column was
-        // replaced by the store_ln_addresses table.
-        $lnAddresses = $lnAutoMeltEnabled
-            ? StoreLnAddresses::addressesForStore($storeId)
+        // Ordered fallback chain: try each destination (Lightning address via
+        // LNURL, or CLINK noffer via Nostr) in priority order until one yields a
+        // usable invoice. The single auto_melt_address column was replaced by the
+        // store_ln_addresses table.
+        $destinations = $lnAutoMeltEnabled
+            ? StoreLnAddresses::destinationsForStore($storeId)
             : [];
         // Skip the merchant lightning rail entirely when a fee owns it — the
         // single lightning option on this invoice is the fee LNURL's bolt11.
-        if ($feeLightning === null && !empty($lnAddresses)) {
+        if ($feeLightning === null && !empty($destinations)) {
             $lnurlTargetSats = (int) ExchangeRates::convertToSats((string)$amount, $currency, 'sat');
             $feesDueSats = LnUrlReceive::feesDueSats($storeId);
             $decision = LnUrlReceive::shouldOverride($feesDueSats, $lnurlTargetSats);
@@ -137,23 +140,54 @@ class Invoice {
                 // can fire the immediate-settle-and-forward handler.
                 $lnurlOverrideReason = $decision['reason'];
             } elseif ($lnurlTargetSats > 0) {
-                // Walk the priority chain. First address to return a usable
+                // Walk the priority chain. First destination to return a usable
                 // invoice wins; the rest are only tried when earlier ones are
-                // down / out of range / lack a LUD-21 verify URL.
-                foreach ($lnAddresses as $priority => $lnAddress) {
-                    if (!StoreLnAddresses::isValid($lnAddress)) {
+                // down / out of range / can't produce a verifiable invoice.
+                foreach ($destinations as $priority => $dest) {
+                    if ($dest['type'] === StoreLnAddresses::TYPE_NOFFER) {
+                        // CLINK noffer: act as the payer toward the merchant's
+                        // Nostr service and fetch a BOLT11. Settlement is later
+                        // confirmed by a kind-21001 receipt (payment page + cron).
+                        try {
+                            $resolved = ClinkClient::requestInvoice($dest['value'], $lnurlTargetSats);
+                        } catch (Throwable $e) {
+                            error_log(sprintf(
+                                '[clink-receive] noffer fetch failed store=%s priority=%d: %s; trying next',
+                                $storeId, $priority, $e->getMessage()
+                            ));
+                            continue;
+                        }
+                        $nofferAttempt = [
+                            'bolt11' => $resolved['bolt11'],
+                            'amount_sats' => $lnurlTargetSats,
+                            'noffer' => $dest['value'],
+                            'relay' => $resolved['relay'],
+                            'receiver_pubkey' => $resolved['receiver_pubkey'],
+                            'ephemeral_sk' => $resolved['ephemeral_sk'],
+                            'ephemeral_pubkey' => $resolved['ephemeral_pubkey'],
+                            'request_event_id' => $resolved['request_event_id'],
+                            'created_at' => $resolved['created_at'],
+                        ];
+                        if ($priority > 0) {
+                            error_log("[clink-receive] using fallback noffer store={$storeId} priority={$priority}");
+                        }
+                        break;
+                    }
+
+                    // Lightning address (LNURL/LUD-21) path.
+                    if (!StoreLnAddresses::isValid($dest['value'])) {
                         error_log(sprintf(
                             '[lnurl-receive] skipping malformed address store=%s priority=%d address=%s',
-                            $storeId, $priority, $lnAddress
+                            $storeId, $priority, $dest['value']
                         ));
                         continue;
                     }
                     try {
                         $probed = LnUrlReceive::probeAndFetchInvoice(
-                            $lnAddress, $lnurlTargetSats
+                            $dest['value'], $lnurlTargetSats
                         );
                     } catch (Throwable $e) {
-                        error_log("[lnurl-receive] probe threw for store {$storeId} address {$lnAddress}: " . $e->getMessage());
+                        error_log("[lnurl-receive] probe threw for store {$storeId} address {$dest['value']}: " . $e->getMessage());
                         $probed = null;
                     }
                     if ($probed !== null) {
@@ -164,25 +198,25 @@ class Invoice {
                             // The LN address this bolt11 was fetched from. Persisted
                             // as ln_destination so the admin invoice view can show
                             // where a lightning payment was sent.
-                            'address' => $lnAddress,
+                            'address' => $dest['value'],
                         ];
                         if ($priority > 0) {
                             error_log(sprintf(
                                 '[lnurl-receive] using fallback address store=%s priority=%d address=%s',
-                                $storeId, $priority, $lnAddress
+                                $storeId, $priority, $dest['value']
                             ));
                         }
                         break;
                     }
                     error_log(sprintf(
                         '[lnurl-receive] probe failed for store=%s priority=%d address=%s amount_sats=%d; trying next',
-                        $storeId, $priority, $lnAddress, $lnurlTargetSats
+                        $storeId, $priority, $dest['value'], $lnurlTargetSats
                     ));
                 }
-                if ($lnurlAttempt === null) {
+                if ($lnurlAttempt === null && $nofferAttempt === null) {
                     error_log(sprintf(
-                        '[lnurl-receive] all %d address(es) failed for store=%s amount_sats=%d; falling back to swap/mint/onchain',
-                        count($lnAddresses), $storeId, $lnurlTargetSats
+                        '[direct-receive] all %d destination(s) failed for store=%s amount_sats=%d; falling back to swap/mint/onchain',
+                        count($destinations), $storeId, $lnurlTargetSats
                     ));
                 }
             }
@@ -194,7 +228,7 @@ class Invoice {
         // bolt11) or the on-chain rail (a swap invoice must stay lightning-only,
         // so we don't pair it with a fee-owned on-chain address).
         $swapAttempt = null; // populated by self::trySwapCreate on success
-        if ($lnurlAttempt === null && $feeLightning === null && $feeOnchain === null
+        if ($lnurlAttempt === null && $nofferAttempt === null && $feeLightning === null && $feeOnchain === null
             && SwapsConfig::isEnabledForStore($storeId) && $onchainConfigured) {
             // Target = what the merchant wants to receive on-chain in sats.
             $targetSats = ExchangeRates::convertToSats((string)$amount, $currency, 'sat');
@@ -237,7 +271,7 @@ class Invoice {
         $usedMintUrl = null;
         $amountInMintUnit = null;
         if ($cashuConfigured && $swapAttempt === null && $lnurlAttempt === null
-            && $feeLightning === null) {
+            && $nofferAttempt === null && $feeLightning === null) {
             $mintUnit = $store['mint_unit'];
             $amountInMintUnit = ExchangeRates::convertToMintUnit(
                 $amount, $currency, $mintUnit, $exchangeFee, $primaryProvider, $secondaryProvider
@@ -283,7 +317,7 @@ class Invoice {
         $onchainAmountTweakSats = null;
         $onchainCreatedTipHeight = null;
         if ($onchainConfigured && $swapAttempt === null && $lnurlAttempt === null
-            && $feeOnchain === null) {
+            && $nofferAttempt === null && $feeOnchain === null) {
             $baseAmountSat = (int)ExchangeRates::convertToSats((string)$amount, $currency, 'sat');
             try {
                 $allocation = OnchainPayments::allocateAddress($storeId, $baseAmountSat);
@@ -330,9 +364,19 @@ class Invoice {
 
         // Decide payment_rail + final field values
         $lnurlVerifyUrl = null;
-        // The Lightning destination the bolt11 points at (LN address / LNURL).
-        // Only set for lnaddress-rail invoices; NULL for mint/swap/onchain.
+        // The Lightning destination the bolt11 points at (LN address / LNURL,
+        // or the noffer string for the CLINK rail). Only set for the direct-
+        // receive rails; NULL for mint/swap/onchain.
         $lnDestination = null;
+        // CLINK noffer receive context, persisted so the payment page and cron
+        // can subscribe for the kind-21001 payment receipt. Only set on the
+        // 'noffer' rail.
+        $nofferRelay = null;
+        $nofferReceiverPubkey = null;
+        $nofferEphemeralSk = null;
+        $nofferEphemeralPubkey = null;
+        $nofferRequestEventId = null;
+        $nofferCreatedAt = null;
         if ($feeLightning !== null) {
             // Fee-redirect lightning rail: the customer pays the fee LNURL's
             // bolt11 directly. Rides payment_rail='lnaddress' so the existing
@@ -353,6 +397,19 @@ class Invoice {
             $amountSatsFinal = $lnurlAttempt['amount_sats'];
             $lnurlVerifyUrl = $lnurlAttempt['verify_url'];
             $lnDestination = $lnurlAttempt['address'] ?? null;
+        } elseif ($nofferAttempt !== null) {
+            $paymentRail = 'noffer';
+            $bolt11Final = $nofferAttempt['bolt11'];
+            $mintUrlFinal = null;
+            $quoteIdFinal = null;
+            $amountSatsFinal = $nofferAttempt['amount_sats'];
+            $lnDestination = $nofferAttempt['noffer'];
+            $nofferRelay = $nofferAttempt['relay'];
+            $nofferReceiverPubkey = $nofferAttempt['receiver_pubkey'];
+            $nofferEphemeralSk = $nofferAttempt['ephemeral_sk'];
+            $nofferEphemeralPubkey = $nofferAttempt['ephemeral_pubkey'];
+            $nofferRequestEventId = $nofferAttempt['request_event_id'];
+            $nofferCreatedAt = $nofferAttempt['created_at'];
         } elseif ($swapAttempt !== null) {
             $paymentRail = 'swap';
             $bolt11Final = $swapAttempt['swap']->invoice;
@@ -396,6 +453,12 @@ class Invoice {
             'lnurl_verify_url' => $lnurlVerifyUrl,
             'lnurl_override_reason' => $lnurlOverrideReason,
             'ln_destination' => $lnDestination,
+            'noffer_relay' => $nofferRelay,
+            'noffer_receiver_pubkey' => $nofferReceiverPubkey,
+            'noffer_ephemeral_sk' => $nofferEphemeralSk,
+            'noffer_ephemeral_pubkey' => $nofferEphemeralPubkey,
+            'noffer_request_event_id' => $nofferRequestEventId,
+            'noffer_created_at' => $nofferCreatedAt,
             'fee_redirect_note' => $feeNote,
             'fee_redirect_destination' => $feeDestination,
             'fee_redirect_rails' => $feeRails ? implode(',', $feeRails) : null,
@@ -746,7 +809,7 @@ class Invoice {
     private static function settledRailToLogical(?string $settledRail): ?string {
         return match ($settledRail) {
             'onchain' => 'onchain',
-            'mint', 'lnaddress', 'swap' => 'lightning',
+            'mint', 'lnaddress', 'noffer', 'swap' => 'lightning',
             default => null,
         };
     }
@@ -1129,6 +1192,138 @@ class Invoice {
     }
 
     /**
+     * Rebuild the CLINK client context (relay, keys, request id) from a
+     * persisted noffer-rail invoice, or null if the row lacks it.
+     *
+     * @return array{relay:string,receiver_pubkey:string,ephemeral_sk:string,
+     *               ephemeral_pubkey:string,request_event_id:string,created_at:int}|null
+     */
+    public static function nofferCtxFromInvoice(array $invoice): ?array {
+        foreach (['noffer_relay', 'noffer_receiver_pubkey', 'noffer_ephemeral_sk',
+                  'noffer_ephemeral_pubkey', 'noffer_request_event_id'] as $k) {
+            if (empty($invoice[$k])) {
+                return null;
+            }
+        }
+        return [
+            'relay' => (string)$invoice['noffer_relay'],
+            'receiver_pubkey' => (string)$invoice['noffer_receiver_pubkey'],
+            'ephemeral_sk' => (string)$invoice['noffer_ephemeral_sk'],
+            'ephemeral_pubkey' => (string)$invoice['noffer_ephemeral_pubkey'],
+            'request_event_id' => (string)$invoice['noffer_request_event_id'],
+            'created_at' => (int)($invoice['noffer_created_at'] ?? 0),
+        ];
+    }
+
+    /**
+     * Cron best-effort receipt poll for noffer-rail invoices. Re-subscribes to
+     * each invoice's relay and looks for the merchant's kind-21001 payment
+     * receipt. NOTE: kind 21001 is ephemeral; spec-compliant relays may not
+     * retain it, so this only catches receipts on retention-friendly relays —
+     * the payment page's live subscription is the reliable path.
+     */
+    public static function pollPendingNoffer(int $minInterval = 30, int $batchLimit = 10): void {
+        self::markExpiredInvoices();
+        $now = time();
+
+        $pending = Database::fetchAll(
+            "SELECT * FROM invoices
+              WHERE status = 'New'
+                AND payment_rail = 'noffer'
+                AND noffer_request_event_id IS NOT NULL
+                AND expiration_time > ?
+                AND (last_polled_at IS NULL OR (? - last_polled_at) >= ?)
+              ORDER BY
+                  CASE WHEN last_polled_at IS NULL THEN 0 ELSE 1 END,
+                  last_polled_at ASC
+              LIMIT ?",
+            [$now, $now, $minInterval, $batchLimit]
+        );
+
+        foreach ($pending as $invoice) {
+            try {
+                Database::update('invoices', ['last_polled_at' => $now], 'id = ?', [$invoice['id']]);
+                $ctx = self::nofferCtxFromInvoice($invoice);
+                if ($ctx === null) {
+                    continue;
+                }
+                $res = ClinkClient::fetchReceipt($ctx);
+                if (!empty($res['paid'])) {
+                    self::markNofferPaid($invoice);
+                }
+            } catch (Throwable $e) {
+                error_log("[clink-receive] cron poll failed for invoice {$invoice['id']}: " . $e->getMessage());
+            }
+        }
+    }
+
+    /**
+     * Settle a noffer-rail invoice from a receipt event the payment page
+     * forwarded off its live subscription. Returns true only when the event is
+     * a valid, merchant-signed payment receipt for this invoice. All trust is
+     * the merchant's Schnorr signature — the browser relays but cannot forge.
+     */
+    public static function settleNofferFromReceiptEvent(string $invoiceId, array $rawEvent): bool {
+        $invoice = self::getById($invoiceId);
+        if (!$invoice || ($invoice['payment_rail'] ?? null) !== 'noffer') {
+            return false;
+        }
+        if (($invoice['status'] ?? null) === 'Settled') {
+            return true;
+        }
+        $ctx = self::nofferCtxFromInvoice($invoice);
+        if ($ctx === null) {
+            return false;
+        }
+        $verdict = ClinkClient::verifyReceiptEvent($rawEvent, $ctx);
+        if (empty($verdict['paid'])) {
+            return false;
+        }
+        self::markNofferPaid($invoice);
+        return true;
+    }
+
+    /**
+     * Mark a noffer-rail invoice as Settled. Funds went straight to the
+     * merchant's CLINK wallet (no proofs in ours, no preimage in the receipt),
+     * so this just records the settlement and fires webhook + notification,
+     * status-guarded so the page and cron can't double-fire.
+     */
+    private static function markNofferPaid(array $invoice): void {
+        Database::beginTransaction();
+        try {
+            $settled = Database::update(
+                'invoices',
+                [
+                    'status' => 'Settled',
+                    'paid_at' => time(),
+                    'settled_rail' => 'noffer',
+                ],
+                'id = ? AND status != ?',
+                [$invoice['id'], 'Settled']
+            );
+            Database::commit();
+        } catch (Throwable $e) {
+            Database::rollback();
+            throw $e;
+        }
+
+        if ($settled !== 1) {
+            return; // already settled by another path
+        }
+
+        $updated = self::getById((string)$invoice['id']);
+        if ($updated !== null) {
+            WebhookSender::fireEvent($invoice['store_id'], 'InvoiceSettled', $updated);
+            NotificationSender::queueInvoicePaid($updated);
+        }
+        error_log(sprintf(
+            '[clink-receive] invoice=%s store=%s settled via noffer receipt',
+            $invoice['id'], $invoice['store_id']
+        ));
+    }
+
+    /**
      * Format invoice for API response
      */
     public static function formatForApi(array $invoice): array {
@@ -1202,12 +1397,12 @@ class Invoice {
                     $result['claimTxid'] = $sa['claim_txid'];
                 }
             }
-        } elseif (($rail === 'lnaddress' || $rail === 'mint') && !empty($invoice['bolt11'])) {
+        } elseif (($rail === 'lnaddress' || $rail === 'noffer' || $rail === 'mint') && !empty($invoice['bolt11'])) {
             // Lightning rails have no block-chain txid; surface the bolt11 as the
             // "TxID" (rendered copy-only, not as an explorer link) and the LN
-            // address / LNURL it was sent to as the destination. The mint rail
-            // has no lnurl destination (paid to the mint), so ln_destination is
-            // NULL there and the destination cell stays empty.
+            // address / LNURL / noffer it was sent to as the destination. The
+            // mint rail has no such destination (paid to the mint), so
+            // ln_destination is NULL there and the destination cell stays empty.
             $result['txid'] = $invoice['bolt11'];
             $result['txidIsLightning'] = true;
             if (!empty($invoice['ln_destination'])) {
@@ -1398,6 +1593,14 @@ class Invoice {
             } catch (Throwable $e) {
                 error_log("swap poll failed for {$invoiceId}: " . $e->getMessage());
             }
+            return;
+        }
+
+        // CLINK noffer rail: settlement arrives via the merchant's kind-21001
+        // receipt, handled by the payment page's live subscription (primary)
+        // and the cron receipt poll (best-effort). There's no quote or on-chain
+        // address to poll here, so this single-row poll is a no-op.
+        if (($invoice['payment_rail'] ?? null) === 'noffer') {
             return;
         }
 

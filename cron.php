@@ -185,6 +185,19 @@ if (!$swapOnly) {
     }
 }
 
+// Task 1a': Best-effort receipt poll for CLINK noffer-direct-receive invoices.
+// These settle on the merchant's kind-21001 payment receipt. The receipt is an
+// ephemeral Nostr event, so this cron path only catches it on relays that
+// retain ephemeral events — the payment page's live subscription is primary.
+if (!$swapOnly) {
+    try {
+        Invoice::pollPendingNoffer();
+        $results['tasks']['poll_noffer'] = 'success';
+    } catch (\Throwable $e) {
+        $results['tasks']['poll_noffer'] = 'error: ' . $e->getMessage();
+    }
+}
+
 // Task 1b: Settle dev / hosting / upstream-dev fees for every store. Runs
 // BEFORE auto-melt so the fee math sees revenue that may otherwise drain in
 // this same cron pass. Per-fee failures are caught inside settleStore() so a
