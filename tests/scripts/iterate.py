@@ -329,6 +329,24 @@ def _seed_fee_revenue(payserver: PayserverHandle, store_id: str, sats: int) -> N
         conn.commit()
 
 
+def _seed_payment_path_debug(payserver: PayserverHandle) -> None:
+    """Turn ON the admin-only payment-path debug labels for this local stack.
+
+    The site-wide default is OFF; this dev rig flips it ON so the labels are
+    visible on every payment screen during manual review. Stored as JSON 'true'
+    so Config::get(...) === true matches (Config json-decodes stored values)."""
+    import sqlite3
+    db_path = payserver.data_dir / "cashupay.sqlite"
+    now = int(time.time())
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO config (key, value, created_at, updated_at) "
+            "VALUES ('show_payment_path_debug', 'true', ?, ?)",
+            (now, now),
+        )
+        conn.commit()
+
+
 def settle_lnaddress(payserver: PayserverHandle, gc: GreenfieldClient, store_id: str,
                      invoice_id: str, timeout_s: float = 45.0, label: str = "") -> dict:
     """Drive an lnaddress-rail invoice to Settled. The customer-side payment
@@ -564,6 +582,11 @@ def main() -> int:
         print("[iterate] logging in as admin + creating API key ...")
         admin = AdminClient(payserver.url)
         admin.login(ADMIN_PASSWORD)
+
+        # Dev rig: surface the admin-only payment-path debug labels on every
+        # payment screen (site-wide default is OFF).
+        _seed_payment_path_debug(payserver)
+
         stores = admin.list_stores()
         oneconf_store_id = next(s["id"] for s in stores if s["name"] == STORE_ONECONF)
 
@@ -920,6 +943,7 @@ def main() -> int:
         print(f"                  oneconf has an LN-address payment ({MERCHANT_LN_ADDRESS});")
         print(f"                  feeredirect store has a 'Fee payment' redirect to {DEV_FEE_LN_ADDRESS}")
         print(f"Workdir:          {workdir}")
+        print(f"Path debug:       ON (admin-only payment-path labels visible on payment screens)")
         print(f"Auto-mine:        every {AUTOMINE_INTERVAL_SEC}s (so oneconf on-chain invoices settle)")
         print(f"\nElectrum:         GUI launched (regtest); vpub registered on both stores")
         print(f"                  ~{ELECTRUM_FUNDING_SAT/1e8:.4f} BTC on-chain, "

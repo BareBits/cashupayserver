@@ -11,6 +11,8 @@ require_once __DIR__ . '/includes/invoice.php';
 require_once __DIR__ . '/includes/background.php';
 require_once __DIR__ . '/includes/urls.php';
 require_once __DIR__ . '/includes/cart.php';
+require_once __DIR__ . '/includes/auth.php';
+require_once __DIR__ . '/includes/payment_path_debug.php';
 
 // Check setup
 if (!Database::isInitialized() || !Config::isSetupComplete()) {
@@ -193,6 +195,40 @@ if ($invoice['amount_sats'] && $requestCurrency !== 'SAT' && $requestCurrency !=
 }
 
 $baseUrl = Config::getBaseUrl();
+
+// Admin-only payment-path debug labels. Double-gated: the site-wide toggle
+// (default OFF) AND a logged-in admin session. In standalone mode we only probe
+// the session when the admin session cookie is already present, so anonymous
+// payers never receive a Set-Cookie from this public page; WordPress mode keys
+// off current_user_can() and needs no PHP session. When on, gather the extra
+// context the labels need (store on-chain mode + swap provider) so the helper
+// stays a pure string builder. $pathDebug stays false for everyone else.
+$pathDebug = false;
+$pathDebugOnchainMode = null;
+$pathDebugSwapProvider = null;
+$pathDebugCashuMintUrl = null;
+$pathDebugMayBeAdmin = (defined('CASHUPAY_WORDPRESS') && CASHUPAY_WORDPRESS)
+    || isset($_COOKIE['cashupay_session']);
+if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
+    if (Auth::isAdmin()) {
+        $pathDebug = true;
+        if (!empty($invoice['onchain_address'])) {
+            $modeRow = Database::fetchOne(
+                "SELECT onchain_address_mode FROM stores WHERE id = ?",
+                [$invoice['store_id']]
+            );
+            $pathDebugOnchainMode = $modeRow['onchain_address_mode'] ?? null;
+        }
+        if (($invoice['payment_rail'] ?? '') === 'swap') {
+            $swapRow = Database::fetchOne(
+                "SELECT provider FROM swap_attempts WHERE invoice_id = ? ORDER BY id DESC LIMIT 1",
+                [$invoice['id']]
+            );
+            $pathDebugSwapProvider = $swapRow['provider'] ?? null;
+        }
+        $pathDebugCashuMintUrl = Config::getStoreMintUrl($invoice['store_id']);
+    }
+}
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -442,6 +478,39 @@ $baseUrl = Config::getBaseUrl();
 
         .btn-secondary:hover {
             background: rgba(255, 255, 255, 0.15);
+        }
+
+        /* Admin-only payment-path debug label (next to each Copy button). */
+        .debug-path {
+            margin-top: 0.6rem;
+            padding: 0.5rem 0.65rem;
+            display: flex;
+            align-items: center;
+            gap: 0.45rem;
+            text-align: left;
+            font-size: 0.72rem;
+            line-height: 1.35;
+            color: var(--text-secondary);
+            background: rgba(247, 147, 26, 0.08);
+            border: 1px dashed rgba(247, 147, 26, 0.4);
+            border-radius: 8px;
+            word-break: break-all;
+        }
+
+        .debug-path-tag {
+            flex-shrink: 0;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+            font-size: 0.6rem;
+            font-weight: 700;
+            color: var(--accent);
+            background: rgba(247, 147, 26, 0.16);
+            padding: 0.12rem 0.4rem;
+            border-radius: 5px;
+        }
+
+        .debug-path-value {
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
         }
 
         .timer {
@@ -827,6 +896,12 @@ $baseUrl = Config::getBaseUrl();
                         </svg>
                         Copy Invoice
                     </button>
+                    <?php if ($pathDebug): ?>
+                    <div class="debug-path" title="Admin debug: how this Lightning invoice was sourced">
+                        <span class="debug-path-tag">path</span>
+                        <span class="debug-path-value"><?= htmlspecialchars(PaymentPathDebug::lightningLabel($invoice, $pathDebugSwapProvider)) ?></span>
+                    </div>
+                    <?php endif; ?>
                 </div>
                 <?php endif; ?>
 
@@ -853,6 +928,12 @@ $baseUrl = Config::getBaseUrl();
                         </svg>
                         Copy Address
                     </button>
+                    <?php if ($pathDebug): ?>
+                    <div class="debug-path" title="Admin debug: on-chain address derivation mode">
+                        <span class="debug-path-tag">path</span>
+                        <span class="debug-path-value"><?= htmlspecialchars(PaymentPathDebug::onchainLabel($invoice, $pathDebugOnchainMode)) ?></span>
+                    </div>
+                    <?php endif; ?>
                 </div>
                 <?php endif; ?>
 
@@ -865,6 +946,12 @@ $baseUrl = Config::getBaseUrl();
                     <button type="button" class="btn btn-secondary" data-copy="<?= htmlspecialchars($cashuRequest) ?>">
                         Copy Cashu Request
                     </button>
+                    <?php if ($pathDebug): ?>
+                    <div class="debug-path" title="Admin debug: Cashu ecash request target mint">
+                        <span class="debug-path-tag">path</span>
+                        <span class="debug-path-value"><?= htmlspecialchars(PaymentPathDebug::cashuLabel($pathDebugCashuMintUrl)) ?></span>
+                    </div>
+                    <?php endif; ?>
                     <div style="margin-top:0.75rem; text-align:left;">
                         <label style="font-size:0.8rem; color:var(--text-secondary);">…or paste a Cashu token to pay</label>
                         <textarea id="cashu-token-input" rows="3" placeholder="cashuB..."

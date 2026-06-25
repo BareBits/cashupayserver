@@ -2451,6 +2451,29 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
             break;
 
+        // ----- Developer / debug settings -----
+
+        case 'get_developer_settings':
+            Auth::requireAdmin();
+            require_once __DIR__ . '/includes/payment_path_debug.php';
+            echo json_encode([
+                'paymentPathDebug' => PaymentPathDebug::enabled(),
+            ]);
+            break;
+
+        case 'save_developer_settings':
+            Auth::requireAdmin();
+            require_once __DIR__ . '/includes/payment_path_debug.php';
+            try {
+                $paymentPathDebug = ($_POST['payment_path_debug'] ?? '0') === '1';
+                Config::set(PaymentPathDebug::CONFIG_KEY, $paymentPathDebug);
+                echo json_encode(['success' => true]);
+            } catch (Exception $e) {
+                http_response_code(400);
+                echo json_encode(['error' => $e->getMessage()]);
+            }
+            break;
+
         // ----- Submarine swap settings -----
 
         case 'get_swap_settings':
@@ -5861,6 +5884,36 @@ header('Cache-Control: no-cache, must-revalidate');
                         Open Store Settings &rarr;
                     </a>
                 </div>
+                <div class="card collapsible" data-admin-only="true" id="card-developer">
+                    <div class="card-header">
+                        <div class="card-title">Developer / Debug</div>
+                    </div>
+                    <div class="card-body">
+                        <p style="font-size: 0.85rem; color: var(--text-secondary); margin: 0 0 0.75rem 0;">
+                            Diagnostic options for operators. These never affect how
+                            payments are processed &mdash; they only change what is shown
+                            for debugging.
+                        </p>
+                        <div class="toggle-container">
+                            <span><strong>Show payment-path labels</strong> on the payment page</span>
+                            <label class="toggle">
+                                <input type="checkbox" id="developer-payment-path-debug">
+                                <span class="toggle-slider"></span>
+                            </label>
+                        </div>
+                        <p class="form-help" style="margin-top: 0.5rem;">
+                            When enabled, a small label next to each &ldquo;Copy&rdquo;
+                            button on the payment screen shows which payment path the
+                            invoice uses (LNURL, CLINK noffer, submarine swap, Cashu mint
+                            quote, on-chain xpub / static address, Cashu ecash). The label
+                            is only visible to a <strong>logged-in admin</strong> &mdash; a
+                            regular payer never sees it. Default off.
+                        </p>
+                        <button class="btn btn-full" id="btn-save-developer" style="margin-top: 0.75rem;">
+                            Save developer settings
+                        </button>
+                    </div>
+                </div>
                 <div class="card collapsible" data-admin-only="true" id="card-notifications">
                     <div class="card-header">
                         <div class="card-title">Email Notifications</div>
@@ -7509,6 +7562,8 @@ header('Cache-Control: no-cache, must-revalidate');
             if (storeTestBtn) storeTestBtn.addEventListener('click', sendStoreTestNotification);
             const saveNotifsBtn = document.getElementById('btn-save-notifications');
             if (saveNotifsBtn) saveNotifsBtn.addEventListener('click', saveNotificationSettings);
+            const saveDevBtn = document.getElementById('btn-save-developer');
+            if (saveDevBtn) saveDevBtn.addEventListener('click', saveDeveloperSettings);
             const testNotifsBtn = document.getElementById('btn-send-test-notification');
             if (testNotifsBtn) testNotifsBtn.addEventListener('click', sendTestNotification);
             const saveSwapsBtn = document.getElementById('btn-save-swaps');
@@ -7752,6 +7807,7 @@ header('Cache-Control: no-cache, must-revalidate');
                     loadCronUrl();
                     loadAutoUpdateCard();
                     loadNotificationSettings();
+                    loadDeveloperSettings();
                     loadSwapSettings();
                     loadSelfServeSettings();
                 }
@@ -10900,6 +10956,40 @@ header('Cache-Control: no-cache, must-revalidate');
                 }
             } catch (e) {
                 showToast('Failed to save notification settings', 'error');
+            }
+        }
+
+        // -------- Developer / debug settings --------
+
+        async function loadDeveloperSettings() {
+            try {
+                // POST (not GET ?action=) — with path-based admin routing a GET to
+                // a sub-path URL is served the SPA page, not the JSON action.
+                const response = await postWithCsrf(adminUrl, 'action=get_developer_settings');
+                if (!response.ok) return;
+                const data = await response.json();
+                document.getElementById('developer-payment-path-debug').checked = !!data.paymentPathDebug;
+            } catch (e) {
+                console.error('Failed to load developer settings', e);
+            }
+        }
+
+        async function saveDeveloperSettings() {
+            const params = new URLSearchParams({
+                action: 'save_developer_settings',
+                payment_path_debug: document.getElementById('developer-payment-path-debug').checked ? '1' : '0',
+            });
+            try {
+                const response = await postWithCsrf(adminUrl, params.toString());
+                const result = await response.json();
+                if (response.ok) {
+                    showToast('Developer settings saved!', 'success');
+                    loadDeveloperSettings();
+                } else {
+                    showToast(result.error || 'Failed to save', 'error');
+                }
+            } catch (e) {
+                showToast('Failed to save developer settings', 'error');
             }
         }
 
