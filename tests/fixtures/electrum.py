@@ -14,9 +14,11 @@ import json
 import os
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import time
+import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -29,11 +31,96 @@ from .fulcrum import FulcrumHandle
 # Wallet filename baked into the GUI title bar so the user can tell the
 # iterate.py-launched Electrum apart from their personal Electrum at a glance.
 ITERATE_WALLET_NAME = "CASHU-iterate-test"
+# Second wallet: the CLINK *payer* (the customer who settles a noffer-issued
+# bolt11). Lives in its own datadir/daemon; baked into the GUI title bar too.
+CLINK_SENDER_WALLET_NAME = "cashu_clink_sender"
+
+
+# ---------------------------------------------------------------------------
+# AppImage extraction + CLINK plugin injection
+#
+# The pinned Electrum is shipped as a read-only AppImage. To run the CLINK
+# plugin we extract the AppImage once into a writable tree and drop the plugin's
+# ``clink/`` folder into Electrum's *internal* plugins dir — it is structured
+# exactly like the bundled ``nwc`` plugin, so it loads as a normal internal
+# plugin (``plugins.clink.enabled=true``) with no loader patch. ``electrum_aionostr``
+# (the relay client the plugin imports) already ships inside the AppImage.
+# ---------------------------------------------------------------------------
+def ensure_electrum_apprun() -> Path:
+    """Extract the Electrum AppImage once and return the path to its ``AppRun``.
+
+    The extracted tree lives next to the cached AppImage (gitignored). Idempotent
+    and crash-safe: extraction happens in a temp dir that is atomically renamed
+    into place, so a concurrent/abandoned extraction can't yield a half tree.
+    """
+    appimage = binaries.ensure_file(binaries.ELECTRUM)
+    install_dir = appimage.parent
+    root = install_dir / "squashfs-root"
+    apprun = root / "AppRun"
+    if apprun.exists():
+        return apprun
+
+    tmp = install_dir / f".extract-{os.getpid()}"
+    if tmp.exists():
+        shutil.rmtree(tmp)
+    tmp.mkdir(parents=True)
+    try:
+        env = os.environ.copy()
+        # --appimage-extract writes ./squashfs-root relative to cwd.
+        subprocess.run(
+            [str(appimage), "--appimage-extract"],
+            cwd=str(tmp), env=env, capture_output=True, text=True, check=True,
+        )
+        extracted = tmp / "squashfs-root"
+        if not (extracted / "AppRun").exists():
+            raise RuntimeError("AppImage extraction produced no AppRun")
+        # Another worker may have won the race; only rename if we're still first.
+        if not apprun.exists():
+            os.replace(extracted, root)
+    finally:
+        if tmp.exists():
+            shutil.rmtree(tmp, ignore_errors=True)
+    if not apprun.exists():
+        raise RuntimeError(f"failed to extract Electrum AppImage to {root}")
+    return apprun
+
+
+def _electrum_internal_plugins_dir(apprun: Path) -> Path:
+    root = apprun.parent
+    matches = list(root.glob("usr/lib/python*/site-packages/electrum/plugins"))
+    if not matches:
+        raise RuntimeError(f"could not locate electrum/plugins under {root}")
+    return matches[0]
+
+
+def ensure_clink_plugin_installed(apprun: Path) -> None:
+    """Inject the CLINK plugin's ``clink/`` package into Electrum's internal
+    plugins dir inside the extracted AppImage. Idempotent (re-installs when the
+    pinned plugin zip changes, keyed by its sha256)."""
+    plugin_zip = binaries.ensure_file(binaries.CLINK_PLUGIN)
+    plugins_dir = _electrum_internal_plugins_dir(apprun)
+    dest = plugins_dir / "clink"
+    marker = dest / f".installed-{binaries.CLINK_PLUGIN.sha256}"
+    if marker.exists():
+        return
+    if dest.exists():
+        shutil.rmtree(dest)
+    with zipfile.ZipFile(plugin_zip) as zf:
+        # The zip stores the package under a top-level ``clink/`` dir; extract it
+        # straight into the plugins dir so we get ``.../plugins/clink/...``.
+        members = [m for m in zf.namelist() if m.startswith("clink/")]
+        if not members:
+            raise RuntimeError(f"{plugin_zip} has no clink/ package")
+        zf.extractall(plugins_dir, members=members)
+    marker.write_text("ok")
 
 
 @dataclass
 class ElectrumHandle:
-    appimage: Path
+    # Path to the extracted AppImage's ``AppRun`` (runs Electrum's bundled
+    # interpreter); behaves identically to the AppImage but lets us inject the
+    # CLINK plugin into the internal plugins dir.
+    exe: Path
     datadir: Path
     wallet_path: Path
     rpc_user: str
@@ -45,22 +132,19 @@ class ElectrumHandle:
     deposit_address: str | None = None
     lightning_node_id: str | None = None
     open_channels: list[str] = field(default_factory=list)
+    with_clink: bool = False
 
     def cli(self, *args: str, expect_json: bool = False, timeout: float = 30.0) -> str | Any:
         """Invoke an Electrum CLI command against this wallet's data dir.
         Returns stdout as text by default; pass expect_json=True to parse JSON."""
         cmd = [
-            str(self.appimage),
+            str(self.exe),
             "--regtest",
             "--dir", str(self.datadir),
             "--wallet", str(self.wallet_path),
             *args,
         ]
         env = os.environ.copy()
-        # AppImages extract themselves on each invocation; pin the extract path
-        # so we don't churn /tmp inodes and so we don't trip Linux's tmpfs perms.
-        env.setdefault("APPDIR", str(self.datadir / "appimage-extract"))
-        env.setdefault("APPIMAGE_EXTRACT_AND_RUN", "1")
         proc = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=timeout)
         if proc.returncode != 0:
             raise RuntimeError(
@@ -77,12 +161,35 @@ class ElectrumHandle:
         return out
 
 
-def start_electrum(workdir: Path, fulcrum: FulcrumHandle) -> ElectrumHandle:
+def start_electrum(
+    workdir: Path,
+    fulcrum: FulcrumHandle,
+    *,
+    instance: str = "electrum",
+    wallet_name: str = ITERATE_WALLET_NAME,
+    with_clink: bool = False,
+    clink_relay_url: str | None = None,
+    clink_devfee_dest: str | None = None,
+    clink_invoice_expiry_sec: int = 120,
+) -> ElectrumHandle:
     """Spin up an Electrum daemon configured for regtest pointing at the
-    provided Fulcrum server. Creates a fresh wallet."""
-    appimage = binaries.ensure_file(binaries.ELECTRUM)
+    provided Fulcrum server. Creates a fresh wallet.
 
-    datadir = workdir / "electrum"
+    ``instance`` is the per-daemon subdir under ``workdir`` (use distinct names
+    to run two Electrum daemons side by side). ``wallet_name`` is the wallet
+    file basename (shown in the GUI title bar).
+
+    With ``with_clink=True`` the CLINK plugin is injected + enabled so this
+    wallet acts as a noffer service (the receiver): ``clink_relay_url`` is the
+    Nostr relay it subscribes to and encodes into every noffer, and
+    ``clink_devfee_dest`` (optional) redirects the plugin's dev-fee payout to a
+    local LNURL so nothing leaks to a real endpoint.
+    """
+    apprun = ensure_electrum_apprun()
+    if with_clink:
+        ensure_clink_plugin_installed(apprun)
+
+    datadir = workdir / instance
     datadir.mkdir(parents=True, exist_ok=True)
 
     # Random RPC credentials so two iterate.py runs on the same machine don't
@@ -103,17 +210,18 @@ def start_electrum(workdir: Path, fulcrum: FulcrumHandle) -> ElectrumHandle:
 
     # Wallet file lives under the per-run datadir; the basename shows up in
     # the GUI title bar.
-    wallet_path = datadir / "regtest" / "wallets" / ITERATE_WALLET_NAME
+    wallet_path = datadir / "regtest" / "wallets" / wallet_name
     wallet_path.parent.mkdir(parents=True, exist_ok=True)
 
     handle = ElectrumHandle(
-        appimage=appimage,
+        exe=apprun,
         datadir=datadir,
         wallet_path=wallet_path,
         rpc_user=rpc_user,
         rpc_password=rpc_password,
         rpc_port=rpc_port,
         lightning_listen_port=lightning_listen_port,
+        with_clink=with_clink,
     )
 
     # 1. Pre-seed config (setconfig writes to the config file; --offline
@@ -147,6 +255,18 @@ def start_electrum(workdir: Path, fulcrum: FulcrumHandle) -> ElectrumHandle:
     # silences it for good and ensures no background update polling either.
     handle.cli("--offline", "setconfig", "check_updates", "false")
 
+    # 1b. CLINK plugin: enable it (the key Electrum's plugin manager checks) and
+    #     point it at the in-rig relay. Set before the daemon starts so the
+    #     plugin loads on startup and subscribes once the wallet is loaded.
+    if with_clink:
+        handle.cli("--offline", "setconfig", "plugins.clink.enabled", "true")
+        if clink_relay_url:
+            handle.cli("--offline", "setconfig", "plugins.clink.relay", clink_relay_url)
+        handle.cli("--offline", "setconfig", "plugins.clink.invoice_expiry_sec",
+                   str(clink_invoice_expiry_sec))
+        if clink_devfee_dest:
+            handle.cli("--offline", "setconfig", "plugins.clink.devfee_dest", clink_devfee_dest)
+
     # 2. Create the wallet (fresh seed). `--offline` so this doesn't try to
     #    contact a server during creation.
     handle.cli("--offline", "create")
@@ -154,9 +274,8 @@ def start_electrum(workdir: Path, fulcrum: FulcrumHandle) -> ElectrumHandle:
     # 3. Start the daemon.
     log = (datadir / "daemon.log").open("ab")
     env = os.environ.copy()
-    env.setdefault("APPIMAGE_EXTRACT_AND_RUN", "1")
     handle.daemon_process = subprocess.Popen(
-        [str(appimage), "--regtest", "--dir", str(datadir), "daemon", "-v"],
+        [str(apprun), "--regtest", "--dir", str(datadir), "daemon", "-v"],
         env=env,
         stdout=log,
         stderr=subprocess.STDOUT,
@@ -374,10 +493,9 @@ def launch_electrum_gui(handle: ElectrumHandle) -> None:
         handle.daemon_process = None
 
     env = os.environ.copy()
-    env.setdefault("APPIMAGE_EXTRACT_AND_RUN", "1")
     handle.gui_process = subprocess.Popen(
         [
-            str(handle.appimage),
+            str(handle.exe),
             "--regtest",
             "--dir", str(handle.datadir),
             "--wallet", str(handle.wallet_path),
@@ -406,3 +524,99 @@ def stop_electrum(handle: ElectrumHandle) -> None:
                 handle.daemon_process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 handle.daemon_process.kill()
+
+
+# ---------------------------------------------------------------------------
+# Lightning helpers for the CLINK flow (direct Electrum<->Electrum channels,
+# paying bolt11s, and driving the CLINK plugin's CLI).
+# ---------------------------------------------------------------------------
+def electrum_node_uri(handle: ElectrumHandle) -> str:
+    """Return ``<node_pubkey>@127.0.0.1:<lightning_listen_port>`` for this
+    wallet, suitable for another Electrum's ``open_channel``. The wallet must
+    have been started with a pinned ``lightning_listen`` (start_electrum does)."""
+    nodeid = handle.cli("nodeid").strip().strip('"').strip("'")
+    if "@" in nodeid:
+        return nodeid
+    return f"{nodeid}@127.0.0.1:{handle.lightning_listen_port}"
+
+
+def open_electrum_channel_to_peer(
+    opener: ElectrumHandle,
+    peer_node_uri: str,
+    bitcoind: BitcoindHandle,
+    *,
+    capacity_sat: int = 5_000_000,
+    push_sat: int | None = None,
+    confirmations: int = 6,
+) -> str:
+    """Open a *balanced* Lightning channel from ``opener`` directly to another
+    Electrum node (``peer_node_uri`` = ``pubkey@host:port``).
+
+    ``push_sat`` (default capacity/2) is pushed to the remote at open, so the
+    opener ends with outbound *and* inbound liquidity and the peer immediately
+    has inbound capacity to receive over this single hop (no LND routing). Mines
+    to activation and returns the channel point.
+    """
+    if push_sat is None:
+        push_sat = capacity_sat // 2
+    capacity_btc = f"{capacity_sat / 100_000_000:.8f}"
+    push_btc = f"{push_sat / 100_000_000:.8f}"
+    peer_pubkey = peer_node_uri.split("@", 1)[0]
+    opener.lightning_node_id = peer_pubkey
+
+    raw = opener.cli(
+        "open_channel", peer_node_uri, capacity_btc,
+        "--push_amount", push_btc, "--password", "",
+        timeout=60,
+    )
+    m = re.search(r"([0-9a-f]{64}:\d+)", raw)
+    if not m:
+        raise RuntimeError(f"electrum open_channel did not return a channel point: {raw}")
+    channel_point = m.group(1)
+    opener.open_channels.append(channel_point)
+
+    bitcoind.mine(confirmations)
+    deadline = time.monotonic() + 90
+    while time.monotonic() < deadline:
+        try:
+            channels = opener.cli("list_channels", expect_json=True)
+        except RuntimeError:
+            channels = []
+        if any((c.get("state") or "").upper() == "OPEN" for c in channels):
+            electrum_wait_synced(opener, bitcoind)
+            return channel_point
+        # Keep the funding tx confirming under load.
+        bitcoind.mine(1)
+        time.sleep(1)
+    raise TimeoutError(f"Electrum channel to {peer_pubkey[:16]} did not reach OPEN within 90s")
+
+
+def electrum_wait_channel_open_with(
+    handle: ElectrumHandle, peer_pubkey: str, timeout: float = 60.0
+) -> None:
+    """Block until ``handle`` shows an OPEN channel whose remote is ``peer_pubkey``
+    (used so the receiver confirms it can accept over a newly opened channel)."""
+    peer_pubkey = peer_pubkey.split("@", 1)[0]  # tolerate a pubkey@host:port
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            channels = handle.cli("list_channels", expect_json=True)
+        except RuntimeError:
+            channels = []
+        if any((c.get("state") or "").upper() == "OPEN"
+               and (c.get("remote_pubkey") == peer_pubkey) for c in channels):
+            return
+        time.sleep(1)
+    raise TimeoutError(f"channel with {peer_pubkey[:16]} did not reach OPEN within {timeout}s")
+
+
+def electrum_lnpay(handle: ElectrumHandle, bolt11: str, timeout: float = 120.0) -> str:
+    """Pay a BOLT11 over Lightning from this Electrum wallet. Returns raw output."""
+    return handle.cli("lnpay", bolt11, "--password", "", timeout=timeout).strip()
+
+
+def electrum_clink(handle: ElectrumHandle, command: str, *args: str, timeout: float = 30.0) -> Any:
+    """Invoke a CLINK plugin command (e.g. ``add_offer``, ``list_offers``,
+    ``clink_status``) on a wallet started with ``with_clink=True``. Returns the
+    parsed JSON the plugin emits."""
+    return handle.cli(f"clink_{command}", *args, expect_json=True, timeout=timeout)

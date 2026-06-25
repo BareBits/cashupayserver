@@ -314,9 +314,9 @@ class LnUrlReceive {
         // engages when auto_melt_enabled=1 at invoice creation, so this is
         // expected to be on; we re-check defensively. The address list is tried
         // in priority order — the first that accepts the payment wins.
-        $addresses = StoreLnAddresses::addressesForStore($storeId);
-        if (empty($addresses)) {
-            error_log("[lnurl-override] no LN addresses for store {$storeId}; skipping auto-melt");
+        $destinations = StoreLnAddresses::destinationsForStore($storeId);
+        if (empty($destinations)) {
+            error_log("[lnurl-override] no payout destinations for store {$storeId}; skipping auto-melt");
             return;
         }
 
@@ -346,11 +346,12 @@ class LnUrlReceive {
         }
 
         $lastError = null;
-        foreach ($addresses as $priority => $address) {
+        foreach ($destinations as $priority => $dest) {
+            $address = $dest['value'];
             try {
-                $result = LightningAddress::meltToAddress(
+                $result = LightningAddress::meltToDestination(
                     $storeId,
-                    $address,
+                    $dest,
                     $meltSats,
                     'BareBits override-triggered auto-cashout'
                 );
@@ -383,9 +384,9 @@ class LnUrlReceive {
 
         // Every address failed — notify against the primary so the operator
         // sees the payout is wedged. Cron auto-melt will retry on the next tick.
-        error_log("[lnurl-override] all auto-melt addresses failed for store {$storeId}");
+        error_log("[lnurl-override] all auto-melt destinations failed for store {$storeId}");
         NotificationSender::queueAutoCashoutFailure(
-            $storeId, $addresses[0],
+            $storeId, $destinations[0]['value'],
             $lastError ? $lastError->getMessage() : 'unknown error',
             null
         );

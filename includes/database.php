@@ -1097,6 +1097,25 @@ HTACCESS;
                 "CREATE INDEX idx_invoices_lnaddress_pending ON invoices(status, payment_rail)"
             );
         }
+        // CLINK noffer receive rail (payment_rail='noffer'): the customer pays a
+        // BOLT11 we fetched from the merchant's Nostr offer service. We persist
+        // the throwaway payer identity + the request event id so both the
+        // payment page (live) and cron (best-effort) can subscribe for the
+        // merchant's kind-21001 payment receipt and confirm settlement. The
+        // ephemeral secret is single-use and only protects a payment receipt's
+        // confidentiality, never store funds.
+        foreach ([
+            'noffer_relay' => 'TEXT DEFAULT NULL',
+            'noffer_receiver_pubkey' => 'TEXT DEFAULT NULL',
+            'noffer_ephemeral_sk' => 'TEXT DEFAULT NULL',
+            'noffer_ephemeral_pubkey' => 'TEXT DEFAULT NULL',
+            'noffer_request_event_id' => 'TEXT DEFAULT NULL',
+            'noffer_created_at' => 'INTEGER DEFAULT NULL',
+        ] as $col => $decl) {
+            if (!self::columnExists($pdo, 'invoices', $col)) {
+                $pdo->exec("ALTER TABLE invoices ADD COLUMN {$col} {$decl}");
+            }
+        }
 
         // Ordered, multi-address Lightning-address fallback. Replaces the single
         // stores.auto_melt_address column: a merchant can list several addresses
@@ -1121,6 +1140,14 @@ HTACCESS;
         }
         if (!self::indexExists($pdo, 'idx_store_ln_addresses_addr')) {
             $pdo->exec("CREATE UNIQUE INDEX idx_store_ln_addresses_addr ON store_ln_addresses(store_id, address);");
+        }
+        // Mixed-type destination chain: each row is either a Lightning address
+        // ('lnaddress', the original behaviour and default) or a CLINK noffer
+        // ('noffer'). Order (position ASC) is the try-order for both receiving
+        // and withdrawing; the resolvers branch on type. Existing rows backfill
+        // to 'lnaddress' via the column default.
+        if (!self::columnExists($pdo, 'store_ln_addresses', 'type')) {
+            $pdo->exec("ALTER TABLE store_ln_addresses ADD COLUMN type TEXT NOT NULL DEFAULT 'lnaddress'");
         }
         // Backfill the existing single address into position 0 before the
         // legacy columns are dropped below. Guarded on columnExists so it only

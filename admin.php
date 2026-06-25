@@ -272,6 +272,7 @@ if (isset($_GET['api'])) {
             $autoMeltAddresses = array_map(static function (array $r): array {
                 return [
                     'address' => $r['address'],
+                    'type' => $r['type'],
                     'lud21Support' => $r['supports_verify'],
                 ];
             }, $lnAddressRows);
@@ -2204,24 +2205,32 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     throw new Exception('Store ID required');
                 }
 
-                // Normalize: trim, drop blanks, validate each, reject duplicates
-                // (case-insensitive) so the fallback chain never repeats a host.
-                $addresses = [];
+                // Normalize: trim, drop blanks, classify each entry as either a
+                // Lightning address or a CLINK noffer (auto-detected by shape —
+                // a noffer is bech32 'noffer1…', an address is local@host), then
+                // validate and reject duplicates (case-insensitive) so the chain
+                // never repeats a destination. Admins add a noffer the same way
+                // they add an LNURL: paste it into the same list.
+                $destinations = [];
                 $seen = [];
                 foreach ($rawAddresses as $raw) {
-                    $addr = trim((string)$raw);
-                    if ($addr === '') {
+                    $val = trim((string)$raw);
+                    if ($val === '') {
                         continue;
                     }
-                    if (!StoreLnAddresses::isValid($addr)) {
-                        throw new Exception("Invalid Lightning address format: {$addr}");
+                    $type = ClinkNoffer::isValid($val)
+                        ? StoreLnAddresses::TYPE_NOFFER
+                        : StoreLnAddresses::TYPE_LNADDRESS;
+                    if (!StoreLnAddresses::isValidEntry($type, $val)) {
+                        $label = $type === StoreLnAddresses::TYPE_NOFFER ? 'noffer' : 'Lightning address';
+                        throw new Exception("Invalid {$label} format: {$val}");
                     }
-                    $key = strtolower($addr);
+                    $key = strtolower($val);
                     if (isset($seen[$key])) {
-                        throw new Exception("Duplicate Lightning address: {$addr}");
+                        throw new Exception("Duplicate destination: {$val}");
                     }
                     $seen[$key] = true;
-                    $addresses[] = $addr;
+                    $destinations[] = ['type' => $type, 'value' => $val];
                 }
 
                 // On-chain auto-cashout requires the store to have an on-chain
@@ -2248,15 +2257,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 // than blocking the save.
                 $entries = [];
                 $addressResults = [];
-                foreach ($addresses as $addr) {
+                foreach ($destinations as $dest) {
+                    // noffers settle via Nostr receipts, not LUD-21 — skip the
+                    // verify probe for them (supports_verify stays NULL).
+                    if ($dest['type'] === StoreLnAddresses::TYPE_NOFFER) {
+                        $entries[] = ['type' => 'noffer', 'address' => $dest['value'], 'supports_verify' => null];
+                        $addressResults[] = ['address' => $dest['value'], 'type' => 'noffer', 'lud21Support' => null];
+                        continue;
+                    }
                     $support = null;
                     try {
-                        $support = LnUrlReceive::probeLud21Support($addr);
+                        $support = LnUrlReceive::probeLud21Support($dest['value']);
                     } catch (Throwable $e) {
                         error_log('[lnurl-receive] LUD-21 save-time probe threw: ' . $e->getMessage());
                     }
-                    $entries[] = ['address' => $addr, 'supports_verify' => $support];
-                    $addressResults[] = ['address' => $addr, 'lud21Support' => $support];
+                    $entries[] = ['type' => 'lnaddress', 'address' => $dest['value'], 'supports_verify' => $support];
+                    $addressResults[] = ['address' => $dest['value'], 'type' => 'lnaddress', 'lud21Support' => $support];
                 }
 
                 Database::update('stores', [
@@ -10197,11 +10213,11 @@ header('Cache-Control: no-cache, must-revalidate');
             // inline rather than failing silently on the server.
             if (modeOverride === '0') {
                 if (enabled === '1' && addresses.length === 0) {
-                    return awError('aw-store-error', 'Add at least one lightning address to withdraw to.');
+                    return awError('aw-store-error', 'Add at least one lightning address or noffer to withdraw to.');
                 }
                 for (const a of addresses) {
-                    if (!isValidLightningAddress(a)) {
-                        return awError('aw-store-error', `"${a}" doesn't look like a valid lightning address (expected name@domain.tld).`);
+                    if (!isNofferValue(a) && !isValidLightningAddress(a)) {
+                        return awError('aw-store-error', `"${a}" doesn't look like a valid lightning address (name@domain.tld) or CLINK noffer (noffer1…).`);
                     }
                 }
                 // Reject duplicates (case-insensitive) — the chain should never
@@ -10241,6 +10257,7 @@ header('Cache-Control: no-cache, must-revalidate');
                     if (Array.isArray(result.addresses)) {
                         awLnAddresses = result.addresses.map(r => ({
                             address: r.address,
+                            type: r.type || (isNofferValue(r.address) ? 'noffer' : 'lnaddress'),
                             lud21Support: (r.lud21Support === null || r.lud21Support === undefined)
                                 ? null : Number(r.lud21Support),
                         }));
@@ -10388,11 +10405,19 @@ header('Cache-Control: no-cache, must-revalidate');
         // turn when an earlier host is down / can't produce an invoice.
         let awLnAddresses = [];
 
+        // A destination is a CLINK noffer if it's a bech32 'noffer1…' string
+        // (optionally lightning:-prefixed), otherwise it's a Lightning address.
+        // Mirrors the server-side auto-detection in save_auto_melt.
+        function isNofferValue(v) {
+            return /^(lightning:)?noffer1[02-9ac-hj-np-z]+$/i.test(String(v || '').trim());
+        }
+
         function setLnAddressRowsFromData() {
             const am = dashboardData && dashboardData.autoMelt;
             const src = (am && Array.isArray(am.addresses)) ? am.addresses : [];
             awLnAddresses = src.map(a => ({
                 address: a.address || '',
+                type: a.type || (isNofferValue(a.address) ? 'noffer' : 'lnaddress'),
                 lud21Support: (a.lud21Support === null || a.lud21Support === undefined)
                     ? null : Number(a.lud21Support),
             }));
@@ -10407,9 +10432,11 @@ header('Cache-Control: no-cache, must-revalidate');
             const inputs = list.querySelectorAll('input.ln-address-input');
             const next = [];
             inputs.forEach((inp, i) => {
+                const noffer = isNofferValue(inp.value);
                 next.push({
                     address: inp.value,
-                    lud21Support: awLnAddresses[i] ? awLnAddresses[i].lud21Support : null,
+                    type: noffer ? 'noffer' : 'lnaddress',
+                    lud21Support: (!noffer && awLnAddresses[i]) ? awLnAddresses[i].lud21Support : null,
                 });
             });
             awLnAddresses = next;
@@ -10417,7 +10444,7 @@ header('Cache-Control: no-cache, must-revalidate');
 
         function addLnAddressRow() {
             syncLnAddressesFromInputs();
-            awLnAddresses.push({ address: '', lud21Support: null });
+            awLnAddresses.push({ address: '', type: 'lnaddress', lud21Support: null });
             renderLnAddressRows();
             // Focus the freshly added input.
             const list = document.getElementById('auto-melt-address-list');
@@ -10475,12 +10502,16 @@ header('Cache-Control: no-cache, must-revalidate');
                 const input = document.createElement('input');
                 input.type = 'text';
                 input.className = 'form-input ln-address-input';
-                input.placeholder = 'user@wallet.com';
+                input.placeholder = 'user@wallet.com or noffer1…';
                 input.value = entry.address || '';
                 input.style.flex = '1';
-                // Editing invalidates the cached probe result for that row.
+                // Editing invalidates the cached probe result for that row and
+                // re-detects the type so the hint stays accurate while typing.
                 input.addEventListener('input', () => {
-                    if (awLnAddresses[i]) awLnAddresses[i].lud21Support = null;
+                    if (awLnAddresses[i]) {
+                        awLnAddresses[i].lud21Support = null;
+                        awLnAddresses[i].type = isNofferValue(input.value) ? 'noffer' : 'lnaddress';
+                    }
                     const hintEl = row.querySelector('.ln-address-hint');
                     if (hintEl) hintEl.style.display = 'none';
                 });
@@ -10503,17 +10534,24 @@ header('Cache-Control: no-cache, must-revalidate');
 
                 list.appendChild(row);
 
-                // Per-row LUD-21 hint, shown beneath the input.
-                const hint = lud21HintFor(entry.lud21Support);
+                // Per-row hint, shown beneath the input. noffers settle via a
+                // Nostr payment receipt (no LUD-21), so they get their own note.
                 const hintEl = document.createElement('p');
                 hintEl.className = 'form-help ln-address-hint';
                 hintEl.style.cssText = 'margin:0 0 0.5rem 1.8rem;';
-                if (hint) {
-                    hintEl.textContent = hint.text;
-                    hintEl.style.color = hint.cls === 'warn'
-                        ? 'var(--warning, #b07b00)' : 'var(--success, #2d7a3a)';
+                if (entry.type === 'noffer') {
+                    hintEl.textContent = 'CLINK noffer — payments are fetched over Nostr and '
+                        + 'confirmed by the merchant’s kind-21001 payment receipt.';
+                    hintEl.style.color = 'var(--success, #2d7a3a)';
                 } else {
-                    hintEl.style.display = 'none';
+                    const hint = lud21HintFor(entry.lud21Support);
+                    if (hint) {
+                        hintEl.textContent = hint.text;
+                        hintEl.style.color = hint.cls === 'warn'
+                            ? 'var(--warning, #b07b00)' : 'var(--success, #2d7a3a)';
+                    } else {
+                        hintEl.style.display = 'none';
+                    }
                 }
                 list.appendChild(hintEl);
             });

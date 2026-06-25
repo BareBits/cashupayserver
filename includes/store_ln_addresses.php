@@ -17,8 +17,13 @@
  */
 
 require_once __DIR__ . '/database.php';
+require_once __DIR__ . '/clink/noffer.php';
 
 class StoreLnAddresses {
+    /** Destination types stored in store_ln_addresses.type. */
+    public const TYPE_LNADDRESS = 'lnaddress';
+    public const TYPE_NOFFER = 'noffer';
+
     /**
      * Lightning-address shape check (LUD-16: local-part@host.tld). Kept in
      * sync with the regex used by Invoice::create and LnUrlReceive so the
@@ -32,12 +37,26 @@ class StoreLnAddresses {
     }
 
     /**
+     * Validate a destination value for a given type: LUD-16 for 'lnaddress',
+     * a structurally valid noffer for 'noffer'. The single gate both the admin
+     * save handler and replaceForStore() use.
+     */
+    public static function isValidEntry(string $type, string $value): bool {
+        $value = trim($value);
+        if ($type === self::TYPE_NOFFER) {
+            return ClinkNoffer::isValid($value);
+        }
+        return self::isValid($value);
+    }
+
+    /**
      * Full ordered list for a store: [['id'=>int,'address'=>string,
-     * 'supports_verify'=>?int], ...] sorted by priority (position ASC).
+     * 'type'=>string,'supports_verify'=>?int], ...] sorted by priority
+     * (position ASC).
      */
     public static function listForStore(string $storeId): array {
         $rows = Database::fetchAll(
-            "SELECT id, address, supports_verify
+            "SELECT id, address, type, supports_verify
                FROM store_ln_addresses
               WHERE store_id = ?
               ORDER BY position ASC, id ASC",
@@ -47,14 +66,31 @@ class StoreLnAddresses {
             return [
                 'id' => (int)$r['id'],
                 'address' => (string)$r['address'],
+                'type' => (string)($r['type'] ?? self::TYPE_LNADDRESS),
                 'supports_verify' => $r['supports_verify'] === null ? null : (int)$r['supports_verify'],
             ];
         }, $rows);
     }
 
     /**
-     * Ordered plain address strings for a store (priority first). Convenience
-     * for the resolvers that just need to walk the chain.
+     * Ordered typed destinations for the resolvers that walk the chain and act
+     * per type: [['type'=>string,'value'=>string,'supports_verify'=>?int], ...]
+     * in priority order.
+     */
+    public static function destinationsForStore(string $storeId): array {
+        return array_map(static function (array $r): array {
+            return [
+                'type' => $r['type'],
+                'value' => $r['address'],
+                'supports_verify' => $r['supports_verify'],
+            ];
+        }, self::listForStore($storeId));
+    }
+
+    /**
+     * Ordered plain destination strings for a store (priority first), across
+     * both types. Used for capability checks (is there any payout target?) and
+     * for representative display in failure notifications.
      */
     public static function addressesForStore(string $storeId): array {
         return array_map(
@@ -88,26 +124,39 @@ class StoreLnAddresses {
         $seen = [];
         foreach ($entries as $entry) {
             if (is_array($entry)) {
-                $address = trim((string)($entry['address'] ?? ''));
+                $address = trim((string)($entry['address'] ?? $entry['value'] ?? ''));
+                $type = (string)($entry['type'] ?? self::TYPE_LNADDRESS);
                 $verify = $entry['supports_verify'] ?? null;
             } else {
                 $address = trim((string)$entry);
+                $type = self::TYPE_LNADDRESS;
                 $verify = null;
             }
             if ($address === '') {
                 continue;
             }
-            if (!self::isValid($address)) {
-                throw new InvalidArgumentException("Invalid Lightning address: {$address}");
+            if ($type !== self::TYPE_LNADDRESS && $type !== self::TYPE_NOFFER) {
+                throw new InvalidArgumentException("Invalid destination type: {$type}");
             }
+            if (!self::isValidEntry($type, $address)) {
+                $label = $type === self::TYPE_NOFFER ? 'noffer' : 'Lightning address';
+                throw new InvalidArgumentException("Invalid {$label}: {$address}");
+            }
+            // Dedup case-insensitively across the whole chain so the same host
+            // never appears twice. noffer strings are all-lowercase bech32, so
+            // case-folding is a no-op for them and exact for addresses.
             $key = strtolower($address);
             if (isset($seen[$key])) {
-                throw new InvalidArgumentException("Duplicate Lightning address: {$address}");
+                throw new InvalidArgumentException("Duplicate destination: {$address}");
             }
             $seen[$key] = true;
+            // supports_verify only has meaning for LNURL/LUD-21; force NULL for
+            // noffers so the column isn't misread by the receive resolver.
             $normalized[] = [
                 'address' => $address,
-                'supports_verify' => $verify === null ? null : (int)$verify,
+                'type' => $type,
+                'supports_verify' => ($type === self::TYPE_LNADDRESS && $verify !== null)
+                    ? (int)$verify : null,
             ];
         }
 
@@ -117,11 +166,11 @@ class StoreLnAddresses {
             $del = $pdo->prepare("DELETE FROM store_ln_addresses WHERE store_id = ?");
             $del->execute([$storeId]);
             $ins = $pdo->prepare(
-                "INSERT INTO store_ln_addresses (store_id, position, address, supports_verify)
-                 VALUES (?, ?, ?, ?)"
+                "INSERT INTO store_ln_addresses (store_id, position, address, type, supports_verify)
+                 VALUES (?, ?, ?, ?, ?)"
             );
             foreach ($normalized as $i => $row) {
-                $ins->execute([$storeId, $i, $row['address'], $row['supports_verify']]);
+                $ins->execute([$storeId, $i, $row['address'], $row['type'], $row['supports_verify']]);
             }
             $pdo->commit();
         } catch (\Throwable $e) {

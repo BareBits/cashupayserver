@@ -27,6 +27,26 @@ if (empty($invoiceId)) {
     exit;
 }
 
+// CLINK noffer receipt endpoint: the payment page holds a live Nostr
+// subscription (native WebSocket) for the merchant's kind-21001 payment
+// receipt and forwards the raw signed event here. We verify the merchant's
+// Schnorr signature + decrypt server-side before settling, so the browser can
+// relay the receipt but cannot forge a payment. No CSRF token — like the
+// receipt-email endpoint below, there's no auth context to abuse, and trust
+// comes entirely from the merchant's signature.
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'noffer_receipt') {
+    header('Content-Type: application/json');
+    $event = json_decode((string)($_POST['event'] ?? ''), true);
+    if (!is_array($event)) {
+        http_response_code(400);
+        echo json_encode(['error' => 'Invalid event']);
+        exit;
+    }
+    $settled = Invoice::settleNofferFromReceiptEvent($invoiceId, $event);
+    echo json_encode(['settled' => $settled]);
+    exit;
+}
+
 // JSON polling branch runs first so we can keep its work tight. The
 // customer's browser polls this every 2 s; firing the full Background
 // fan-out on every poll burns mint API budget and fights cron for the
@@ -974,6 +994,19 @@ $baseUrl = Config::getBaseUrl();
         const expirationTime = <?= (int)$invoice['expiration_time'] ?>;
         const redirectUrl = <?= json_encode($redirectUrl) ?>;
         const payerReceiptOffered = <?= json_encode($payerReceiptOffered) ?>;
+        // CLINK noffer receive: subscription params so the page can watch the
+        // offer's relay for the merchant's kind-21001 payment receipt. Null
+        // unless this invoice rides the noffer rail.
+        const nofferSub = <?= json_encode(
+            (($invoice['payment_rail'] ?? '') === 'noffer' && !empty($invoice['noffer_relay']))
+                ? [
+                    'relay' => (string)$invoice['noffer_relay'],
+                    'pubkey' => (string)$invoice['noffer_ephemeral_pubkey'],
+                    'requestId' => (string)$invoice['noffer_request_event_id'],
+                    'since' => (int)($invoice['noffer_created_at'] ?? 0),
+                ]
+                : null
+        ) ?>;
         let currentStatus = <?= json_encode($invoice['status']) ?>;
 
         function renderQR(targetId, data) {
@@ -1121,6 +1154,74 @@ $baseUrl = Config::getBaseUrl();
             timerEl.className = remaining < 300 ? 'timer urgent' : 'timer';
         }
 
+        // CLINK noffer: hold a live Nostr subscription on the offer's relay and
+        // forward the merchant's kind-21001 payment receipt to the server, which
+        // verifies the signature + decrypts before settling. This is the
+        // reliable settlement path for the noffer rail (cron is best-effort,
+        // since the receipt is an ephemeral event relays may not retain). Uses
+        // the browser's native WebSocket — no library/bundle needed.
+        function startNofferReceiptWatch() {
+            if (!nofferSub || !nofferSub.relay) return;
+            let ws = null;
+            let stopped = false;
+            const subId = 'clink-' + Math.random().toString(36).slice(2, 10);
+
+            function connect() {
+                if (stopped) return;
+                try { ws = new WebSocket(nofferSub.relay); }
+                catch (e) { return; }
+
+                ws.onopen = function () {
+                    ws.send(JSON.stringify(['REQ', subId, {
+                        kinds: [21001],
+                        '#p': [nofferSub.pubkey],
+                        '#e': [nofferSub.requestId],
+                        since: Math.max(0, nofferSub.since - 1),
+                    }]));
+                };
+                ws.onmessage = async function (msg) {
+                    let data;
+                    try { data = JSON.parse(msg.data); } catch (e) { return; }
+                    if (!Array.isArray(data) || data[0] !== 'EVENT' || data[1] !== subId || !data[2]) return;
+                    try {
+                        const body = new URLSearchParams();
+                        body.set('action', 'noffer_receipt');
+                        body.set('event', JSON.stringify(data[2]));
+                        const postUrl = new URL(window.location.href);
+                        postUrl.searchParams.set('id', invoiceId);
+                        const r = await fetch(postUrl.toString(), {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                            body: body.toString(),
+                        });
+                        const res = await r.json().catch(() => ({}));
+                        if (res && res.settled) {
+                            stopped = true;
+                            try { ws.close(); } catch (e) {}
+                            pollStatus(); // flip the UI to Settled promptly
+                        }
+                    } catch (e) { /* ignore; cron is the fallback */ }
+                };
+                ws.onclose = function () {
+                    // Relays drop idle connections; reconnect while still open.
+                    if (!stopped && currentStatus === 'New') {
+                        setTimeout(connect, 3000);
+                    }
+                };
+                ws.onerror = function () { try { ws.close(); } catch (e) {} };
+            }
+            connect();
+
+            // Stop once the invoice leaves the New state.
+            const guard = setInterval(function () {
+                if (currentStatus !== 'New') {
+                    stopped = true;
+                    try { if (ws) ws.close(); } catch (e) {}
+                    clearInterval(guard);
+                }
+            }, 2000);
+        }
+
         // Poll for status
         async function pollStatus() {
             if (currentStatus === 'Settled' || currentStatus === 'Expired' || currentStatus === 'Invalid') {
@@ -1181,6 +1282,7 @@ $baseUrl = Config::getBaseUrl();
             if (currentStatus === 'New') {
                 updateTimer();
                 setInterval(updateTimer, 1000);
+                startNofferReceiptWatch();
             }
         }
 

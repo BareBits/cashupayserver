@@ -46,12 +46,17 @@ from fixtures import binaries  # noqa: E402
 from fixtures.api_client import AdminClient, GreenfieldClient  # noqa: E402
 from fixtures.bitcoind import BitcoindHandle, start_bitcoind, stop_bitcoind  # noqa: E402
 from fixtures.cashume import CashuMeHandle, start_cashume, stop_cashume  # noqa: E402
+from fixtures.clink_relay import start_clink_relay, stop_clink_relay  # noqa: E402
 from fixtures.electrum import (  # noqa: E402
+    CLINK_SENDER_WALLET_NAME,
     ElectrumHandle,
+    electrum_clink,
+    electrum_node_uri,
     electrum_send_onchain,
     fund_electrum_from_bitcoind,
     launch_electrum_gui,
     open_electrum_channel_to_lnd,
+    open_electrum_channel_to_peer,
     start_electrum,
     stop_electrum,
 )
@@ -109,6 +114,14 @@ FEE_REDIRECT_SEED_REVENUE_SAT = 1_000_000  # 2% dev fee => ~20k sat owed, dwarfs
 # Customer-side wallet funding (the wallets handed off for manual play)
 ELECTRUM_FUNDING_SAT = 10_000_000   # 0.1 BTC on-chain
 ELECTRUM_CHANNEL_SAT = 200_000      # Lightning channel capacity to lnd_mint
+# CLINK: the existing Electrum wallet runs the electrum_clink plugin (the noffer
+# *service* / receiver). A second wallet, cashu_clink_sender, is the customer who
+# pays a noffer-issued bolt11; it opens a *balanced* direct channel to the
+# merchant so the merchant gets inbound liquidity (to receive) and the sender
+# gets both outbound (to pay) and inbound.
+CLINK_SENDER_FUNDING_SAT = 10_000_000   # 0.1 BTC on-chain for the sender wallet
+CLINK_SENDER_CHANNEL_SAT = 5_000_000    # balanced direct channel sender <-> merchant
+CLINK_FEES_LN_USER = "clink_fees"       # dev-fee payout is redirected to this local lnurlp user
 CASHUME_FUNDING_SAT = 100_000_000   # 1 BTC pre-loaded into the cashu.me wallet
 AUTOMINE_INTERVAL_SEC = 30          # regtest blocks tick this often so 1-conf invoices settle
 
@@ -524,8 +537,24 @@ def main() -> int:
         fulcrum = start_fulcrum(workdir, bitcoind)
         handles.append(("fulcrum", stop_fulcrum, fulcrum))
 
-        print("[iterate] starting Electrum daemon (regtest) ...")
-        electrum = start_electrum(workdir, fulcrum)
+        # CLINK: in-rig Nostr relay the plugin (and cashupayserver's ClinkClient)
+        # speak over. Started before Electrum so the plugin can subscribe on
+        # startup. Loopback-only; no auth — throwaway rig only.
+        print("[iterate] starting in-rig CLINK Nostr relay ...")
+        clink_relay = start_clink_relay(workdir)
+        handles.append(("clink-relay", stop_clink_relay, clink_relay))
+        print(f"[iterate] CLINK relay: {clink_relay.ws_url}")
+        # Redirect the plugin's opt-out dev-fee payout to the local LNURL host so
+        # nothing ever leaves the rig (default is a real mainnet address).
+        clink_devfee_dest = f"{lnurlp.base_url}/.well-known/lnurlp/{CLINK_FEES_LN_USER}"
+
+        print("[iterate] starting Electrum daemon (regtest) + CLINK noffer plugin ...")
+        electrum = start_electrum(
+            workdir, fulcrum,
+            with_clink=True,
+            clink_relay_url=clink_relay.ws_url,
+            clink_devfee_dest=clink_devfee_dest,
+        )
         handles.append(("electrum", stop_electrum, electrum))
 
         electrum_vpub = electrum.cli("getmpk").strip()
@@ -711,6 +740,42 @@ def main() -> int:
             capacity_sat=ELECTRUM_CHANNEL_SAT,
         )
 
+        # 8a. CLINK sender wallet: a second Electrum instance (cashu_clink_sender)
+        #     that pays noffer-issued bolt11s. It opens a balanced direct channel
+        #     to the merchant (the plugin wallet), giving the merchant the inbound
+        #     liquidity it needs to receive CLINK payments and the sender both
+        #     outbound and inbound.
+        print(f"\n[iterate] === Setting up CLINK sender wallet ({CLINK_SENDER_WALLET_NAME}) ===")
+        clink_sender = start_electrum(
+            workdir, fulcrum,
+            instance="electrum-clink-sender",
+            wallet_name=CLINK_SENDER_WALLET_NAME,
+        )
+        handles.append(("electrum-clink-sender", stop_electrum, clink_sender))
+        print(f"[iterate] funding {CLINK_SENDER_WALLET_NAME} on-chain with {CLINK_SENDER_FUNDING_SAT:,} sat ...")
+        fund_electrum_from_bitcoind(clink_sender, bitcoind, CLINK_SENDER_FUNDING_SAT, confirmations=3)
+        print(f"[iterate] opening balanced channel {CLINK_SENDER_WALLET_NAME} <-> merchant "
+              f"({CLINK_SENDER_CHANNEL_SAT:,} sat, half pushed) ...")
+        open_electrum_channel_to_peer(
+            clink_sender, electrum_node_uri(electrum), bitcoind,
+            capacity_sat=CLINK_SENDER_CHANNEL_SAT,
+        )
+        # Wait for the plugin to see inbound liquidity, then mint a demo noffer
+        # the operator can pay from cashu_clink_sender (or wire into a store's
+        # auto-cashout chain in admin).
+        clink_noffer = None
+        try:
+            for _ in range(45):
+                avail = int(electrum_clink(electrum, "clink_status").get("available_sat", 0) or 0)
+                if avail > 0:
+                    break
+                bitcoind.mine(1)
+                time.sleep(2)
+            clink_noffer = electrum_clink(electrum, "add_offer", "--label", "iterate-demo")["noffer"]
+            print(f"[iterate] merchant inbound liquidity: {avail:,} sat; demo noffer: {clink_noffer}")
+        except Exception as e:
+            print(f"[iterate] (note) CLINK demo offer not minted: {e}")
+
         # 8b. Static-address store: create + pay 2 invoices, paid from the
         #     now-funded Electrum wallet. Each invoice has a distinct base
         #     amount + unique tweak, so Electrum sends two single-tx
@@ -764,8 +829,9 @@ def main() -> int:
         handles.append(("cashu.me", stop_cashume, cashume))
         cashume_url = cashume.deeplink(mint_url=mint.url, token=cashume_token)
 
-        print("[iterate] launching Electrum GUI ...")
+        print("[iterate] launching Electrum GUIs (merchant + CLINK sender) ...")
         launch_electrum_gui(electrum)
+        launch_electrum_gui(clink_sender)
 
         print("[iterate] launching cashu.me + admin in a single Chromium window ...")
         # Use Playwright's manual lifecycle (start/stop instead of context
@@ -858,6 +924,16 @@ def main() -> int:
         print(f"\nElectrum:         GUI launched (regtest); vpub registered on both stores")
         print(f"                  ~{ELECTRUM_FUNDING_SAT/1e8:.4f} BTC on-chain, "
               f"~{ELECTRUM_CHANNEL_SAT:,} sat channel to lnd_mint")
+        print(f"                  + runs the electrum_clink plugin (noffer service)")
+        print(f"CLINK relay:      {clink_relay.ws_url}    (in-rig Nostr relay)")
+        print(f"CLINK sender:     {CLINK_SENDER_WALLET_NAME} GUI launched; "
+              f"~{CLINK_SENDER_FUNDING_SAT/1e8:.4f} BTC on-chain,")
+        print(f"                  balanced ~{CLINK_SENDER_CHANNEL_SAT:,} sat channel to the merchant")
+        if clink_noffer:
+            print(f"CLINK demo noffer:{clink_noffer}")
+            print(f"                  (pay it from {CLINK_SENDER_WALLET_NAME}, or add it to a store's")
+            print(f"                   auto-cashout chain in admin to direct-receive over CLINK)")
+        print(f"CLINK dev-fee:    redirected to {clink_devfee_dest} (local; never leaves the rig)")
         print(f"cashu.me:         {cashume_url}")
         print(f"                  opened in Chromium with {CASHUME_FUNDING_SAT} sat pre-loaded")
 

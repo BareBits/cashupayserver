@@ -16,6 +16,7 @@ require_once __DIR__ . '/notification_sender.php';
 require_once __DIR__ . '/safe_http.php';
 require_once __DIR__ . '/swap/auto_melt.php';
 require_once __DIR__ . '/store_ln_addresses.php';
+require_once __DIR__ . '/clink/client.php';
 require_once __DIR__ . '/../cashu-wallet-php/CashuWallet.php';
 
 use Cashu\Wallet;
@@ -232,11 +233,12 @@ class LightningAddress {
             }
             // Ordered fallback chain for this store; skip stores with none
             // (replaces the old WHERE auto_melt_address IS NOT NULL filter).
-            $addresses = StoreLnAddresses::addressesForStore($store['id']);
-            if (empty($addresses)) {
+            // Mixed types: Lightning addresses and CLINK noffers, tried in order.
+            $destinations = StoreLnAddresses::destinationsForStore($store['id']);
+            if (empty($destinations)) {
                 continue;
             }
-            $primaryAddress = $addresses[0];
+            $primaryAddress = $destinations[0]['value'];
             try {
                 // Check store balance from local storage (offline-first, no mint contact)
                 // This prevents crashes when mint is unreachable
@@ -283,22 +285,23 @@ class LightningAddress {
                     $meltResult = null;
                     $usedAddress = null;
                     $lastMeltError = null;
-                    foreach ($addresses as $priority => $address) {
+                    foreach ($destinations as $priority => $dest) {
+                        $destValue = $dest['value'];
                         try {
-                            $meltResult = self::meltToAddress(
+                            $meltResult = self::meltToDestination(
                                 $store['id'],
-                                $address,
+                                $dest,
                                 $meltAmountSats,
                                 'BareBits auto-cashout'
                             );
-                            $usedAddress = $address;
+                            $usedAddress = $destValue;
                             if ($priority > 0) {
-                                error_log("Auto-melt: used fallback address (priority {$priority}) {$address} for store {$store['id']}");
+                                error_log("Auto-melt: used fallback destination (priority {$priority}, {$dest['type']}) {$destValue} for store {$store['id']}");
                             }
                             break;
                         } catch (Exception $meltError) {
                             $lastMeltError = $meltError;
-                            error_log("Auto-melt attempt to {$address} (priority {$priority}) failed for store {$store['id']}: " . $meltError->getMessage());
+                            error_log("Auto-melt attempt to {$destValue} ({$dest['type']}, priority {$priority}) failed for store {$store['id']}: " . $meltError->getMessage());
                         }
                     }
 
@@ -346,7 +349,7 @@ class LightningAddress {
                         // funds, etc.). Notify against the primary and continue — don't
                         // crash the admin page load.
                         $errMsg = $lastMeltError ? $lastMeltError->getMessage() : 'unknown error';
-                        error_log("Auto-melt operation failed for store {$store['id']} (all " . count($addresses) . " address(es)): " . $errMsg);
+                        error_log("Auto-melt operation failed for store {$store['id']} (all " . count($destinations) . " destination(s)): " . $errMsg);
                         NotificationSender::queueAutoCashoutFailure(
                             $store['id'],
                             $primaryAddress,
@@ -598,6 +601,33 @@ class LightningAddress {
             'fee' => $meltQuote->feeReserve - Wallet::sumProofs($result['change'] ?? []),
             'changeAmount' => Wallet::sumProofs($result['change'] ?? []),
         ];
+    }
+
+    /**
+     * Withdraw to a typed destination from the ordered chain, dispatching on
+     * type so callers can walk a mixed list of Lightning addresses and CLINK
+     * noffers uniformly.
+     *
+     *   lnaddress → meltToAddress (LNURL-pay resolution).
+     *   noffer    → ask the noffer's Nostr service for a BOLT11 (acting as the
+     *               payer), then melt to that one-shot invoice. The cashu melt
+     *               preimage is the proof of payment, so noffer withdrawal needs
+     *               no kind-21001 receipt — that's only for the receive side.
+     *
+     * Returns the same shape as meltToAddress/meltToBolt11. Throws on failure
+     * (the chain-walking callers catch per-attempt and fall through).
+     *
+     * @param array{type:string,value:string} $dest
+     */
+    public static function meltToDestination(string $storeId, array $dest, int $amountSats, ?string $comment = null): array {
+        $type = $dest['type'] ?? StoreLnAddresses::TYPE_LNADDRESS;
+        $value = (string)($dest['value'] ?? '');
+        if ($type === StoreLnAddresses::TYPE_NOFFER) {
+            // Resolve a fresh invoice for exactly this amount, then pay it.
+            $resolved = ClinkClient::requestInvoice($value, $amountSats, $comment);
+            return self::meltToBolt11($storeId, $resolved['bolt11'], $amountSats);
+        }
+        return self::meltToAddress($storeId, $value, $amountSats, $comment);
     }
 }
 
