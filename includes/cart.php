@@ -122,9 +122,12 @@ class Cart {
      *                              or a custom line: ['title','price','currency','quantity']
      * @param string|null $memo     optional note stored on the invoice
      * @param string|null $redirect optional checkout redirect URL
+     * @param array       $privacy  optional per-invoice memo-privacy overrides:
+     *                              ['hideStoreName'=>bool, 'hideNote'=>bool].
+     *                              Omitted keys fall back to the store defaults.
      * @return array ['invoiceId','checkoutLink','amountSats']
      */
-    public static function checkout(string $storeId, array $items, ?string $memo = null, ?string $redirect = null): array {
+    public static function checkout(string $storeId, array $items, ?string $memo = null, ?string $redirect = null, array $privacy = []): array {
         $priced = self::priceItems($storeId, $items);
         $lines = $priced['lines'];
         $totalSats = $priced['totalSats'];
@@ -135,6 +138,14 @@ class Cart {
             'itemDesc' => ($memo !== null && $memo !== '') ? $memo : (count($lines) . ' item(s)'),
             'cart' => true,
         ];
+        // Per-invoice memo-privacy overrides (win over the store defaults when
+        // present; see Invoice::buildInvoiceMemo).
+        if (array_key_exists('hideStoreName', $privacy)) {
+            $metadata['hideStoreName'] = (bool)$privacy['hideStoreName'];
+        }
+        if (array_key_exists('hideNote', $privacy)) {
+            $metadata['hideNote'] = (bool)$privacy['hideNote'];
+        }
         $options = ['amount' => (string)$totalSats, 'currency' => 'sat', 'metadata' => $metadata];
         if ($redirect !== null && $redirect !== '') {
             $options['checkout'] = ['redirectURL' => $redirect, 'redirectAutomatically' => true];
