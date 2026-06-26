@@ -23,9 +23,13 @@ final class Schnorr {
         if (strlen($msg32) !== 32) {
             throw new InvalidArgumentException('msg must be 32 bytes');
         }
-        if ($auxRand32 === null) {
-            $auxRand32 = random_bytes(32);
-        } elseif (strlen($auxRand32) !== 32) {
+        // When the caller pins auxRand we must stay deterministic (BIP340 test
+        // vectors, reproducible signatures), so a degenerate nonce is a hard
+        // error. When we own the randomness we can resample fresh auxRand on the
+        // astronomically-rare (~2^-256) degenerate nonce instead of failing the
+        // caller's swap claim.
+        $auxProvided = $auxRand32 !== null;
+        if ($auxProvided && strlen($auxRand32) !== 32) {
             throw new InvalidArgumentException('auxRand must be 32 bytes when provided');
         }
 
@@ -42,35 +46,51 @@ final class Schnorr {
         $d = Secp256k1::pointParity($P) === 0 ? $dPrime : gmp_sub($n, $dPrime);
         $pubX = Secp256k1::gmpTo32Bytes($P[0]);
 
-        // t = d XOR tagged_hash("BIP0340/aux", auxRand)
-        $t = self::xor32(Secp256k1::gmpTo32Bytes($d), Secp256k1::taggedHash('BIP0340/aux', $auxRand32));
+        $maxAttempts = $auxProvided ? 1 : 8;
+        for ($attempt = 0; $attempt < $maxAttempts; $attempt++) {
+            $aux = $auxProvided ? $auxRand32 : random_bytes(32);
 
-        // rand = tagged_hash("BIP0340/nonce", t || bytes(P) || msg)
-        $rand = Secp256k1::taggedHash('BIP0340/nonce', $t . $pubX . $msg32);
-        $kPrime = gmp_mod(Secp256k1::bytesToGmp($rand), $n);
-        if (gmp_cmp($kPrime, 0) === 0) {
-            throw new RuntimeException('Schnorr nonce was zero — try again with different auxRand');
+            // t = d XOR tagged_hash("BIP0340/aux", auxRand)
+            $t = self::xor32(Secp256k1::gmpTo32Bytes($d), Secp256k1::taggedHash('BIP0340/aux', $aux));
+
+            // rand = tagged_hash("BIP0340/nonce", t || bytes(P) || msg)
+            $rand = Secp256k1::taggedHash('BIP0340/nonce', $t . $pubX . $msg32);
+            $kPrime = gmp_mod(Secp256k1::bytesToGmp($rand), $n);
+            if (gmp_cmp($kPrime, 0) === 0) {
+                if ($auxProvided) {
+                    throw new RuntimeException('Schnorr nonce was zero — try again with different auxRand');
+                }
+                continue; // resample with fresh auxRand
+            }
+            $R = Secp256k1::generatorMult($kPrime);
+            if ($R === null) {
+                if ($auxProvided) {
+                    throw new RuntimeException('Schnorr nonce produced point at infinity');
+                }
+                continue; // resample with fresh auxRand
+            }
+            $k = Secp256k1::pointParity($R) === 0 ? $kPrime : gmp_sub($n, $kPrime);
+            $rX = Secp256k1::gmpTo32Bytes($R[0]);
+
+            // e = int(tagged_hash("BIP0340/challenge", bytes(R) || bytes(P) || msg)) mod n
+            $e = gmp_mod(Secp256k1::bytesToGmp(
+                Secp256k1::taggedHash('BIP0340/challenge', $rX . $pubX . $msg32)
+            ), $n);
+
+            $s = gmp_mod(gmp_add($k, gmp_mul($e, $d)), $n);
+            $sig = $rX . Secp256k1::gmpTo32Bytes($s);
+
+            // Self-verify as a sanity check (BIP340 recommended for new code). A
+            // failure here signals a logic/hardware fault, not a bad nonce, so we
+            // surface it rather than silently resampling.
+            if (!self::verify($pubX, $msg32, $sig)) {
+                throw new RuntimeException('Schnorr self-verify failed');
+            }
+            return $sig;
         }
-        $R = Secp256k1::generatorMult($kPrime);
-        if ($R === null) {
-            throw new RuntimeException('Schnorr nonce produced point at infinity');
-        }
-        $k = Secp256k1::pointParity($R) === 0 ? $kPrime : gmp_sub($n, $kPrime);
-        $rX = Secp256k1::gmpTo32Bytes($R[0]);
 
-        // e = int(tagged_hash("BIP0340/challenge", bytes(R) || bytes(P) || msg)) mod n
-        $e = gmp_mod(Secp256k1::bytesToGmp(
-            Secp256k1::taggedHash('BIP0340/challenge', $rX . $pubX . $msg32)
-        ), $n);
-
-        $s = gmp_mod(gmp_add($k, gmp_mul($e, $d)), $n);
-        $sig = $rX . Secp256k1::gmpTo32Bytes($s);
-
-        // Self-verify as a sanity check (BIP340 recommended for new code).
-        if (!self::verify($pubX, $msg32, $sig)) {
-            throw new RuntimeException('Schnorr self-verify failed');
-        }
-        return $sig;
+        // Exhausted resampling without a usable nonce — practically impossible.
+        throw new RuntimeException('Schnorr signing failed to find a valid nonce after resampling');
     }
 
     /**

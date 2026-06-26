@@ -1262,7 +1262,24 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
             if (!nofferSub || !nofferSub.relay) return;
             let ws = null;
             let stopped = false;
-            const subId = 'clink-' + Math.random().toString(36).slice(2, 10);
+            // The sub id only needs to be unique on this socket, but we draw it
+            // from the platform CSPRNG (with a graceful fallback for legacy /
+            // non-secure contexts) to avoid any collision between concurrent
+            // tabs and to keep Math.random out of the codebase.
+            const subId = 'clink-' + (function () {
+                try {
+                    const c = (typeof crypto !== 'undefined' && crypto)
+                        || (typeof window !== 'undefined' && window.crypto);
+                    if (c && c.getRandomValues) {
+                        const buf = new Uint8Array(6);
+                        c.getRandomValues(buf);
+                        return Array.from(buf, function (b) {
+                            return b.toString(16).padStart(2, '0');
+                        }).join('');
+                    }
+                } catch (e) { /* fall through to non-CSPRNG fallback */ }
+                return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+            })();
 
             function connect() {
                 if (stopped) return;
