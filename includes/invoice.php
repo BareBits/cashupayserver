@@ -31,37 +31,92 @@ use Cashu\Proof;
 use Cashu\ProofState;
 
 class Invoice {
+    // ---- Invoice-memo privacy resolution ------------------------------------
+    // The store name and the payer-facing note can each be embedded in the memo
+    // a payer's wallet records (noffer NIP-69 description + cashu NUT-18 memo).
+    // Visibility resolves per field with the per-invoice override winning:
+    //   1. invoice metadata flag (hideStoreName / hideNote), when present;
+    //   2. else the per-store default column (hide_store_name_on_invoice /
+    //      hide_note_on_invoice), when set (1 = hide);
+    //   3. else show (the product default).
+    // Both layers default to "show", so existing stores/invoices are unchanged.
+
+    /** Coerce a metadata/DB flag (bool, 1/0, "1"/"0", "true"/"false") to bool. */
+    private static function flagIsOn($val): bool {
+        if (is_bool($val)) { return $val; }
+        if (is_int($val))  { return $val === 1; }
+        return filter_var((string)$val, FILTER_VALIDATE_BOOLEAN);
+    }
+
+    /** Whether the store name should appear in this invoice's memo. */
+    public static function showStoreNameOnInvoice(array $store, ?array $metadata = null): bool {
+        if (is_array($metadata) && array_key_exists('hideStoreName', $metadata)) {
+            return !self::flagIsOn($metadata['hideStoreName']);
+        }
+        $v = $store['hide_store_name_on_invoice'] ?? null;
+        if ($v !== null && $v !== '') {
+            return (int)$v !== 1;
+        }
+        return true;
+    }
+
+    /** Whether the payer-facing note should appear in this invoice's memo. */
+    public static function showNoteOnInvoice(array $store, ?array $metadata = null): bool {
+        if (is_array($metadata) && array_key_exists('hideNote', $metadata)) {
+            return !self::flagIsOn($metadata['hideNote']);
+        }
+        $v = $store['hide_note_on_invoice'] ?? null;
+        if ($v !== null && $v !== '') {
+            return (int)$v !== 1;
+        }
+        return true;
+    }
+
+    /**
+     * Build the payer-facing memo embedded in an invoice — the store name plus
+     * the invoice's note (metadata.itemDesc) joined with " - ", each included
+     * only when its privacy resolution (see showStoreNameOnInvoice /
+     * showNoteOnInvoice) says to show it. mb-safe so multibyte names/notes
+     * aren't cut mid-character. Returns '' when there's nothing to say, so
+     * callers can omit the memo entirely.
+     *
+     * $maxLen caps the result (mb-safe); pass <= 0 to leave it uncapped.
+     */
+    public static function buildInvoiceMemo(array $store, ?array $metadata = null, int $maxLen = 100): string {
+        $parts = [];
+        if (self::showStoreNameOnInvoice($store, $metadata)) {
+            $name = trim((string)($store['name'] ?? ''));
+            if ($name !== '') { $parts[] = $name; }
+        }
+        if (self::showNoteOnInvoice($store, $metadata)) {
+            // itemDesc is the payer-facing note convention used across the app
+            // (see payment.php / pay.php); reuse it so the memo matches.
+            $note = is_array($metadata) ? trim((string)($metadata['itemDesc'] ?? '')) : '';
+            if ($note !== '') { $parts[] = $note; }
+        }
+        $memo = implode(' - ', $parts);
+        if ($maxLen > 0 && mb_strlen($memo) > $maxLen) {
+            $memo = rtrim(mb_substr($memo, 0, $maxLen));
+        }
+        return $memo;
+    }
+
     /**
      * Best-effort, spec-compliant memo for an externally-minted Lightning
      * invoice we request as the payer — currently the CLINK noffer rail's
      * NIP-69 `description`. We surface the store name plus the invoice's
-     * payer-facing note (metadata.itemDesc) when present, so the receiving
-     * wallet *can* label the payment in its history, mirroring the text the
-     * payment page shows the customer.
+     * payer-facing note (metadata.itemDesc) when present and not hidden by the
+     * store/invoice privacy settings, so the receiving wallet *can* label the
+     * payment in its history, mirroring the text the payment page shows.
      *
      * This is only a request: per NIP-69 the receiving service may honor or
      * ignore the description and has the final say on the invoice's actual
      * memo. Capped at 100 chars to stay within the CLINK spec (the reference
-     * @shocknet/clink-sdk rejects longer descriptions); mb-safe so multibyte
-     * store names aren't cut mid-character. Returns '' when there's nothing
-     * to say, so callers can omit the field entirely.
+     * @shocknet/clink-sdk rejects longer descriptions). Returns '' when there's
+     * nothing to say, so callers can omit the field entirely.
      */
     public static function nofferMemo(array $store, ?array $metadata = null): string {
-        $name = trim((string)($store['name'] ?? ''));
-        $note = '';
-        if (is_array($metadata)) {
-            // itemDesc is the payer-facing note convention used across the app
-            // (see payment.php / pay.php); reuse it so the LN memo matches.
-            $note = trim((string)($metadata['itemDesc'] ?? ''));
-        }
-        $parts = [];
-        if ($name !== '') { $parts[] = $name; }
-        if ($note !== '') { $parts[] = $note; }
-        $memo = implode(' - ', $parts);
-        if (mb_strlen($memo) > 100) {
-            $memo = rtrim(mb_substr($memo, 0, 100));
-        }
-        return $memo;
+        return self::buildInvoiceMemo($store, $metadata, 100);
     }
 
     /**

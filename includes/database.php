@@ -100,7 +100,7 @@ class Database {
             // that migration ran — getInstance() will then trigger runMigrations()
             // on existing installs that haven't yet picked it up. All migrations
             // are idempotent, so a fire is safe.
-            $hasLatestMigration = $hasConfig && self::columnExists(self::$instance, 'stores', 'selfserve_max_sats');
+            $hasLatestMigration = $hasConfig && self::columnExists(self::$instance, 'stores', 'hide_note_on_invoice');
             // The auto-withdraw → auto-cashout rename is a data-only migration
             // (config key + notification event labels) with no schema artifact
             // to mark it done, so probe for the legacy config key directly. The
@@ -254,6 +254,13 @@ HTACCESS;
             -- (NULL = inherit config key selfserve_max_sats).
             selfserve_enabled INTEGER NOT NULL DEFAULT -1,
             selfserve_max_sats INTEGER DEFAULT NULL,
+            -- Invoice privacy. Per-store defaults for whether the store name and
+            -- the payer-facing note are embedded in the invoice memo a payer's
+            -- wallet records (noffer NIP-69 description + cashu NUT-18 memo).
+            -- NULL/0 = show (default), 1 = hide. Per-invoice metadata overrides
+            -- (hideStoreName / hideNote) win over these; see Invoice::buildInvoiceMemo.
+            hide_store_name_on_invoice INTEGER DEFAULT NULL,
+            hide_note_on_invoice INTEGER DEFAULT NULL,
             -- Timestamps
             created_at INTEGER NOT NULL
         );
@@ -1500,15 +1507,24 @@ HTACCESS;
 
         // Self-serve invoices (public /pay/{storeId} page). selfserve_enabled is
         // a tri-state override (-1 inherit / 0 off / 1 on); selfserve_max_sats
-        // overrides the site-wide per-invoice max (NULL = inherit). The last
-        // column added here (stores.selfserve_max_sats) doubles as this
-        // migration set's "latest" marker (see getInstance), so it must stay
-        // last.
+        // overrides the site-wide per-invoice max (NULL = inherit).
         if (!self::columnExists($pdo, 'stores', 'selfserve_enabled')) {
             $pdo->exec("ALTER TABLE stores ADD COLUMN selfserve_enabled INTEGER NOT NULL DEFAULT -1");
         }
         if (!self::columnExists($pdo, 'stores', 'selfserve_max_sats')) {
             $pdo->exec("ALTER TABLE stores ADD COLUMN selfserve_max_sats INTEGER DEFAULT NULL");
+        }
+
+        // Invoice privacy: per-store defaults for hiding the store name / note
+        // from the invoice memo a payer's wallet records (noffer NIP-69 +
+        // cashu NUT-18). NULL/0 = show (default), 1 = hide. The last column
+        // added here (stores.hide_note_on_invoice) doubles as this migration
+        // set's "latest" marker (see getInstance), so it must stay last.
+        if (!self::columnExists($pdo, 'stores', 'hide_store_name_on_invoice')) {
+            $pdo->exec("ALTER TABLE stores ADD COLUMN hide_store_name_on_invoice INTEGER DEFAULT NULL");
+        }
+        if (!self::columnExists($pdo, 'stores', 'hide_note_on_invoice')) {
+            $pdo->exec("ALTER TABLE stores ADD COLUMN hide_note_on_invoice INTEGER DEFAULT NULL");
         }
     }
 

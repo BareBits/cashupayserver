@@ -139,4 +139,70 @@ try {
     @unlink($dumpFile);
 }
 
+// ---------------------------------------------------------------------------
+// Integration: invoice-privacy settings gate what reaches the NIP-69 memo.
+// ---------------------------------------------------------------------------
+
+/**
+ * Create a noffer invoice and return the description the relay actually saw.
+ * Each call spins up its own relay/dump so the cases stay independent.
+ */
+function noffer_description(string $mSk, string $mPk, string $storeId, callable $configure, array $metadata): ?string {
+    $dump = sys_get_temp_dir() . '/clink_req_dump_' . bin2hex(random_bytes(4)) . '.json';
+    [$proc, $pipes, $port] = start_relay([
+        'MOCK_CLINK_MERCHANT_SK' => $mSk,
+        'MOCK_CLINK_BOLT11' => 'lnbc100n1mockinvoice0000000',
+        'MOCK_CLINK_DUMP' => $dump,
+    ]);
+    try {
+        $noffer = ClinkNoffer::encode([
+            'pubkey' => $mPk,
+            'relay' => "ws://127.0.0.1:$port",
+            'offer' => 'shop',
+            'price_type' => ClinkNoffer::PRICE_SPONTANEOUS,
+        ]);
+        make_store($storeId, 'http://127.0.0.1:1');
+        Database::update('stores', ['name' => 'Acme Coffee'], 'id = ?', [$storeId]);
+        $configure($storeId);
+        StoreLnAddresses::replaceForStore($storeId, [['type' => 'noffer', 'address' => $noffer]]);
+        Invoice::create($storeId, ['amount' => 1000, 'currency' => 'sat', 'metadata' => $metadata]);
+        $payload = wait_for_dump($dump);
+        assert_not_null($payload, 'relay dumped the decrypted request payload');
+        // NIP-69 omits an empty description, so a fully-suppressed memo arrives
+        // as a missing key — normalise that to '' for the assertions.
+        return array_key_exists('description', $payload) ? (string)$payload['description'] : '';
+    } finally {
+        stop_relay($proc);
+        @unlink($dump);
+    }
+}
+
+$noop = function (string $s): void {};
+$hideName = function (string $s): void {
+    Database::update('stores', ['hide_store_name_on_invoice' => 1], 'id = ?', [$s]);
+};
+
+// Per-store "hide store name" -> the description carries only the note.
+assert_eq('2x Latte',
+    noffer_description($mSk, $mPk, 'store_noffer_hide_name', $hideName, ['itemDesc' => '2x Latte']),
+    'store-level hide store name -> NIP-69 description is note only');
+
+// Per-invoice override still wins: force-show the name on a store that hides it.
+assert_eq('Acme Coffee - 2x Latte',
+    noffer_description($mSk, $mPk, 'store_noffer_force_show', $hideName,
+        ['itemDesc' => '2x Latte', 'hideStoreName' => false]),
+    'per-invoice hideStoreName=false force-shows the name over the store default');
+
+// Per-invoice "hide note" on a default store -> name only.
+assert_eq('Acme Coffee',
+    noffer_description($mSk, $mPk, 'store_noffer_hide_note', $noop,
+        ['itemDesc' => '2x Latte', 'hideNote' => true]),
+    'per-invoice hideNote -> NIP-69 description is store name only');
+
+// Hide both -> empty description (the field is omitted on the wire).
+assert_eq('',
+    noffer_description($mSk, $mPk, 'store_noffer_hide_both', $noop,
+        ['itemDesc' => '2x Latte', 'hideStoreName' => true, 'hideNote' => true]),
+    'hiding both leaves no NIP-69 description');
+
 echo "test_clink_noffer_memo: OK\n";

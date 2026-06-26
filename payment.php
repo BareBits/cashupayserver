@@ -86,9 +86,11 @@ if ($invoice === null) {
     exit;
 }
 
-// Get store name for display
+// Get store name for display. Also pull the invoice-privacy defaults so the
+// cashu (NUT-18) memo honours the same store-name/note hiding the noffer rail
+// applies via Invoice::buildInvoiceMemo.
 $store = Database::fetchOne(
-    "SELECT name FROM stores WHERE id = ?",
+    "SELECT name, hide_store_name_on_invoice, hide_note_on_invoice FROM stores WHERE id = ?",
     [$invoice['store_id']]
 );
 $storeName = $store['name'] ?? 'Payment';
@@ -797,10 +799,19 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                     $cMintUrl = Config::getStoreMintUrl($invoice['store_id']);
                     $cUnit = Config::getStoreMintUnit($invoice['store_id']);
                     $cWallet = new \Cashu\Wallet($cMintUrl, $cUnit);
+                    // Mirror the noffer rail: prepend the store name (unless
+                    // hidden) and drop the note when the privacy settings hide
+                    // it. Uncapped — NUT-18 has no description length limit and
+                    // notes already cap at 200 chars at entry.
+                    $cashuMemo = Invoice::buildInvoiceMemo(
+                        is_array($store) ? $store : [],
+                        $invoiceMetadata,
+                        0
+                    );
                     $cPr = $cWallet->createHttpPaymentRequest(
                         (int)$invoice['amount_sats'],
                         Urls::receive(),
-                        $invoiceNote !== '' ? $invoiceNote : null
+                        $cashuMemo !== '' ? $cashuMemo : null
                     );
                     $cPr->id = $invoice['id'];
                     $cashuRequest = $cPr->serialize();

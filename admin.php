@@ -428,6 +428,13 @@ if (isset($_GET['api'])) {
                 'stores' => $stores,
                 'autoMelt' => $autoMelt,
                 'notifications' => $storeNotifications,
+                // Per-store invoice-memo privacy defaults. Drives both the
+                // store-settings checkboxes and the pre-fill of the per-invoice
+                // override checkboxes in the Request/Cart modals.
+                'invoicePrivacy' => [
+                    'hideStoreName' => (int)($store['hide_store_name_on_invoice'] ?? 0) === 1,
+                    'hideNote' => (int)($store['hide_note_on_invoice'] ?? 0) === 1,
+                ],
                 'onchain' => $onchain,
                 'swaps' => $storeSwaps,
                 'selfserve' => $storeSelfServe,
@@ -1454,7 +1461,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 }
                 $memo = isset($_POST['memo']) ? (string)$_POST['memo'] : null;
                 $redirect = isset($_POST['redirect']) ? (string)$_POST['redirect'] : null;
-                $result = Cart::checkout($storeId, $items, $memo, $redirect);
+                // Per-invoice memo-privacy overrides. Sent on every cart
+                // checkout (the modal checkboxes are pre-filled from the store
+                // defaults), so they always win for cart-created invoices.
+                $privacy = [];
+                if (isset($_POST['hide_store_name'])) {
+                    $privacy['hideStoreName'] = $_POST['hide_store_name'] === '1';
+                }
+                if (isset($_POST['hide_note'])) {
+                    $privacy['hideNote'] = $_POST['hide_note'] === '1';
+                }
+                $result = Cart::checkout($storeId, $items, $memo, $redirect, $privacy);
                 echo json_encode(['success' => true] + $result);
             } catch (InvalidArgumentException $e) {
                 http_response_code(400);
@@ -1703,6 +1720,32 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'success' => true,
                     'isConfigured' => Config::isStoreConfigured($storeId),
                 ]);
+            } catch (Exception $e) {
+                http_response_code(400);
+                echo json_encode(['error' => $e->getMessage()]);
+            }
+            break;
+
+        case 'save_store_privacy':
+            Auth::requireAdmin();
+            try {
+                $storeId = $_POST['store_id'] ?? '';
+                if (empty($storeId)) {
+                    throw new Exception('Store ID required');
+                }
+                if (!Config::getStore($storeId)) {
+                    throw new Exception('Store not found');
+                }
+                // Per-store invoice-memo privacy defaults. 1 = hide, 0 = show.
+                // Written via Database::update directly rather than
+                // Config::updateStore, keeping the updateStore allowlist tight.
+                $hideStoreName = ($_POST['hide_store_name_on_invoice'] ?? '0') === '1' ? 1 : 0;
+                $hideNote = ($_POST['hide_note_on_invoice'] ?? '0') === '1' ? 1 : 0;
+                Database::update('stores', [
+                    'hide_store_name_on_invoice' => $hideStoreName,
+                    'hide_note_on_invoice' => $hideNote,
+                ], 'id = ?', [$storeId]);
+                echo json_encode(['success' => true]);
             } catch (Exception $e) {
                 http_response_code(400);
                 echo json_encode(['error' => $e->getMessage()]);
@@ -5724,6 +5767,41 @@ header('Cache-Control: no-cache, must-revalidate');
 
                     <div class="card collapsible">
                         <div class="card-header">
+                            <div class="card-title">Invoice Privacy</div>
+                        </div>
+                        <div class="card-body">
+                            <p style="font-size: 0.85rem; color: var(--text-secondary); margin: 0 0 0.75rem 0;">
+                                Controls whether the store name and the payer-facing note are
+                                embedded in the invoice memo a customer's wallet records (the
+                                Lightning noffer description and Cashu payment-request memo). The
+                                payment page itself still shows them. Each invoice can override
+                                these defaults from the Request Payment screen.
+                            </p>
+
+                            <div class="toggle-container">
+                                <span>Hide store name on invoices</span>
+                                <label class="toggle">
+                                    <input type="checkbox" id="store-hide-store-name">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
+
+                            <div class="toggle-container" style="margin-top: 1rem;">
+                                <span>Hide notes on invoices</span>
+                                <label class="toggle">
+                                    <input type="checkbox" id="store-hide-note">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
+
+                            <button class="btn btn-full" id="btn-save-store-privacy" style="margin-top: 0.75rem;">
+                                Save privacy settings
+                            </button>
+                        </div>
+                    </div>
+
+                    <div class="card collapsible">
+                        <div class="card-header">
                             <div class="card-title">Exchange Rate Settings</div>
                         </div>
                         <div class="card-body">
@@ -6838,6 +6916,21 @@ header('Cache-Control: no-cache, must-revalidate');
                            placeholder="Payment for...">
                 </div>
 
+                <div class="form-group">
+                    <label style="display:flex; align-items:flex-start; gap:0.5rem; cursor:pointer;">
+                        <input type="checkbox" id="request-hide-store-name" style="margin-top:0.15rem;">
+                        <span style="font-size:0.85rem;">Hide store name on invoice
+                            <span style="display:block; font-size:0.74rem; color:var(--text-secondary);">Keep the store name out of the invoice memo the payer's wallet records.</span>
+                        </span>
+                    </label>
+                    <label style="display:flex; align-items:flex-start; gap:0.5rem; cursor:pointer; margin-top:0.5rem;">
+                        <input type="checkbox" id="request-hide-note" style="margin-top:0.15rem;">
+                        <span style="font-size:0.85rem;">Hide note on invoice
+                            <span style="display:block; font-size:0.74rem; color:var(--text-secondary);">Keep the description above out of the invoice memo (still shown on the payment page).</span>
+                        </span>
+                    </label>
+                </div>
+
                 <div class="form-group" id="request-allow-any-mint-row" style="display:none;">
                     <label style="display:flex; align-items:flex-start; gap:0.5rem; cursor:pointer;">
                         <input type="checkbox" id="request-allow-any-mint" style="margin-top:0.15rem;">
@@ -6892,6 +6985,18 @@ header('Cache-Control: no-cache, must-revalidate');
             </div>
 
             <input type="text" class="form-input" id="cart-memo" placeholder="Description (optional)" style="margin-top:0.5rem;">
+            <label style="display:flex; align-items:flex-start; gap:0.5rem; cursor:pointer; margin-top:0.5rem;">
+                <input type="checkbox" id="cart-hide-store-name" style="margin-top:0.15rem;">
+                <span style="font-size:0.85rem;">Hide store name on invoice
+                    <span style="display:block; font-size:0.74rem; color:var(--text-secondary);">Keep the store name out of the invoice memo the payer's wallet records.</span>
+                </span>
+            </label>
+            <label style="display:flex; align-items:flex-start; gap:0.5rem; cursor:pointer; margin-top:0.5rem;">
+                <input type="checkbox" id="cart-hide-note" style="margin-top:0.15rem;">
+                <span style="font-size:0.85rem;">Hide note on invoice
+                    <span style="display:block; font-size:0.74rem; color:var(--text-secondary);">Keep the description above out of the invoice memo (still shown on the payment page).</span>
+                </span>
+            </label>
             <button class="btn btn-full" id="btn-cart-checkout" style="margin-top:0.5rem;" disabled>Checkout</button>
             <button class="btn btn-secondary btn-full" style="margin-top: 0.5rem;" onclick="closeModal('modal-cart')">Cancel</button>
         </div>
@@ -7552,6 +7657,8 @@ header('Cache-Control: no-cache, must-revalidate');
             wireAwSelectors();
             const saveStoreNotifsBtn = document.getElementById('btn-save-store-notifications');
             if (saveStoreNotifsBtn) saveStoreNotifsBtn.addEventListener('click', saveStoreNotifications);
+            const saveStorePrivacyBtn = document.getElementById('btn-save-store-privacy');
+            if (saveStorePrivacyBtn) saveStorePrivacyBtn.addEventListener('click', saveStorePrivacy);
             const storeNotifsToggle = document.getElementById('store-notifications-enabled');
             if (storeNotifsToggle) storeNotifsToggle.addEventListener('change', () => {
                 if (storeNotifsToggle.checked) warnIfSiteEmailUnavailable();
@@ -9047,6 +9154,15 @@ header('Cache-Control: no-cache, must-revalidate');
                     if (typeof updateStoreSmtpFieldsVisibility === 'function') updateStoreSmtpFieldsVisibility();
                 }
 
+                // Load per-store invoice-privacy defaults.
+                if (dashboardData && dashboardData.invoicePrivacy) {
+                    const p = dashboardData.invoicePrivacy;
+                    const hsn = document.getElementById('store-hide-store-name');
+                    if (hsn) hsn.checked = !!p.hideStoreName;
+                    const hn = document.getElementById('store-hide-note');
+                    if (hn) hn.checked = !!p.hideNote;
+                }
+
                 // Load exchange rate settings from store data
                 document.getElementById('price-provider-primary').value = store.price_provider_primary || 'coingecko';
                 document.getElementById('price-provider-secondary').value = store.price_provider_secondary || 'binance';
@@ -9947,6 +10063,10 @@ header('Cache-Control: no-cache, must-revalidate');
             const currency = document.getElementById('request-currency').value || 'sat';
             const allowAnyMintBox = document.getElementById('request-allow-any-mint');
             const allowAnyMint = allowAnyMintBox && allowAnyMintBox.checked;
+            const hideStoreNameBox = document.getElementById('request-hide-store-name');
+            const hideStoreName = !!(hideStoreNameBox && hideStoreNameBox.checked);
+            const hideNoteBox = document.getElementById('request-hide-note');
+            const hideNote = !!(hideNoteBox && hideNoteBox.checked);
 
             if (!storeId) {
                 showToast('Please select a store first', 'error');
@@ -9983,8 +10103,12 @@ header('Cache-Control: no-cache, must-revalidate');
                     }
                 };
 
+                // Always carry the privacy overrides (pre-filled from the store
+                // defaults) so the per-invoice choice wins; include the note
+                // only when one was entered.
+                invoiceData.metadata = { hideStoreName: hideStoreName, hideNote: hideNote };
                 if (memo) {
-                    invoiceData.metadata = { itemDesc: memo };
+                    invoiceData.metadata.itemDesc = memo;
                 }
 
                 const response = await fetch(apiUrl, {
@@ -10849,6 +10973,41 @@ header('Cache-Control: no-cache, must-revalidate');
                 }
             } catch (e) {
                 showToast('Failed to save notification settings', 'error');
+            }
+        }
+
+        async function saveStorePrivacy() {
+            if (!currentStoreId) {
+                showToast('No store selected', 'error');
+                return;
+            }
+            const hideStoreName = document.getElementById('store-hide-store-name').checked ? '1' : '0';
+            const hideNote = document.getElementById('store-hide-note').checked ? '1' : '0';
+            const params = new URLSearchParams({
+                action: 'save_store_privacy',
+                store_id: currentStoreId,
+                hide_store_name_on_invoice: hideStoreName,
+                hide_note_on_invoice: hideNote,
+            });
+            try {
+                const response = await postWithCsrf(adminUrl, params.toString());
+                const result = await response.json();
+                if (response.ok) {
+                    showToast('Privacy settings saved!', 'success');
+                    // Keep the in-memory copy fresh so the Request/Cart modals
+                    // pre-fill their override checkboxes from the new defaults
+                    // without a full dashboard reload.
+                    if (dashboardData) {
+                        dashboardData.invoicePrivacy = {
+                            hideStoreName: hideStoreName === '1',
+                            hideNote: hideNote === '1',
+                        };
+                    }
+                } else {
+                    showToast(result.error || 'Failed to save', 'error');
+                }
+            } catch (e) {
+                showToast('Failed to save privacy settings', 'error');
             }
         }
 
@@ -13384,6 +13543,12 @@ header('Cache-Control: no-cache, must-revalidate');
             cartPage = 1;
             document.getElementById('cart-search').value = '';
             document.getElementById('cart-memo').value = '';
+            // Pre-fill the per-invoice privacy overrides from the store defaults.
+            const cartPriv = dashboardData?.invoicePrivacy || {};
+            const cartHsn = document.getElementById('cart-hide-store-name');
+            if (cartHsn) cartHsn.checked = !!cartPriv.hideStoreName;
+            const cartHn = document.getElementById('cart-hide-note');
+            if (cartHn) cartHn.checked = !!cartPriv.hideNote;
             const customForm = document.getElementById('cart-custom-form');
             if (customForm) customForm.style.display = 'none';
             renderCart();
@@ -13540,9 +13705,15 @@ header('Cache-Control: no-cache, must-revalidate');
                 ? { product_id: it.productId, quantity: it.quantity }
                 : { title: it.title, price: it.price, currency: it.currency, quantity: it.quantity });
             const memo = document.getElementById('cart-memo').value.trim();
+            const hideStoreName = document.getElementById('cart-hide-store-name')?.checked ? '1' : '0';
+            const hideNote = document.getElementById('cart-hide-note')?.checked ? '1' : '0';
             let body = `store_id=${encodeURIComponent(currentStoreId)}`
                 + `&items=${encodeURIComponent(JSON.stringify(items))}`
-                + `&redirect=${encodeURIComponent(window.location.href.split('?')[0])}`;
+                + `&redirect=${encodeURIComponent(window.location.href.split('?')[0])}`
+                // Always send the privacy overrides (pre-filled from store
+                // defaults) so the per-invoice choice wins.
+                + `&hide_store_name=${hideStoreName}`
+                + `&hide_note=${hideNote}`;
             if (memo) body += `&memo=${encodeURIComponent(memo)}`;
             try {
                 const r = await postWithCsrf(adminUrl, `action=cart_checkout&` + body);
@@ -13682,6 +13853,14 @@ header('Cache-Control: no-cache, must-revalidate');
 
                 document.getElementById('request-amount').value = '';
                 document.getElementById('request-memo').value = '';
+
+                // Pre-fill the per-invoice privacy overrides from the store
+                // defaults; the value at submit wins for this invoice.
+                const priv = dashboardData?.invoicePrivacy || {};
+                const hsnBox = document.getElementById('request-hide-store-name');
+                if (hsnBox) hsnBox.checked = !!priv.hideStoreName;
+                const hnBox = document.getElementById('request-hide-note');
+                if (hnBox) hnBox.checked = !!priv.hideNote;
 
                 // Configure currency selector + amount constraints from the
                 // store's default currency (falls back to mint unit).
