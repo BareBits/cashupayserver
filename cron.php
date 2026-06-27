@@ -209,6 +209,18 @@ if (!$swapOnly) {
 // tick (DevFee::computeOwed calls it too, but explicit here keeps the
 // cron sequence obvious).
 if (!$swapOnly && !$skipNonEssential) {
+    // Resolve any fee-melt intents stranded 'pending' by a crash in a prior
+    // tick's melt->record window FIRST, so this tick's owed math sees a clean
+    // picture: a confirmed-at-the-mint intent stays counted (no double-pay) and
+    // a never-happened one is dropped and can be re-attempted below.
+    try {
+        $feeReconcile = DevFee::reconcilePendingFeeMelts();
+        $results['tasks']['fee_melt_reconcile'] =
+            ($feeReconcile['checked'] > 0) ? $feeReconcile : 'skipped';
+    } catch (\Throwable $e) {
+        $results['tasks']['fee_melt_reconcile'] = 'error: ' . $e->getMessage();
+    }
+
     try {
         FreeTrial::expireIfNeeded();
         $feeResults = DevFee::settleAllStores();

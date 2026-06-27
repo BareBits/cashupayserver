@@ -685,6 +685,27 @@ class Invoice {
                 }
 
                 $lockupFee = $pairInfo->lockupFeeSats;
+
+                // Bound the LN invoice the customer is about to be shown against
+                // the quoted economics. invoiceAmountSats is provider-controlled;
+                // the range/threshold gates above validated the QUOTE, not the
+                // issued invoice. Without this a provider could quote fairly then
+                // return an invoice charging far more, overcharging the payer.
+                // Mirrors SwapAutoMelt::buildSweep. Expected max = target +
+                // lockup fee + ceil(target * feePercent) + tolerance.
+                $expectedMaxInvoice = $targetSats
+                    + $lockupFee
+                    + (int)ceil($targetSats * $pairInfo->feePercent / 100.0);
+                $invoiceTolerance = max(2, (int)ceil($expectedMaxInvoice * 0.005));
+                if ($swap->invoiceAmountSats > $expectedMaxInvoice + $invoiceTolerance) {
+                    error_log(sprintf(
+                        'swap: %s issued invoice %d sat exceeds quoted max %d (+%d tol) for target %d; trying next',
+                        $name, $swap->invoiceAmountSats, $expectedMaxInvoice, $invoiceTolerance, $targetSats
+                    ));
+                    $failureReasons[] = "{$name}: issued invoice exceeds quoted max (provider overcharge)";
+                    continue;
+                }
+
                 $percentFee = max(0, $swap->invoiceAmountSats - $targetSats - $lockupFee);
 
                 return [

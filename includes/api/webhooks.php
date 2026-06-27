@@ -4,6 +4,7 @@
  */
 
 require_once __DIR__ . '/../webhook_sender.php';
+require_once __DIR__ . '/../security.php';
 
 /**
  * Create a new webhook
@@ -26,7 +27,11 @@ function handleCreateWebhook(array $auth, array $params, array $body): void {
         errorResponse('validation-error', 'Webhook URL is required');
     }
 
-    if (!filter_var($url, FILTER_VALIDATE_URL)) {
+    // Enforce http(s) only at store time. FILTER_VALIDATE_URL alone accepts
+    // ftp:/javascript:/etc; SafeHttp rejects non-http(s) at delivery, but a bad
+    // scheme should never be persisted in the first place.
+    $url = Security::sanitizeUrl($url);
+    if ($url === null) {
         errorResponse('validation-error', 'Invalid webhook URL');
     }
 
@@ -105,10 +110,11 @@ function handleUpdateWebhook(array $auth, array $params, array $body): void {
     $updates = [];
 
     if (isset($body['url'])) {
-        if (!filter_var($body['url'], FILTER_VALIDATE_URL)) {
+        $safeUrl = Security::sanitizeUrl((string)$body['url']);
+        if ($safeUrl === null) {
             errorResponse('validation-error', 'Invalid webhook URL');
         }
-        $updates['url'] = $body['url'];
+        $updates['url'] = $safeUrl;
     }
 
     if (isset($body['authorizedEvents']['specificEvents']) || isset($body['authorizedEvents']['specific']) || isset($body['events'])) {

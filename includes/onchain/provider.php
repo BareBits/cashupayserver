@@ -106,10 +106,24 @@ final class EsploraProvider implements BlockchainProvider {
             foreach ($txs as $tx) {
                 $confirmed = (bool)($tx['status']['confirmed'] ?? false);
                 $blockHeight = $confirmed ? ($tx['status']['block_height'] ?? null) : null;
+                // A hostile or MITM'd provider could report an out-of-range
+                // block_height to inflate the confirmation count past minConfs /
+                // REORG_SAFETY_DEPTH and force a premature settle. A genuinely
+                // confirmed tx sits at an integer height in (0, tip]; anything
+                // else is treated as unconfirmed (confs=0) so it can't settle.
                 if ($confirmed) {
-                    $confirmedInPage++;
-                    if ($blockHeight !== null && ($minHeightInPage === null || $blockHeight < $minHeightInPage)) {
-                        $minHeightInPage = $blockHeight;
+                    if (!is_int($blockHeight) || $blockHeight <= 0 || $blockHeight > $tip) {
+                        error_log(sprintf(
+                            'EsploraProvider::addressTransactions(%s): tx %s reported out-of-range block_height %s (tip %d); treating as unconfirmed',
+                            $address, (string)($tx['txid'] ?? '?'), var_export($blockHeight, true), $tip
+                        ));
+                        $confirmed = false;
+                        $blockHeight = null;
+                    } else {
+                        $confirmedInPage++;
+                        if ($minHeightInPage === null || $blockHeight < $minHeightInPage) {
+                            $minHeightInPage = $blockHeight;
+                        }
                     }
                 }
                 $confs = ($confirmed && $blockHeight !== null) ? max(0, $tip - $blockHeight + 1) : 0;
@@ -120,7 +134,9 @@ final class EsploraProvider implements BlockchainProvider {
                     $out[] = new OnchainTxObservation(
                         txid: $tx['txid'],
                         vout: $voutIdx,
-                        amountSat: (int)($vout['value'] ?? 0),
+                        // Floor at 0: a negative value would corrupt the
+                        // received-amount / underpayment math downstream.
+                        amountSat: max(0, (int)($vout['value'] ?? 0)),
                         confirmations: $confs,
                         blockHeight: $blockHeight,
                     );

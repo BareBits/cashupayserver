@@ -110,6 +110,28 @@ class Security {
     }
 
     /**
+     * Neutralize spreadsheet formula injection for a single CSV cell.
+     *
+     * A cell whose first character is one of = + - @ (or a leading control
+     * character that some parsers strip before evaluating the first visible
+     * char) is interpreted as a formula by Excel / Google Sheets / LibreOffice
+     * — e.g. a payer-supplied memo or email of `=HYPERLINK(...)` or `=cmd|...`
+     * executes when an admin opens the export. Prefixing a single quote forces
+     * the value to be shown literally. Non-string scalars are stringified;
+     * null becomes an empty string.
+     */
+    public static function csvCell($value): string {
+        $s = ($value === null) ? '' : (string)$value;
+        if ($s === '') {
+            return $s;
+        }
+        if (strpos("=+-@\t\r\n", $s[0]) !== false) {
+            return "'" . $s;
+        }
+        return $s;
+    }
+
+    /**
      * Validate and sanitize URL
      */
     public static function sanitizeUrl(string $url): ?string {

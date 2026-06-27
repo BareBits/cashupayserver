@@ -508,8 +508,14 @@ class LightningAddress {
      * @param string $storeId Store ID for wallet access
      * @param string $bolt11 The BOLT-11 invoice
      * @param int|null $expectedAmount Optional expected amount (for amountless invoices)
+     * @param callable|null $onQuoteReady Optional hook invoked as
+     *   `fn(string $meltQuoteId): void` immediately BEFORE proofs are spent,
+     *   once the mint melt quote exists. The fee-settlement path uses it to
+     *   write a write-ahead "pending" intent keyed by the quote id, so a crash
+     *   in the spend→record window can't double-pay (see DevFee). Other callers
+     *   pass null and behaviour is unchanged.
      */
-    public static function meltToBolt11(string $storeId, string $bolt11, ?int $expectedAmount = null): array {
+    public static function meltToBolt11(string $storeId, string $bolt11, ?int $expectedAmount = null, ?callable $onQuoteReady = null): array {
         $mintUrl = Config::getStoreMintUrl($storeId);
         $wallet = null;
         $meltQuoteId = null;
@@ -572,6 +578,18 @@ class LightningAddress {
 
         // Select proofs
         $selectedProofs = Wallet::selectProofs($proofs, $totalNeeded);
+
+        // Write-ahead hook: fired with the mint melt-quote id right before the
+        // proofs are spent, so the caller can persist a pending intent that is
+        // resolvable against this quote if we crash mid-melt. Keep it from
+        // aborting the melt — a bookkeeping failure must not strand funds.
+        if ($onQuoteReady !== null) {
+            try {
+                $onQuoteReady((string)$meltQuote->quote);
+            } catch (\Throwable $e) {
+                error_log('meltToBolt11 onQuoteReady hook failed: ' . $e->getMessage());
+            }
+        }
 
         // Execute melt
         try {

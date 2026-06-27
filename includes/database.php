@@ -100,7 +100,7 @@ class Database {
             // that migration ran — getInstance() will then trigger runMigrations()
             // on existing installs that haven't yet picked it up. All migrations
             // are idempotent, so a fire is safe.
-            $hasLatestMigration = $hasConfig && self::columnExists(self::$instance, 'stores', 'hide_note_on_invoice');
+            $hasLatestMigration = $hasConfig && self::columnExists(self::$instance, 'melts', 'melt_quote_id');
             // The auto-withdraw → auto-cashout rename is a data-only migration
             // (config key + notification event labels) with no schema artifact
             // to mark it done, so probe for the legacy config key directly. The
@@ -648,6 +648,8 @@ HTACCESS;
                     destination TEXT NOT NULL,
                     preimage TEXT,
                     note TEXT,
+                    status TEXT NOT NULL DEFAULT 'paid',
+                    melt_quote_id TEXT DEFAULT NULL,
                     created_at INTEGER NOT NULL,
                     FOREIGN KEY (store_id) REFERENCES stores(id) ON DELETE CASCADE
                 );
@@ -1517,14 +1519,31 @@ HTACCESS;
 
         // Invoice privacy: per-store defaults for hiding the store name / note
         // from the invoice memo a payer's wallet records (noffer NIP-69 +
-        // cashu NUT-18). NULL/0 = show (default), 1 = hide. The last column
-        // added here (stores.hide_note_on_invoice) doubles as this migration
-        // set's "latest" marker (see getInstance), so it must stay last.
+        // cashu NUT-18). NULL/0 = show (default), 1 = hide.
         if (!self::columnExists($pdo, 'stores', 'hide_store_name_on_invoice')) {
             $pdo->exec("ALTER TABLE stores ADD COLUMN hide_store_name_on_invoice INTEGER DEFAULT NULL");
         }
         if (!self::columnExists($pdo, 'stores', 'hide_note_on_invoice')) {
             $pdo->exec("ALTER TABLE stores ADD COLUMN hide_note_on_invoice INTEGER DEFAULT NULL");
+        }
+
+        // Fee-melt write-ahead idempotency. The fee settlement loop melts
+        // proofs (spent + LN paid in the cashu-wallet DB) and then records a
+        // `melts` row here — two separate databases, so a crash in that window
+        // used to recompute the fee as still-owed and double-pay on the next
+        // tick. We now insert a 'pending' intent row (counted as paid, so it
+        // suppresses re-pay) BEFORE the melt and finalize it to 'paid' after;
+        // melt_quote_id lets DevFee::reconcilePendingFeeMelts() resolve a
+        // stranded intent against the mint's melt-quote state (PAID -> finalize,
+        // UNPAID -> drop and retry). `status` defaults to 'paid' so existing
+        // rows and every non-fee caller (user withdraw, auto-melt) are
+        // unaffected. melts.melt_quote_id is this set's "latest" marker (see
+        // getInstance), so these two must stay last.
+        if (!self::columnExists($pdo, 'melts', 'status')) {
+            $pdo->exec("ALTER TABLE melts ADD COLUMN status TEXT NOT NULL DEFAULT 'paid'");
+        }
+        if (!self::columnExists($pdo, 'melts', 'melt_quote_id')) {
+            $pdo->exec("ALTER TABLE melts ADD COLUMN melt_quote_id TEXT DEFAULT NULL");
         }
     }
 

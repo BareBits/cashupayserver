@@ -85,6 +85,44 @@ def test_non_admin_cannot_call_export_info(
     assert r.status_code == 403
 
 
+def test_non_admin_cannot_call_proofs(
+    configured: ConfiguredPayserver, non_admin: dict[str, Any],
+) -> None:
+    """?api=proofs returns the store's unspent proofs — secret + C, i.e.
+    spendable bearer ecash. A non-admin 'user' must not be able to dump it
+    (it would let staff redeem the whole balance at the mint)."""
+    staff = non_admin["client"]
+    r = staff.s.get(
+        f"{configured.handle.url}/admin?api=proofs&store_id={configured.store_id}",
+        timeout=15,
+    )
+    assert r.status_code == 403, f"expected 403, got {r.status_code}: {r.text[:200]}"
+
+
+def test_non_admin_cannot_call_api_keys(
+    configured: ConfiguredPayserver, non_admin: dict[str, Any],
+) -> None:
+    """?api=api_keys leaks API-key metadata (id/label/scopes) — admin-only."""
+    staff = non_admin["client"]
+    r = staff.s.get(
+        f"{configured.handle.url}/admin?api=api_keys&store_id={configured.store_id}",
+        timeout=15,
+    )
+    assert r.status_code == 403, f"expected 403, got {r.status_code}: {r.text[:200]}"
+
+
+def test_admin_can_call_proofs(configured: ConfiguredPayserver) -> None:
+    """The admin (the role the endpoint is meant for) still gets a 200 + JSON
+    array, so the new gate didn't break the legitimate path."""
+    admin = configured.admin
+    r = admin.s.get(
+        f"{configured.handle.url}/admin?api=proofs&store_id={configured.store_id}",
+        timeout=15,
+    )
+    assert r.status_code == 200, r.text
+    assert isinstance(r.json(), list)
+
+
 # ---------- self-service ----------
 
 

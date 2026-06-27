@@ -761,7 +761,9 @@ if (isset($_GET['api'])) {
                 fputcsv($out, array_keys($row));
             };
             $writeRow = function (array $row) use ($out) {
-                fputcsv($out, array_values($row));
+                // Neutralize spreadsheet formula injection on every value cell
+                // (memo/email/note/destination fields are payer-controlled).
+                fputcsv($out, array_map([Security::class, 'csvCell'], array_values($row)));
             };
 
             if ($action === 'export_invoices_csv' || $action === 'export_all_invoices_csv') {
@@ -856,18 +858,19 @@ if (isset($_GET['api'])) {
             $out = fopen('php://output', 'w');
             fputcsv($out, ['Email', 'Subscribed', 'Store', 'Most recent invoice', 'Paid at (UTC)']);
             foreach (Database::fetchAll($base . " ORDER BY paid_ts DESC, email ASC", $baseParams) as $r) {
-                fputcsv($out, [
+                fputcsv($out, array_map([Security::class, 'csvCell'], [
                     $r['email'],
                     (int)($r['newsletter_opt_in'] ?? 0) === 1 ? 'yes' : 'no',
                     $storeNames[$r['store_id']] ?? '',
                     $r['invoice_id'],
                     $r['paid_ts'] !== null ? gmdate('Y-m-d H:i:s', (int)$r['paid_ts']) : '',
-                ]);
+                ]));
             }
             fclose($out);
             exit;
 
         case 'api_keys':
+            Auth::requireAdmin();
             $storeId = $_GET['store_id'] ?? null;
             if (!$storeId) {
                 echo json_encode([]);
@@ -950,6 +953,9 @@ if (isset($_GET['api'])) {
             break;
 
         case 'proofs':
+            // Admin-only: these rows carry secret + C — i.e. spendable bearer
+            // ecash. Match the sibling fund endpoints (export_info/export_token).
+            Auth::requireAdmin();
             $storeId = $_GET['store_id'] ?? null;
             if (!$storeId || !Config::isStoreConfigured($storeId)) {
                 echo json_encode([]);
