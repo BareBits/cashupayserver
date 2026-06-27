@@ -152,8 +152,54 @@ class MeltLog {
             'destination' => $destination,
             'preimage' => $preimage,
             'note' => $note,
+            'status' => 'paid',
             'created_at' => time(),
         ]);
+    }
+
+    /**
+     * Write-ahead a 'pending' fee-melt intent BEFORE the proofs are spent.
+     *
+     * The row counts toward DevFee::sumPaid() immediately (it's a real melts
+     * row), so a crash between the melt and the would-be MeltLog::record() can
+     * no longer leave the fee looking unpaid and double-pay on the next tick.
+     * $meltQuoteId lets DevFee::reconcilePendingFeeMelts() later resolve the
+     * intent against the mint's melt-quote state. Returns the row id to
+     * finalize/delete. network_fee is 0 and preimage null until finalized.
+     */
+    public static function recordPendingIntent(
+        string $storeId,
+        int $amountSats,
+        string $destination,
+        ?string $note,
+        ?string $meltQuoteId
+    ): int {
+        return (int) Database::insert('melts', [
+            'store_id' => $storeId,
+            'amount_sats' => max(0, $amountSats),
+            'network_fee_sats' => 0,
+            'destination' => $destination,
+            'preimage' => null,
+            'note' => $note,
+            'status' => 'pending',
+            'melt_quote_id' => $meltQuoteId,
+            'created_at' => time(),
+        ]);
+    }
+
+    /** Promote a pending intent to a confirmed payment (idempotent on status). */
+    public static function finalizeIntent(int $rowId, int $networkFeeSats, ?string $preimage): void {
+        Database::update(
+            'melts',
+            ['status' => 'paid', 'network_fee_sats' => max(0, $networkFeeSats), 'preimage' => $preimage],
+            'id = ? AND status = ?',
+            [$rowId, 'pending']
+        );
+    }
+
+    /** Drop a pending intent (the melt definitively did not happen). */
+    public static function deleteIntent(int $rowId): void {
+        Database::delete('melts', 'id = ? AND status = ?', [$rowId, 'pending']);
     }
 }
 
@@ -231,6 +277,50 @@ class DevFee {
         }
 
         return ['owed' => $owed, 'outcomes' => $outcomes];
+    }
+
+    /**
+     * Resolve fee-melt intents left 'pending' by a crash between the melt and
+     * its finalize (see MeltLog::recordPendingIntent). For each stale pending
+     * row that carries a mint melt-quote id, ask the mint's quote state:
+     *   - PAID    -> finalize to 'paid' (the fee really went out; it stays
+     *                counted so it is never re-paid).
+     *   - PENDING -> leave it (still in flight; check again next tick).
+     *   - else    -> the proofs were not spent, so the fee is genuinely still
+     *                owed; drop the intent so the next settle pass retries it.
+     * $graceSeconds avoids racing a settle pass that is finalizing right now.
+     *
+     * Only the LNURL fee path (dev + hosting) writes quote-bearing intents.
+     * The upstream token-sink path has no verifiable quote and is unchanged.
+     */
+    public static function reconcilePendingFeeMelts(int $graceSeconds = 120): array {
+        $cutoff = time() - max(0, $graceSeconds);
+        $rows = Database::fetchAll(
+            "SELECT id, store_id, melt_quote_id FROM melts
+             WHERE status = 'pending' AND melt_quote_id IS NOT NULL AND created_at < ?",
+            [$cutoff]
+        );
+        $out = ['checked' => count($rows), 'finalized' => 0, 'reverted' => 0, 'left' => 0];
+        foreach ($rows as $r) {
+            try {
+                $wallet = Invoice::getWalletInstance((string)$r['store_id']);
+                $quote = $wallet->checkMeltQuote((string)$r['melt_quote_id']);
+            } catch (\Throwable $e) {
+                // Mint unreachable / wallet error — leave it, retry next tick.
+                $out['left']++;
+                continue;
+            }
+            if ($quote->isPaid()) {
+                MeltLog::finalizeIntent((int)$r['id'], 0, null);
+                $out['finalized']++;
+            } elseif ($quote->isPending()) {
+                $out['left']++;
+            } else {
+                MeltLog::deleteIntent((int)$r['id']);
+                $out['reverted']++;
+            }
+        }
+        return $out;
     }
 
     /**
@@ -404,22 +494,36 @@ class DevFee {
             return ['success' => false, 'error' => 'fetchInvoice: ' . $e->getMessage()];
         }
 
+        // Write-ahead a pending intent keyed by the mint melt-quote id, just
+        // before the proofs are spent (via the meltToBolt11 hook). If we crash
+        // after the melt but before finalizing, the pending row keeps the fee
+        // from being recomputed as owed and double-paid; reconcilePendingFeeMelts
+        // later resolves it against the mint. On a thrown melt we leave the
+        // pending row in place (the payment may be in-flight) — reconcile, not
+        // this path, decides whether it really happened.
+        $intentRowId = null;
         try {
-            $result = LightningAddress::meltToBolt11($storeId, $bolt11, $owedSats);
+            $result = LightningAddress::meltToBolt11(
+                $storeId,
+                $bolt11,
+                $owedSats,
+                function (string $meltQuoteId) use ($storeId, $owedSats, $destination, $noteTag, &$intentRowId) {
+                    $intentRowId = MeltLog::recordPendingIntent($storeId, $owedSats, $destination, $noteTag, $meltQuoteId);
+                }
+            );
         } catch (Exception $e) {
             return ['success' => false, 'error' => 'meltToBolt11: ' . $e->getMessage()];
         }
 
         $networkFeeSats = self::networkFeeSats($storeId, $result['fee'] ?? 0);
 
-        MeltLog::record(
-            $storeId,
-            $owedSats,
-            $networkFeeSats,
-            $destination,
-            $result['preimage'] ?? null,
-            $noteTag
-        );
+        if ($intentRowId !== null) {
+            MeltLog::finalizeIntent($intentRowId, $networkFeeSats, $result['preimage'] ?? null);
+        } else {
+            // Hook never fired (shouldn't happen on a successful melt) — fall
+            // back to a direct, already-confirmed record so the fee is counted.
+            MeltLog::record($storeId, $owedSats, $networkFeeSats, $destination, $result['preimage'] ?? null, $noteTag);
+        }
 
         return ['success' => true, 'amount_sats' => $owedSats, 'network_fee_sats' => $networkFeeSats];
     }

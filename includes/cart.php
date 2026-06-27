@@ -16,6 +16,7 @@ require_once __DIR__ . '/rates.php';
 require_once __DIR__ . '/invoice.php';
 require_once __DIR__ . '/products.php';
 require_once __DIR__ . '/urls.php';
+require_once __DIR__ . '/security.php';
 
 class Cart {
     public const MAX_QTY = 999;
@@ -148,7 +149,15 @@ class Cart {
         }
         $options = ['amount' => (string)$totalSats, 'currency' => 'sat', 'metadata' => $metadata];
         if ($redirect !== null && $redirect !== '') {
-            $options['checkout'] = ['redirectURL' => $redirect, 'redirectAutomatically' => true];
+            // The redirect is rendered as an <a href> on the public payment
+            // page; an unvalidated value lets a javascript:/data: URL execute
+            // when the payer clicks "Continue to Store". Enforce http(s) only,
+            // mirroring the Greenfield API path (includes/api/invoices.php).
+            $safeRedirect = Security::sanitizeUrl($redirect);
+            if ($safeRedirect === null) {
+                throw new InvalidArgumentException('Invalid checkout redirect URL');
+            }
+            $options['checkout'] = ['redirectURL' => $safeRedirect, 'redirectAutomatically' => true];
         }
 
         $invoice = Invoice::create($storeId, $options);

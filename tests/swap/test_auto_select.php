@@ -44,7 +44,7 @@ class QuoteMockProvider implements SwapProvider {
     public bool $quoteThrows = false;
     public function __construct(
         private string $name,
-        private SwapPairInfo $pairInfo,
+        protected SwapPairInfo $pairInfo,
     ) {}
     public function getName(): string { return $this->name; }
     public function isReachable(string $network): bool { return true; }
@@ -271,10 +271,17 @@ class LockupTreeMockProvider extends QuoteMockProvider {
         [$outKey, $_p] = Taproot::tweakOutputKey($internalKey, $merkleRoot);
         $lockup = Taproot::encodeP2trAddress($outKey, $network === 'regtest' ? 'regtest' : 'mainnet');
         self::$lastResponse = ['lockup' => $lockup];
+        // Issue an invoice CONSISTENT with this provider's own quote
+        // (lockup fee + percent fee), so a well-behaved provider passes
+        // Invoice::trySwapCreate's overcharge bound. A provider that returned
+        // more than its quoted economics is exactly what that bound rejects.
+        $consistentInvoice = $onchainAmountSats
+            + $this->pairInfo->lockupFeeSats
+            + (int)ceil($onchainAmountSats * $this->pairInfo->feePercent / 100.0);
         return new SwapCreateResult(
             swapId: 'sw-' . $this->getName() . '-' . bin2hex(random_bytes(3)),
-            invoice: 'lnbcrt' . ($onchainAmountSats + 500) . 'n1mockauto',
-            invoiceAmountSats: $onchainAmountSats + 500,
+            invoice: 'lnbcrt' . $consistentInvoice . 'n1mockauto',
+            invoiceAmountSats: $consistentInvoice,
             onchainAmountSats: $onchainAmountSats,
             lockupAddress: $lockup,
             refundPublicKeyHex: bin2hex($refundPub),
@@ -352,6 +359,61 @@ class LockupTreeMockProvider extends QuoteMockProvider {
     $decoded = $attempt['quotes_compared_json'] ? json_decode($attempt['quotes_compared_json'], true) : null;
     tassert($decoded === null || ($decoded['reason'] ?? null) === 'auto_select_disabled',
             'feature off: audit either null or reason=auto_select_disabled', $failures);
+}
+
+// ------------- Overcharge bound: provider that issues an invoice far above
+// its own quote is rejected, and the flow falls through to a well-behaved one.
+
+class OverchargeMockProvider extends LockupTreeMockProvider {
+    public function createReverseSwap(string $network, int $onchainAmountSats,
+                                       string $claimPubkeyHex, string $preimageHashHex): SwapCreateResult {
+        $base = parent::createReverseSwap($network, $onchainAmountSats, $claimPubkeyHex, $preimageHashHex);
+        // Re-issue with an invoice 5000 sat over the quoted economics — a
+        // provider overcharging the payer. Everything else (valid lockup tree)
+        // is kept so verifySwapLockup passes and only the amount bound fires.
+        return new SwapCreateResult(
+            swapId: $base->swapId,
+            invoice: 'lnbcrt' . ($onchainAmountSats + 5000) . 'n1mockover',
+            invoiceAmountSats: $onchainAmountSats + 5000,
+            onchainAmountSats: $base->onchainAmountSats,
+            lockupAddress: $base->lockupAddress,
+            refundPublicKeyHex: $base->refundPublicKeyHex,
+            timeoutBlockHeight: $base->timeoutBlockHeight,
+            claimLeafScript: $base->claimLeafScript,
+            refundLeafScript: $base->refundLeafScript,
+        );
+    }
+}
+
+{
+    // greedy is first in priority but overcharges by 5000 sat; good is a
+    // well-behaved fallback. Auto-select off so we walk strict priority order.
+    $greedy = new OverchargeMockProvider('greedy', new SwapPairInfo(0.1, 50, 50, 1000, 5_000_000, 'h1'));
+    $good   = new LockupTreeMockProvider('good',   new SwapPairInfo(0.1, 50, 50, 1000, 5_000_000, 'h2'));
+    SwapProviderFactory::setRegistry(['greedy' => $greedy, 'good' => $good]);
+    SwapsConfig::setProviderOrder(['greedy', 'good']);
+    SwapsConfig::setAutoSelectCheapest(false);
+    SwapsConfig::setSiteEnabled(true);
+    SwapsConfig::setStrictNoMintFallback(true);
+
+    $storeId = Database::generateId('store');
+    Database::insert('stores', [
+        'id' => $storeId,
+        'name' => 'Overcharge Store',
+        'mint_url' => null,
+        'mint_unit' => 'sat',
+        'created_at' => time(),
+        'onchain_xpub' => 'tpubD6NzVbkrYhZ4WaWSyoBvQwbpLkojyoTZPRsgXELWz3Popb3qkjcJyJUGLnL4qHHoQvao8ESaAstxYSnhyswJ76uZPStJRJCTKvosUCJZL5B',
+        'onchain_address_type' => 'P2WPKH',
+        'onchain_network' => 'regtest',
+    ]);
+
+    $invoice = Invoice::create($storeId, ['amount' => 50_000, 'currency' => 'sat']);
+    $attempt = Database::fetchOne("SELECT * FROM swap_attempts WHERE invoice_id = ?", [$invoice['id']]);
+    // 'good' is second in priority, so it can only be chosen if 'greedy' was
+    // tried first and rejected by the overcharge bound (see the error_log).
+    tassert($attempt !== null && $attempt['provider'] === 'good',
+            'overcharging provider rejected; well-behaved provider chosen', $failures);
 }
 
 // ------------- Cleanup -------------

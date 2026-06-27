@@ -156,6 +156,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'send_
 // Get checkout config
 $checkoutConfig = $invoice['checkout_config'] ? json_decode($invoice['checkout_config'], true) : [];
 $redirectUrl = $checkoutConfig['redirectURL'] ?? null;
+// Defense-in-depth: the redirect is rendered as an <a href> below, and rows
+// stored before the create-time http(s) validation may carry any scheme.
+// htmlspecialchars does NOT neutralize a javascript:/data: scheme in an href,
+// so re-validate here and drop anything that isn't http(s).
+if ($redirectUrl !== null && $redirectUrl !== '') {
+    $redirectUrl = Security::sanitizeUrl((string)$redirectUrl);
+}
 $redirectAuto = $checkoutConfig['redirectAutomatically'] ?? true;
 
 // Pull the payer-facing note out of the invoice's metadata. itemDesc is what

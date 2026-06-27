@@ -30,6 +30,7 @@ $blockedPatterns = [
     '#\.db$#i',
     '#/\.#',              // Hidden files (.htaccess, .git, etc.)
     '#/config\.local\.php#i',
+    '#/user_config\.php#i',   // Secrets (SMTP password, keys, update constants)
     '#/includes/.*\.php$#i',  // Direct access to include files via router
     '#/cashu-wallet-php/#i',  // Library internals
 ];

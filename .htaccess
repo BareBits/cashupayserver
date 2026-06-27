@@ -37,6 +37,19 @@
     </IfModule>
 </FilesMatch>
 
+# Block direct access to config files that hold secrets (SMTP password, keys,
+# auto-update constants). Apache normally executes .php rather than serving it,
+# but if PHP handling is ever misconfigured these would dump as plaintext.
+<FilesMatch "^(user_config|config\.local)\.php$">
+    <IfModule mod_authz_core.c>
+        Require all denied
+    </IfModule>
+    <IfModule !mod_authz_core.c>
+        Order deny,allow
+        Deny from all
+    </IfModule>
+</FilesMatch>
+
 # Block access to sensitive directories
 # Note: <Directory> doesn't work in .htaccess, use RewriteRule instead
 <IfModule mod_rewrite.c>
