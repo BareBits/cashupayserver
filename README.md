@@ -44,7 +44,7 @@ BareBits supports a number of payment types, risk/trust levels, and capabilities
 - **Product management** - Add commonly-used products to your store to make invoicing fast and clear
 - **Receipts** E-mail receipts to your customers (optional)
  - **On-chain payments** to an off-server wallet using xpub addresses
- - **Lightning payments** to an LNURL lightning address and/or a cashu mint (no need to manage liquidity). No LNURL? Don't want to rely on a cashu mint? You can use dubmarine swaps so your customer's can pay in lightning but you receive the funds on-chain. Your customer pays the swap fee. Noffers/CLINK are also supported, so you can direct lightning payments to an off-server wallet (Electrum is suggested)
+ - **Lightning payments** to an LNURL lightning address and/or a cashu mint (no need to manage liquidity). No LNURL? Don't want to rely on a cashu mint? You can use dubmarine swaps so your customer's can pay in lightning but you receive the funds on-chain. Your customer pays the swap fee. Noffers/CLINK are also supported, so you can direct lightning payments to an off-server wallet ([Electrum](https://electrum.org/) is suggested)
  - **Offline** payments powered by Cashu tokens (optional), melded to lightning when back online.
 - **Open source** - Read every line of code. Fork it, audit it yourself. Dual-licensed MIT (pre-2026-05-30) and Modified MIT (post-2026-05-30). See [LICENSE.md](LICENSE.md) and [USE_POLICY.md](USE_POLICY.md).
 
@@ -70,7 +70,7 @@ BareBits is robust payment software that can direct payments to you via many met
 - Note: Strike does not work with all kinds of merchants.
   
 ### Full self-custody setup (suggested, no USD conversion):
-- Run an electrum wallet on your desktop computer and enable automatic liquidity management. Keep $100 or so in the wallet to keep liquidity flowing smoothly. You can start with zero and build up gradually as payments arrive. See [How to get an LNURL or CLINK Noffer](#how-to-get-an-lnurl-or-clink-noffer)
+- Run an [Electrum](https://electrum.org/) wallet on your desktop computer and enable automatic liquidity management. Keep $100 or so in the wallet to keep liquidity flowing smoothly. You can start with zero and build up gradually as payments arrive. See [How to get an LNURL or CLINK Noffer](#how-to-get-an-lnurl-or-clink-noffer)
 - Enable submarine swaps as a fallback in case your desktop is offline or doesn't have sufficient inbound liquidity.
 - Suggestion: leave "strict mode" disabled. If your electrum wallet is unavailable AND a payment would be uneconomical to do a submarine swap for, lightning payments will land in a cashu mint (custodial) and be automatically withdrawn to your Electrum wallet once you have sufficient inbound liquidity OR will be withdrawn on-chain once it's economically reasonable.
 - Need USD or other fiat currency? Use an exchange to convert your funds.
