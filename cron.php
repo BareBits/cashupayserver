@@ -247,9 +247,13 @@ if (!$swapOnly && !$skipNonEssential) {
 }
 
 // Task 2: Check auto-melt — runs both rails. LightningAddress::checkAutoMelt
-// internally skips stores that have opted into the swap rail (via
-// SwapAutoMelt::modeForStore), and SwapAutoMelt::checkAndExecute does the
-// opposite, so each store gets handled by exactly one path.
+// is the primary drain: it runs for every auto-melt store that has an
+// LNURL/noffer destination (regardless of swap mode) and empties the wallet
+// first. SwapAutoMelt::checkAndExecute runs right after and handles the
+// on-chain (swap) rail; for a store that also has an LNURL/noffer it now
+// reads a drained wallet and no-ops, so on-chain acts as an automatic
+// fallback that only fires when the LN host is down and funds remain. A
+// swap-only store (no LNURL/noffer) is still handled solely by the swap rail.
 if (!$swapOnly && !$skipNonEssential) {
     try {
         $meltResult = LightningAddress::checkAutoMelt();

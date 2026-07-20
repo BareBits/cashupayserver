@@ -228,12 +228,20 @@ class LightningAddress {
         $results = [];
 
         foreach ($stores as $store) {
-            if (SwapAutoMelt::modeForStore($store) === 'swap') {
-                continue;
-            }
+            // LNURL/noffer is the primary mint-drain rail: it runs for EVERY
+            // auto-melt-enabled store that has a destination configured — even
+            // stores that ALSO have the on-chain (swap) rail set up. Draining
+            // here first means funds leave the mint promptly instead of waiting
+            // for an on-chain swap to become economically rational. The swap
+            // rail (SwapAutoMelt::checkAndExecute, run right after in cron) then
+            // reads a drained wallet and no-ops, so it acts as an automatic
+            // fallback that only fires when the LN host is down and funds remain.
+            //
             // Ordered fallback chain for this store; skip stores with none
-            // (replaces the old WHERE auto_melt_address IS NOT NULL filter).
-            // Mixed types: Lightning addresses and CLINK noffers, tried in order.
+            // (replaces the old WHERE auto_melt_address IS NOT NULL filter). A
+            // swap-only store with no Lightning address / noffer falls through
+            // here untouched and is handled solely by the swap rail. Mixed
+            // types: Lightning addresses and CLINK noffers, tried in order.
             $destinations = StoreLnAddresses::destinationsForStore($store['id']);
             if (empty($destinations)) {
                 continue;
@@ -246,10 +254,19 @@ class LightningAddress {
                 $mintUnit = strtolower($store['mint_unit'] ?? 'sat');
                 $isFiatMint = !in_array($mintUnit, ['sat', 'sats', 'msat']);
 
-                if ($balance >= $store['auto_melt_threshold']) {
+                // No balance threshold: LNURL/noffer is the always-on primary
+                // drain, so we attempt a cashout whenever there is any spendable
+                // balance. The only floor is physical — an amount too small to
+                // cover the Lightning fee is dropped by the post-fee dust guard
+                // below (before any LNURL host is contacted), so sub-fee dust
+                // never triggers network calls or failure emails.
+                // auto_melt_threshold intentionally NO LONGER gates this rail; it
+                // still governs the on-chain swap floor via SwapAutoMelt.
+                if ($balance >= 1) {
                     // Fees (upstream dev / dev / hosting) are settled separately
-                    // on the cron fee-settlement tick; auto-melt just empties the
-                    // post-fee balance to the operator's Lightning address.
+                    // on the cron fee-settlement tick (which runs BEFORE auto-melt),
+                    // so auto-melt just empties the post-fee balance to the
+                    // operator's Lightning address.
                     $meltAmountInMintUnit = $balance;
 
                     if ($meltAmountInMintUnit < 1) {
