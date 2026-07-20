@@ -63,19 +63,19 @@ BareBits sits between custodial payment gateways and full self-hosting:
 ## Suggested Configurations
 BareBits is robust payment software that can direct payments to you via many methods depending on your security and speed needs. It offers a ton of configuration options. Below are several suggested setups. No matter which setup you choose, on-chain payments will ALWAYS go to your on-chain wallet. Lightning payments can take several paths depending on your needs.
 
-1. Dead simple setup with automatic USD conversion
+### Dead simple setup with automatic USD conversion
 - Get an account at [strike.me](https://strike.me) and enable USD conversion in settings. Strike works in over 100 countries and native fiat currencies.
 - You can grab an LNURL (lightning address) from your profile page and an on-chain adress from the receive tab.
 - Note: Strike is a custodial exchange that holds onto funds for you, which means there is risk they may take them. Don't keep significant funds on exchanges.
 - Note: Strike does not work with all kinds of merchants.
-
-2. Full self-custody setup (suggested, no USD conversion):
-- Run an electrum wallet on your desktop computer (see [How to get an LNURL or CLINK Noffer](#How to get an LNURL or CLINK Noffer)) and enable automatic liquidity management. Keep $100 or so in the wallet to keep liquidity flowing smoothly. You can start with zero and build up gradually as payments arrive.
+  
+### Full self-custody setup (suggested, no USD conversion):
+- Run an electrum wallet on your desktop computer and enable automatic liquidity management. Keep $100 or so in the wallet to keep liquidity flowing smoothly. You can start with zero and build up gradually as payments arrive. See [How to get an LNURL or CLINK Noffer](#How to get an LNURL or CLINK Noffer)
 - Enable submarine swaps as a fallback in case your desktop is offline or doesn't have sufficient inbound liquidity.
 - Suggestion: leave "strict mode" disabled. If your electrum wallet is unavailable AND a payment would be uneconomical to do a submarine swap for, lightning payments will land in a cashu mint (custodial) and be automatically withdrawn to your Electrum wallet once you have sufficient inbound liquidity OR will be withdrawn on-chain once it's economically reasonable.
 - Need USD or other fiat currency? Use an exchange to convert your funds.
 
-3. On-chain Absolutist
+### On-chain Absolutist
 Don't want to mess around with LNURLs or CLINK noffers? Just want everything to go to your cold on-chain wallet? No problem!
 - Get an xpub or bare address from your wallet, add it to your BareBits store configuration
 - Want your customers to be able to pay with lightning? Enable submarine swaps: your customers pay in lightning, you get funds on-chain
