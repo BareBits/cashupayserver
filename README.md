@@ -8,7 +8,7 @@
 # BareBits
 > **A BTCPay-compatible payment gateway that runs on any PHP hosting.**
 
-Accept Bitcoin Lightning payments without running a full BTCPay Server instance. No Docker, no VPS, no command line. Just upload and go. **Low 1% fee**. 
+Accept Bitcoin payments (lightning and on-chain) without running a full BTCPay Server instance. No Docker, no VPS, no command line. Just upload and go. **Low 1% fee**. 
 
 **Are you a web developer? Re-sell this software to your customers at a custom fee rate. Your customers pay a x% fee, payments go directly to your LNURL.** Just modify the appropriate settings in the config file.
 
