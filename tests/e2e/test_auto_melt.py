@@ -99,3 +99,58 @@ def test_auto_melt_drains_balance_to_lightning_address(
     # After a melt the residual change is folded back as new proofs; the
     # remainder should be small relative to the melt amount.
     assert remaining < AUTO_MELT_THRESHOLD_SAT, f"store balance not drained: {remaining}"
+
+
+def _run_auto_melt_cron(configured: ConfiguredPayserver) -> object:
+    """Trigger cron and return the parsed `auto_melt` task result, tolerating
+    non-JSON preamble lines the cron may emit before its JSON payload."""
+    r = configured.handle.trigger_cron()
+    assert r.status_code == 200, r.text
+    body_text = r.text.strip()
+    try:
+        cron_body = r.json()
+    except Exception:
+        import json as _json
+
+        idx = body_text.find("{")
+        cron_body = _json.loads(body_text[idx:]) if idx >= 0 else {}
+    return cron_body.get("tasks", {}).get("auto_melt")
+
+
+def test_auto_melt_ignores_threshold_for_lightning(
+    configured_with_lnurlp: ConfiguredPayserver,
+    lnd_payer: LndHandle,
+    lnurlp_server: LnurlpServer,
+) -> None:
+    """The LNURL/noffer rail is the always-on primary drain: it cashes the mint
+    balance out to the configured Lightning address every cycle regardless of
+    auto_melt_threshold. Funding a balance far *below* a huge threshold must
+    still drain — under the old threshold-gated behaviour it would not have."""
+    configured = configured_with_lnurlp
+
+    # 1. Fund the store, then set a threshold far above the funded balance.
+    _settle_invoice(configured, lnd_payer, SETTLE_AMOUNT_SAT)
+    assert _store_balance(configured) >= SETTLE_AMOUNT_SAT
+
+    payer_channel_before = lnd_payer.channel_balance_sat()
+
+    huge_threshold = SETTLE_AMOUNT_SAT * 1000  # balance is nowhere near this
+    _enable_auto_melt(configured, address="test@example.test", threshold_sat=huge_threshold)
+
+    # 2. Trigger cron; the drain must fire even though balance < threshold.
+    auto_melt_result = _run_auto_melt_cron(configured)
+    assert auto_melt_result and auto_melt_result != "skipped", (
+        f"auto_melt task didn't run despite a fundable balance; result={auto_melt_result!r}"
+    )
+
+    # 3. Funds were delivered to the receiving node and the mint was drained.
+    payer_channel_after = lnd_payer.channel_balance_sat()
+    delta = payer_channel_after - payer_channel_before
+    assert delta >= SETTLE_AMOUNT_SAT - 200, (
+        f"expected ~{SETTLE_AMOUNT_SAT} sats delivered, got delta={delta}"
+    )
+
+    remaining = _store_balance(configured)
+    assert remaining < 500, (
+        f"store balance not drained despite huge threshold: {remaining}"
+    )

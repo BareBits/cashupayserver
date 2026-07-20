@@ -5419,6 +5419,15 @@ header('Cache-Control: no-cache, must-revalidate');
                                 <label class="form-label" id="auto-melt-threshold-label">Threshold (<span class="unit-label">SAT</span>)</label>
                                 <input type="number" class="form-input" id="auto-melt-threshold"
                                        value="2000" min="1" step="1">
+                                <p class="form-help" style="margin-top:0.5rem;">
+                                    This threshold applies only to <strong>on-chain</strong>
+                                    withdrawals &mdash; it sets the minimum mint balance before an
+                                    on-chain swap is attempted. Lightning address / noffer
+                                    withdrawals ignore it: whenever a Lightning address or noffer is
+                                    configured, the mint balance is cashed out to it automatically
+                                    each cycle (no minimum), so funds don&rsquo;t sit in the mint
+                                    waiting for the on-chain fee to become economical.
+                                </p>
                             </div>
 
                             <div id="aw-store-error" class="hidden" style="margin-top:0.75rem; color: var(--error); font-size: 0.85rem;"></div>
