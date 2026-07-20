@@ -63,6 +63,28 @@ BareBits sits between custodial payment gateways and full self-hosting:
 | **BareBits** | Simple, cheap hosting | No KYC, trust mint with funds until withdrawal, or go full self-custody |
 
 
+## Suggested Configurations
+BareBits is robust payment software that can direct payments to you via many methods depending on your security and speed needs. It offers a ton of configuration options. Below are several suggested setups. No matter which setup you choose, on-chain payments will ALWAYS go to your on-chain wallet. Lightning payments can take several paths depending on your needs.
+
+1. Dead simple setup with automatic USD conversion
+- Get an account at [strike.me](https://strike.me) and enable USD conversion in settings. Strike works in over 100 countries and native fiat currencies.
+- You can grab an LNURL (lightning address) from your profile page and an on-chain adress from the receive tab.
+- Note: Strike is a custodial exchange that holds onto funds for you, which means there is risk they may take them. Don't keep significant funds on exchanges.
+- Note: Strike does not work with all kinds of merchants.
+
+2. Full self-custody setup (suggested, no USD conversion):
+- Run an electrum wallet on your desktop computer (see [How to get an LNURL or CLINK Noffer](#How to get an LNURL or CLINK Noffer)) and enable automatic liquidity management. Keep $100 or so in the wallet to keep liquidity flowing smoothly. You can start with zero and build up gradually as payments arrive.
+- Enable submarine swaps as a fallback in case your desktop is offline or doesn't have sufficient inbound liquidity.
+- Suggestion: leave "strict mode" disabled. If your electrum wallet is unavailable AND a payment would be uneconomical to do a submarine swap for, lightning payments will land in a cashu mint (custodial) and be automatically withdrawn to your Electrum wallet once you have sufficient inbound liquidity OR will be withdrawn on-chain once it's economically reasonable.
+- Need USD or other fiat currency? Use an exchange to convert your funds.
+
+3. On-chain Absolutist
+Don't want to mess around with LNURLs or CLINK noffers? Just want everything to go to your cold on-chain wallet? No problem!
+- Get an xpub or bare address from your wallet, add it to your BareBits store configuration
+- Want your customers to be able to pay with lightning? Enable submarine swaps: your customers pay in lightning, you get funds on-chain
+- Suggested: allow fallback to mint (strict mode disabled, the default) so smaller lightning payments are workable. Submarine swap providers won't let you make swaps < around $25. Funds will be temporarily stored in the cashu mint, then forwarded to you on-chain when fees permit.
+
+
 ## Installation
 
 ### Standalone (Any PHP Hosting)
@@ -72,6 +94,7 @@ BareBits sits between custodial payment gateways and full self-hosting:
 3. **Upload** to your web hosting via FTP or file manager
 4. **Open** the URL in your browser (e.g., `https://yourdomain.com/barebits/`)
 5. **Follow** the setup wizard to configure your mint and password
+6. **Customize** your store settings to your heart's content!
 
 ### Integration with ecommerce tools (woocommerce, magneto, etc)
 
@@ -170,6 +193,29 @@ on the checkout page.
 For on-chain Bitcoin payment support, the release zip ships with the required
 PHP libraries (bitwasp/bitcoin et al.) under `vendor/`. Composer is only needed
 if you're building from source (see Development below).
+
+## How to get an LNURL or CLINK Noffer
+
+If you want your customers to be able to pay natively via lightning (lowest fees, fastest payments), you will need to generate a lightning invoice for each customer. There are two ways to automate this: LNURLs (lightning address) and CLINK Noffers. Alternatively, you can use cashu mints and submarine swaps (accept customer payments in LN, automatically send to you on-chain).
+
+### CLINK Noffers (suggested) (self-custody)
+CLINK Noffers enable you to generate lightning invoices on the fly from a desktop wallet that is left running online. This means you maintain full self-custody over your funds! You will need to manage your liquidity (make sure you have room for incoming payments), but this can be automated fairly easily. BareBits will automatically fall back to submarine swaps, cashu mints, etc if there is no liquidity available or the wallet is offline, so it's not a big deal.
+
+Suggested setup: [Electrum wallet](https://electrum.org/) with the [CLINK plugin](https://github.com/BareBits/electrum_clink) and [Liquidity management plugin](https://github.com/BareBits/electrum_clink). Once the CLINK plugin is installed, go to the settings and generate an noffer to add to your store settings page. You only need to generate a single noffer.
+
+The default settings on these plugins should work, just be sure to set the liquidity management plugin to run in automatic mode.
+
+### LNURL Providers (simplest, instant USD conversion)
+Many centralized exchanges like [Strike](https://strike.me) offer LNURLs out of the box and can offer instant USD conversion. Note that these exchanges are custodial: they hold onto funds for you. This introduces risk of theft, exchange collapse, etc so we do not suggest storing significant funds on them.
+
+| Provider   |      USD Conversion |  Notes |
+|----------|:-------------:|------:|
+| [Strike](https://strike.me) |  ✅ | Works in most countries, some merchant type restrictions, KYC process |
+| [CoinOS](https://coinos.io) |    ✖️   |  Works in all countries, no restrictions, no KYC |
+| [Rizful](https://rizful.com/) |  ✖️ |    Works in all countries, no restrictions, no KYC |
+
+You can also get your own LNURL by hosting your own lightning node (rather complex, not suggested if you are not technically inclined)
+
 
 ## Security
 
