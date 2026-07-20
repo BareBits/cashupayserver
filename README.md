@@ -14,19 +14,16 @@ Accept Bitcoin Lightning payments without running a full BTCPay Server instance.
 
 ---
 
-## ⚠️ EXPERIMENTAL SOFTWARE - USE AT YOUR OWN RISK ⚠️
+## ⚠️ AS-IS SOFTWARE - USE AT YOUR OWN RISK ⚠️
 
-**This project is in early development and has NOT been thoroughly tested in production environments.**
+**This software is produced AS-IS without any warranty, do not use it to store significant funds**
 
 - Do NOT use with amounts you cannot afford to lose
-- Test with small transactions first
-- The software may contain bugs that could result in loss of funds
-- No warranty is provided - see the LICENSE file
-- Security audits have not been performed
+- The software may contain bugs that could result in loss of funds. Use the suggested default pattern of having funds go to a cold wallet to limit risk.
 
 **You are responsible for your own funds. The developers are not liable for any losses.**
 
-**Important:** A selected Cashu mint takes custody of your funds until you withdraw. For maximum sovereignty, run your own mint or enable auto-cashout to move funds immediately to your Lightning wallet.
+**Important:** A Cashu mint (if enabled) takes custody of your funds until you withdraw. For maximum sovereignty, run your own mint or enable auto-cashout to move funds immediately to your Lightning wallet.
 
 ---
 
@@ -47,9 +44,8 @@ BareBits supports a number of payment types, risk/trust levels, and capabilities
 - **Product management** - Add commonly-used products to your store to make invoicing fast and clear
 - **Receipts** E-mail receipts to your customers (optional)
  - **On-chain payments** to an off-server wallet using xpub addresses
- - **Lightning payments** to an LNURL lightning address and/or a cashu mint (no need to manage liquidity). No LNURL? Don't want to rely on a cashu mint? You can use dubmarine swaps so your customer's can pay in lightning but you receive the funds on-chain. Your customer pays the swap fee
- - **Cashu token** payments immediately melded to lightning. 
- - **Offline** payments powered by Cashu tokens (optional)
+ - **Lightning payments** to an LNURL lightning address and/or a cashu mint (no need to manage liquidity). No LNURL? Don't want to rely on a cashu mint? You can use dubmarine swaps so your customer's can pay in lightning but you receive the funds on-chain. Your customer pays the swap fee. Noffers/CLINK are also supported, so you can direct lightning payments to an off-server wallet (Electrum is suggested)
+ - **Offline** payments powered by Cashu tokens (optional), melded to lightning when back online.
 - **Open source** - Read every line of code. Fork it, audit it yourself. Dual-licensed MIT (pre-2026-05-30) and Modified MIT (post-2026-05-30). See [LICENSE.md](LICENSE.md) and [USE_POLICY.md](USE_POLICY.md).
 
 ### BareBits vs CashuPayServer
@@ -61,16 +57,50 @@ BareBits sits between custodial payment gateways and full self-hosting:
 
 | Solution | Pros | Cons |
 |----------|------|------|
-| Custodial gateways | Easy setup | KYC, can freeze funds, geographic restrictions |
+| Custodial gateways like [OpenNode](https://opennode.com)| Easy setup | KYC, can freeze funds, geographic restrictions |
 | [BTCPay Server](https://btcpayserver.org/) | Full sovereignty | Needs VPS ($20+/mo), Docker, ongoing maintenance |
-| [Bitcart](https://bitcart.ai/) | Full sovereignty, limited lightning support | Needs VPS ($10+/mo), Docker, ongoing maintenance |
-| **BareBits** | Simple, cheap hosting | Trust mint with funds until withdrawal, or go full self-custody |
+| [Bitcart](https://bitcart.ai/) | Full sovereignty, limited lightning support | Needs smaller VPS ($10+/mo), Docker, ongoing maintenance |
+| **BareBits** | Simple, cheap hosting | No KYC, trust mint with funds until withdrawal, or go full self-custody |
+
+
+## Installation
+
+### Standalone (Any PHP Hosting)
+
+1. **Download** the latest `cashupayserver.zip` from [GitHub Releases](https://github.com/BareBits/cashupayserver/releases)
+2. **Extract** the zip file
+3. **Upload** to your web hosting via FTP or file manager
+4. **Open** the URL in your browser (e.g., `https://yourdomain.com/barebits/`)
+5. **Follow** the setup wizard to configure your mint and password
+
+### Integration with ecommerce tools (woocommerce, magneto, etc)
+
+BareBits integrates with most ecommerce platforms including woocommerce, magneto, drupal, and prestashop. Full list [here](https://docs.btcpayserver.org/FAQ/Integrations/#what-e-commerce-integrations-are-available).
+
+1. Download the BTCPayServer plugin for your ecommerce platform
+2. When asked to input your BTCPayServer URL, input your store API URL instead. You can find this URL in the store settings
+
+
+### Recommended: Configure system cron
+
+BareBits's background tasks — invoice polling, auto-cashout, and
+fee settlement — run on a tight schedule when your hosting environment
+invokes `cron.php` once a minute. Without it, the same tasks still fire
+opportunistically when an admin or customer loads a page, but with
+multi-minute latency. 
+
+**This is particularly critical for submarine swaps: without cron, payments may not be claimed in time and may be refunded to the customer!**
+
+Open **Settings** in the admin UI to copy the suggested entry, then add it
+to your system crontab (or your host's cron panel). The admin dashboard
+will show a one-time dismissable banner if external cron hasn't been
+detected in over 24 hours.
 
 ## Payment Flow
 
 Generally speaking, BareBits tries to offer both on-chain and lightning as payment options to all customers. On-chain payments are always enabled, lightning payments are enabled depending on configuration. Here's what that decision tree looks like:
 - Is the customer paying on-chain? Send directly to merchant xpub wallet
-- Does the merchant have a working LNURL? Present a lightning invoice
+- Does the merchant have a working LNURL or CLINK Noffer? Present a lightning invoice
 - If submarine swaps are NOT enabled and a cashu mint is NOT enabled, do not present a lightning invoice.
 - If submarine swaps ARE enabled AND the invoice amount falls within the swap provider's min/max limits, present a lightning invoice that settles directly to the merchant's on-chain wallet. When several providers are configured, the preferred (first reachable) provider is used unless another is cheaper by more than the auto-select threshold (`swaps_auto_select_threshold_pct`, default 10%).
 - If submarine swaps are NOT enabled, or no provider can serve the amount, display a lightning invoice that sends payment to the cashu mint — unless strict mode is on, in which case the invoice is rejected instead. Funds are later emptied from the mint to the merchant's on-chain wallet by auto-cashout once it's worth it (auto-cashout caps the swap fee at 1% of the amount by default).
@@ -81,7 +111,7 @@ Generally speaking, BareBits tries to offer both on-chain and lightning as payme
 The BareBits software charges a 1% fee for usage. If you are a web developer, you can sell this service to your clients and charge an additional fee on top. Fees are paid in a number of ways.
 
  - When any invoice is generated where the invoice amount is < the fee due, the payment will be automatically redirected to the fee destination.
- - If any funds are in the cash mint and a fee is due, those funds will be used to pay the fee
+ - If any funds are in the cashu mint and a fee is due, those funds will be used to pay the fee
 
 ## Submarine Swaps (LN → on-chain, optional)
 
@@ -131,13 +161,6 @@ on the checkout page.
 3. (Optional) Per-store override: a store can force swaps on or off
    independently of the site default.
 
-**Providers and testnet**
-
-| Provider | Mainnet | Testnet | Regtest |
-|----------|---------|---------|---------|
-| Zeus     | `https://swaps.zeuslsp.com/api`       | `https://testnet-swaps.zeuslsp.com/api` | — |
-| Boltz    | `https://api.boltz.exchange`          | — (discontinued upstream)               | configurable (`swaps_boltz_regtest_url`) |
-
 ## Requirements
 
 - PHP 8.0 or higher
@@ -147,42 +170,6 @@ on the checkout page.
 For on-chain Bitcoin payment support, the release zip ships with the required
 PHP libraries (bitwasp/bitcoin et al.) under `vendor/`. Composer is only needed
 if you're building from source (see Development below).
-
-## Installation
-
-### Standalone (Any PHP Hosting)
-
-1. **Download** the latest `cashupayserver.zip` from [GitHub Releases](https://github.com/BareBits/cashupayserver/releases)
-2. **Extract** the zip file
-3. **Upload** to your web hosting via FTP or file manager
-4. **Open** the URL in your browser (e.g., `https://yourdomain.com/cashupayserver/`)
-5. **Follow** the setup wizard to configure your mint and password
-
-### WordPress Plugin
-
-1. **Download** `cashupay-wordpress.zip` from [GitHub Releases](https://github.com/BareBits/cashupayserver/releases)
-2. In WordPress admin, go to **Plugins → Add New → Upload Plugin**
-3. **Upload** the zip file and activate
-4. Go to **Tools → BareBits** to configure
-5. Optionally integrates with the BTCPay for WooCommerce plugin if installed (configured during setup), or paste the pairing URL into BTCPay plugin settings manually
-
-### Other e-commerce integrations
-
-Any e-commerce website which support BTCPay Server will work with BareBits, just change the BTCPay Server URL to your BareBits URL. [Supported platforms include Drupal, Magneto, Presto Shop, and more](https://docs.btcpayserver.org/FAQ/Integrations/#what-e-commerce-integrations-are-available). 
-
-### Recommended: Configure system cron
-
-BareBits's background tasks — invoice polling, auto-cashout, and
-fee settlement — run on a tight schedule when your hosting environment
-invokes `cron.php` once a minute. Without it, the same tasks still fire
-opportunistically when an admin or customer loads a page, but with
-multi-minute latency. 
-**This is particularly critical for submarine swaps: without cron, payments may not be claimed in time and may be refunded to the customer!**
-
-Open **Settings** in the admin UI to copy the suggested entry, then add it
-to your system crontab (or your host's cron panel). The admin dashboard
-will show a one-time dismissable banner if external cron hasn't been
-detected in over 24 hours.
 
 ## Security
 
@@ -240,7 +227,7 @@ Then reload the sign-in page. It detects the file and shows a **"Set a new admin
 The simplest way to run BareBits locally:
 
 ```bash
-git clone --recurse-submodules https://github.com/jooray/cashupayserver.git
+git clone --recurse-submodules https://github.com/BareBits/cashupayserver.git
 cd cashupayserver
 # Install PHP dependencies (bitwasp/bitcoin for on-chain payment support).
 # Composer is only needed for development and at build time — the deploy zip
@@ -268,7 +255,7 @@ See [DOCKER.md](DOCKER.md) for detailed setup instructions, persistent data volu
 #### Standalone + WordPress (for testing both)
 
 ```bash
-git clone --recurse-submodules https://github.com/jooray/cashupayserver.git
+git clone --recurse-submodules https://github.com/BareBits/cashupayserver.git
 cd cashupayserver
 
 docker build -f docker/Dockerfile.standalone -t cashupayserver-standalone .
@@ -438,12 +425,6 @@ Contributions are welcome! Please discuss with us first prior to committing and 
 
 BareBits is a fork of [CashuPayServer](https://github.com/jooray/cashupayserver) by Juraj Bednár. The original project established the core idea: a PHP-only Bitcoin payment gateway built on Cashu mints, speaking the BTCPay Greenfield API. BareBits preserves that foundation and adds direct on-chain support, multi-user administration, security hardening, an in-app updater, a sustainable revenue model, and a comprehensive test suite — all while keeping the "upload and go" deployment story on any PHP host.
 
-#### Brand rename to BareBits, CashuPayServer origin
-
-**Forked from [cashupayserver.org](https://cashupayserver.org/)**
-
-User-facing surfaces (page titles, headings, footers, button labels, PWA manifest, WordPress admin labels, withdrawal-memo descriptions, API "setup not complete" error) were renamed to "BareBits". Code identifiers, file paths, the composer package name, the `isCashuPayServer` BTCPay-compat API flag, and the WordPress menu slug are kept as-is to preserve compatibility.
-
 ---
 
 ## License and Use Policy
@@ -471,7 +452,3 @@ its creators disclaim liability for your deployment, modifications,
 integrations, and downstream use, and provide the Software "as is" with no
 warranties. BareBits does not provide a hosted service unless you have a
 separate written Service Agreement.
-
-## Links
-
-- **Website**: [cashupayserver.org](https://cashupayserver.org/)
