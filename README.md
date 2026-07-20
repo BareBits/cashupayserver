@@ -70,7 +70,7 @@ BareBits is robust payment software that can direct payments to you via many met
 - Note: Strike does not work with all kinds of merchants.
   
 ### Full self-custody setup (suggested, no USD conversion):
-- Run an electrum wallet on your desktop computer and enable automatic liquidity management. Keep $100 or so in the wallet to keep liquidity flowing smoothly. You can start with zero and build up gradually as payments arrive. See [How to get an LNURL or CLINK Noffer](#How to get an LNURL or CLINK Noffer)
+- Run an electrum wallet on your desktop computer and enable automatic liquidity management. Keep $100 or so in the wallet to keep liquidity flowing smoothly. You can start with zero and build up gradually as payments arrive. See [How to get an LNURL or CLINK Noffer](#how-to-get-an-lnurl-or-clink-noffer)
 - Enable submarine swaps as a fallback in case your desktop is offline or doesn't have sufficient inbound liquidity.
 - Suggestion: leave "strict mode" disabled. If your electrum wallet is unavailable AND a payment would be uneconomical to do a submarine swap for, lightning payments will land in a cashu mint (custodial) and be automatically withdrawn to your Electrum wallet once you have sufficient inbound liquidity OR will be withdrawn on-chain once it's economically reasonable.
 - Need USD or other fiat currency? Use an exchange to convert your funds.
