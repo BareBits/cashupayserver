@@ -48,9 +48,6 @@ BareBits supports a number of payment types, risk/trust levels, and capabilities
  - **Offline** payments powered by Cashu tokens (optional), melded to lightning when back online.
 - **Open source** - Read every line of code. Fork it, audit it yourself. Dual-licensed MIT (pre-2026-05-30) and Modified MIT (post-2026-05-30). See [LICENSE.md](LICENSE.md) and [USE_POLICY.md](USE_POLICY.md).
 
-### BareBits vs CashuPayServer
-BareBits adds a number of enhancements to the original CashuPayServer software including on-chain payments, accepting cashu tokens, offline payments, automatic submarine swaps, automatic updates, security enhancements, LNURL support, user management, product management, a stats menu, and more. BareBits charges a **1% fee** for usage
-
 ### Trade-offs
 
 BareBits sits between custodial payment gateways and full self-hosting:
@@ -216,6 +213,8 @@ Many centralized exchanges like [Strike](https://strike.me) offer LNURLs out of 
 
 You can also get your own LNURL by hosting your own lightning node (rather complex, not suggested if you are not technically inclined)
 
+### BareBits vs CashuPayServer
+BareBits adds a number of enhancements to the original CashuPayServer software including on-chain payments, accepting cashu tokens, offline payments, automatic submarine swaps, automatic updates, security enhancements, LNURL support, user management, product management, a stats menu, and more. BareBits charges a **1% fee** for usage
 
 ## Security
 
