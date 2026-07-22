@@ -6,9 +6,8 @@
 </p>
 
 # BareBits
-> **A BTCPay-compatible payment gateway that runs on any PHP hosting.**
 
-Accept Bitcoin payments (lightning and on-chain) without running a full BTCPay Server instance. No Docker, no VPS, no command line. Just upload and go. **Low 1% fee**. 
+Accept Bitcoin payments (lightning and on-chain) **without** running a full BTCPay Server instance. No Docker, no VPS, no command line. Just upload and go. Works on all "shared" web hosting, if it can host WordPress, it can host BareBits. **Low 1% fee**. 
 
 **Are you a web developer? Re-sell this software to your customers at a custom fee rate. Your customers pay a x% fee, payments go directly to your LNURL.** Just modify the appropriate settings in the config file.
 
@@ -19,11 +18,11 @@ Accept Bitcoin payments (lightning and on-chain) without running a full BTCPay S
 **This software is produced AS-IS without any warranty, do not use it to store significant funds**
 
 - Do NOT use with amounts you cannot afford to lose
-- The software may contain bugs that could result in loss of funds. Use the suggested default pattern of having funds go to a cold wallet to limit risk.
+- Use the suggested default pattern of having funds go to a cold wallet to limit risk.
 
 **You are responsible for your own funds. The developers are not liable for any losses.**
 
-**Important:** A Cashu mint (if enabled) takes custody of your funds until you withdraw. For maximum sovereignty, run your own mint or enable auto-cashout to move funds immediately to your Lightning wallet.
+**Important:** A Cashu mint (if enabled) takes custody of your funds until you withdraw. For maximum sovereignty, run your own mint or enable auto-cashout to move funds immediately to your wallet.
 
 ---
 
@@ -35,8 +34,8 @@ BareBits supports a number of payment types, risk/trust levels, and capabilities
  
 
 ### Key Features
-- **Any PHP hosting** - Works on $3/month shared hosting. If it runs WordPress, it runs this.
-- **No accounts or KYC**
+- **Any PHP hosting** - Works on $3/month shared hosting.
+- **No KYC or approval process**
 - **Self-custody** - A fully self-custody solution, or add Cashu mint support for increased convenience
 - **Multiple stores** - Each store can have it's own invoice settings, cashout addresses, etc.
 - **BTCPay-compatible API** - WooCommerce and other BTCPay plugins work by changing one URL.
@@ -44,7 +43,7 @@ BareBits supports a number of payment types, risk/trust levels, and capabilities
 - **Product management** - Add commonly-used products to your store to make invoicing fast and clear
 - **Receipts** E-mail receipts to your customers (optional)
  - **On-chain payments** to an off-server wallet using xpub addresses
- - **Lightning payments** to an LNURL lightning address and/or a cashu mint (no need to manage liquidity). No LNURL? Don't want to rely on a cashu mint? You can use dubmarine swaps so your customer's can pay in lightning but you receive the funds on-chain. Your customer pays the swap fee. Noffers/CLINK are also supported, so you can direct lightning payments to an off-server wallet ([Electrum](https://electrum.org/) is suggested)
+ - **Lightning payments** to an LNURL lightning address and/or a cashu mint (no need to manage liquidity). No LNURL? Don't want to rely on a cashu mint? You can use submarine swaps so your customer's can pay in lightning but you receive the funds on-chain. Your customer pays the swap fee. Noffers/CLINK are also supported, so you can direct lightning payments to an off-server wallet ([Electrum](https://electrum.org/) is suggested)
  - **Offline** payments powered by Cashu tokens (optional), melded to lightning when back online.
 - **Open source** - Read every line of code. Fork it, audit it yourself. Dual-licensed MIT (pre-2026-05-30) and Modified MIT (post-2026-05-30). See [LICENSE.md](LICENSE.md) and [USE_POLICY.md](USE_POLICY.md).
 
