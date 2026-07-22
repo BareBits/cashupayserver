@@ -1,5 +1,14 @@
 # CashuPayServer Apache Configuration
 
+# Serve index.php as the directory index. Bare Apache's built-in DirectoryIndex
+# is "index.html" only (index.php is added by distro config that many shared
+# hosts don't apply), so without this a directory URL like
+# https://example.com/cashupay/ would list files or 403 instead of running
+# index.php — which is what redirects a fresh install into the setup wizard.
+<IfModule mod_dir.c>
+    DirectoryIndex index.php
+</IfModule>
+
 # Enable rewrite engine
 <IfModule mod_rewrite.c>
     RewriteEngine On
