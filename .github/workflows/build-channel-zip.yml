@@ -52,17 +52,36 @@ jobs:
         run: |
           ./scripts/build-standalone.sh
 
-      - name: Determine moving release tag
-        id: tag
-        run: echo "tag=channel-${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+      - name: Compute release metadata
+        id: meta
+        run: |
+          echo "tag=channel-${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          echo "short_sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - name: Refresh moving-tag release
+        # softprops/action-gh-release re-uploads assets to an existing release
+        # but never moves the tag or refreshes the release's published date, so
+        # the Releases page stays frozen at whenever the release was first cut.
+        # Delete the release AND its tag first so the next step recreates both
+        # at the current commit with a current timestamp. The window where the
+        # asset is absent is a few seconds; the auto-updater is cron-driven and
+        # retries, and the per-ref concurrency group prevents overlapping runs.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete "${{ steps.meta.outputs.tag }}" \
+            --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
 
       - name: Publish moving-tag release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.tag.outputs.tag }}
-          name: "Channel: ${{ github.ref_name }}"
+          tag_name: ${{ steps.meta.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: "Channel: ${{ github.ref_name }} (${{ steps.meta.outputs.short_sha }})"
           body: |
-            Auto-built from ${{ github.ref_name }}@${{ github.sha }}.
+            Auto-built from ${{ github.ref_name }}@${{ github.sha }}
+            on ${{ steps.meta.outputs.built_at }}.
 
             This is a moving release. The deployed auto-updater pulls
             `cashupayserver.zip` from here. Do not link humans to it.
