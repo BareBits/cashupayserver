@@ -13,16 +13,16 @@ Accept Bitcoin payments (lightning and on-chain) **without** running a full BTCP
 
 ---
 
-## ⚠️ AS-IS SOFTWARE - USE AT YOUR OWN RISK ⚠️
+## ⚠️ AS-IS SOFTWARE ⚠️
 
-**This software is produced AS-IS without any warranty, do not use it to store significant funds**
+**This software is produced AS-IS without any warranty**
 
 - Do NOT use with amounts you cannot afford to lose
-- Use the suggested default pattern of having funds go to a cold wallet to limit risk.
+- Use the suggested default pattern of having funds go to a cold wallet to limit risk. You wouldn't want your funds sitting on a web server anyways.
 
 **You are responsible for your own funds. The developers are not liable for any losses.**
 
-**Important:** A Cashu mint (if enabled) takes custody of your funds until you withdraw. For maximum sovereignty, run your own mint or enable auto-cashout to move funds immediately to your wallet.
+**Important:** A Cashu mint (if enabled) takes custody of smaaller lightning payments until automatic withdrawal thresholds are reached. For maximum sovereignty, choose settings that enable lightning payments to an off-server wallet.
 
 ---
 
