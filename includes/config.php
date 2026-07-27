@@ -29,10 +29,24 @@ class Config {
             return self::$cache[$key];
         }
 
-        $row = Database::fetchOne(
-            "SELECT value FROM config WHERE key = ?",
-            [$key]
-        );
+        try {
+            $row = Database::fetchOne(
+                "SELECT value FROM config WHERE key = ?",
+                [$key]
+            );
+        } catch (PDOException $e) {
+            // Before setup.php runs Database::initialize(), the `config` table
+            // does not exist yet. Any entrypoint that reads config while the
+            // schema is absent (e.g. a pre-setup redirect that builds a URL)
+            // would otherwise hit an uncaught "no such table: config" and 500.
+            // Treat a not-yet-initialized database as "unconfigured" and fall
+            // back to the default. Scope the rescue to that case only — if the
+            // schema exists, a query failure is a real error and must surface.
+            if (!Database::isInitialized()) {
+                return $default;
+            }
+            throw $e;
+        }
 
         if ($row === null) {
             return $default;
@@ -81,7 +95,17 @@ class Config {
      * Get all configuration values
      */
     public static function getAll(): array {
-        $rows = Database::fetchAll("SELECT key, value FROM config");
+        try {
+            $rows = Database::fetchAll("SELECT key, value FROM config");
+        } catch (PDOException $e) {
+            // Same not-yet-initialized guard as get(): a missing `config` table
+            // means the install has no configuration yet, so return an empty
+            // set rather than 500. Real errors on an initialized DB still throw.
+            if (!Database::isInitialized()) {
+                return [];
+            }
+            throw $e;
+        }
         $config = [];
 
         foreach ($rows as $row) {

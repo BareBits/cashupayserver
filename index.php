@@ -11,7 +11,15 @@ require_once __DIR__ . '/includes/urls.php';
 
 // Check if database is initialized
 if (!Database::isInitialized()) {
-    header('Location: ' . Urls::setup());
+    // Fresh install: the schema does not exist yet, so we must NOT build the
+    // redirect via Urls::setup(). In standalone mode that reads DB-backed
+    // config (base_url / url_mode), which would query the not-yet-created
+    // `config` table and surface an uncaught "no such table" as a 500 — the
+    // bare directory URL then fails on every visit until setup.php has run
+    // once. A relative redirect needs no configuration and always resolves
+    // from the directory index (and through router.php's front controller).
+    // WordPress mode routes through its own bootstrap and never reaches here.
+    header('Location: setup.php');
     exit;
 }
 
