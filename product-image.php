@@ -11,6 +11,8 @@
 
 declare(strict_types=1);
 
+
+require_once __DIR__ . '/includes/http_status.php';
 require_once __DIR__ . '/includes/database.php';
 require_once __DIR__ . '/includes/products.php';
 
@@ -18,13 +20,13 @@ $f = $_GET['f'] ?? '';
 $f = is_string($f) ? basename($f) : '';
 
 if (!Product::isValidImageFilename($f)) {
-    http_response_code(404);
+    cashupay_status(404);
     exit;
 }
 
 $path = Product::uploadsDir() . '/' . $f;
 if (!is_file($path)) {
-    http_response_code(404);
+    cashupay_status(404);
     exit;
 }
 

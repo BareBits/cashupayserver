@@ -1,0 +1,270 @@
+"""Onboarding wizard: the payment-rail branches that persist store settings.
+
+Complements test_setup_wizard_ui.py (the happy path) with the decision points
+that write different state:
+
+  - declining Cashu mints pins the per-store strict-no-mint-fallback flag and
+    leaves the store without a mint rail at all
+  - submarine swaps cannot be enabled without an xpub
+  - a CLINK noffer is accepted alongside a Lightning address and ordered after
+    it, matching the chain Invoice::create walks
+  - add_store mode runs the same screens against an already-configured install
+  - navigating Back to the store screen renames the store under construction
+    rather than creating a second one
+
+Run with: pytest tests/ui/test_setup_payment_rails_ui.py -v -s
+"""
+from __future__ import annotations
+
+import sqlite3
+
+import pytest
+
+from fixtures.nutshell import MintHandle
+from fixtures.payserver import PayserverHandle
+
+pytestmark = pytest.mark.ui
+
+MAINNET_XPUB = (
+    "xpub69uEaVYoN1mZyMon8qwRP41YjYyevp3YxJ68ymBGV7qmXZ9rsbMy9kBZnLNPg3TLj"
+    "Kd2EnMw5BtUFQCGrTVDjQok859LowMV2SEooseLCt1"
+)
+# Reference noffer from @shocknet/clink-sdk — decodes to a valid pubkey/relay/
+# offer. Only persisted here, never dialled.
+REFERENCE_NOFFER = (
+    "noffer1qvqsyqjqxuurvwpcxc6rvvrxxsurqep5vfjk2wf4v33nsenrxumnyvesxfnrswfkvycrw"
+    "dp3x93xydf5xg6rzce4vv6xgdfh8quxgct9x5erxvspremhxue69uhhgetnwskhyetvv9ujumrfv"
+    "a58gmnfdenjuur4vgqzpccxc30wpf78wf2q78wg3vq008fd8ygtl4qy06gstpye3h5unc47xmee6z"
+)
+ADMIN_PW = "wizard-test-pw"
+
+
+def _rows(payserver: PayserverHandle, sql: str) -> list[sqlite3.Row]:
+    conn = sqlite3.connect(payserver.data_dir / "cashupay.sqlite")
+    conn.row_factory = sqlite3.Row
+    try:
+        return conn.execute(sql).fetchall()
+    finally:
+        conn.close()
+
+
+def _walk_to_store(page, payserver: PayserverHandle) -> None:
+    """security ack → password → the store-name screen."""
+    page.set_default_timeout(30000)
+    page.goto(f"{payserver.url}/setup")
+    page.check("#security_acknowledged")
+    page.click("button[type=submit]")
+    page.fill("#password", ADMIN_PW)
+    page.fill("#confirm_password", ADMIN_PW)
+    page.click("button[type=submit]")
+    page.wait_for_selector("#store_name")
+
+
+def test_declining_mints_pins_strict_mode(
+    payserver: PayserverHandle, mint: MintHandle, page
+) -> None:
+    _walk_to_store(page, payserver)
+    page.fill("#store_name", "Mintless Store")
+    page.click("button[type=submit]")
+
+    page.wait_for_selector("#onchain-form")
+    page.fill("#onchain_xpub", MAINNET_XPUB)
+    page.click("#onchain-validate-btn")
+    page.wait_for_selector("#onchain-validation:has-text('Looks good')")
+    page.click("#onchain-save-btn")
+
+    page.wait_for_selector("button:has-text('Wait for 1 confirmation')")
+    page.click("button:has-text('Wait for 1 confirmation')")
+
+    page.wait_for_selector("#lightning_address")
+    page.click("button:has-text('Skip for now')")
+
+    page.wait_for_selector("button:has-text('Enable submarine swaps')")
+    page.click("button:has-text('Enable submarine swaps')")
+
+    page.wait_for_selector("button:has-text('No thanks, run without mints')")
+    page.click("button:has-text('No thanks, run without mints')")
+
+    page.wait_for_selector("h2:has-text('Enable cron')")
+
+    row = _rows(payserver, "SELECT * FROM stores")[0]
+    assert row["strict_no_mint_fallback"] == 1, "declining mints must pin strict mode on the store"
+    assert not row["mint_url"], "no mint should have been configured"
+    assert not row["seed_phrase"], "no mint means no mint wallet seed"
+    assert row["onchain_min_confs"] == 1, "one confirmation was chosen"
+    assert _rows(payserver, "SELECT * FROM store_mints") == [], "no backup mints either"
+
+
+def test_swaps_cannot_be_enabled_without_an_xpub(
+    payserver: PayserverHandle, mint: MintHandle, page
+) -> None:
+    _walk_to_store(page, payserver)
+    page.fill("#store_name", "No Xpub Store")
+    page.click("button[type=submit]")
+
+    page.wait_for_selector("#onchain-form")
+    page.click("button:has-text('Skip for now')")
+
+    page.wait_for_selector("#lightning_address")
+    page.click("button:has-text('Skip for now')")
+
+    page.wait_for_selector("button:has-text('No thanks')")
+    enable = page.locator("button:has-text('Enable submarine swaps')")
+    assert enable.is_disabled(), "swaps need an on-chain xpub, so the button must be disabled"
+    assert "they need an xpub" in page.content()
+
+
+def test_noffer_is_stored_after_the_lightning_address(
+    payserver: PayserverHandle, mint: MintHandle, backup_mint: MintHandle, page
+) -> None:
+    """Both destination types are accepted on one screen and saved as an
+    ordered chain: LNURL address first, noffer as the fallback."""
+    _walk_to_store(page, payserver)
+    page.fill("#store_name", "Noffer Store")
+    page.click("button[type=submit]")
+
+    page.wait_for_selector("#onchain-form")
+    page.click("button:has-text('Skip for now')")
+
+    page.wait_for_selector("#lightning_address")
+    page.fill("#lightning_address", "merchant@strike.me")
+    page.fill("#noffer", REFERENCE_NOFFER)
+    page.click("button:has-text('Continue')")
+
+    page.wait_for_selector("button:has-text('No thanks')")
+
+    chain = _rows(
+        payserver, "SELECT address, type, position FROM store_ln_addresses ORDER BY position ASC"
+    )
+    assert [(r["type"], r["position"]) for r in chain] == [("lnaddress", 0), ("noffer", 1)]
+    assert chain[0]["address"] == "merchant@strike.me"
+    assert chain[1]["address"] == REFERENCE_NOFFER
+
+
+def test_back_to_store_screen_renames_instead_of_duplicating(
+    payserver: PayserverHandle, mint: MintHandle, page
+) -> None:
+    _walk_to_store(page, payserver)
+    page.fill("#store_name", "First Name")
+    page.click("button[type=submit]")
+
+    page.wait_for_selector("#onchain-form")
+    page.fill("#onchain_xpub", MAINNET_XPUB)
+    page.click("#onchain-validate-btn")
+    page.wait_for_selector("#onchain-validation:has-text('Looks good')")
+    page.click("#onchain-save-btn")
+
+    # Zero-conf screen → Back lands on the on-chain screen → Back again on store.
+    page.wait_for_selector("button:has-text('Enable zero-conf')")
+    page.click("a:has-text('Back')")
+    page.wait_for_selector("#onchain-form")
+    page.click("a:has-text('Back')")
+
+    page.wait_for_selector("#store_name")
+    assert page.input_value("#store_name") == "First Name", "the screen should prefill what was saved"
+    page.fill("#store_name", "Renamed Store")
+    page.click("button[type=submit]")
+
+    stores = _rows(payserver, "SELECT id, name, onchain_xpub FROM stores")
+    assert len(stores) == 1, f"going back must not create a second store, got {len(stores)}"
+    assert stores[0]["name"] == "Renamed Store"
+    assert stores[0]["onchain_xpub"] == MAINNET_XPUB, "the xpub saved earlier must survive the rename"
+
+
+def test_add_store_mode_runs_the_same_screens(
+    payserver: PayserverHandle, mint: MintHandle, backup_mint: MintHandle, page
+) -> None:
+    """add_store starts at the store screen, skips security/password/cron/done,
+    and returns to admin once mints are answered."""
+    _walk_to_store(page, payserver)
+    page.fill("#store_name", "Initial Store")
+    page.click("button[type=submit]")
+    page.wait_for_selector("#onchain-form")
+    page.click("button:has-text('Skip for now')")
+    page.wait_for_selector("#lightning_address")
+    page.click("button:has-text('Skip for now')")
+    page.wait_for_selector("button:has-text('No thanks')")
+    page.click("button:has-text('No thanks')")
+    page.wait_for_selector("button:has-text('No thanks, run without mints')")
+    page.click("button:has-text('No thanks, run without mints')")
+    page.wait_for_selector("h2:has-text('Enable cron')")
+
+    page.goto(f"{payserver.url}/admin")
+    page.fill("#password-input", ADMIN_PW)
+    page.click("#password-submit")
+    page.wait_for_selector("#app", state="visible")
+
+    page.goto(f"{payserver.url}/setup?mode=add_store")
+    page.wait_for_selector("h1:has-text('Add New Store')")
+    # add_store mode has no security/password ahead of it, and the counter
+    # starts at five because zero-conf only joins once an on-chain rail exists.
+    assert "Step 1 of 5" in page.locator(".subtitle").inner_text()
+    page.fill("#store_name", "Second Store")
+    page.click("button[type=submit]")
+
+    page.wait_for_selector("#onchain-form")
+    page.click("button:has-text('Skip for now')")
+    page.wait_for_selector("#lightning_address")
+    page.click("button:has-text('Skip for now')")
+    page.wait_for_selector("button:has-text('No thanks')")
+    page.click("button:has-text('No thanks')")
+    page.wait_for_selector("button:has-text('No thanks, run without mints')")
+    page.click("button:has-text('No thanks, run without mints')")
+
+    # No mints means no seed was generated, so add_store hands straight back to
+    # the admin panel rather than showing cron/done or a hand-off panel.
+    page.wait_for_selector("#app", state="visible")
+    names = [r["name"] for r in _rows(payserver, "SELECT name FROM stores ORDER BY created_at")]
+    assert names == ["Initial Store", "Second Store"]
+
+
+def test_add_store_with_mints_shows_the_generated_seed_once(
+    payserver: PayserverHandle, mint: MintHandle, backup_mint: MintHandle, page
+) -> None:
+    """Enabling mints for an added store mints a wallet seed. add_store has no
+    completion screen of its own, so without the hand-off panel that seed would
+    be created and never shown — unrecoverable if the database is later lost."""
+    _walk_to_store(page, payserver)
+    page.fill("#store_name", "Host Store")
+    page.click("button[type=submit]")
+    page.wait_for_selector("#onchain-form")
+    page.click("button:has-text('Skip for now')")
+    page.wait_for_selector("#lightning_address")
+    page.click("button:has-text('Skip for now')")
+    page.wait_for_selector("button:has-text('No thanks')")
+    page.click("button:has-text('No thanks')")
+    page.wait_for_selector("button:has-text('No thanks, run without mints')")
+    page.click("button:has-text('No thanks, run without mints')")
+    page.wait_for_selector("h2:has-text('Enable cron')")
+
+    page.goto(f"{payserver.url}/admin")
+    page.fill("#password-input", ADMIN_PW)
+    page.click("#password-submit")
+    page.wait_for_selector("#app", state="visible")
+
+    page.goto(f"{payserver.url}/setup?mode=add_store")
+    page.wait_for_selector("h1:has-text('Add New Store')")
+    page.fill("#store_name", "Minted Store")
+    page.click("button[type=submit]")
+    page.wait_for_selector("#onchain-form")
+    page.click("button:has-text('Skip for now')")
+    page.wait_for_selector("#lightning_address")
+    page.click("button:has-text('Skip for now')")
+    page.wait_for_selector("button:has-text('No thanks')")
+    page.click("button:has-text('No thanks')")
+
+    page.wait_for_selector("#mint-manual-toggle")
+    page.click("#mint-manual-toggle")
+    page.fill("#mint_url_manual", mint.url)
+    page.fill("#backup_mint_url_manual", backup_mint.url)
+    page.click("#mints-continue-btn")
+
+    page.wait_for_selector("h2:has-text('Store created')")
+    shown = page.locator(".seed-display").inner_text().split()
+    assert len(shown) == 12, f"expected a 12-word phrase, got {len(shown)}"
+
+    stored = _rows(payserver, "SELECT name, seed_phrase FROM stores WHERE name = 'Minted Store'")[0]
+    assert stored["seed_phrase"].split() == shown, "the phrase shown must be the one actually stored"
+
+    page.click("a:has-text('Go to BareBits Admin')")
+    page.wait_for_selector("#app", state="visible")

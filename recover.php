@@ -18,6 +18,8 @@
 
 declare(strict_types=1);
 
+
+require_once __DIR__ . '/includes/http_status.php';
 // Hard-coded minimal recovery logic — does not require includes/updater.php
 // in case the update broke it. Mirrors Updater::rollbackToMostRecent().
 
@@ -106,7 +108,7 @@ function recover_apply(string $backupName): bool {
 // override unintentionally).
 $token = $_POST['token'] ?? $_GET['token'] ?? '';
 if (!is_string($token) || !recover_verify_token($token)) {
-    http_response_code(403);
+    cashupay_status(403);
     header('Content-Type: text/plain; charset=UTF-8');
     echo "Invalid or missing recovery token.\n";
     exit;
@@ -114,7 +116,7 @@ if (!is_string($token) || !recover_verify_token($token)) {
 
 $backups = recover_list_backups();
 if (empty($backups)) {
-    http_response_code(409);
+    cashupay_status(409);
     header('Content-Type: text/plain; charset=UTF-8');
     echo "No backups available to roll back to.\n";
     exit;
@@ -151,6 +153,6 @@ header('Content-Type: text/plain; charset=UTF-8');
 if ($ok) {
     echo "Rolled back to {$backups[0]}.\n";
 } else {
-    http_response_code(500);
+    cashupay_status(500);
     echo "Rollback failed. Check server error log.\n";
 }

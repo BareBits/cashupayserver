@@ -14,6 +14,8 @@
  * The directory will be created automatically with proper permissions.
  */
 
+require_once __DIR__ . '/http_status.php';
+
 require_once __DIR__ . '/../cashu-wallet-php/CashuWallet.php';
 
 // Load custom config if exists
@@ -898,6 +900,15 @@ HTACCESS;
         }
         if (!self::columnExists($pdo, 'stores', 'swaps_fee_fallback_max_sats')) {
             $pdo->exec("ALTER TABLE stores ADD COLUMN swaps_fee_fallback_max_sats INTEGER DEFAULT NULL");
+        }
+        // Per-store "never fall back to a cashu mint" override. The onboarding
+        // wizard sets this to 1 when the operator declines mints, so a store
+        // that was set up mint-free errors instead of silently acquiring a mint
+        // rail later (e.g. from the trusted-mints list). Tri-state mirrors
+        // swaps_enabled: -1 inherit the site-wide swaps_strict_no_mint_fallback
+        // config key, 0 force off, 1 force on.
+        if (!self::columnExists($pdo, 'stores', 'strict_no_mint_fallback')) {
+            $pdo->exec("ALTER TABLE stores ADD COLUMN strict_no_mint_fallback INTEGER NOT NULL DEFAULT -1");
         }
         if (!self::columnExists($pdo, 'invoices', 'payment_rail')) {
             // 'mint' (cashu mint, existing default) / 'swap' (submarine swap) /

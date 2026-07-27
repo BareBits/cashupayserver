@@ -10,14 +10,17 @@ rm -rf build/cashupay build/cashupay-wordpress.zip
 
 mkdir -p "$BUILD_DIR"
 
-# Copy WordPress-specific files
-cp -r wordpress/ "$BUILD_DIR/wordpress/"
-
-# Copy plugin entry point to root of plugin directory
-cp "$BUILD_DIR/wordpress/cashupay.php" "$BUILD_DIR/cashupay.php"
-
-# Copy uninstall.php to plugin root (WordPress expects it there)
-cp "$BUILD_DIR/wordpress/uninstall.php" "$BUILD_DIR/uninstall.php"
+# Copy WordPress-specific files FLAT into the plugin root.
+#
+# This layout is not cosmetic: every one of these files requires its siblings
+# as `__DIR__ . '/sibling.php'` (cashupay.php -> bootstrap.php, activation.php,
+# rewrite-rules.php, admin-menu.php; bootstrap.php -> includes/urls.php), and
+# setup.php requires btcpay-integration.php the same way. Keeping them in a
+# wordpress/ subdirectory broke every one of those paths, so the zip this
+# script produced could not even activate. docker/Dockerfile.wordpress and the
+# test fixture both flatten; this now matches them.
+# scripts/verify-plugin-build.php enforces it.
+cp wordpress/*.php "$BUILD_DIR/"
 
 # Install Composer dependencies (bitwasp/bitcoin etc.) before bundling.
 if [ ! -f composer.phar ]; then
@@ -29,7 +32,10 @@ fi
 # Copy shared core
 cp -r includes/ "$BUILD_DIR/includes/"
 cp -r vendor/ "$BUILD_DIR/vendor/"
-cp admin.php setup.php api.php payment.php receive.php cron.php "$BUILD_DIR/"
+# These are the top-level entry points wordpress/rewrite-rules.php dispatches
+# to via CASHUPAY_PLUGIN_DIR. pay.php (self-serve /cashupay/pay/{store}) was
+# missing, so that route fataled on the installed plugin.
+cp admin.php setup.php api.php payment.php receive.php cron.php pay.php "$BUILD_DIR/"
 cp -r api-keys/ "$BUILD_DIR/api-keys/"
 
 # Copy assets

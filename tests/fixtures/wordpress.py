@@ -243,8 +243,14 @@ if ($dataDir !== false && $dataDir !== '' && !defined('CASHUPAY_DATA_DIR')) {{
     define('CASHUPAY_DATA_DIR', $dataDir);
 }}
 // WordPress front controller — fall through to wp's index.php on misses.
+//
+// Paths resolve against the WordPress docroot, NOT __DIR__: this router lives
+// in the workdir alongside the install, so __DIR__ would never match a real WP
+// file and every request — including /wp-login.php — would fall through to
+// index.php. That silently made browser-style authentication impossible.
+$docRoot = {wp_root!r};
 $uri = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH);
-$file = __DIR__ . $uri;
+$file = $docRoot . $uri;
 if ($uri !== '/' && file_exists($file) && !is_dir($file) && substr($uri, -4) !== '.php') {{
     return false;  // let PHP serve static assets
 }}
@@ -291,7 +297,10 @@ def start_wordpress(workdir: Path) -> WordPressHandle:
     # 5. Router wrapper.
     router_wrapper = workdir / "wp-router.php"
     router_wrapper.write_text(
-        ROUTER_WRAPPER_TEMPLATE.format(wp_index=str(wp_root / "index.php"))
+        ROUTER_WRAPPER_TEMPLATE.format(
+            wp_root=str(wp_root),
+            wp_index=str(wp_root / "index.php"),
+        )
     )
 
     # 6. wp core install (uses the static PHP via wp-cli).

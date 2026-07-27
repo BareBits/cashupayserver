@@ -31,7 +31,16 @@ cp -r includes/ "$BUILD_DIR/includes/"
 cp -r vendor/ "$BUILD_DIR/vendor/"
 cp -r assets/ "$BUILD_DIR/assets/"
 cp -r api-keys/ "$BUILD_DIR/api-keys/"
-cp admin.php setup.php api.php payment.php receive.php cron.php router.php index.php recover.php "$BUILD_DIR/"
+# Every top-level entry point router.php can dispatch to must be present, or a
+# fresh install fatals the moment that route is hit. health.php (updater probe),
+# pay.php (self-serve /pay), product-image.php and update.php (the auto-updater
+# itself) were previously omitted — a from-zip install had no working updater.
+# scripts/verify-plugin-build.php enforces this against router.php's requires.
+cp admin.php setup.php api.php payment.php receive.php cron.php router.php index.php \
+   recover.php health.php pay.php product-image.php update.php "$BUILD_DIR/"
+# Operator config template (the real user_config.php is gitignored dev-local and
+# is preserved across updates by includes/updater.php's keep-list).
+cp user_config.example.php "$BUILD_DIR/"
 cp .htaccess manifest.json favicon.ico "$BUILD_DIR/"
 cp -r images/ "$BUILD_DIR/images/"
 

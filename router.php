@@ -15,6 +15,8 @@
  * Both modes work simultaneously.
  */
 
+require_once __DIR__ . '/includes/http_status.php';
+
 // =============================================================================
 // SECURITY: Block access to sensitive paths
 // =============================================================================
@@ -37,7 +39,7 @@ $blockedPatterns = [
 
 foreach ($blockedPatterns as $pattern) {
     if (preg_match($pattern, $requestUri) || preg_match($pattern, $pathInfo)) {
-        http_response_code(403);
+        cashupay_status(403);
         die('Forbidden');
     }
 }
@@ -230,5 +232,5 @@ if (php_sapi_name() === 'cli-server') {
 // -----------------------------------------------------------------------------
 // 404 Not Found
 // -----------------------------------------------------------------------------
-http_response_code(404);
+cashupay_status(404);
 echo "Not found";

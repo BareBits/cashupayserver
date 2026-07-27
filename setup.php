@@ -1,30 +1,42 @@
 <?php
 /**
- * CashuPayServer - Setup Wizard
+ * CashuPayServer - Onboarding Wizard
  *
- * Multi-step setup wizard for initial configuration.
+ * Multi-screen wizard for initial configuration. Screens are identified by
+ * slug rather than by number, so the sequence below reads in execution order
+ * and inserting a screen never requires a renumber (the old wizard used sparse
+ * integers whose order had drifted from the flow).
  *
- * Flow (in execution order; internal step numbers are non-sequential):
- * Step 1:  Welcome/Requirements + Security Check (merged)
- * Step 2:  Admin Password (skipped in WordPress mode)
- * Step 4:  Create Store (name only)
- * Step 5:  Connect Mint (URL → fetch keysets → select unit)
- * Step 10: Backup Mint (required, same unit as primary)
- * Step 6:  Generate Seed for Store
- * Step 9:  Configure Auto-Cashout (lightning address or on-chain xpub)
- * Step 8:  On-chain Bitcoin payment destinations (xpub or static address)
- * Step 7:  Complete
+ * Sequence (standalone first run):
+ *   security   Requirements + database-exposure check + URL-mode detection
+ *   password   Admin password (skipped in WordPress mode)
+ *   store      Store name
+ *   onchain    On-chain destination — xpub (preferred) or single address
+ *   zeroconf   Zero-conf vs 1-confirmation (skipped when onchain was skipped)
+ *   lightning  LNURL/Lightning address + CLINK noffer
+ *   swaps      Submarine swaps on/off
+ *   mints      Cashu mints on/off; auto-picks a main + backup when on
+ *   cron       Reminder to install the cron entry
+ *   done       Completion, seed phrase, e-commerce pairing
  *
- * Note: Step 3 was merged into Step 1 and is unused. Steps 9 and 10 were
- * appended (rather than renumbered) to avoid breaking saved-state users
- * mid-wizard; the numbers do not reflect execution order.
+ * `?mode=add_store` (from the admin panel) runs store → mints only and then
+ * returns to admin; it never shows security/password/cron/done.
+ *
+ * setup_complete is set at the end of the `mints` screen — the install is
+ * fully usable from that point, so abandoning the browser on the cron or done
+ * screen does not strand a half-configured server. The redirect-if-set-up
+ * guard below therefore has to let those two screens through.
  */
+
+require_once __DIR__ . '/includes/http_status.php';
 
 require_once __DIR__ . '/includes/database.php';
 require_once __DIR__ . '/includes/config.php';
 require_once __DIR__ . '/includes/auth.php';
 require_once __DIR__ . '/includes/urls.php';
 require_once __DIR__ . '/includes/store_ln_addresses.php';
+require_once __DIR__ . '/includes/swap/config.php';
+require_once __DIR__ . '/includes/setup_flow.php';
 
 // Initialize session early - needed for storing temp data during setup
 Auth::initSession();
@@ -80,9 +92,12 @@ if (isset($_GET['action'])) {
 // Get mode parameter
 $mode = $_GET['mode'] ?? $_POST['mode'] ?? '';
 
-// If already set up, redirect to admin (unless in add_store mode or finishing step 7)
-$isStep7Post = ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['step'] ?? '') === '7');
-if (Database::isInitialized() && Config::isSetupComplete() && !$isStep7Post) {
+// setup_complete flips at the end of the `mints` screen so an abandoned
+// browser doesn't leave a half-configured install. The two screens that come
+// after it therefore have to survive the redirect-if-set-up guard.
+$postStep = $_SERVER['REQUEST_METHOD'] === 'POST' ? (string)($_POST['step'] ?? '') : '';
+$isTailPost = in_array($postStep, SetupFlow::POST_COMPLETION, true);
+if (Database::isInitialized() && Config::isSetupComplete() && !$isTailPost) {
     if ($mode !== 'add_store') {
         header('Location: ' . Urls::admin());
         exit;
@@ -99,12 +114,22 @@ if (!Database::isInitialized()) {
     Database::initialize();
 }
 
-// Handle form submissions
-$step = (int)($_POST['step'] ?? $_GET['step'] ?? 1);
+// Current screen. Anything unrecognised (a stale bookmark, or a form saved
+// from the pre-slug wizard) restarts at the first screen for this mode rather
+// than rendering a blank card.
+$stepRequested = isset($_POST['step']) || isset($_GET['step']);
+$step = (string)($_POST['step'] ?? $_GET['step'] ?? '');
+if (!SetupFlow::isKnownStep($step)) {
+    $step = SetupFlow::firstStep($mode);
+}
 
-// For add_store mode, start at step 4 (store creation)
-if ($mode === 'add_store' && !isset($_POST['step']) && !isset($_GET['step'])) {
-    $step = 4;
+// Entering add_store fresh must start a genuinely new store. The session can
+// still be carrying the id of the store built during first-run setup (it is
+// only cleared on the completion screen), and the store handler deliberately
+// reuses that id so navigating Back renames rather than duplicates — which
+// would silently rename the operator's existing store instead of adding one.
+if ($mode === 'add_store' && !$stepRequested) {
+    unset($_SESSION['setup_store_id'], $_SESSION['setup_store_mode'], $_SESSION['setup_generated_seed']);
 }
 
 $error = null;
@@ -139,21 +164,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         exit;
     }
 
-    // Handle AJAX action for expiry testing
-    if (isset($_POST['action']) && $_POST['action'] === 'test_mint_expiry') {
-        header('Content-Type: application/json');
-        require_once __DIR__ . '/includes/mint_helpers.php';
-        $mintUrl = $_POST['mint_url'] ?? '';
-        $unit = $_POST['unit'] ?? 'sat';
-
-        if (empty($mintUrl)) {
-            echo json_encode(['success' => false, 'error' => 'Mint URL required']);
-        } else {
-            echo json_encode(MintHelpers::testExpiry($mintUrl, $unit));
-        }
-        exit;
-    }
-
     // Handle AJAX action for saving URL mode
     if (isset($_POST['action']) && $_POST['action'] === 'save_url_mode') {
         header('Content-Type: application/json');
@@ -167,18 +177,27 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         exit;
     }
 
+    // The screen sequence depends on whether an on-chain destination exists,
+    // which the `onchain` handler may be about to change. Resolved again after
+    // each handler runs so the advance lands on the right screen.
+    $storeIdForFlow = $_SESSION['setup_store_id'] ?? null;
+    $flowSteps = SetupFlow::stepSequence(
+        $mode, Urls::isWordPress(), SetupFlow::onchainState($storeIdForFlow)['configured']
+    );
+    // Set by the mints handler when it mints a fresh wallet seed. add_store
+    // has to stop and show it rather than redirecting past it.
+    $generatedSeedThisRequest = false;
+
     try {
         switch ($step) {
-            case 1: // Welcome + Security (merged step)
-                $securityPassed = $_POST['security_acknowledged'] ?? false;
-                if (!$securityPassed) {
-                    throw new Exception('Please verify that your database is protected');
+            case 'security':
+                if (empty($_POST['security_acknowledged'])) {
+                    throw new Exception('Please confirm you have checked that your database is not reachable from the web.');
                 }
-                // Go to password step (standalone) or create store step (WordPress)
-                $step = Urls::isWordPress() ? 4 : 2;
+                $step = SetupFlow::nextStep('security', $flowSteps) ?? 'store';
                 break;
 
-            case 2: // Password setup
+            case 'password':
                 // Re-entry guard: refuse to overwrite an existing admin if
                 // setup_complete was cleared (backup restore, manual purge,
                 // partial corruption). Audit finding #3.
@@ -186,7 +205,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     "SELECT id FROM users WHERE role = 'admin' LIMIT 1"
                 );
                 if ($existingAdmin !== null) {
-                    http_response_code(403);
+                    cashupay_status(403);
                     throw new Exception(
                         'An admin account already exists. Setup cannot be repeated.'
                         . ' Sign in and change credentials from the admin panel.'
@@ -210,398 +229,407 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 }
 
                 Auth::setAdminPassword($password, $email !== '' ? $email : null);
-                // Go directly to step 4 (create store) - step 3 is merged into step 1
-                $step = 4;
+                $step = SetupFlow::nextStep('password', $flowSteps) ?? 'store';
                 break;
 
-            case 4: // Create store
-                $storeName = trim($_POST['store_name'] ?? 'My Store');
-
-                // Check for duplicate store name
-                $existingStore = Database::fetchOne(
-                    "SELECT id FROM stores WHERE LOWER(name) = LOWER(?)",
-                    [$storeName]
-                );
-                if ($existingStore) {
-                    throw new Exception('A store with this name already exists.');
+            case 'store':
+                $storeName = trim($_POST['store_name'] ?? '');
+                if ($storeName === '') {
+                    throw new Exception('Give your store a name to continue.');
                 }
 
-                // Create store with just a name (mint and seed will be added in later steps).
-                // primary_mint_source='setup' marks this store as un-configured so the
-                // trusted-list applier can auto-populate the primary if a list is set.
-                $storeId = Database::generateId('store');
-                Database::insert('stores', [
-                    'id' => $storeId,
-                    'name' => $storeName,
-                    'primary_mint_source' => 'setup',
-                    'created_at' => Database::timestamp(),
-                ]);
+                // Coming back to this screen mid-wizard must rename the store
+                // already under construction, not create a second one — the
+                // first would be orphaned the moment the session id is
+                // replaced, and it would keep whatever rails were configured.
+                // Only reuse a store this same wizard run created: a session
+                // carried over from first-run setup into add_store (or the
+                // reverse) would rename the operator's existing store instead
+                // of adding one.
+                $storeId = $_SESSION['setup_store_id'] ?? null;
+                $storeMode = $mode === 'add_store' ? 'add_store' : 'first_run';
+                if ($storeId !== null
+                    && (($_SESSION['setup_store_mode'] ?? null) !== $storeMode
+                        || Config::getStore($storeId) === null)) {
+                    $storeId = null;
+                }
 
-                require_once __DIR__ . '/includes/trusted_mints.php';
-                try {
-                    TrustedMints::applyToNewStore($storeId);
-                } catch (Exception $e) {
-                    error_log("TrustedMints::applyToNewStore failed in setup: " . $e->getMessage());
+                $clash = $storeId === null
+                    ? Database::fetchOne(
+                        "SELECT id FROM stores WHERE LOWER(name) = LOWER(?)",
+                        [$storeName]
+                    )
+                    : Database::fetchOne(
+                        "SELECT id FROM stores WHERE LOWER(name) = LOWER(?) AND id != ?",
+                        [$storeName, $storeId]
+                    );
+                if ($clash) {
+                    throw new Exception('You already have a store with that name. Try another one.');
+                }
+
+                if ($storeId === null) {
+                    // primary_mint_source='setup' marks the primary mint as
+                    // un-configured. Unlike the old wizard we do NOT apply the
+                    // trusted-mints list here: the operator has not yet said
+                    // whether they want mints at all, and auto-populating one
+                    // now would have to be undone on the `mints` screen if they
+                    // say no. TrustedMints::applyToNewStore runs from there.
+                    $storeId = Database::generateId('store');
+                    Database::insert('stores', [
+                        'id' => $storeId,
+                        'name' => $storeName,
+                        'primary_mint_source' => 'setup',
+                        'created_at' => Database::timestamp(),
+                    ]);
+                } else {
+                    Config::updateStore($storeId, ['name' => $storeName]);
                 }
 
                 $_SESSION['setup_store_id'] = $storeId;
-                // New flow: ask about auto-cashout destination first, then
-                // on-chain xpub, *then* mint URL / seed. The wallet operator
-                // typically knows where they want funds to end up before they
-                // pick the temporary holding mint.
-                $step = 9;
+                $_SESSION['setup_store_mode'] = $storeMode;
+                // Re-resolve: a brand new store has no on-chain rail, but one
+                // reached by going Back may already have one, which decides
+                // whether the zero-conf screen is in the sequence.
+                $flowSteps = SetupFlow::stepSequence(
+                    $mode, Urls::isWordPress(), SetupFlow::onchainState($storeId)['configured']
+                );
+                $step = SetupFlow::nextStep('store', $flowSteps) ?? 'onchain';
                 break;
 
-            case 5: // Mint configuration
-                $storeId = $_SESSION['setup_store_id'] ?? null;
-                if (!$storeId) {
-                    throw new Exception('Store not found. Please go back and create a store first.');
-                }
-
-                $mintUrl = rtrim($_POST['mint_url'] ?? '', '/');
-                $mintUnit = $_POST['mint_unit'] ?? null;
-
-                if (empty($mintUrl)) {
-                    throw new Exception('Mint URL is required');
-                }
-
-                // Fetch available units from mint
-                require_once __DIR__ . '/cashu-wallet-php/CashuWallet.php';
-                try {
-                    $units = \Cashu\Wallet::getSupportedUnits($mintUrl);
-                    if (empty($units)) {
-                        throw new Exception('Could not connect to mint or no keysets found');
-                    }
-                } catch (Exception $e) {
-                    throw new Exception('Failed to connect to mint: ' . $e->getMessage());
-                }
-
-                // If no unit selected yet, show selection
-                if ($mintUnit === null || $mintUnit === '') {
-                    $_SESSION['mint_url_temp'] = $mintUrl;
-                    $_SESSION['mint_units'] = array_keys($units);
-                    // Stay on step 5 but show unit selector
-                } else {
-                    // Validate selected unit
-                    if (!isset($units[$mintUnit])) {
-                        throw new Exception("Mint does not support unit: {$mintUnit}");
-                    }
-
-                    // Update store with mint config
-                    Config::updateStore($storeId, [
-                        'mint_url' => $mintUrl,
-                        'mint_unit' => $mintUnit,
-                    ]);
-
-                    unset($_SESSION['mint_url_temp'], $_SESSION['mint_units']);
-                    // After primary mint is saved, force the operator to pick a
-                    // backup mint before they advance to the seed step. New
-                    // installs without a backup have no fallback if the primary
-                    // goes offline. Step 10 is wedged in here rather than
-                    // renumbering 6/7 to keep session state and existing
-                    // step links unaffected.
-                    $step = 10;
-                }
-                break;
-
-            case 10: // Backup mint (required) — same unit as primary
-                $storeId = $_SESSION['setup_store_id'] ?? null;
-                if (!$storeId) {
-                    throw new Exception('Store not found. Please restart setup.');
-                }
-
-                $store = Config::getStore($storeId);
-                if (!$store || empty($store['mint_url']) || empty($store['mint_unit'])) {
-                    // Primary not saved yet — can't pick a backup. Bounce back.
-                    $step = 5;
-                    break;
-                }
-                $primaryUrl = rtrim($store['mint_url'], '/');
-                $primaryUnit = $store['mint_unit'];
-
-                $backupUrl = rtrim(trim($_POST['backup_mint_url'] ?? ''), '/');
-                if ($backupUrl === '') {
-                    throw new Exception('Pick a backup mint to continue.');
-                }
-                if (strcasecmp($backupUrl, $primaryUrl) === 0) {
-                    throw new Exception(
-                        'Backup mint must be different from your primary mint '
-                        . '(' . htmlspecialchars($primaryUrl) . ').'
-                    );
-                }
-
-                // Reject if this URL was already added (e.g. trusted-list applier
-                // ran in step 4 and pre-seeded it). The (store_id, mint_url)
-                // unique constraint would surface this as a DB error otherwise.
-                foreach (Config::getStoreBackupMints($storeId) as $existing) {
-                    if (strcasecmp(rtrim($existing['mint_url'], '/'), $backupUrl) === 0) {
-                        throw new Exception(
-                            'That mint is already configured as a backup for this store. '
-                            . 'Pick a different one.'
-                        );
-                    }
-                }
-
-                require_once __DIR__ . '/cashu-wallet-php/CashuWallet.php';
-                try {
-                    $units = \Cashu\Wallet::getSupportedUnits($backupUrl);
-                } catch (Exception $e) {
-                    throw new Exception('Failed to connect to backup mint: ' . $e->getMessage());
-                }
-                if (empty($units)) {
-                    throw new Exception('Could not connect to backup mint or no keysets found.');
-                }
-                if (!isset($units[$primaryUnit])) {
-                    throw new Exception(
-                        'Backup mint must support unit "' . htmlspecialchars($primaryUnit)
-                        . '" (your primary mint uses it). This mint does not advertise that unit.'
-                    );
-                }
-
-                Config::addStoreBackupMint($storeId, $backupUrl, $primaryUnit, 100);
-                $step = 6;
-                break;
-
-            case 6: // Seed phrase for this store
-                $storeId = $_SESSION['setup_store_id'] ?? null;
-                if (!$storeId) {
-                    throw new Exception('Store not found. Please restart setup.');
-                }
-
-                $action = $_POST['action'] ?? '';
-
-                if ($action === 'generate') {
-                    require_once __DIR__ . '/cashu-wallet-php/CashuWallet.php';
-                    $mnemonic = \Cashu\Mnemonic::generate();
-                    $_SESSION['temp_seed'] = $mnemonic;
-                } elseif ($action === 'confirm') {
-                    if (!isset($_POST['seed_confirmed'])) {
-                        throw new Exception('Please confirm you have saved your seed phrase');
-                    }
-
-                    // Determine if seed was generated or manually entered
-                    $isGenerated = isset($_SESSION['temp_seed']);
-                    $seed = $_SESSION['temp_seed'] ?? $_POST['existing_seed'] ?? '';
-
-                    if (empty($seed)) {
-                        throw new Exception('No seed phrase provided');
-                    }
-
-                    // Validate mnemonic
-                    require_once __DIR__ . '/cashu-wallet-php/CashuWallet.php';
-                    if (!\Cashu\Mnemonic::validate($seed)) {
-                        throw new Exception('Invalid seed phrase');
-                    }
-
-                    // Save seed to THIS store (not global config)
-                    Config::updateStore($storeId, [
-                        'seed_phrase' => $seed,
-                    ]);
-
-                    // If seed was manually entered (not freshly generated), restore wallet
-                    // to recover counter position and avoid "token already spent" errors
-                    if (!$isGenerated) {
-                        require_once __DIR__ . '/includes/invoice.php';
-                        try {
-                            $wallet = Invoice::getWalletInstance($storeId);
-                            $restoreResult = $wallet->restore();
-
-                            // Persist restored counters to storage
-                            $storage = $wallet->getStorage();
-                            if ($storage && !empty($restoreResult['counters'])) {
-                                foreach ($restoreResult['counters'] as $keysetId => $counter) {
-                                    $storage->setCounter($keysetId, $counter);
-                                }
-                            }
-
-                            // Count unspent vs spent proofs across all units
-                            $unspentCount = 0;
-                            $spentCount = 0;
-                            foreach ($restoreResult['byUnit'] ?? [] as $unitData) {
-                                $unspentCount += count($unitData['unspent'] ?? []);
-                                $spentCount += count($unitData['spent'] ?? []);
-                            }
-
-                            // Store result in session for display
-                            $_SESSION['restore_result'] = [
-                                'success' => true,
-                                'proofs_found' => count($restoreResult['proofs'] ?? []),
-                                'proofs_unspent' => $unspentCount,
-                                'proofs_spent' => $spentCount,
-                                'counters' => $restoreResult['counters'] ?? [],
-                            ];
-                        } catch (Exception $e) {
-                            // Log but don't fail setup - user can still proceed
-                            error_log("Wallet restore during setup failed: " . $e->getMessage());
-                            $_SESSION['restore_result'] = [
-                                'success' => false,
-                                'error' => $e->getMessage(),
-                            ];
-                        }
-                    }
-
-                    unset($_SESSION['temp_seed']);
-
-                    // Seed confirmation is the last step of the wizard in the
-                    // new order (auto-cashout + on-chain already happened
-                    // earlier). Finalize the install or hand back to admin.
-                    unset($_SESSION['setup_auto_cashout_mode']);
-                    if ($mode === 'add_store') {
-                        $createdStoreId = $storeId;
-                        unset($_SESSION['setup_store_id']);
-                        header('Location: ' . Urls::admin() . '?store_created=' . urlencode($createdStoreId));
-                        exit;
-                    }
-                    Config::set('setup_complete', true);
-                    $step = 7;
-                }
-                break;
-
-            case 9: // Auto-cashout destination (lightning address or on-chain swap)
-                $storeId = $_SESSION['setup_store_id'] ?? null;
-                if (!$storeId) {
-                    throw new Exception('Store not found. Please restart setup.');
-                }
-
-                $autoCashoutAction = $_POST['auto_cashout_action'] ?? '';
-
-                // The auto_melt_* columns aren't in Config::updateStore's
-                // allowlist (kept intentionally tight), so save them via
-                // Database::update directly — same pattern admin.php uses
-                // in the save_auto_melt action.
-                if ($autoCashoutAction === 'skip') {
-                    // Persist that the user explicitly skipped, so step 8 can
-                    // adjust its copy and so we don't keep nagging them.
-                    Database::update('stores', [
-                        'auto_melt_enabled' => 0,
-                    ], 'id = ?', [$storeId]);
-                    $_SESSION['setup_auto_cashout_mode'] = 'skip';
-                } elseif ($autoCashoutAction === 'save') {
-                    $autoMode = $_POST['auto_cashout_mode'] ?? '';
-                    if ($autoMode === 'lightning') {
-                        $address = trim($_POST['lightning_address'] ?? '');
-                        // Lightning addresses are user@host — same shape as email,
-                        // but we don't want filter_var rejecting legitimate ones
-                        // for nitpick reasons (e.g. plus tags). Keep the check
-                        // simple: non-empty, exactly one '@', host has a dot.
-                        if ($address === '' || substr_count($address, '@') !== 1) {
-                            throw new Exception('Enter a Lightning address (user@host)');
-                        }
-                        [, $host] = explode('@', $address);
-                        if ($host === '' || strpos($host, '.') === false) {
-                            throw new Exception('Lightning address host looks invalid');
-                        }
-                        Database::update('stores', [
-                            'auto_melt_enabled' => 1,
-                            'auto_melt_use_swap' => 0, // explicit Lightning mode
-                        ], 'id = ?', [$storeId]);
-                        // The ordered Lightning-address chain lives in
-                        // store_ln_addresses; seed it with this one address.
-                        StoreLnAddresses::replaceForStore($storeId, [$address]);
-                        $_SESSION['setup_auto_cashout_mode'] = 'lightning';
-                    } elseif ($autoMode === 'onchain') {
-                        // On-chain mode: store the choice, the actual xpub
-                        // gets validated and saved on step 8.
-                        Database::update('stores', [
-                            'auto_melt_enabled' => 1,
-                            'auto_melt_use_swap' => 1, // submarine-swap to on-chain
-                        ], 'id = ?', [$storeId]);
-                        // No Lightning address in on-chain mode — clear any chain.
-                        StoreLnAddresses::replaceForStore($storeId, []);
-                        $_SESSION['setup_auto_cashout_mode'] = 'onchain';
-                    } else {
-                        throw new Exception('Pick an auto-cashout method or Skip');
-                    }
-                } else {
-                    // GET landing on step 9 — fall through to render the form.
-                    break;
-                }
-
-                $step = 8;
-                break;
-
-            case 8: // Optional: configure on-chain Bitcoin payments
+            case 'onchain':
                 $storeId = $_SESSION['setup_store_id'] ?? null;
                 if (!$storeId) {
                     throw new Exception('Store not found. Please restart setup.');
                 }
                 $onchainAction = $_POST['onchain_action'] ?? '';
-                // The user picked on-chain auto-cashout on step 9, so a real
-                // on-chain destination is mandatory here — there's no other
-                // place to point the swap output. Skip is blocked.
-                $autoCashoutMode = $_SESSION['setup_auto_cashout_mode'] ?? '';
-                if ($onchainAction === 'skip') {
-                    if ($autoCashoutMode === 'onchain') {
-                        throw new Exception(
-                            'On-chain auto-cashout needs an xpub or static address. '
-                            . 'Configure one below, or go back and pick Lightning / Skip on the previous step.'
-                        );
-                    }
-                    // user chose to add it later from admin
-                } elseif ($onchainAction === 'save') {
-                    $onchainMode = $_POST['onchain_address_mode'] ?? 'xpub';
-                    if (!in_array($onchainMode, ['xpub', 'static'], true)) {
-                        throw new Exception('Invalid mode');
-                    }
-                    $network = $_POST['onchain_network'] ?? 'mainnet';
-                    $minConfs = max(0, (int)($_POST['onchain_min_confs'] ?? 1));
-                    $providerUrl = trim($_POST['onchain_provider_url'] ?? '');
 
-                    require_once __DIR__ . '/includes/onchain/wallet.php';
-                    if ($onchainMode === 'static') {
-                        if ($autoCashoutMode === 'onchain') {
-                            // Submarine-swap auto-melt needs an xpub to derive
-                            // a fresh sweep destination per swap. A reused
-                            // static address would leak the swap history.
-                            throw new Exception(
-                                'On-chain auto-cashout requires an xpub (not a static address). '
-                                . 'Static-address mode is fine for receiving customer payments, but '
-                                . 'submarine swaps derive a fresh address each time.'
-                            );
-                        }
-                        $staticAddress = trim($_POST['onchain_static_address'] ?? '');
-                        $tweakRange = max(100, min(100000, (int)($_POST['onchain_static_tweak_range'] ?? 1000)));
-                        if ($staticAddress === '') {
-                            throw new Exception('Static address required');
-                        }
-                        $check = OnchainWallet::validateAddress($staticAddress, $network);
-                        if (!$check['valid']) {
-                            throw new Exception($check['error'] ?: 'Invalid address');
-                        }
-                        Config::updateStore($storeId, [
-                            'onchain_address_mode' => 'static',
-                            'onchain_static_address' => $staticAddress,
-                            'onchain_static_tweak_range' => $tweakRange,
-                            'onchain_xpub' => null,
-                            'onchain_network' => $network,
-                            'onchain_min_confs' => $minConfs,
-                            'onchain_provider_url' => $providerUrl ?: null,
-                        ]);
-                    } else {
-                        $xpub = trim($_POST['onchain_xpub'] ?? '');
-                        $type = $_POST['onchain_address_type'] ?? 'P2WPKH';
-                        $check = OnchainWallet::validateXpub($xpub, $network, $type);
-                        if (!$check['valid']) {
-                            throw new Exception($check['error'] ?: 'Invalid xpub');
-                        }
-                        Config::updateStore($storeId, [
-                            'onchain_address_mode' => 'xpub',
-                            'onchain_xpub' => $xpub,
-                            'onchain_static_address' => null,
-                            'onchain_network' => $network,
-                            'onchain_address_type' => $type,
-                            'onchain_min_confs' => $minConfs,
-                            'onchain_provider_url' => $providerUrl ?: null,
-                        ]);
-                    }
-                } else {
-                    // GET landing on step 8 — fall through to render the form.
+                if ($onchainAction === 'skip') {
+                    // Nothing saved; the zero-conf screen drops out of the
+                    // sequence because there is no on-chain rail to time.
+                    $flowSteps = SetupFlow::stepSequence($mode, Urls::isWordPress(), false);
+                    $step = SetupFlow::nextStep('onchain', $flowSteps) ?? 'lightning';
+                    break;
+                }
+                if ($onchainAction !== 'save') {
+                    // GET landing — fall through to render the form.
                     break;
                 }
 
-                // In the new flow, on-chain comes before mint+seed. Move on to
-                // configuring the Cashu mint URL for this store.
-                $step = 5;
+                require_once __DIR__ . '/includes/onchain/wallet.php';
+                $onchainMode = ($_POST['onchain_address_mode'] ?? 'xpub') === 'static' ? 'static' : 'xpub';
+
+                if ($onchainMode === 'static') {
+                    $staticAddress = trim($_POST['onchain_static_address'] ?? '');
+                    if ($staticAddress === '') {
+                        throw new Exception('Enter a Bitcoin address, or go back and use an xpub.');
+                    }
+                    // Address encodings differ per network and the operator is
+                    // never asked which one they are on, so try each in turn.
+                    // Order matters: bcrt1… fails testnet and only passes
+                    // regtest, and tb1… passes testnet before regtest is tried.
+                    $network = null;
+                    foreach (['mainnet', 'testnet', 'regtest'] as $candidate) {
+                        if (OnchainWallet::validateAddress($staticAddress, $candidate)['valid']) {
+                            $network = $candidate;
+                            break;
+                        }
+                    }
+                    if ($network === null) {
+                        throw new Exception(
+                            'We could not read that as a Bitcoin address. Copy it again from your wallet and try once more.'
+                        );
+                    }
+                    // onchain_address_mode / onchain_static_address /
+                    // onchain_static_tweak_range are intentionally outside
+                    // Config::updateStore's allowlist, so the whole on-chain
+                    // payload goes through Database::update — the same path
+                    // admin.php's save_onchain handler uses. Clearing the xpub
+                    // enforces the "one OR the other" invariant.
+                    Database::update('stores', [
+                        'onchain_address_mode' => 'static',
+                        'onchain_static_address' => $staticAddress,
+                        'onchain_static_tweak_range' => 1000,
+                        'onchain_xpub' => null,
+                        'onchain_network' => $network,
+                    ], 'id = ?', [$storeId]);
+                } else {
+                    $xpub = trim($_POST['onchain_xpub'] ?? '');
+                    if ($xpub === '') {
+                        throw new Exception('Paste your extended public key to continue.');
+                    }
+                    // Network and address type come from the key's SLIP-32
+                    // prefix. SLIP-32 only distinguishes mainnet from the
+                    // testnet family, so testnet-family keys carry an explicit
+                    // sub-network picked on the form; mainnet keys never show
+                    // that control. An xpub/tpub prefix (BIP44) says nothing
+                    // useful about the address type, so those default to
+                    // P2WPKH and the operator confirms against the address
+                    // preview, with a one-click switch to wrapped SegWit.
+                    $probe = OnchainWallet::validateXpub($xpub, 'mainnet', 'P2WPKH');
+                    $inferredNetwork = $probe['inferredNetwork'];
+                    $inferredType = $probe['inferredType'];
+                    if ($inferredNetwork === null) {
+                        // validateXpub could not read the version bytes at all.
+                        // Its own message ("base58check decode failed") is
+                        // developer-speak; the operator just needs to re-copy.
+                        throw new Exception(
+                            'We couldn\'t read that as an extended public key. '
+                            . 'Check for a missing character and paste it again.'
+                        );
+                    }
+                    if ($inferredNetwork === 'mainnet') {
+                        $network = 'mainnet';
+                    } else {
+                        $network = $_POST['onchain_testnet_network'] ?? 'testnet';
+                        if (!in_array($network, ['testnet', 'signet', 'regtest'], true)) {
+                            $network = 'testnet';
+                        }
+                    }
+                    // P2PKH is not a supported receive type here; it only ever
+                    // appears as the inferred type of a BIP44-prefixed key.
+                    $type = $_POST['onchain_address_type'] ?? '';
+                    if (!in_array($type, ['P2WPKH', 'P2SH-P2WPKH'], true)) {
+                        $type = ($inferredType === 'P2SH-P2WPKH') ? 'P2SH-P2WPKH' : 'P2WPKH';
+                    }
+
+                    $check = OnchainWallet::validateXpub($xpub, $network, $type);
+                    if (!$check['valid']) {
+                        throw new Exception(
+                            $check['error']
+                            ?: 'We could not read that as an extended public key. Check for a missing character and paste it again.'
+                        );
+                    }
+                    // Same allowlist caveat as the static branch above.
+                    Database::update('stores', [
+                        'onchain_address_mode' => 'xpub',
+                        'onchain_xpub' => $xpub,
+                        'onchain_static_address' => null,
+                        'onchain_network' => $network,
+                        'onchain_address_type' => $type,
+                    ], 'id = ?', [$storeId]);
+                }
+
+                $flowSteps = SetupFlow::stepSequence($mode, Urls::isWordPress(), true);
+                $step = SetupFlow::nextStep('onchain', $flowSteps) ?? 'zeroconf';
+                break;
+
+            case 'zeroconf':
+                $storeId = $_SESSION['setup_store_id'] ?? null;
+                if (!$storeId) {
+                    throw new Exception('Store not found. Please restart setup.');
+                }
+                if (!isset($_POST['zero_conf'])) {
+                    // GET landing — fall through to render the form.
+                    break;
+                }
+                $zeroConf = $_POST['zero_conf'] === '1';
+                Config::updateStore($storeId, [
+                    'onchain_min_confs' => $zeroConf ? 0 : 1,
+                ]);
+                $step = SetupFlow::nextStep('zeroconf', $flowSteps) ?? 'lightning';
+                break;
+
+            case 'lightning':
+                $storeId = $_SESSION['setup_store_id'] ?? null;
+                if (!$storeId) {
+                    throw new Exception('Store not found. Please restart setup.');
+                }
+                $lnAction = $_POST['lightning_action'] ?? '';
+                if ($lnAction !== 'save' && $lnAction !== 'skip') {
+                    // GET landing — fall through to render the form.
+                    break;
+                }
+
+                $lnAddress = trim($_POST['lightning_address'] ?? '');
+                $noffer = trim($_POST['noffer'] ?? '');
+
+                if ($lnAction === 'skip') {
+                    $lnAddress = '';
+                    $noffer = '';
+                }
+
+                // Validate separately so the operator gets a message naming the
+                // field they got wrong, rather than chainFromLists' generic one.
+                if ($lnAddress !== '' && !StoreLnAddresses::isValid($lnAddress)) {
+                    throw new Exception('Lightning addresses look like myname@strike.me. Check the spelling and try again.');
+                }
+                if ($noffer !== '' && !ClinkNoffer::isValid($noffer)) {
+                    throw new Exception('That noffer doesn\'t look right. It should start with noffer1 — copy the whole string from your wallet.');
+                }
+
+                // Address first, noffer as fallback — the order Invoice::create
+                // walks the chain at payment time.
+                $chain = StoreLnAddresses::chainFromLists(
+                    $lnAddress !== '' ? [$lnAddress] : [],
+                    $noffer !== '' ? [$noffer] : []
+                );
+                StoreLnAddresses::replaceForStore($storeId, $chain);
+                // Auto-cashout mode isn't decided here: which rail sweeps the
+                // mint balance depends on the swaps and mints answers still to
+                // come. setupResolveAutoCashout() settles it at the end.
+
+                $step = SetupFlow::nextStep('lightning', $flowSteps) ?? 'swaps';
+                break;
+
+            case 'swaps':
+                $storeId = $_SESSION['setup_store_id'] ?? null;
+                if (!$storeId) {
+                    throw new Exception('Store not found. Please restart setup.');
+                }
+                if (!isset($_POST['swaps_enabled'])) {
+                    // GET landing — fall through to render the form.
+                    break;
+                }
+                $swapsWanted = $_POST['swaps_enabled'] === '1';
+                if ($swapsWanted && !SetupFlow::onchainState($storeId)['hasXpub']) {
+                    throw new Exception(
+                        'Submarine swaps send Bitcoin to your on-chain wallet, so they need an xpub. '
+                        . 'Go back and add one to turn this on.'
+                    );
+                }
+                SwapsConfig::setStoreOverride(
+                    $storeId,
+                    $swapsWanted ? SwapsConfig::FORCE_ON : SwapsConfig::FORCE_OFF
+                );
+                // On a first run also flip the site default, so stores added
+                // later inherit the operator's answer instead of the built-in
+                // off. add_store leaves the site setting alone — the operator
+                // is answering for one store, not re-deciding for the install.
+                if ($mode !== 'add_store' && $swapsWanted) {
+                    SwapsConfig::setSiteEnabled(true);
+                }
+                $step = SetupFlow::nextStep('swaps', $flowSteps) ?? 'mints';
+                break;
+
+            case 'mints':
+                $storeId = $_SESSION['setup_store_id'] ?? null;
+                if (!$storeId) {
+                    throw new Exception('Store not found. Please restart setup.');
+                }
+                if (!isset($_POST['mints_enabled'])) {
+                    // GET landing — fall through to render the form.
+                    break;
+                }
+                $mintsWanted = $_POST['mints_enabled'] === '1';
+
+                if (!$mintsWanted) {
+                    // Leave mint_url/seed_phrase NULL (Config::isStoreConfigured
+                    // stays false, so Invoice::create never offers a mint rail)
+                    // and pin the per-store strict flag so a mint can't be
+                    // acquired later without an explicit decision.
+                    SwapsConfig::setStoreStrictOverride($storeId, SwapsConfig::FORCE_ON);
+                    Config::updateStore($storeId, ['primary_mint_source' => 'manual']);
+                } else {
+                    $primaryUrl = rtrim(trim($_POST['mint_url'] ?? ''), '/');
+                    $backupUrl = rtrim(trim($_POST['backup_mint_url'] ?? ''), '/');
+                    $unit = trim($_POST['mint_unit'] ?? 'sat') ?: 'sat';
+
+                    if ($primaryUrl === '') {
+                        throw new Exception('Pick a main mint to continue, or choose "No thanks" to run without mints.');
+                    }
+                    if ($backupUrl === '') {
+                        throw new Exception('Pick a backup mint to continue.');
+                    }
+                    if (strcasecmp($primaryUrl, $backupUrl) === 0) {
+                        throw new Exception(
+                            'Your backup mint needs to be different from your main one — that\'s the whole point of a backup.'
+                        );
+                    }
+
+                    require_once __DIR__ . '/cashu-wallet-php/CashuWallet.php';
+                    try {
+                        $primaryUnits = \Cashu\Wallet::getSupportedUnits($primaryUrl);
+                    } catch (Exception $e) {
+                        throw new Exception('We couldn\'t reach that mint. Check the URL, or pick a different one.');
+                    }
+                    if (empty($primaryUnits) || !isset($primaryUnits[$unit])) {
+                        throw new Exception(
+                            'Your main mint doesn\'t offer ' . htmlspecialchars($unit) . '. Pick a different mint.'
+                        );
+                    }
+                    try {
+                        $backupUnits = \Cashu\Wallet::getSupportedUnits($backupUrl);
+                    } catch (Exception $e) {
+                        throw new Exception('We couldn\'t reach your backup mint. Check the URL, or pick a different one.');
+                    }
+                    if (empty($backupUnits) || !isset($backupUnits[$unit])) {
+                        throw new Exception(
+                            'Your backup mint needs to support ' . htmlspecialchars($unit)
+                            . ', same as your main mint. This one doesn\'t.'
+                        );
+                    }
+
+                    Config::updateStore($storeId, [
+                        'mint_url' => $primaryUrl,
+                        'mint_unit' => $unit,
+                        'primary_mint_source' => 'manual',
+                    ]);
+
+                    // The trusted-list applier can have pre-seeded backups on a
+                    // previous pass through this screen; adding a duplicate
+                    // would trip the (store_id, mint_url) unique constraint.
+                    $alreadyBacked = false;
+                    foreach (Config::getStoreBackupMints($storeId) as $existing) {
+                        if (strcasecmp(rtrim($existing['mint_url'], '/'), $backupUrl) === 0) {
+                            $alreadyBacked = true;
+                            break;
+                        }
+                    }
+                    if (!$alreadyBacked) {
+                        Config::addStoreBackupMint($storeId, $backupUrl, $unit, 100);
+                    }
+
+                    // Seed for this store's mint wallet. Generated silently and
+                    // shown on the completion screen — the operator is told to
+                    // write it down there rather than being gated on it here.
+                    $existingSeed = Config::getStore($storeId)['seed_phrase'] ?? null;
+                    if (empty($existingSeed)) {
+                        $mnemonic = \Cashu\Mnemonic::generate();
+                        Config::updateStore($storeId, ['seed_phrase' => $mnemonic]);
+                        $_SESSION['setup_generated_seed'] = $mnemonic;
+                        $generatedSeedThisRequest = true;
+                    }
+
+                    // Now that mints are wanted, let the trusted list top up the
+                    // backup chain (it leaves a 'manual' primary alone).
+                    require_once __DIR__ . '/includes/trusted_mints.php';
+                    try {
+                        TrustedMints::applyToNewStore($storeId);
+                    } catch (Exception $e) {
+                        error_log('TrustedMints::applyToNewStore failed in setup: ' . $e->getMessage());
+                    }
+                }
+
+                // Every rail answer is in, so the auto-cashout rail can now be
+                // settled: Lightning when there's a destination, else a
+                // submarine swap to the xpub when mints + swaps make that
+                // possible, else off. See SetupFlow::resolveAutoCashout.
+                SetupFlow::resolveAutoCashout($storeId);
+
+                if ($mode === 'add_store') {
+                    // Don't redirect straight to admin when a seed was just
+                    // generated — it would never be shown. Fall through to the
+                    // add_store completion screen, which displays it once and
+                    // links on. With no seed there's nothing to show, so go
+                    // straight back to admin as before.
+                    if ($generatedSeedThisRequest) {
+                        $step = 'store_created';
+                        break;
+                    }
+                    $createdStoreId = $storeId;
+                    unset($_SESSION['setup_store_id'], $_SESSION['setup_store_mode']);
+                    header('Location: ' . Urls::admin() . '?store_created=' . urlencode($createdStoreId));
+                    exit;
+                }
+
+                // The install is usable from here; everything after this screen
+                // is advisory, so complete the setup before showing it.
+                Config::set('setup_complete', true);
+                $step = SetupFlow::nextStep('mints', $flowSteps) ?? 'cron';
+                break;
+
+            case 'cron':
+                $step = 'done';
                 break;
         }
     } catch (Exception $e) {
@@ -609,15 +637,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 }
 
-// Clear mint session data when navigating to step 5 via GET (e.g. "Change Mint" button)
-if ($step === 5 && $_SERVER['REQUEST_METHOD'] === 'GET') {
-    unset($_SESSION['mint_url_temp'], $_SESSION['mint_units']);
-}
-
-// Get session data for display
-$mintUrlTemp = $_SESSION['mint_url_temp'] ?? null;
-$mintUnits = $_SESSION['mint_units'] ?? [];
-$tempSeed = $_SESSION['temp_seed'] ?? null;
+$generatedSeed = $_SESSION['setup_generated_seed'] ?? null;
 
 
 /**
@@ -1008,25 +1028,7 @@ function getDataDirHttpPath(): ?string {
             }
         }
 
-        /* Spinner overlay for restore */
-        .spinner-overlay {
-            display: none;
-            position: fixed;
-            top: 0;
-            left: 0;
-            right: 0;
-            bottom: 0;
-            background: rgba(0, 0, 0, 0.7);
-            z-index: 1000;
-            justify-content: center;
-            align-items: center;
-            flex-direction: column;
-        }
-
-        .spinner-overlay.active {
-            display: flex;
-        }
-
+        /* Loading spinner (mint discovery modal) */
         .spinner {
             width: 50px;
             height: 50px;
@@ -1038,12 +1040,6 @@ function getDataDirHttpPath(): ?string {
 
         @keyframes spin {
             to { transform: rotate(360deg); }
-        }
-
-        .spinner-text {
-            color: #fff;
-            margin-top: 1rem;
-            font-size: 1.1rem;
         }
 
         /* Code blocks with proper overflow handling */
@@ -1059,57 +1055,46 @@ function getDataDirHttpPath(): ?string {
     <div class="container">
         <div class="card">
             <div class="logo">&#9889;</div>
-            <?php if ($mode === 'add_store'): ?>
-                <h1>Add New Store</h1>
-                <?php
-                // add_store walks steps 4 → 9 (auto-cashout) → 8 (on-chain)
-                // → 5 (mint URL) → 10 (backup mint) → 6 (seed) before
-                // redirecting to admin. Step 7 (Complete) is not reached.
-                $addStoreMapping = [4 => 1, 9 => 2, 8 => 3, 5 => 4, 10 => 5, 6 => 6];
-                $totalDisplaySteps = 6;
-                $displayStep = $addStoreMapping[$step] ?? $step;
-                ?>
-                <p class="subtitle">Step <?= $displayStep ?> of <?= $totalDisplaySteps ?></p>
+            <?php
+            // Render-time view of the sequence. The zero-conf screen is only
+            // part of it once the store actually has an on-chain destination,
+            // so the counter never promises a screen that won't appear.
+            $renderStoreId = $_SESSION['setup_store_id'] ?? null;
+            $renderOnchain = SetupFlow::onchainState($renderStoreId);
+            $renderSteps = SetupFlow::stepSequence($mode, Urls::isWordPress(), $renderOnchain['configured']);
+            $displayIndex = array_search($step, $renderSteps, true);
+            $totalSteps = count($renderSteps);
+            // The add_store hand-off panel sits outside the sequence; show it
+            // as the final step rather than resetting the counter to 1.
+            $displayStep = $step === SetupFlow::ADD_STORE_COMPLETE
+                ? $totalSteps
+                : ($displayIndex === false ? 1 : $displayIndex + 1);
+            $backStep = SetupFlow::backStep($step, $renderSteps);
+            $backUrl = $backStep === null
+                ? null
+                : Urls::setup() . '?step=' . urlencode($backStep)
+                    . ($mode === 'add_store' ? '&mode=add_store' : '');
+            ?>
+            <h1><?= $mode === 'add_store' ? 'Add New Store' : 'BareBits Setup' ?></h1>
+            <p class="subtitle">Step <?= (int)$displayStep ?> of <?= (int)$totalSteps ?></p>
 
-                <div class="steps">
-                    <?php for ($i = 1; $i <= $totalDisplaySteps; $i++): ?>
-                        <div class="step-dot <?= $i < $displayStep ? 'completed' : ($i === $displayStep ? 'active' : '') ?>"></div>
-                    <?php endfor; ?>
-                </div>
-            <?php else: ?>
-                <h1>BareBits Setup</h1>
-                <?php
-                $isWpMode = Urls::isWordPress();
-                // Internal step order:
-                //   1 (welcome+security), 2 (password, standalone only),
-                //   4 (store), 9 (auto-cashout), 8 (on-chain),
-                //   5 (primary mint), 10 (backup mint), 6 (seed), 7 (complete).
-                // Step 3 was merged into step 1 and is unused.
-                $stepMapping = $isWpMode
-                    ? [1 => 1, 4 => 2, 9 => 3, 8 => 4, 5 => 5, 10 => 6, 6 => 7, 7 => 8]
-                    : [1 => 1, 2 => 2, 4 => 3, 9 => 4, 8 => 5, 5 => 6, 10 => 7, 6 => 8, 7 => 9];
-                $totalSteps = $isWpMode ? 8 : 9;
-                $displayStep = $stepMapping[$step] ?? $step;
-                ?>
-                <p class="subtitle">Step <?= $displayStep ?> of <?= $totalSteps ?></p>
-
-                <div class="steps">
-                    <?php for ($i = 1; $i <= $totalSteps; $i++): ?>
-                        <div class="step-dot <?= $i < $displayStep ? 'completed' : ($i === $displayStep ? 'active' : '') ?>"></div>
-                    <?php endfor; ?>
-                </div>
-            <?php endif; ?>
+            <div class="steps">
+                <?php for ($i = 1; $i <= $totalSteps; $i++): ?>
+                    <div class="step-dot <?= $i < $displayStep ? 'completed' : ($i === $displayStep ? 'active' : '') ?>"></div>
+                <?php endfor; ?>
+            </div>
 
             <?php if ($error): ?>
                 <div class="error"><?= htmlspecialchars($error) ?></div>
             <?php endif; ?>
 
-            <?php if ($step === 1): ?>
-                <!-- Step 1: Welcome + Security Check (merged) -->
-                <h2 style="margin-bottom: 1rem;">Welcome</h2>
+            <?php if ($step === 'security'): ?>
+                <!-- Screen: security check (requirements + DB exposure + URL mode) -->
+                <h2 style="margin-bottom: 1rem;">Quick safety check</h2>
                 <p style="margin-bottom: 1.5rem;">
-                    BareBits is a Lightning payment gateway that uses Cashu ecash.
-                    Let's get you set up in a few minutes.
+                    Your payment database lives in a folder on this server.
+                    Before we go any further, let's make sure the web can't read
+                    it. We ran the checks below &mdash; everything should say OK.
                 </p>
 
                 <?php
@@ -1289,7 +1274,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                     <?php endif; ?>
 
                     <form method="post">
-                        <input type="hidden" name="step" value="1">
+                        <input type="hidden" name="step" value="security">
 
                         <div class="checkbox-group" style="margin: 1.5rem 0;">
                             <input type="checkbox" id="security_acknowledged" name="security_acknowledged" required>
@@ -1466,13 +1451,17 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                     </script>
                 <?php endif; ?>
 
-            <?php elseif ($step === 2): ?>
-                <!-- Step 2: Admin Password -->
-                <h2 style="margin-bottom: 1rem;">Admin Password</h2>
-                <p style="margin-bottom: 1.5rem;">Create a password for the admin interface.</p>
+            <?php elseif ($step === 'password'): ?>
+                <!-- Screen: admin password -->
+                <h2 style="margin-bottom: 1rem;">Create your admin password</h2>
+                <p style="margin-bottom: 1.5rem;">
+                    This is the password you'll use to sign in to your BareBits
+                    dashboard. Pick something long &mdash; you'll only type it
+                    occasionally.
+                </p>
 
                 <form method="post">
-                    <input type="hidden" name="step" value="2">
+                    <input type="hidden" name="step" value="password">
 
                     <div class="form-group">
                         <label for="password">Password</label>
@@ -1486,600 +1475,659 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                     </div>
 
                     <div class="form-group">
-                        <label for="admin_email">Recovery Email <span style="color: var(--text-secondary); font-weight: normal;">(optional)</span></label>
+                        <label for="admin_email">Recovery Email <span style="color: #a0aec0; font-weight: normal;">(optional)</span></label>
                         <input type="email" id="admin_email" name="admin_email"
                                placeholder="you@example.com">
-                        <p class="help-text">Used to email you a password-reset link if you ever get locked out. Requires outbound email (SMTP) to be configured. You can add or change this later in Settings.</p>
+                        <p class="help-text">
+                            Optional. If you add an email, we can send you a
+                            password reset link. You can also reset from the
+                            server without one.
+                        </p>
                     </div>
 
                     <button type="submit" class="btn" style="width: 100%;">Continue</button>
                 </form>
 
-            <?php elseif ($step === 4): ?>
-                <!-- Step 4: Create Store (name only) -->
-                <h2 style="margin-bottom: 1rem;">Create Store</h2>
-                <p style="margin-bottom: 1.5rem;"><?= $mode === 'add_store' ? 'Create a new store. You\'ll set its auto-cashout destination next, then connect a Cashu mint.' : 'Create your first store. You\'ll set its auto-cashout destination next, then connect a Cashu mint.' ?></p>
+            <?php elseif ($step === 'store'): ?>
+                <!-- Screen: store name -->
+                <h2 style="margin-bottom: 1rem;">Name your store</h2>
+                <?php if ($mode !== 'add_store'): ?>
+                <p style="margin-bottom: 1rem;">
+                    Welcome to BareBits! We will ask some questions to get you
+                    setup, you can customize all these options and much more in
+                    your store settings.
+                </p>
+                <?php endif; ?>
+                <p style="margin-bottom: 1.5rem; color: #a0aec0; font-size: 0.9rem;">
+                    Next, we'll configure your off-server wallets to send funds
+                    to, keep in mind you can use more than one wallet depending
+                    on your needs.
+                </p>
 
                 <form method="post">
-                    <input type="hidden" name="step" value="4">
+                    <input type="hidden" name="step" value="store">
                     <?php if ($mode === 'add_store'): ?>
                         <input type="hidden" name="mode" value="add_store">
                     <?php endif; ?>
 
+                    <?php
+                    // Prefill with the store under construction when the
+                    // operator navigated back to this screen.
+                    $storeNameExisting = $renderStoreId
+                        ? (Config::getStore($renderStoreId)['name'] ?? '') : '';
+                    $storeNameValue = $_POST['store_name'] ?? ($storeNameExisting ?: 'My Store');
+                    ?>
                     <div class="form-group">
-                        <label for="store_name">Store Name</label>
+                        <label for="store_name">Store name</label>
                         <input type="text" id="store_name" name="store_name"
-                               value="My Store" required>
-                        <p class="help-text">This name will be shown on payment pages</p>
+                               value="<?= htmlspecialchars($storeNameValue) ?>" required>
+                        <p class="help-text">Your customers see this on payment pages and receipts.</p>
                     </div>
 
-                    <button type="submit" class="btn" style="width: 100%;">Create Store & Continue</button>
+                    <button type="submit" class="btn" style="width: 100%;">Continue</button>
                 </form>
                 <?php if ($mode === 'add_store'): ?>
                     <a href="<?= htmlspecialchars(Urls::admin()) ?>" class="btn btn-secondary" style="width: 100%; margin-top: 0.5rem; text-align: center;">Cancel</a>
                 <?php endif; ?>
 
-            <?php elseif ($step === 5): ?>
-                <!-- Step 5: Mint Configuration (with dynamic unit selection) -->
-                <h2 style="margin-bottom: 1rem;">Connect Cashu Mint</h2>
-                <p style="margin-bottom: 1.5rem;">
-                    <?php if (!empty($mintUnits)): ?>
-                        Select which currency unit to use with this mint.
-                    <?php else: ?>
-                        Choose a Cashu Mint for your store. This is a third
-                        party who you trust to temporarily hold on to some small
-                        amount of funds via lightning (around $10 max). This
-                        store will only be used if you select on-chain cashouts
-                        or your main LN cashout mechanism is offline.
-                    <?php endif; ?>
-                </p>
-
-                <form method="post">
-                    <input type="hidden" name="step" value="5">
-                    <?php if ($mode === 'add_store'): ?>
-                        <input type="hidden" name="mode" value="add_store">
-                    <?php endif; ?>
-
-                    <?php if (!empty($mintUnits)): ?>
-                        <!-- Phase 2: Unit selection (shown after URL submitted) -->
-                        <input type="hidden" name="mint_url" value="<?= htmlspecialchars($mintUrlTemp) ?>">
-
-                        <div style="background: rgba(72, 187, 120, 0.1); border: 1px solid rgba(72, 187, 120, 0.3); padding: 1rem; border-radius: 8px; margin-bottom: 1.5rem;">
-                            <p style="font-size: 0.9rem; color: #68d391;">Connected to mint:</p>
-                            <code style="word-break: break-all;"><?= htmlspecialchars($mintUrlTemp) ?></code>
-                        </div>
-
-                        <div class="form-group">
-                            <label for="mint_unit">Currency Unit</label>
-                            <?php
-                            // Sort units to put 'sat' first
-                            $sortedUnits = $mintUnits;
-                            usort($sortedUnits, function($a, $b) {
-                                if ($a === 'sat') return -1;
-                                if ($b === 'sat') return 1;
-                                return strcmp($a, $b);
-                            });
-                            $hasSat = in_array('sat', $sortedUnits);
-                            ?>
-                            <select id="mint_unit" name="mint_unit" required onchange="testMintExpirySetup()">
-                                <?php if (!$hasSat): ?>
-                                    <option value="">Select unit...</option>
-                                <?php endif; ?>
-                                <?php foreach ($sortedUnits as $unit): ?>
-                                    <?php
-                                    $displayName = ($unit === 'sat') ? 'Bitcoin (sats)' : strtoupper($unit);
-                                    $selected = ($unit === 'sat') ? ' selected' : '';
-                                    ?>
-                                    <option value="<?= htmlspecialchars($unit) ?>"<?= $selected ?>><?= htmlspecialchars($displayName) ?></option>
-                                <?php endforeach; ?>
-                            </select>
-                            <p class="help-text">Available units from this mint. Choose the one that matches how you want to receive payments.</p>
-                        </div>
-
-                        <div id="expiry-test-status" style="display: none; padding: 0.75rem; border-radius: 8px; margin-bottom: 1rem;"></div>
-
-                        <div id="expiry-warning" class="warning" style="display: none;">
-                            <strong>Short Invoice Expiry</strong>
-                            <p id="expiry-warning-message" style="margin: 0.5rem 0;"></p>
-                            <label class="checkbox-group" style="margin-top: 0.75rem;">
-                                <input type="checkbox" id="expiry-acknowledged" name="expiry_acknowledged">
-                                <span>I understand this may cause payment issues and want to proceed anyway</span>
-                            </label>
-                        </div>
-
-                        <div class="btn-group">
-                            <a href="?step=5<?= $mode === 'add_store' ? '&mode=add_store' : '' ?>" class="btn btn-secondary" style="text-align: center;">Change Mint</a>
-                            <button type="submit" class="btn" id="continue-btn">Continue</button>
-                        </div>
-                    <?php else: ?>
-                        <!-- Phase 1: Enter mint URL -->
-                        <div class="form-group">
-                            <label for="mint_url">Mint URL</label>
-                            <div style="display: flex; gap: 0.5rem;">
-                                <input type="url" id="mint_url" name="mint_url"
-                                       placeholder="https://..."
-                                       value="<?= htmlspecialchars($_POST['mint_url'] ?? '') ?>"
-                                       required style="flex: 1;">
-                                <button type="button" class="btn btn-secondary" onclick="openMintDiscovery()" style="white-space: nowrap;">Discover</button>
-                            </div>
-                        </div>
-
-                        <button type="submit" class="btn" style="width: 100%;">Connect to Mint</button>
-                    <?php endif; ?>
-                </form>
-
-            <?php elseif ($step === 10): ?>
-                <!-- Step 10: Backup Mint (required) -->
+            <?php elseif ($step === 'onchain'): ?>
+                <!-- Screen: on-chain destination -->
                 <?php
-                $primaryStore = Config::getStore($_SESSION['setup_store_id'] ?? '');
-                $primaryUrlForCopy = $primaryStore['mint_url'] ?? '';
-                $primaryUnitForCopy = $primaryStore['mint_unit'] ?? 'sat';
+                $ocStore = $renderStoreId ? Config::getStore($renderStoreId) : null;
+                $ocSavedXpub = (string)($ocStore['onchain_xpub'] ?? '');
+                $ocSavedStatic = (string)($ocStore['onchain_static_address'] ?? '');
+                $ocSavedMode = ($ocStore['onchain_address_mode'] ?? 'xpub') === 'static' ? 'static' : 'xpub';
+                $ocSavedNetwork = (string)($ocStore['onchain_network'] ?? 'mainnet');
                 ?>
-                <h2 style="margin-bottom: 1rem;">Backup Mint</h2>
+                <h2 style="margin-bottom: 1rem;">On-chain Bitcoin payments</h2>
                 <p style="margin-bottom: 1.25rem;">
-                    Pick a second Cashu mint to use as a fallback if your primary
-                    mint becomes unreachable. Incoming payments will automatically
-                    route to the backup mint when the primary is down, keeping
-                    checkouts working without manual intervention.
-                </p>
-                <p style="margin-bottom: 1.5rem; color: #a0aec0; font-size: 0.9rem;">
-                    The backup must support the same unit as your primary
-                    (<code><?= htmlspecialchars($primaryUnitForCopy) ?></code>)
-                    and must be a different mint from
-                    <code style="word-break: break-all;"><?= htmlspecialchars($primaryUrlForCopy) ?></code>.
-                </p>
-
-                <form method="post">
-                    <input type="hidden" name="step" value="10">
-                    <?php if ($mode === 'add_store'): ?>
-                        <input type="hidden" name="mode" value="add_store">
-                    <?php endif; ?>
-
-                    <div class="form-group">
-                        <label for="mint_url">Backup Mint URL</label>
-                        <div style="display: flex; gap: 0.5rem;">
-                            <input type="url" id="mint_url" name="backup_mint_url"
-                                   placeholder="https://..."
-                                   value="<?= htmlspecialchars($_POST['backup_mint_url'] ?? '') ?>"
-                                   required style="flex: 1;">
-                            <button type="button" class="btn btn-secondary" onclick="openMintDiscovery()" style="white-space: nowrap;">Discover</button>
-                        </div>
-                    </div>
-
-                    <button type="submit" class="btn" style="width: 100%;">Add Backup Mint</button>
-                </form>
-
-            <?php elseif ($step === 6): ?>
-                <!-- Step 6: Seed Phrase for this Store -->
-                <h2 style="margin-bottom: 1rem;">Mint Wallet Seed</h2>
-                <p style="margin-bottom: 1.25rem; color: #a0aec0; font-size: 0.9rem;">
-                    This is the seed phrase for the wallet this store uses with
-                    its Cashu mint. It lets you recover the small mint balance
-                    held on your behalf if this server is lost or restored.
-                </p>
-
-                <?php if ($tempSeed): ?>
-                    <div class="warning">
-                        <strong>Important!</strong> This seed phrase is for <strong>backup and recovery only</strong>.
-                        <ul style="margin: 0.5rem 0 0 1.25rem;">
-                            <li>Write it down and store it in a safe place</li>
-                            <li>Do NOT import this seed into another wallet you use regularly</li>
-                            <li>Using the same seed in multiple active wallets causes coin loss</li>
-                        </ul>
-                    </div>
-
-                    <div class="seed-display"><?= htmlspecialchars($tempSeed) ?></div>
-
-                    <form method="post">
-                        <input type="hidden" name="step" value="6">
-                        <input type="hidden" name="action" value="confirm">
-                        <?php if ($mode === 'add_store'): ?>
-                            <input type="hidden" name="mode" value="add_store">
-                        <?php endif; ?>
-
-                        <div class="checkbox-group" style="margin-bottom: 1.5rem;">
-                            <input type="checkbox" id="seed_confirmed" name="seed_confirmed" required>
-                            <label for="seed_confirmed">I have written down my seed phrase and stored it safely</label>
-                        </div>
-
-                        <button type="submit" class="btn" style="width: 100%;"><?= $mode === 'add_store' ? 'Create Store' : 'Complete Setup' ?></button>
-                    </form>
-                <?php else: ?>
-                    <p style="margin-bottom: 1.5rem;">
-                        Generate a new seed phrase for this store's mint wallet,
-                        or restore from an existing seed.
-                    </p>
-
-                    <form method="post" style="margin-bottom: 1rem;">
-                        <input type="hidden" name="step" value="6">
-                        <input type="hidden" name="action" value="generate">
-                        <?php if ($mode === 'add_store'): ?>
-                            <input type="hidden" name="mode" value="add_store">
-                        <?php endif; ?>
-                        <button type="submit" class="btn" style="width: 100%;">Generate New Seed Phrase</button>
-                    </form>
-
-                    <details style="margin-top: 1.5rem;">
-                        <summary style="cursor: pointer; color: #a0aec0;">Restore from existing seed phrase</summary>
-                        <form method="post" style="margin-top: 1rem;">
-                            <input type="hidden" name="step" value="6">
-                            <input type="hidden" name="action" value="confirm">
-                            <?php if ($mode === 'add_store'): ?>
-                                <input type="hidden" name="mode" value="add_store">
-                            <?php endif; ?>
-
-                            <div class="form-group">
-                                <label for="existing_seed">12-word seed phrase</label>
-                                <textarea id="existing_seed" name="existing_seed" rows="3" placeholder="word1 word2 word3 ..."></textarea>
-                            </div>
-
-                            <div class="checkbox-group" style="margin-bottom: 1.5rem;">
-                                <input type="checkbox" id="seed_confirmed2" name="seed_confirmed" required>
-                                <label for="seed_confirmed2">I understand this will restore an existing wallet and that this seed phrase must not be used anywhere else (another store, instance, or wallet) as this will cause loss of funds</label>
-                            </div>
-
-                            <button type="submit" class="btn btn-secondary" style="width: 100%;"><?= $mode === 'add_store' ? 'Create Store with Existing Seed' : 'Use Existing Seed' ?></button>
-                        </form>
-                    </details>
-                <?php endif; ?>
-
-            <?php elseif ($step === 9): ?>
-                <!-- Step 9: Auto-cashout destination -->
-                <h2 style="margin-bottom: 0.5rem;">Auto-cashout destination</h2>
-                <p style="color: #a0aec0; margin-bottom: 1.25rem; font-size: 0.9rem;">
-                    Where should incoming payments end up? Picking a destination
-                    lets the server sweep funds out of the Cashu mint automatically
-                    once the balance is high enough, so you don't have to.
-                </p>
-
-                <form id="auto-cashout-form" method="POST" action="<?= htmlspecialchars(Urls::setup()) ?>" style="margin-bottom: 1rem;">
-                    <input type="hidden" name="step" value="9">
-                    <input type="hidden" name="auto_cashout_action" value="save">
-                    <?php if ($mode === 'add_store'): ?>
-                        <input type="hidden" name="mode" value="add_store">
-                    <?php endif; ?>
-
-                    <label class="aw-choice" style="display: block; padding: 1rem; border: 1px solid #2d3748; border-radius: 8px; margin-bottom: 0.75rem; cursor: pointer;">
-                        <input type="radio" name="auto_cashout_mode" value="lightning" checked
-                               onchange="document.getElementById('aw-ln-row').style.display = this.checked ? 'block' : 'none';">
-                        <strong>Auto-cashout to Lightning</strong>
-                        <p style="margin: 0.25rem 0 0 1.5rem; color: #a0aec0; font-size: 0.85rem;">
-                            Fastest, lowest fees. Requires a Lightning address
-                            like <code>awesomemerchant@strike.me</code>.
-                        </p>
-                    </label>
-
-                    <div id="aw-ln-row" class="form-group" style="margin-left: 1.5rem;">
-                        <label for="lightning_address" style="font-size: 0.85rem;">Lightning address</label>
-                        <input type="text" id="lightning_address" name="lightning_address"
-                               placeholder="awesomemerchant@strike.me"
-                               style="width: 100%; font-family: monospace; font-size: 0.9rem;">
-                    </div>
-
-                    <label class="aw-choice" style="display: block; padding: 1rem; border: 1px solid #2d3748; border-radius: 8px; margin: 0.75rem 0; cursor: pointer;">
-                        <input type="radio" name="auto_cashout_mode" value="onchain"
-                               onchange="document.getElementById('aw-ln-row').style.display = this.checked ? 'none' : 'block';">
-                        <strong>Auto-cashout to on-chain (any wallet)</strong>
-                        <p style="margin: 0.25rem 0 0 1.5rem; color: #a0aec0; font-size: 0.85rem;">
-                            Submarine-swap sweep to the on-chain xpub you'll set up
-                            next. Slower and a bit more expensive than Lightning,
-                            but works with any Bitcoin wallet.
-                        </p>
-                    </label>
-
-                    <button type="submit" class="btn" style="width: 100%; margin-top: 0.75rem;">Save and continue</button>
-                </form>
-
-                <div class="warning" style="margin-bottom: 0.75rem;">
-                    <strong>Strongly recommended:</strong> set an auto-cashout
-                    destination. Without one, incoming funds sit on this server
-                    and inside the third-party Cashu mint until you withdraw
-                    manually &mdash; the safest place for your money is the
-                    wallet you control on the other end.
-                </div>
-
-                <form method="POST" action="<?= htmlspecialchars(Urls::setup()) ?>">
-                    <input type="hidden" name="step" value="9">
-                    <input type="hidden" name="auto_cashout_action" value="skip">
-                    <?php if ($mode === 'add_store'): ?>
-                        <input type="hidden" name="mode" value="add_store">
-                    <?php endif; ?>
-                    <button type="submit" class="btn btn-secondary" style="width: 100%;">
-                        Skip for now (configure later in Admin)
-                    </button>
-                </form>
-
-                <script>
-                (function () {
-                    // The Lightning Address row visibility is wired via inline
-                    // onchange on the radios above; this just ensures the
-                    // server-redrawn state matches whichever option is checked
-                    // (e.g. after a validation error redraws the form).
-                    var checked = document.querySelector('input[name="auto_cashout_mode"]:checked');
-                    if (checked) checked.dispatchEvent(new Event('change'));
-                })();
-                </script>
-
-            <?php elseif ($step === 8): ?>
-                <!-- Step 8: On-chain Bitcoin payment destination -->
-                <?php
-                $awMode = $_SESSION['setup_auto_cashout_mode'] ?? '';
-                $onchainRequired = ($awMode === 'onchain');
-                ?>
-                <h2 style="margin-bottom: 0.5rem;">
-                    On-chain Bitcoin payments<?= $onchainRequired ? '' : ' (optional)' ?>
-                </h2>
-                <p style="color: #a0aec0; margin-bottom: 1.25rem; font-size: 0.9rem;">
-                    <?php if ($onchainRequired): ?>
-                        You picked on-chain auto-cashout on the previous step, so the
-                        xpub you set here is also where your withdrawals will land.
-                        Provide an extended public key (xpub / zpub / vpub / etc.)
-                        from your wallet &mdash; the server derives a fresh receive
-                        address per invoice and per swap output.
-                    <?php elseif ($awMode === 'lightning'): ?>
-                        Optionally accept direct Bitcoin transactions in addition to
-                        Lightning. Adding an on-chain address means lower fees and
-                        faster settlement for customers paying on-chain &mdash; without
-                        one, they have no on-chain option at all.
-                    <?php else: ?>
-                        Accept direct Bitcoin transactions in addition to Lightning.
-                        You can skip this step now and configure it later from Admin.
-                        Provide an extended public key (xpub / zpub / vpub / etc.) from your wallet
-                        &mdash; the server will derive a fresh receive address per invoice.
-                        The key will be automatically validated for the chosen network and address type.
-                    <?php endif; ?>
+                    On-chain payments from your customers always go directly
+                    into your off-server wallet. We <strong>strongly</strong>
+                    suggest using an xpub address (extended public key), but
+                    regular bare addresses work as well. An xpub enables
+                    BareBits to generate a unique payment address for each
+                    invoice. Without an xpub, we will use the same address for
+                    all invoices, which may lead to issues if you have multiple
+                    invoices being paid at once or a customer who tries to pay
+                    in multiple payments.
                 </p>
 
                 <form id="onchain-form" method="POST" action="<?= htmlspecialchars(Urls::setup()) ?>">
-                    <input type="hidden" name="step" value="8">
+                    <input type="hidden" name="step" value="onchain">
                     <input type="hidden" name="onchain_action" value="save">
+                    <input type="hidden" name="onchain_address_mode" id="onchain_address_mode" value="<?= htmlspecialchars($ocSavedMode) ?>">
+                    <input type="hidden" name="onchain_address_type" id="onchain_address_type" value="P2WPKH">
                     <?php if ($mode === 'add_store'): ?>
                         <input type="hidden" name="mode" value="add_store">
                     <?php endif; ?>
 
-                    <div class="form-group">
-                        <label for="onchain_address_mode">Address source:</label>
-                        <select id="onchain_address_mode" name="onchain_address_mode">
-                            <option value="xpub">Extended public key (recommended)</option>
-                            <?php if (!$onchainRequired): ?>
-                                <option value="static">Single static address (not recommended)</option>
-                            <?php endif; ?>
-                        </select>
-                        <?php if ($onchainRequired): ?>
-                            <p style="font-size: 0.8rem; color: #fbd38d; margin-top: 0.35rem;">
-                                Static-address mode is hidden because on-chain auto-cashout
-                                derives a fresh address per swap and needs an xpub.
-                            </p>
-                        <?php endif; ?>
-                    </div>
-
-                    <div id="onchain-static-warning" class="warning" style="display:none; margin-bottom: 1rem;">
-                        <strong>&#9888; Static address re-use is strongly discouraged.</strong>
-                        <p style="margin: 0.5rem 0;">
-                            It is STRONGLY recommended that you use an xpub instead of a static
-                            address. Static address re-use decreases the privacy of you and your
-                            customers and prevents correctly detecting payment when multiple
-                            transactions are used to pay an invoice. Each invoice will be assigned
-                            a unique sat-tweak so totals don&rsquo;t collide; customers must pay the
-                            exact amount in a single transaction.
+                    <div class="form-group" id="onchain-xpub-row"<?= $ocSavedMode === 'static' ? ' style="display:none;"' : '' ?>>
+                        <label for="onchain_xpub">Extended public key (xpub)</label>
+                        <textarea id="onchain_xpub" name="onchain_xpub" rows="2"
+                                  style="width: 100%; font-family: monospace; font-size: 0.85rem;"
+                                  placeholder="xpub&hellip; ypub&hellip; zpub&hellip;"><?= htmlspecialchars($ocSavedXpub) ?></textarea>
+                        <p class="help-text">
+                            Don't have an xpub? We suggest
+                            <a href="https://electrum.org" target="_blank" rel="noopener noreferrer" style="color: #63b3ed;">Electrum wallet</a>.
+                            To find your xpub in Electrum, go to
+                            Wallet &rarr; Information &rarr; Extended public key.
                         </p>
                     </div>
 
-                    <div class="form-group" id="onchain-xpub-row">
-                        <label for="onchain_xpub">Extended public key (xpub):</label>
-                        <textarea id="onchain_xpub" name="onchain_xpub" rows="2"
-                                  style="width: 100%; font-family: monospace; font-size: 0.85rem;"
-                                  placeholder="xpub6CUGRUonZ... or zpub6rFR7y4Q2... or vpub5SLqN2bL...">
-                        </textarea>
+                    <!-- Only revealed for testnet-family keys: SLIP-32 version
+                         bytes are shared by testnet, signet and regtest, so the
+                         key itself cannot tell us which one this is. Mainnet
+                         operators never see this control. -->
+                    <div class="form-group" id="onchain-testnet-row" style="display:none;">
+                        <label for="onchain_testnet_network">That looks like a test-network key. Which network?</label>
+                        <select id="onchain_testnet_network" name="onchain_testnet_network">
+                            <option value="testnet"<?= $ocSavedNetwork === 'testnet' ? ' selected' : '' ?>>testnet</option>
+                            <option value="signet"<?= $ocSavedNetwork === 'signet' ? ' selected' : '' ?>>signet</option>
+                            <option value="regtest"<?= $ocSavedNetwork === 'regtest' ? ' selected' : '' ?>>regtest</option>
+                        </select>
                     </div>
 
-                    <div class="form-group" id="onchain-static-address-row" style="display:none;">
-                        <label for="onchain_static_address">Static receive address:</label>
+                    <div class="form-group" id="onchain-static-row"<?= $ocSavedMode === 'static' ? '' : ' style="display:none;"' ?>>
+                        <label for="onchain_static_address">Bitcoin address</label>
                         <input type="text" id="onchain_static_address" name="onchain_static_address"
                                style="width: 100%; font-family: monospace; font-size: 0.85rem;"
-                               placeholder="bc1q... / 3... / 1... (or testnet / regtest equivalent)">
+                               value="<?= htmlspecialchars($ocSavedStatic) ?>"
+                               placeholder="bc1q&hellip; / 3&hellip; / 1&hellip;">
+                        <p class="help-text">
+                            The same address is reused for every invoice. Each
+                            invoice gets a unique sat-offset so totals don't
+                            collide, but customers must pay the exact amount in
+                            a single transaction.
+                        </p>
                     </div>
 
-                    <div class="form-group" id="onchain-static-tweak-row" style="display:none;">
-                        <label for="onchain_static_tweak_range">
-                            Tweak range (number of unique sat-offsets):
-                        </label>
-                        <input type="number" id="onchain_static_tweak_range" name="onchain_static_tweak_range"
-                               min="100" max="100000" value="1000">
-                    </div>
-
-                    <div class="form-group">
-                        <label for="onchain_network">Network:</label>
-                        <select id="onchain_network" name="onchain_network">
-                            <option value="mainnet">mainnet</option>
-                            <option value="testnet">testnet</option>
-                            <option value="signet">signet</option>
-                            <option value="regtest">regtest</option>
-                        </select>
-                    </div>
-
-                    <div class="form-group" id="onchain-address-type-row">
-                        <label for="onchain_address_type">Address type:</label>
-                        <select id="onchain_address_type" name="onchain_address_type">
-                            <option value="P2WPKH">P2WPKH (native segwit, recommended)</option>
-                            <option value="P2SH-P2WPKH">P2SH-P2WPKH (wrapped segwit, legacy compat)</option>
-                        </select>
-                    </div>
-
-                    <div class="form-group">
-                        <label for="onchain_min_confs">
-                            Required confirmations (0 = accept zero-conf):
-                            <span class="info-tip" tabindex="0" aria-label="More info">i<span class="info-tip-text">
-                                How many block confirmations the on-chain payment
-                                needs before the invoice is marked paid.
-                                <br><br>
-                                <strong>0 (zero-conf):</strong> instant settlement, but a malicious
-                                customer could double-spend the unconfirmed tx. For ~90% of merchants
-                                taking small consumer payments, zero-conf is a fine default.
-                                <br><br>
-                                <strong>1+ confirmations:</strong> safer for high-value invoices, but
-                                customers wait ~10 minutes per confirmation.
-                            </span></span>
-                        </label>
-                        <input type="number" id="onchain_min_confs" name="onchain_min_confs" min="0" max="100" value="1">
-                    </div>
+                    <p style="margin-bottom: 1rem;">
+                        <a href="#" id="onchain-mode-toggle" style="color: #63b3ed; font-size: 0.9rem;">
+                            <?= $ocSavedMode === 'static' ? 'Use an xpub instead (recommended)' : 'Use a single Bitcoin address instead' ?>
+                        </a>
+                    </p>
 
                     <div id="onchain-validation" style="display:none; margin: 1rem 0; padding: 0.75rem; border-radius: 6px;"></div>
 
                     <button type="button" class="btn btn-secondary" id="onchain-validate-btn"
-                            style="width: 100%; margin-bottom: 0.5rem;">
-                        Validate xpub &amp; preview first 3 addresses
+                            style="width: 100%; margin-bottom: 0.5rem;<?= $ocSavedMode === 'static' ? ' display:none;' : '' ?>">
+                        Check my xpub
                     </button>
 
-                    <button type="submit" class="btn" id="onchain-save-btn" style="width: 100%;" disabled>
-                        Save and continue
+                    <button type="submit" class="btn" id="onchain-save-btn" style="width: 100%;"<?= $ocSavedMode === 'static' ? '' : ' disabled' ?>>
+                        Continue
                     </button>
                 </form>
 
-                <?php if (!$onchainRequired): ?>
                 <form method="POST" action="<?= htmlspecialchars(Urls::setup()) ?>" style="margin-top: 0.75rem;">
-                    <input type="hidden" name="step" value="8">
+                    <input type="hidden" name="step" value="onchain">
                     <input type="hidden" name="onchain_action" value="skip">
                     <?php if ($mode === 'add_store'): ?>
                         <input type="hidden" name="mode" value="add_store">
                     <?php endif; ?>
-                    <button type="submit" class="btn btn-secondary" style="width: 100%;">
-                        Skip for now (configure later in Admin)
-                    </button>
+                    <button type="submit" class="btn btn-secondary" style="width: 100%;">Skip for now</button>
                 </form>
-                <?php endif; ?>
+
+                <div class="warning" style="margin-top: 0.75rem;">
+                    Without an on-chain wallet we can't send you Bitcoin
+                    directly, use submarine swaps, or sweep funds out of a Cashu
+                    mint. You can add one later in store settings.
+                </div>
 
                 <script>
                 (function () {
-                    const validateBtn = document.getElementById('onchain-validate-btn');
-                    const saveBtn = document.getElementById('onchain-save-btn');
-                    const box = document.getElementById('onchain-validation');
-                    const modeSel = document.getElementById('onchain_address_mode');
-                    const warning = document.getElementById('onchain-static-warning');
-                    const xpubRow = document.getElementById('onchain-xpub-row');
-                    const addrRow = document.getElementById('onchain-static-address-row');
-                    const tweakRow = document.getElementById('onchain-static-tweak-row');
-                    const typeRow = document.getElementById('onchain-address-type-row');
+                    var setupUrl = <?= json_encode(Urls::setup()) ?>;
+                    var validateBtn = document.getElementById('onchain-validate-btn');
+                    var saveBtn = document.getElementById('onchain-save-btn');
+                    var box = document.getElementById('onchain-validation');
+                    var modeField = document.getElementById('onchain_address_mode');
+                    var typeField = document.getElementById('onchain_address_type');
+                    var xpubRow = document.getElementById('onchain-xpub-row');
+                    var staticRow = document.getElementById('onchain-static-row');
+                    var testnetRow = document.getElementById('onchain-testnet-row');
+                    var testnetSel = document.getElementById('onchain_testnet_network');
+                    var toggle = document.getElementById('onchain-mode-toggle');
 
                     function applyMode() {
-                        const isStatic = modeSel.value === 'static';
-                        warning.style.display = isStatic ? 'block' : 'none';
+                        var isStatic = modeField.value === 'static';
                         xpubRow.style.display = isStatic ? 'none' : '';
-                        typeRow.style.display = isStatic ? 'none' : '';
-                        addrRow.style.display = isStatic ? '' : 'none';
-                        tweakRow.style.display = isStatic ? '' : 'none';
+                        staticRow.style.display = isStatic ? '' : 'none';
                         validateBtn.style.display = isStatic ? 'none' : '';
-                        // In static mode the xpub validate flow doesn't apply,
-                        // so enable Save directly. The server still validates
-                        // the address on submit.
+                        if (isStatic) { testnetRow.style.display = 'none'; }
+                        toggle.textContent = isStatic
+                            ? 'Use an xpub instead (recommended)'
+                            : 'Use a single Bitcoin address instead';
+                        // Static addresses are validated server-side on submit;
+                        // xpubs must pass the preview check first so the
+                        // operator has actually eyeballed the addresses.
                         saveBtn.disabled = !isStatic;
                         box.style.display = 'none';
                     }
-                    modeSel.addEventListener('change', applyMode);
-                    applyMode();
 
-                    validateBtn.addEventListener('click', async () => {
-                        const xpub = document.getElementById('onchain_xpub').value.trim();
-                        const network = document.getElementById('onchain_network').value;
-                        const type = document.getElementById('onchain_address_type').value;
-                        if (!xpub) {
-                            box.style.display = 'block';
-                            box.style.background = 'rgba(245, 101, 101, 0.15)';
-                            box.style.border = '1px solid rgba(245, 101, 101, 0.3)';
-                            box.textContent = 'Paste an xpub first.';
-                            saveBtn.disabled = true;
-                            return;
-                        }
-                        const body = new FormData();
-                        body.append('action', 'validate_xpub');
-                        body.append('xpub', xpub);
-                        body.append('network', network);
-                        body.append('address_type', type);
-                        const resp = await fetch(<?= json_encode(Urls::setup()) ?>, { method: 'POST', body });
-                        const data = await resp.json();
+                    toggle.addEventListener('click', function (e) {
+                        e.preventDefault();
+                        modeField.value = modeField.value === 'static' ? 'xpub' : 'static';
+                        applyMode();
+                    });
+
+                    // A tpub/upub/vpub prefix means testnet-family; reveal the
+                    // sub-network picker as soon as one is pasted rather than
+                    // waiting for the validate round-trip.
+                    function syncTestnetRow() {
+                        var v = document.getElementById('onchain_xpub').value.trim().toLowerCase();
+                        var isTestnet = /^(tpub|upub|vpub)/.test(v);
+                        testnetRow.style.display = (isTestnet && modeField.value !== 'static') ? '' : 'none';
+                    }
+                    document.getElementById('onchain_xpub').addEventListener('input', function () {
+                        syncTestnetRow();
+                        saveBtn.disabled = true;
+                        box.style.display = 'none';
+                    });
+
+                    function renderResult(data, triedType) {
                         box.style.display = 'block';
                         if (!data.valid) {
                             box.style.background = 'rgba(245, 101, 101, 0.15)';
                             box.style.border = '1px solid rgba(245, 101, 101, 0.3)';
-                            box.innerHTML = '';
-                            const strong = document.createElement('strong');
-                            strong.textContent = 'Invalid: ';
-                            box.appendChild(strong);
-                            box.appendChild(document.createTextNode(data.error || 'unknown error'));
+                            box.textContent = data.error
+                                || 'We couldn\'t read that as an extended public key. Check for a missing character and paste it again.';
                             saveBtn.disabled = true;
                             return;
                         }
+                        typeField.value = triedType;
                         box.innerHTML = '';
-                        const validStrong = document.createElement('strong');
-                        validStrong.textContent = 'Valid. ';
-                        box.appendChild(validStrong);
-                        box.appendChild(document.createTextNode('Verify these match your wallet\'s first 3 receive addresses:'));
-                        box.appendChild(document.createElement('br'));
-                        const pre = document.createElement('pre');
+                        box.style.background = 'rgba(72, 187, 120, 0.1)';
+                        box.style.border = '1px solid rgba(72, 187, 120, 0.3)';
+                        var intro = document.createElement('div');
+                        intro.textContent = 'Looks good. Here are the first three addresses we\'d generate '
+                            + '— check they match your wallet.';
+                        box.appendChild(intro);
+                        var pre = document.createElement('pre');
                         pre.style.cssText = 'margin:0.5rem 0 0; font-size:0.85rem;';
-                        pre.textContent = (data.preview || []).map((a, i) => 'm/0/' + i + ' = ' + a).join('\n');
+                        pre.textContent = (data.preview || []).map(function (a, i) {
+                            return 'm/0/' + i + ' = ' + a;
+                        }).join('\n');
                         box.appendChild(pre);
-                        (data.warnings || []).forEach(w => {
-                            const warn = document.createElement('div');
+                        (data.warnings || []).forEach(function (w) {
+                            var warn = document.createElement('div');
                             warn.style.cssText = 'margin-top:0.5rem; color:#f6ad55;';
                             warn.textContent = '⚠ ' + w;
                             box.appendChild(warn);
                         });
-                        box.style.background = 'rgba(72, 187, 120, 0.1)';
-                        box.style.border = '1px solid rgba(72, 187, 120, 0.3)';
+                        // A BIP44-prefixed key (xpub/tpub) says nothing about
+                        // the address type, so wrapped-SegWit wallets need a
+                        // way out without an "advanced settings" panel.
+                        var other = triedType === 'P2WPKH' ? 'P2SH-P2WPKH' : 'P2WPKH';
+                        var alt = document.createElement('a');
+                        alt.href = '#';
+                        alt.style.cssText = 'display:inline-block; margin-top:0.5rem; color:#63b3ed; font-size:0.85rem;';
+                        alt.textContent = triedType === 'P2WPKH'
+                            ? 'Not the addresses your wallet shows? Try wrapped SegWit'
+                            : 'Try native SegWit instead';
+                        alt.addEventListener('click', function (e) {
+                            e.preventDefault();
+                            runValidate(other);
+                        });
+                        box.appendChild(alt);
                         saveBtn.disabled = false;
+                    }
+
+                    async function runValidate(type) {
+                        var xpub = document.getElementById('onchain_xpub').value.trim();
+                        if (!xpub) {
+                            box.style.display = 'block';
+                            box.style.background = 'rgba(245, 101, 101, 0.15)';
+                            box.style.border = '1px solid rgba(245, 101, 101, 0.3)';
+                            box.textContent = 'Paste your extended public key to continue.';
+                            saveBtn.disabled = true;
+                            return;
+                        }
+                        var isTestnet = /^(tpub|upub|vpub)/.test(xpub.toLowerCase());
+                        var network = isTestnet ? testnetSel.value : 'mainnet';
+                        var body = new FormData();
+                        body.append('action', 'validate_xpub');
+                        body.append('xpub', xpub);
+                        body.append('network', network);
+                        body.append('address_type', type);
+                        try {
+                            var resp = await fetch(setupUrl, { method: 'POST', body: body });
+                            renderResult(await resp.json(), type);
+                        } catch (e) {
+                            box.style.display = 'block';
+                            box.style.background = 'rgba(245, 101, 101, 0.15)';
+                            box.style.border = '1px solid rgba(245, 101, 101, 0.3)';
+                            box.textContent = 'Could not reach the server to check that key. Try again.';
+                            saveBtn.disabled = true;
+                        }
+                    }
+
+                    validateBtn.addEventListener('click', function () {
+                        // Default to native SegWit; renderResult offers the
+                        // wrapped-SegWit alternative when the preview is wrong.
+                        runValidate('P2WPKH');
                     });
+                    testnetSel.addEventListener('change', function () {
+                        saveBtn.disabled = true;
+                        box.style.display = 'none';
+                    });
+
+                    applyMode();
+                    syncTestnetRow();
                 })();
                 </script>
 
-            <?php elseif ($step === 7): ?>
-                <!-- Step 7: Complete -->
-                <h2 style="margin-bottom: 1rem;">Setup Complete!</h2>
+            <?php elseif ($step === 'zeroconf'): ?>
+                <!-- Screen: zero-conf vs one-confirmation -->
+                <h2 style="margin-bottom: 1rem;">Zero-conf payments</h2>
+                <p style="margin-bottom: 1.5rem;">
+                    Enable zero-conf on-chain transactions? This means invoices
+                    get marked as paid instantly instead of waiting for an
+                    on-chain confirmation (seconds to minutes depending on fees
+                    paid). Your customer may use this to try to cheat you. For
+                    most merchants, the extra speed is worth the small risk that
+                    a payment never gets confirmed.
+                </p>
+
+                <form method="POST" action="<?= htmlspecialchars(Urls::setup()) ?>">
+                    <input type="hidden" name="step" value="zeroconf">
+                    <?php if ($mode === 'add_store'): ?>
+                        <input type="hidden" name="mode" value="add_store">
+                    <?php endif; ?>
+                    <button type="submit" name="zero_conf" value="1" class="btn" style="width: 100%;">
+                        Enable zero-conf
+                    </button>
+                    <button type="submit" name="zero_conf" value="0" class="btn btn-secondary" style="width: 100%; margin-top: 0.5rem;">
+                        Wait for 1 confirmation
+                    </button>
+                </form>
+
+            <?php elseif ($step === 'lightning'): ?>
+                <!-- Screen: Lightning destinations (LNURL + CLINK noffer) -->
+                <?php
+                $lnExistingAddress = '';
+                $lnExistingNoffer = '';
+                foreach ($renderStoreId ? StoreLnAddresses::listForStore($renderStoreId) : [] as $lnRow) {
+                    if ($lnRow['type'] === StoreLnAddresses::TYPE_NOFFER) {
+                        if ($lnExistingNoffer === '') { $lnExistingNoffer = $lnRow['address']; }
+                    } elseif ($lnExistingAddress === '') {
+                        $lnExistingAddress = $lnRow['address'];
+                    }
+                }
+                ?>
+                <h2 style="margin-bottom: 1rem;">Lightning payments</h2>
+                <p style="margin-bottom: 1.25rem;">
+                    Lightning payments are faster and cheaper, we strongly
+                    suggest enabling them.
+                </p>
+
+                <form method="POST" action="<?= htmlspecialchars(Urls::setup()) ?>">
+                    <input type="hidden" name="step" value="lightning">
+                    <input type="hidden" name="lightning_action" value="save">
+                    <?php if ($mode === 'add_store'): ?>
+                        <input type="hidden" name="mode" value="add_store">
+                    <?php endif; ?>
+
+                    <div class="form-group">
+                        <label for="lightning_address">LNURL/lightning address eg myname@strike.me</label>
+                        <input type="text" id="lightning_address" name="lightning_address"
+                               style="font-family: monospace; font-size: 0.9rem;"
+                               value="<?= htmlspecialchars($_POST['lightning_address'] ?? $lnExistingAddress) ?>"
+                               placeholder="myname@strike.me">
+                    </div>
+
+                    <div class="form-group">
+                        <label for="noffer">noffer</label>
+                        <input type="text" id="noffer" name="noffer"
+                               style="font-family: monospace; font-size: 0.9rem;"
+                               value="<?= htmlspecialchars($_POST['noffer'] ?? $lnExistingNoffer) ?>"
+                               placeholder="noffer1&hellip;">
+                    </div>
+
+                    <button type="submit" class="btn" style="width: 100%;">Continue</button>
+                </form>
+
+                <form method="POST" action="<?= htmlspecialchars(Urls::setup()) ?>" style="margin-top: 0.5rem;">
+                    <input type="hidden" name="step" value="lightning">
+                    <input type="hidden" name="lightning_action" value="skip">
+                    <?php if ($mode === 'add_store'): ?>
+                        <input type="hidden" name="mode" value="add_store">
+                    <?php endif; ?>
+                    <button type="submit" class="btn btn-secondary" style="width: 100%;">Skip for now</button>
+                </form>
+
+                <div style="background: rgba(0,0,0,0.2); padding: 1rem; border-radius: 8px; margin-top: 1.5rem; font-size: 0.9rem; color: #a0aec0;">
+                    <p style="margin-bottom: 0.75rem;">
+                        Don't have a lightning address? You can get one for free
+                        (and enable instant fiat/USD conversion) in 100+
+                        countries at
+                        <a href="https://strike.me" target="_blank" rel="noopener noreferrer" style="color: #63b3ed;">strike.me</a>.
+                    </p>
+                    <p style="margin-bottom: 0.75rem;">
+                        Don't want to use strike? Want full self-custody? You can
+                        use the
+                        <a href="https://github.com/BareBits/electrum_clink" target="_blank" rel="noopener noreferrer" style="color: #63b3ed;">clink plugin for the Electrum wallet</a>
+                        to generate an noffer and have lightning payments
+                        delivered directly to your electrum wallet (when
+                        online). We also suggest the
+                        <a href="https://github.com/BareBits/electrum_liquidity" target="_blank" rel="noopener noreferrer" style="color: #63b3ed;">Electrum Liquidity Management plugin</a>,
+                        just set to automatic mode and you'll always have
+                        inbound liquidity once you reach a balance of around
+                        $100 worth of BTC. BareBits provides graceful fallback
+                        options for if your wallet is offline or doesn't have
+                        inbound liquidity.
+                    </p>
+                    <p style="margin: 0;">
+                        Alternate option: use a cashu mint. A cashu mint holds
+                        onto your funds (no need to worry about managing
+                        liquidity or keeping wallet online) and funds are
+                        automatically withdrawn to your on-chain wallet when a
+                        sufficient amount has accumulated. Just skip this
+                        section if you prefer to use a cashu mint.
+                    </p>
+                </div>
+
+            <?php elseif ($step === 'swaps'): ?>
+                <!-- Screen: submarine swaps -->
+                <h2 style="margin-bottom: 1rem;">Submarine swaps</h2>
+                <p style="margin-bottom: 1.5rem;">
+                    Enable submarine swaps? We suggest using them. Submarine
+                    swaps are used if lightning payments can't be delivered. For
+                    example: your lightning address provider is down, you are
+                    using Electrum but have no available liquidity/your wallet
+                    is offline. With a submarine swap, your customer pays in
+                    lightning + a small fee for the swap (around 1%), and you
+                    receive the payment on-chain.
+                </p>
+
+                <?php if (!$renderOnchain['hasXpub']): ?>
+                    <div class="warning" style="margin-bottom: 1rem;">
+                        Submarine swaps send Bitcoin to your on-chain wallet, so
+                        they need an xpub. Go back and add one to turn this on.
+                    </div>
+                <?php endif; ?>
+
+                <form method="POST" action="<?= htmlspecialchars(Urls::setup()) ?>">
+                    <input type="hidden" name="step" value="swaps">
+                    <?php if ($mode === 'add_store'): ?>
+                        <input type="hidden" name="mode" value="add_store">
+                    <?php endif; ?>
+                    <button type="submit" name="swaps_enabled" value="1" class="btn" style="width: 100%;"
+                            <?= $renderOnchain['hasXpub'] ? '' : 'disabled' ?>>
+                        Enable submarine swaps
+                    </button>
+                    <button type="submit" name="swaps_enabled" value="0" class="btn btn-secondary" style="width: 100%; margin-top: 0.5rem;">
+                        No thanks
+                    </button>
+                </form>
+
+            <?php elseif ($step === 'mints'): ?>
+                <!-- Screen: Cashu mints (auto-picked main + backup, or manual) -->
+                <h2 style="margin-bottom: 1rem;">Cashu mints</h2>
+                <p style="margin-bottom: 1.5rem;">
+                    Enable Cashu Mints? We suggest enabling a cashu mint, it
+                    will be used as a fallback for accepting lightning payments
+                    ONLY when you have no working lnurl/noffer AND submarine
+                    swaps are not workable. This might happen if the payment is
+                    small (submarine swap providers generally won't allow swaps
+                    under around $10). Funds from your cashu mint will be
+                    automatically swept into your on-chain wallet when
+                    economically rational (fees are not too high). Remember that
+                    mints are custodial: they could go offline and take your
+                    funds with them, which is why we sweep funds out of them at
+                    the first available opportunity.
+                </p>
+
+                <form method="POST" action="<?= htmlspecialchars(Urls::setup()) ?>" id="mints-form">
+                    <input type="hidden" name="step" value="mints">
+                    <input type="hidden" name="mints_enabled" value="1">
+                    <input type="hidden" name="mint_url" id="mint_url" value="<?= htmlspecialchars($_POST['mint_url'] ?? '') ?>">
+                    <input type="hidden" name="backup_mint_url" id="backup_mint_url" value="<?= htmlspecialchars($_POST['backup_mint_url'] ?? '') ?>">
+                    <input type="hidden" name="mint_unit" id="mint_unit" value="<?= htmlspecialchars($_POST['mint_unit'] ?? 'sat') ?>">
+                    <?php if ($mode === 'add_store'): ?>
+                        <input type="hidden" name="mode" value="add_store">
+                    <?php endif; ?>
+
+                    <div id="mint-autopick-status" style="background: rgba(0,0,0,0.2); padding: 1rem; border-radius: 8px; margin-bottom: 1rem; font-size: 0.9rem; color: #a0aec0;">
+                        Finding well-reviewed mints&hellip;
+                    </div>
+
+                    <div id="mint-autopick-result" style="display: none; margin-bottom: 1rem;">
+                        <p style="font-weight: 500; margin-bottom: 0.75rem;">We picked two well-reviewed mints for you</p>
+                        <div style="background: rgba(0,0,0,0.2); padding: 0.75rem; border-radius: 8px; margin-bottom: 0.5rem;">
+                            <p style="font-size: 0.8rem; color: #a0aec0; margin: 0;">Main mint</p>
+                            <code id="mint-primary-display" style="word-break: break-all; font-size: 0.85rem;"></code>
+                        </div>
+                        <div style="background: rgba(0,0,0,0.2); padding: 0.75rem; border-radius: 8px;">
+                            <p style="font-size: 0.8rem; color: #a0aec0; margin: 0;">Backup mint</p>
+                            <code id="mint-backup-display" style="word-break: break-all; font-size: 0.85rem;"></code>
+                        </div>
+                    </div>
+
+                    <!-- Manual entry. Shown on demand, and automatically when
+                         discovery can't produce two usable sat mints. -->
+                    <div id="mint-manual" style="display: none; margin-bottom: 1rem;">
+                        <div class="form-group">
+                            <label for="mint_url_manual">Main mint URL</label>
+                            <div style="display: flex; gap: 0.5rem;">
+                                <input type="url" id="mint_url_manual" placeholder="https://&hellip;" style="flex: 1;">
+                                <button type="button" class="btn btn-secondary" onclick="openMintDiscovery('primary')" style="white-space: nowrap;">Browse</button>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label for="backup_mint_url_manual">Backup mint URL</label>
+                            <div style="display: flex; gap: 0.5rem;">
+                                <input type="url" id="backup_mint_url_manual" placeholder="https://&hellip;" style="flex: 1;">
+                                <button type="button" class="btn btn-secondary" onclick="openMintDiscovery('backup')" style="white-space: nowrap;">Browse</button>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label for="mint_unit_manual">Currency unit</label>
+                            <select id="mint_unit_manual">
+                                <option value="sat">Bitcoin (sats)</option>
+                                <option value="usd">USD</option>
+                                <option value="eur">EUR</option>
+                            </select>
+                            <p class="help-text">Both mints must support the unit you pick.</p>
+                        </div>
+                    </div>
+
+                    <p style="margin-bottom: 1rem;">
+                        <a href="#" id="mint-manual-toggle" style="color: #63b3ed; font-size: 0.9rem;">Choose my own mints</a>
+                    </p>
+
+                    <button type="submit" class="btn" style="width: 100%;" id="mints-continue-btn" disabled>Continue</button>
+                </form>
+
+                <form method="POST" action="<?= htmlspecialchars(Urls::setup()) ?>" style="margin-top: 0.5rem;">
+                    <input type="hidden" name="step" value="mints">
+                    <input type="hidden" name="mints_enabled" value="0">
+                    <?php if ($mode === 'add_store'): ?>
+                        <input type="hidden" name="mode" value="add_store">
+                    <?php endif; ?>
+                    <button type="submit" class="btn btn-secondary" style="width: 100%;">No thanks, run without mints</button>
+                </form>
+
+            <?php elseif ($step === SetupFlow::ADD_STORE_COMPLETE): ?>
+                <!-- Screen: add_store hand-off. Only reached when the mints
+                     answer generated a wallet seed, which has to be shown once
+                     before we return the operator to the admin panel. -->
+                <?php
+                $createdStoreId = $_SESSION['setup_store_id'] ?? null;
+                $createdStore = $createdStoreId ? Config::getStore($createdStoreId) : null;
+                unset($_SESSION['setup_store_id'], $_SESSION['setup_store_mode']);
+                $adminReturn = Urls::admin()
+                    . ($createdStoreId ? '?store_created=' . urlencode($createdStoreId) : '');
+                ?>
+                <h2 style="margin-bottom: 1rem;">Store created</h2>
+
+                <div class="success">
+                    <?= htmlspecialchars($createdStore['name'] ?? 'Your store') ?> is ready.
+                </div>
+
+                <?php if ($generatedSeed): ?>
+                <div class="warning" style="margin-bottom: 1rem;">
+                    <strong>Save your recovery phrase</strong>
+                    <p style="margin: 0.5rem 0 0; font-size: 0.9rem;">
+                        These 12 words can recover any ecash held at this store's
+                        mints if this server is lost. Write them down somewhere
+                        safe and offline &mdash; we can show them again in store
+                        settings, but anyone who has them can spend your funds.
+                    </p>
+                </div>
+                <div class="seed-display"><?= htmlspecialchars($generatedSeed) ?></div>
+                <?php unset($_SESSION['setup_generated_seed']); ?>
+                <?php endif; ?>
+
+                <a href="<?= htmlspecialchars($adminReturn) ?>" class="btn" style="width: 100%; text-align: center; display: block;">
+                    Go to BareBits Admin
+                </a>
+
+            <?php elseif ($step === 'cron'): ?>
+                <!-- Screen: cron reminder -->
+                <?php
+                $cronKey = Config::get('cron_key');
+                if (!$cronKey) {
+                    $cronKey = bin2hex(random_bytes(32));
+                    Config::set('cron_key', $cronKey);
+                }
+                // Same shape the admin Settings page renders, so operators see
+                // one canonical line in both places. The key travels in a
+                // header rather than the query string so it stays out of
+                // access logs.
+                $cronLine = '* * * * * curl -fsS -H \'X-CRON-KEY: ' . $cronKey . '\' '
+                    . Urls::cron() . ' > /dev/null';
+                ?>
+                <h2 style="margin-bottom: 1rem;">Enable cron</h2>
+                <p style="margin-bottom: 1.25rem;">
+                    Important: we strongly suggest enabling cron. Without cron,
+                    certain operations like sweeping funds from a mint will only
+                    occur when the site is visited instead of regularly in the
+                    background.
+                </p>
+
+                <p style="margin-bottom: 0.5rem; font-size: 0.9rem; color: #a0aec0;">
+                    Add this line to your crontab (or your host's cron panel):
+                </p>
+                <pre style="background: rgba(0,0,0,0.3); padding: 0.75rem; border-radius: 6px; font-size: 0.8rem; user-select: all;"><?= htmlspecialchars($cronLine) ?></pre>
+
+                <form method="POST" action="<?= htmlspecialchars(Urls::setup()) ?>" style="margin-top: 1.5rem;">
+                    <input type="hidden" name="step" value="cron">
+                    <button type="submit" class="btn" style="width: 100%;">Continue</button>
+                </form>
+
+            <?php elseif ($step === 'done'): ?>
+                <!-- Screen: complete -->
+                <h2 style="margin-bottom: 1rem;">You're all set!</h2>
 
                 <div class="success">
                     BareBits is ready to accept payments.
                 </div>
 
                 <?php
-                // Check for restore result from previous step
-                $restoreResult = $_SESSION['restore_result'] ?? null;
-                if ($restoreResult):
-                    unset($_SESSION['restore_result']);
-                    if ($restoreResult['success']):
-                        $proofsFound = $restoreResult['proofs_found'] ?? 0;
-                        $proofsUnspent = $restoreResult['proofs_unspent'] ?? 0;
-                        $proofsSpent = $restoreResult['proofs_spent'] ?? 0;
-                        $countersRestored = count($restoreResult['counters'] ?? []);
-                        if ($proofsFound > 0 || $countersRestored > 0): ?>
-                <div style="background: rgba(72, 187, 120, 0.1); border: 1px solid rgba(72, 187, 120, 0.3); padding: 1rem; border-radius: 8px; margin-bottom: 1.5rem;">
-                    <p style="margin-bottom: 0.25rem; font-weight: 500; color: #68d391;">Wallet Restored</p>
-                    <p style="color: #a0aec0; font-size: 0.9rem;">
-                        <?php if ($proofsFound > 0): ?>
-                            Found <?= $proofsFound ?> token(s) from previous use.
-                            <?php if ($proofsUnspent > 0 || $proofsSpent > 0): ?>
-                                <br><span style="font-size: 0.85rem;">
-                                    <?= $proofsUnspent ?> unspent (available)<?php if ($proofsSpent > 0): ?>, <?= $proofsSpent ?> already spent<?php endif; ?>
-                                </span>
-                            <?php endif; ?>
-                        <?php else: ?>
-                            Counter position restored for <?= $countersRestored ?> keyset(s).
-                        <?php endif; ?>
-                    </p>
-                </div>
-                <?php endif;
-                    elseif (!empty($restoreResult['error'])): ?>
+                // Warn when the operator skipped every payment rail — the
+                // store exists but no invoice created against it could be
+                // paid. Mirrors the capability test Invoice::create makes.
+                //
+                // Only claim this when we actually know which store was just
+                // built. Reaching this screen on a fresh session (browser
+                // restarted, cookie expired, link opened in another tab) leaves
+                // no store id, and a store we cannot inspect must not be
+                // reported as unpayable — that reads as "your setup failed"
+                // when nothing is wrong.
+                $doneStoreId = $_SESSION['setup_store_id'] ?? null;
+                $doneOnchain = SetupFlow::onchainState($doneStoreId);
+                $doneStore = $doneStoreId ? Config::getStore($doneStoreId) : null;
+                $doneHasLn = $doneStoreId ? (StoreLnAddresses::addressesForStore($doneStoreId) !== []) : false;
+                $doneHasMint = !empty($doneStore['mint_url']) && !empty($doneStore['seed_phrase']);
+                $doneHasSwaps = $doneStoreId ? SwapsConfig::isEnabledForStore($doneStoreId) : false;
+                $doneHasAnyRail = $doneOnchain['configured'] || $doneHasLn || $doneHasMint || $doneHasSwaps;
+                $doneKnowsStore = $doneStore !== null;
+                ?>
+                <?php if ($doneKnowsStore && !$doneHasAnyRail): ?>
                 <div class="warning" style="margin-bottom: 1.5rem;">
-                    <p style="margin-bottom: 0.25rem; font-weight: 500;">Wallet Restore Warning</p>
-                    <p style="font-size: 0.9rem;">
-                        Could not restore wallet history: <?= htmlspecialchars($restoreResult['error']) ?>
-                    </p>
-                    <p style="font-size: 0.85rem; color: #a0aec0; margin-top: 0.5rem;">
-                        If this seed was used before, you may encounter "token already spent" errors.
-                        You can re-run setup with the same seed to try again.
+                    <strong>No payment method is set up yet.</strong>
+                    <p style="margin-top: 0.5rem; font-size: 0.9rem;">
+                        Your store can't take payments yet. Add an on-chain
+                        wallet, a Lightning address, or a Cashu mint in store
+                        settings.
                     </p>
                 </div>
-                <?php endif;
-                endif;
+                <?php endif; ?>
+
+                <?php if ($generatedSeed): ?>
+                <div class="warning" style="margin-bottom: 1rem;">
+                    <strong>Save your recovery phrase</strong>
+                    <p style="margin: 0.5rem 0 0; font-size: 0.9rem;">
+                        These 12 words can recover any ecash held at your mints
+                        if this server is lost. Write them down somewhere safe
+                        and offline &mdash; we can show them again in store settings,
+                        but anyone who has them can spend your funds.
+                    </p>
+                </div>
+                <div class="seed-display"><?= htmlspecialchars($generatedSeed) ?></div>
+                <?php unset($_SESSION['setup_generated_seed']); ?>
+                <?php endif; ?>
+
                 ?>
 
                 <?php
@@ -2092,8 +2140,33 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                 if (!function_exists('is_plugin_active')) {
                     require_once ABSPATH . 'wp-admin/includes/plugin.php';
                 }
-                require_once __DIR__ . '/btcpay-integration.php';
-                $btcpayPluginActive = is_plugin_active('btcpay-greenfield-for-woocommerce/btcpay-greenfield-for-woocommerce.php');
+                // The helper's location depends on how the plugin was
+                // assembled: build-wordpress-plugin.sh keeps wordpress/ as a
+                // subdirectory, while docker/Dockerfile.wordpress flattens
+                // wordpress/*.php to the plugin root. A bare
+                // __DIR__ . '/btcpay-integration.php' only resolves under the
+                // second, so the zip the build script produces fataled here and
+                // never rendered the completion screen at all. Try both, and
+                // degrade to "no WooCommerce wiring offered" rather than
+                // killing the page if neither is present.
+                $btcpayHelper = null;
+                foreach ([
+                    __DIR__ . '/wordpress/btcpay-integration.php',
+                    __DIR__ . '/btcpay-integration.php',
+                ] as $candidate) {
+                    if (is_file($candidate)) {
+                        $btcpayHelper = $candidate;
+                        break;
+                    }
+                }
+                if ($btcpayHelper !== null) {
+                    require_once $btcpayHelper;
+                } else {
+                    error_log('CashuPayServer: btcpay-integration.php not found; '
+                        . 'skipping the WooCommerce section of the setup completion screen.');
+                }
+                $btcpayPluginActive = $btcpayHelper !== null
+                    && is_plugin_active('btcpay-greenfield-for-woocommerce/btcpay-greenfield-for-woocommerce.php');
                 $storeId = $_SESSION['setup_store_id'] ?? null;
                 $wooConfigured = false;
 
@@ -2158,7 +2231,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                                 The BTCPay WooCommerce plugin is active. Click below to auto-configure it to use CashuPay.
                             </p>
                             <form method="post">
-                                <input type="hidden" name="step" value="7">
+                                <input type="hidden" name="step" value="done">
                                 <input type="hidden" name="configure_woocommerce" value="1">
                                 <button type="submit" class="btn" style="width: 100%;">Configure WooCommerce</button>
                             </form>
@@ -2249,17 +2322,17 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                 // Clear temporary session data
                 // In WordPress mode, keep session if WooCommerce still needs to be configured
                 if (!Urls::isWordPress() || (isset($wooConfigured) && $wooConfigured)) {
-                    unset($_SESSION['setup_store_id'], $_SESSION['mint_units'], $_SESSION['mint_url_temp'], $_SESSION['temp_seed']);
+                    unset($_SESSION['setup_store_id'], $_SESSION['setup_store_mode'], $_SESSION['setup_generated_seed']);
                 }
                 ?>
             <?php endif; ?>
-        </div>
-    </div>
 
-    <!-- Spinner overlay for restore -->
-    <div class="spinner-overlay" id="spinnerOverlay">
-        <div class="spinner"></div>
-        <div class="spinner-text" id="spinnerText">Restoring wallet from seed...</div>
+            <?php if ($backUrl !== null): ?>
+                <p style="margin-top: 1.25rem; text-align: center;">
+                    <a href="<?= htmlspecialchars($backUrl) ?>" style="color: #a0aec0; font-size: 0.9rem;">Back</a>
+                </p>
+            <?php endif; ?>
+        </div>
     </div>
 
     <!-- Mint Discovery Modal -->
@@ -2328,7 +2401,9 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
         return String(u || '').replace(/\/+$/, '');
     }
 
-    function openMintDiscovery() {
+    function openMintDiscovery(target) {
+        // Remember which manual field the "Select" buttons should fill.
+        mintDiscoveryTarget = (target === 'backup') ? 'backup' : 'primary';
         document.getElementById('mint-discovery-modal').style.display = 'flex';
         // Reset disclaimer checkbox state when opening
         var checkbox = document.getElementById('mint-disclaimer-checkbox');
@@ -2710,108 +2785,178 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
         updateSelectButtons();
     }
 
+
+    // Which field the discovery modal is filling — set by the Browse button
+    // that opened it. Defaults to the main mint.
+    var mintDiscoveryTarget = 'primary';
+
     function selectDiscoveredMint(url) {
-        document.getElementById('mint_url').value = url;
+        var id = mintDiscoveryTarget === 'backup' ? 'backup_mint_url_manual' : 'mint_url_manual';
+        var el = document.getElementById(id);
+        if (el) {
+            el.value = url;
+            el.dispatchEvent(new Event('input'));
+        }
         closeMintDiscovery();
     }
 
-    // Expiry testing
-    var expiryTestTimeout = null;
+    // ---- Cashu mint auto-pick (mints screen) -------------------------------
+    //
+    // Runs the same Nostr discovery the Browse modal uses and picks the two
+    // best-reviewed mints that advertise 'sat', preferring the BareBits
+    // suggested list (which the modal also pins to the top). Discovery is
+    // best-effort: relays can be slow, blocked, or return too few usable
+    // mints, so anything short of two results falls back to manual entry
+    // rather than leaving the operator on a dead screen.
+    (function () {
+        var form = document.getElementById('mints-form');
+        if (!form) return;
 
-    function testMintExpirySetup() {
-        var unitSelect = document.getElementById('mint_unit');
-        var unit = unitSelect ? unitSelect.value : '';
-        var mintUrlEl = document.getElementById('mint_url');
+        var statusEl = document.getElementById('mint-autopick-status');
+        var resultEl = document.getElementById('mint-autopick-result');
+        var manualEl = document.getElementById('mint-manual');
+        var manualToggle = document.getElementById('mint-manual-toggle');
+        var continueBtn = document.getElementById('mints-continue-btn');
+        var primaryField = document.getElementById('mint_url');
+        var backupField = document.getElementById('backup_mint_url');
+        var unitField = document.getElementById('mint_unit');
+        var primaryManual = document.getElementById('mint_url_manual');
+        var backupManual = document.getElementById('backup_mint_url_manual');
+        var unitManual = document.getElementById('mint_unit_manual');
+        var manualShown = false;
 
-        // For setup.php, the mint URL is in a hidden input when unit selection is shown
-        var mintUrl = '<?= htmlspecialchars($mintUrlTemp ?? '') ?>';
-
-        if (!unit || !mintUrl) return;
-
-        var statusEl = document.getElementById('expiry-test-status');
-        var warningEl = document.getElementById('expiry-warning');
-        var continueBtn = document.getElementById('continue-btn');
-
-        statusEl.style.display = 'block';
-        statusEl.style.background = 'rgba(247, 147, 26, 0.1)';
-        statusEl.style.border = '1px solid rgba(247, 147, 26, 0.3)';
-        statusEl.innerHTML = '<span style="color: #f7931a;">Testing invoice expiry...</span>';
-        warningEl.style.display = 'none';
-
-        // Clear any previous timeout
-        if (expiryTestTimeout) clearTimeout(expiryTestTimeout);
-
-        expiryTestTimeout = setTimeout(function() {
-            var formData = new FormData();
-            formData.append('action', 'test_mint_expiry');
-            formData.append('mint_url', mintUrl);
-            formData.append('unit', unit);
-            <?php if ($mode === 'add_store'): ?>
-            formData.append('mode', 'add_store');
-            <?php endif; ?>
-
-            fetch(<?= json_encode(Urls::setup()) ?>, {
-                method: 'POST',
-                body: formData
-            })
-            .then(function(response) { return response.json(); })
-            .then(function(result) {
-                if (result.success) {
-                    if (result.warning) {
-                        statusEl.style.display = 'none';
-                        warningEl.style.display = 'block';
-                        document.getElementById('expiry-warning-message').textContent = result.message;
-
-                        // Check acknowledgment state for button
-                        var ackCheckbox = document.getElementById('expiry-acknowledged');
-                        ackCheckbox.onchange = function() {
-                            continueBtn.disabled = !ackCheckbox.checked;
-                        };
-                        continueBtn.disabled = true;
-                    } else {
-                        var mins = Math.round(result.expiry_seconds / 60);
-                        statusEl.style.background = 'rgba(72, 187, 120, 0.1)';
-                        statusEl.style.border = '1px solid rgba(72, 187, 120, 0.3)';
-                        statusEl.innerHTML = '<span style="color: #68d391;">Invoice expiry: ' + mins + ' minutes (OK)</span>';
-                        continueBtn.disabled = false;
-                    }
-                } else {
-                    statusEl.style.background = 'rgba(229, 62, 62, 0.1)';
-                    statusEl.style.border = '1px solid rgba(229, 62, 62, 0.3)';
-                    statusEl.innerHTML = '<span style="color: #fc8181;">Could not test expiry: ' + escapeHtml(result.error || 'Unknown error') + '</span>';
-                    continueBtn.disabled = false;
-                }
-            })
-            .catch(function(error) {
-                statusEl.style.background = 'rgba(229, 62, 62, 0.1)';
-                statusEl.style.border = '1px solid rgba(229, 62, 62, 0.3)';
-                statusEl.innerHTML = '<span style="color: #fc8181;">Network error testing expiry</span>';
-                continueBtn.disabled = false;
-            });
-        }, 300);
-    }
-
-    // Auto-trigger expiry test if a unit is already selected on page load
-    var unitSelect = document.getElementById('mint_unit');
-    if (unitSelect && unitSelect.value) {
-        testMintExpirySetup();
-    }
-
-    // Show spinner when restoring from existing seed
-    document.addEventListener('DOMContentLoaded', function() {
-        var existingSeedForm = document.getElementById('existing_seed');
-        if (existingSeedForm) {
-            var form = existingSeedForm.closest('form');
-            if (form) {
-                form.addEventListener('submit', function() {
-                    var spinner = document.getElementById('spinnerOverlay');
-                    if (spinner) {
-                        spinner.classList.add('active');
-                    }
-                });
-            }
+        function normalize(u) {
+            return String(u || '').replace(/\/+$/, '');
         }
-    });
+
+        function showManual(force) {
+            manualShown = true;
+            manualEl.style.display = 'block';
+            manualToggle.style.display = 'none';
+            if (force) { resultEl.style.display = 'none'; }
+            syncFromManual();
+        }
+
+        // The hidden fields are what actually POST; the visible manual inputs
+        // mirror into them so both paths submit through one code path.
+        function syncFromManual() {
+            primaryField.value = normalize(primaryManual.value.trim());
+            backupField.value = normalize(backupManual.value.trim());
+            unitField.value = unitManual.value;
+            continueBtn.disabled = !(primaryField.value && backupField.value);
+        }
+
+        manualToggle.addEventListener('click', function (e) {
+            e.preventDefault();
+            // Seed the manual inputs with whatever was auto-picked so the
+            // operator edits rather than retypes.
+            if (primaryField.value && !primaryManual.value) { primaryManual.value = primaryField.value; }
+            if (backupField.value && !backupManual.value) { backupManual.value = backupField.value; }
+            showManual(true);
+        });
+        primaryManual.addEventListener('input', syncFromManual);
+        backupManual.addEventListener('input', syncFromManual);
+        unitManual.addEventListener('change', syncFromManual);
+
+        function applyAutoPick(primary, backup) {
+            primaryField.value = primary;
+            backupField.value = backup;
+            unitField.value = 'sat';
+            document.getElementById('mint-primary-display').textContent = primary;
+            document.getElementById('mint-backup-display').textContent = backup;
+            resultEl.style.display = 'block';
+            statusEl.style.display = 'none';
+            continueBtn.disabled = false;
+        }
+
+        function failToManual(message) {
+            statusEl.textContent = message;
+            showManual(true);
+        }
+
+        function supportsSat(mint) {
+            var units = getUnitsFromInfo(mint.info);
+            return units.indexOf('sat') !== -1;
+        }
+
+        function rank(mints) {
+            // Suggested mints first (in server order), then by review count and
+            // rating — the same ordering the Browse modal presents, so the
+            // auto-pick is never surprising relative to the manual list.
+            var pinned = [];
+            var rest = [];
+            mints.forEach(function (m) {
+                if (isSuggested(m.url)) { pinned.push(m); } else { rest.push(m); }
+            });
+            pinned.sort(function (a, b) {
+                return suggestedMintUrls.indexOf(normalize(a.url)) - suggestedMintUrls.indexOf(normalize(b.url));
+            });
+            rest.sort(function (a, b) {
+                var countDiff = (b.reviewsCount || 0) - (a.reviewsCount || 0);
+                if (countDiff !== 0) return countDiff;
+                return (b.averageRating || 0) - (a.averageRating || 0);
+            });
+            return pinned.concat(rest);
+        }
+
+        function finish() {
+            if (manualShown) return;
+            var usable = rank(discoveredMints.filter(function (m) {
+                return !m.error && m.info && supportsSat(m);
+            }));
+            // Dedup by normalized URL — the suggested-list fetch and the Nostr
+            // stream can surface the same mint twice.
+            var seen = {};
+            var unique = [];
+            usable.forEach(function (m) {
+                var n = normalize(m.url);
+                if (!n || seen[n]) return;
+                seen[n] = true;
+                unique.push(n);
+            });
+            if (unique.length < 2) {
+                failToManual(
+                    'We couldn\'t reach the mint directory just now. You can enter mint URLs '
+                    + 'yourself, or skip and add them later in store settings.'
+                );
+                return;
+            }
+            applyAutoPick(unique[0], unique[1]);
+        }
+
+        if (typeof MintDiscovery === 'undefined') {
+            failToManual('The mint list didn\'t load. Enter mint URLs manually below.');
+            return;
+        }
+
+        fetchSuggestedMints();
+        var instance = MintDiscovery.create({ httpTimeout: 8000, nostrTimeout: 15000 });
+        var settled = false;
+        function settle() {
+            if (settled) return;
+            settled = true;
+            finish();
+        }
+        // Belt and braces: discoverStreaming's onComplete does not fire if a
+        // relay hangs past its own timeout, and an operator staring at
+        // "Finding well-reviewed mints…" forever is worse than manual entry.
+        var guard = setTimeout(settle, 20000);
+        instance.discoverStreaming({
+            onMint: function (mint) {
+                var i = discoveredMints.findIndex(function (m) { return m.url === mint.url; });
+                if (i >= 0) { discoveredMints[i] = mint; } else { discoveredMints.push(mint); }
+                statusEl.textContent = 'Found ' + discoveredMints.length + ' mints…';
+            },
+            onComplete: function (mints) {
+                if (Array.isArray(mints) && mints.length) { discoveredMints = mints; }
+                clearTimeout(guard);
+                settle();
+            }
+        }).catch(function () {
+            clearTimeout(guard);
+            settle();
+        });
+    })();
     </script>
 </body>
 </html>

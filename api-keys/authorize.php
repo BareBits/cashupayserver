@@ -16,6 +16,8 @@
  * - strict            - If false, user can modify permissions (default: true)
  */
 
+require_once __DIR__ . '/../includes/http_status.php';
+
 require_once __DIR__ . '/../includes/database.php';
 require_once __DIR__ . '/../includes/config.php';
 require_once __DIR__ . '/../includes/auth.php';
@@ -67,7 +69,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     // deny redirects the user). Forms below carry the per-session token.
     $submittedToken = $_POST['csrf_token'] ?? '';
     if (!Auth::validateCsrfToken($submittedToken)) {
-        http_response_code(403);
+        cashupay_status(403);
         // Render via the same template as other failures so the user gets
         // a recoverable page (reload mints a new token).
         $error = 'Session expired or invalid request. Please try again.';

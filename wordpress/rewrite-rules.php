@@ -104,7 +104,10 @@ function cashupay_handle_request(): void {
 
     if ($admin) {
         if (!current_user_can('manage_options')) {
-            wp_die('Access denied');
+            // Without an explicit response code wp_die() answers 500, which
+            // tells a client the server broke rather than that they are not
+            // allowed in.
+            wp_die('Access denied', 'Access denied', ['response' => 403]);
         }
         require CASHUPAY_PLUGIN_DIR . '/admin.php';
         exit;
@@ -112,7 +115,7 @@ function cashupay_handle_request(): void {
 
     if ($setup) {
         if (!current_user_can('manage_options')) {
-            wp_die('Access denied');
+            wp_die('Access denied', 'Access denied', ['response' => 403]);
         }
         require CASHUPAY_PLUGIN_DIR . '/setup.php';
         exit;

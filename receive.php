@@ -8,6 +8,8 @@
  * - Can be used as the transport target for payment requests
  */
 
+require_once __DIR__ . '/includes/http_status.php';
+
 require_once __DIR__ . '/includes/database.php';
 require_once __DIR__ . '/includes/config.php';
 require_once __DIR__ . '/includes/auth.php';
@@ -25,7 +27,7 @@ use Cashu\CashuNetworkException;
 
 // Initialize database
 if (!Database::isInitialized()) {
-    http_response_code(503);
+    cashupay_status(503);
     header('Content-Type: application/json');
     echo json_encode(['error' => 'Server not configured']);
     exit;
@@ -33,7 +35,7 @@ if (!Database::isInitialized()) {
 
 // Check setup complete
 if (!Config::isSetupComplete()) {
-    http_response_code(503);
+    cashupay_status(503);
     header('Content-Type: application/json');
     echo json_encode(['error' => 'Server setup not complete']);
     exit;
@@ -63,20 +65,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $storeId = $data['store_id'] ?? null;
 
     if (!$storeId) {
-        http_response_code(400);
+        cashupay_status(400);
         echo json_encode(['error' => 'Missing store_id parameter']);
         exit;
     }
 
     if (!$tokenString) {
-        http_response_code(400);
+        cashupay_status(400);
         echo json_encode(['error' => 'Missing token']);
         exit;
     }
 
     // Verify store exists and is configured
     if (!Config::isStoreConfigured($storeId)) {
-        http_response_code(400);
+        cashupay_status(400);
         echo json_encode(['error' => 'Store not found or not configured']);
         exit;
     }
@@ -104,21 +106,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $probeToken = (new Wallet(Config::getStoreMintUrl($storeId), $unit))
             ->deserializeToken($tokenString);
     } catch (Exception $e) {
-        http_response_code(400);
+        cashupay_status(400);
         echo json_encode(['error' => 'Could not read token: ' . $e->getMessage()]);
         exit;
     }
     $tokenUnit = OfflineCashu::normUnit($probeToken->unit ?? null);
     $wantUnit = OfflineCashu::normUnit($unit);
     if ($tokenUnit !== $wantUnit) {
-        http_response_code(400);
+        cashupay_status(400);
         echo json_encode(['error' => "Token unit ({$tokenUnit}) does not match this store's unit ({$wantUnit})"]);
         exit;
     }
     if ($existingInvoice !== null && !empty($existingInvoice['amount_sats'])) {
         $faceAmount = (int)$probeToken->getAmount();
         if ($faceAmount < (int)$existingInvoice['amount_sats']) {
-            http_response_code(400);
+            cashupay_status(400);
             echo json_encode(['error' => "Token amount ($faceAmount) is less than the invoice amount ({$existingInvoice['amount_sats']})"]);
             exit;
         }
@@ -156,7 +158,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         // Provisional invoice to reconcile on reconnect. Otherwise surface the
         // outage as an error (unchanged behavior).
         if (!OfflineCashu::isEnabled($storeId)) {
-            http_response_code(503);
+            cashupay_status(503);
             echo json_encode(['error' => 'Mint is currently unreachable. Please try again shortly.']);
             exit;
         }
@@ -174,7 +176,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     . 'connectivity is restored. There is a small double-spend risk until then.',
             ]);
         } else {
-            http_response_code(400);
+            cashupay_status(400);
             echo json_encode([
                 'error' => 'Offline acceptance failed: ' . $result['reason'],
                 'settlement' => 'rejected',
@@ -183,7 +185,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     } catch (Exception $e) {
         // Mint responded and rejected (already spent, wrong mint, etc.) or any
         // other error: never accept these offline.
-        http_response_code(400);
+        cashupay_status(400);
         echo json_encode(['error' => $e->getMessage()]);
     }
     exit;
@@ -203,7 +205,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
     // POST stays public (NUT-18 token receipt) — handled above.
     if (!Auth::isLoggedIn()) {
         if ($format === 'json') {
-            http_response_code(401);
+            cashupay_status(401);
             header('Content-Type: application/json');
             echo json_encode(['error' => 'Authentication required']);
             exit;
@@ -218,7 +220,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
     // If no store_id provided, show store selector
     if (!$storeId) {
         if ($format === 'json') {
-            http_response_code(400);
+            cashupay_status(400);
             header('Content-Type: application/json');
             echo json_encode(['error' => 'store_id required. Use ?store_id=X&amount=Y']);
             exit;
@@ -386,12 +388,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
     // Verify store exists and is configured
     if (!Config::isStoreConfigured($storeId)) {
         if ($format === 'json') {
-            http_response_code(400);
+            cashupay_status(400);
             header('Content-Type: application/json');
             echo json_encode(['error' => 'Store not found or not configured']);
             exit;
         }
-        http_response_code(400);
+        cashupay_status(400);
         echo "Error: Store not found or not configured";
         exit;
     }
@@ -434,7 +436,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
     if ($amount <= 0) {
         // Show form if no amount specified
         if ($format === 'json') {
-            http_response_code(400);
+            cashupay_status(400);
             header('Content-Type: application/json');
             echo json_encode(['error' => 'Amount required. Use ?store_id=X&amount=Y']);
             exit;
@@ -796,11 +798,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
         <?php
     } catch (Exception $e) {
         if ($format === 'json') {
-            http_response_code(500);
+            cashupay_status(500);
             header('Content-Type: application/json');
             echo json_encode(['error' => $e->getMessage()]);
         } else {
-            http_response_code(500);
+            cashupay_status(500);
             echo "Error: " . htmlspecialchars($e->getMessage());
         }
     }
@@ -808,6 +810,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
 }
 
 // Method not allowed
-http_response_code(405);
+cashupay_status(405);
 header('Content-Type: application/json');
 echo json_encode(['error' => 'Method not allowed']);

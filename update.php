@@ -38,6 +38,8 @@
 
 declare(strict_types=1);
 
+
+require_once __DIR__ . '/includes/http_status.php';
 // Keep running server-side even when the triggering request disconnects early
 // (cron.php fires this fire-and-forget with a 200ms timeout). Downloads + the
 // health-probe retry window need real wall-clock time.
@@ -552,7 +554,7 @@ header('Content-Type: application/json');
 $providedKey = $_SERVER['HTTP_X_CRON_KEY'] ?? $_GET['key'] ?? '';
 $cronKey = upd_config_get('cron_key');
 if (!$cronKey || !is_string($providedKey) || !hash_equals((string)$cronKey, (string)$providedKey)) {
-    http_response_code(403);
+    cashupay_status(403);
     echo json_encode(['ok' => false, 'error' => 'forbidden']);
     exit;
 }
@@ -629,7 +631,7 @@ try {
     if ($manual) {
         upd_set_manual_run('error', ['message' => $e->getMessage()]);
     }
-    http_response_code(500);
+    cashupay_status(500);
     echo json_encode(['ok' => false, 'error' => 'apply_failed', 'message' => $e->getMessage()]);
     exit;
 }

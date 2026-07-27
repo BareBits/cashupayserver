@@ -79,3 +79,93 @@ jobs:
             tests/.tmp/**/*.sqlite
           retention-days: 7
           if-no-files-found: ignore
+
+  build-artifacts:
+    name: Build artifacts
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Use HTTPS for SSH-form submodule URLs
+        run: |
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
+
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.1"
+          extensions: curl, json, gmp, mbstring, sqlite3, zip
+          coverage: none
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # Both artifacts are built on every push/PR, not just on the release
+      # branches, because a broken build is otherwise only discovered when a
+      # release is cut. The WordPress zip in particular shipped for a while
+      # with wordpress/*.php in a subdirectory, which broke every
+      # `__DIR__ . '/sibling.php'` require in the plugin entry point — the zip
+      # could not activate at all, and no job ever built it to notice.
+      - name: Build WordPress plugin
+        run: ./scripts/build-wordpress-plugin.sh
+
+      - name: Verify WordPress plugin layout
+        # Fails if any literal __DIR__- or CASHUPAY_PLUGIN_DIR-relative require
+        # in the built tree does not resolve, or if an expected file is missing
+        # from the plugin root.
+        run: |
+          php scripts/verify-plugin-build.php build/cashupay \
+            cashupay.php \
+            uninstall.php \
+            bootstrap.php \
+            rewrite-rules.php \
+            admin-menu.php \
+            activation.php \
+            btcpay-integration.php \
+            setup.php \
+            admin.php \
+            api.php \
+            pay.php \
+            includes/database.php
+
+      - name: Build standalone zip
+        env:
+          COMMIT_SHA: ${{ github.sha }}
+          CHANNEL: ci
+        run: ./scripts/build-standalone.sh
+
+      - name: Verify standalone layout
+        # Every entry point router.php dispatches to must be present, or a
+        # from-zip install fatals on that route. update.php (the auto-updater),
+        # health.php, pay.php and product-image.php were all missing until this
+        # check was added.
+        run: |
+          php scripts/verify-plugin-build.php build/cashupayserver \
+            setup.php \
+            admin.php \
+            api.php \
+            router.php \
+            index.php \
+            health.php \
+            pay.php \
+            product-image.php \
+            update.php \
+            recover.php \
+            includes/database.php
+
+      - name: Upload built artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-artifacts
+          path: |
+            build/cashupay-wordpress.zip
+            build/cashupayserver.zip
+          retention-days: 7
+          if-no-files-found: error

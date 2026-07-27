@@ -5,6 +5,8 @@
  * BTCPay Server Greenfield API compatible endpoints.
  */
 
+require_once __DIR__ . '/includes/http_status.php';
+
 require_once __DIR__ . '/includes/database.php';
 require_once __DIR__ . '/includes/config.php';
 require_once __DIR__ . '/includes/auth.php';
@@ -19,13 +21,13 @@ header('Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS');
 header('Access-Control-Allow-Headers: Content-Type, Authorization');
 
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
-    http_response_code(200);
+    cashupay_status(200);
     exit;
 }
 
 // Check if setup is complete
 if (!Database::isInitialized() || !Config::isSetupComplete()) {
-    http_response_code(503);
+    cashupay_status(503);
     echo json_encode([
         'code' => 'service-unavailable',
         'message' => 'BareBits setup not complete'
@@ -36,7 +38,7 @@ if (!Database::isInitialized() || !Config::isSetupComplete()) {
 // M1: API Rate limiting (100 requests per minute per IP)
 $clientIp = Security::getClientIp();
 if (!Security::checkRateLimit('api', $clientIp, 100)) {
-    http_response_code(429);
+    cashupay_status(429);
     echo json_encode([
         'code' => 'rate-limited',
         'message' => 'Too many requests. Please wait.'
@@ -74,7 +76,7 @@ if (!str_starts_with($path, '/api/v1/')) {
     if (str_starts_with($path, '/v1/')) {
         $path = '/api' . $path;
     } else {
-        http_response_code(404);
+        cashupay_status(404);
         echo json_encode([
             'code' => 'not-found',
             'message' => 'API endpoint not found'
@@ -157,7 +159,7 @@ function getRequestBody(): array {
  * Send JSON response
  */
 function jsonResponse(array $data, int $status = 200): void {
-    http_response_code($status);
+    cashupay_status($status);
     echo json_encode($data, JSON_UNESCAPED_SLASHES);
     exit;
 }
