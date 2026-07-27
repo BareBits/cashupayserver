@@ -71,6 +71,8 @@ def test_full_flow_persists_every_answer(payserver: PayserverHandle) -> None:
 
     body = w.post(step="cron")
     assert _heading(body) == "You&#039;re all set!" or "all set" in _heading(body)
+    # A stray PHP close tag once leaked onto this screen as literal text.
+    assert "?>" not in body, "the completion screen must not render a bare ?> as text"
 
     row = _stores(payserver)[0]
     assert row["name"] == "Persisted Store"
