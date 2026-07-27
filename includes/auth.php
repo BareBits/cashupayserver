@@ -5,6 +5,8 @@
  * Admin session management and API key validation.
  */
 
+require_once __DIR__ . '/http_status.php';
+
 require_once __DIR__ . '/database.php';
 require_once __DIR__ . '/config.php';
 require_once __DIR__ . '/security.php';
@@ -70,7 +72,7 @@ class Auth {
      */
     public static function requireAdmin(): void {
         if (!self::isAdmin()) {
-            http_response_code(403);
+            cashupay_status(403);
             header('Content-Type: application/json');
             echo json_encode(['error' => 'Admin role required']);
             exit;
@@ -91,6 +93,62 @@ class Auth {
             return null;
         }
         return self::getUserById($userId);
+    }
+
+    /**
+     * Re-verify the acting admin's own password, for actions sensitive enough
+     * that a hijacked session alone must not be sufficient (currently: reading
+     * a store's wallet recovery phrase).
+     *
+     * The credential differs by deployment. Standalone installs check the
+     * BareBits `users` row. Under WordPress there is no such row at all —
+     * currentUser() returns null by design, because the WordPress admin *is*
+     * the admin — so the WP user's own password is what gets checked. Callers
+     * must still gate on requireAdmin() first; this only adds the second
+     * factor.
+     */
+    public static function verifyCurrentUserPassword(string $password): bool {
+        if ($password === '') {
+            return false;
+        }
+        if (defined('CASHUPAY_WORDPRESS') && CASHUPAY_WORDPRESS) {
+            if (!function_exists('wp_get_current_user') || !function_exists('wp_check_password')) {
+                return false;
+            }
+            $wpUser = wp_get_current_user();
+            if (!$wpUser || empty($wpUser->ID)) {
+                return false;
+            }
+            return (bool) wp_check_password($password, $wpUser->user_pass, $wpUser->ID);
+        }
+
+        $self = self::currentUser();
+        if (!$self) {
+            return false;
+        }
+        $row = Database::fetchOne(
+            "SELECT password_hash FROM users WHERE id = ?",
+            [$self['id']]
+        );
+        return $row !== null && password_verify($password, $row['password_hash']);
+    }
+
+    /**
+     * A stable identifier for whoever is acting, for audit logging. Returns the
+     * WordPress login under WordPress and the BareBits user id otherwise.
+     */
+    public static function currentActorLabel(): string {
+        if (defined('CASHUPAY_WORDPRESS') && CASHUPAY_WORDPRESS) {
+            if (function_exists('wp_get_current_user')) {
+                $wpUser = wp_get_current_user();
+                if ($wpUser && !empty($wpUser->ID)) {
+                    return 'wp:' . ($wpUser->user_login ?: (string) $wpUser->ID);
+                }
+            }
+            return 'wp:unknown';
+        }
+        $self = self::currentUser();
+        return $self['id'] ?? 'unknown';
     }
 
     /**
@@ -767,7 +825,7 @@ class Auth {
     public static function requireApiAuth(): array {
         $auth = self::validateApiRequest();
         if ($auth === null) {
-            http_response_code(401);
+            cashupay_status(401);
             header('Content-Type: application/json');
             echo json_encode([
                 'code' => 'unauthenticated',

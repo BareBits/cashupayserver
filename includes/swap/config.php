@@ -33,6 +33,11 @@
  *    0 → force off
  *    1 → force on
  *
+ * stores.strict_no_mint_fallback uses the same tri-state to override
+ * swaps_strict_no_mint_fallback per store. The onboarding wizard sets it to 1
+ * when the operator declines cashu mints, so that store never acquires a mint
+ * rail even if another store on the same install uses one.
+ *
  * Per-store fee-fallback overrides live on stores.swaps_fee_fallback_max_pct
  * and stores.swaps_fee_fallback_max_sats (REAL/INTEGER, NULL = inherit the
  * site value, which itself falls back to the config-file constant).
@@ -88,6 +93,42 @@ final class SwapsConfig {
 
     public static function setStrictNoMintFallback(bool $strict): void {
         Config::set('swaps_strict_no_mint_fallback', $strict);
+    }
+
+    /**
+     * Effective strict-no-mint-fallback for one store: the per-store tri-state
+     * wins when it is 0/1, otherwise the site-wide config key applies. Callers
+     * that reason about a specific store's rails should always use this rather
+     * than strictNoMintFallback(), which is the site default only.
+     */
+    public static function strictNoMintFallbackForStore(string $storeId): bool {
+        $row = Database::fetchOne(
+            "SELECT strict_no_mint_fallback FROM stores WHERE id = ?",
+            [$storeId]
+        );
+        $tri = ($row && $row['strict_no_mint_fallback'] !== null)
+            ? (int)$row['strict_no_mint_fallback']
+            : self::INHERIT;
+        return match ($tri) {
+            self::FORCE_ON  => true,
+            self::FORCE_OFF => false,
+            default         => self::strictNoMintFallback(),
+        };
+    }
+
+    /**
+     * Persist the per-store strict-no-mint-fallback tri-state. Written via a
+     * direct UPDATE — the column is intentionally kept outside
+     * Config::updateStore's allowlist.
+     */
+    public static function setStoreStrictOverride(string $storeId, int $tri): void {
+        if (!in_array($tri, [self::INHERIT, self::FORCE_OFF, self::FORCE_ON], true)) {
+            throw new InvalidArgumentException("Invalid strict_no_mint_fallback tri-state: {$tri}");
+        }
+        Database::query(
+            "UPDATE stores SET strict_no_mint_fallback = ? WHERE id = ?",
+            [$tri, $storeId]
+        );
     }
 
     public static function minimumTargetSats(): ?int {

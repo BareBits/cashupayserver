@@ -23,8 +23,10 @@
 
 declare(strict_types=1);
 
+
+require_once __DIR__ . '/includes/http_status.php';
 // Pessimistic default: only an explicit success path flips this to 200.
-http_response_code(503);
+cashupay_status(503);
 header('Content-Type: application/json');
 
 // Catch fatals/parse errors that abort the require chain below. The response
@@ -38,7 +40,7 @@ register_shutdown_function(static function (): void {
         true
     )) {
         if (!headers_sent()) {
-            http_response_code(500);
+            cashupay_status(500);
         }
         echo json_encode(['ok' => false, 'error' => 'bootstrap_fatal']);
     }
@@ -52,7 +54,7 @@ require_once __DIR__ . '/includes/config.php';
 $providedKey = $_GET['key'] ?? $_SERVER['HTTP_X_CRON_KEY'] ?? '';
 $cronKey = Config::get('cron_key');
 if (!$cronKey || !is_string($providedKey) || !hash_equals((string)$cronKey, (string)$providedKey)) {
-    http_response_code(403);
+    cashupay_status(403);
     echo json_encode(['ok' => false, 'error' => 'forbidden']);
     exit;
 }
@@ -82,12 +84,12 @@ try {
         throw new RuntimeException('db read returned nothing');
     }
 } catch (Throwable $e) {
-    http_response_code(500);
+    cashupay_status(500);
     echo json_encode(['ok' => false, 'error' => 'db_unreachable']);
     exit;
 }
 
-http_response_code(200);
+cashupay_status(200);
 echo json_encode([
     'ok' => true,
     'version' => Updater::getLocalBuildInfo()['VERSION'] ?? CASHUPAY_VERSION,

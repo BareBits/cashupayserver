@@ -339,7 +339,7 @@ class Invoice {
             // (swap proceeds regardless of fee, preserving prior behaviour).
             $feeMaxPct = 0.0;
             $feeMaxSats = 0;
-            if ($cashuConfigured && !SwapsConfig::strictNoMintFallback()) {
+            if ($cashuConfigured && !SwapsConfig::strictNoMintFallbackForStore($storeId)) {
                 $thresholds = SwapsConfig::effectiveFeeFallbackForStore($storeId);
                 $feeMaxPct = $thresholds['pct'];
                 $feeMaxSats = $thresholds['sats'];
@@ -348,7 +348,7 @@ class Invoice {
             $swapAttempt = self::trySwapCreate(
                 $storeId, $store, $targetSats, $swapFailures, $feeMaxPct, $feeMaxSats
             );
-            if ($swapAttempt === null && SwapsConfig::strictNoMintFallback()) {
+            if ($swapAttempt === null && SwapsConfig::strictNoMintFallbackForStore($storeId)) {
                 // Surface each provider's reason so the operator can act
                 // (typically: "Boltz: amount 10000 sat outside range [50000, 5000000]").
                 $detail = $swapFailures
@@ -582,7 +582,8 @@ class Invoice {
      * Try each configured swap provider in order. Returns null if none could
      * service this request (provider unreachable, amount out of range, lockup
      * verification failed). The caller then either falls back to the mint or
-     * errors out depending on the site's strict-fallback setting.
+     * errors out depending on the store's effective strict-fallback setting
+     * (per-store override, else the site default).
      *
      * On success returns:
      *   ['swap' => SwapCreateResult,

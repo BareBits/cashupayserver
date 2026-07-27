@@ -5,6 +5,8 @@
  * Customer-facing payment page with Lightning QR code.
  */
 
+require_once __DIR__ . '/includes/http_status.php';
+
 require_once __DIR__ . '/includes/database.php';
 require_once __DIR__ . '/includes/config.php';
 require_once __DIR__ . '/includes/invoice.php';
@@ -16,7 +18,7 @@ require_once __DIR__ . '/includes/payment_path_debug.php';
 
 // Check setup
 if (!Database::isInitialized() || !Config::isSetupComplete()) {
-    http_response_code(503);
+    cashupay_status(503);
     echo 'Service unavailable';
     exit;
 }
@@ -24,7 +26,7 @@ if (!Database::isInitialized() || !Config::isSetupComplete()) {
 // Get invoice ID
 $invoiceId = $_GET['id'] ?? '';
 if (empty($invoiceId)) {
-    http_response_code(400);
+    cashupay_status(400);
     echo 'Invoice ID required';
     exit;
 }
@@ -40,7 +42,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'noffe
     header('Content-Type: application/json');
     $event = json_decode((string)($_POST['event'] ?? ''), true);
     if (!is_array($event)) {
-        http_response_code(400);
+        cashupay_status(400);
         echo json_encode(['error' => 'Invalid event']);
         exit;
     }
@@ -62,7 +64,7 @@ if (isset($_GET['json'])) {
     header('Content-Type: application/json');
     $invoice = Invoice::getById($invoiceId);
     if ($invoice === null) {
-        http_response_code(404);
+        cashupay_status(404);
         echo json_encode(['error' => 'Invoice not found']);
         exit;
     }
@@ -81,7 +83,7 @@ Background::trigger();
 // Get invoice
 $invoice = Invoice::getById($invoiceId);
 if ($invoice === null) {
-    http_response_code(404);
+    cashupay_status(404);
     echo 'Invoice not found';
     exit;
 }
@@ -107,14 +109,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'send_
     header('Content-Type: application/json');
 
     if ($invoice['status'] !== 'Settled') {
-        http_response_code(400);
+        cashupay_status(400);
         echo json_encode(['error' => 'Invoice is not paid yet.']);
         exit;
     }
 
     $email = trim((string)($_POST['email'] ?? ''));
     if ($email === '' || !filter_var($email, FILTER_VALIDATE_EMAIL)) {
-        http_response_code(400);
+        cashupay_status(400);
         echo json_encode(['error' => 'Please enter a valid email address.']);
         exit;
     }
@@ -136,14 +138,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'send_
     if (NotificationSender::isPayerReceiptOffered()) {
         if (NotificationSender::payerReceiptCountForInvoice($invoice['id'])
                 >= NotificationSender::PAYER_RECEIPT_MAX_PER_INVOICE) {
-            http_response_code(429);
+            cashupay_status(429);
             echo json_encode(['error' => 'Receipt limit reached for this invoice.']);
             exit;
         }
         $receiptQueued = NotificationSender::queuePayerReceipt($invoice, $email);
         if (!$receiptQueued) {
             // Race: the cap was reached between the check above and the call.
-            http_response_code(429);
+            cashupay_status(429);
             echo json_encode(['error' => 'Receipt limit reached for this invoice.']);
             exit;
         }

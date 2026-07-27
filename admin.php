@@ -5,6 +5,8 @@
  * Modern PWA admin dashboard.
  */
 
+require_once __DIR__ . '/includes/http_status.php';
+
 require_once __DIR__ . '/includes/database.php';
 require_once __DIR__ . '/includes/config.php';
 require_once __DIR__ . '/includes/auth.php';
@@ -192,7 +194,7 @@ if (isset($_GET['api'])) {
     // Verify session for API requests
     Auth::initSession();
     if (!Auth::isLoggedIn()) {
-        http_response_code(401);
+        cashupay_status(401);
         echo json_encode(['error' => 'Not authenticated']);
         exit;
     }
@@ -224,7 +226,7 @@ if (isset($_GET['api'])) {
 
             // Verify store exists
             if (!Config::getStore($storeId)) {
-                http_response_code(404);
+                cashupay_status(404);
                 echo json_encode(['error' => 'Store not found']);
                 break;
             }
@@ -328,6 +330,11 @@ if (isset($_GET['api'])) {
                     ? (int)$store['swaps_fee_fallback_max_sats'] : null,
                 'feeFallbackEffectivePct' => $swapFeeEff['pct'],
                 'feeFallbackEffectiveSats' => $swapFeeEff['sats'],
+                // Per-store "never fall back to a cashu mint" tri-state plus
+                // its resolved value (store override, else the site key).
+                'strictOverride' => isset($store['strict_no_mint_fallback'])
+                    ? (int)$store['strict_no_mint_fallback'] : SwapsConfig::INHERIT,
+                'strictEffective' => SwapsConfig::strictNoMintFallbackForStore($storeId),
             ];
 
             // Self-serve invoice tri-state override + per-store max override.
@@ -537,7 +544,7 @@ if (isset($_GET['api'])) {
         case 'products':
             $storeId = $_GET['store_id'] ?? null;
             if (!$storeId) {
-                http_response_code(400);
+                cashupay_status(400);
                 echo json_encode(['error' => 'store_id required']);
                 break;
             }
@@ -557,7 +564,7 @@ if (isset($_GET['api'])) {
             Auth::requireAdmin();
             $storeId = $_GET['store_id'] ?? null;
             if (!$storeId) {
-                http_response_code(400);
+                cashupay_status(400);
                 echo json_encode(['error' => 'store_id required']);
                 break;
             }
@@ -577,7 +584,7 @@ if (isset($_GET['api'])) {
         case 'invoice_items':
             $invoiceId = $_GET['id'] ?? '';
             if ($invoiceId === '') {
-                http_response_code(400);
+                cashupay_status(400);
                 echo json_encode(['error' => 'id required']);
                 break;
             }
@@ -710,7 +717,7 @@ if (isset($_GET['api'])) {
             $range   = (string)($_GET['range']    ?? 'all');
             $type    = (string)($_GET['type']     ?? 'revenue');
             if (!in_array($type, ['revenue', 'count', 'fees'], true)) {
-                http_response_code(400);
+                cashupay_status(400);
                 echo json_encode(['error' => 'invalid chart type']);
                 break;
             }
@@ -1042,7 +1049,7 @@ if (isset($_GET['api'])) {
             require_once __DIR__ . '/includes/mint_reliability.php';
             $mintUrl = $_GET['mint_url'] ?? '';
             if ($mintUrl === '') {
-                http_response_code(400);
+                cashupay_status(400);
                 echo json_encode(['error' => 'mint_url required']);
                 break;
             }
@@ -1142,7 +1149,7 @@ if (isset($_GET['api'])) {
         case 'get_offline_cashu':
             $storeId = $_GET['store_id'] ?? null;
             if (!$storeId) {
-                http_response_code(400);
+                cashupay_status(400);
                 echo json_encode(['error' => 'Store ID required']);
                 break;
             }
@@ -1160,7 +1167,7 @@ if (isset($_GET['api'])) {
             break;
 
         default:
-            http_response_code(404);
+            cashupay_status(404);
             echo json_encode(['error' => 'Unknown action']);
     }
     exit;
@@ -1181,7 +1188,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         // Check if locked out
         if (Security::isLockedOut($clientIp)) {
             $remaining = Security::getLockoutRemaining($clientIp);
-            http_response_code(429);
+            cashupay_status(429);
             echo json_encode(['error' => "Too many failed attempts. Try again in {$remaining} seconds."]);
             exit;
         }
@@ -1212,7 +1219,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             ]);
         } else {
             Security::recordFailedLogin($clientIp);
-            http_response_code(401);
+            cashupay_status(401);
             echo json_encode(['error' => 'Invalid username or password']);
         }
         exit;
@@ -1226,7 +1233,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if ($action === 'request_password_reset') {
         $clientIp = Security::getClientIp();
         if (!Security::checkRateLimit('pwreset_request', $clientIp, 5)) {
-            http_response_code(429);
+            cashupay_status(429);
             echo json_encode(['error' => 'Too many requests. Please wait a minute and try again.']);
             exit;
         }
@@ -1266,7 +1273,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if ($action === 'reset_with_token') {
         $clientIp = Security::getClientIp();
         if (!Security::checkRateLimit('pwreset_submit', $clientIp, 10)) {
-            http_response_code(429);
+            cashupay_status(429);
             echo json_encode(['error' => 'Too many attempts. Please wait a minute and try again.']);
             exit;
         }
@@ -1276,11 +1283,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             if (Auth::resetPasswordWithToken($token, $new)) {
                 echo json_encode(['success' => true]);
             } else {
-                http_response_code(400);
+                cashupay_status(400);
                 echo json_encode(['error' => 'This reset link is invalid or has expired. Request a new one.']);
             }
         } catch (\InvalidArgumentException $e) {
-            http_response_code(400);
+            cashupay_status(400);
             echo json_encode(['error' => $e->getMessage()]);
         }
         exit;
@@ -1292,7 +1299,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     // succeeds.
     if ($action === 'file_reset_set_password') {
         if (!Auth::fileResetRequested()) {
-            http_response_code(409);
+            cashupay_status(409);
             echo json_encode(['error' => 'No password-reset file is present.']);
             exit;
         }
@@ -1301,11 +1308,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             if (Auth::completeFileReset($new)) {
                 echo json_encode(['success' => true]);
             } else {
-                http_response_code(409);
+                cashupay_status(409);
                 echo json_encode(['error' => 'Reset could not be completed. Ensure the reset file is still present.']);
             }
         } catch (\InvalidArgumentException $e) {
-            http_response_code(400);
+            cashupay_status(400);
             echo json_encode(['error' => $e->getMessage()]);
         }
         exit;
@@ -1314,7 +1321,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     // All other actions require authentication
     Auth::initSession();
     if (!Auth::isLoggedIn()) {
-        http_response_code(401);
+        cashupay_status(401);
         echo json_encode(['error' => 'Not authenticated']);
         exit;
     }
@@ -1322,7 +1329,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     // M2: CSRF validation for authenticated POST requests
     $csrfToken = $_SERVER['HTTP_X_CSRF_TOKEN'] ?? $_POST['csrf_token'] ?? '';
     if (!Auth::validateCsrfToken($csrfToken)) {
-        http_response_code(403);
+        cashupay_status(403);
         echo json_encode(['error' => 'Invalid CSRF token']);
         exit;
     }
@@ -1349,7 +1356,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 ]);
                 echo json_encode(['success' => true, 'product' => Product::formatForApi($product)]);
             } catch (InvalidArgumentException $e) {
-                http_response_code(400);
+                cashupay_status(400);
                 echo json_encode(['error' => $e->getMessage()]);
             }
             break;
@@ -1376,7 +1383,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $product = Product::update($productId, $storeId, $data);
                 echo json_encode(['success' => true, 'product' => Product::formatForApi($product)]);
             } catch (InvalidArgumentException $e) {
-                http_response_code(400);
+                cashupay_status(400);
                 echo json_encode(['error' => $e->getMessage()]);
             }
             break;
@@ -1386,7 +1393,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $storeId = $_POST['store_id'] ?? '';
             $productId = $_POST['product_id'] ?? '';
             if ($storeId === '' || $productId === '') {
-                http_response_code(400);
+                cashupay_status(400);
                 echo json_encode(['error' => 'store_id and product_id required']);
                 break;
             }
@@ -1398,7 +1405,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             Auth::requireAdmin();
             $storeId = $_POST['store_id'] ?? '';
             if ($storeId === '') {
-                http_response_code(400);
+                cashupay_status(400);
                 echo json_encode(['error' => 'store_id required']);
                 break;
             }
@@ -1449,7 +1456,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'url' => Product::imageUrl($filename),
                 ]);
             } catch (Throwable $e) {
-                http_response_code(400);
+                cashupay_status(400);
                 echo json_encode(['error' => $e->getMessage()]);
             }
             break;
@@ -1480,10 +1487,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $result = Cart::checkout($storeId, $items, $memo, $redirect, $privacy);
                 echo json_encode(['success' => true] + $result);
             } catch (InvalidArgumentException $e) {
-                http_response_code(400);
+                cashupay_status(400);
                 echo json_encode(['error' => $e->getMessage()]);
             } catch (Throwable $e) {
-                http_response_code(500);
+                cashupay_status(500);
                 echo json_encode(['error' => $e->getMessage()]);
             }
             break;
@@ -1505,7 +1512,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'serverUrl' => Urls::server()
                 ]);
             } else {
-                http_response_code(400);
+                cashupay_status(400);
                 echo json_encode(['error' => 'Invalid mode']);
             }
             break;
@@ -1514,7 +1521,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             Auth::requireAdmin();
             $channel = (string)($_POST['channel'] ?? '');
             if (!in_array($channel, ['main', 'testing'], true)) {
-                http_response_code(400);
+                cashupay_status(400);
                 echo json_encode(['error' => 'Invalid channel']);
                 break;
             }
@@ -1641,7 +1648,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'seedPhrase' => $seedPhrase, // Show once for backup
                 ]);
             } catch (Exception $e) {
-                http_response_code(400);
+                cashupay_status(400);
                 echo json_encode(['error' => $e->getMessage()]);
             }
             break;
@@ -1727,7 +1734,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'isConfigured' => Config::isStoreConfigured($storeId),
                 ]);
             } catch (Exception $e) {
-                http_response_code(400);
+                cashupay_status(400);
                 echo json_encode(['error' => $e->getMessage()]);
             }
             break;
@@ -1753,7 +1760,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 ], 'id = ?', [$storeId]);
                 echo json_encode(['success' => true]);
             } catch (Exception $e) {
-                http_response_code(400);
+                cashupay_status(400);
                 echo json_encode(['error' => $e->getMessage()]);
             }
             break;
@@ -1788,7 +1795,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     echo json_encode(['valid' => true]);
                 }
             } catch (Exception $e) {
-                http_response_code(400);
+                cashupay_status(400);
                 echo json_encode(['error' => $e->getMessage()]);
             }
             break;
@@ -2098,7 +2105,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'resumedIndex' => $resumedIndex,
                 ]);
             } catch (Exception $e) {
-                http_response_code(400);
+                cashupay_status(400);
                 echo json_encode(['error' => $e->getMessage()]);
             }
             break;
@@ -2132,7 +2139,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'preview' => $preview,
                 ]);
             } catch (Exception $e) {
-                http_response_code(400);
+                cashupay_status(400);
                 echo json_encode(['error' => $e->getMessage()]);
             }
             break;
@@ -2162,7 +2169,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 );
                 echo json_encode(['address' => $addr, 'index' => $idx]);
             } catch (Exception $e) {
-                http_response_code(400);
+                cashupay_status(400);
                 echo json_encode(['error' => $e->getMessage()]);
             }
             break;
@@ -2199,7 +2206,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 }
                 echo json_encode(['invoices' => $out]);
             } catch (Exception $e) {
-                http_response_code(400);
+                cashupay_status(400);
                 echo json_encode(['error' => $e->getMessage()]);
             }
             break;
@@ -2219,7 +2226,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 OnchainPayments::manuallyAttribute($invoiceId, $txid, $vout);
                 echo json_encode(['success' => true]);
             } catch (Exception $e) {
-                http_response_code(400);
+                cashupay_status(400);
                 echo json_encode(['error' => $e->getMessage()]);
             }
             break;
@@ -2361,7 +2368,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'addresses' => $addressResults,
                 ]);
             } catch (Exception $e) {
-                http_response_code(400);
+                cashupay_status(400);
                 echo json_encode(['error' => $e->getMessage()]);
             }
             break;
@@ -2420,7 +2427,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
                 echo json_encode(['success' => true]);
             } catch (Exception $e) {
-                http_response_code(400);
+                cashupay_status(400);
                 echo json_encode(['error' => $e->getMessage()]);
             }
             break;
@@ -2495,7 +2502,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
                 echo json_encode(['success' => true]);
             } catch (Exception $e) {
-                http_response_code(400);
+                cashupay_status(400);
                 echo json_encode(['error' => $e->getMessage()]);
             }
             break;
@@ -2518,7 +2525,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 Config::set(PaymentPathDebug::CONFIG_KEY, $paymentPathDebug);
                 echo json_encode(['success' => true]);
             } catch (Exception $e) {
-                http_response_code(400);
+                cashupay_status(400);
                 echo json_encode(['error' => $e->getMessage()]);
             }
             break;
@@ -2625,7 +2632,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
                 echo json_encode(['success' => true]);
             } catch (Exception $e) {
-                http_response_code(400);
+                cashupay_status(400);
                 echo json_encode(['error' => $e->getMessage()]);
             }
             break;
@@ -2677,9 +2684,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 }
                 SwapsConfig::setStoreFeeFallback($storeId, $pct, $sats);
 
+                // Per-store strict-no-mint-fallback tri-state. Absent from the
+                // POST means "leave as-is" so older clients don't clobber it.
+                if (array_key_exists('strict_no_mint_fallback', $_POST)) {
+                    $rawStrict = (string)$_POST['strict_no_mint_fallback'];
+                    if (!in_array($rawStrict, ['-1', '0', '1'], true)) {
+                        throw new Exception('Invalid mint-fallback mode');
+                    }
+                    SwapsConfig::setStoreStrictOverride($storeId, (int)$rawStrict);
+                }
+
                 echo json_encode(['success' => true]);
             } catch (Exception $e) {
-                http_response_code(400);
+                cashupay_status(400);
                 echo json_encode(['error' => $e->getMessage()]);
             }
             break;
@@ -2719,7 +2736,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
                 echo json_encode(['success' => true]);
             } catch (Exception $e) {
-                http_response_code(400);
+                cashupay_status(400);
                 echo json_encode(['error' => $e->getMessage()]);
             }
             break;
@@ -2758,7 +2775,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
                 echo json_encode(['success' => true]);
             } catch (Exception $e) {
-                http_response_code(400);
+                cashupay_status(400);
                 echo json_encode(['error' => $e->getMessage()]);
             }
             break;
@@ -2788,7 +2805,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 );
                 echo json_encode(['success' => true]);
             } catch (Throwable $e) {
-                http_response_code(400);
+                cashupay_status(400);
                 echo json_encode(['error' => $e->getMessage()]);
             }
             break;
@@ -2892,7 +2909,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     try {
                         $wallet = Invoice::getWalletInstance($storeId);
                         $wallet->syncProofStates();
-                        http_response_code(400);
+                        cashupay_status(400);
                         echo json_encode([
                             'error' => 'Some proofs were already spent. Balance updated. Please try again.',
                             'sync' => true
@@ -2902,7 +2919,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         // Sync failed, fall through to generic error
                     }
                 }
-                http_response_code(400);
+                cashupay_status(400);
                 $errorMsg = ($e instanceof \Cashu\CashuProtocolException)
                     ? 'Mint returned error: ' . $e->getMessage()
                     : $e->getMessage();
@@ -2979,7 +2996,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'mintUnit' => $mintUnit,
                 ]);
             } catch (Exception $e) {
-                http_response_code(400);
+                cashupay_status(400);
                 echo json_encode(['error' => $e->getMessage()]);
             }
             break;
@@ -3085,7 +3102,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                             if ($wallet) {
                                 try { $wallet->syncProofStates(); } catch (Exception $se) {}
                             }
-                            http_response_code(400);
+                            cashupay_status(400);
                             echo json_encode([
                                 'error' => 'Some proofs were already spent. Balance updated. Please try again.',
                                 'sync' => true
@@ -3173,7 +3190,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if (Database::getInstance()->inTransaction()) {
                     Database::rollback();
                 }
-                http_response_code(400);
+                cashupay_status(400);
                 echo json_encode(['error' => $e->getMessage()]);
             }
             break;
@@ -3181,7 +3198,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         case 'get_backup_mints':
             $storeId = $_GET['store_id'] ?? $_POST['store_id'] ?? null;
             if (!$storeId) {
-                http_response_code(400);
+                cashupay_status(400);
                 echo json_encode(['error' => 'Store ID required']);
                 break;
             }
@@ -3216,7 +3233,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'mint_info' => $test['info']
                 ]);
             } catch (Exception $e) {
-                http_response_code(400);
+                cashupay_status(400);
                 echo json_encode(['error' => $e->getMessage()]);
             }
             break;
@@ -3235,7 +3252,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 Config::updateStoreBackupMint($id, $data);
                 echo json_encode(['success' => true]);
             } catch (Exception $e) {
-                http_response_code(400);
+                cashupay_status(400);
                 echo json_encode(['error' => $e->getMessage()]);
             }
             break;
@@ -3247,7 +3264,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 Config::removeStoreBackupMint($id);
                 echo json_encode(['success' => true]);
             } catch (Exception $e) {
-                http_response_code(400);
+                cashupay_status(400);
                 echo json_encode(['error' => $e->getMessage()]);
             }
             break;
@@ -3261,7 +3278,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $result = Config::testMintConnection($mintUrl);
                 echo json_encode($result);
             } catch (Exception $e) {
-                http_response_code(400);
+                cashupay_status(400);
                 echo json_encode(['error' => $e->getMessage()]);
             }
             break;
@@ -3292,7 +3309,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 }
                 echo json_encode(['success' => true, 'seeded' => $seeded]);
             } catch (Exception $e) {
-                http_response_code(400);
+                cashupay_status(400);
                 echo json_encode(['error' => $e->getMessage()]);
             }
             break;
@@ -3308,7 +3325,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 Database::update('invoices', ['cashu_offline_allow_any_mint' => $allow], 'id = ?', [$invoiceId]);
                 echo json_encode(['success' => true]);
             } catch (Exception $e) {
-                http_response_code(400);
+                cashupay_status(400);
                 echo json_encode(['error' => $e->getMessage()]);
             }
             break;
@@ -3324,7 +3341,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 OfflineCashu::addAllowedMint($storeId, $mintUrl);
                 echo json_encode(['success' => true]);
             } catch (Exception $e) {
-                http_response_code(400);
+                cashupay_status(400);
                 echo json_encode(['error' => $e->getMessage()]);
             }
             break;
@@ -3341,7 +3358,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 OfflineCashu::setMintEnabled($storeId, $mintUrl, $enabled);
                 echo json_encode(['success' => true]);
             } catch (Exception $e) {
-                http_response_code(400);
+                cashupay_status(400);
                 echo json_encode(['error' => $e->getMessage()]);
             }
             break;
@@ -3357,7 +3374,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 OfflineCashu::removeAllowedMint($storeId, $mintUrl);
                 echo json_encode(['success' => true]);
             } catch (Exception $e) {
-                http_response_code(400);
+                cashupay_status(400);
                 echo json_encode(['error' => $e->getMessage()]);
             }
             break;
@@ -3374,7 +3391,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 MintReliability::adminReenable($mintUrl, $_SESSION['username'] ?? null);
                 echo json_encode(['success' => true]);
             } catch (Exception $e) {
-                http_response_code(400);
+                cashupay_status(400);
                 echo json_encode(['error' => $e->getMessage()]);
             }
             break;
@@ -3390,7 +3407,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 MintReliability::adminConfirmedBad($mintUrl, $_SESSION['username'] ?? null);
                 echo json_encode(['success' => true]);
             } catch (Exception $e) {
-                http_response_code(400);
+                cashupay_status(400);
                 echo json_encode(['error' => $e->getMessage()]);
             }
             break;
@@ -3406,7 +3423,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 MintReliability::resetCounters($mintUrl, $_SESSION['username'] ?? null);
                 echo json_encode(['success' => true]);
             } catch (Exception $e) {
-                http_response_code(400);
+                cashupay_status(400);
                 echo json_encode(['error' => $e->getMessage()]);
             }
             break;
@@ -3418,7 +3435,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 MintReliability::resetAllCounters($_SESSION['username'] ?? null);
                 echo json_encode(['success' => true]);
             } catch (Exception $e) {
-                http_response_code(400);
+                cashupay_status(400);
                 echo json_encode(['error' => $e->getMessage()]);
             }
             break;
@@ -3443,7 +3460,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 }
                 echo json_encode(['success' => true]);
             } catch (Exception $e) {
-                http_response_code(400);
+                cashupay_status(400);
                 echo json_encode(['error' => $e->getMessage()]);
             }
             break;
@@ -3464,7 +3481,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'cached' => TrustedMints::getCachedList(),
                 ]);
             } catch (Exception $e) {
-                http_response_code(400);
+                cashupay_status(400);
                 echo json_encode(['error' => $e->getMessage()]);
             }
             break;
@@ -3480,7 +3497,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $result = MintHelpers::testExpiry($mintUrl, $unit);
                 echo json_encode($result);
             } catch (Exception $e) {
-                http_response_code(400);
+                cashupay_status(400);
                 echo json_encode(['error' => $e->getMessage()]);
             }
             break;
@@ -3500,10 +3517,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $userId = Auth::createUser($username, $password, $role);
                 echo json_encode(['success' => true, 'id' => $userId]);
             } catch (\InvalidArgumentException $e) {
-                http_response_code(400);
+                cashupay_status(400);
                 echo json_encode(['error' => $e->getMessage()]);
             } catch (\RuntimeException $e) {
-                http_response_code(409);
+                cashupay_status(409);
                 echo json_encode(['error' => $e->getMessage()]);
             }
             break;
@@ -3519,7 +3536,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 Auth::deleteUser($userId);
                 echo json_encode(['success' => true]);
             } catch (\RuntimeException $e) {
-                http_response_code(400);
+                cashupay_status(400);
                 echo json_encode(['error' => $e->getMessage()]);
             }
             break;
@@ -3533,10 +3550,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 Auth::changePassword($userId, $newPassword);
                 echo json_encode(['success' => true]);
             } catch (\InvalidArgumentException $e) {
-                http_response_code(400);
+                cashupay_status(400);
                 echo json_encode(['error' => $e->getMessage()]);
             } catch (\RuntimeException $e) {
-                http_response_code(404);
+                cashupay_status(404);
                 echo json_encode(['error' => $e->getMessage()]);
             }
             break;
@@ -3546,7 +3563,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             try {
                 $self = Auth::currentUser();
                 if (!$self) {
-                    http_response_code(401);
+                    cashupay_status(401);
                     echo json_encode(['error' => 'Not authenticated']);
                     break;
                 }
@@ -3560,14 +3577,64 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     [$self['id']]
                 );
                 if (!$row || !password_verify($current, $row['password_hash'])) {
-                    http_response_code(401);
+                    cashupay_status(401);
                     echo json_encode(['error' => 'Current password is incorrect']);
                     break;
                 }
                 Auth::changePassword($self['id'], $new);
                 echo json_encode(['success' => true]);
             } catch (\InvalidArgumentException $e) {
-                http_response_code(400);
+                cashupay_status(400);
+                echo json_encode(['error' => $e->getMessage()]);
+            }
+            break;
+
+        case 'reveal_store_seed':
+            // Return a store's Cashu wallet seed phrase so the operator can
+            // back it up. The onboarding wizard generates this silently and
+            // shows it once on the completion screen; without this endpoint an
+            // operator who missed it had no way to ever recover mint funds.
+            //
+            // The seed is spendable key material, so this is the most
+            // sensitive read in the panel: admin-only, and gated on re-entering
+            // the acting admin's own password, so a hijacked session alone is
+            // not enough. The seed itself is never logged and never appears in
+            // any bulk payload — only ever returned from here.
+            Auth::requireAdmin();
+            try {
+                $storeId = $_POST['store_id'] ?? '';
+                if (!$storeId) {
+                    throw new Exception('Store ID required');
+                }
+                // Auth::verifyCurrentUserPassword handles both deployments:
+                // the BareBits users row standalone, the WordPress user's own
+                // password under WordPress (where there is no BareBits row and
+                // Auth::currentUser() is null by design).
+                if (!Auth::verifyCurrentUserPassword((string)($_POST['password'] ?? ''))) {
+                    cashupay_status(401);
+                    echo json_encode(['error' => 'Password is incorrect']);
+                    break;
+                }
+                $store = Database::fetchOne(
+                    "SELECT seed_phrase FROM stores WHERE id = ?",
+                    [$storeId]
+                );
+                if (!$store) {
+                    throw new Exception('Store not found');
+                }
+                $seed = (string)($store['seed_phrase'] ?? '');
+                error_log(sprintf(
+                    'CashuPayServer: recovery phrase revealed for store %s by user %s from %s',
+                    $storeId, Auth::currentActorLabel(), Security::getClientIp()
+                ));
+                echo json_encode([
+                    'success' => true,
+                    // Empty when this store has no mint wallet (mints declined
+                    // during setup) — the UI says so rather than showing blank.
+                    'seedPhrase' => $seed,
+                ]);
+            } catch (Exception $e) {
+                cashupay_status(400);
                 echo json_encode(['error' => $e->getMessage()]);
             }
             break;
@@ -3581,7 +3648,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             try {
                 $self = Auth::currentUser();
                 if (!$self) {
-                    http_response_code(401);
+                    cashupay_status(401);
                     echo json_encode(['error' => 'Not authenticated']);
                     break;
                 }
@@ -3589,16 +3656,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 Auth::setUserEmail($self['id'], $email === '' ? null : $email);
                 echo json_encode(['success' => true, 'email' => $email]);
             } catch (\InvalidArgumentException $e) {
-                http_response_code(400);
+                cashupay_status(400);
                 echo json_encode(['error' => $e->getMessage()]);
             } catch (\RuntimeException $e) {
-                http_response_code(404);
+                cashupay_status(404);
                 echo json_encode(['error' => $e->getMessage()]);
             }
             break;
 
         default:
-            http_response_code(400);
+            cashupay_status(400);
             echo json_encode(['error' => 'Unknown action']);
     }
     exit;
@@ -5589,6 +5656,21 @@ header('Cache-Control: no-cache, must-revalidate');
                             </div>
 
                             <div class="form-group" style="margin-top: 0.75rem; padding-top: 0.75rem; border-top: 1px solid var(--border-color, rgba(255,255,255,0.08));">
+                                <label class="form-label">Cashu mint fallback (this store)</label>
+                                <select class="form-input" id="store-swaps-strict">
+                                    <option value="-1">Inherit site default</option>
+                                    <option value="0">Allow falling back to a mint</option>
+                                    <option value="1">Never fall back to a mint (strict)</option>
+                                </select>
+                                <p class="form-help">
+                                    Strict means an invoice errors rather than being issued by a Cashu
+                                    mint when Lightning and swaps both fail. Setup sets this to strict
+                                    when you decline mints. Currently effective:
+                                    <strong id="store-swaps-strict-effective">&mdash;</strong>
+                                </p>
+                            </div>
+
+                            <div class="form-group" style="margin-top: 0.75rem; padding-top: 0.75rem; border-top: 1px solid var(--border-color, rgba(255,255,255,0.08));">
                                 <label class="form-label">Fee-too-high mint fallback (this store)</label>
                                 <p class="form-help" style="margin-top: -0.25rem;">
                                     Override the site thresholds for skipping an expensive swap in
@@ -5614,6 +5696,39 @@ header('Cache-Control: no-cache, must-revalidate');
                             <button class="btn btn-full" id="btn-save-store-swaps" style="margin-top: 0.5rem;">
                                 Save
                             </button>
+                        </div>
+                    </div>
+
+                    <div class="card collapsible" id="card-store-seed">
+                        <div class="card-header">
+                            <div class="card-title">Recovery phrase</div>
+                        </div>
+                        <div class="card-body">
+                            <p style="font-size: 0.85rem; color: var(--text-secondary); margin: 0 0 0.75rem 0;">
+                                The 12 words that recover any ecash this store holds at its
+                                Cashu mints if this server's database is lost. Setup shows
+                                them once; this is where you get them back. Anyone who has
+                                them can spend those funds, so keep them offline.
+                            </p>
+                            <div class="form-group">
+                                <label class="form-label" for="store-seed-password">
+                                    <?= Urls::isWordPress()
+                                        ? 'Confirm your WordPress password'
+                                        : 'Confirm your password' ?>
+                                </label>
+                                <input type="password" class="form-input" id="store-seed-password"
+                                       autocomplete="current-password"
+                                       placeholder="<?= Urls::isWordPress()
+                                           ? 'Your WordPress password'
+                                           : 'Your admin password' ?>">
+                            </div>
+                            <div id="store-seed-error" class="hidden" style="margin-bottom:0.5rem; color: var(--error); font-size: 0.85rem;"></div>
+                            <div id="store-seed-output" class="hidden" style="margin-bottom: 0.75rem;">
+                                <code id="store-seed-value" style="display:block; padding:0.75rem; border-radius:6px;
+                                      background: rgba(0,0,0,0.3); word-spacing:0.4rem; line-height:1.8;
+                                      user-select:all; font-size:0.9rem;"></code>
+                            </div>
+                            <button class="btn btn-full" id="btn-reveal-store-seed">Show recovery phrase</button>
                         </div>
                     </div>
 
@@ -7692,6 +7807,8 @@ header('Cache-Control: no-cache, must-revalidate');
             if (saveSwapsBtn) saveSwapsBtn.addEventListener('click', saveSwapSettings);
             const saveStoreSwapsBtn = document.getElementById('btn-save-store-swaps');
             if (saveStoreSwapsBtn) saveStoreSwapsBtn.addEventListener('click', saveStoreSwaps);
+            const revealSeedBtn = document.getElementById('btn-reveal-store-seed');
+            if (revealSeedBtn) revealSeedBtn.addEventListener('click', revealStoreSeed);
             const saveSelfServeBtn = document.getElementById('btn-save-selfserve');
             if (saveSelfServeBtn) saveSelfServeBtn.addEventListener('click', saveSelfServeSettings);
             const saveStoreSelfServeBtn = document.getElementById('btn-save-store-selfserve');
@@ -11311,6 +11428,63 @@ header('Cache-Control: no-cache, must-revalidate');
                 const satsTxt = s.feeFallbackEffectiveSats > 0 ? (Number(s.feeFallbackEffectiveSats).toLocaleString() + ' sat') : 'off';
                 feff.textContent = `${pctTxt} / ${satsTxt}`;
             }
+            // Per-store strict-no-mint-fallback tri-state.
+            const strictSel = document.getElementById('store-swaps-strict');
+            const strictEff = document.getElementById('store-swaps-strict-effective');
+            if (strictSel) strictSel.value = String(s.strictOverride);
+            if (strictEff) strictEff.textContent = s.strictEffective ? 'strict (no mint fallback)' : 'mint fallback allowed';
+            // A revealed phrase belongs to the store it was revealed for, so
+            // clear it whenever the settings panel re-binds to a store.
+            resetStoreSeedCard();
+        }
+
+        function resetStoreSeedCard() {
+            const output = document.getElementById('store-seed-output');
+            const valueEl = document.getElementById('store-seed-value');
+            const pwEl = document.getElementById('store-seed-password');
+            if (output) output.classList.add('hidden');
+            if (valueEl) valueEl.textContent = '';
+            if (pwEl) pwEl.value = '';
+            clearAwError('store-seed-error');
+        }
+
+        // -------- Store recovery phrase --------
+
+        async function revealStoreSeed() {
+            if (!currentStoreId) {
+                showToast('No store selected', 'error');
+                return;
+            }
+            clearAwError('store-seed-error');
+            const output = document.getElementById('store-seed-output');
+            const valueEl = document.getElementById('store-seed-value');
+            const pwEl = document.getElementById('store-seed-password');
+            output.classList.add('hidden');
+
+            const password = pwEl.value;
+            if (!password) {
+                return awError('store-seed-error', 'Enter your password to show the recovery phrase.');
+            }
+            try {
+                const response = await postWithCsrf(adminUrl,
+                    `action=reveal_store_seed&store_id=${encodeURIComponent(currentStoreId)}`
+                    + `&password=${encodeURIComponent(password)}`
+                );
+                const result = await response.json();
+                if (!response.ok) {
+                    return awError('store-seed-error', result.error || 'Could not show the recovery phrase');
+                }
+                // Don't leave the password sitting in the DOM once it's spent.
+                pwEl.value = '';
+                if (!result.seedPhrase) {
+                    return awError('store-seed-error',
+                        'This store has no Cashu mint wallet, so there is no recovery phrase to show.');
+                }
+                valueEl.textContent = result.seedPhrase;
+                output.classList.remove('hidden');
+            } catch (e) {
+                awError('store-seed-error', 'Could not show the recovery phrase');
+            }
         }
 
         async function saveStoreSwaps() {
@@ -11326,11 +11500,13 @@ header('Cache-Control: no-cache, must-revalidate');
             }
             const feePct = document.getElementById('store-swaps-fee-pct').value.trim();
             const feeSats = document.getElementById('store-swaps-fee-sats').value.trim();
+            const strict = document.getElementById('store-swaps-strict').value;
             try {
                 const response = await postWithCsrf(adminUrl,
                     `action=save_store_swaps&store_id=${encodeURIComponent(currentStoreId)}&override=${encodeURIComponent(override)}`
                     + `&fee_fallback_max_pct=${encodeURIComponent(feePct)}`
                     + `&fee_fallback_max_sats=${encodeURIComponent(feeSats)}`
+                    + `&strict_no_mint_fallback=${encodeURIComponent(strict)}`
                 );
                 const result = await response.json();
                 if (response.ok) {

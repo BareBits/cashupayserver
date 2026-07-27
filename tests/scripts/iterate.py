@@ -513,37 +513,31 @@ def main() -> int:
             page.click("button[type=submit]")
             page.fill("#store_name", STORE_ONECONF)
             page.click("button[type=submit]")
-            # Step 9: auto-cashout destination. The new flow asks for this
-            # before the mint URL — skip it here so we still drive the rest
-            # of the wizard the same way. Operator can configure
-            # auto-cashout from admin once the stack is up.
-            page.wait_for_selector("button:has-text('Skip for now')")
+            # onchain: skip. The real xpub (Electrum's vpub, on regtest) is
+            # registered further down once Electrum is up, via direct SQL —
+            # the wizard can't know it yet. Skipping here also drops the
+            # zero-conf screen from the sequence.
+            page.wait_for_selector("#onchain-form")
             page.click("button:has-text('Skip for now')")
-            # Step 8: on-chain destination. Skip is offered because we
-            # skipped auto-cashout above (so on-chain isn't required).
-            page.wait_for_selector("button:has-text('Skip for now')")
+            # lightning: skip. Auto-cashout destinations are configured from
+            # admin once the stack is up.
+            page.wait_for_selector("#lightning_address")
             page.click("button:has-text('Skip for now')")
-            page.fill("#mint_url", mint.url)
-            page.click("button[type=submit]")
-            page.wait_for_selector("#mint_unit")
-            page.select_option("#mint_unit", "sat")
-            page.click("#continue-btn")
-            # Step 10: backup mint (required, same unit as primary). Drive the
-            # second nutshell instance in here.
-            page.wait_for_selector("button:has-text('Add Backup Mint')")
-            page.fill("#mint_url", backup_mint.url)
-            page.click("button:has-text('Add Backup Mint')")
-            page.wait_for_selector("button[type=submit]")
-            page.click("button:has-text('Generate New Seed Phrase')")
-            page.wait_for_selector("#seed_confirmed")
-            page.check("#seed_confirmed")
-            page.click("button[type=submit]")
-            # Seed confirmation lands on step 7 ("Setup Complete!"). The
-            # earlier post-seed "Skip for now" step no longer exists — those
-            # skip buttons live on steps 9 and 8, which we consumed before
-            # the mint URL. Wait for the completion heading so the wizard
-            # flow ends cleanly.
-            page.wait_for_selector("h2:has-text('Setup Complete')")
+            # swaps: off — they need an xpub, which this store doesn't have yet.
+            page.wait_for_selector("button:has-text('No thanks')")
+            page.click("button:has-text('No thanks')")
+            # mints: Nostr discovery can't reach relays from the test sandbox,
+            # so go straight to manual entry and point at the two local
+            # nutshell instances.
+            page.wait_for_selector("#mint-manual-toggle")
+            page.click("#mint-manual-toggle")
+            page.fill("#mint_url_manual", mint.url)
+            page.fill("#backup_mint_url_manual", backup_mint.url)
+            page.click("#mints-continue-btn")
+            # setup_complete flips here; cron and done are advisory.
+            page.wait_for_selector("h2:has-text('Enable cron')")
+            page.click("button:has-text('Continue')")
+            page.wait_for_selector("h2:has-text(\"You're all set!\")")
 
             browser.close()
 

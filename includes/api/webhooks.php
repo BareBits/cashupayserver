@@ -3,6 +3,8 @@
  * CashuPayServer - Webhook API Handlers
  */
 
+require_once __DIR__ . '/../http_status.php';
+
 require_once __DIR__ . '/../webhook_sender.php';
 require_once __DIR__ . '/../security.php';
 
@@ -153,7 +155,7 @@ function handleDeleteWebhook(array $auth, array $params, array $body): void {
 
     Database::delete('webhooks', 'id = ?', [$webhookId]);
 
-    http_response_code(200);
+    cashupay_status(200);
     exit;
 }
 

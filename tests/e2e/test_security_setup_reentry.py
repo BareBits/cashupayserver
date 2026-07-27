@@ -3,7 +3,7 @@
 Audit finding #3: if config.setup_complete is missing (aborted install,
 restored backup, manual purge) but the users table already has an admin,
 the wizard's password step would silently overwrite the admin password.
-After the fix, step 2 must refuse with 403 when any admin exists.
+After the fix, the password step must refuse with 403 when any admin exists.
 """
 from __future__ import annotations
 
@@ -12,15 +12,15 @@ import requests
 from conftest import ConfiguredPayserver, DEFAULT_ADMIN_PASSWORD
 
 
-def test_setup_step2_refuses_when_admin_already_exists(
+def test_setup_password_step_refuses_when_admin_already_exists(
     configured: ConfiguredPayserver,
 ) -> None:
     """Simulate the actual exploit scenario from audit finding #3:
     setup_complete is missing (corrupted, restored backup, etc.) but the
     users table still has an admin. The primary guard in setup.php (redirect
-    when setup_complete) would no longer fire — so step 2 itself must refuse.
+    when setup_complete) would no longer fire — so the step itself must refuse.
     """
-    # Clear the primary guard so the request reaches step 2.
+    # Clear the primary guard so the request reaches the password step.
     with configured.handle.db() as db:
         db.execute("DELETE FROM config WHERE key = 'setup_complete'")
 
@@ -29,7 +29,7 @@ def test_setup_step2_refuses_when_admin_already_exists(
 
     r = attacker_session.post(
         url,
-        data={"step": "2", "password": "evil-pw-1234", "confirm_password": "evil-pw-1234"},
+        data={"step": "password", "password": "evil-pw-1234", "confirm_password": "evil-pw-1234"},
         timeout=15,
         allow_redirects=False,
     )

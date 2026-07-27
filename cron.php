@@ -12,6 +12,8 @@
  * * * * * * curl -s https://your-domain.com/cron.php?key=YOUR_CRON_KEY
  */
 
+require_once __DIR__ . '/includes/http_status.php';
+
 require_once __DIR__ . '/includes/database.php';
 require_once __DIR__ . '/includes/config.php';
 require_once __DIR__ . '/includes/invoice.php';
@@ -41,7 +43,7 @@ if (!defined('CASHUPAY_IN_CRON')) {
 
 // Check if setup is complete
 if (!Database::isInitialized() || !Config::isSetupComplete()) {
-    http_response_code(503);
+    cashupay_status(503);
     echo 'Not configured';
     exit;
 }
@@ -56,7 +58,7 @@ $isInternal = isset($_GET['internal']) && $_GET['internal'] === '1';
 if ($isInternal) {
     // Internal self-request - verify internal key
     if (!Background::verifyInternalKey($providedKey)) {
-        http_response_code(403);
+        cashupay_status(403);
         echo 'Invalid internal key';
         exit;
     }
@@ -66,12 +68,12 @@ if ($isInternal) {
     // rather than fall through to an open endpoint.
     $cronKey = Config::get('cron_key');
     if (!$cronKey) {
-        http_response_code(503);
+        cashupay_status(503);
         echo 'Cron not configured';
         exit;
     }
     if (!hash_equals($cronKey, $providedKey)) {
-        http_response_code(403);
+        cashupay_status(403);
         echo 'Invalid cron key';
         exit;
     }

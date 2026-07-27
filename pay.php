@@ -18,6 +18,8 @@
  * IDs exist or which have self-serve turned on.
  */
 
+require_once __DIR__ . '/includes/http_status.php';
+
 require_once __DIR__ . '/includes/database.php';
 require_once __DIR__ . '/includes/config.php';
 require_once __DIR__ . '/includes/selfserve.php';
@@ -28,14 +30,14 @@ require_once __DIR__ . '/includes/urls.php';
 
 // Bootstrap checks.
 if (!Database::isInitialized() || !Config::isSetupComplete()) {
-    http_response_code(503);
+    cashupay_status(503);
     echo 'Service unavailable';
     exit;
 }
 
 /** Render a generic 404 and stop. Used for unknown / disabled stores. */
 function selfserve_not_found(): void {
-    http_response_code(404);
+    cashupay_status(404);
     echo 'Not found';
     exit;
 }

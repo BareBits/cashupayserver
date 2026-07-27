@@ -3,6 +3,8 @@
  * CashuPayServer - Store API Handlers
  */
 
+require_once __DIR__ . '/../http_status.php';
+
 /**
  * Get all stores
  *
@@ -116,6 +118,6 @@ function handleDeleteStore(array $auth, array $params, array $body): void {
     // Delete will cascade to api_keys, invoices, webhooks
     Database::delete('stores', 'id = ?', [$storeId]);
 
-    http_response_code(200);
+    cashupay_status(200);
     exit;
 }
