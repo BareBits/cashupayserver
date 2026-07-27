@@ -19,24 +19,27 @@ require_once dirname(__DIR__, 2) . '/includes/setup_flow.php';
 
 $noOnchain = SetupFlow::stepSequence('', false, false);
 assert_eq(
-    ['security', 'password', 'store', 'onchain', 'lightning', 'swaps', 'mints', 'cron', 'done'],
+    ['terms', 'security', 'password', 'store', 'onchain', 'lightning', 'swaps', 'mints', 'cron', 'done'],
     $noOnchain,
     'standalone without an on-chain rail drops zeroconf'
 );
 
 $withOnchain = SetupFlow::stepSequence('', false, true);
 assert_eq(
-    ['security', 'password', 'store', 'onchain', 'zeroconf', 'lightning', 'swaps', 'mints', 'cron', 'done'],
+    ['terms', 'security', 'password', 'store', 'onchain', 'zeroconf', 'lightning', 'swaps', 'mints', 'cron', 'done'],
     $withOnchain,
     'standalone with an on-chain rail includes zeroconf'
 );
+
+// The terms-of-service gate opens every first run and is never skipped.
+assert_eq('terms', $withOnchain[0], 'a first run opens on the terms-of-service gate');
 
 // --- WordPress mode has no password screen --------------------------------
 
 $wp = SetupFlow::stepSequence('', true, true);
 assert_false(in_array('password', $wp, true), 'WordPress mode supplies its own auth');
-assert_eq('security', $wp[0], 'WordPress mode still starts with the safety check');
-assert_eq(9, count($wp), 'WordPress with on-chain is one screen shorter than standalone');
+assert_eq('terms', $wp[0], 'WordPress mode still opens on the terms gate');
+assert_eq(10, count($wp), 'WordPress with on-chain is one screen shorter than standalone');
 
 // --- add_store mode runs only the store-scoped screens --------------------
 
@@ -52,10 +55,13 @@ assert_eq(
     'add_store drops zeroconf with no on-chain rail too'
 );
 assert_eq('store', SetupFlow::firstStep('add_store'), 'add_store opens on the store screen');
-assert_eq('security', SetupFlow::firstStep(''), 'a first run opens on the safety check');
+assert_eq('terms', SetupFlow::firstStep(''), 'a first run opens on the terms gate');
+// add_store belongs to an already-configured instance, so it never re-shows terms.
+assert_false(in_array('terms', $addStore, true), 'add_store never re-shows the terms gate');
 
 // --- next / prev ----------------------------------------------------------
 
+assert_eq('security', SetupFlow::nextStep('terms', $withOnchain), 'the safety check follows the terms gate');
 assert_eq('zeroconf', SetupFlow::nextStep('onchain', $withOnchain), 'zeroconf follows onchain');
 assert_eq('lightning', SetupFlow::nextStep('onchain', $noOnchain), 'without zeroconf, lightning follows onchain');
 assert_null(SetupFlow::nextStep('done', $withOnchain), 'done is terminal');
@@ -63,7 +69,8 @@ assert_null(SetupFlow::nextStep('mints', $addStore), 'mints is terminal in add_s
 assert_null(SetupFlow::nextStep('cron', $addStore), 'a screen outside the sequence has no next');
 
 assert_eq('store', SetupFlow::prevStep('onchain', $withOnchain), 'store precedes onchain');
-assert_null(SetupFlow::prevStep('security', $withOnchain), 'the first screen has no previous');
+assert_eq('terms', SetupFlow::prevStep('security', $withOnchain), 'the terms gate precedes the safety check');
+assert_null(SetupFlow::prevStep('terms', $withOnchain), 'the first screen has no previous');
 assert_null(SetupFlow::prevStep('zeroconf', $noOnchain), 'a screen outside the sequence has no previous');
 
 // --- Back targets ---------------------------------------------------------
@@ -72,7 +79,8 @@ assert_null(SetupFlow::prevStep('zeroconf', $noOnchain), 'a screen outside the s
 // land on the password screen — re-submitting it trips the "an admin already
 // exists" guard and shows a 403 mid-wizard.
 assert_null(SetupFlow::backStep('store', $withOnchain), 'Back from store must not reach the password screen');
-assert_null(SetupFlow::backStep('security', $withOnchain), 'the first screen has no Back');
+assert_null(SetupFlow::backStep('terms', $withOnchain), 'the terms gate is first and has no Back');
+assert_null(SetupFlow::backStep('security', $withOnchain), 'the safety check has no Back (it must not return to terms)');
 assert_null(SetupFlow::backStep('password', $withOnchain), 'the password screen has no Back');
 assert_eq('store', SetupFlow::backStep('onchain', $withOnchain), 'Back from onchain returns to store');
 assert_eq('onchain', SetupFlow::backStep('zeroconf', $withOnchain), 'Back from zeroconf returns to onchain');
@@ -86,6 +94,7 @@ assert_null(SetupFlow::backStep('store', $addStore), 'store is the first add_sto
 
 // --- Step validation ------------------------------------------------------
 
+assert_true(SetupFlow::isKnownStep('terms'), 'terms is a real screen');
 assert_true(SetupFlow::isKnownStep('mints'), 'mints is a real screen');
 assert_false(SetupFlow::isKnownStep(''), 'an empty step is not a screen');
 assert_false(SetupFlow::isKnownStep('4'), 'the pre-slug numeric steps are gone');

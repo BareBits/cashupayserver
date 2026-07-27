@@ -49,9 +49,12 @@ def _rows(payserver: PayserverHandle, sql: str) -> list[sqlite3.Row]:
 
 
 def _walk_to_store(page, payserver: PayserverHandle) -> None:
-    """security ack → password → the store-name screen."""
+    """terms → security ack → password → the store-name screen."""
     page.set_default_timeout(30000)
     page.goto(f"{payserver.url}/setup")
+    page.check("#terms_legal")
+    page.check("#terms_warranty")
+    page.click("button[type=submit]")
     page.check("#security_acknowledged")
     page.click("button[type=submit]")
     page.fill("#password", ADMIN_PW)

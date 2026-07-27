@@ -3,8 +3,8 @@
 The wizard at /setup uses PHP sessions (cookies) and a slug-valued 'step'
 POST field. The standalone first-run sequence is:
 
-    security -> password -> store -> onchain -> [zeroconf] -> lightning
-             -> swaps -> mints -> cron -> done
+    terms -> security -> password -> store -> onchain -> [zeroconf] -> lightning
+          -> swaps -> mints -> cron -> done
 
 `zeroconf` only appears once an on-chain destination has been saved, so a run
 that skips `onchain` skips it too. `setup_complete` flips at the end of the
@@ -123,8 +123,13 @@ class SetupWizard:
         )
         assert r.status_code == 200 and r.json().get("success") is True, r.text
 
+    def accept_terms(self) -> str:
+        """Tick both terms-of-service boxes — the first-run gate before security."""
+        return self.post(step="terms", terms_legal="1", terms_warranty="1")
+
     def through_store(self, name: str = "Wizard Store") -> str:
-        """security ack → password → store name, landing on the on-chain screen."""
+        """terms → security ack → password → store name, landing on the on-chain screen."""
+        self.accept_terms()
         self.post(step="security", security_acknowledged="1")
         self.post(
             step="password",
@@ -159,6 +164,15 @@ def run_setup_wizard(
 
     # Initial GET — triggers session start and schema init.
     s.get(setup, timeout=10)
+
+    # terms: accept the first-run terms-of-service gate.
+    r = s.post(
+        setup,
+        data={"step": "terms", "terms_legal": "1", "terms_warranty": "1"},
+        timeout=10,
+        allow_redirects=False,
+    )
+    _assert_step_ok(r, "terms")
 
     # security: acknowledge the database-exposure check
     r = s.post(setup, data={"step": "security", "security_acknowledged": "1"}, timeout=10, allow_redirects=False)

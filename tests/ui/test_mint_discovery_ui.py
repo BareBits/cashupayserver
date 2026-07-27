@@ -46,11 +46,14 @@ def test_mint_discovery_finds_mints(
     page.on("console", lambda m: console_msgs.append(f"[{m.type}] {m.text}"))
 
     # Walk the onboarding wizard to the Cashu mints screen. Order:
-    # security → password → store → on-chain (skip) → lightning (skip) →
-    # swaps (off) → mints. The mints screen hosts the same Discover-Mints
+    # terms → security → password → store → on-chain (skip) → lightning (skip)
+    # → swaps (off) → mints. The mints screen hosts the same Discover-Mints
     # modal and the discoveredMints / openMintDiscovery globals this test
     # exercises.
     page.goto(f"{payserver.url}/setup")
+    page.check("#terms_legal")
+    page.check("#terms_warranty")
+    page.click("button[type=submit]")
     page.check("#security_acknowledged")
     page.click("button[type=submit]")
     page.fill("#password", "wizard-test-pw")
