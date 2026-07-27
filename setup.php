@@ -2168,8 +2168,6 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                 <?php unset($_SESSION['setup_generated_seed']); ?>
                 <?php endif; ?>
 
-                ?>
-
                 <?php
                 $baseUrl = Urls::siteBase();
                 ?>
