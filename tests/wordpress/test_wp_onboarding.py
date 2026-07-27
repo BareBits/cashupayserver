@@ -77,9 +77,10 @@ def test_wizard_skips_the_password_screen_and_completes(wp_ready) -> None:
 
     body = w.get("security")
     assert wizard_heading(body) == "Quick safety check", wizard_heading(body)
-    # 9 screens, not the standalone 10 — the password screen is absent, and
-    # zero-conf has not joined yet because no on-chain rail exists.
-    assert "of 8" in body, "WordPress with no on-chain rail should be 8 screens"
+    # 9 screens, not the standalone 10 — the password screen is absent (the
+    # terms gate and safety check remain), and zero-conf has not joined yet
+    # because no on-chain rail exists.
+    assert "of 9" in body, "WordPress with no on-chain rail should be 9 screens"
 
     body = w.post(step="security", security_acknowledged="1")
     assert wizard_heading(body) == "Name your store", (

@@ -190,6 +190,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     try {
         switch ($step) {
+            case 'terms':
+                if (empty($_POST['terms_legal']) || empty($_POST['terms_warranty'])) {
+                    throw new Exception('Please accept both terms to continue.');
+                }
+                $step = SetupFlow::nextStep('terms', $flowSteps) ?? 'security';
+                break;
+
             case 'security':
                 if (empty($_POST['security_acknowledged'])) {
                     throw new Exception('Please confirm you have checked that your database is not reachable from the web.');
@@ -1088,7 +1095,40 @@ function getDataDirHttpPath(): ?string {
                 <div class="error"><?= htmlspecialchars($error) ?></div>
             <?php endif; ?>
 
-            <?php if ($step === 'security'): ?>
+            <?php if ($step === 'terms'): ?>
+                <!-- Screen: terms of service acknowledgement (first-run gate) -->
+                <h2 style="margin-bottom: 1rem;">Terms of service</h2>
+                <p style="margin-bottom: 1.5rem;">
+                    Before we set up BareBits, please read and accept the terms
+                    below. Both boxes must be checked to continue.
+                </p>
+
+                <form method="post">
+                    <input type="hidden" name="step" value="terms">
+
+                    <div class="checkbox-group" style="margin: 1.5rem 0;">
+                        <input type="checkbox" id="terms_legal" name="terms_legal" required>
+                        <label for="terms_legal">
+                            I agree not to use this software for any illegal
+                            purposes and agree to the terms of the
+                            <a href="https://github.com/BareBits/cashupayserver/blob/main/LICENSE.md" target="_blank" rel="noopener" style="color: #63b3ed;">license</a>
+                            provided with the software.
+                        </label>
+                    </div>
+
+                    <div class="checkbox-group" style="margin: 1.5rem 0;">
+                        <input type="checkbox" id="terms_warranty" name="terms_warranty" required>
+                        <label for="terms_warranty">
+                            I understand this software is provided as-is without
+                            any warranty and the developers are not responsible
+                            for any lost funds.
+                        </label>
+                    </div>
+
+                    <button type="submit" class="btn" style="width: 100%;">Continue</button>
+                </form>
+
+            <?php elseif ($step === 'security'): ?>
                 <!-- Screen: security check (requirements + DB exposure + URL mode) -->
                 <h2 style="margin-bottom: 1rem;">Quick safety check</h2>
                 <p style="margin-bottom: 1.5rem;">

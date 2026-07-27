@@ -51,6 +51,11 @@ def test_setup_wizard_completes_in_browser(
     page.set_default_timeout(30000)
     page.goto(f"{payserver.url}/setup")
 
+    # terms: accept the first-run terms-of-service gate.
+    page.check("#terms_legal")
+    page.check("#terms_warranty")
+    page.click("button[type=submit]")
+
     # security: acknowledge the database-exposure check.
     page.check("#security_acknowledged")
     page.click("button[type=submit]")
@@ -132,6 +137,9 @@ def test_setup_wizard_without_onchain_skips_zeroconf(
     has nothing to apply to — and shortens the step counter accordingly."""
     page.set_default_timeout(30000)
     page.goto(f"{payserver.url}/setup")
+    page.check("#terms_legal")
+    page.check("#terms_warranty")
+    page.click("button[type=submit]")
     page.check("#security_acknowledged")
     page.click("button[type=submit]")
     page.fill("#password", "wizard-test-pw")
@@ -141,8 +149,8 @@ def test_setup_wizard_without_onchain_skips_zeroconf(
     page.click("button[type=submit]")
 
     page.wait_for_selector("#onchain-form")
-    assert "of 9" in page.locator(".subtitle").inner_text(), (
-        "without an on-chain rail the wizard should advertise 9 screens, not 10"
+    assert "of 10" in page.locator(".subtitle").inner_text(), (
+        "without an on-chain rail the wizard should advertise 10 screens, not 11"
     )
     page.click("button:has-text('Skip for now')")
 

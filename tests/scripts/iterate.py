@@ -506,6 +506,9 @@ def main() -> int:
             page.set_default_timeout(15000)
 
             page.goto(f"{payserver.url}/setup")
+            page.check("#terms_legal")
+            page.check("#terms_warranty")
+            page.click("button[type=submit]")
             page.check("#security_acknowledged")
             page.click("button[type=submit]")
             page.fill("#password", ADMIN_PASSWORD)

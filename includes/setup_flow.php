@@ -14,7 +14,7 @@ require_once __DIR__ . '/database.php';
 final class SetupFlow {
     /** Every screen the wizard knows, in canonical order. */
     public const STEPS = [
-        'security', 'password', 'store', 'onchain', 'zeroconf',
+        'terms', 'security', 'password', 'store', 'onchain', 'zeroconf',
         'lightning', 'swaps', 'mints', 'cron', 'done',
     ];
 
@@ -51,7 +51,9 @@ final class SetupFlow {
 
     /** The first screen for a given mode. */
     public static function firstStep(string $mode): string {
-        return $mode === 'add_store' ? 'store' : 'security';
+        // Terms of service is a first-run-only gate: add_store belongs to an
+        // operator who already accepted them when they set the instance up.
+        return $mode === 'add_store' ? 'store' : 'terms';
     }
 
     /**

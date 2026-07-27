@@ -53,7 +53,7 @@ def test_full_flow_persists_every_answer(payserver: PayserverHandle) -> None:
     )
     # Saving an on-chain destination pulls zero-conf into the sequence.
     assert _heading(body) == "Zero-conf payments"
-    assert "of 10" in body
+    assert "of 11" in body
 
     body = w.post(step="zeroconf", zero_conf="1")
     assert _heading(body) == "Lightning payments"
@@ -88,7 +88,7 @@ def test_full_flow_persists_every_answer(payserver: PayserverHandle) -> None:
 def test_skipping_onchain_removes_the_zeroconf_screen(payserver: PayserverHandle) -> None:
     w = Wizard(payserver)
     body = w.through_store("Skip Onchain")
-    assert "of 9" in body, "without an on-chain rail the wizard is 9 screens, not 10"
+    assert "of 10" in body, "without an on-chain rail the wizard is 10 screens, not 11"
 
     body = w.post(step="onchain", onchain_action="skip")
     assert _heading(body) == "Lightning payments", "zero-conf must be skipped with nothing to time"
@@ -232,4 +232,28 @@ def test_unknown_step_restarts_rather_than_rendering_blank(payserver: PayserverH
     w = Wizard(payserver)
     for stale in ("4", "", "bogus"):
         body = w.get(stale)
-        assert _heading(body) == "Quick safety check", f"step={stale!r} should restart the wizard"
+        assert _heading(body) == "Terms of service", f"step={stale!r} should restart the wizard"
+
+
+def test_terms_gate_requires_both_checkboxes(payserver: PayserverHandle) -> None:
+    """The terms-of-service gate opens every first run and only advances when
+    both the legal-use and the as-is/no-warranty boxes are ticked."""
+    w = Wizard(payserver)
+
+    # The wizard lands on the terms gate before anything else.
+    landing = w.get("")
+    assert _heading(landing) == "Terms of service", _heading(landing)
+    assert "github.com/BareBits/cashupayserver/blob/main/LICENSE.md" in landing, (
+        "the license must link to the LICENSE file on GitHub"
+    )
+
+    # Neither box, then each box alone: all rejected, none advances.
+    for data in ({}, {"terms_legal": "1"}, {"terms_warranty": "1"}):
+        body = w.post(step="terms", **data)
+        assert "accept both terms" in (_error(body) or ""), _error(body)
+        assert _heading(body) == "Terms of service", "a partial acceptance must not advance"
+
+    # Both boxes ticked advances to the safety check.
+    body = w.post(step="terms", terms_legal="1", terms_warranty="1")
+    assert _error(body) is None, _error(body)
+    assert _heading(body) == "Quick safety check", _heading(body)
