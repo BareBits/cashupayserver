@@ -22,7 +22,7 @@ Accept Bitcoin payments (lightning and on-chain) **without** running a full BTCP
 
 **You are responsible for your own funds. The developers are not liable for any losses.**
 
-**Important:** A Cashu mint (if enabled) takes custody of smaaller lightning payments until automatic withdrawal thresholds are reached. For maximum sovereignty, choose settings that enable lightning payments to an off-server wallet.
+**Important:** A Cashu mint (if enabled) takes custody of smaller lightning payments until automatic withdrawal thresholds are reached. For maximum sovereignty, choose settings that enable lightning payments to an off-server wallet.
 
 ---
 
@@ -69,7 +69,7 @@ BareBits is robust payment software that can direct payments to you via many met
 - Note: Strike does not work with all kinds of merchants.
   
 ### Full self-custody setup (suggested, no USD conversion):
-- Run an [Electrum](https://electrum.org/) wallet on your desktop computer and enable automatic liquidity management. Keep $100 or so in the wallet to keep liquidity flowing smoothly. You can start with zero and build up gradually as payments arrive. See [How to get an LNURL or CLINK Noffer](#how-to-get-an-lnurl-or-clink-noffer). Find your xpub in the "wallet information" section.
+- Run an [Electrum](https://electrum.org/) wallet on your desktop computer and enable the [automatic liquidity management plugin](https://github.com/BareBits/electrum_liquidity). Keep $100 or so in the wallet to keep liquidity flowing smoothly. You can start with zero and build up gradually as payments arrive. See [How to get an LNURL or CLINK Noffer](#how-to-get-an-lnurl-or-clink-noffer). Find your xpub in the "wallet information" section.
 - Enable submarine swaps as a fallback in case your desktop is offline or doesn't have sufficient inbound liquidity.
 - Suggestion: leave "strict mode" disabled. If your electrum wallet is unavailable AND a payment would be uneconomical to do a submarine swap for, lightning payments will land in a cashu mint (custodial) and be automatically withdrawn to your Electrum wallet once you have sufficient inbound liquidity OR will be withdrawn on-chain once it's economically reasonable.
 - Need USD or other fiat currency? Use an exchange to convert your funds.
