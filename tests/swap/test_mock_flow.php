@@ -172,8 +172,21 @@ MockSwapProvider::$statusQueue = ['swap.created'];
 $invoice = Invoice::create($storeId, ['amount' => 50000, 'currency' => 'sat']);
 tassert($invoice['payment_rail'] === 'swap', 'invoice on swap rail', $failures);
 tassert(!empty($invoice['bolt11']), 'invoice has bolt11 from provider', $failures);
-tassert(empty($invoice['onchain_address']), 'no onchain pay-to-address on swap invoice', $failures);
+// The swap rail no longer disables the normal on-chain route: because this
+// store has an xpub, the same invoice also carries a parallel pay-to-address.
+// The swap supplies Lightning; the on-chain address settles independently.
+tassert(!empty($invoice['onchain_address']), 'swap invoice also carries an on-chain address', $failures);
+tassert((int)$invoice['onchain_amount_sat'] === 50000, 'on-chain rail targets the invoice amount', $failures);
 tassert(empty($invoice['mint_url']), 'no mint_url on swap invoice', $failures);
+// Longer-of-two expiry: the on-chain rail keeps the full default window and is
+// not cut short by the (shorter-lived) Lightning side.
+tassert((int)$invoice['expiration_time'] >= time() + Config::getInvoiceExpiration() - 60,
+    'swap+onchain invoice keeps the full on-chain expiry window', $failures);
+// The on-chain pay-to-address is a distinct allocation from the swap's claim
+// address (both derived from the xpub), so the two rails never collide.
+$swapClaimAddr = Database::fetchOne("SELECT merchant_address FROM swap_attempts WHERE invoice_id = ?", [$invoice['id']]);
+tassert($swapClaimAddr && $swapClaimAddr['merchant_address'] !== $invoice['onchain_address'],
+    'on-chain rail address differs from the swap claim address', $failures);
 
 $attempt = Database::fetchOne("SELECT * FROM swap_attempts WHERE invoice_id = ?", [$invoice['id']]);
 tassert($attempt !== null, 'swap_attempts row created', $failures);
@@ -212,6 +225,23 @@ tassert($r3['polled'] === 1 && $r3['errors'] === 0, 'settled poll: no error', $f
 
 $invoiceAfter = Database::fetchOne("SELECT * FROM invoices WHERE id = ?", [$invoice['id']]);
 tassert($invoiceAfter['status'] === 'Settled', 'invoice settled', $failures);
+
+// ------------- On-chain OFFERING toggle (Lightning-only checkout) -------------
+// A merchant can keep the xpub (swaps still need it to settle on-chain) but
+// turn OFF the customer-facing on-chain rail for a Lightning-only checkout. The
+// swap is still created and still allocates its xpub claim address; the invoice
+// just carries no pay-to-address.
+tassert(OnchainConfig::isEnabledForStore($storeId) === true, 'offering default: enabled (inherits site default)', $failures);
+OnchainConfig::setStoreOverride($storeId, OnchainConfig::FORCE_OFF);
+tassert(OnchainConfig::isEnabledForStore($storeId) === false, 'offering-off: resolver reports disabled', $failures);
+$lnOnly = Invoice::create($storeId, ['amount' => 50000, 'currency' => 'sat']);
+tassert($lnOnly['payment_rail'] === 'swap', 'offering-off: invoice still on swap rail', $failures);
+tassert(!empty($lnOnly['bolt11']), 'offering-off: swap bolt11 still present', $failures);
+tassert(empty($lnOnly['onchain_address']), 'offering-off: no customer-facing on-chain address', $failures);
+$lnOnlySwap = Database::fetchOne("SELECT merchant_address FROM swap_attempts WHERE invoice_id = ?", [$lnOnly['id']]);
+tassert($lnOnlySwap && !empty($lnOnlySwap['merchant_address']),
+    'offering-off: swap still allocates its xpub claim address (settles on-chain internally)', $failures);
+OnchainConfig::setStoreOverride($storeId, OnchainConfig::INHERIT);
 
 // ------------- Lockup mismatch defense -------------
 
