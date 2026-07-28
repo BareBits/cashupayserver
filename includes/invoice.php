@@ -14,6 +14,7 @@ require_once __DIR__ . '/notification_sender.php';
 require_once __DIR__ . '/urls.php';
 require_once __DIR__ . '/../cashu-wallet-php/CashuWallet.php';
 require_once __DIR__ . '/onchain/payments.php';
+require_once __DIR__ . '/onchain/config.php';
 require_once __DIR__ . '/swap/factory.php';
 require_once __DIR__ . '/swap/config.php';
 require_once __DIR__ . '/swap/quote_fetcher.php';
@@ -151,6 +152,12 @@ class Invoice {
                 'Store has no payment methods configured. Add a Cashu mint or an on-chain xpub.'
             );
         }
+        // Whether to OFFER the on-chain rail to customers. A store can keep its
+        // xpub configured (submarine swaps still settle on-chain to it) while
+        // turning off the customer-facing pay-to-address for a Lightning-only
+        // checkout. The swap path below keeps using $onchainConfigured — it
+        // needs the xpub regardless of what the customer is shown.
+        $onchainOffered = $onchainConfigured && OnchainConfig::isEnabledForStore($storeId);
 
         $exchangeFee = (float)($store['exchange_fee_percent'] ?? 0);
         $primaryProvider = $store['price_provider_primary'] ?? 'coingecko';
@@ -183,7 +190,7 @@ class Invoice {
             || (SwapsConfig::isEnabledForStore($storeId) && $onchainConfigured);
         $offeredRails = [];
         if ($lightningCapable)   { $offeredRails[] = 'lightning'; }
-        if ($onchainConfigured)  { $offeredRails[] = 'onchain'; }
+        if ($onchainOffered)     { $offeredRails[] = 'onchain'; }
 
         $feeRoute       = FeeRedirect::decide($storeId, $store, $invoiceSats, $offeredRails);
         $feeNote        = $feeRoute['note'] ?? null;
@@ -400,9 +407,16 @@ class Invoice {
         }
 
         // ---- On-chain path: allocate a receive address ----
-        // Skipped on swap-rail invoices — the customer is paying via Lightning,
-        // and offering a pay-to-address option in parallel would create a
-        // second settlement path the swap lifecycle is not aware of.
+        // The "normal on-chain route" is always offered when the store has an
+        // xpub, in parallel with whatever Lightning rail (swap / LNURL / noffer
+        // / mint) this invoice landed on. A swap (or LN address) is only a
+        // convenience Lightning option for merchants with no inbound liquidity;
+        // it must not disable the on-chain address. The rails settle
+        // independently: the on-chain poller keys off onchain_address (not
+        // payment_rail), settlement is status-guarded (settle-once), and the
+        // swap's held invoice is released by SwapPoller::expireStale() once the
+        // invoice expires. Only skipped when a fee payee owns the on-chain rail
+        // (its address is set below instead of the merchant's).
         //
         // In xpub mode the allocation derives a fresh address per invoice. In
         // static-address mode it returns the shared address plus a per-invoice
@@ -413,8 +427,7 @@ class Invoice {
         $onchainAmountSat = null;
         $onchainAmountTweakSats = null;
         $onchainCreatedTipHeight = null;
-        if ($onchainConfigured && $swapAttempt === null && $lnurlAttempt === null
-            && $nofferAttempt === null && $feeOnchain === null) {
+        if ($onchainOffered && $feeOnchain === null) {
             $baseAmountSat = (int)ExchangeRates::convertToSats((string)$amount, $currency, 'sat');
             try {
                 $allocation = OnchainPayments::allocateAddress($storeId, $baseAmountSat);
@@ -448,12 +461,20 @@ class Invoice {
             $onchainCreatedTipHeight = $feeOnchain['tip_height'] ?? null;
         }
 
-        // Calculate expiration. Swap-rail invoices use the provider's BOLT11
-        // expiration plus an extra grace window for cron to drive the claim;
-        // mint-rail and onchain-rail use the existing default.
+        // Calculate expiration. A mint quote carries its own (short, ~minutes)
+        // expiry; everything else uses the default invoice window.
+        $defaultExpiration = time() + Config::getInvoiceExpiration();
         $expiration = ($quote && isset($quote->expiry))
             ? $quote->expiry
-            : (time() + Config::getInvoiceExpiration());
+            : $defaultExpiration;
+        // When an on-chain address is offered alongside a shorter-lived
+        // Lightning rail (e.g. a ~15-min mint quote), don't let that rail cut
+        // the on-chain window short — keep the invoice alive for the longer of
+        // the two. The Lightning bolt11 may lapse first (its wallet shows it as
+        // expired); the on-chain address stays payable for the full window.
+        if ($onchainAddress !== null && $expiration < $defaultExpiration) {
+            $expiration = $defaultExpiration;
+        }
 
         // Generate invoice ID
         $invoiceId = Database::generateId('inv');
@@ -1697,40 +1718,35 @@ class Invoice {
             return;
         }
 
-        // Submarine-swap rail: advance the swap state machine inline so
-        // settlement isn't dependent on the cron poller (Task 4c). The
-        // single-row poll reuses SwapPoller's atomic last_polled_at gate, so
-        // it's safe against the cron task and other concurrent checkout polls
-        // hitting the same swap, and the gate's min-interval keeps us off the
-        // provider API on every 2s checkout tick. Cron's expireStale() remains
-        // the backstop (incl. HTLC cancellation) for customers who close the
-        // page before invoice.settled. A swap invoice has no Cashu quote or
-        // on-chain pay-to-address, so none of the rails below apply.
-        if (($invoice['payment_rail'] ?? null) === 'swap') {
-            try {
-                SwapPoller::pollByInvoiceId($invoiceId);
-            } catch (Throwable $e) {
-                error_log("swap poll failed for {$invoiceId}: " . $e->getMessage());
+        // Direct-receive / swap Lightning rails: poll the Lightning side first,
+        // then fall through to the on-chain poll below when this invoice ALSO
+        // carries an on-chain address (the normal on-chain route is offered in
+        // parallel whenever the store has an xpub). Each rail's Lightning poll:
+        //
+        //   swap     — advance the swap state machine inline so settlement isn't
+        //              dependent on the cron poller (Task 4c). The single-row
+        //              poll reuses SwapPoller's atomic last_polled_at gate, so
+        //              it's safe against the cron task and other concurrent
+        //              checkout polls, and the min-interval keeps us off the
+        //              provider API on every 2s tick. Cron's expireStale()
+        //              remains the backstop that releases the held swap invoice.
+        //   noffer   — settlement arrives via the merchant's kind-21001 receipt
+        //              (page subscription + cron receipt poll), so there's
+        //              nothing to poll here; this is a no-op on the LN side.
+        //   lnaddress— poll the LUD-21 verify URL.
+        //
+        // If the rail has no on-chain address, we're done after the LN poll.
+        $rail = $invoice['payment_rail'] ?? null;
+        if (in_array($rail, ['swap', 'noffer', 'lnaddress'], true)) {
+            if ($rail === 'swap') {
+                try {
+                    SwapPoller::pollByInvoiceId($invoiceId);
+                } catch (Throwable $e) {
+                    error_log("swap poll failed for {$invoiceId}: " . $e->getMessage());
+                }
+            } elseif ($rail === 'lnaddress') {
+                self::pollSingleLnAddress($invoiceId);
             }
-            return;
-        }
-
-        // CLINK noffer rail: settlement arrives via the merchant's kind-21001
-        // receipt, handled by the payment page's live subscription (primary)
-        // and the cron receipt poll (best-effort). There's no quote or on-chain
-        // address to poll here, so this single-row poll is a no-op.
-        if (($invoice['payment_rail'] ?? null) === 'noffer') {
-            return;
-        }
-
-        // LNURL direct-receive: poll the LUD-21 verify URL. For a normal
-        // lnaddress invoice there's no on-chain address and nothing else to
-        // check. A fee-redirect invoice, however, can offer BOTH lightning
-        // (fee LNURL) and on-chain (fee xpub) rails on the same row, so after
-        // the verify poll we fall through to the on-chain poll below when an
-        // address is present and the invoice is still open.
-        if (($invoice['payment_rail'] ?? null) === 'lnaddress') {
-            self::pollSingleLnAddress($invoiceId);
             if (empty($invoice['onchain_address'])) {
                 return;
             }

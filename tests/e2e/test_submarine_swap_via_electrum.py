@@ -102,6 +102,21 @@ def test_submarine_swap_via_electrum_lightning(boltz_regtest: BoltzRegtestHandle
             "invoice amount should include the swap fees"
         merchant_address = swap_row["merchant_address"]
 
+        # ---- The swap rail must NOT disable the normal on-chain route ----
+        # This invoice also carries a parallel merchant pay-to-address (a
+        # distinct xpub allocation from the swap's claim address), and the
+        # Greenfield checkout exposes BOTH rails. The swap only adds a Lightning
+        # option; on-chain stays available.
+        inv_created = fetch_invoice_row(payserver, invoice_id)
+        assert inv_created is not None
+        assert inv_created["onchain_address"], \
+            "swap invoice should also carry an on-chain pay-to-address"
+        assert inv_created["onchain_address"] != merchant_address, \
+            "on-chain rail address must differ from the swap claim address"
+        methods = invoice["checkout"]["paymentMethods"]
+        assert "BTC-LightningNetwork" in methods and "BTC-OnChain" in methods, \
+            f"checkout should offer both Lightning and on-chain, got {sorted(methods)}"
+
         # ---- Pay via Electrum LN ----
         # `lnpay` blocks on a hold invoice until Boltz settles. We don't
         # want to wait synchronously — kick it off and drive the cron in

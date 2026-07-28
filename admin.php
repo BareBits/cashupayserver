@@ -358,6 +358,7 @@ if (isset($_GET['api'])) {
                 ? ($onchainStaticAddress !== '')
                 : ($onchainXpub !== '');
             require_once __DIR__ . '/includes/onchain/payments.php';
+            require_once __DIR__ . '/includes/onchain/config.php';
             $onchain = [
                 'enabled' => $onchainEnabled,
                 'mode' => $onchainMode,
@@ -371,6 +372,12 @@ if (isset($_GET['api'])) {
                 'nextIndex' => (int)($store['onchain_next_index'] ?? 0),
                 'providerUrl' => $store['onchain_provider_url'] ?? '',
                 'needsManualConfirmation' => OnchainPayments::countNeedingManualConfirmation($storeId),
+                // Whether the on-chain rail is OFFERED to customers. Tri-state
+                // per-store override + resolved effective value + site default,
+                // so the UI can show "Inherit (on/off) / On / Off".
+                'offerOverride' => OnchainConfig::storeOverride($storeId),
+                'offerEffective' => OnchainConfig::isEnabledForStore($storeId),
+                'offerSiteDefault' => OnchainConfig::siteEnabled(),
             ];
 
             // Calculate balance in sats for fiat mints (uses cached exchange rates)
@@ -1973,6 +1980,32 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
             break;
 
+        case 'save_onchain_offer':
+            Auth::requireAdmin();
+            // Toggle whether the on-chain rail is OFFERED to customers for this
+            // store, independent of whether an xpub/static address is
+            // configured. Lets a merchant keep the xpub (submarine swaps still
+            // settle on-chain to it) while presenting a Lightning-only checkout.
+            try {
+                $storeId = $_POST['store_id'] ?? '';
+                if (empty($storeId)) {
+                    throw new Exception('Store ID required');
+                }
+                require_once __DIR__ . '/includes/onchain/config.php';
+                // Tri-state: -1 inherit site default, 0 force off, 1 force on.
+                $tri = (int)($_POST['offer_enabled'] ?? OnchainConfig::INHERIT);
+                OnchainConfig::setStoreOverride($storeId, $tri);
+                echo json_encode([
+                    'success' => true,
+                    'offerOverride' => OnchainConfig::storeOverride($storeId),
+                    'offerEffective' => OnchainConfig::isEnabledForStore($storeId),
+                ]);
+            } catch (Throwable $e) {
+                http_response_code(400);
+                echo json_encode(['success' => false, 'error' => $e->getMessage()]);
+            }
+            break;
+
         case 'save_onchain':
             Auth::requireAdmin();
             // Persist a store's on-chain Bitcoin payment configuration.
@@ -2523,6 +2556,29 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             try {
                 $paymentPathDebug = ($_POST['payment_path_debug'] ?? '0') === '1';
                 Config::set(PaymentPathDebug::CONFIG_KEY, $paymentPathDebug);
+                echo json_encode(['success' => true]);
+            } catch (Exception $e) {
+                cashupay_status(400);
+                echo json_encode(['error' => $e->getMessage()]);
+            }
+            break;
+
+        // ----- Site-wide on-chain payment default -----
+
+        case 'get_onchain_site_settings':
+            Auth::requireAdmin();
+            require_once __DIR__ . '/includes/onchain/config.php';
+            echo json_encode([
+                'onchainPaymentsEnabled' => OnchainConfig::siteEnabled(),
+            ]);
+            break;
+
+        case 'save_onchain_site_settings':
+            Auth::requireAdmin();
+            require_once __DIR__ . '/includes/onchain/config.php';
+            try {
+                $enabled = ($_POST['onchain_payments_enabled'] ?? '1') === '1';
+                OnchainConfig::setSiteEnabled($enabled);
                 echo json_encode(['success' => true]);
             } catch (Exception $e) {
                 cashupay_status(400);
@@ -5522,6 +5578,32 @@ header('Cache-Control: no-cache, must-revalidate');
                                 does not expose an xpub, you can fall back to reusing a single
                                 static address.
                             </p>
+
+                            <!-- Whether to OFFER the on-chain rail to customers, independent of
+                                 whether an xpub/static address is configured. Keeping the xpub but
+                                 turning this off gives a Lightning-only checkout while submarine
+                                 swaps still settle on-chain to that xpub. Saves instantly on change. -->
+                            <div class="form-group">
+                                <label class="form-label">Offer on-chain to customers</label>
+                                <select class="form-input" id="onchain-offer-override" onchange="onchainOfferChanged()">
+                                    <option value="-1">Inherit site default</option>
+                                    <option value="1">On for this store</option>
+                                    <option value="0">Off &mdash; Lightning-only checkout</option>
+                                </select>
+                                <p class="form-help">
+                                    Site default: <strong id="onchain-offer-site-default">&mdash;</strong>.
+                                    Currently effective: <strong id="onchain-offer-effective">&mdash;</strong>.
+                                    Your xpub is still used for submarine-swap settlement even when
+                                    on-chain checkout is off.
+                                </p>
+                                <div id="onchain-offer-warning" style="display:none; margin-top:0.5rem; padding:0.75rem; border-radius:8px; background:rgba(245,158,11,0.12); border:1px solid rgba(245,158,11,0.35); font-size:0.85rem;">
+                                    <strong>&#9888; Heads up.</strong>
+                                    Not all wallets support Lightning. Disabling on-chain payments will
+                                    mean some wallets can&rsquo;t make payment to you. Additionally, if your
+                                    LNURL/noffer/mint is down, it may leave you with no way to accept payment.
+                                </div>
+                            </div>
+
                             <div class="form-group">
                                 <label class="form-label">Address source</label>
                                 <select class="form-input" id="onchain-mode">
@@ -6124,6 +6206,40 @@ header('Cache-Control: no-cache, must-revalidate');
                         </p>
                         <button class="btn btn-full" id="btn-save-developer" style="margin-top: 0.75rem;">
                             Save developer settings
+                        </button>
+                    </div>
+                </div>
+                <div class="card collapsible" data-admin-only="true" id="card-onchain-site">
+                    <div class="card-header">
+                        <div class="card-title">On-chain payments (site-wide default)</div>
+                    </div>
+                    <div class="card-body">
+                        <p style="font-size: 0.85rem; color: var(--text-secondary); margin: 0 0 0.75rem 0;">
+                            The default for whether stores offer a direct on-chain (pay-to-address)
+                            option to customers, alongside Lightning. Individual stores can override
+                            this on their Bitcoin tab. Turning it off here makes new stores
+                            Lightning-only by default (useful when you want fast, Lightning-first
+                            checkout across the instance).
+                        </p>
+                        <div class="toggle-container">
+                            <span><strong>Offer on-chain payments by default</strong></span>
+                            <label class="toggle">
+                                <input type="checkbox" id="onchain-site-enabled">
+                                <span class="toggle-slider"></span>
+                            </label>
+                        </div>
+                        <div id="onchain-site-warning" style="display:none; margin-top:0.75rem; padding:0.75rem; border-radius:8px; background:rgba(245,158,11,0.12); border:1px solid rgba(245,158,11,0.35); font-size:0.85rem;">
+                            <strong>&#9888; Heads up.</strong>
+                            Not all wallets support Lightning. Disabling on-chain payments will
+                            mean some wallets can&rsquo;t make payment to you. Additionally, if your
+                            LNURL/noffer/mint is down, it may leave you with no way to accept payment.
+                        </div>
+                        <p class="form-help" style="margin-top: 0.5rem;">
+                            A store&rsquo;s xpub is still used for submarine-swap settlement even when
+                            on-chain checkout is off. Default on.
+                        </p>
+                        <button class="btn btn-full" id="btn-save-onchain-site" style="margin-top: 0.75rem;">
+                            Save on-chain default
                         </button>
                     </div>
                 </div>
@@ -7810,6 +7926,10 @@ header('Cache-Control: no-cache, must-revalidate');
             if (saveNotifsBtn) saveNotifsBtn.addEventListener('click', saveNotificationSettings);
             const saveDevBtn = document.getElementById('btn-save-developer');
             if (saveDevBtn) saveDevBtn.addEventListener('click', saveDeveloperSettings);
+            const saveOnchainSiteBtn = document.getElementById('btn-save-onchain-site');
+            if (saveOnchainSiteBtn) saveOnchainSiteBtn.addEventListener('click', saveOnchainSiteSettings);
+            const onchainSiteCb = document.getElementById('onchain-site-enabled');
+            if (onchainSiteCb) onchainSiteCb.addEventListener('change', updateOnchainSiteWarning);
             const testNotifsBtn = document.getElementById('btn-send-test-notification');
             if (testNotifsBtn) testNotifsBtn.addEventListener('click', sendTestNotification);
             const saveSwapsBtn = document.getElementById('btn-save-swaps');
@@ -8058,6 +8178,7 @@ header('Cache-Control: no-cache, must-revalidate');
                     loadAutoUpdateCard();
                     loadNotificationSettings();
                     loadDeveloperSettings();
+                    loadOnchainSiteSettings();
                     loadSwapSettings();
                     loadSelfServeSettings();
                 }
@@ -10368,7 +10489,56 @@ header('Cache-Control: no-cache, must-revalidate');
                 staticMeta.textContent =
                     'Paste a single Bitcoin address you control. The server will reuse it for every invoice. Leave blank to disable on-chain payments.';
             }
+            // "Offer on-chain to customers" tri-state override.
+            const offerSel = document.getElementById('onchain-offer-override');
+            const offerDef = document.getElementById('onchain-offer-site-default');
+            const offerEff = document.getElementById('onchain-offer-effective');
+            if (offerSel) offerSel.value = String(oc.offerOverride ?? -1);
+            if (offerDef) offerDef.textContent = oc.offerSiteDefault ? 'on' : 'off';
+            if (offerEff) offerEff.textContent = oc.offerEffective ? 'on' : 'off';
+            updateOnchainOfferWarning();
             applyOnchainModeVisibility();
+        }
+
+        // Show the "some wallets can't pay you" warning whenever on-chain would
+        // be OFF for this store (either forced off, or inheriting an off site
+        // default). Computed from the current select value so it reacts before
+        // the save round-trips.
+        function updateOnchainOfferWarning() {
+            const oc = dashboardData?.onchain;
+            const sel = document.getElementById('onchain-offer-override');
+            const warn = document.getElementById('onchain-offer-warning');
+            if (!sel || !warn) return;
+            const v = sel.value;
+            const effectiveOff = v === '0' || (v === '-1' && oc && !oc.offerSiteDefault);
+            warn.style.display = effectiveOff ? 'block' : 'none';
+        }
+
+        function onchainOfferChanged() {
+            updateOnchainOfferWarning();
+            saveOnchainOffer();
+        }
+
+        async function saveOnchainOffer() {
+            if (!currentStoreId) {
+                showToast('No store selected', 'error');
+                return;
+            }
+            const tri = document.getElementById('onchain-offer-override').value;
+            try {
+                const response = await postWithCsrf(adminUrl,
+                    `action=save_onchain_offer&store_id=${encodeURIComponent(currentStoreId)}&offer_enabled=${encodeURIComponent(tri)}`);
+                const result = await response.json();
+                if (response.ok && result.success) {
+                    showToast('On-chain payment setting saved', 'success');
+                    await loadDashboard();
+                    renderOnchainDashboard();
+                } else {
+                    showToast(result.error || 'Failed to save on-chain setting', 'error');
+                }
+            } catch (e) {
+                showToast('Failed to save on-chain setting', 'error');
+            }
         }
 
         async function validateOnchainXpub() {
@@ -11291,6 +11461,45 @@ header('Cache-Control: no-cache, must-revalidate');
                 }
             } catch (e) {
                 showToast('Failed to save developer settings', 'error');
+            }
+        }
+
+        // -------- Site-wide on-chain payment default --------
+
+        function updateOnchainSiteWarning() {
+            const cb = document.getElementById('onchain-site-enabled');
+            const warn = document.getElementById('onchain-site-warning');
+            if (cb && warn) warn.style.display = cb.checked ? 'none' : 'block';
+        }
+
+        async function loadOnchainSiteSettings() {
+            try {
+                const response = await postWithCsrf(adminUrl, 'action=get_onchain_site_settings');
+                if (!response.ok) return;
+                const data = await response.json();
+                document.getElementById('onchain-site-enabled').checked = !!data.onchainPaymentsEnabled;
+                updateOnchainSiteWarning();
+            } catch (e) {
+                console.error('Failed to load on-chain site settings', e);
+            }
+        }
+
+        async function saveOnchainSiteSettings() {
+            const params = new URLSearchParams({
+                action: 'save_onchain_site_settings',
+                onchain_payments_enabled: document.getElementById('onchain-site-enabled').checked ? '1' : '0',
+            });
+            try {
+                const response = await postWithCsrf(adminUrl, params.toString());
+                const result = await response.json();
+                if (response.ok && result.success) {
+                    showToast('On-chain default saved!', 'success');
+                    loadOnchainSiteSettings();
+                } else {
+                    showToast(result.error || 'Failed to save', 'error');
+                }
+            } catch (e) {
+                showToast('Failed to save on-chain default', 'error');
             }
         }
 

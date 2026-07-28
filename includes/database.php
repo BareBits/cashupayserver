@@ -487,6 +487,14 @@ HTACCESS;
         if (!self::columnExists($pdo, 'stores', 'onchain_static_tweak_range')) {
             $pdo->exec("ALTER TABLE stores ADD COLUMN onchain_static_tweak_range INTEGER NOT NULL DEFAULT 1000");
         }
+        // Whether the on-chain rail is OFFERED to customers, independent of
+        // whether an xpub/static address is CONFIGURED. Lets a merchant keep an
+        // xpub (needed for submarine-swap claims) while presenting a
+        // Lightning-only checkout. Tri-state: -1 inherit the site default
+        // (config key onchain_payments_enabled), 0 force off, 1 force on.
+        if (!self::columnExists($pdo, 'stores', 'onchain_offer_enabled')) {
+            $pdo->exec("ALTER TABLE stores ADD COLUMN onchain_offer_enabled INTEGER NOT NULL DEFAULT -1");
+        }
 
         if (!self::columnExists($pdo, 'invoices', 'onchain_address')) {
             $pdo->exec("ALTER TABLE invoices ADD COLUMN onchain_address TEXT DEFAULT NULL");
