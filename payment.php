@@ -15,6 +15,7 @@ require_once __DIR__ . '/includes/urls.php';
 require_once __DIR__ . '/includes/cart.php';
 require_once __DIR__ . '/includes/auth.php';
 require_once __DIR__ . '/includes/payment_path_debug.php';
+require_once __DIR__ . '/includes/offline_cashu.php';
 
 // Check setup
 if (!Database::isInitialized() || !Config::isSetupComplete()) {
@@ -557,9 +558,27 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
         .payment-methods .pm-logos {
             display: inline-flex;
             flex-wrap: wrap;
-            align-items: center;
+            align-items: flex-start;
             justify-content: center;
             gap: 0.5rem;
+        }
+        /* Each brand is a logo stacked over its name, wrapped in a link to
+           the provider's site. */
+        .pm-item {
+            display: inline-flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 0.25rem;
+            text-decoration: none;
+            color: var(--text-secondary);
+        }
+        .pm-name {
+            font-size: 0.65rem;
+            line-height: 1;
+            white-space: nowrap;
+        }
+        .pm-item:hover .pm-name {
+            color: var(--text-primary);
         }
         .pm-logo {
             display: inline-block;
@@ -794,14 +813,15 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                 ? htmlspecialchars($invoice['onchain_address'])
                 : '';
 
-            // Cashu ecash: any configured store can be paid by presenting a
-            // token. The request is built without contacting the mint, so it
-            // works even while the server is mint-offline (the whole point of
-            // offline acceptance). The NUT-18 request id is the invoice id so
-            // the receipt attaches back to THIS invoice.
+            // Cashu ecash: offered only when the store has opted into offline
+            // Cashu acceptance. The request is built without contacting the
+            // mint, so it works even while the server is mint-offline (the
+            // whole point of offline acceptance). The NUT-18 request id is the
+            // invoice id so the receipt attaches back to THIS invoice.
             $hasCashu = false;
             $cashuRequest = '';
             if (Config::isStoreConfigured($invoice['store_id'])
+                && OfflineCashu::isEnabled($invoice['store_id'])
                 && in_array($invoice['status'], ['New', 'Provisional'], true)
                 && (int)($invoice['amount_sats'] ?? 0) > 0) {
                 try {
@@ -987,16 +1007,32 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                 <?php
                 $initialMethod = $firstMethod;
                 $imgBase = Urls::images('payment-methods/');
+                // Logos shown in the "Pay with … or any Bitcoin wallet" row. Each links
+                // to the provider's site and carries a small name caption. `noLightning`
+                // brands (card apps that can't natively send Lightning) are hidden on the
+                // Lightning view via the pm-no-lightning class.
+                $paymentBrands = [
+                    ['name' => 'Cash App', 'file' => 'cashapp.svg',  'url' => 'https://cash.app'],
+                    ['name' => 'Strike',   'file' => 'strike.png',   'url' => 'https://strike.me',         'class' => 'pm-strike'],
+                    ['name' => 'Coinbase', 'file' => 'coinbase.svg', 'url' => 'https://www.coinbase.com'],
+                    ['name' => 'Kraken',   'file' => 'kraken.svg',   'url' => 'https://www.kraken.com'],
+                    ['name' => 'Venmo',    'file' => 'venmo.svg',    'url' => 'https://venmo.com',          'class' => 'pm-card', 'noLightning' => true],
+                    ['name' => 'PayPal',   'file' => 'paypal.svg',   'url' => 'https://www.paypal.com',     'class' => 'pm-card', 'noLightning' => true],
+                ];
                 ?>
                 <div class="payment-methods" id="payment-methods" data-method="<?= $initialMethod ?>">
                     <span class="pm-label">Pay with</span>
                     <span class="pm-logos">
-                        <img class="pm-logo" src="<?= htmlspecialchars($imgBase) ?>cashapp.svg" alt="Cash App" title="Cash App">
-                        <img class="pm-logo pm-strike" src="<?= htmlspecialchars($imgBase) ?>strike.png" alt="Strike" title="Strike">
-                        <img class="pm-logo" src="<?= htmlspecialchars($imgBase) ?>coinbase.svg" alt="Coinbase" title="Coinbase">
-                        <img class="pm-logo" src="<?= htmlspecialchars($imgBase) ?>kraken.svg" alt="Kraken" title="Kraken">
-                        <img class="pm-logo pm-card pm-no-lightning" src="<?= htmlspecialchars($imgBase) ?>venmo.svg" alt="Venmo" title="Venmo">
-                        <img class="pm-logo pm-card pm-no-lightning" src="<?= htmlspecialchars($imgBase) ?>paypal.svg" alt="PayPal" title="PayPal">
+                        <?php foreach ($paymentBrands as $brand): ?>
+                            <?php
+                            $itemClass = 'pm-item' . (!empty($brand['noLightning']) ? ' pm-no-lightning' : '');
+                            $logoClass = 'pm-logo' . (!empty($brand['class']) ? ' ' . $brand['class'] : '');
+                            ?>
+                            <a class="<?= $itemClass ?>" href="<?= htmlspecialchars($brand['url']) ?>" target="_blank" rel="noopener noreferrer">
+                                <img class="<?= $logoClass ?>" src="<?= htmlspecialchars($imgBase) ?><?= htmlspecialchars($brand['file']) ?>" alt="<?= htmlspecialchars($brand['name']) ?>" title="<?= htmlspecialchars($brand['name']) ?>">
+                                <span class="pm-name"><?= htmlspecialchars($brand['name']) ?></span>
+                            </a>
+                        <?php endforeach; ?>
                     </span>
                     <span class="pm-label">or any Bitcoin wallet</span>
                 </div>
@@ -1087,7 +1123,7 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
     </div>
 
     <div class="footer">
-        Powered by <a href="#">BareBits</a>
+        Powered by <a href="https://getbarebits.com" target="_blank" rel="noopener">BareBits</a>
     </div>
 
     <div class="copy-toast" id="copy-toast">Copied to clipboard!</div>
