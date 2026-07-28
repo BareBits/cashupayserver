@@ -11512,7 +11512,7 @@ header('Cache-Control: no-cache, must-revalidate');
                 if (response.ok) {
                     showToast('Store swap setting saved', 'success');
                     // Re-fetch dashboard data to refresh "effective" indicator.
-                    await loadDashboardData();
+                    await loadDashboard();
                     refreshStoreSwapsCard();
                 } else {
                     awError('store-swaps-error', result.error || 'Failed to save');
@@ -11556,7 +11556,7 @@ header('Cache-Control: no-cache, must-revalidate');
                 if (response.ok) {
                     showToast('Self-serve settings saved!', 'success');
                     // Refresh the per-store card's "site default" + effective text.
-                    if (currentStoreId) { await loadDashboardData(); refreshStoreSelfServeCard(); }
+                    if (currentStoreId) { await loadDashboard(); refreshStoreSelfServeCard(); }
                 } else {
                     showToast(result.error || 'Failed to save', 'error');
                 }
@@ -11636,7 +11636,7 @@ header('Cache-Control: no-cache, must-revalidate');
                 const result = await response.json();
                 if (response.ok) {
                     showToast('Store self-serve setting saved', 'success');
-                    await loadDashboardData();
+                    await loadDashboard();
                     refreshStoreSelfServeCard();
                 } else {
                     awError('store-selfserve-error', result.error || 'Failed to save');

@@ -132,3 +132,66 @@ def test_admin_invoices_view_shows_selfserve_link(configured: ConfiguredPayserve
         assert configured.store_id in link, f"banner link should target the store, got {link}"
     finally:
         ctx.close()
+
+
+def _login_page(configured: ConfiguredPayserver, browser):
+    """A logged-in admin browser page in a fresh context."""
+    ctx = browser.new_context(viewport={"width": 1280, "height": 900})
+    ctx.request.post(
+        f"{configured.handle.url}/admin",
+        form={"action": "login", "username": "admin", "password": DEFAULT_ADMIN_PASSWORD},
+    )
+    return ctx, ctx.new_page()
+
+
+def test_admin_save_global_selfserve_shows_success(
+    configured: ConfiguredPayserver, browser
+) -> None:
+    # Regression: the save handlers used to call a non-existent loadDashboard*()
+    # in their success branch, so the ReferenceError was swallowed by the same
+    # try/catch and the user saw "Failed to save self-serve settings" even though
+    # the server returned {"success":true} and the setting persisted. Drive the
+    # real button and assert the SUCCESS toast wins (not the error toast).
+    ctx, page = _login_page(configured, browser)
+    try:
+        page.goto(f"{configured.handle.url}/admin/settings", wait_until="networkidle")
+        # The global-save refresh path is gated on a selected store; loading the
+        # dashboard auto-selects one, matching what an operator sees.
+        page.evaluate("async () => { await loadDashboard(); }")
+        assert page.evaluate("currentStoreId") is not None, "a store should be selected"
+
+        page.click("#btn-save-selfserve")
+        # Let the (previously throwing) success branch settle so we read the
+        # final, stable toast rather than the momentary one.
+        page.wait_for_timeout(1000)
+        toast_text = page.text_content("#toast")
+        toast_class = page.get_attribute("#toast", "class") or ""
+        assert toast_text == "Self-serve settings saved!", toast_text
+        assert "error" not in toast_class.split(), toast_class
+    finally:
+        ctx.close()
+
+
+def test_admin_save_store_selfserve_shows_success(
+    configured: ConfiguredPayserver, browser
+) -> None:
+    # Same regression as above for the per-store save button, whose success
+    # branch unconditionally refreshes the dashboard.
+    ctx, page = _login_page(configured, browser)
+    try:
+        page.goto(f"{configured.handle.url}/admin/stores", wait_until="networkidle")
+        page.evaluate("async () => { await loadDashboard(); }")
+        page.wait_for_timeout(300)
+        # Force the override off so neither the client- nor server-side
+        # payment-capability check is in play — we're testing the save/refresh
+        # wiring, not the resolution rules (those are covered elsewhere).
+        page.select_option("#store-selfserve-override", "0")
+
+        page.click("#btn-save-store-selfserve")
+        page.wait_for_timeout(1000)
+        toast_text = page.text_content("#toast")
+        toast_class = page.get_attribute("#toast", "class") or ""
+        assert toast_text == "Store self-serve setting saved", toast_text
+        assert "error" not in toast_class.split(), toast_class
+    finally:
+        ctx.close()
