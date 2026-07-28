@@ -1504,7 +1504,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         case 'save_url_mode':
             Auth::requireAdmin();
             $mode = $_POST['mode'] ?? 'router';
-            if (in_array($mode, ['direct', 'router'])) {
+            if (in_array($mode, ['clean', 'direct', 'router'])) {
                 Config::set('url_mode', $mode);
                 echo json_encode([
                     'success' => true,
@@ -6281,7 +6281,7 @@ header('Cache-Control: no-cache, must-revalidate');
                             <label class="form-label">URL routing</label>
                             <div style="display: flex; align-items: center; gap: 0.5rem; padding: 0.75rem; background: rgba(0,0,0,0.2); border-radius: 8px;">
                                 <span style="font-weight: 500;" id="url-mode-current-label">
-                                    <?= htmlspecialchars(Config::getUrlMode() === 'direct' ? 'Direct URLs' : 'Router.php URLs') ?>
+                                    <?= htmlspecialchars(Urls::urlModeLabel()) ?>
                                 </span>
                                 <span style="font-size: 0.8rem; color: var(--text-secondary);">
                                     (auto-detected)
@@ -11721,12 +11721,35 @@ header('Cache-Control: no-cache, must-revalidate');
         // URL Mode re-detect (standalone deployments only). The setup wizard
         // already auto-detected once; this is the same probe + auto-save flow,
         // run manually from the Settings page when hosting changes.
+        // Mirror of Urls::urlModeLabel() for client-side status text.
+        function urlModeLabel(mode) {
+            if (mode === 'clean') return 'Clean URLs';
+            if (mode === 'direct') return 'Direct URLs';
+            return 'Router.php URLs';
+        }
+
         async function testUrlEndpoint(url) {
             try {
                 const response = await fetch(url, { method: 'GET', mode: 'same-origin' });
                 // 200 from a healthy server, 503 from a half-set-up one — both
                 // confirm the route resolves (mirrors setup.php's logic).
                 return response.status === 200 || response.status === 503;
+            } catch (e) {
+                return false;
+            }
+        }
+
+        // Probe an extension-less, non-/api/v1 route to tell "clean URLs" apart
+        // from "direct" (both answer /api/v1/... via .htaccess, so that probe
+        // can't distinguish them). /health is the target: it is cron-key gated,
+        // so when the front-controller rewrite is active it resolves to
+        // health.php and returns 403 (unauthenticated). A 404 means the pretty
+        // path did NOT route — clean URLs are unavailable. 200/503 also count
+        // (e.g. before the key exists) as "the route resolved".
+        async function testCleanUrl(url) {
+            try {
+                const response = await fetch(url, { method: 'GET', mode: 'same-origin' });
+                return response.status === 200 || response.status === 403 || response.status === 503;
             } catch (e) {
                 return false;
             }
@@ -11743,14 +11766,18 @@ header('Cache-Control: no-cache, must-revalidate');
             }
 
             const baseUrl = urlModeConfig.baseUrl;
+            // Prefer the nicest routing the host actually supports:
+            // clean (pretty URLs) > direct (.php files) > router (front-controller).
             const tests = await Promise.all([
+                testCleanUrl(baseUrl + '/health'),
                 testUrlEndpoint(baseUrl + '/api/v1/server/info'),
                 testUrlEndpoint(baseUrl + '/router.php/api/v1/server/info')
             ]);
 
             let selectedMode = null;
-            if (tests[0]) selectedMode = 'direct';
-            else if (tests[1]) selectedMode = 'router';
+            if (tests[0]) selectedMode = 'clean';
+            else if (tests[1]) selectedMode = 'direct';
+            else if (tests[2]) selectedMode = 'router';
 
             if (!selectedMode) {
                 if (statusEl) {
@@ -11768,7 +11795,7 @@ header('Cache-Control: no-cache, must-revalidate');
                 if (response.ok && result.success) {
                     urlModeConfig.currentMode = selectedMode;
                     if (labelEl) {
-                        labelEl.textContent = selectedMode === 'direct' ? 'Direct URLs' : 'Router.php URLs';
+                        labelEl.textContent = urlModeLabel(selectedMode);
                     }
                     const urlEl = document.getElementById('current-server-url');
                     if (urlEl && result.serverUrl) urlEl.textContent = result.serverUrl;
@@ -11782,7 +11809,7 @@ header('Cache-Control: no-cache, must-revalidate');
                         statusEl.textContent = 'Updated';
                         statusEl.style.color = 'var(--success)';
                     }
-                    showToast('URL routing updated to ' + (selectedMode === 'direct' ? 'Direct URLs' : 'Router.php URLs'), 'success');
+                    showToast('URL routing updated to ' + urlModeLabel(selectedMode), 'success');
                 } else {
                     if (statusEl) {
                         statusEl.textContent = 'Save failed';

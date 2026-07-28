@@ -168,7 +168,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if (isset($_POST['action']) && $_POST['action'] === 'save_url_mode') {
         header('Content-Type: application/json');
         $mode = $_POST['mode'] ?? 'router';
-        if (in_array($mode, ['direct', 'router'])) {
+        if (in_array($mode, ['clean', 'direct', 'router'])) {
             Config::set('url_mode', $mode);
             echo json_encode(['success' => true, 'mode' => $mode]);
         } else {
@@ -1429,25 +1429,34 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                             const baseUrl = <?= json_encode(Urls::siteBase()) ?>;
                             const setupUrl = <?= json_encode(Urls::setup()) ?>;
 
-                            // Test both URL patterns
+                            // Probe each routing style. The /health probe tells
+                            // "clean" (pretty URLs via the front-controller
+                            // rewrite) apart from "direct": /health is cron-key
+                            // gated, so it answers 403 when the extension-less
+                            // path routes and 404 when it does not. 200/503 also
+                            // count as "resolved". The /api/v1 probes accept
+                            // 200/503 (503 = setup not complete yet).
                             const tests = {
-                                direct: { url: baseUrl + '/api/v1/server/info', works: false },
-                                router: { url: baseUrl + '/router.php/api/v1/server/info', works: false }
+                                clean:  { url: baseUrl + '/health', works: false, ok: [200, 403, 503] },
+                                direct: { url: baseUrl + '/api/v1/server/info', works: false, ok: [200, 503] },
+                                router: { url: baseUrl + '/router.php/api/v1/server/info', works: false, ok: [200, 503] }
                             };
 
                             for (const [mode, test] of Object.entries(tests)) {
                                 try {
                                     const response = await fetch(test.url, { method: 'GET', mode: 'same-origin' });
-                                    // Accept 200 or 503 (setup not complete) as success - both mean routing works
-                                    test.works = response.status === 200 || response.status === 503;
+                                    test.works = test.ok.includes(response.status);
                                 } catch (e) {
                                     test.works = false;
                                 }
                             }
 
-                            // Determine which mode to use (prefer direct)
+                            // Prefer the nicest routing the host supports:
+                            // clean > direct > router.
                             let selectedMode = null;
-                            if (tests.direct.works) {
+                            if (tests.clean.works) {
+                                selectedMode = 'clean';
+                            } else if (tests.direct.works) {
                                 selectedMode = 'direct';
                             } else if (tests.router.works) {
                                 selectedMode = 'router';
@@ -1469,10 +1478,14 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                             loadingEl.style.display = 'none';
                             resultEl.style.display = 'flex';
 
-                            if (selectedMode === 'direct') {
+                            if (selectedMode === 'clean') {
+                                statusEl.className = 'status OK';
+                                messageEl.textContent = 'Clean URLs working';
+                                detailsEl.textContent = 'Pretty URLs like /admin and /pay/... are supported.';
+                            } else if (selectedMode === 'direct') {
                                 statusEl.className = 'status OK';
                                 messageEl.textContent = 'Direct URLs working';
-                                detailsEl.textContent = 'Clean URLs like /api/v1/... are supported.';
+                                detailsEl.textContent = 'API URLs like /api/v1/... are supported.';
                             } else if (selectedMode === 'router') {
                                 statusEl.className = 'status OK';
                                 messageEl.textContent = 'Router.php URLs working';
@@ -2282,7 +2295,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                 <?php
                 $serverUrl = Urls::server();
                 $urlMode = Config::getUrlMode();
-                $urlModeLabel = Urls::isWordPress() ? 'WordPress routing' : ($urlMode === 'direct' ? 'Direct URLs (clean)' : 'Router.php URLs (compatible)');
+                $urlModeLabel = Urls::urlModeLabel($urlMode);
                 ?>
                 <div style="background: rgba(72, 187, 120, 0.1); border: 1px solid rgba(72, 187, 120, 0.3); padding: 1rem; border-radius: 8px; margin-bottom: 1.5rem;">
                     <p style="margin-bottom: 0.5rem; font-weight: 500;">Your Server URL</p>

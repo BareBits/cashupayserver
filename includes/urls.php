@@ -26,6 +26,24 @@ class Urls {
     }
 
     /**
+     * Human-readable label for a URL routing mode (standalone only).
+     *
+     * Centralised so the admin settings card and the setup summary render the
+     * same wording. Falls back to the current configured mode when none given.
+     */
+    public static function urlModeLabel(?string $mode = null): string {
+        if (self::isWordPress()) {
+            return 'WordPress routing';
+        }
+        $mode = $mode ?? Config::getUrlMode();
+        switch ($mode) {
+            case 'clean':  return 'Clean URLs';
+            case 'direct': return 'Direct URLs';
+            default:       return 'Router.php URLs';
+        }
+    }
+
+    /**
      * Get the server URL for e-commerce integration (BTCPay API base).
      * This is the URL e-commerce plugins should use as "BTCPay Server URL".
      */
@@ -34,11 +52,14 @@ class Urls {
             return site_url('/cashupay');
         }
 
-        // Standalone: check url_mode config for direct vs router.php URLs
+        // Standalone: only router mode needs the /router.php front-controller
+        // prefix. In both clean (rewrite-to-router.php) and direct (.htaccess
+        // rewrites /api/v1 straight to api.php) modes the API is reachable at
+        // the bare base URL.
         $base = rtrim(Config::getBaseUrl(), '/');
         $mode = Config::getUrlMode();
 
-        return $mode === 'direct' ? $base : $base . '/router.php';
+        return $mode === 'router' ? $base . '/router.php' : $base;
     }
 
     /**
@@ -47,6 +68,14 @@ class Urls {
     public static function admin(): string {
         if (self::isWordPress()) {
             return site_url('/cashupay-admin/');
+        }
+        // Clean mode serves the SPA at the extension-less /admin route (the
+        // front-controller rewrite forwards it to router.php -> admin.php).
+        // Absolute so it is a valid redirect target from index.php. Direct and
+        // router modes keep the relative 'admin.php', which resolves to the
+        // real file from the directory index under both.
+        if (Config::getUrlMode() === 'clean') {
+            return rtrim(Config::getBaseUrl(), '/') . '/admin';
         }
         return 'admin.php';
     }
@@ -65,7 +94,9 @@ class Urls {
         }
         $base = rtrim(Config::getBaseUrl(), '/');
         $mode = Config::getUrlMode();
-        return $mode === 'direct' ? $base . '/setup.php' : $base . '/router.php/setup.php';
+        if ($mode === 'clean')  return $base . '/setup';
+        if ($mode === 'router') return $base . '/router.php/setup.php';
+        return $base . '/setup.php'; // direct
     }
 
     /**
@@ -122,8 +153,14 @@ class Urls {
             return $invoiceId ? $url . $invoiceId : $url;
         }
 
-        $base = rtrim(Config::getBaseUrl(), '/') . '/payment.php';
-        return $invoiceId ? $base . '?id=' . urlencode($invoiceId) : $base;
+        $base = rtrim(Config::getBaseUrl(), '/');
+        // Clean mode uses the pretty /payment/{id} route (router.php maps the
+        // path tail into $_GET['id']); other modes hit payment.php directly.
+        if (Config::getUrlMode() === 'clean') {
+            return $invoiceId ? $base . '/payment/' . rawurlencode($invoiceId) : $base . '/payment';
+        }
+        $file = $base . '/payment.php';
+        return $invoiceId ? $file . '?id=' . urlencode($invoiceId) : $file;
     }
 
     /**
@@ -139,9 +176,9 @@ class Urls {
         }
         $base = rtrim(Config::getBaseUrl(), '/');
         $mode = Config::getUrlMode();
-        return $mode === 'direct'
-            ? $base . '/pay.php?store=' . urlencode($storeId)
-            : $base . '/router.php/pay/' . rawurlencode($storeId);
+        if ($mode === 'clean')  return $base . '/pay/' . rawurlencode($storeId);
+        if ($mode === 'router') return $base . '/router.php/pay/' . rawurlencode($storeId);
+        return $base . '/pay.php?store=' . urlencode($storeId); // direct
     }
 
     /**

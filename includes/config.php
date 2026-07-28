@@ -169,9 +169,17 @@ class Config {
     }
 
     /**
-     * Get URL mode for standalone deployments
+     * Get URL mode for standalone deployments.
      *
-     * @return string 'direct' for clean URLs (/api/v1/...) or 'router' for router.php URLs
+     * - 'clean'  : extension-less pretty URLs (/admin, /setup, /pay/x) served
+     *              through the router.php front controller via a mod_rewrite
+     *              catch-all. Preferred when the host supports it.
+     * - 'direct' : hit the .php files directly (/admin.php); the shipped
+     *              .htaccess still rewrites /api/v1/* to api.php.
+     * - 'router' : front-controller prefix (/router.php/...); works with no
+     *              URL rewriting at all — the safe universal fallback.
+     *
+     * @return string 'clean', 'direct', or 'router'
      */
     public static function getUrlMode(): string {
         return self::get('url_mode', 'router'); // Default router for max compatibility
