@@ -71,6 +71,22 @@
     RewriteRule ^docker/ - [F,L]
     RewriteRule ^docs/ - [F,L]
     RewriteRule ^\.claude/ - [F,L]
+
+    # Clean-URL front controller (enables url_mode = 'clean').
+    #
+    # Route anything that is not a real file or directory through router.php,
+    # which already dispatches extension-less paths: /admin, /admin/<view>,
+    # /setup, /pay/{store}, /payment/{id}, /health, etc. Kept LAST so the
+    # [F,L] blocks above and the /api/v1 rules near the top keep priority, and
+    # so real files (assets, admin.php itself) are served directly and never
+    # loop back through the rewrite.
+    #
+    # Requires mod_rewrite + AllowOverride. Hosts without them simply never
+    # match this rule; the URL-mode probe then detects direct/router instead
+    # and everything keeps working through .php or /router.php paths.
+    RewriteCond %{REQUEST_FILENAME} !-f
+    RewriteCond %{REQUEST_FILENAME} !-d
+    RewriteRule ^(.*)$ router.php/$1 [L,QSA]
 </IfModule>
 
 # PHP settings (if allowed)
