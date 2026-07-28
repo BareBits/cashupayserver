@@ -5388,9 +5388,14 @@ header('Cache-Control: no-cache, must-revalidate');
                                 <span class="store-info-label">Mint URL</span>
                                 <span class="store-info-value" id="store-settings-mint">-</span>
                             </div>
-                            <div class="store-info-item">
-                                <span class="store-info-label">Unit</span>
-                                <span class="store-info-value" id="store-settings-unit">-</span>
+                            <div class="store-info-item" id="store-info-selfserve-row" style="display:none;">
+                                <span class="store-info-label">Self-serve link</span>
+                                <span class="store-info-value" style="display:flex; gap:0.4rem; align-items:center; max-width:70%;">
+                                    <input type="text" class="form-input" id="store-info-selfserve-link" readonly
+                                           style="flex:1; min-width:0; font-size:0.8rem; padding:0.25rem 0.4rem;">
+                                    <button type="button" class="btn btn-secondary" id="btn-copy-store-info-selfserve"
+                                            style="width:auto; flex:0 0 auto; padding:0.25rem 0.6rem;">Copy</button>
+                                </span>
                             </div>
                         </div>
                     </div>
@@ -6593,6 +6598,10 @@ header('Cache-Control: no-cache, must-revalidate');
                                 <span class="toggle-slider"></span>
                             </label>
                         </div>
+
+                        <p class="form-help" style="margin-top: 0.5rem;">
+                            To get the self-serve invoice URL, go to settings for the individual store.
+                        </p>
 
                         <div class="form-group" style="margin-top: 1rem;">
                             <label class="form-label" for="selfserve-max-sats">Maximum invoice (sats)</label>
@@ -7815,6 +7824,8 @@ header('Cache-Control: no-cache, must-revalidate');
             if (saveStoreSelfServeBtn) saveStoreSelfServeBtn.addEventListener('click', saveStoreSelfServe);
             const copySelfServeLinkBtn = document.getElementById('btn-copy-selfserve-link');
             if (copySelfServeLinkBtn) copySelfServeLinkBtn.addEventListener('click', copySelfServeLink);
+            const copyInfoSelfServeLinkBtn = document.getElementById('btn-copy-store-info-selfserve');
+            if (copyInfoSelfServeLinkBtn) copyInfoSelfServeLinkBtn.addEventListener('click', () => copyLinkFromEl('store-info-selfserve-link'));
             const copyInvoicesSelfServeLinkBtn = document.getElementById('btn-copy-invoices-selfserve-link');
             if (copyInvoicesSelfServeLinkBtn) copyInvoicesSelfServeLinkBtn.addEventListener('click', () => {
                 const el = document.getElementById('invoices-selfserve-link');
@@ -9224,7 +9235,6 @@ header('Cache-Control: no-cache, must-revalidate');
                 document.getElementById('store-settings-name').textContent = store.name;
                 document.getElementById('store-settings-id').textContent = store.id;
                 document.getElementById('store-settings-mint').textContent = store.mint_url || '-';
-                document.getElementById('store-settings-unit').textContent = (store.mint_unit || 'sat').toUpperCase();
 
                 // Load auto-melt settings from dashboard data
                 if (dashboardData && dashboardData.autoMelt) {
@@ -11592,6 +11602,19 @@ header('Cache-Control: no-cache, must-revalidate');
                 }
             }
 
+            // Mirror the link into the store-info grid (next to Mint URL), again
+            // only when self-serve is effectively on.
+            const infoRow = document.getElementById('store-info-selfserve-row');
+            const infoLink = document.getElementById('store-info-selfserve-link');
+            if (infoRow && infoLink) {
+                if (s.effective && s.payUrl) {
+                    infoLink.value = s.payUrl;
+                    infoRow.style.display = '';
+                } else {
+                    infoRow.style.display = 'none';
+                }
+            }
+
             // Mirror the link onto the Invoices view banner so the feature is
             // discoverable from where operators manage invoices.
             const banner = document.getElementById('card-selfserve-link');
@@ -11608,12 +11631,16 @@ header('Cache-Control: no-cache, must-revalidate');
             }
         }
 
-        function copySelfServeLink() {
-            const linkEl = document.getElementById('store-selfserve-link');
+        function copyLinkFromEl(elId) {
+            const linkEl = document.getElementById(elId);
             if (!linkEl || !linkEl.value) return;
             navigator.clipboard.writeText(linkEl.value).then(() => {
                 showToast('Link copied!', 'success');
             }).catch(() => showToast('Could not copy link', 'error'));
+        }
+
+        function copySelfServeLink() {
+            copyLinkFromEl('store-selfserve-link');
         }
 
         async function saveStoreSelfServe() {

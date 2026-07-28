@@ -28,6 +28,16 @@ function assert_rejects(callable $fn, string $msg): void {
 assert_eq(['sat'], SelfServe::allowedCurrencies($satStore), 'sat-only store offers just sat');
 assert_eq(['sat', 'USD'], SelfServe::allowedCurrencies($fiatStore), 'fiat store offers sat + USD');
 
+// ---- Default (pre-selected) currency: the store's default display currency ----
+
+assert_eq('sat', SelfServe::defaultCurrency($satStore), 'sat-only store pre-selects sat');
+assert_eq('USD', SelfServe::defaultCurrency($fiatStore), 'fiat store pre-selects its default (USD)');
+// Whatever the default resolves to must always be an offered/valid currency.
+assert_true(in_array(SelfServe::defaultCurrency($fiatStore), SelfServe::allowedCurrencies($fiatStore), true),
+    'default currency is always one of the allowed currencies');
+assert_eq('USD', SelfServe::validateCurrency($fiatStore, SelfServe::defaultCurrency($fiatStore)),
+    'default currency passes validation');
+
 assert_eq('sat', SelfServe::validateCurrency($satStore, 'sat'), 'sat accepted');
 assert_eq('sat', SelfServe::validateCurrency($satStore, 'SATS'), 'SATS normalizes to sat');
 assert_eq('USD', SelfServe::validateCurrency($fiatStore, 'usd'), 'usd normalizes to USD');
