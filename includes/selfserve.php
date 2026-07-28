@@ -214,6 +214,19 @@ final class SelfServe {
     }
 
     /**
+     * The currency the self-serve form should pre-select for this store: the
+     * store's configured default display currency, normalized to match the
+     * codes in allowedCurrencies() ('sat' lowercase, fiat uppercase). Always
+     * one of the allowed currencies, so it is safe to use as the default
+     * selection.
+     */
+    public static function defaultCurrency(string $storeId): string {
+        $default = Config::getStoreDefaultCurrency($storeId); // 'sat' or e.g. 'USD'
+        $norm = strtoupper($default) === 'SATS' ? 'sat' : $default;
+        return strtolower($norm) === 'sat' ? 'sat' : strtoupper($norm);
+    }
+
+    /**
      * Validate that a customer-supplied currency code is one we offer for this
      * store. Returns the normalized code, or throws.
      */

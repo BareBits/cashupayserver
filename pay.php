@@ -59,13 +59,15 @@ $maxSats = SelfServe::effectiveMaxSats($storeId);
 // Values echoed back into the form so a validation error doesn't wipe what the
 // customer typed.
 $formAmount = '';
-$formCurrency = $allowedCurrencies[0];
+// Pre-select the store's default currency (falls back to 'sat' for sat-only
+// stores). Always one of $allowedCurrencies.
+$formCurrency = SelfServe::defaultCurrency($storeId);
 $formNotes = '';
 $error = null;
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $formAmount   = (string)($_POST['amount'] ?? '');
-    $formCurrency = (string)($_POST['currency'] ?? $allowedCurrencies[0]);
+    $formCurrency = (string)($_POST['currency'] ?? SelfServe::defaultCurrency($storeId));
     $formNotes    = (string)($_POST['notes'] ?? '');
 
     try {

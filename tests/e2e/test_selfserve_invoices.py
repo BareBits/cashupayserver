@@ -41,6 +41,14 @@ def _set_store_max(configured: ConfiguredPayserver, max_sats) -> None:
         )
 
 
+def _set_store_currency(configured: ConfiguredPayserver, currency: str) -> None:
+    with configured.handle.db() as db:
+        db.execute(
+            "UPDATE stores SET default_currency = ? WHERE id = ?",
+            (currency, configured.store_id),
+        )
+
+
 def test_pay_page_404_when_disabled(configured: ConfiguredPayserver) -> None:
     # Disabled by default → generic 404 (no leak of the store or the feature).
     r = requests.get(
@@ -64,6 +72,27 @@ def test_pay_page_renders_when_enabled(configured: ConfiguredPayserver) -> None:
     assert "Continue to payment" in r.text
     # Sat-only store: the max hint is shown.
     assert "Maximum" in r.text
+
+
+def test_pay_page_defaults_to_store_currency(
+    configured: ConfiguredPayserver, browser
+) -> None:
+    # A fiat store offers [sat, USD]; the selector must pre-select the store's
+    # default display currency (USD), not sat.
+    _enable_site_selfserve(configured)
+    _set_store_currency(configured, "USD")
+    ctx = browser.new_context(viewport={"width": 480, "height": 900})
+    page = ctx.new_page()
+    try:
+        page.goto(
+            f"{configured.handle.url}/pay/{configured.store_id}", wait_until="networkidle"
+        )
+        # The currency <select> is only rendered for fiat stores.
+        assert page.locator("#currency").count() == 1, "fiat store should show a currency selector"
+        assert page.eval_on_selector("#currency", "el => el.value") == "USD"
+    finally:
+        ctx.close()
+        _set_store_currency(configured, "sat")
 
 
 def test_over_max_amount_rejected(configured: ConfiguredPayserver) -> None:
@@ -130,6 +159,62 @@ def test_admin_invoices_view_shows_selfserve_link(configured: ConfiguredPayserve
         assert banner.is_visible(), "self-serve link banner should be visible when enabled"
         link = page.locator("#invoices-selfserve-link").input_value()
         assert configured.store_id in link, f"banner link should target the store, got {link}"
+    finally:
+        ctx.close()
+
+
+def test_store_settings_info_no_unit_and_selfserve_link(
+    configured: ConfiguredPayserver, browser
+) -> None:
+    # The store-info block drops the always-"sat" Unit row and, when self-serve
+    # is effectively on, surfaces the public link with a Copy button.
+    _enable_site_selfserve(configured)
+    ctx = browser.new_context(viewport={"width": 1280, "height": 900})
+    ctx.request.post(
+        f"{configured.handle.url}/admin",
+        form={"action": "login", "username": "admin", "password": DEFAULT_ADMIN_PASSWORD},
+    )
+    page = ctx.new_page()
+    try:
+        page.goto(f"{configured.handle.url}/admin/stores", wait_until="networkidle")
+        # loadDashboard auto-selects a store, populates dashboardData.selfserve
+        # and runs refreshStoreSelfServeCard (which toggles the info-grid link);
+        # loadStoreSettings fills the store-info block.
+        page.evaluate("async () => { await loadDashboard(); await loadStoreSettings(); }")
+        page.wait_for_timeout(1000)
+
+        # The Unit row is gone entirely (element removed, not just hidden).
+        assert page.locator("#store-settings-unit").count() == 0, "Unit row should be removed"
+
+        # Self-serve is inherited-on for a payment-capable store → link visible.
+        row = page.locator("#store-info-selfserve-row")
+        assert row.is_visible(), "self-serve link row should show when enabled"
+        link = page.locator("#store-info-selfserve-link").input_value()
+        assert configured.store_id in link, f"link should target the store, got {link}"
+        assert page.locator("#btn-copy-store-info-selfserve").is_visible(), "Copy button present"
+    finally:
+        ctx.close()
+
+
+def test_store_settings_info_hides_selfserve_link_when_off(
+    configured: ConfiguredPayserver, browser
+) -> None:
+    # With self-serve disabled site-wide (the default) and no override, the
+    # info-grid link row stays hidden.
+    _enable_site_selfserve(configured, enabled=False)
+    ctx = browser.new_context(viewport={"width": 1280, "height": 900})
+    ctx.request.post(
+        f"{configured.handle.url}/admin",
+        form={"action": "login", "username": "admin", "password": DEFAULT_ADMIN_PASSWORD},
+    )
+    page = ctx.new_page()
+    try:
+        page.goto(f"{configured.handle.url}/admin/stores", wait_until="networkidle")
+        page.evaluate("async () => { await loadDashboard(); await loadStoreSettings(); }")
+        page.wait_for_timeout(1000)
+        assert not page.locator("#store-info-selfserve-row").is_visible(), (
+            "self-serve link row should be hidden when the feature is off"
+        )
     finally:
         ctx.close()
 
