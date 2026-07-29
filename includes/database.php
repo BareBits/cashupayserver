@@ -102,7 +102,7 @@ class Database {
             // that migration ran — getInstance() will then trigger runMigrations()
             // on existing installs that haven't yet picked it up. All migrations
             // are idempotent, so a fire is safe.
-            $hasLatestMigration = $hasConfig && self::columnExists(self::$instance, 'melts', 'melt_quote_id');
+            $hasLatestMigration = $hasConfig && self::columnExists(self::$instance, 'stores', 'onchain_offer_enabled');
             // The auto-withdraw → auto-cashout rename is a data-only migration
             // (config key + notification event labels) with no schema artifact
             // to mark it done, so probe for the legacy config key directly. The

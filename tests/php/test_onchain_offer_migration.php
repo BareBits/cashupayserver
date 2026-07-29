@@ -1,0 +1,69 @@
+<?php
+/**
+ * Regression: the on-chain offer setting ships a schema migration that adds
+ * stores.onchain_offer_enabled. runMigrations() only fires for an already-
+ * current install when the marker column in Database::getInstance() is absent,
+ * so the marker MUST advance to the newest migration's artifact. When it didn't,
+ * existing installs skipped the migration and every Invoice::create() threw
+ * "no such column: onchain_offer_enabled" (surfaced as the generic self-serve
+ * "Could not create the invoice right now." error).
+ *
+ * This test simulates a pre-merge install (newest column dropped, old marker
+ * still present), drops the connection singleton, and asserts the next
+ * connection self-heals — re-adding the column so OnchainConfig works.
+ */
+declare(strict_types=1);
+require __DIR__ . '/harness.php';
+fresh_db();
+require_once dirname(__DIR__, 2) . '/includes/config.php';
+require_once dirname(__DIR__, 2) . '/includes/onchain/config.php';
+
+/** Force the next Database call to reconnect and re-run the migration gate. */
+function reset_db_singleton(): void {
+    $ref = new ReflectionProperty('Database', 'instance');
+    $ref->setAccessible(true);
+    $ref->setValue(null, null);
+    $cacheRef = new ReflectionProperty('Config', 'cache');
+    $cacheRef->setAccessible(true);
+    $cacheRef->setValue(null, []);
+}
+
+function has_col(string $table, string $col): bool {
+    $r = Database::fetchOne(
+        "SELECT COUNT(*) AS n FROM pragma_table_info('{$table}') WHERE name = ?",
+        [$col]
+    );
+    return (int)($r['n'] ?? 0) > 0;
+}
+
+// A fresh install has the new column AND the previous marker column.
+assert_true(has_col('stores', 'onchain_offer_enabled'), 'fresh install has onchain_offer_enabled');
+assert_true(has_col('melts', 'melt_quote_id'), 'fresh install has the previous marker column');
+
+// Simulate a pre-merge install: the newest column is missing, but the old
+// marker (melt_quote_id) is still present — exactly the state of a running
+// instance when it pulls code that adds a new migration.
+Database::getInstance()->exec("ALTER TABLE stores DROP COLUMN onchain_offer_enabled");
+assert_false(has_col('stores', 'onchain_offer_enabled'), 'pre-merge: column dropped');
+assert_true(has_col('melts', 'melt_quote_id'), 'pre-merge: old marker still present');
+
+// First DB access after the "deploy" must re-run migrations and re-add it.
+reset_db_singleton();
+Database::getInstance();
+assert_true(has_col('stores', 'onchain_offer_enabled'), 'getInstance() self-heals the missing column');
+
+// And the resolver that Invoice::create() calls now works instead of throwing.
+Database::insert('stores', [
+    'id' => 'store_offer_mig',
+    'name' => 'Offer Mig',
+    'mint_unit' => 'sat',
+    'created_at' => Database::timestamp(),
+]);
+assert_true(OnchainConfig::isEnabledForStore('store_offer_mig'), 'OnchainConfig works after heal (default on)');
+
+// Idempotent: a second reconnect makes no further changes and no errors.
+reset_db_singleton();
+Database::getInstance();
+assert_true(has_col('stores', 'onchain_offer_enabled'), 're-run leaves the column in place');
+
+echo "test_onchain_offer_migration: ok\n";
