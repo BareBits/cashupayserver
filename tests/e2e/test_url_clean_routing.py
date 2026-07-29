@@ -60,6 +60,28 @@ def test_extensionless_admin_route_resolves(payserver: PayserverHandle) -> None:
     )
 
 
+def test_payment_method_logo_served_through_front_controller(
+    payserver: PayserverHandle,
+) -> None:
+    """/images/payment-methods/*.png must serve the real image, not 404.
+
+    The clean /payment/{id} page links its "Pay with …" wallet logos with a
+    base-rooted /images/payment-methods/... URL. Those static files must resolve
+    through the front controller (the router serves /images/* the same way it
+    serves /assets/*); a 404 here is exactly the blank-logo regression."""
+    r = requests.get(
+        f"{payserver.url}/images/payment-methods/strike.png",
+        timeout=15,
+        allow_redirects=False,
+    )
+    assert r.status_code == 200, (
+        f"payment-method logo did not resolve: {r.status_code}: {r.text[:120]}"
+    )
+    assert r.headers.get("Content-Type", "").startswith("image/"), (
+        f"expected an image content-type, got {r.headers.get('Content-Type')!r}"
+    )
+
+
 def test_api_reachable_at_bare_base(payserver: PayserverHandle) -> None:
     """The BTCPay-compat API base must answer at the bare /api/v1 path (this is
     what 'clean' and 'direct' modes both advertise as the server URL)."""

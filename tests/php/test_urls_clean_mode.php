@@ -40,6 +40,11 @@ assert_eq($BASE . '/payment',    Urls::payment(),           'clean: payment (no 
 assert_eq($BASE . '/payment/inv_9', Urls::payment('inv_9'), 'clean: payment (with id)');
 assert_eq('Clean URLs',          Urls::urlModeLabel(),      'clean: label');
 
+// Static image URLs must be base-rooted absolute, or the payment-method wallet
+// logos 404 when the payment page is served at the /payment/{id} sub-path.
+assert_eq($BASE . '/images/payment-methods/strike.png',
+    Urls::images('payment-methods/strike.png'), 'clean: image is base-rooted');
+
 // The whole point of clean mode: no '.php' and no '/router.php/' in the
 // user-facing page URLs.
 foreach ([Urls::admin(), Urls::setup(), Urls::selfServe('s'), Urls::payment('i')] as $u) {
