@@ -131,7 +131,12 @@ class Urls {
             $pluginFile = self::$pluginFile ?? (defined('CASHUPAY_PLUGIN_DIR') ? CASHUPAY_PLUGIN_DIR . '/cashupay.php' : __FILE__);
             return plugins_url('images/' . $subpath, $pluginFile);
         }
-        return 'images/' . $subpath;
+        // Base-rooted ABSOLUTE URL, not a page-relative 'images/...'. In clean
+        // mode the payment page is served at the sub-path /payment/{id}, where a
+        // relative 'images/payment-methods/foo.svg' resolves to
+        // /payment/images/... and 404s — which silently blanked the "Pay with …"
+        // wallet logos. Mirrors assets(): a base-rooted URL loads from any path.
+        return Config::getBaseUrl() . '/images/' . $subpath;
     }
 
     /**

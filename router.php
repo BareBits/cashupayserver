@@ -169,9 +169,15 @@ if (preg_match('#^/product-image$#', $uri)) {
 }
 
 // -----------------------------------------------------------------------------
-// Static assets: /assets/*
+// Static assets: /assets/* and /images/*
+//
+// /images/* covers the payment-method wallet logos referenced from the clean
+// /payment/{id} page. Apache serves these real files directly (the front
+// controller rewrite is gated on !-f), but keep them handled here too so the
+// front controller stays self-sufficient under any SAPI (e.g. the PHP
+// built-in server) and router-mode deep paths.
 // -----------------------------------------------------------------------------
-if (preg_match('#^/assets/#', $uri)) {
+if (preg_match('#^/(?:assets|images)/#', $uri)) {
     $file = __DIR__ . $uri;
     if (file_exists($file) && is_file($file)) {
         // Determine content type
