@@ -45,6 +45,23 @@ WP_ADMIN_PASSWORD = "wp-admin-test-pw"
 WP_ADMIN_EMAIL = "admin@example.test"
 WP_SITE_TITLE = "CashuPay Test"
 
+# WooCommerce + the real BTCPay Greenfield gateway plugin, pinned for a
+# deterministic end-to-end checkout. WooCommerce 9.6.2 is the newest release
+# that still lists "Requires at least: 6.6" (11.x needs WP 6.9, newer than the
+# 6.6.2 core this fixture installs). The BTCPay plugin verifies the exact same
+# `sha256=` HMAC BareBits emits, so no protocol shim is needed.
+WOOCOMMERCE_VERSION = "9.6.2"
+WOOCOMMERCE_URL = f"https://downloads.wordpress.org/plugin/woocommerce.{WOOCOMMERCE_VERSION}.zip"
+WOOCOMMERCE_SHA256 = "d801efe9ffc3fdcf1495dc9662a08c9373ff1eee44b1838de649cf758ccbcd13"
+WOOCOMMERCE_CACHE = BIN_DIR / f"woocommerce-{WOOCOMMERCE_VERSION}"
+
+BTCPAY_WC_VERSION = "2.8.0"
+BTCPAY_WC_URL = (
+    f"https://downloads.wordpress.org/plugin/btcpay-greenfield-for-woocommerce.{BTCPAY_WC_VERSION}.zip"
+)
+BTCPAY_WC_SHA256 = "b06a4da4835d984ddd870c3bfafb6fc4c524fe0ef988f22cd1575a8a7b77d236"
+BTCPAY_WC_CACHE = BIN_DIR / f"btcpay-greenfield-{BTCPAY_WC_VERSION}"
+
 
 @dataclass
 class WordPressHandle:
@@ -172,6 +189,25 @@ def _ensure_sqlite_plugin() -> Path:
         zf.extractall(SQLITE_DB_CACHE)
     if not (extracted / "db.copy").is_file():
         raise RuntimeError(f"sqlite-database-integration extracted but db.copy missing at {extracted}")
+    return extracted
+
+
+def _ensure_cached_plugin(cache_dir: Path, url: str, sha256: str, slug: str) -> Path:
+    """Download + extract a wp.org plugin zip once. Returns the extracted plugin
+    directory (cache_dir/<slug>), whose basename matches the plugin slug so
+    `wp plugin activate <slug>` works. Idempotent across runs and tests."""
+    extracted = cache_dir / slug
+    main_file = extracted / f"{slug}.php"
+    if main_file.is_file():
+        return extracted
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    archive = cache_dir / "plugin.zip"
+    _download_to(url, archive, expected_sha256=sha256)
+    import zipfile
+    with zipfile.ZipFile(archive) as zf:
+        zf.extractall(cache_dir)
+    if not main_file.is_file():
+        raise RuntimeError(f"{slug} extracted but {main_file.name} missing at {extracted}")
     return extracted
 
 
@@ -346,6 +382,14 @@ def start_wordpress(workdir: Path) -> WordPressHandle:
     # webhook sink in this test runs on 127.0.0.1, so let the WP-served
     # cashupay plugin opt in.
     env.setdefault("CASHUPAY_ALLOW_PRIVATE_ENDPOINTS", "1")
+    # Fork multiple worker processes for the built-in server. A single-threaded
+    # `php -S` deadlocks on any same-server loopback request, and a real
+    # WooCommerce checkout makes two: the BTCPay gateway calls the cashupay
+    # Greenfield API to create the invoice *during* the checkout request, and
+    # the cashupay webhook cron POSTs back to WooCommerce's wc-api endpoint
+    # *during* the cron request. Production (Apache/php-fpm) is multi-process;
+    # this mirrors that. Confirmed honored by the pinned static PHP 8.3 build.
+    env.setdefault("PHP_CLI_SERVER_WORKERS", "6")
     log = (workdir / "wp-server.log").open("ab")
     proc = subprocess.Popen(
         [
@@ -385,6 +429,87 @@ def stop_wordpress(handle: WordPressHandle) -> None:
         except subprocess.TimeoutExpired:
             handle.process.kill()
             handle.process.wait()
+
+
+# ---------- WooCommerce + BTCPay gateway on top of a running WP ----------
+
+# The shop currency the checkout test uses is BTC. BareBits treats BTC as a
+# fixed 1e8 sats with no exchange-rate lookup (see includes/invoice.php), so a
+# BTC-priced order settles deterministically with no network price feed. Eight
+# decimals lets us price a product in exact sats (0.00001500 BTC = 1500 sats).
+WC_PRODUCT_PRICE_BTC = "0.00001500"
+
+
+def install_woocommerce(handle: WordPressHandle) -> dict:
+    """Install + activate WooCommerce and the real BTCPay Greenfield gateway on
+    an already-running WordPress handle, configure a headless-checkout-friendly
+    store (BTC currency, guest checkout, no taxes/shipping), and create one
+    virtual product.
+
+    Returns {"product_id": int} for the test to add to the cart. The BTCPay
+    gateway is installed but left *unconfigured* — wiring it to BareBits is the
+    behaviour under test (cashupay_configure_btcpay_plugin), so the test does
+    that itself.
+    """
+    woo_src = _ensure_cached_plugin(
+        WOOCOMMERCE_CACHE, WOOCOMMERCE_URL, WOOCOMMERCE_SHA256, "woocommerce"
+    )
+    btcpay_src = _ensure_cached_plugin(
+        BTCPAY_WC_CACHE, BTCPAY_WC_URL, BTCPAY_WC_SHA256, "btcpay-greenfield-for-woocommerce"
+    )
+
+    plugins_dir = handle.wp_root / "wp-content" / "plugins"
+    for src in (woo_src, btcpay_src):
+        dst = plugins_dir / src.name
+        if not dst.exists():
+            os.symlink(src, dst)
+
+    # WooCommerce first, then the gateway (which declares WooCommerce a
+    # dependency). Activation runs the WC installer against the SQLite DB.
+    handle.wp_cli("plugin", "activate", "woocommerce")
+    handle.wp_cli("plugin", "activate", "btcpay-greenfield-for-woocommerce")
+
+    # Store config: everything that would otherwise make a headless Store API
+    # checkout demand extra input or hide the storefront. wp-cli reports a
+    # no-op `option update` (value already equal to the default) as a failure,
+    # so these are best-effort — the ones that matter are asserted below.
+    for key, value in {
+        "woocommerce_currency": "BTC",
+        "woocommerce_price_num_decimals": "8",
+        "woocommerce_enable_guest_checkout": "yes",
+        "woocommerce_enable_checkout_login_reminder": "no",
+        "woocommerce_calc_taxes": "no",
+        "woocommerce_default_customer_address": "base",
+        # WC 9.x "Launch Your Store" ships sites in coming-soon mode, which
+        # 503s the front end and the Store API. Turn it off.
+        "woocommerce_coming_soon": "no",
+        # Skip the onboarding wizard so the REST endpoints behave normally.
+        "woocommerce_task_list_hidden": "yes",
+    }.items():
+        handle.wp_cli("option", "update", key, value, check=False)
+    handle.wp_cli(
+        "option", "update", "woocommerce_onboarding_profile",
+        '{"completed":true}', "--format=json", check=False,
+    )
+    # Currency drives the whole settlement math (BareBits reads BTC as fixed
+    # 1e8 sats); confirm it actually took rather than trusting the no-op path.
+    got_currency = handle.wp_cli("option", "get", "woocommerce_currency").stdout.strip()
+    assert got_currency == "BTC", f"currency not set to BTC: {got_currency!r}"
+
+    # A virtual product needs no shipping, which keeps the Store API checkout
+    # payload to just a billing address.
+    created = handle.wp_cli(
+        "wc", "product", "create",
+        "--name=Test Widget",
+        f"--regular_price={WC_PRODUCT_PRICE_BTC}",
+        "--virtual=true",
+        "--manage_stock=false",
+        "--status=publish",
+        f"--user={WP_ADMIN_USER}",
+        "--porcelain",
+    )
+    product_id = int(created.stdout.strip().splitlines()[-1])
+    return {"product_id": product_id}
 
 
 def _wp_config_php(*, port: int, data_dir: Path) -> str:
