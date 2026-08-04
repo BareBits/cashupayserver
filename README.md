@@ -18,7 +18,7 @@ Accept Bitcoin payments (lightning and on-chain) **without** running a full BTCP
 **This software is produced AS-IS without any warranty**
 
 - Do NOT use with amounts you cannot afford to lose
-- Use the suggested default pattern of having funds go to a cold wallet to limit risk. You wouldn't want your funds sitting on a web server anyways.
+- Use the suggested default pattern of having funds go to a cold wallet to limit risk. You wouldn't want your funds sitting on a web server anyway.
 
 **You are responsible for your own funds. The developers are not liable for any losses.**
 
@@ -36,9 +36,9 @@ BareBits supports a number of payment types, risk/trust levels, and capabilities
 ### Key Features
 - **Any PHP hosting** - Works on $3/month shared hosting.
 - **No KYC or approval process**
+- **E-commerce integration** - Plugin for WooCommerce. On magneto, shopify, or another platform? Use the BTCPay plugin and point it to your BareBits URL.
 - **Self-custody** - A fully self-custody solution, or add Cashu mint support for increased convenience
 - **Multiple stores** - Each store can have it's own invoice settings, cashout addresses, etc.
-- **BTCPay-compatible API** - WooCommerce and other BTCPay plugins work by changing one URL.
 - **User management** - Admin users can modify store settings and products and withdraw funds, regular users can only take payments.
 - **Product management** - Add commonly-used products to your store to make invoicing fast and clear
 - **Receipts** E-mail receipts to your customers (optional)
@@ -64,7 +64,7 @@ BareBits is robust payment software that can direct payments to you via many met
 
 ### Dead simple setup with automatic USD conversion
 - Get an account at [strike.me](https://strike.me) and enable USD conversion in settings. Strike works in over 100 countries and native fiat currencies.
-- You can grab an LNURL (lightning address) from your profile page and an on-chain adress from the receive tab.
+- You can grab an LNURL (lightning address) from your profile page and an on-chain address from the receive tab.
 - Note: Strike is a custodial exchange that holds onto funds for you, which means there is risk they may take them. Don't keep significant funds on exchanges.
 - Note: Strike does not work with all kinds of merchants.
   
@@ -98,6 +98,9 @@ BareBits integrates with most ecommerce platforms including woocommerce, magneto
 
 1. Download the BTCPayServer plugin for your ecommerce platform
 2. When asked to input your BTCPayServer URL, input your store API URL instead. You can find this URL in the store settings
+
+#### WooCommerce
+Have WooCommerce? Download our plugin zip and upload it to your WordPress installation, no need to install separately. Easy peasy!
 
 
 ### Recommended: Configure system cron
