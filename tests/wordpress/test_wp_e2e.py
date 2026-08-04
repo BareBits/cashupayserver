@@ -71,6 +71,16 @@ def _flush_rewrites(wp: WordPressHandle) -> None:
     wp.wp_cli("rewrite", "flush", "--hard")
 
 
+def _cron_key(wp: WordPressHandle) -> str:
+    """The install's cron authorization key, seeded at Database::initialize."""
+    snippet = (
+        "require_once CASHUPAY_PLUGIN_DIR . '/includes/database.php';"
+        "require_once CASHUPAY_PLUGIN_DIR . '/includes/config.php';"
+        "Database::initialize(); echo Config::get('cron_key');"
+    )
+    return wp.wp_cli("eval", snippet).stdout.strip().splitlines()[-1].strip()
+
+
 def test_greenfield_invoice_settles_via_wp_routes(
     wordpress: WordPressHandle,
     mint: MintHandle,
@@ -124,8 +134,20 @@ def test_greenfield_invoice_settles_via_wp_routes(
     else:
         raise AssertionError(f"invoice never settled; last body: {r.text}")
 
-    # Confirm the webhook delivered through the WP plumbing.
-    captured = webhook_sink.wait_for("/hook/wp-settle", count=1, timeout_s=15)
+    # Drain the webhook outbox through the WP plumbing and confirm delivery.
+    # Delivery is an async outbox: settlement only *enqueues* the webhook, and
+    # the opportunistic Background::trigger drain is unreliable on the
+    # single-process test server. Drive the real authenticated cron endpoint
+    # (a keyless call 403s) — it runs WebhookSender::drainPending, which POSTs
+    # to the sink synchronously.
+    cron_key = _cron_key(wordpress)
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        requests.get(f"{wordpress.url}/cashupay/cron", params={"key": cron_key}, timeout=15)
+        if webhook_sink.by_path("/hook/wp-settle"):
+            break
+        time.sleep(1)
+    captured = webhook_sink.wait_for("/hook/wp-settle", count=1, timeout_s=5)
     types = {c.json().get("type") for c in captured}
     assert "InvoiceSettled" in types, f"missing InvoiceSettled in WP delivery: {types}"
 

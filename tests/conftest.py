@@ -47,7 +47,12 @@ from fixtures.onchain import OnchainContext, make_onchain_context  # noqa: E402,
 from fixtures.payserver import PayserverHandle, start_payserver, stop_payserver  # noqa: E402
 from fixtures.setup_helpers import run_setup_wizard  # noqa: E402
 from fixtures.webhook_sink import WebhookSink, start_webhook_sink, stop_webhook_sink  # noqa: E402
-from fixtures.wordpress import WordPressHandle, start_wordpress, stop_wordpress  # noqa: E402
+from fixtures.wordpress import (  # noqa: E402
+    WordPressHandle,
+    install_woocommerce,
+    start_wordpress,
+    stop_wordpress,
+)
 
 DEFAULT_ADMIN_PASSWORD = "test-admin-pw-1234"
 DEFAULT_STORE_NAME = "Test Store"
@@ -159,6 +164,16 @@ def wordpress(request) -> Iterator[WordPressHandle]:
     handle = start_wordpress(workdir)
     yield handle
     stop_wordpress(handle)
+
+
+@pytest.fixture
+def woocommerce(wordpress: WordPressHandle) -> Iterator[tuple[WordPressHandle, dict]]:
+    """The `wordpress` fixture plus a live WooCommerce store and the real BTCPay
+    Greenfield gateway plugin (both pinned). Yields (handle, info) where info
+    carries the created product_id. The gateway is installed but not yet wired
+    to BareBits — that wiring is what the checkout test exercises."""
+    info = install_woocommerce(wordpress)
+    yield wordpress, info
 
 
 @pytest.fixture
