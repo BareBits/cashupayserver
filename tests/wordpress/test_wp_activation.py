@@ -39,3 +39,55 @@ def test_cashupay_data_dir_honored(wordpress: WordPressHandle) -> None:
     """wp-config.php pins CASHUPAY_DATA_DIR to the per-test isolated path."""
     result = wordpress.wp_cli("eval", "echo CASHUPAY_DATA_DIR;")
     assert str(wordpress.data_dir) == result.stdout.strip(), result.stdout
+
+
+def test_plugin_uri_points_at_barebits_repo(wordpress: WordPressHandle) -> None:
+    """The "Visit plugin site" link on the Plugins screen must lead to the
+    BareBits fork that actually ships this plugin, not the old ArcadeLabsInc
+    upstream URL that no longer hosts it."""
+    result = wordpress.wp_cli(
+        "eval",
+        "require_once ABSPATH . 'wp-admin/includes/plugin.php';"
+        "echo get_plugin_data(WP_PLUGIN_DIR . '/cashupay/cashupay.php', false, false)['PluginURI'];",
+    )
+    uri = result.stdout.strip()
+    assert uri == "https://github.com/BareBits/cashupayserver", uri
+
+
+def test_admin_menu_is_a_top_level_section_not_under_tools(wordpress: WordPressHandle) -> None:
+    """BareBits gets its own top-level sidebar section. Regression guard against
+    the previous placement as a Tools submenu, which buried it."""
+    snippet = (
+        "require_once ABSPATH . 'wp-admin/includes/plugin.php';"
+        "wp_set_current_user(1);"
+        "do_action('admin_menu');"
+        "global $menu, $submenu;"
+        "$top = false;"
+        "foreach ((array)$menu as $m) { if (($m[2] ?? '') === 'cashupay') $top = true; }"
+        "$underTools = false;"
+        "foreach ((array)($submenu['tools.php'] ?? []) as $m) { if (($m[2] ?? '') === 'cashupay') $underTools = true; }"
+        "echo ($top ? '1' : '0') . '|' . ($underTools ? '1' : '0');"
+    )
+    top, under_tools = wordpress.wp_cli("eval", snippet).stdout.strip().split("|")
+    assert top == "1", "BareBits should register a top-level admin menu page"
+    assert under_tools == "0", "BareBits must no longer live under the Tools menu"
+
+
+def test_unconfigured_admin_banner_invites_configuration(wordpress: WordPressHandle) -> None:
+    """A freshly installed, not-yet-configured plugin shows an admin banner that
+    links operators straight into setup. Rendered for a manage_options user."""
+    snippet = (
+        "wp_set_current_user(1);"
+        "ob_start(); cashupay_admin_notice(); echo ob_get_clean();"
+    )
+    body = wordpress.wp_cli("eval", snippet).stdout
+    assert "Configure BareBits" in body, body[:400]
+    assert "cashupay-setup" in body, "banner must link to the setup wizard: " + body[:400]
+
+
+def test_admin_banner_never_leaks_to_the_storefront(wordpress: WordPressHandle) -> None:
+    """The configuration banner is an admin_notices callback, so it must stay on
+    wp-admin and never render on the customer-facing site."""
+    import requests
+    r = requests.get(wordpress.url, timeout=10)
+    assert "Configure BareBits" not in r.text
