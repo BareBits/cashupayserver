@@ -2,9 +2,10 @@
 /**
  * CashuPayServer - Auto-Update Module
  *
- * Fetches a fresh build of the standalone zip from a moving-tag GitHub
- * release (`channel-main` / `channel-testing`), overlays it on the
- * current install, and supports rollback via stored backups.
+ * Fetches a fresh build of the standalone zip from the versioned GitHub
+ * release the current channel tracks (main -> newest stable, testing ->
+ * newest prerelease-or-stable), overlays it on the current install, and
+ * supports rollback via stored backups.
  *
  * Deployed servers have no shell, composer, npm, or git — only PHP. The
  * release artifact is a fully pre-built zip (vendor/, JS bundle, etc.
@@ -27,9 +28,11 @@ class Updater {
     public const HTTP_USER_AGENT = 'cashupayserver-updater';
 
     /**
-     * Override for the release-tag API base URL. Tests point this at a
-     * local fixture server. Null = use GitHub. Production code never
-     * touches this; production callers should not see this property.
+     * Override for the releases-collection API base URL (the equivalent of
+     * https://api.github.com/repos/<owner>/<repo>/releases, no trailing
+     * slash). The updater appends `/latest` for the main channel and a
+     * `?per_page=` list query for testing. Tests point this at a local
+     * fixture server. Null = use GitHub. Production code never touches this.
      */
     public static ?string $releaseApiUrlBase = null;
 
@@ -79,7 +82,7 @@ class Updater {
         // Test-harness kill switch. Honoured for BOTH auto and manual paths:
         // when running under iterate.py or the pytest payserver fixture a
         // manual click must not overlay an in-progress dev branch with the
-        // latest channel-main build.
+        // latest released build.
         if (self::isDisabledForTests()) {
             return false;
         }
@@ -217,18 +220,24 @@ class Updater {
     // ---------------- Remote / local build info ----------------
 
     /**
-     * Fetch the BUILD_INFO asset attached to the channel-<channel> release.
-     * Returns the parsed key=value pairs, or null on failure.
+     * Discover the release the current channel should track and return its
+     * parsed BUILD_INFO (plus the app-zip download URL under '__zip_url'), or
+     * null on failure.
+     *
+     * Releases are versioned (vX.Y.Z tags); the old moving channel-<x> tags no
+     * longer exist. Selection by channel:
+     *   - main:    GitHub's "latest" release — the newest non-draft,
+     *              non-prerelease build. (GET /releases/latest)
+     *   - testing: the newest non-draft release of ANY kind, prereleases
+     *              included. (first entry of GET /releases, which GitHub
+     *              returns newest-first)
+     *
+     * Within the chosen release the stable-named BUILD_INFO asset carries
+     * COMMIT_SHA/VERSION; the app zip is found by name pattern
+     * (cashupayserver-<version>.zip), never matching wordpress_plugin-*.zip.
      */
     private static function fetchRemoteBuildInfo(string $channel): ?array {
-        $tag = 'channel-' . $channel;
-        $base = self::$releaseApiUrlBase ?? sprintf(
-            'https://api.github.com/repos/%s/%s/releases/tags/',
-            self::GH_OWNER,
-            self::GH_REPO
-        );
-        $apiUrl = $base . $tag;
-        $release = self::httpGetJson($apiUrl);
+        $release = self::fetchChannelRelease($channel);
         if (!is_array($release) || empty($release['assets'])) {
             return null;
         }
@@ -236,11 +245,11 @@ class Updater {
         $buildInfoUrl = null;
         $zipUrl = null;
         foreach ($release['assets'] as $asset) {
-            $name = $asset['name'] ?? '';
-            $url = $asset['browser_download_url'] ?? '';
+            $name = (string)($asset['name'] ?? '');
+            $url = (string)($asset['browser_download_url'] ?? '');
             if ($name === 'BUILD_INFO') {
                 $buildInfoUrl = $url;
-            } elseif ($name === 'cashupayserver.zip') {
+            } elseif (self::isAppZipAsset($name)) {
                 $zipUrl = $url;
             }
         }
@@ -255,6 +264,53 @@ class Updater {
         $info = self::parseBuildInfo($raw);
         $info['__zip_url'] = $zipUrl;
         return $info;
+    }
+
+    /** Base URL of the releases-collection API (overridable for tests). */
+    private static function releasesApiUrl(): string {
+        return self::$releaseApiUrlBase ?? sprintf(
+            'https://api.github.com/repos/%s/%s/releases',
+            self::GH_OWNER,
+            self::GH_REPO
+        );
+    }
+
+    /**
+     * Fetch the release object the channel tracks (decoded JSON), or null.
+     * See fetchRemoteBuildInfo() for the per-channel selection rules.
+     */
+    private static function fetchChannelRelease(string $channel): ?array {
+        $base = rtrim(self::releasesApiUrl(), '/');
+        if ($channel === 'testing') {
+            // Newest release of any kind. GitHub's list endpoint returns
+            // releases newest-first; take the first non-draft. (Drafts are
+            // invisible to the unauthenticated updater anyway; guard regardless.)
+            $list = self::httpGetJson($base . '?per_page=30');
+            if (!is_array($list)) {
+                return null;
+            }
+            foreach ($list as $rel) {
+                if (is_array($rel) && empty($rel['draft'])) {
+                    return $rel;
+                }
+            }
+            return null;
+        }
+        // main: newest stable (non-prerelease, non-draft) release. GitHub's
+        // /releases/latest excludes both by definition.
+        $rel = self::httpGetJson($base . '/latest');
+        return is_array($rel) ? $rel : null;
+    }
+
+    /**
+     * Is $name the standalone app zip asset? Matches the version-stamped
+     * cashupayserver-<version>.zip the release workflow emits (plus the bare
+     * cashupayserver.zip as a defensive fallback), while never matching the
+     * WordPress plugin asset (wordpress_plugin-*.zip).
+     */
+    private static function isAppZipAsset(string $name): bool {
+        return $name === 'cashupayserver.zip'
+            || (bool)preg_match('/^cashupayserver-.+\.zip$/', $name);
     }
 
     public static function getLocalBuildInfo(): array {

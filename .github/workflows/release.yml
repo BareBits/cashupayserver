@@ -1,0 +1,148 @@
+name: Release
+
+# Cuts an immutable, versioned GitHub release when a v* tag is pushed.
+#
+# Replaces the old moving-tag "channel" release model. Each release carries
+# three assets:
+#   - cashupayserver-<tag>.zip   the standalone app (auto-updater downloads this)
+#   - wordpress_plugin-<tag>.zip  the WordPress plugin (humans / WP install this)
+#   - BUILD_INFO                  stable-named metadata the updater reads first
+#
+# The release version comes from the tag; scripts/verify-release-version.sh
+# fails the build if the in-tree version strings disagree, so a tag can never
+# ship advertising the wrong version.
+#
+# Channel semantics: a plain vX.Y[.Z] tag is a STABLE release (feeds the
+# updater's 'main' channel via GitHub's /releases/latest). A tag with a
+# prerelease suffix (v0.4-alpha, v1.0.0-rc1, ...) is published as a GitHub
+# prerelease and feeds the 'testing' channel (newest release of any kind).
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Use HTTPS for SSH-form submodule URLs
+        run: |
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
+
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.1"
+          extensions: curl, json, gmp, mbstring, sqlite3, zip
+          coverage: none
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Verify in-tree version matches the tag
+        run: ./scripts/verify-release-version.sh "${{ github.ref_name }}"
+
+      - name: Classify release (stable vs prerelease)
+        id: classify
+        # A plain vMAJOR.MINOR[.PATCH] tag is stable; anything with a suffix
+        # (-alpha / -beta / -rc / ...) is a prerelease. Stable releases are
+        # marked "latest" so the updater's 'main' channel (/releases/latest)
+        # advances; prereleases must NOT be latest, or 'main' would jump to a
+        # prerelease.
+        run: |
+          tag="${{ github.ref_name }}"
+          if [[ "$tag" =~ ^v[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+            echo "make_latest=true"  >> "$GITHUB_OUTPUT"
+            echo "channel=main (stable)"    >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "prerelease=true"  >> "$GITHUB_OUTPUT"
+            echo "make_latest=false" >> "$GITHUB_OUTPUT"
+            echo "channel=testing (prerelease)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Build standalone zip
+        env:
+          COMMIT_SHA: ${{ github.sha }}
+          CHANNEL: ${{ steps.classify.outputs.prerelease == 'true' && 'testing' || 'main' }}
+        run: ./scripts/build-standalone.sh
+
+      - name: Verify standalone layout
+        run: |
+          php scripts/verify-plugin-build.php build/cashupayserver \
+            setup.php \
+            admin.php \
+            api.php \
+            router.php \
+            index.php \
+            health.php \
+            pay.php \
+            product-image.php \
+            update.php \
+            recover.php \
+            includes/database.php
+
+      - name: Build WordPress plugin
+        run: ./scripts/build-wordpress-plugin.sh
+
+      - name: Verify WordPress plugin layout
+        run: |
+          php scripts/verify-plugin-build.php build/cashupay \
+            cashupay.php \
+            uninstall.php \
+            bootstrap.php \
+            rewrite-rules.php \
+            admin-menu.php \
+            activation.php \
+            btcpay-integration.php \
+            setup.php \
+            admin.php \
+            api.php \
+            pay.php \
+            includes/database.php
+
+      - name: Version-stamp the release assets
+        # Rename the fixed build outputs to version-stamped asset names. The
+        # ZIP internals are untouched: cashupayserver.zip still extracts to
+        # cashupayserver/ (the updater hardcodes that), and wordpress_plugin.zip
+        # still contains cashupay/ (the WP plugin slug).
+        run: |
+          tag="${{ github.ref_name }}"
+          cp build/cashupayserver.zip "build/cashupayserver-${tag}.zip"
+          cp build/wordpress_plugin.zip "build/wordpress_plugin-${tag}.zip"
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: "CashuPayServer ${{ github.ref_name }}"
+          body: |
+            CashuPayServer ${{ github.ref_name }}, built from ${{ github.sha }}.
+
+            Assets:
+            - `cashupayserver-${{ github.ref_name }}.zip` — standalone server (the auto-updater pulls this)
+            - `wordpress_plugin-${{ github.ref_name }}.zip` — WordPress plugin
+            - `BUILD_INFO` — build metadata
+          prerelease: ${{ steps.classify.outputs.prerelease }}
+          make_latest: ${{ steps.classify.outputs.make_latest }}
+          files: |
+            build/cashupayserver-${{ github.ref_name }}.zip
+            build/wordpress_plugin-${{ github.ref_name }}.zip
+            build/cashupayserver/BUILD_INFO

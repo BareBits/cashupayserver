@@ -330,7 +330,7 @@ This starts:
 
 # Build WordPress plugin
 ./scripts/build-wordpress-plugin.sh
-# Output: build/cashupay-wordpress.zip
+# Output: build/wordpress_plugin.zip
 ```
 
 ### Building mint-discovery Bundle

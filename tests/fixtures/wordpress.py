@@ -271,6 +271,39 @@ def _assemble_plugin(plugin_dir: Path) -> None:
             os.symlink(src, dst)
 
 
+# ---------- built plugin zip (the shipped artifact) ----------
+
+def ensure_wp_plugin_zip() -> Path:
+    """Return the built WordPress plugin zip — the exact artifact the release
+    workflow publishes.
+
+    If CASHUPAY_WP_PLUGIN_ZIP points at an existing file, use it verbatim (CI
+    passes the artifact built by the `build-artifacts` job, so the E2E job needs
+    no Node/composer). Otherwise build it locally via
+    scripts/build-wordpress-plugin.sh, using the pinned static PHP for composer.
+    A local build additionally needs Node/npm for the mint-discovery bundle.
+    """
+    env_zip = os.environ.get("CASHUPAY_WP_PLUGIN_ZIP")
+    if env_zip:
+        p = Path(env_zip)
+        if p.is_file():
+            return p
+        raise RuntimeError(
+            f"CASHUPAY_WP_PLUGIN_ZIP={env_zip!r} but that file does not exist"
+        )
+
+    php_exe = binaries.ensure(binaries.PHP)["php"]
+    script = REPO_ROOT / "scripts" / "build-wordpress-plugin.sh"
+    env = os.environ.copy()
+    env["PHP_BIN"] = str(php_exe)
+    print(f"[wp] building plugin zip via {script.name} ...")
+    subprocess.run(["bash", str(script)], cwd=str(REPO_ROOT), env=env, check=True)
+    zip_path = REPO_ROOT / "build" / "wordpress_plugin.zip"
+    if not zip_path.is_file():
+        raise RuntimeError("build-wordpress-plugin.sh did not produce build/wordpress_plugin.zip")
+    return zip_path
+
+
 # ---------- fixture ----------
 
 ROUTER_WRAPPER_TEMPLATE = """<?php
@@ -298,7 +331,15 @@ require {wp_index!r};
 """
 
 
-def start_wordpress(workdir: Path) -> WordPressHandle:
+def start_wordpress(workdir: Path, *, install_cashupay: bool = True) -> WordPressHandle:
+    """Stand up a fresh SQLite-backed WordPress install.
+
+    install_cashupay=True (default) assembles the cashupay plugin from live
+    source via symlinks and activates it — what every existing WP test wants.
+    install_cashupay=False brings WordPress up with NO cashupay plugin, so a
+    test can install the real built zip itself (`wp plugin install <zip>`) and
+    exercise the shipped artifact rather than the symlink tree.
+    """
     php_exe = binaries.ensure(binaries.PHP)["php"]
     wp_cli_phar = binaries.ensure_file(binaries.WP_CLI)
 
@@ -321,8 +362,10 @@ def start_wordpress(workdir: Path) -> WordPressHandle:
     if not drop_in.exists():
         shutil.copy(sqlite_plugin / "db.copy", drop_in)
 
-    # 3. Cashupay plugin (symlinks for live source).
-    _assemble_plugin(wp_root / "wp-content" / "plugins" / "cashupay")
+    # 3. Cashupay plugin (symlinks for live source). Skipped when the caller
+    #    will install the built zip itself.
+    if install_cashupay:
+        _assemble_plugin(wp_root / "wp-content" / "plugins" / "cashupay")
 
     # 4. wp-config.php with SQLite config + WP_HOME.
     port = ports.allocate(1)[0]
@@ -361,19 +404,20 @@ def start_wordpress(workdir: Path) -> WordPressHandle:
         text=True,
     )
 
-    # 7. Activate cashupay plugin.
-    subprocess.run(
-        [
-            str(php_exe), str(wp_cli_phar),
-            f"--path={wp_root}",
-            "--allow-root",
-            "plugin", "activate", "cashupay",
-        ],
-        env=install_env,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    # 7. Activate cashupay plugin (unless the caller installs the zip itself).
+    if install_cashupay:
+        subprocess.run(
+            [
+                str(php_exe), str(wp_cli_phar),
+                f"--path={wp_root}",
+                "--allow-root",
+                "plugin", "activate", "cashupay",
+            ],
+            env=install_env,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
 
     # 8. Spin php -S.
     env = os.environ.copy()

@@ -14,6 +14,10 @@ jobs:
     name: E2E + UI
     runs-on: ubuntu-22.04
     timeout-minutes: 40
+    # Depend on the artifact build so the WordPress install E2E can exercise the
+    # EXACT zip CI publishes (composer vendor/, flattened plugin layout) rather
+    # than the symlink tree the other WP tests assemble from live source.
+    needs: build-artifacts
 
     steps:
       - name: Use HTTPS for SSH-form submodule URLs
@@ -63,11 +67,21 @@ jobs:
           pip install --quiet -r tests/requirements.txt
           sudo $(which playwright) install-deps chromium
 
+      - name: Download built artifacts (for the plugin-install E2E)
+        uses: actions/download-artifact@v4
+        with:
+          name: build-artifacts
+          path: build
+
       - name: Run test suite
         run: |
           ./tests/scripts/run-tests.sh -v
         env:
           PYTHONUNBUFFERED: "1"
+          # test_wp_plugin_zip_install consumes this exact artifact instead of
+          # rebuilding the zip (the E2E job has no Node/composer). If unset, the
+          # test builds the zip itself — the path a local dev run takes.
+          CASHUPAY_WP_PLUGIN_ZIP: ${{ github.workspace }}/build/wordpress_plugin.zip
 
       - name: Upload test logs on failure
         if: failure() || cancelled()
@@ -165,7 +179,7 @@ jobs:
         with:
           name: build-artifacts
           path: |
-            build/cashupay-wordpress.zip
+            build/wordpress_plugin.zip
             build/cashupayserver.zip
           retention-days: 7
           if-no-files-found: error
