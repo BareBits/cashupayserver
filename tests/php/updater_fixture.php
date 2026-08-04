@@ -1,27 +1,30 @@
 <?php
 /**
  * Shared fixture for Updater integration tests. Spins up PHP's built-in
- * server pointed at a tempdir that mimics the GitHub release layout the
- * updater fetches against:
+ * server pointed at a tempdir that mimics the *versioned* GitHub release API
+ * the updater fetches against (the old moving channel-<x> tags are gone):
  *
- *   GET /release/channel-<channel>
- *       → JSON {"assets": [
- *             {"name": "BUILD_INFO",         "browser_download_url": ".../BUILD_INFO"},
- *             {"name": "cashupayserver.zip", "browser_download_url": ".../cashupayserver.zip"}
- *         ]}
- *   GET /BUILD_INFO
- *       → the build-info file (server side, matches the zip)
- *   GET /cashupayserver.zip
- *       → the zip that overlay will install
+ *   GET /releases/latest
+ *       → the newest non-draft, non-prerelease release JSON (what the 'main'
+ *         channel tracks). 404 if there is no stable release.
+ *   GET /releases
+ *       → JSON array of all non-draft releases, newest-first (what the
+ *         'testing' channel scans; it takes the first entry).
+ *   GET /assets/<tag>/BUILD_INFO          → that release's BUILD_INFO file
+ *   GET /assets/<tag>/cashupayserver-<tag>.zip → that release's app zip
+ *
+ * Each release JSON carries the two assets the updater looks for: a
+ * stable-named BUILD_INFO and a version-stamped cashupayserver-<tag>.zip.
  *
  * Returns an array with:
- *   - 'baseUrl'   — pass to Updater::$releaseApiUrlBase (with trailing slash)
+ *   - 'baseUrl'     — pass to Updater::$releaseApiUrlBase. It is the releases
+ *                     collection URL WITHOUT a trailing slash; the updater
+ *                     appends '/latest' (main) or '?per_page=' (testing).
  *   - 'installRoot' — pre-populated fake install root with old BUILD_INFO
- *   - 'pid'       — server pid for explicit kill (also auto-killed at shutdown)
- *   - 'workdir'   — root of fixture tempdir
- *
- * The "old" install is set up with COMMIT_SHA = 0000... so the updater sees
- * a mismatch and runs the full apply path.
+ *                     (COMMIT_SHA = 0000..., so the updater sees a mismatch and
+ *                     runs the full apply path)
+ *   - 'workdir'     — root of fixture tempdir
+ *   - 'port', 'proc'
  */
 
 declare(strict_types=1);
@@ -61,76 +64,113 @@ function updater_fixture_make_zip(string $zipPath, string $stagedRoot): void {
 }
 
 /**
- * Build a full fixture: staged "release" content + zip + release-tag JSON,
- * then start a PHP built-in server serving it. Caller owns shutdown.
+ * Build + serve one-or-more versioned releases. Caller owns shutdown (handled
+ * automatically at process exit).
  *
- * $newBuildInfo: array of keys for the BUILD_INFO file shipped in the zip
- *                (e.g. ['COMMIT_SHA' => 'newsha', 'VERSION' => '0.2'])
- * $extraFiles:   array of relative path => contents that should land inside
- *                the zip's cashupayserver/ tree. e.g. ['admin.php' => 'NEW']
+ * $releases: a list in NEWEST-FIRST order. Each entry:
+ *   [
+ *     'tag'         => 'v0.3.0-rc1',           // required; drives the asset name
+ *     'prerelease'  => true,                    // default false
+ *     'draft'       => false,                   // default false (drafts hidden)
+ *     'build_info'  => ['COMMIT_SHA'=>..., 'VERSION'=>..., ...], // BUILD_INFO
+ *     'extra'       => ['admin.php' => 'NEW', ...], // extra files inside the zip
+ *   ]
  */
-function updater_fixture_start(string $channel, array $newBuildInfo, array $extraFiles = []): array {
+function updater_fixture_start_releases(array $releases): array {
     $work = sys_get_temp_dir() . '/cashupay_fixture_' . bin2hex(random_bytes(6));
     mkdir($work, 0755, true);
-
-    // Build the staged release content (this is what goes INSIDE the zip,
-    // under cashupayserver/).
-    $stage = $work . '/stage';
-    mkdir($stage . '/data', 0755, true);
-    $buildInfoLines = [];
-    foreach ($newBuildInfo as $k => $v) {
-        $buildInfoLines[] = "$k=$v";
-    }
-    $buildInfoText = implode("\n", $buildInfoLines) . "\n";
-    file_put_contents($stage . '/BUILD_INFO', $buildInfoText);
-    // A minimal .htaccess matching the HTACCESS_SHA256 the test will assert
-    // against. Caller may have set HTACCESS_SHA256 — if so the .htaccess
-    // file content must hash to that. The simplest contract: caller passes
-    // .htaccess content via extraFiles and provides the matching SHA in
-    // newBuildInfo if it cares.
-    foreach ($extraFiles as $rel => $content) {
-        $full = $stage . '/' . $rel;
-        @mkdir(dirname($full), 0755, true);
-        file_put_contents($full, $content);
-    }
-
-    // Build the zip.
     $serveDir = $work . '/serve';
-    mkdir($serveDir . '/release', 0755, true);
-    $zipPath = $serveDir . '/cashupayserver.zip';
-    updater_fixture_make_zip($zipPath, $stage);
-    // Copy BUILD_INFO to serve dir (the BUILD_INFO asset is served separately
-    // from the zip, just like the real GH release).
-    copy($stage . '/BUILD_INFO', $serveDir . '/BUILD_INFO');
+    mkdir($serveDir, 0755, true);
 
-    // Pick a port. There's a small race window between picking and PHP-
-    // built-in-server binding, but in CI/test machines this is fine.
     $port = updater_fixture_pick_free_port();
 
-    // Write the release-tag JSON pointing at our own server.
-    $releaseJson = json_encode([
-        'tag_name' => 'channel-' . $channel,
-        'assets' => [
-            [
-                'name' => 'BUILD_INFO',
-                'browser_download_url' => "http://127.0.0.1:$port/BUILD_INFO",
-            ],
-            [
-                'name' => 'cashupayserver.zip',
-                'browser_download_url' => "http://127.0.0.1:$port/cashupayserver.zip",
-            ],
-        ],
-    ]);
-    file_put_contents($serveDir . '/release/channel-' . $channel, $releaseJson);
+    $releaseObjs = [];
+    foreach ($releases as $i => $r) {
+        $tag = (string)($r['tag'] ?? '');
+        if ($tag === '') {
+            fail("updater_fixture: release #$i missing 'tag'");
+        }
+        $buildInfo = $r['build_info'] ?? [];
+        $extra = $r['extra'] ?? [];
 
-    // Spawn the PHP built-in server. No router — just static file serving
-    // from $serveDir.
-    $phpBin = PHP_BINARY;
+        // Stage the release content (this is what goes INSIDE the zip, under
+        // cashupayserver/).
+        $stage = $work . '/stage-' . $i;
+        mkdir($stage . '/data', 0755, true);
+        $lines = [];
+        foreach ($buildInfo as $k => $v) {
+            $lines[] = "$k=$v";
+        }
+        $buildInfoText = implode("\n", $lines) . "\n";
+        file_put_contents($stage . '/BUILD_INFO', $buildInfoText);
+        foreach ($extra as $rel => $content) {
+            $full = $stage . '/' . $rel;
+            @mkdir(dirname($full), 0755, true);
+            file_put_contents($full, $content);
+        }
+
+        // Serve this release's assets under /assets/<tag>/.
+        $assetDir = $serveDir . '/assets/' . $tag;
+        mkdir($assetDir, 0755, true);
+        $zipName = 'cashupayserver-' . $tag . '.zip';
+        updater_fixture_make_zip($assetDir . '/' . $zipName, $stage);
+        copy($stage . '/BUILD_INFO', $assetDir . '/BUILD_INFO');
+
+        $base = "http://127.0.0.1:$port/assets/" . rawurlencode($tag);
+        $releaseObjs[] = [
+            'tag_name' => $tag,
+            'prerelease' => (bool)($r['prerelease'] ?? false),
+            'draft' => (bool)($r['draft'] ?? false),
+            'assets' => [
+                ['name' => 'BUILD_INFO', 'browser_download_url' => "$base/BUILD_INFO"],
+                ['name' => $zipName, 'browser_download_url' => "$base/$zipName"],
+            ],
+        ];
+    }
+
+    // /releases → non-draft releases, newest-first (== input order).
+    $list = array_values(array_filter($releaseObjs, static fn($r) => !$r['draft']));
+    file_put_contents($serveDir . '/releases_list.json', json_encode($list));
+    // /releases/latest → newest non-draft, non-prerelease (GitHub semantics).
+    $latest = null;
+    foreach ($list as $r) {
+        if (!$r['prerelease']) {
+            $latest = $r;
+            break;
+        }
+    }
+    if ($latest !== null) {
+        file_put_contents($serveDir . '/releases_latest.json', json_encode($latest));
+    }
+
+    // Router mimicking the two GitHub endpoints; everything else falls through
+    // to static serving (the BUILD_INFO + zip assets).
+    $router = <<<'PHP'
+<?php
+$uri = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH);
+if ($uri === '/releases/latest') {
+    header('Content-Type: application/json');
+    $f = __DIR__ . '/releases_latest.json';
+    if (!is_file($f)) { http_response_code(404); echo '{"message":"Not Found"}'; return true; }
+    readfile($f);
+    return true;
+}
+if ($uri === '/releases') {
+    header('Content-Type: application/json');
+    readfile(__DIR__ . '/releases_list.json');
+    return true;
+}
+return false; // static file (assets/*)
+PHP;
+    file_put_contents($serveDir . '/router.php', $router);
+
+    // Spawn the PHP built-in server with the router.
     $cmd = sprintf(
-        '%s -S 127.0.0.1:%d -t %s',
-        escapeshellarg($phpBin),
+        '%s -S 127.0.0.1:%d -t %s %s',
+        escapeshellarg(PHP_BINARY),
         $port,
-        escapeshellarg($serveDir)
+        escapeshellarg($serveDir),
+        escapeshellarg($serveDir . '/router.php')
     );
     $descriptors = [
         0 => ['pipe', 'r'],
@@ -141,8 +181,6 @@ function updater_fixture_start(string $channel, array $newBuildInfo, array $extr
     if (!is_resource($proc)) {
         fail('proc_open(php -S) failed');
     }
-    $status = proc_get_status($proc);
-    $pid = $status['pid'];
 
     // Wait for the server to start accepting connections (max ~3s).
     $deadline = microtime(true) + 3.0;
@@ -177,8 +215,6 @@ function updater_fixture_start(string $channel, array $newBuildInfo, array $extr
     // Ensure cleanup even on test failure.
     register_shutdown_function(static function () use ($proc, $work) {
         if (is_resource($proc)) {
-            // PHP's -S server doesn't quit on SIGTERM cleanly always; kill
-            // process group to be sure. proc_terminate sends SIGTERM.
             @proc_terminate($proc, SIGKILL);
             @proc_close($proc);
         }
@@ -195,10 +231,32 @@ function updater_fixture_start(string $channel, array $newBuildInfo, array $extr
     });
 
     return [
-        'baseUrl' => "http://127.0.0.1:$port/release/",
+        'baseUrl' => "http://127.0.0.1:$port/releases",
         'installRoot' => $installRoot,
         'workdir' => $work,
         'port' => $port,
         'proc' => $proc,
     ];
+}
+
+/**
+ * Backward-compatible single-release fixture. Publishes ONE stable release so
+ * it is visible to both the main (/releases/latest) and testing channels.
+ *
+ * $newBuildInfo: BUILD_INFO keys for the release (e.g. ['COMMIT_SHA'=>...,
+ *                'VERSION'=>'0.2']). The tag is derived from VERSION.
+ * $extraFiles:   relative path => contents to place inside the zip's
+ *                cashupayserver/ tree (e.g. ['admin.php' => 'NEW']).
+ */
+function updater_fixture_start(string $channel, array $newBuildInfo, array $extraFiles = []): array {
+    $version = (string)($newBuildInfo['VERSION'] ?? '0.0.0-fixture');
+    return updater_fixture_start_releases([
+        [
+            'tag' => 'v' . $version,
+            'prerelease' => false,
+            'draft' => false,
+            'build_info' => $newBuildInfo,
+            'extra' => $extraFiles,
+        ],
+    ]);
 }

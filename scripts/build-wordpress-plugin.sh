@@ -6,7 +6,7 @@ set -e
 cd "$(dirname "$0")/.."
 
 BUILD_DIR="build/cashupay"
-rm -rf build/cashupay build/cashupay-wordpress.zip
+rm -rf build/cashupay build/wordpress_plugin.zip
 
 mkdir -p "$BUILD_DIR"
 
@@ -59,7 +59,11 @@ if [ -d "mint-discovery" ]; then
     cp mint-discovery/dist/mint-discovery.bundle.js "$BUILD_DIR/assets/js/"
 fi
 
-# Create zip
-cd build && zip -r cashupay-wordpress.zip cashupay/ && cd ..
+# Create zip. The archive FILE is named wordpress_plugin.zip (the release asset
+# name, later version-stamped by the release workflow), but the top-level
+# directory inside it stays `cashupay/` — that is the WordPress plugin slug, and
+# `wp plugin install` derives the install folder from it. Renaming the folder
+# would change the slug and break activation.
+cd build && zip -r wordpress_plugin.zip cashupay/ && cd ..
 
-echo "WordPress plugin built: build/cashupay-wordpress.zip"
+echo "WordPress plugin built: build/wordpress_plugin.zip"
