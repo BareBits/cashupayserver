@@ -219,9 +219,19 @@ def test_offline_token_underpays_invoice_rejected(configured: ConfiguredPayserve
 
 def test_checkout_shows_cashu_method(configured: ConfiguredPayserver) -> None:
     """A New cashu invoice's checkout page offers the Cashu pay option (the QR
-    request + token paste box) so it can be paid by presenting a token."""
+    request + token paste box) so it can be paid by presenting a token.
+
+    The Cashu rail is gated on the store opting into offline acceptance (see
+    payment.php, commit "gate Cashu on offline"), so enable it on the live-mint
+    store before rendering the checkout."""
     handle = configured.handle
     store_id = configured.store_id  # live-mint store from the fixture
+    with handle.db() as conn:
+        conn.execute(
+            "UPDATE stores SET offline_cashu_enabled = 1, offline_cashu_policy = 'dleq'"
+            " WHERE id = ?",
+            (store_id,),
+        )
     inv_id = "inv_checkout_cashu"
     _insert_cashu_invoice(handle, store_id, inv_id, 1)
 

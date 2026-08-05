@@ -23,9 +23,18 @@ def _set_primary_mint_url(configured: ConfiguredPayserver, mint_url: str) -> Non
         db.execute("UPDATE stores SET mint_url = ? WHERE id = ?", (mint_url, configured.store_id))
 
 
+def _clear_backup_mints(configured: ConfiguredPayserver) -> None:
+    """Drop the store's backup mints. The onboarding wizard provisions a
+    required backup mint at setup, so tests that need "no reachable mint" must
+    remove it explicitly."""
+    with configured.handle.db() as db:
+        db.execute("DELETE FROM store_mints WHERE store_id = ?", (configured.store_id,))
+
+
 def test_invoice_falls_over_to_backup_when_primary_is_dead(
     configured: ConfiguredPayserver,
     mint: MintHandle,
+    backup_mint: MintHandle,
 ) -> None:
     # Add the real (working) mint as a backup before nuking primary.
     _add_backup_mint(configured, mint.url, priority=100)
@@ -39,19 +48,25 @@ def test_invoice_falls_over_to_backup_when_primary_is_dead(
     assert invoice["status"] in ("New", "Processing")
     assert invoice.get("checkout", {}).get("paymentMethods", {}).get("BTC-LightningNetwork"), invoice
 
-    # The invoice row should record the actual mint that served it.
+    # The invoice row should record the actual mint that served it: one of the
+    # reachable backups (the wizard-provisioned backup_mint, or the mint added
+    # above), never the dead primary.
     with configured.handle.db() as db:
         row = db.execute(
             "SELECT mint_url FROM invoices WHERE id = ?", (invoice["id"],)
         ).fetchone()
     assert row is not None
-    assert row["mint_url"] == mint.url, f"expected backup mint {mint.url}, got {row['mint_url']}"
+    assert row["mint_url"] in {mint.url, backup_mint.url}, (
+        f"expected a reachable backup, got {row['mint_url']}"
+    )
+    assert row["mint_url"] != dead_url
 
 
 def test_invoice_creation_fails_when_no_mints_are_reachable(
     configured: ConfiguredPayserver,
 ) -> None:
     """With no backups and primary dead, the API should surface the error."""
+    _clear_backup_mints(configured)
     _set_primary_mint_url(configured, "http://127.0.0.1:1")
 
     import pytest
