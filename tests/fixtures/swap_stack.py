@@ -43,12 +43,21 @@ from typing import Any
 import urllib.request
 import urllib.error
 
+from . import binaries
 from .boltz_regtest import BoltzRegtestHandle
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
-PHP = REPO_ROOT / "tests" / "bin" / "php-8.3.31" / "php"
 FULCRUM = REPO_ROOT / "tests" / "bin" / "fulcrum-2.1.1" / "Fulcrum"
 ELECTRUM = REPO_ROOT / "tests" / "bin" / "electrum-4.7.2" / "electrum.AppImage"
+
+
+def _php_bin() -> Path:
+    """Resolve the static PHP binary, downloading it via the binary manager if
+    it is not present yet. The swap-stack fixtures do not pull the
+    `installed_binaries` fixture the rest of the suite relies on to fetch PHP,
+    so a hardcoded path could be missing on a fresh CI checkout — which surfaced
+    as FileNotFoundError deep in payserver setup."""
+    return binaries.ensure(binaries.PHP)["php"]
 
 
 def free_port() -> int:
@@ -340,7 +349,7 @@ def _php_eval(data_dir: Path, snippet: str) -> str:
         f"require_once {str(REPO_ROOT / 'includes' / 'config.php')!r};\n"
         + snippet
     )
-    res = subprocess.run([str(PHP), "-r", code], capture_output=True, text=True)
+    res = subprocess.run([str(_php_bin()), "-r", code], capture_output=True, text=True)
     if res.returncode != 0:
         raise RuntimeError(f"php failed: {res.stderr}\n{res.stdout}")
     return res.stdout.strip()
@@ -455,7 +464,7 @@ def setup_payserver(workdir: Path, vpub: str, boltz_api_url: str,
     port = free_port()
     log = (data_dir / "payserver.log").open("ab")
     proc = subprocess.Popen(
-        [str(PHP), "-S", f"127.0.0.1:{port}", "-t", str(REPO_ROOT), str(wrapper)],
+        [str(_php_bin()), "-S", f"127.0.0.1:{port}", "-t", str(REPO_ROOT), str(wrapper)],
         cwd=str(REPO_ROOT), env=env, stdout=log, stderr=subprocess.STDOUT,
     )
     deadline = time.monotonic() + 20
@@ -904,7 +913,7 @@ def setup_payserver_for_sweep(workdir: Path, vpub: str, mint_url: str,
     port = free_port()
     log = (data_dir / "payserver.log").open("ab")
     proc = subprocess.Popen(
-        [str(PHP), "-S", f"127.0.0.1:{port}", "-t", str(REPO_ROOT), str(wrapper)],
+        [str(_php_bin()), "-S", f"127.0.0.1:{port}", "-t", str(REPO_ROOT), str(wrapper)],
         cwd=str(REPO_ROOT), env=env, stdout=log, stderr=subprocess.STDOUT,
     )
     deadline = time.monotonic() + 20
