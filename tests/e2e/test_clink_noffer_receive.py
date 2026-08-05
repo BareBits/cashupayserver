@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -199,13 +200,37 @@ def _relay_query(relay: ClinkRelayHandle, filt: dict) -> list[dict]:
                         break
         return out
 
-    try:
-        result = asyncio.run(once())
-        _last_relay_query_error = None
-        return result
-    except Exception as e:  # noqa: BLE001 — surfaced via diagnostics
-        _last_relay_query_error = f"{type(e).__name__}: {e}"
+    # Run in a dedicated thread with its own event loop. Under the full CI suite
+    # the pytest main thread already has a running event loop (left by an earlier
+    # async fixture — grpc.aio / Playwright), so asyncio.run() here raised
+    # "cannot be called from a running event loop" and every query silently
+    # returned empty. A fresh loop in its own thread is immune to that.
+    box: dict = {}
+
+    def runner() -> None:
+        loop = asyncio.new_event_loop()
+        try:
+            asyncio.set_event_loop(loop)
+            box["value"] = loop.run_until_complete(once())
+        except Exception as e:  # noqa: BLE001 — surfaced via diagnostics
+            box["error"] = f"{type(e).__name__}: {e}"
+        finally:
+            try:
+                loop.close()
+            finally:
+                asyncio.set_event_loop(None)
+
+    t = threading.Thread(target=runner, daemon=True)
+    t.start()
+    t.join(timeout=45)
+    if t.is_alive():
+        _last_relay_query_error = "relay query thread timed out"
         return []
+    if "error" in box:
+        _last_relay_query_error = box["error"]
+        return []
+    _last_relay_query_error = None
+    return box.get("value", [])
 
 
 def _relay_events(relay: ClinkRelayHandle, request_event_id: str, since: int) -> list[dict]:
