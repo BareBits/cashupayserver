@@ -196,6 +196,48 @@ def _relay_events(relay: ClinkRelayHandle, request_event_id: str, since: int) ->
         return []
 
 
+def _relay_all_events(relay: ClinkRelayHandle) -> list[dict]:
+    """Diagnostic: every kind-21001 event in the relay buffer, ignoring the #e
+    filter and `since`. Distinguishes 'nothing was published to the relay' from
+    'published, but our request-id / since filter excluded it'."""
+    async def once() -> list[dict]:
+        import aiohttp
+        out: list[dict] = []
+        async with aiohttp.ClientSession() as s:
+            async with s.ws_connect(relay.ws_url) as ws:
+                await ws.send_str(json.dumps(["REQ", "diag", {"kinds": [CLINK_KIND], "since": 0}]))
+                while True:
+                    msg = await asyncio.wait_for(ws.receive(), timeout=5)
+                    if msg.type != aiohttp.WSMsgType.TEXT:
+                        break
+                    data = json.loads(msg.data)
+                    if data[0] == "EVENT" and data[1] == "diag":
+                        out.append(data[2])
+                    elif data[0] == "EOSE":
+                        break
+        return out
+    try:
+        return asyncio.run(once())
+    except Exception:
+        return []
+
+
+def _relay_diagnostics(relay: ClinkRelayHandle) -> str:
+    """A compact dump of what the relay actually holds + its log tail, so a CI
+    failure that does not reproduce locally is still debuggable from the job
+    output alone."""
+    def summ(e: dict) -> dict:
+        etags = [t[1][:12] for t in e.get("tags", []) if len(t) >= 2 and t[0] == "e"]
+        return {"id": str(e.get("id", ""))[:12], "kind": e.get("kind"),
+                "pubkey": str(e.get("pubkey", ""))[:12], "#e": etags}
+    all_ev = _relay_all_events(relay)
+    lines = [f"relay held {len(all_ev)} kind-{CLINK_KIND} event(s): {[summ(e) for e in all_ev]}"]
+    if relay.log_path and relay.log_path.exists():
+        tail = relay.log_path.read_text(errors="replace").splitlines()[-40:]
+        lines.append("relay.log tail:\n  " + "\n  ".join(tail))
+    return "\n".join(lines)
+
+
 def _wait_for_receipt_buffered(relay: ClinkRelayHandle, request_event_id: str,
                                since: int, timeout: float = 30.0) -> list[dict]:
     """Wait until the relay buffer holds both the bolt11 reply *and* the receipt
@@ -209,7 +251,8 @@ def _wait_for_receipt_buffered(relay: ClinkRelayHandle, request_event_id: str,
         time.sleep(1)
     raise AssertionError(
         f"relay never buffered the receipt for request {request_event_id[:12]} "
-        f"within {timeout}s (saw {len(events)} event(s))"
+        f"within {timeout}s (saw {len(events)} matching event(s)).\n"
+        + _relay_diagnostics(relay)
     )
 
 
