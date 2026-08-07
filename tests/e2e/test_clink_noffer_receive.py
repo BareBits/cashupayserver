@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -163,41 +164,112 @@ def _invoice_row(payserver, invoice_id: str) -> dict:
         return dict(row)
 
 
-def _relay_events(relay: ClinkRelayHandle, request_event_id: str, since: int) -> list[dict]:
-    """One-shot relay query (like the payment page's live subscription) for all
-    kind-21001 events referencing our request. NOTE: the merchant's bolt11
-    *reply* and its later *receipt* are both kind-21001 with the same ``e`` tag
-    and differ only in their (encrypted) body, so the caller must inspect/try
-    every event rather than assume the first is the receipt."""
+# Last error from _relay_query, surfaced in diagnostics so a silent empty result
+# is distinguishable from a query that actually failed.
+_last_relay_query_error: str | None = None
+
+
+def _relay_query(relay: ClinkRelayHandle, filt: dict) -> list[dict]:
+    """One REQ against the relay, returning every matching event.
+
+    Robust against WebSocket control frames: the relay runs with heartbeat
+    pings, so a PING/PONG can arrive interleaved with the backfill. The naive
+    "break on the first non-TEXT frame" lost the race under CI load — a
+    heartbeat frame arrived before EVENT/EOSE and the query returned empty even
+    though the events were sitting in the relay buffer. Skip control frames and
+    only stop on EOSE or a real close/error."""
+    global _last_relay_query_error
+
     async def once() -> list[dict]:
         import aiohttp
         out: list[dict] = []
-        async with aiohttp.ClientSession() as s:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as s:
             async with s.ws_connect(relay.ws_url) as ws:
-                sub = "e2e-receipt"
-                await ws.send_str(json.dumps(["REQ", sub, {
-                    "kinds": [CLINK_KIND], "#e": [request_event_id],
-                    "since": max(0, since - 1),
-                }]))
+                await ws.send_str(json.dumps(["REQ", "q", filt]))
                 while True:
-                    msg = await asyncio.wait_for(ws.receive(), timeout=5)
-                    if msg.type != aiohttp.WSMsgType.TEXT:
-                        break
-                    data = json.loads(msg.data)
-                    if data[0] == "EVENT" and data[1] == sub:
-                        out.append(data[2])
-                    elif data[0] == "EOSE":
+                    msg = await asyncio.wait_for(ws.receive(), timeout=10)
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        data = json.loads(msg.data)
+                        if data[0] == "EVENT" and data[1] == "q":
+                            out.append(data[2])
+                        elif data[0] == "EOSE":
+                            break
+                    elif msg.type in (aiohttp.WSMsgType.PING, aiohttp.WSMsgType.PONG):
+                        continue  # heartbeat — keep reading for the backfill
+                    else:  # CLOSE / CLOSING / CLOSED / ERROR
                         break
         return out
 
-    try:
-        return asyncio.run(once())
-    except Exception:
+    # Run in a dedicated thread with its own event loop. Under the full CI suite
+    # the pytest main thread already has a running event loop (left by an earlier
+    # async fixture — grpc.aio / Playwright), so asyncio.run() here raised
+    # "cannot be called from a running event loop" and every query silently
+    # returned empty. A fresh loop in its own thread is immune to that.
+    box: dict = {}
+
+    def runner() -> None:
+        loop = asyncio.new_event_loop()
+        try:
+            asyncio.set_event_loop(loop)
+            box["value"] = loop.run_until_complete(once())
+        except Exception as e:  # noqa: BLE001 — surfaced via diagnostics
+            box["error"] = f"{type(e).__name__}: {e}"
+        finally:
+            try:
+                loop.close()
+            finally:
+                asyncio.set_event_loop(None)
+
+    t = threading.Thread(target=runner, daemon=True)
+    t.start()
+    t.join(timeout=45)
+    if t.is_alive():
+        _last_relay_query_error = "relay query thread timed out"
         return []
+    if "error" in box:
+        _last_relay_query_error = box["error"]
+        return []
+    _last_relay_query_error = None
+    return box.get("value", [])
+
+
+def _relay_events(relay: ClinkRelayHandle, request_event_id: str, since: int) -> list[dict]:
+    """All kind-21001 events referencing our request. NOTE: the merchant's
+    bolt11 *reply* and its later *receipt* are both kind-21001 with the same
+    ``e`` tag and differ only in their (encrypted) body, so the caller must
+    inspect/try every event rather than assume the first is the receipt."""
+    return _relay_query(relay, {
+        "kinds": [CLINK_KIND], "#e": [request_event_id], "since": max(0, since - 1),
+    })
+
+
+def _relay_all_events(relay: ClinkRelayHandle) -> list[dict]:
+    """Diagnostic: every kind-21001 event in the relay buffer, ignoring the #e
+    filter and `since`. Distinguishes 'nothing was published to the relay' from
+    'published, but our request-id / since filter excluded it'."""
+    return _relay_query(relay, {"kinds": [CLINK_KIND], "since": 0})
+
+
+def _relay_diagnostics(relay: ClinkRelayHandle) -> str:
+    """A compact dump of what the relay actually holds + its log tail, so a CI
+    failure that does not reproduce locally is still debuggable from the job
+    output alone."""
+    def summ(e: dict) -> dict:
+        etags = [t[1][:12] for t in e.get("tags", []) if len(t) >= 2 and t[0] == "e"]
+        return {"id": str(e.get("id", ""))[:12], "kind": e.get("kind"),
+                "pubkey": str(e.get("pubkey", ""))[:12], "#e": etags}
+    all_ev = _relay_all_events(relay)
+    lines = [f"relay held {len(all_ev)} kind-{CLINK_KIND} event(s): {[summ(e) for e in all_ev]}"]
+    if _last_relay_query_error:
+        lines.append(f"last relay query error: {_last_relay_query_error}")
+    if relay.log_path and relay.log_path.exists():
+        tail = relay.log_path.read_text(errors="replace").splitlines()[-40:]
+        lines.append("relay.log tail:\n  " + "\n  ".join(tail))
+    return "\n".join(lines)
 
 
 def _wait_for_receipt_buffered(relay: ClinkRelayHandle, request_event_id: str,
-                               since: int, timeout: float = 30.0) -> list[dict]:
+                               since: int, timeout: float = 60.0) -> list[dict]:
     """Wait until the relay buffer holds both the bolt11 reply *and* the receipt
     (two kind-21001 events for our request) and return them."""
     deadline = time.monotonic() + timeout
@@ -209,7 +281,8 @@ def _wait_for_receipt_buffered(relay: ClinkRelayHandle, request_event_id: str,
         time.sleep(1)
     raise AssertionError(
         f"relay never buffered the receipt for request {request_event_id[:12]} "
-        f"within {timeout}s (saw {len(events)} event(s))"
+        f"within {timeout}s (saw {len(events)} matching event(s)).\n"
+        + _relay_diagnostics(relay)
     )
 
 

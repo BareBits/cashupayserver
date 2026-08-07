@@ -38,6 +38,16 @@ def _payment_html(session: requests.Session, base_url: str, invoice_id: str) -> 
 def test_payment_path_debug_double_gate(configured: ConfiguredPayserver) -> None:
     base_url = configured.handle.url
 
+    # The Cashu ecash rail (and its "Cashu ecash (NUT-18)" debug label) is gated
+    # on the store opting into offline acceptance (see payment.php, "gate Cashu
+    # on offline"); enable it so both rail labels below are exercised.
+    with configured.handle.db() as db:
+        db.execute(
+            "UPDATE stores SET offline_cashu_enabled = 1, offline_cashu_policy = 'dleq'"
+            " WHERE id = ?",
+            (configured.store_id,),
+        )
+
     # A sat invoice on the mint-only config routes via the 'mint' rail: it has a
     # Lightning method block (mint quote) and a Cashu ecash block.
     invoice = configured.greenfield.create_invoice(

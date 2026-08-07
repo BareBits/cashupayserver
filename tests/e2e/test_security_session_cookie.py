@@ -11,24 +11,30 @@ import requests
 from conftest import ConfiguredPayserver, DEFAULT_ADMIN_PASSWORD
 
 
-def _session_set_cookie(headers) -> str:
-    """Return the Set-Cookie value for cashupay_session, raising if missing."""
-    cookies = headers.get_list("Set-Cookie") if hasattr(headers, "get_list") else []
-    if not cookies:
-        # requests doesn't expose get_list; fall back to splitting Set-Cookie
-        raw = headers.get("Set-Cookie", "")
-        cookies = [c.strip() for c in raw.split(",") if "cashupay_session" in c]
-    for c in cookies:
-        if c.startswith("cashupay_session="):
-            return c
-    raise AssertionError(f"no cashupay_session in Set-Cookie: {dict(headers)}")
+def _session_set_cookie(resp) -> str:
+    """Return the raw Set-Cookie value for cashupay_session, raising if missing.
+
+    The cookie is emitted on whichever response first starts the session. An
+    anonymous GET /admin 302-redirects to /admin/dashboard, and PHP sets the
+    session cookie on that 302 — so we must scan the whole redirect chain, not
+    just the final response requests hands back.
+    """
+    for r in [*resp.history, resp]:
+        raw = r.headers.get("Set-Cookie", "")
+        for c in (part.strip() for part in raw.split(",")):
+            if c.startswith("cashupay_session="):
+                return c
+    raise AssertionError(
+        f"no cashupay_session in Set-Cookie across chain: "
+        f"{[(r.status_code, r.headers.get('Set-Cookie')) for r in [*resp.history, resp]]}"
+    )
 
 
 def test_session_cookie_is_httponly_and_samesite_lax(configured: ConfiguredPayserver) -> None:
     """Anonymous GET should already set the hardened cookie."""
     s = requests.Session()
     r = s.get(f"{configured.handle.url}/admin", timeout=15)
-    set_cookie = _session_set_cookie(r.headers)
+    set_cookie = _session_set_cookie(r)
     assert "HttpOnly" in set_cookie, set_cookie
     assert "SameSite=Lax" in set_cookie, set_cookie
     # Local stack is plain HTTP, so Secure should NOT be present.

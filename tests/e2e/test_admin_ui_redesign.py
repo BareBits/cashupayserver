@@ -95,11 +95,17 @@ def test_auto_cashout_columns_and_selection(admin_page):
                                  "el => el.classList.contains('selected')")
 
 
-def test_site_settings_email_first_and_aw_site(admin_page):
+def test_site_settings_email_card_and_aw_site(admin_page):
     page, base = admin_page
     _goto(page, base, "settings")
-    first = page.eval_on_selector("#view-settings > .card .card-title", "el => el.textContent.trim()")
-    assert first == "Email Notifications"
+    # Cards now live inside a .settings-scroll wrapper (pinned-footer redesign),
+    # so match by descendant rather than direct child. Email Notifications is no
+    # longer the first card — Developer/Debug and the site-wide on-chain default
+    # card were added above it — so assert it is present rather than first.
+    titles = page.eval_on_selector_all(
+        "#view-settings .card .card-title", "els => els.map(e => e.textContent.trim())"
+    )
+    assert "Email Notifications" in titles, titles
     site_cols = page.eval_on_selector_all(
         "#aw-site .aw-col", "els => els.map(e => e.getAttribute('data-aw-mode'))"
     )

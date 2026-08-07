@@ -8,7 +8,7 @@
 require_once __DIR__ . '/database.php';
 
 // Version
-define('CASHUPAY_VERSION', '1.0');
+define('CASHUPAY_VERSION', '1.1');
 
 // Upstream dev fee — paid to the original CashuPayServer author via the
 // existing cypherpunk.today donation sink. Triggered on the periodic fee

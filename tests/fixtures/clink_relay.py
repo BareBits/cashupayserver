@@ -105,6 +105,17 @@ def _build_app():
 
         async def _on_event(self, sender, event: Dict[str, Any]) -> None:
             self.recent.append(event)
+            # Log every published event so a failing test can reconstruct the
+            # round-trip from relay.log: did the payserver publish the request,
+            # did the merchant plugin reply, did the receipt arrive?
+            etags = [t[1] for t in event.get("tags", []) if len(t) >= 2 and t[0] == "e"]
+            print(
+                f"[clink-relay] EVENT kind={event.get('kind')} "
+                f"id={str(event.get('id', ''))[:12]} "
+                f"pubkey={str(event.get('pubkey', ''))[:12]} "
+                f"#e={[e[:12] for e in etags]}",
+                flush=True,
+            )
             # NIP-20 command result: clients (incl. electrum_aionostr and
             # swentel/nostr-php) block on this OK before considering the publish
             # complete.
@@ -173,6 +184,7 @@ class ClinkRelayHandle:
     host: str
     port: int
     process: subprocess.Popen[bytes]
+    log_path: Path | None = None
 
     @property
     def ws_url(self) -> str:
@@ -190,7 +202,8 @@ def start_clink_relay(workdir: Path, *, host: str = "127.0.0.1") -> ClinkRelayHa
     (port,) = ports_mod.allocate(1)
     log_dir = workdir / "clink-relay"
     log_dir.mkdir(parents=True, exist_ok=True)
-    log = (log_dir / "relay.log").open("ab")
+    log_path = log_dir / "relay.log"
+    log = log_path.open("ab")
 
     # Run this very module as a script via the active interpreter (the test
     # venv when under pytest / iterate.py — both have aiohttp).
@@ -205,7 +218,7 @@ def start_clink_relay(workdir: Path, *, host: str = "127.0.0.1") -> ClinkRelayHa
         stderr=subprocess.STDOUT,
     )
 
-    handle = ClinkRelayHandle(host=host, port=port, process=proc)
+    handle = ClinkRelayHandle(host=host, port=port, process=proc, log_path=log_path)
     deadline = time.monotonic() + 20
     last: Exception | None = None
     while time.monotonic() < deadline:

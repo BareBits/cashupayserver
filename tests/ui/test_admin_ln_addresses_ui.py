@@ -39,9 +39,12 @@ def _open_auto_cashout(page, configured: ConfiguredPayserver) -> None:
     page.click("#password-submit")
     page.wait_for_selector("#app", state="visible")
     page.locator('.nav-item[data-view="stores"]').click()
-    page.wait_for_selector("#auto-melt-address-list", state="visible")
-    # Make sure we're in Lightning-address mode so the address list shows.
+    page.wait_for_selector("#aw-store", state="visible")
+    # Select Lightning-address mode so the address group is shown. The list div
+    # (#auto-melt-address-list) starts empty and thus has zero size, which
+    # Playwright treats as hidden — so wait on the always-present Add button.
     page.locator('#aw-store .aw-col[data-aw-mode="0"]').click()
+    page.wait_for_selector("#btn-add-ln-address", state="visible")
 
 
 def _fill_rows(page, addresses: list[str]) -> None:
@@ -60,8 +63,10 @@ def test_add_reorder_and_save_chain(configured: ConfiguredPayserver, page) -> No
     _fill_rows(page, [ADDR_A, ADDR_B, ADDR_C])
 
     # Enable auto-melt + a threshold so the save validation passes.
-    if not page.locator("#auto-melt-enabled").is_checked():
-        page.locator("#auto-melt-enabled").check()
+    # Enable auto-melt. The toggle is a CSS-hidden checkbox positioned off the
+    # viewport, so set it directly rather than clicking; its value is only read
+    # on save (no change handler).
+    page.evaluate("() => { document.getElementById('auto-melt-enabled').checked = true; }")
     page.fill("#auto-melt-threshold", "100")
 
     # Move the third row (C) up one → order becomes A, C, B.
@@ -82,8 +87,10 @@ def test_add_reorder_and_save_chain(configured: ConfiguredPayserver, page) -> No
 def test_remove_row(configured: ConfiguredPayserver, page) -> None:
     _open_auto_cashout(page, configured)
     _fill_rows(page, [ADDR_A, ADDR_B])
-    if not page.locator("#auto-melt-enabled").is_checked():
-        page.locator("#auto-melt-enabled").check()
+    # Enable auto-melt. The toggle is a CSS-hidden checkbox positioned off the
+    # viewport, so set it directly rather than clicking; its value is only read
+    # on save (no change handler).
+    page.evaluate("() => { document.getElementById('auto-melt-enabled').checked = true; }")
     page.fill("#auto-melt-threshold", "100")
 
     # Remove the first row (A) → only B remains.
@@ -99,8 +106,10 @@ def test_remove_row(configured: ConfiguredPayserver, page) -> None:
 def test_duplicate_rejected_client_side(configured: ConfiguredPayserver, page) -> None:
     _open_auto_cashout(page, configured)
     _fill_rows(page, [ADDR_A, ADDR_A])
-    if not page.locator("#auto-melt-enabled").is_checked():
-        page.locator("#auto-melt-enabled").check()
+    # Enable auto-melt. The toggle is a CSS-hidden checkbox positioned off the
+    # viewport, so set it directly rather than clicking; its value is only read
+    # on save (no change handler).
+    page.evaluate("() => { document.getElementById('auto-melt-enabled').checked = true; }")
     page.fill("#auto-melt-threshold", "100")
 
     page.click("#btn-save-auto-melt")

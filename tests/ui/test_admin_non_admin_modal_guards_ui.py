@@ -1,6 +1,7 @@
-"""Non-admin users see the dashboard's Withdraw and Export buttons, but
-clicking them must show a toast and refuse to open the modal — the server
-already 403s the actions, this is the UX side of that gate.
+"""Non-admin users see the dashboard's Withdraw button, but clicking it must
+show a toast and refuse to open the modal — the server already 403s the action,
+this is the UX side of that gate. Receiving (the Request modal) stays open to
+non-admins.
 """
 from __future__ import annotations
 
@@ -45,31 +46,16 @@ def test_non_admin_withdraw_button_toasts_and_does_not_open(
     assert is_visible is False, "withdraw modal must not open for non-admin"
 
 
-def test_non_admin_export_button_toasts_and_does_not_open(
-    configured: ConfiguredPayserver, page,
-) -> None:
-    username, password = _create_staff(configured)
-    _login(page, configured.handle.url, username, password)
-
-    page.click("#btn-export")
-    page.wait_for_selector("#toast.show", timeout=3000)
-    assert "admin" in page.locator("#toast").text_content().lower()
-
-    is_visible = page.evaluate(
-        "() => document.getElementById('modal-export').classList.contains('visible')"
-    )
-    assert is_visible is False, "export modal must not open for non-admin"
-
-
 def test_non_admin_request_button_still_opens(
     configured: ConfiguredPayserver, page,
 ) -> None:
-    """Receiving payments is a non-admin operation — the Request modal must
-    still open."""
+    """Receiving payments is a non-admin operation — the simple Request modal
+    must still open. (#btn-request now opens the cart builder; the direct
+    request modal moved to #btn-request-simple.)"""
     username, password = _create_staff(configured)
     _login(page, configured.handle.url, username, password)
 
-    page.click("#btn-request")
+    page.click("#btn-request-simple")
     page.wait_for_selector("#modal-request.visible", timeout=3000)
 
 

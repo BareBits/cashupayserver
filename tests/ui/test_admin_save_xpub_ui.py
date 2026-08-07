@@ -147,7 +147,10 @@ def test_save_new_xpub_replacing_existing(configured: ConfiguredPayserver, page)
     # --- step 3: paste new xpub + click Save
     page.fill("#onchain-xpub", new_xpub)
     # network + type may have shifted; force them to the values that match
-    # what iterate.py used so save_onchain isn't rejected for unrelated reasons
+    # what iterate.py used so save_onchain isn't rejected for unrelated reasons.
+    # They now live in the collapsed "Advanced" subsection, so expand it first.
+    page.locator("#onchain-advanced > .subsection-toggle").click()
+    page.wait_for_selector("#onchain-network", state="visible")
     page.select_option("#onchain-network", "regtest")
     page.select_option("#onchain-address-type", "P2WPKH")
 

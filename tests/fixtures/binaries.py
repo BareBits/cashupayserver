@@ -154,7 +154,7 @@ CLINK_PLUGIN = FileSpec(
     name="electrum-clink-plugin",
     version="0.0.1",
     url="https://github.com/BareBits/electrum_clink/releases/download/latest/clink-0.0.1.zip",
-    sha256="5ae075a85eb692781b0e414426f06d597ceefbebbbe30afbf99a9f3274e379a5",
+    sha256="d7c61afe8545a75107ff843cfb2e2557c8b61d85de017d5fa2cc95ea11f51398",
     filename="clink-plugin.zip",
     env_override="CASHUPAY_TEST_CLINK_PLUGIN",
 )

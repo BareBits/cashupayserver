@@ -13,7 +13,11 @@ jobs:
   e2e-and-ui:
     name: E2E + UI
     runs-on: ubuntu-22.04
-    timeout-minutes: 40
+    # The full e2e+ui+wordpress suite runs serially (session-scoped bitcoind/
+    # lnd/mint/channels rule out xdist), taking ~40m and growing. 40m left no
+    # headroom — runs were cancelled mid-suite at ~96%. 60m gives room until
+    # sharding becomes worthwhile.
+    timeout-minutes: 60
     # Depend on the artifact build so the WordPress install E2E can exercise the
     # EXACT zip CI publishes (composer vendor/, flattened plugin layout) rather
     # than the symlink tree the other WP tests assemble from live source.
