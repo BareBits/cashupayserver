@@ -182,6 +182,15 @@ final class SwapAutoMelt {
      * Returns one row per store touched, suitable for the cron summary JSON.
      */
     public static function checkAndExecute(): ?array {
+        // Sweep swaps sign Taproot claim transactions — EC math that needs
+        // GMP. Gate the whole rail up front on GMP-less hosts: this runs from
+        // cron every minute, and without the gate each eligible store would
+        // fail mid-pipeline with a cryptic "undefined function gmp_init".
+        require_once __DIR__ . '/../onchain/wallet.php';
+        if (($envError = OnchainWallet::environmentError()) !== null) {
+            error_log('SwapAutoMelt: skipping swap rail: ' . $envError);
+            return null;
+        }
         $stores = Database::fetchAll(
             "SELECT s.* FROM stores s
               WHERE auto_melt_enabled = 1

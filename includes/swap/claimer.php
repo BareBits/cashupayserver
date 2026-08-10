@@ -50,6 +50,14 @@ final class SwapClaimer {
      * @return string txid (hex, big-endian display order)
      */
     public static function buildAndBroadcast(array $row, string $lockupTxHex, ?SwapSettlementContext $ctx = null): string {
+        // Schnorr-signing the claim needs GMP. Swaps can't be created without
+        // it, but a host downgrade (or migration to a GMP-less box) with swaps
+        // still pending would otherwise die here with a bare "undefined
+        // function" instead of a message the operator can act on.
+        require_once __DIR__ . '/../onchain/wallet.php';
+        if (($envError = OnchainWallet::environmentError()) !== null) {
+            throw new RuntimeException($envError);
+        }
         $ctx = $ctx ?? new CustomerSwapSettlement();
         $table = $ctx->tableName();
         // 1. Parse the lockup transaction; find the output paying our lockup_address.

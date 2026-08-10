@@ -2137,7 +2137,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'xpubChanged' => $xpubChanged,
                     'resumedIndex' => $resumedIndex,
                 ]);
-            } catch (Exception $e) {
+            } catch (Throwable $e) {
+                // Throwable, not Exception: on hosts without the GMP
+                // extension the on-chain stack throws Error, and an uncaught
+                // one turns this JSON endpoint into an HTML fatal.
                 cashupay_status(400);
                 echo json_encode(['error' => $e->getMessage()]);
             }
@@ -2171,7 +2174,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'inferredNetwork' => $check['inferredNetwork'],
                     'preview' => $preview,
                 ]);
-            } catch (Exception $e) {
+            } catch (Throwable $e) {
+                // Throwable for the same GMP-less-host reason as save_onchain.
                 cashupay_status(400);
                 echo json_encode(['error' => $e->getMessage()]);
             }
@@ -2201,7 +2205,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $idx
                 );
                 echo json_encode(['address' => $addr, 'index' => $idx]);
-            } catch (Exception $e) {
+            } catch (Throwable $e) {
+                // Throwable for the same GMP-less-host reason as save_onchain.
                 cashupay_status(400);
                 echo json_encode(['error' => $e->getMessage()]);
             }
@@ -5461,8 +5466,24 @@ header('Cache-Control: no-cache, must-revalidate');
                             <div class="card-title">Auto-Cashout</div>
                         </div>
                         <div class="card-body">
+                            <?php
+                            // Shared by the auto-cashout / on-chain / swap cards
+                            // in this settings view: features that run EC math
+                            // (xpub derivation, swap signing) are dead on a host
+                            // without GMP, so each affected card says so instead
+                            // of failing on save.
+                            require_once __DIR__ . '/includes/onchain/wallet.php';
+                            $gmpEnvError = OnchainWallet::environmentError();
+                            ?>
                             <div id="aw-store" data-aw data-aw-scope="store">
                             <p class="aw-title">auto-cashout settings</p>
+                            <?php if ($gmpEnvError !== null): ?>
+                                <div style="margin-bottom:0.75rem; padding:0.6rem 0.8rem; border-radius:8px; background:rgba(245,158,11,0.12); border:1px solid rgba(245,158,11,0.4); font-size:0.82rem;">
+                                    &#9888; <strong>On-chain withdrawal is unavailable on this server.</strong>
+                                    <?= htmlspecialchars($gmpEnvError) ?>
+                                    Lightning-address and noffer withdrawals still work.
+                                </div>
+                            <?php endif; ?>
                             <div id="aw-store-warning" class="hidden" style="margin-bottom:0.75rem; padding:0.6rem 0.8rem; border-radius:8px; background:rgba(245,158,11,0.12); border:1px solid rgba(245,158,11,0.4); font-size:0.82rem;">
                                 &#9888; This store has no on-chain xpub or withdrawal address configured on the Bitcoin tab. On-chain withdrawal cannot be used until you add one.
                             </div>
@@ -5578,6 +5599,13 @@ header('Cache-Control: no-cache, must-revalidate');
                                 does not expose an xpub, you can fall back to reusing a single
                                 static address.
                             </p>
+                            <?php if ($gmpEnvError !== null): ?>
+                                <div style="margin-bottom:1rem; padding:0.75rem; border-radius:8px; background:rgba(245,158,11,0.12); border:1px solid rgba(245,158,11,0.35); font-size:0.85rem;">
+                                    <strong>&#9888; Xpub mode is unavailable on this server.</strong>
+                                    <?= htmlspecialchars($gmpEnvError) ?>
+                                    A single static address still works.
+                                </div>
+                            <?php endif; ?>
 
                             <!-- Whether to OFFER the on-chain rail to customers, independent of
                                  whether an xpub/static address is configured. Keeping the xpub but
@@ -5729,6 +5757,13 @@ header('Cache-Control: no-cache, must-revalidate');
                                 in low fee environments). Requires an on-chain xpub on the Bitcoin tab.
                                 Site default: <strong id="store-swaps-site-default">&mdash;</strong>.
                             </p>
+                            <?php if ($gmpEnvError !== null): ?>
+                                <div style="margin-bottom:0.75rem; padding:0.75rem; border-radius:8px; background:rgba(245,158,11,0.12); border:1px solid rgba(245,158,11,0.35); font-size:0.85rem;">
+                                    <strong>&#9888; Swaps are unavailable on this server.</strong>
+                                    <?= htmlspecialchars($gmpEnvError) ?>
+                                    Invoices fall back to Lightning / mint until it is enabled.
+                                </div>
+                            <?php endif; ?>
 
                             <div class="form-group">
                                 <label class="form-label">Mode</label>
@@ -6571,6 +6606,17 @@ header('Cache-Control: no-cache, must-revalidate');
                             an intermediate custodian. Requires each store using swaps to have an
                             on-chain xpub configured. See README for trade-offs.
                         </p>
+                        <?php
+                        require_once __DIR__ . '/includes/onchain/wallet.php';
+                        $gmpEnvErrorSite = OnchainWallet::environmentError();
+                        ?>
+                        <?php if ($gmpEnvErrorSite !== null): ?>
+                            <div style="margin-bottom:0.75rem; padding:0.75rem; border-radius:8px; background:rgba(245,158,11,0.12); border:1px solid rgba(245,158,11,0.35); font-size:0.85rem;">
+                                <strong>&#9888; Swaps are unavailable on this server.</strong>
+                                <?= htmlspecialchars($gmpEnvErrorSite) ?>
+                                These settings are saved but won't take effect until it is enabled.
+                            </div>
+                        <?php endif; ?>
 
                         <div class="toggle-container">
                             <span><strong>Enable submarine swaps</strong> (site-wide default)</span>
