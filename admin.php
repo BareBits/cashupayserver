@@ -5909,7 +5909,12 @@ header('Cache-Control: no-cache, must-revalidate');
                                 </p>
                             </div>
 
-                            <div class="toggle-container" style="margin-top: 1rem;">
+                            <?php if ($isWp): ?>
+                            <div style="margin-top: 1rem; background: rgba(247,147,26,0.15); border: 1px solid rgba(247,147,26,0.4); padding: 0.6rem; border-radius: 6px; font-size: 0.85rem;">
+                                Installed in plugin mode &mdash; configure your e-mail settings in WordPress directly.
+                            </div>
+                            <?php endif; ?>
+                            <div class="toggle-container" style="margin-top: 1rem;<?= $isWp ? ' opacity: 0.5; pointer-events: none;' : '' ?>">
                                 <span>Use a custom SMTP server for this store</span>
                                 <label class="toggle">
                                     <input type="checkbox" id="store-smtp-override-enabled">
@@ -5917,7 +5922,7 @@ header('Cache-Control: no-cache, must-revalidate');
                                 </label>
                             </div>
 
-                            <div id="store-smtp-fields" class="hidden" style="margin-top: 0.75rem; padding: 0.75rem; background: rgba(0,0,0,0.2); border-radius: 8px;">
+                            <div id="store-smtp-fields" class="hidden" style="margin-top: 0.75rem; padding: 0.75rem; background: rgba(0,0,0,0.2); border-radius: 8px;<?= $isWp ? ' opacity: 0.5; pointer-events: none;' : '' ?>">
                                 <p class="form-help" style="margin-top: 0;">
                                     Any field left blank falls back to the global SMTP settings, then to
                                     <code>user_config.php</code>.
@@ -6310,7 +6315,12 @@ header('Cache-Control: no-cache, must-revalidate');
                             </p>
                         </div>
 
-                        <div style="margin-top: 1rem; padding: 0.75rem; background: rgba(0,0,0,0.2); border-radius: 8px;">
+                        <?php if ($isWp): ?>
+                        <div style="margin-top: 1rem; background: rgba(247,147,26,0.15); border: 1px solid rgba(247,147,26,0.4); padding: 0.6rem; border-radius: 6px; font-size: 0.85rem;">
+                            Installed in plugin mode &mdash; configure your e-mail settings in WordPress directly.
+                        </div>
+                        <?php endif; ?>
+                        <div style="margin-top: 1rem; padding: 0.75rem; background: rgba(0,0,0,0.2); border-radius: 8px;<?= $isWp ? ' opacity: 0.5; pointer-events: none;' : '' ?>">
                             <div style="font-weight: 500; margin-bottom: 0.5rem;">SMTP server</div>
                             <p class="form-help" style="margin-top: 0;">
                                 Outgoing mail server. Any field left blank falls back to
@@ -7560,6 +7570,19 @@ header('Cache-Control: no-cache, must-revalidate');
                 },
                 body: body
             });
+        }
+
+        // Parse a fetch Response as JSON without ever throwing an unhandled
+        // rejection: a PHP fatal, an expired-session redirect, or any non-JSON
+        // body would otherwise make r.json() reject and leave the calling button
+        // dead-silent (no toast, no inline error). Returns { ok, status, data }
+        // where data is {} when the body could not be parsed.
+        async function readJsonResponse(r) {
+            let text = '';
+            try { text = await r.text(); } catch (e) { text = ''; }
+            let data = {};
+            try { data = text ? JSON.parse(text) : {}; } catch (e) { data = {}; }
+            return { ok: r.ok, status: r.status, data };
         }
 
         // Format amount for display based on unit (handles fiat decimals)
@@ -10554,17 +10577,29 @@ header('Cache-Control: no-cache, must-revalidate');
             const network = document.getElementById('onchain-network').value;
             const type = document.getElementById('onchain-address-type').value;
             const body = `action=validate_onchain_xpub&xpub=${encodeURIComponent(xpub)}&network=${network}&address_type=${type}`;
-            const r = await postWithCsrf(adminUrl, body);
-            const data = await r.json();
-            box.style.display = 'block';
-            if (!data.valid) {
+            const showInvalid = msg => {
+                box.style.display = 'block';
                 box.style.background = 'rgba(245, 101, 101, 0.15)';
                 box.style.border = '1px solid rgba(245, 101, 101, 0.3)';
                 box.innerHTML = '';
                 const strong = document.createElement('strong');
                 strong.textContent = 'Invalid: ';
                 box.appendChild(strong);
-                box.appendChild(document.createTextNode(data.error || 'unknown'));
+                box.appendChild(document.createTextNode(msg));
+            };
+            let res;
+            try {
+                res = await readJsonResponse(await postWithCsrf(adminUrl, body));
+            } catch (e) {
+                // Network-level failure (offline, CORS, connection reset). Without
+                // this, the button would appear to do nothing at all.
+                showInvalid('Could not reach the server. Check your connection and try again.');
+                return;
+            }
+            const data = res.data;
+            box.style.display = 'block';
+            if (!res.ok || !data.valid) {
+                showInvalid(data.error || (res.ok ? 'unknown' : `server error (HTTP ${res.status})`));
                 return;
             }
             box.innerHTML = '';
@@ -10589,17 +10624,28 @@ header('Cache-Control: no-cache, must-revalidate');
 
         async function testOnchainCurrent() {
             if (!currentStoreId) { showToast('No store selected', 'error'); return; }
-            const r = await postWithCsrf(adminUrl,
-                `action=test_onchain_xpub&store_id=${encodeURIComponent(currentStoreId)}`);
-            const data = await r.json();
             const box = document.getElementById('onchain-validation-box');
-            box.style.display = 'block';
-            if (!r.ok || data.error) {
+            const showFail = msg => {
+                box.style.display = 'block';
                 box.style.background = 'rgba(245, 101, 101, 0.15)';
                 box.style.border = '1px solid rgba(245, 101, 101, 0.3)';
-                box.innerHTML = '<strong>Test failed:</strong> ' + (data.error || 'unknown');
+                box.innerHTML = '<strong>Test failed:</strong> ';
+                box.appendChild(document.createTextNode(msg));
+            };
+            let res;
+            try {
+                res = await readJsonResponse(await postWithCsrf(adminUrl,
+                    `action=test_onchain_xpub&store_id=${encodeURIComponent(currentStoreId)}`));
+            } catch (e) {
+                showFail('could not reach the server. Check your connection and try again.');
                 return;
             }
+            const data = res.data;
+            if (!res.ok || data.error) {
+                showFail(data.error || `server error (HTTP ${res.status})`);
+                return;
+            }
+            box.style.display = 'block';
             box.style.background = 'rgba(72, 187, 120, 0.1)';
             box.style.border = '1px solid rgba(72, 187, 120, 0.3)';
             box.innerHTML = 'Current next address (m/0/' + data.index + '): <code>' + data.address + '</code>';
@@ -10691,9 +10737,18 @@ header('Cache-Control: no-cache, must-revalidate');
             }
             // Mirror the result inline next to the Save button — the global
             // toast sits above the mobile bottom-nav and is easy to miss.
-            const r = await postWithCsrf(adminUrl, body);
-            const data = await r.json();
-            if (r.ok) {
+            let res;
+            try {
+                res = await readJsonResponse(await postWithCsrf(adminUrl, body));
+            } catch (e) {
+                // Network-level failure. Surface it instead of leaving the Save
+                // button apparently dead (the original silent-failure report).
+                showInline('<strong>Save failed:</strong> could not reach the server. Check your connection and try again.', false);
+                showToast('Could not reach the server', 'error');
+                return;
+            }
+            const data = res.data;
+            if (res.ok) {
                 let suffix = '';
                 if (data.disabled) {
                     suffix = ' (on-chain disabled)';
@@ -10706,7 +10761,7 @@ header('Cache-Control: no-cache, must-revalidate');
                 showToast('On-chain settings saved' + (data.disabled ? ' (disabled)' : ''), 'success');
                 loadDashboard();
             } else {
-                const err = data.error || 'Failed to save';
+                const err = data.error || `Failed to save (HTTP ${res.status})`;
                 showInline('<strong>Save failed:</strong> ' + err, false);
                 showToast(err, 'error');
             }

@@ -1,0 +1,60 @@
+name: Testing release
+
+# Every push to the `testing` branch cuts a testing-channel prerelease.
+#
+# The auto-updater's `testing` channel tracks the newest release of any kind
+# (prereleases included); the `main` channel tracks only stable releases. So a
+# prerelease published here reaches installs on the testing channel without
+# affecting stable installs.
+#
+# Mechanism: derive a v<version>-testing.<run#> tag from the in-tree
+# CASHUPAY_VERSION, then call release.yml as a reusable workflow to build and
+# publish it. We reuse release.yml (rather than duplicating its build/publish
+# steps) and invoke it via workflow_call instead of pushing a git tag — a tag
+# pushed with the default GITHUB_TOKEN would NOT re-trigger release.yml, so the
+# tag-push route would need a PAT. workflow_call needs neither.
+
+on:
+  push:
+    branches:
+      - testing
+
+permissions:
+  contents: write
+
+concurrency:
+  # Serialize testing releases so two quick pushes can't race on the same tag.
+  group: testing-release
+  cancel-in-progress: false
+
+jobs:
+  compute-tag:
+    runs-on: ubuntu-22.04
+    outputs:
+      tag: ${{ steps.derive.outputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Derive prerelease tag from in-tree version
+        id: derive
+        # Base version comes from the same source release.yml verifies against,
+        # so the -testing suffix is the only difference. run_number keeps each
+        # testing build's tag unique and monotonic.
+        run: |
+          version="$(grep -oE "define\('CASHUPAY_VERSION',\s*'[^']+'\)" includes/config.php \
+            | sed -E "s/.*'([^']+)'\)/\1/" | head -1)"
+          if [ -z "$version" ]; then
+            echo "ERROR: could not read CASHUPAY_VERSION from includes/config.php" >&2
+            exit 1
+          fi
+          echo "tag=v${version}-testing.${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+
+  release:
+    needs: compute-tag
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.compute-tag.outputs.tag }}
+    secrets: inherit

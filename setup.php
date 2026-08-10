@@ -245,6 +245,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     throw new Exception('Give your store a name to continue.');
                 }
 
+                // Default display/quote currency. Payments always settle in
+                // Bitcoin; this only drives how invoices are shown and priced.
+                // The field is a controlled <select>, so an out-of-range value
+                // means tampering — fall back to sat rather than hard-fail an
+                // onboarding step. Normalized to match the admin settings page:
+                // sat lowercase, fiat codes uppercase.
+                $supportedCurrencies = Config::getSupportedDisplayCurrencies();
+                $rawCurrency = (string)($_POST['default_currency'] ?? 'sat');
+                $defaultCurrency = (strtolower($rawCurrency) === 'sat' || strtolower($rawCurrency) === 'sats')
+                    ? 'sat' : strtoupper($rawCurrency);
+                if (!in_array($defaultCurrency, $supportedCurrencies, true)) {
+                    $defaultCurrency = 'sat';
+                }
+
                 // Coming back to this screen mid-wizard must rename the store
                 // already under construction, not create a second one — the
                 // first would be orphaned the moment the session id is
@@ -285,11 +299,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     Database::insert('stores', [
                         'id' => $storeId,
                         'name' => $storeName,
+                        'default_currency' => $defaultCurrency,
                         'primary_mint_source' => 'setup',
                         'created_at' => Database::timestamp(),
                     ]);
                 } else {
-                    Config::updateStore($storeId, ['name' => $storeName]);
+                    Config::updateStore($storeId, [
+                        'name' => $storeName,
+                        'default_currency' => $defaultCurrency,
+                    ]);
                 }
 
                 $_SESSION['setup_store_id'] = $storeId;
@@ -1600,15 +1618,41 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                     <?php
                     // Prefill with the store under construction when the
                     // operator navigated back to this screen.
-                    $storeNameExisting = $renderStoreId
-                        ? (Config::getStore($renderStoreId)['name'] ?? '') : '';
+                    $storeUnderConstruction = $renderStoreId ? Config::getStore($renderStoreId) : null;
+                    $storeNameExisting = $storeUnderConstruction['name'] ?? '';
                     $storeNameValue = $_POST['store_name'] ?? ($storeNameExisting ?: 'My Store');
+                    // Prefill currency from the posted value (validation retry),
+                    // then the store row, then default to sat.
+                    $currencyValue = $_POST['default_currency']
+                        ?? ($storeUnderConstruction['default_currency'] ?? 'sat');
+                    $currencyValue = (strtolower((string)$currencyValue) === 'sat'
+                        || strtolower((string)$currencyValue) === 'sats')
+                        ? 'sat' : strtoupper((string)$currencyValue);
+                    $currencyOptions = Config::getSupportedDisplayCurrencies();
+                    if (!in_array($currencyValue, $currencyOptions, true)) {
+                        $currencyValue = 'sat';
+                    }
                     ?>
                     <div class="form-group">
                         <label for="store_name">Store name</label>
                         <input type="text" id="store_name" name="store_name"
                                value="<?= htmlspecialchars($storeNameValue) ?>" required>
                         <p class="help-text">Your customers see this on payment pages and receipts.</p>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="default_currency">Default currency</label>
+                        <select id="default_currency" name="default_currency">
+                            <?php foreach ($currencyOptions as $cur): ?>
+                                <option value="<?= htmlspecialchars($cur) ?>"<?= $cur === $currencyValue ? ' selected' : '' ?>>
+                                    <?= $cur === 'sat' ? 'Bitcoin (sats)' : htmlspecialchars($cur) ?>
+                                </option>
+                            <?php endforeach; ?>
+                        </select>
+                        <p class="help-text">
+                            Note: Payments are always received as Bitcoin. This only
+                            affects how invoices are displayed and quoted.
+                        </p>
                     </div>
 
                     <button type="submit" class="btn" style="width: 100%;">Continue</button>

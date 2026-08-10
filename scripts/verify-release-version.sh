@@ -29,6 +29,14 @@ fi
 # taken as-is.
 EXPECTED="${TAG#v}"
 
+# Auto testing releases (.github/workflows/testing-release.yml) append a
+# "-testing.<run#>" suffix to the in-tree version so each testing build gets a
+# unique prerelease tag (e.g. 1.2 -> 1.2-testing.5). The in-tree version isn't
+# bumped for these, so compare against the base version with that suffix
+# stripped. Stable tags (1.2) and manual prereleases (1.3-rc1) have no
+# "-testing." segment, so they are compared verbatim exactly as before.
+EXPECTED="${EXPECTED%%-testing.*}"
+
 fail=0
 
 config_version="$(grep -oE "define\('CASHUPAY_VERSION',\s*'[^']+'\)" includes/config.php \

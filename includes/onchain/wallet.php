@@ -205,10 +205,21 @@ class OnchainWallet {
             (new AddressCreator())->fromString($address, $net);
             return ['valid' => true, 'error' => null];
         } catch (Throwable $e) {
+            // bitwasp's AddressCreator predates bech32m, so it rejects v1
+            // Taproot outputs (bc1p…/tb1p…/bcrt1p…) — the receive-address
+            // default in most modern wallets. Fall back to our own bech32m
+            // decoder, which is network-aware and returns null on any parse
+            // failure, before declaring the address unreadable. Static-address
+            // mode only watches the string, so a valid P2TR address works
+            // end-to-end once it passes here.
+            require_once __DIR__ . '/../crypto/taproot.php';
+            if (Taproot::decodeP2trAddress($address, $network) !== null) {
+                return ['valid' => true, 'error' => null];
+            }
             $isTestnetFamily = in_array($network, ['testnet', 'signet', 'regtest'], true);
             $hint = $isTestnetFamily
-                ? 'Expected a testnet/signet/regtest address (starts with m/n/2 or tb1/bcrt1).'
-                : 'Expected a mainnet address (starts with 1/3 or bc1).';
+                ? 'Expected a testnet/signet/regtest address (starts with m/n/2 or tb1/tb1p/bcrt1).'
+                : 'Expected a mainnet address (starts with 1/3 or bc1/bc1p).';
             return ['valid' => false, 'error' => "Invalid address for {$network}. {$hint}"];
         } finally {
             error_reporting($prev);
