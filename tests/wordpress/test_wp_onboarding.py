@@ -83,7 +83,7 @@ def test_wizard_skips_the_password_screen_and_completes(wp_ready) -> None:
     assert "of 9" in body, "WordPress with no on-chain rail should be 9 screens"
 
     body = w.post(step="security", security_acknowledged="1")
-    assert wizard_heading(body) == "Name your store", (
+    assert wizard_heading(body) == "Let's name your store", (
         f"WordPress mode must skip the password screen, landed on {wizard_heading(body)!r}"
     )
 
@@ -109,6 +109,11 @@ def test_wizard_skips_the_password_screen_and_completes(wp_ready) -> None:
     assert wizard_heading(body).startswith("You"), wizard_heading(body)
     assert "WooCommerce" in body, "the WordPress completion screen should offer WooCommerce wiring"
     assert "Back to WordPress Dashboard" in body
+    # In WordPress mode the manual e-commerce integration sections are dropped —
+    # BareBits wires WooCommerce up itself, so there is nothing for the merchant
+    # to copy or pair by hand.
+    assert "Your Server URL" not in body, "the server-URL section must be hidden in WordPress mode"
+    assert "Connect Your E-commerce" not in body, "the manual pairing section must be hidden in WordPress mode"
 
     with wp.db() as db:
         assert db.execute(

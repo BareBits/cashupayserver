@@ -26,10 +26,10 @@ Database::insert('invoices', [
 ]);
 Database::update('stores', ['hosting_fee_percent' => 1.0], 'id = ?', [$store]);
 
-// Initial owed: upstream = 2500, dev = 10000 (upstream not yet paid), hosting = 5000.
+// Initial owed: upstream = 2500, dev = 5000 (upstream not yet paid), hosting = 5000.
 $o = DevFee::computeOwed($store);
 assert_eq(2500, $o['upstream_owed']);
-assert_eq(10000, $o['dev_owed']);
+assert_eq(5000, $o['dev_owed']);
 assert_eq(5000, $o['hosting_owed']);
 
 // Simulate a SUCCESSFUL upstream payment by inserting the melts row directly
@@ -37,23 +37,23 @@ assert_eq(5000, $o['hosting_owed']);
 MeltLog::record($store, 2500, 0, 'https://sink', null, FEE_NOTE_UPSTREAM);
 
 // Next pass: upstream_owed drops to 0; dev_owed shrinks (upstream paid counts).
-//   dev_base = 500000 - 0 - 2500 = 497500 → floor * 0.02 = 9950
-//   dev_owed = 9950 - 0 = 9950
+//   dev_base = 500000 - 0 - 2500 = 497500 → floor * 0.01 = 4975
+//   dev_owed = 4975 - 0 = 4975
 $o = DevFee::computeOwed($store);
 assert_eq(0, $o['upstream_owed'], 'upstream paid, owed clamps to 0');
 assert_eq(2500, $o['upstream_paid']);
-assert_eq(9950, $o['dev_owed'], 'dev unchanged because upstream paid - upstream subtracted match exactly');
+assert_eq(4975, $o['dev_owed'], 'dev unchanged because upstream paid - upstream subtracted match exactly');
 
 // Now pay dev and hosting; their owed clamps to 0 on the next pass.
-MeltLog::record($store, 9950, 50, 'fees@getbarebits.com', 'pre1', FEE_NOTE_DEV);
+MeltLog::record($store, 4975, 50, 'fees@getbarebits.com', 'pre1', FEE_NOTE_DEV);
 MeltLog::record($store, 5000, 25, 'host@op.com', 'pre2', FEE_NOTE_HOSTING);
 
 $o = DevFee::computeOwed($store);
 assert_eq(0, $o['upstream_owed']);
 assert_eq(75, $o['network_cost'], 'both fee payments contributed network cost');
 
-// Dev base after second pass: 500000 - 75 - 2500 = 497425 → floor * 0.02 = 9948
-// dev_owed = 9948 - 9950 = -2 → clamped to 0
+// Dev base after second pass: 500000 - 75 - 2500 = 497425 → floor * 0.01 = 4974
+// dev_owed = 4974 - 4975 = -1 → clamped to 0
 assert_eq(0, $o['dev_owed'], 'dev clamps to 0 even after slight base shrink');
 assert_eq(0, $o['hosting_owed'], 'hosting clamps to 0');
 

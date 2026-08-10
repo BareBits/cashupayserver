@@ -53,6 +53,7 @@ def test_mint_discovery_finds_mints(
     page.goto(f"{payserver.url}/setup")
     page.check("#terms_legal")
     page.check("#terms_warranty")
+    page.check("#terms_fee")
     page.click("button[type=submit]")
     page.check("#security_acknowledged")
     page.click("button[type=submit]")

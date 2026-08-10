@@ -11,7 +11,7 @@
  *   - Upstream dev fee (CASHUPAY_UPSTREAM_DEV_FEE_PERCENT, default 0.5%):
  *       base = revenue − network_costs. Paid to the original CashuPayServer
  *       author via the existing cypherpunk.today Cashu-token sink.
- *   - Dev fee (CASHUPAY_DEV_FEE_PERCENT, hard-coded 2%):
+ *   - Dev fee (CASHUPAY_DEV_FEE_PERCENT, hard-coded 1%):
  *       base = revenue − network_costs − upstream_paid. Paid to the LNURL
  *       configured by CASHUPAY_DEV_FEE_LNURL (default fees@getbarebits.com)
  *       with "Deployment: $DEPLOYMENT_ID" attached as a memo (LUD-12 comment
@@ -44,8 +44,12 @@ require_once __DIR__ . '/../cashu-wallet-php/CashuWallet.php';
 use Cashu\Wallet;
 
 // MANDATORY: this constant is intentionally hard-coded and not env-overridable.
+// Canonically defined in includes/config.php so lightweight callers (e.g. the
+// setup wizard) get it without loading this settlement stack; the guard below
+// is a defensive fallback for the rare path that reaches here first. Keep the
+// two values in sync.
 if (!defined('CASHUPAY_DEV_FEE_PERCENT')) {
-    define('CASHUPAY_DEV_FEE_PERCENT', 2);
+    define('CASHUPAY_DEV_FEE_PERCENT', 1);
 }
 
 // Default dev fee destination. CASHUPAY_DEV_FEE_LNURL env override exists

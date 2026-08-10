@@ -41,7 +41,7 @@
 // =============================================================================
 // While a free trial is active, all three platform fees are waived:
 //   - upstream dev fee (0.5%)
-//   - dev fee (2%)
+//   - dev fee (1%)
 //   - per-store hosting fee
 // Network fees (Lightning routing, on-chain miner fees) are real sats spent
 // on melts and cannot be waived.

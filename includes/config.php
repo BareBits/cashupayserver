@@ -8,7 +8,7 @@
 require_once __DIR__ . '/database.php';
 
 // Version
-define('CASHUPAY_VERSION', '1.1');
+define('CASHUPAY_VERSION', '1.2');
 
 // Upstream dev fee — paid to the original CashuPayServer author via the
 // existing cypherpunk.today donation sink. Triggered on the periodic fee
@@ -17,6 +17,15 @@ define('CASHUPAY_VERSION', '1.1');
 // base, so the upstream fee never "stacks" on top of the dev fee.
 define('CASHUPAY_UPSTREAM_DEV_FEE_PERCENT', 0.5);
 define('CASHUPAY_UPSTREAM_DEV_FEE_SINK_URL', 'https://cypherpunk.today/donation-sink/donation-sink.php');
+
+// Development fee — the mandatory BareBits fee assessed on incoming payments,
+// settled on the same cron tick as the upstream fee. Defined here (rather than
+// only in includes/dev_fee.php) so lightweight callers such as the setup
+// wizard's terms screen can display the rate without pulling in the full
+// settlement stack. dev_fee.php keeps a guarded fallback define for the same
+// value. MANDATORY: intentionally hard-coded and not env-overridable; changing
+// it is governed by LICENSE.md (see includes/dev_fee.php for details).
+define('CASHUPAY_DEV_FEE_PERCENT', 1);
 
 class Config {
     private static array $cache = [];

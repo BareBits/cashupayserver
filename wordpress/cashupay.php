@@ -1,9 +1,9 @@
 <?php
 /**
- * Plugin Name: BareBits - Lightning Payments via Cashu
+ * Plugin Name: BareBits - Lightning Payments via Bitcoin
  * Plugin URI: https://github.com/BareBits/cashupayserver
- * Description: Accept Lightning payments through a Cashu mint. BTCPay Server API compatible.
- * Version: 1.1
+ * Description: Accept Bitcoin payments via Lightning. BTCPay Server API compatible.
+ * Version: 1.2
  * Requires PHP: 8.0
  * Author: BareBits
  * License: MIT

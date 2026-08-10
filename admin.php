@@ -6975,7 +6975,7 @@ header('Cache-Control: no-cache, must-revalidate');
                                 <div class="stats-stat-row" title="Donated to upstream development (cypherpunk.today). 0.5% of (revenue − network costs).">
                                     <span class="stats-stat-label">Upstream dev fee</span><span class="stats-stat-value" id="stats-fee-upstream-paid">—</span>
                                 </div>
-                                <div class="stats-stat-row" title="Dev fee from your deployment configuration. 2% of (revenue − network costs − upstream paid).">
+                                <div class="stats-stat-row" title="Dev fee from your deployment configuration. <?= (int) CASHUPAY_DEV_FEE_PERCENT ?>% of (revenue − network costs − upstream paid).">
                                     <span class="stats-stat-label">Dev fee</span><span class="stats-stat-value" id="stats-fee-dev-paid">—</span>
                                 </div>
                                 <div class="stats-stat-row" title="Hosting / referral / deployment fee, configured per-store and paid to the hosting destination.">

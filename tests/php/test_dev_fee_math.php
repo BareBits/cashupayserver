@@ -42,17 +42,17 @@ assert_eq(0, $o['hosting_owed']);
 
 // 2. 100k sats revenue, no network costs, no hosting fee.
 //    upstream = 100000 * 0.005 = 500 sats
-//    dev      = (100000 - 0) * 0.02 = 2000 sats   (no upstream paid yet)
+//    dev      = (100000 - 0) * 0.01 = 1000 sats   (no upstream paid yet)
 //    hosting  = 100000 * 0 / 100 = 0
 paid_invoice($store, 100000, time());
 $o = DevFee::computeOwed($store);
 assert_eq(100000, $o['revenue']);
 assert_eq(500, $o['upstream_owed'], 'upstream 0.5% of revenue');
-assert_eq(2000, $o['dev_owed'], 'dev 2% of revenue (upstream not yet paid)');
+assert_eq(1000, $o['dev_owed'], 'dev 1% of revenue (upstream not yet paid)');
 assert_eq(0, $o['hosting_owed']);
 
 // 3. After upstream is paid, dev fee base shrinks by upstream_paid.
-//    dev base = 100000 - 0 - 500 = 99500 → floor(99500 * 0.02) = 1990
+//    dev base = 100000 - 0 - 500 = 99500 → floor(99500 * 0.01) = 995
 Database::insert('melts', [
     'store_id' => $store,
     'amount_sats' => 500,
@@ -65,14 +65,14 @@ Database::insert('melts', [
 $o = DevFee::computeOwed($store);
 assert_eq(500, $o['upstream_paid']);
 assert_eq(0, $o['upstream_owed'], 'upstream paid, nothing more owed');
-assert_eq(1990, $o['dev_owed'], 'dev base shrunk by upstream paid');
+assert_eq(995, $o['dev_owed'], 'dev base shrunk by upstream paid');
 
 // 4. Network cost from a user withdraw further reduces both bases.
 //    User withdrew with 100 sats network fee.
 //    upstream base = 100000 - 100 = 99900 → floor(99900 * 0.005) = 499
 //      upstream_owed = 499 - 500 = -1 → clamped to 0 (already overpaid)
-//    dev base = 100000 - 100 - 500 = 99400 → floor(99400 * 0.02) = 1988
-//      dev_owed = 1988 - 0 = 1988
+//    dev base = 100000 - 100 - 500 = 99400 → floor(99400 * 0.01) = 994
+//      dev_owed = 994 - 0 = 994
 Database::insert('melts', [
     'store_id' => $store,
     'amount_sats' => 50000,
@@ -85,7 +85,7 @@ Database::insert('melts', [
 $o = DevFee::computeOwed($store);
 assert_eq(100, $o['network_cost']);
 assert_eq(0, $o['upstream_owed'], 'upstream already overpaid');
-assert_eq(1988, $o['dev_owed'], 'dev base reflects network cost + upstream paid');
+assert_eq(994, $o['dev_owed'], 'dev base reflects network cost + upstream paid');
 
 // 5. Hosting fee is flat over revenue (does NOT subtract network costs).
 //    With 2% hosting: 100000 * 0.02 = 2000
@@ -107,8 +107,8 @@ $o = DevFee::computeOwed($store);
 assert_eq(2000, $o['hosting_paid']);
 assert_eq(0, $o['hosting_owed']);
 // The hosting payment also added 5 sats to network cost, shrinking dev base:
-// dev base = 100000 - 105 - 500 = 99395 → floor * 0.02 = 1987
+// dev base = 100000 - 105 - 500 = 99395 → floor * 0.01 = 993
 assert_eq(105, $o['network_cost'], 'hosting payment network fee counted');
-assert_eq(1987, $o['dev_owed'], 'dev base shrunk by hosting payment network fee');
+assert_eq(993, $o['dev_owed'], 'dev base shrunk by hosting payment network fee');
 
 echo "test_dev_fee_math: ok\n";

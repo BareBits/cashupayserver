@@ -60,9 +60,24 @@ def wizard_error(body: str) -> str | None:
 
 
 def wizard_heading(body: str) -> str:
-    """The <h2> of the screen that was rendered — i.e. where the wizard landed."""
+    """The <h2> of the screen that was rendered — i.e. where the wizard landed.
+
+    The onboarding copy prefixes each heading with a decorative emoji (e.g.
+    "⛓️ On-chain Bitcoin payments"). Those are cosmetic and not part of the
+    screen's identity, so a leading run of emoji/symbol characters and spaces is
+    stripped — assertions pin the semantic heading, not the icon.
+    """
     m = re.search(r"<h2[^>]*>(.*?)</h2>", body, re.S)
-    return html.unescape(m.group(1).strip()) if m else ""
+    if not m:
+        return ""
+    text = html.unescape(m.group(1).strip())
+    # Drop a leading run of whitespace and non-ASCII symbol/emoji code points
+    # (>= U+2000 covers the symbol, dingbat, variation-selector and emoji
+    # planes) up to the first ASCII heading character.
+    i = 0
+    while i < len(text) and (text[i].isspace() or ord(text[i]) >= 0x2000):
+        i += 1
+    return text[i:].strip()
 
 
 class SetupWizard:
@@ -124,8 +139,10 @@ class SetupWizard:
         assert r.status_code == 200 and r.json().get("success") is True, r.text
 
     def accept_terms(self) -> str:
-        """Tick both terms-of-service boxes — the first-run gate before security."""
-        return self.post(step="terms", terms_legal="1", terms_warranty="1")
+        """Tick every terms-of-service box — the first-run gate before security.
+        Three are mandatory: legal use, as-is/no-warranty, and the incoming-fee
+        acknowledgement."""
+        return self.post(step="terms", terms_legal="1", terms_warranty="1", terms_fee="1")
 
     def through_store(self, name: str = "Wizard Store") -> str:
         """terms → security ack → password → store name, landing on the on-chain screen."""
@@ -165,10 +182,11 @@ def run_setup_wizard(
     # Initial GET — triggers session start and schema init.
     s.get(setup, timeout=10)
 
-    # terms: accept the first-run terms-of-service gate.
+    # terms: accept the first-run terms-of-service gate (all three boxes,
+    # including the incoming-fee acknowledgement).
     r = s.post(
         setup,
-        data={"step": "terms", "terms_legal": "1", "terms_warranty": "1"},
+        data={"step": "terms", "terms_legal": "1", "terms_warranty": "1", "terms_fee": "1"},
         timeout=10,
         allow_redirects=False,
     )
