@@ -60,6 +60,18 @@ class EmailSender {
             (self::$transportOverride)($to, $subject, $body);
             return;
         }
+
+        // WordPress plugin mode: WordPress owns email delivery. Hand off to
+        // wp_mail() so whatever the site has configured (WP Mail SMTP,
+        // FluentSMTP, the host MTA, …) is used instead of our own PHPMailer/SMTP
+        // stack. The admin SMTP settings are disabled in this mode for the same
+        // reason, so there is nothing to resolve here — the per-store override
+        // is deliberately ignored.
+        if (self::useWordPressMail()) {
+            self::sendViaWordPress($to, $subject, $body);
+            return;
+        }
+
         $cfg = self::resolveConfig($storeId);
 
         $fromAddress = $cfg['from_address'];
@@ -90,6 +102,57 @@ class EmailSender {
             // PHPMailerException's message is operator-facing safe and includes
             // the SMTP server reply when available.
             throw new RuntimeException($e->getMessage(), 0, $e);
+        }
+    }
+
+    /**
+     * True when BareBits is running as a WordPress plugin and wp_mail() is
+     * available. In that case email is delegated to WordPress rather than our
+     * own SMTP stack. Urls is loaded defensively (mirrors the lazy requires
+     * elsewhere in this file); if it can't be loaded we are certainly not in
+     * the WordPress plugin context.
+     */
+    private static function useWordPressMail(): bool {
+        if (!class_exists('Urls')) {
+            $urls = __DIR__ . '/urls.php';
+            if (is_file($urls)) {
+                require_once $urls;
+            }
+        }
+        return class_exists('Urls') && Urls::isWordPress() && function_exists('wp_mail');
+    }
+
+    /**
+     * Send through WordPress's wp_mail(). Bodies here are plain text, which is
+     * wp_mail's default content type, so no extra headers are needed. On
+     * failure wp_mail returns false and fires the 'wp_mail_failed' action with
+     * a WP_Error — captured so the queue's last_error carries WordPress's own
+     * reason instead of a bare "failed".
+     */
+    private static function sendViaWordPress(string $to, string $subject, string $body): void {
+        $captured = null;
+        $listener = static function ($wpError) use (&$captured) {
+            if (is_object($wpError) && method_exists($wpError, 'get_error_message')) {
+                $captured = (string)$wpError->get_error_message();
+            }
+        };
+        if (function_exists('add_action')) {
+            add_action('wp_mail_failed', $listener);
+        }
+        try {
+            $ok = wp_mail($to, $subject, $body);
+        } finally {
+            if (function_exists('remove_action')) {
+                remove_action('wp_mail_failed', $listener);
+            }
+        }
+        if ($ok !== true) {
+            throw new RuntimeException(
+                'WordPress wp_mail() failed to send the message'
+                . ($captured !== null && $captured !== ''
+                    ? ': ' . $captured
+                    : '. Check your WordPress email/SMTP configuration.')
+            );
         }
     }
 

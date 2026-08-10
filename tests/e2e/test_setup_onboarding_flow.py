@@ -195,6 +195,43 @@ def test_duplicate_store_name_is_rejected_but_a_rename_is_not(payserver: Payserv
     assert stores[0]["name"] == "Renamed"
 
 
+def test_store_step_offers_default_currency_and_persists_it(payserver: PayserverHandle) -> None:
+    """The store-name screen also asks for a default display/quote currency,
+    with the copy that clarifies settlement is always Bitcoin. The chosen
+    currency is written to the store's default_currency column."""
+    w = Wizard(payserver)
+    w.accept_terms()
+    w.post(step="security", security_acknowledged="1")
+    # password -> lands on the store screen; inspect that rendered body.
+    store_body = w.post(
+        step="password", password=ADMIN_PW, confirm_password=ADMIN_PW
+    )
+    assert 'name="default_currency"' in store_body, "store screen must render a currency selector"
+    assert "Payments are always received as Bitcoin" in store_body, "the settlement-note copy must be shown"
+    assert 'value="USD"' in store_body, "fiat options must be offered alongside sat"
+
+    body = w.post(step="store", store_name="Fiat Store", default_currency="USD")
+    assert _error(body) is None, _error(body)
+    stores = _stores(payserver)
+    assert len(stores) == 1
+    assert stores[0]["default_currency"] == "USD", "the chosen currency must persist"
+
+
+def test_store_step_rejects_out_of_range_currency_by_falling_back_to_sat(
+    payserver: PayserverHandle,
+) -> None:
+    """The selector is a controlled list; a tampered value must not persist —
+    it falls back to sat rather than hard-failing an onboarding step."""
+    w = Wizard(payserver)
+    w.accept_terms()
+    w.post(step="security", security_acknowledged="1")
+    w.post(step="password", password=ADMIN_PW, confirm_password=ADMIN_PW)
+    body = w.post(step="store", store_name="Tamper Store", default_currency="DOGE")
+    assert _error(body) is None, _error(body)
+    stores = _stores(payserver)
+    assert stores[0]["default_currency"] == "sat", "an unsupported currency must fall back to sat"
+
+
 def test_add_store_does_not_rename_the_store_from_first_run(payserver: PayserverHandle) -> None:
     """The store screen reuses the in-progress store id so navigating Back
     renames rather than duplicates. That reuse must not leak across wizard

@@ -144,7 +144,7 @@ class SetupWizard:
         acknowledgement."""
         return self.post(step="terms", terms_legal="1", terms_warranty="1", terms_fee="1")
 
-    def through_store(self, name: str = "Wizard Store") -> str:
+    def through_store(self, name: str = "Wizard Store", default_currency: str = "sat") -> str:
         """terms → security ack → password → store name, landing on the on-chain screen."""
         self.accept_terms()
         self.post(step="security", security_acknowledged="1")
@@ -153,7 +153,7 @@ class SetupWizard:
             password=self.DEFAULT_PASSWORD,
             confirm_password=self.DEFAULT_PASSWORD,
         )
-        return self.post(step="store", store_name=name)
+        return self.post(step="store", store_name=name, default_currency=default_currency)
 
 
 @dataclass
@@ -174,6 +174,7 @@ def run_setup_wizard(
     mint_url: str,
     mint_unit: str = "sat",
     backup_mint_url: str,
+    default_currency: str = "sat",
 ) -> SetupResult:
     """Walk the standalone onboarding wizard end-to-end."""
     s = requests.Session()
@@ -205,8 +206,13 @@ def run_setup_wizard(
     )
     _assert_step_ok(r, "password")
 
-    # store: name only
-    r = s.post(setup, data={"step": "store", "store_name": store_name}, timeout=10, allow_redirects=False)
+    # store: name + default display/quote currency
+    r = s.post(
+        setup,
+        data={"step": "store", "store_name": store_name, "default_currency": default_currency},
+        timeout=10,
+        allow_redirects=False,
+    )
     _assert_step_ok(r, "store")
 
     # onchain: skip, so callers needn't supply an xpub. This also drops the
