@@ -47,7 +47,7 @@ function cashupay_admin_notice(): void {
 
     if (!Database::isInitialized() || !Config::isSetupComplete()) {
         echo '<div class="notice notice-info"><p>';
-        echo '<strong>BareBits</strong> is almost ready — finish setup to start accepting Lightning payments via Cashu. ';
+        echo '<strong>BareBits</strong> is almost ready — finish setup to start accepting Lightning payments via Bitcoin. ';
         echo '<a class="button button-primary" href="' . esc_url(Urls::setup()) . '">Configure BareBits</a>';
         echo '</p></div>';
     }

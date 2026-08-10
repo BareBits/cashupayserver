@@ -23,6 +23,7 @@ the foreign plugin actually installed and talking to us.
 """
 from __future__ import annotations
 
+import json
 import time
 
 import pytest
@@ -160,6 +161,57 @@ def _order_field(wp: WordPressHandle, order_id: int, method: str) -> str:
     """Read a single field off a WooCommerce order via wp-cli."""
     snippet = f"$o = wc_get_order({order_id}); echo $o ? (string)$o->{method} : 'NO_ORDER';"
     return wp.wp_cli("eval", snippet).stdout.strip().splitlines()[-1].strip()
+
+
+def _ensure_integration(wp: WordPressHandle, store_id: str, api_key: str) -> dict:
+    """Drive the one entry point the setup wizard's completion screen now calls
+    in WordPress mode: install-if-needed + configure + enable, all unattended.
+    Returns the function's status plus the resulting gateway-enabled flag and the
+    BTCPay URL the plugin ended up pointed at."""
+    snippet = f"""
+require_once CASHUPAY_PLUGIN_DIR . '/btcpay-integration.php';
+$res = cashupay_ensure_woocommerce_integration({store_id!r}, {api_key!r});
+$gw = get_option('woocommerce_{GATEWAY_ID}_settings', []);
+echo json_encode([
+    'res' => $res,
+    'enabled' => $gw['enabled'] ?? null,
+    'url' => get_option('btcpay_gf_url', ''),
+]);
+"""
+    out = wp.wp_cli("eval", snippet).stdout.strip().splitlines()[-1]
+    return json.loads(out)
+
+
+def test_completion_screen_autowires_and_enables_gateway(woocommerce) -> None:
+    """The completion screen (WordPress mode) wires WooCommerce up with no manual
+    steps: it points the BTCPay gateway at BareBits, registers the webhook, and —
+    the piece that used to be a manual click — flips the gateway to enabled so it
+    shows at checkout. The gateway plugin is already active in this fixture, so
+    nothing should report as auto-installed."""
+    wp, _info = woocommerce
+    _flush_rewrites(wp)
+    store_id, api_key = _seed_store(wp, "https://mint.example")
+
+    data = _ensure_integration(wp, store_id, api_key)
+    assert data["res"]["status"] == "ready", data
+    assert data["res"]["auto_installed"] is False, "an already-active plugin must not report as auto-installed"
+    assert data["enabled"] == "yes", "the BTCPay gateway must be enabled at checkout"
+    assert data["url"].endswith("/cashupay"), data["url"]
+
+
+def test_completion_screen_never_clobbers_a_real_btcpay_server(woocommerce) -> None:
+    """If a merchant already points the BTCPay plugin at a real BTCPay Server, the
+    completion screen must refuse to overwrite it rather than silently hijack
+    their payments."""
+    wp, _info = woocommerce
+    store_id, api_key = _seed_store(wp, "https://mint.example")
+
+    real = "https://btcpay.example.com"
+    wp.wp_cli("eval", f"update_option('btcpay_gf_url', {real!r});")
+
+    data = _ensure_integration(wp, store_id, api_key)
+    assert data["res"]["status"] == "existing_btcpay", data
+    assert data["url"] == real, "the real BTCPay URL must be left untouched"
 
 
 def test_woocommerce_stack_installs(woocommerce) -> None:

@@ -54,6 +54,7 @@ def _walk_to_store(page, payserver: PayserverHandle) -> None:
     page.goto(f"{payserver.url}/setup")
     page.check("#terms_legal")
     page.check("#terms_warranty")
+    page.check("#terms_fee")
     page.click("button[type=submit]")
     page.check("#security_acknowledged")
     page.click("button[type=submit]")
@@ -262,7 +263,7 @@ def test_add_store_with_mints_shows_the_generated_seed_once(
     page.fill("#backup_mint_url_manual", backup_mint.url)
     page.click("#mints-continue-btn")
 
-    page.wait_for_selector("h2:has-text('Store created')")
+    page.wait_for_selector("h2:has-text('Your store is ready!')")
     shown = page.locator(".seed-display").inner_text().split()
     assert len(shown) == 12, f"expected a 12-word phrase, got {len(shown)}"
 

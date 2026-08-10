@@ -234,28 +234,42 @@ def test_unknown_step_restarts_rather_than_rendering_blank(payserver: PayserverH
     w = Wizard(payserver)
     for stale in ("4", "", "bogus"):
         body = w.get(stale)
-        assert _heading(body) == "Terms of service", f"step={stale!r} should restart the wizard"
+        assert _heading(body) == "Let's agree on a few things", f"step={stale!r} should restart the wizard"
 
 
-def test_terms_gate_requires_both_checkboxes(payserver: PayserverHandle) -> None:
+def test_terms_gate_requires_all_three_checkboxes(payserver: PayserverHandle) -> None:
     """The terms-of-service gate opens every first run and only advances when
-    both the legal-use and the as-is/no-warranty boxes are ticked."""
+    all three boxes are ticked: legal-use, as-is/no-warranty, and the
+    incoming-payment fee acknowledgement."""
     w = Wizard(payserver)
 
     # The wizard lands on the terms gate before anything else.
     landing = w.get("")
-    assert _heading(landing) == "Terms of service", _heading(landing)
+    assert _heading(landing) == "Let's agree on a few things", _heading(landing)
     assert "github.com/BareBits/cashupayserver/blob/main/LICENSE.md" in landing, (
         "the license must link to the LICENSE file on GitHub"
     )
+    # The mandatory fee acknowledgement shows the configured dev fee (1%).
+    assert "1% fee is assessed on all incoming payments" in landing, (
+        "the fee acknowledgement must state the incoming-payment fee"
+    )
 
-    # Neither box, then each box alone: all rejected, none advances.
-    for data in ({}, {"terms_legal": "1"}, {"terms_warranty": "1"}):
+    # No box, then any two of the three alone: all rejected, none advances.
+    partial = (
+        {},
+        {"terms_legal": "1"},
+        {"terms_warranty": "1"},
+        {"terms_fee": "1"},
+        {"terms_legal": "1", "terms_warranty": "1"},
+        {"terms_legal": "1", "terms_fee": "1"},
+        {"terms_warranty": "1", "terms_fee": "1"},
+    )
+    for data in partial:
         body = w.post(step="terms", **data)
-        assert "accept both terms" in (_error(body) or ""), _error(body)
-        assert _heading(body) == "Terms of service", "a partial acceptance must not advance"
+        assert "accept all three terms" in (_error(body) or ""), _error(body)
+        assert _heading(body) == "Let's agree on a few things", "a partial acceptance must not advance"
 
-    # Both boxes ticked advances to the safety check.
-    body = w.post(step="terms", terms_legal="1", terms_warranty="1")
+    # All three ticked advances to the safety check.
+    body = w.post(step="terms", terms_legal="1", terms_warranty="1", terms_fee="1")
     assert _error(body) is None, _error(body)
     assert _heading(body) == "Quick safety check", _heading(body)

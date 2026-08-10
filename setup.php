@@ -191,8 +191,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     try {
         switch ($step) {
             case 'terms':
-                if (empty($_POST['terms_legal']) || empty($_POST['terms_warranty'])) {
-                    throw new Exception('Please accept both terms to continue.');
+                if (empty($_POST['terms_legal']) || empty($_POST['terms_warranty']) || empty($_POST['terms_fee'])) {
+                    throw new Exception('Please accept all three terms to continue.');
                 }
                 $step = SetupFlow::nextStep('terms', $flowSteps) ?? 'security';
                 break;
@@ -1049,6 +1049,17 @@ function getDataDirHttpPath(): ?string {
             to { transform: rotate(360deg); }
         }
 
+        /* Small inline spinner for the mint auto-pick status row */
+        .spinner-inline {
+            width: 18px;
+            height: 18px;
+            border: 3px solid rgba(255, 255, 255, 0.2);
+            border-top-color: #f7931a;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            flex-shrink: 0;
+        }
+
         /* Code blocks with proper overflow handling */
         pre {
             overflow-x: auto;
@@ -1097,10 +1108,19 @@ function getDataDirHttpPath(): ?string {
 
             <?php if ($step === 'terms'): ?>
                 <!-- Screen: terms of service acknowledgement (first-run gate) -->
-                <h2 style="margin-bottom: 1rem;">Terms of service</h2>
+                <?php
+                // Rate shown on the fee acknowledgement below. This is the
+                // BareBits development fee only (CASHUPAY_DEV_FEE_PERCENT);
+                // trailing zeros are trimmed so "1" renders as "1%" and a
+                // fractional rate like 1.5 renders as "1.5%".
+                $devFeeDisplay = rtrim(rtrim(number_format((float) CASHUPAY_DEV_FEE_PERCENT, 2), '0'), '.');
+                ?>
+                <h2 style="margin-bottom: 1rem;">🤝 Let's agree on a few things</h2>
+                <p style="margin-bottom: 0.75rem;">
+                    Almost ready to roll! First, a quick read-through. 👀
+                </p>
                 <p style="margin-bottom: 1.5rem;">
-                    Before we set up BareBits, please read and accept the terms
-                    below. Both boxes must be checked to continue.
+                    Tick all three boxes and we'll get you set up.
                 </p>
 
                 <form method="post">
@@ -1109,32 +1129,39 @@ function getDataDirHttpPath(): ?string {
                     <div class="checkbox-group" style="margin: 1.5rem 0;">
                         <input type="checkbox" id="terms_legal" name="terms_legal" required>
                         <label for="terms_legal">
-                            I agree not to use this software for any illegal
-                            purposes and agree to the terms of the
-                            <a href="https://github.com/BareBits/cashupayserver/blob/main/LICENSE.md" target="_blank" rel="noopener" style="color: #63b3ed;">license</a>
-                            provided with the software.
+                            I promise not to use this software for anything
+                            illegal, and I'm good with the terms of the
+                            <a href="https://github.com/BareBits/cashupayserver/blob/main/LICENSE.md" target="_blank" rel="noopener" style="color: #63b3ed;">license</a>.
                         </label>
                     </div>
 
                     <div class="checkbox-group" style="margin: 1.5rem 0;">
                         <input type="checkbox" id="terms_warranty" name="terms_warranty" required>
                         <label for="terms_warranty">
-                            I understand this software is provided as-is without
-                            any warranty and the developers are not responsible
-                            for any lost funds.
+                            I get that this software comes as-is — no warranty —
+                            and the developers can't be blamed for any lost funds.
                         </label>
                     </div>
 
-                    <button type="submit" class="btn" style="width: 100%;">Continue</button>
+                    <div class="checkbox-group" style="margin: 1.5rem 0;">
+                        <input type="checkbox" id="terms_fee" name="terms_fee" required>
+                        <label for="terms_fee">
+                            I understand that a <?= htmlspecialchars($devFeeDisplay) ?>% fee is assessed on all incoming payments.
+                        </label>
+                    </div>
+
+                    <button type="submit" class="btn" style="width: 100%;">Continue →</button>
                 </form>
 
             <?php elseif ($step === 'security'): ?>
                 <!-- Screen: security check (requirements + DB exposure + URL mode) -->
-                <h2 style="margin-bottom: 1rem;">Quick safety check</h2>
+                <h2 style="margin-bottom: 1rem;">🔒 Quick safety check</h2>
+                <p style="margin-bottom: 0.75rem;">
+                    Your payment database lives in a folder on this server. 📁
+                </p>
                 <p style="margin-bottom: 1.5rem;">
-                    Your payment database lives in a folder on this server.
-                    Before we go any further, let's make sure the web can't read
-                    it. We ran the checks below &mdash; everything should say OK.
+                    Before we go further, let's make sure the web can't peek at
+                    it. We ran the checks below &mdash; everything should say OK. ✅
                 </p>
 
                 <?php
@@ -1168,10 +1195,12 @@ function getDataDirHttpPath(): ?string {
                     </div>
                 <?php else: ?>
                     <!-- Security Check Section -->
-                    <h3 style="margin-bottom: 0.75rem;">Protecting Your Database</h3>
+                    <h3 style="margin-bottom: 0.75rem;">🛡️ Protecting your database</h3>
                     <p style="margin-bottom: 1rem; color: #a0aec0; font-size: 0.9rem;">
-                        Your database stores ecash tokens with real monetary value. It's critical this file
-                        cannot be downloaded via the web. If in doubt, verify manually or ask someone.
+                        This file holds ecash with real monetary value, so it must never be downloadable over the web.
+                    </p>
+                    <p style="margin-bottom: 1rem; color: #a0aec0; font-size: 0.9rem;">
+                        Not sure? Verify it manually, or ask someone you trust.
                     </p>
 
                     <?php
@@ -1506,11 +1535,14 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
 
             <?php elseif ($step === 'password'): ?>
                 <!-- Screen: admin password -->
-                <h2 style="margin-bottom: 1rem;">Create your admin password</h2>
-                <p style="margin-bottom: 1.5rem;">
+                <h2 style="margin-bottom: 1rem;">🔑 Create your admin password</h2>
+                <p style="margin-bottom: 0.75rem;">
                     This is the password you'll use to sign in to your BareBits
-                    dashboard. Pick something long &mdash; you'll only type it
-                    occasionally.
+                    dashboard. 🖥️
+                </p>
+                <p style="margin-bottom: 1.5rem;">
+                    Pick something long and memorable &mdash; you'll only type it
+                    now and then.
                 </p>
 
                 <form method="post">
@@ -1532,9 +1564,9 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                         <input type="email" id="admin_email" name="admin_email"
                                placeholder="you@example.com">
                         <p class="help-text">
-                            Optional. If you add an email, we can send you a
-                            password reset link. You can also reset from the
-                            server without one.
+                            Optional, but handy! Add an email and we can send you
+                            a password-reset link. No email? No problem &mdash;
+                            you can also reset it right from the server.
                         </p>
                     </div>
 
@@ -1543,18 +1575,20 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
 
             <?php elseif ($step === 'store'): ?>
                 <!-- Screen: store name -->
-                <h2 style="margin-bottom: 1rem;">Name your store</h2>
+                <h2 style="margin-bottom: 1rem;">🏪 Let's name your store</h2>
                 <?php if ($mode !== 'add_store'): ?>
+                <p style="margin-bottom: 0.75rem;">
+                    Welcome aboard! 🎉 Just a few quick questions and you'll be
+                    up and running.
+                </p>
                 <p style="margin-bottom: 1rem;">
-                    Welcome to BareBits! We will ask some questions to get you
-                    setup, you can customize all these options and much more in
-                    your store settings.
+                    Nothing's set in stone &mdash; you can tweak all of it later
+                    in your store settings.
                 </p>
                 <?php endif; ?>
                 <p style="margin-bottom: 1.5rem; color: #a0aec0; font-size: 0.9rem;">
-                    Next, we'll configure your off-server wallets to send funds
-                    to, keep in mind you can use more than one wallet depending
-                    on your needs.
+                    Up next, we'll hook up the off-server wallets your funds go
+                    to. Feel free to use as many as you need.
                 </p>
 
                 <form method="post">
@@ -1592,17 +1626,20 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                 $ocSavedMode = ($ocStore['onchain_address_mode'] ?? 'xpub') === 'static' ? 'static' : 'xpub';
                 $ocSavedNetwork = (string)($ocStore['onchain_network'] ?? 'mainnet');
                 ?>
-                <h2 style="margin-bottom: 1rem;">On-chain Bitcoin payments</h2>
+                <h2 style="margin-bottom: 1rem;">⛓️ On-chain Bitcoin payments</h2>
+                <p style="margin-bottom: 0.75rem;">
+                    On-chain payments from your customers always land straight
+                    in your off-server wallet. 👛
+                </p>
+                <p style="margin-bottom: 0.75rem;">
+                    We <strong>strongly</strong> recommend using an xpub
+                    (extended public key), though plain bare addresses work too.
+                </p>
                 <p style="margin-bottom: 1.25rem;">
-                    On-chain payments from your customers always go directly
-                    into your off-server wallet. We <strong>strongly</strong>
-                    suggest using an xpub address (extended public key), but
-                    regular bare addresses work as well. An xpub enables
-                    BareBits to generate a unique payment address for each
-                    invoice. Without an xpub, we will use the same address for
-                    all invoices, which may lead to issues if you have multiple
-                    invoices being paid at once or a customer who tries to pay
-                    in multiple payments.
+                    An xpub lets BareBits create a fresh payment address for
+                    every invoice. Without one, all invoices share a single
+                    address &mdash; which can cause trouble if several are paid
+                    at once, or a customer pays in multiple parts.
                 </p>
 
                 <form id="onchain-form" method="POST" action="<?= htmlspecialchars(Urls::setup()) ?>">
@@ -1831,14 +1868,19 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
 
             <?php elseif ($step === 'zeroconf'): ?>
                 <!-- Screen: zero-conf vs one-confirmation -->
-                <h2 style="margin-bottom: 1rem;">Zero-conf payments</h2>
+                <h2 style="margin-bottom: 1rem;">⚡ Zero-conf payments</h2>
+                <p style="margin-bottom: 0.75rem;">
+                    Want to enable zero-conf on-chain transactions? 🤔
+                </p>
+                <p style="margin-bottom: 0.75rem;">
+                    With it on, invoices are marked paid instantly instead of
+                    waiting for an on-chain confirmation (seconds to minutes,
+                    depending on fees).
+                </p>
                 <p style="margin-bottom: 1.5rem;">
-                    Enable zero-conf on-chain transactions? This means invoices
-                    get marked as paid instantly instead of waiting for an
-                    on-chain confirmation (seconds to minutes depending on fees
-                    paid). Your customer may use this to try to cheat you. For
-                    most merchants, the extra speed is worth the small risk that
-                    a payment never gets confirmed.
+                    There's a small catch: a customer could try to game it. For
+                    most merchants, though, the extra speed is well worth that
+                    tiny risk.
                 </p>
 
                 <form method="POST" action="<?= htmlspecialchars(Urls::setup()) ?>">
@@ -1867,10 +1909,13 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                     }
                 }
                 ?>
-                <h2 style="margin-bottom: 1rem;">Lightning payments</h2>
+                <h2 style="margin-bottom: 1rem;">⚡ Lightning payments</h2>
+                <p style="margin-bottom: 0.75rem;">
+                    Lightning is the fast, low-fee way to get paid &mdash; quick
+                    for your customers, cheap for you. 🚀
+                </p>
                 <p style="margin-bottom: 1.25rem;">
-                    Lightning payments are faster and cheaper, we strongly
-                    suggest enabling them.
+                    We'd really suggest turning it on!
                 </p>
 
                 <form method="POST" action="<?= htmlspecialchars(Urls::setup()) ?>">
@@ -1941,15 +1986,19 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
 
             <?php elseif ($step === 'swaps'): ?>
                 <!-- Screen: submarine swaps -->
-                <h2 style="margin-bottom: 1rem;">Submarine swaps</h2>
+                <h2 style="margin-bottom: 1rem;">🌊 Submarine swaps</h2>
+                <p style="margin-bottom: 0.75rem;">
+                    Want submarine swaps on? We'd recommend it! 👍
+                </p>
+                <p style="margin-bottom: 0.75rem;">
+                    Think of them as a safety net for when Lightning can't get
+                    through &mdash; maybe your Lightning provider is down, or your
+                    Electrum wallet is offline or short on liquidity.
+                </p>
                 <p style="margin-bottom: 1.5rem;">
-                    Enable submarine swaps? We suggest using them. Submarine
-                    swaps are used if lightning payments can't be delivered. For
-                    example: your lightning address provider is down, you are
-                    using Electrum but have no available liquidity/your wallet
-                    is offline. With a submarine swap, your customer pays in
-                    lightning + a small fee for the swap (around 1%), and you
-                    receive the payment on-chain.
+                    When that happens, your customer pays via Lightning plus a
+                    small swap fee (about 1%), and the money lands in your
+                    on-chain wallet.
                 </p>
 
                 <?php if (!$renderOnchain['hasXpub']): ?>
@@ -1975,19 +2024,24 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
 
             <?php elseif ($step === 'mints'): ?>
                 <!-- Screen: Cashu mints (auto-picked main + backup, or manual) -->
-                <h2 style="margin-bottom: 1rem;">Cashu mints</h2>
+                <h2 style="margin-bottom: 1rem;">🪙 Cashu mints</h2>
+                <p style="margin-bottom: 0.75rem;">
+                    Want to switch on a Cashu mint? We'd suggest it. 👍
+                </p>
+                <p style="margin-bottom: 0.75rem;">
+                    Think of it as the last fallback for Lightning &mdash; it
+                    only steps in when you've got no working LNURL/noffer AND a
+                    submarine swap won't work (like tiny payments, since swap
+                    providers rarely go under ~$10).
+                </p>
+                <p style="margin-bottom: 0.75rem;">
+                    Any funds that land in your mint get swept to your on-chain
+                    wallet automatically, as soon as the fees make sense.
+                </p>
                 <p style="margin-bottom: 1.5rem;">
-                    Enable Cashu Mints? We suggest enabling a cashu mint, it
-                    will be used as a fallback for accepting lightning payments
-                    ONLY when you have no working lnurl/noffer AND submarine
-                    swaps are not workable. This might happen if the payment is
-                    small (submarine swap providers generally won't allow swaps
-                    under around $10). Funds from your cashu mint will be
-                    automatically swept into your on-chain wallet when
-                    economically rational (fees are not too high). Remember that
-                    mints are custodial: they could go offline and take your
-                    funds with them, which is why we sweep funds out of them at
-                    the first available opportunity.
+                    ⚠️ One thing to know: mints are custodial &mdash; they could
+                    vanish with your funds, so we move your money out the moment
+                    we can.
                 </p>
 
                 <form method="POST" action="<?= htmlspecialchars(Urls::setup()) ?>" id="mints-form">
@@ -2000,8 +2054,9 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                         <input type="hidden" name="mode" value="add_store">
                     <?php endif; ?>
 
-                    <div id="mint-autopick-status" style="background: rgba(0,0,0,0.2); padding: 1rem; border-radius: 8px; margin-bottom: 1rem; font-size: 0.9rem; color: #a0aec0;">
-                        Finding well-reviewed mints&hellip;
+                    <div id="mint-autopick-status" style="background: rgba(0,0,0,0.2); padding: 1rem; border-radius: 8px; margin-bottom: 1rem; font-size: 0.9rem; color: #a0aec0; display: flex; align-items: center; gap: 0.75rem;">
+                        <span class="spinner-inline"></span>
+                        <span>🔍 Searching for well-reviewed mints&hellip; please wait.</span>
                     </div>
 
                     <div id="mint-autopick-result" style="display: none; margin-bottom: 1rem;">
@@ -2071,20 +2126,24 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                 $adminReturn = Urls::admin()
                     . ($createdStoreId ? '?store_created=' . urlencode($createdStoreId) : '');
                 ?>
-                <h2 style="margin-bottom: 1rem;">Store created</h2>
+                <h2 style="margin-bottom: 1rem;">🎉 Your store is ready!</h2>
 
                 <div class="success">
-                    <?= htmlspecialchars($createdStore['name'] ?? 'Your store') ?> is ready.
+                    <?= htmlspecialchars($createdStore['name'] ?? 'Your store') ?> is all set up and good to go. 🙌
                 </div>
 
                 <?php if ($generatedSeed): ?>
                 <div class="warning" style="margin-bottom: 1rem;">
-                    <strong>Save your recovery phrase</strong>
+                    <strong>🔐 Jot down your recovery phrase</strong>
                     <p style="margin: 0.5rem 0 0; font-size: 0.9rem;">
-                        These 12 words can recover any ecash held at this store's
-                        mints if this server is lost. Write them down somewhere
-                        safe and offline &mdash; we can show them again in store
-                        settings, but anyone who has them can spend your funds.
+                        These 12 little words are your lifeline &mdash; they
+                        recover any ecash at this store's mints if the server ever
+                        disappears.
+                    </p>
+                    <p style="margin: 0.5rem 0 0; font-size: 0.9rem;">
+                        Write them somewhere safe and offline. You can peek at
+                        them again in store settings, but remember: whoever has
+                        them can spend your funds.
                     </p>
                 </div>
                 <div class="seed-display"><?= htmlspecialchars($generatedSeed) ?></div>
@@ -2110,12 +2169,12 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                 $cronLine = '* * * * * curl -fsS -H \'X-CRON-KEY: ' . $cronKey . '\' '
                     . Urls::cron() . ' > /dev/null';
                 ?>
-                <h2 style="margin-bottom: 1rem;">Enable cron</h2>
+                <h2 style="margin-bottom: 1rem;">⏰ Enable cron</h2>
                 <p style="margin-bottom: 1.25rem;">
-                    Important: we strongly suggest enabling cron. Without cron,
-                    certain operations like sweeping funds from a mint will only
-                    occur when the site is visited instead of regularly in the
-                    background.
+                    Important: we strongly recommend enabling cron. ✅ Without it,
+                    background jobs &mdash; like sweeping funds out of a mint
+                    &mdash; only run when someone visits your site, instead of
+                    regularly on their own.
                 </p>
 
                 <p style="margin-bottom: 0.5rem; font-size: 0.9rem; color: #a0aec0;">
@@ -2130,10 +2189,10 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
 
             <?php elseif ($step === 'done'): ?>
                 <!-- Screen: complete -->
-                <h2 style="margin-bottom: 1rem;">You're all set!</h2>
+                <h2 style="margin-bottom: 1rem;">🎉 You're all set!</h2>
 
                 <div class="success">
-                    BareBits is ready to accept payments.
+                    BareBits is ready to accept payments. ✅
                 </div>
 
                 <?php
@@ -2158,9 +2217,9 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                 ?>
                 <?php if ($doneKnowsStore && !$doneHasAnyRail): ?>
                 <div class="warning" style="margin-bottom: 1.5rem;">
-                    <strong>No payment method is set up yet.</strong>
+                    <strong>⚠️ No payment method yet</strong>
                     <p style="margin-top: 0.5rem; font-size: 0.9rem;">
-                        Your store can't take payments yet. Add an on-chain
+                        Your store can't take payments just yet. Add an on-chain
                         wallet, a Lightning address, or a Cashu mint in store
                         settings.
                     </p>
@@ -2169,12 +2228,15 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
 
                 <?php if ($generatedSeed): ?>
                 <div class="warning" style="margin-bottom: 1rem;">
-                    <strong>Save your recovery phrase</strong>
+                    <strong>🔐 Save your recovery phrase</strong>
                     <p style="margin: 0.5rem 0 0; font-size: 0.9rem;">
                         These 12 words can recover any ecash held at your mints
-                        if this server is lost. Write them down somewhere safe
-                        and offline &mdash; we can show them again in store settings,
-                        but anyone who has them can spend your funds.
+                        if this server is ever lost.
+                    </p>
+                    <p style="margin: 0.5rem 0 0; font-size: 0.9rem;">
+                        Write them down somewhere safe and offline &mdash; we can
+                        show them again in store settings, but anyone who has them
+                        can spend your funds.
                     </p>
                 </div>
                 <div class="seed-display"><?= htmlspecialchars($generatedSeed) ?></div>
@@ -2186,11 +2248,14 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                 ?>
 
                 <?php if (Urls::isWordPress()): ?>
-                <!-- WooCommerce BTCPay Integration (WordPress mode) - shown first in WP mode -->
+                <!-- WooCommerce integration (WordPress mode).
+                     Run from the plugin, BareBits owns the whole WooCommerce
+                     hookup: we install the BTCPay gateway plugin if needed,
+                     point it at our Greenfield API, register the webhook and
+                     enable the gateway at checkout — no manual steps. The
+                     "server URL / connect your e-commerce" sections below are
+                     therefore hidden in WordPress mode. -->
                 <?php
-                if (!function_exists('is_plugin_active')) {
-                    require_once ABSPATH . 'wp-admin/includes/plugin.php';
-                }
                 // The helper's location depends on how the plugin was
                 // assembled: build-wordpress-plugin.sh keeps wordpress/ as a
                 // subdirectory, while docker/Dockerfile.wordpress flattens
@@ -2216,81 +2281,95 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                     error_log('CashuPayServer: btcpay-integration.php not found; '
                         . 'skipping the WooCommerce section of the setup completion screen.');
                 }
-                $btcpayPluginActive = $btcpayHelper !== null
-                    && is_plugin_active('btcpay-greenfield-for-woocommerce/btcpay-greenfield-for-woocommerce.php');
+
                 $storeId = $_SESSION['setup_store_id'] ?? null;
-                $wooConfigured = false;
+                $wooStatus = null;
+                $wooReady = false;
 
-                if ($btcpayPluginActive && $storeId) {
-                    // Get or create an API key for WooCommerce
+                if ($btcpayHelper !== null && $storeId) {
                     $apiKey = Auth::getOrCreateInternalApiKey($storeId);
-                    $configResult = null;
-
-                    if (isset($_POST['configure_woocommerce']) && $apiKey) {
-                        $configResult = cashupay_configure_btcpay_plugin($storeId, $apiKey);
-                        $wooConfigured = $configResult['success'] ?? false;
+                    if ($apiKey) {
+                        // Idempotent: installs/activates the gateway plugin if
+                        // needed, then configures + enables it. Safe to re-run
+                        // on refresh.
+                        $wooStatus = cashupay_ensure_woocommerce_integration($storeId, $apiKey);
+                        $wooReady = ($wooStatus['status'] ?? '') === 'ready';
                     }
                 }
                 ?>
-                <div style="background: rgba(0,0,0,0.2); padding: 1.5rem; border-radius: 8px; margin-bottom: 1.5rem;">
-                    <h3 style="margin-bottom: 0.75rem;">WooCommerce Integration</h3>
 
-                    <?php if (!$btcpayPluginActive): ?>
+                <?php if ($wooReady): ?>
+                    <div class="success" style="margin-bottom: 1rem;">
+                        ✅ WooCommerce is wired up — BareBits is set as a payment method and enabled at checkout.
+                    </div>
+                    <?php if (!empty($wooStatus['auto_installed'])): ?>
+                    <div class="warning" style="margin-bottom: 1.5rem;">
+                        <strong>ℹ️ We installed a plugin for you</strong>
+                        <p style="margin: 0.5rem 0 0; font-size: 0.9rem;">
+                            The <strong>BTCPay Server</strong> plugin has been
+                            automatically installed &mdash; this is what lets
+                            WooCommerce talk to the BareBits plugin. So if you see
+                            a new plugin in your plugin list, that's why. Keep it
+                            enabled! 🙏
+                        </p>
+                    </div>
+                    <?php endif; ?>
+                <?php elseif ($wooStatus !== null && $wooStatus['status'] === 'existing_btcpay'): ?>
+                    <div style="background: rgba(0,0,0,0.2); padding: 1.5rem; border-radius: 8px; margin-bottom: 1.5rem;">
+                        <h3 style="margin-bottom: 0.75rem;">WooCommerce Integration</h3>
+                        <div class="warning">
+                            <strong>Existing BTCPay Server detected:</strong>
+                            <code style="display: block; margin-top: 0.5rem; word-break: break-all;"><?= htmlspecialchars($wooStatus['current_url'] ?? '') ?></code>
+                        </div>
+                        <p style="color: #a0aec0; font-size: 0.9rem; margin: 0.75rem 0;">
+                            A real BTCPay Server is already connected. To use BareBits instead, disconnect it first via WooCommerce settings, then reload this page.
+                        </p>
+                        <div class="btn-group">
+                            <a href="<?= admin_url('admin.php?page=wc-settings&tab=checkout&section=btcpay_greenfield') ?>" class="btn btn-secondary" style="text-align: center;">Go to BTCPay Settings</a>
+                            <a href="<?= admin_url('admin.php?page=cashupay') ?>" class="btn" style="text-align: center;">Skip</a>
+                        </div>
+                    </div>
+                <?php elseif ($wooStatus !== null && $wooStatus['status'] === 'needs_woocommerce'): ?>
+                    <div style="background: rgba(0,0,0,0.2); padding: 1.5rem; border-radius: 8px; margin-bottom: 1.5rem;">
+                        <h3 style="margin-bottom: 0.75rem;">WooCommerce Integration</h3>
+                        <p style="color: #a0aec0; font-size: 0.9rem; margin-bottom: 1rem;">
+                            WooCommerce isn't active yet. Install and activate WooCommerce, then reload this page and BareBits will finish wiring up payments for you.
+                        </p>
+                        <a href="<?= admin_url('plugin-install.php?s=woocommerce&tab=search&type=term') ?>" class="btn btn-secondary" style="display: inline-block;">
+                            Install WooCommerce
+                        </a>
+                    </div>
+                <?php elseif ($wooStatus !== null && $wooStatus['status'] === 'needs_plugin'): ?>
+                    <div style="background: rgba(0,0,0,0.2); padding: 1.5rem; border-radius: 8px; margin-bottom: 1.5rem;">
+                        <h3 style="margin-bottom: 0.75rem;">WooCommerce Integration</h3>
                         <p style="color: #a0aec0; font-size: 0.9rem; margin-bottom: 0.75rem;">
-                            To accept payments in WooCommerce, install the
-                            <strong>"BTCPay Server for WooCommerce"</strong> plugin:
+                            BareBits needs the <strong>"BTCPay Server for WooCommerce"</strong> plugin to take payments in WooCommerce. We couldn't install it automatically on this host, so please add it by hand:
                         </p>
                         <ol style="color: #a0aec0; font-size: 0.9rem; margin: 0 0 1rem 1.25rem; padding: 0;">
                             <li>Go to Plugins &rarr; Add New in WordPress</li>
                             <li>Search for "BTCPay Server for WooCommerce"</li>
                             <li>Install and activate the plugin</li>
-                            <li>Return here to auto-configure it</li>
+                            <li>Reload this page &mdash; BareBits will finish the setup automatically</li>
                         </ol>
                         <a href="<?= admin_url('plugin-install.php?s=btcpay+greenfield+woocommerce&tab=search&type=term') ?>" class="btn btn-secondary" style="display: inline-block;">
                             Install BTCPay Plugin
                         </a>
-                    <?php elseif ($wooConfigured): ?>
-                        <div class="success">
-                            WooCommerce has been configured to use CashuPay for payments.
-                        </div>
-                    <?php elseif (isset($configResult) && !$configResult['success']): ?>
+                    </div>
+                <?php elseif ($wooStatus !== null && $wooStatus['status'] === 'error'): ?>
+                    <div style="background: rgba(0,0,0,0.2); padding: 1.5rem; border-radius: 8px; margin-bottom: 1.5rem;">
+                        <h3 style="margin-bottom: 0.75rem;">WooCommerce Integration</h3>
                         <div class="warning">
-                            <strong>Cannot auto-configure:</strong>
-                            <?= htmlspecialchars($configResult['message']) ?>
+                            <strong>Couldn't finish automatic setup:</strong>
+                            <?= htmlspecialchars($wooStatus['message'] ?? '') ?>
                         </div>
-                        <p style="color: #a0aec0; font-size: 0.9rem; margin-top: 0.75rem;">
-                            Disconnect your existing BTCPay Server via WooCommerce &rarr; Settings &rarr; Payments &rarr; BTCPay, then return here.
-                        </p>
-                        <a href="<?= admin_url('admin.php?page=wc-settings&tab=checkout&section=btcpay_greenfield') ?>" class="btn btn-secondary" style="display: inline-block; margin-top: 0.5rem;">
+                        <a href="<?= admin_url('admin.php?page=wc-settings&tab=checkout&section=btcpay_greenfield') ?>" class="btn btn-secondary" style="display: inline-block; margin-top: 0.75rem;">
                             Go to BTCPay Settings
                         </a>
-                    <?php else: ?>
-                        <?php if (cashupay_is_real_btcpay_configured()): ?>
-                            <div class="warning">
-                                <strong>Existing BTCPay Server detected:</strong>
-                                <code style="display: block; margin-top: 0.5rem; word-break: break-all;"><?= htmlspecialchars(get_option('btcpay_gf_url', '')) ?></code>
-                            </div>
-                            <p style="color: #a0aec0; font-size: 0.9rem; margin: 0.75rem 0;">
-                                A real BTCPay Server is configured. To use CashuPay instead, disconnect it first via WooCommerce settings.
-                            </p>
-                            <div class="btn-group">
-                                <a href="<?= admin_url('admin.php?page=wc-settings&tab=checkout&section=btcpay_greenfield') ?>" class="btn btn-secondary" style="text-align: center;">Go to BTCPay Settings</a>
-                                <a href="<?= admin_url('admin.php?page=cashupay') ?>" class="btn" style="text-align: center;">Skip</a>
-                            </div>
-                        <?php else: ?>
-                            <p style="color: #a0aec0; font-size: 0.9rem; margin-bottom: 1rem;">
-                                The BTCPay WooCommerce plugin is active. Click below to auto-configure it to use CashuPay.
-                            </p>
-                            <form method="post">
-                                <input type="hidden" name="step" value="done">
-                                <input type="hidden" name="configure_woocommerce" value="1">
-                                <button type="submit" class="btn" style="width: 100%;">Configure WooCommerce</button>
-                            </form>
-                        <?php endif; ?>
-                    <?php endif; ?>
-                </div>
+                    </div>
+                <?php endif; ?>
                 <?php endif; ?>
 
+                <?php if (!Urls::isWordPress()): ?>
                 <!-- Server URL (already detected in Step 1) -->
                 <?php
                 $serverUrl = Urls::server();
@@ -2351,14 +2430,11 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                     <summary style="cursor: pointer; color: #a0aec0; font-size: 0.9rem;">URL Detection Details</summary>
                     <div style="margin-top: 0.75rem; padding: 0.75rem; background: rgba(0,0,0,0.2); border-radius: 8px; font-size: 0.85rem;">
                         <div style="font-family: monospace; color: #48bb78;">
-                            <?php if (Urls::isWordPress()): ?>
-                                wordpress: OK
-                            <?php else: ?>
-                                <?= $urlMode ?>: OK (detected in Step 1)
-                            <?php endif; ?>
+                            <?= $urlMode ?>: OK (detected in Step 1)
                         </div>
                     </div>
                 </details>
+                <?php endif; ?>
 
                 <a href="<?= Urls::isWordPress() ? admin_url('admin.php?page=cashupay') : Urls::admin() ?>" class="btn" style="width: 100%; text-align: center; display: block;">
                     Go to BareBits Admin
@@ -2370,9 +2446,11 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                 <?php endif; ?>
 
                 <?php
-                // Clear temporary session data
-                // In WordPress mode, keep session if WooCommerce still needs to be configured
-                if (!Urls::isWordPress() || (isset($wooConfigured) && $wooConfigured)) {
+                // Clear temporary session data. In WordPress mode, keep the
+                // session around if the WooCommerce hookup didn't complete (the
+                // merchant may need to install WooCommerce / the gateway plugin
+                // and reload to let the auto-wiring finish).
+                if (!Urls::isWordPress() || (isset($wooReady) && $wooReady)) {
                     unset($_SESSION['setup_store_id'], $_SESSION['setup_store_mode'], $_SESSION['setup_generated_seed']);
                 }
                 ?>

@@ -419,8 +419,8 @@ def test_completion_screen_warns_when_no_rail_was_configured(
     w = walk(payserver, Choices(onchain="skip", lightning="skip", swaps=False, mints=False))
     body = w.post(step="cron")
     assert wizard_heading(body).startswith("You"), wizard_heading(body)
-    assert "No payment method is set up yet" in body
-    assert "can't take payments yet" in body
+    assert "No payment method yet" in body
+    assert "can't take payments just yet" in body
 
 
 def test_completion_screen_is_clean_when_a_rail_exists(
@@ -505,7 +505,7 @@ def test_add_store_applies_the_same_rail_resolution(
                    mint_url=mint.url, backup_mint_url=backup_mint.url, mint_unit="sat")
     assert wizard_error(body) is None, wizard_error(body)
     # A seed was generated, so add_store stops on its hand-off panel to show it.
-    assert wizard_heading(body) == "Store created", wizard_heading(body)
+    assert wizard_heading(body) == "Your store is ready!", wizard_heading(body)
 
     conn = sqlite3.connect(payserver.data_dir / "cashupay.sqlite")
     conn.row_factory = sqlite3.Row

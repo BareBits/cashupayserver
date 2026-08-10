@@ -35,14 +35,14 @@ Database::update('stores', ['hosting_fee_percent' => 1.0], 'id = ?', [$store]);
 
 // Baseline owed.
 $o = DevFee::computeOwed($store);
-assert_eq(10000, $o['dev_owed'], 'baseline dev owed');
+assert_eq(5000, $o['dev_owed'], 'baseline dev owed');
 assert_eq(5000, $o['hosting_owed'], 'baseline hosting owed');
 
 // --- A pending intent suppresses re-pay (the crash-after-melt case) ---
-$devIntent = MeltLog::recordPendingIntent($store, 10000, 'fees@getbarebits.com', FEE_NOTE_DEV, 'qid-dev');
+$devIntent = MeltLog::recordPendingIntent($store, 5000, 'fees@getbarebits.com', FEE_NOTE_DEV, 'qid-dev');
 $o = DevFee::computeOwed($store);
 assert_eq(0, $o['dev_owed'], 'pending intent counts as paid -> dev not re-owed');
-assert_eq(10000, $o['dev_paid'], 'pending intent included in dev_paid');
+assert_eq(5000, $o['dev_paid'], 'pending intent included in dev_paid');
 
 // Confirm it is actually stored as pending with the quote id (what reconcile keys on).
 $row = Database::fetchOne("SELECT status, melt_quote_id, network_fee_sats, preimage FROM melts WHERE id = ?", [$devIntent]);

@@ -54,6 +54,7 @@ def test_setup_wizard_completes_in_browser(
     # terms: accept the first-run terms-of-service gate.
     page.check("#terms_legal")
     page.check("#terms_warranty")
+    page.check("#terms_fee")
     page.click("button[type=submit]")
 
     # security: acknowledge the database-exposure check.
@@ -139,6 +140,7 @@ def test_setup_wizard_without_onchain_skips_zeroconf(
     page.goto(f"{payserver.url}/setup")
     page.check("#terms_legal")
     page.check("#terms_warranty")
+    page.check("#terms_fee")
     page.click("button[type=submit]")
     page.check("#security_acknowledged")
     page.click("button[type=submit]")

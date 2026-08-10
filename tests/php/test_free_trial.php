@@ -44,7 +44,7 @@ paid_invoice_at($store, 100000, time() - 10);
 $o = DevFee::computeOwed($store);
 assert_eq(false, $o['trial_active'], 'trial_active false when no trial');
 assert_eq(500, $o['upstream_owed'], 'no trial → normal upstream accrual');
-assert_eq(2000, $o['dev_owed'], 'no trial → normal dev accrual');
+assert_eq(1000, $o['dev_owed'], 'no trial → normal dev accrual');
 
 // ----- 2. Active trial — date in the future -----
 $future = time() + 30 * 86400;
@@ -82,7 +82,7 @@ $o = DevFee::computeOwed($store);
 assert_eq(200000, $o['revenue'], 'post-trial revenue counted');
 assert_eq(false, $o['trial_active'], 'trial_active false after expiry');
 assert_eq(1000, $o['upstream_owed'], 'post-trial upstream = 0.5% of post-trial revenue');
-assert_eq(4000, $o['dev_owed'], 'post-trial dev = 2% of post-trial revenue (no upstream paid yet)');
+assert_eq(2000, $o['dev_owed'], 'post-trial dev = 1% of post-trial revenue (no upstream paid yet)');
 
 echo "test_free_trial[date-expiry]: ok\n";
 

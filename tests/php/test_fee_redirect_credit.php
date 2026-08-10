@@ -24,7 +24,7 @@ Database::insert('invoices', [
 ]);
 
 $before = DevFee::computeOwed($store);
-assert_eq(10000, $before['dev_owed'], 'dev owed 2% of 500k = 10000');
+assert_eq(5000, $before['dev_owed'], 'dev owed 1% of 500k = 5000');
 assert_eq(0, $before['dev_paid'], 'nothing paid yet');
 
 // A redirect invoice pointed at the dev fee, still New (not yet counted as
@@ -56,12 +56,12 @@ assert_eq(0, (int)$melts[0]['network_fee_sats'], 'redirect has no network fee');
 // computeOwed reflects it: the redirect invoice now counts as revenue (503000)
 // and dev_paid jumped by 3000.
 //   dev base = 503000 - 0 networkCost - 0 upstreamPaid = 503000
-//   dev gross = floor(503000 * 0.02) = 10060
-//   dev_owed  = 10060 - 3000 = 7060
+//   dev gross = floor(503000 * 0.01) = 5030
+//   dev_owed  = 5030 - 3000 = 2030
 $after = DevFee::computeOwed($store);
 assert_eq(3000, $after['dev_paid'], 'dev_paid credited by the redirect');
 assert_eq(503000, $after['revenue'], 'redirect invoice now counts as revenue');
-assert_eq(7060, $after['dev_owed'], 'dev owed dropped by the redirected amount (less its ~2% residual)');
+assert_eq(2030, $after['dev_owed'], 'dev owed dropped by the redirected amount (less its ~1% residual)');
 assert_true($after['dev_owed'] < $before['dev_owed'], 'owed strictly decreased');
 
 // Idempotency: a second settlement pass (dual-rail race / re-poll) must not
