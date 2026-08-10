@@ -138,29 +138,39 @@ $success = null;
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     // Handle AJAX action for on-chain xpub validation + preview.
     if (isset($_POST['action']) && $_POST['action'] === 'validate_xpub') {
-        require_once __DIR__ . '/includes/onchain/wallet.php';
         header('Content-Type: application/json');
-        $xpub = trim($_POST['xpub'] ?? '');
-        $network = $_POST['network'] ?? 'mainnet';
-        $type = $_POST['address_type'] ?? 'P2WPKH';
-        $check = OnchainWallet::validateXpub($xpub, $network, $type);
-        $preview = [];
-        if ($check['valid']) {
-            try {
+        // Catch Throwable, not Exception: a host missing the GMP extension
+        // throws Error from gmp_init(), and an uncaught one turns this JSON
+        // endpoint into an HTML fatal — which the wizard's JS could only
+        // report as "could not reach the server" while the server was fine.
+        try {
+            require_once __DIR__ . '/includes/onchain/wallet.php';
+            $xpub = trim($_POST['xpub'] ?? '');
+            $network = $_POST['network'] ?? 'mainnet';
+            $type = $_POST['address_type'] ?? 'P2WPKH';
+            $check = OnchainWallet::validateXpub($xpub, $network, $type);
+            $preview = [];
+            if ($check['valid']) {
                 $preview = OnchainWallet::deriveFirstN($xpub, $type, $network, 3);
-            } catch (Throwable $e) {
-                $check['valid'] = false;
-                $check['error'] = $e->getMessage();
             }
+            echo json_encode([
+                'valid' => $check['valid'],
+                'error' => $check['error'],
+                'warnings' => $check['warnings'],
+                'inferredType' => $check['inferredType'],
+                'inferredNetwork' => $check['inferredNetwork'],
+                'preview' => $preview,
+            ]);
+        } catch (Throwable $e) {
+            echo json_encode([
+                'valid' => false,
+                'error' => $e->getMessage(),
+                'warnings' => [],
+                'inferredType' => null,
+                'inferredNetwork' => null,
+                'preview' => [],
+            ]);
         }
-        echo json_encode([
-            'valid' => $check['valid'],
-            'error' => $check['error'],
-            'warnings' => $check['warnings'],
-            'inferredType' => $check['inferredType'],
-            'inferredNetwork' => $check['inferredNetwork'],
-            'preview' => $preview,
-        ]);
         exit;
     }
 
@@ -390,6 +400,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     // useful about the address type, so those default to
                     // P2WPKH and the operator confirms against the address
                     // preview, with a one-click switch to wrapped SegWit.
+                    // A host that can't run the xpub stack at all (no GMP)
+                    // must say so — the generic "couldn't read that" message
+                    // below would send the operator hunting for a paste typo
+                    // that isn't there.
+                    if (($envError = OnchainWallet::environmentError()) !== null) {
+                        throw new Exception($envError);
+                    }
                     $probe = OnchainWallet::validateXpub($xpub, 'mainnet', 'P2WPKH');
                     $inferredNetwork = $probe['inferredNetwork'];
                     $inferredType = $probe['inferredType'];
@@ -1212,6 +1229,24 @@ function getDataDirHttpPath(): ?string {
                         </ul>
                     </div>
                 <?php else: ?>
+                    <?php if (!function_exists('gmp_init')): ?>
+                        <!-- BCMath satisfies the hard requirement (Cashu falls
+                             back to it), but xpub derivation and swap signing
+                             run through libraries that only speak GMP. Flagged
+                             here, on the first screen with a requirements list,
+                             so a shared-host operator learns before investing
+                             time in the wizard — the affected steps repeat it.
+                             function_exists, not extension_loaded: hardened
+                             hosts sometimes disable the functions while the
+                             extension itself reports as loaded. -->
+                        <div class="warning" style="margin-bottom: 1.5rem;">
+                            <strong>Heads up: PHP's GMP extension is not enabled.</strong>
+                            Payments will work, but xpub-based on-chain wallets and
+                            submarine swaps need it (a single Bitcoin address works
+                            fine without it). Ask your hosting provider to enable
+                            <code>php-gmp</code> to unlock everything.
+                        </div>
+                    <?php endif; ?>
                     <!-- Security Check Section -->
                     <h3 style="margin-bottom: 0.75rem;">🛡️ Protecting your database</h3>
                     <p style="margin-bottom: 1rem; color: #a0aec0; font-size: 0.9rem;">
@@ -1669,6 +1704,13 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                 $ocSavedStatic = (string)($ocStore['onchain_static_address'] ?? '');
                 $ocSavedMode = ($ocStore['onchain_address_mode'] ?? 'xpub') === 'static' ? 'static' : 'xpub';
                 $ocSavedNetwork = (string)($ocStore['onchain_network'] ?? 'mainnet');
+                require_once __DIR__ . '/includes/onchain/wallet.php';
+                $ocEnvError = OnchainWallet::environmentError();
+                // Don't greet a GMP-less operator with a pre-selected mode
+                // that cannot work on their server.
+                if ($ocEnvError !== null && $ocSavedXpub === '') {
+                    $ocSavedMode = 'static';
+                }
                 ?>
                 <h2 style="margin-bottom: 1rem;">⛓️ On-chain Bitcoin payments</h2>
                 <p style="margin-bottom: 0.75rem;">
@@ -1685,6 +1727,14 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                     address &mdash; which can cause trouble if several are paid
                     at once, or a customer pays in multiple parts.
                 </p>
+
+                <?php if ($ocEnvError !== null): ?>
+                    <div class="warning" style="margin-bottom: 1rem;">
+                        <strong>Xpub wallets won't work on this server yet:</strong>
+                        <?= htmlspecialchars($ocEnvError) ?>
+                        A single Bitcoin address works fine in the meantime.
+                    </div>
+                <?php endif; ?>
 
                 <form id="onchain-form" method="POST" action="<?= htmlspecialchars(Urls::setup()) ?>">
                     <input type="hidden" name="step" value="onchain">
@@ -1883,14 +1933,33 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                         body.append('xpub', xpub);
                         body.append('network', network);
                         body.append('address_type', type);
+                        // Two very different failures used to share one message:
+                        // fetch() rejecting (genuinely unreachable) and the server
+                        // answering with a non-JSON error page (reachable but
+                        // broken — e.g. a PHP fatal from a missing extension).
+                        // Telling the operator "could not reach the server" for
+                        // the latter sent them debugging their network instead of
+                        // their PHP setup.
+                        var resp = null;
                         try {
-                            var resp = await fetch(setupUrl, { method: 'POST', body: body });
-                            renderResult(await resp.json(), type);
+                            resp = await fetch(setupUrl, { method: 'POST', body: body });
                         } catch (e) {
                             box.style.display = 'block';
                             box.style.background = 'rgba(245, 101, 101, 0.15)';
                             box.style.border = '1px solid rgba(245, 101, 101, 0.3)';
                             box.textContent = 'Could not reach the server to check that key. Try again.';
+                            saveBtn.disabled = true;
+                            return;
+                        }
+                        try {
+                            renderResult(await resp.json(), type);
+                        } catch (e) {
+                            box.style.display = 'block';
+                            box.style.background = 'rgba(245, 101, 101, 0.15)';
+                            box.style.border = '1px solid rgba(245, 101, 101, 0.3)';
+                            box.textContent = 'The server hit an error while checking that key'
+                                + (resp.status >= 400 ? ' (HTTP ' + resp.status + ')' : '')
+                                + '. Check the server\'s PHP error log for details.';
                             saveBtn.disabled = true;
                         }
                     }
@@ -2045,7 +2114,16 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                     on-chain wallet.
                 </p>
 
-                <?php if (!$renderOnchain['hasXpub']): ?>
+                <?php
+                require_once __DIR__ . '/includes/onchain/wallet.php';
+                $swapEnvError = OnchainWallet::environmentError();
+                ?>
+                <?php if ($swapEnvError !== null): ?>
+                    <div class="warning" style="margin-bottom: 1rem;">
+                        <strong>Swaps aren't available on this server yet:</strong>
+                        <?= htmlspecialchars($swapEnvError) ?>
+                    </div>
+                <?php elseif (!$renderOnchain['hasXpub']): ?>
                     <div class="warning" style="margin-bottom: 1rem;">
                         Submarine swaps send Bitcoin to your on-chain wallet, so
                         they need an xpub. Go back and add one to turn this on.
@@ -2058,7 +2136,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                         <input type="hidden" name="mode" value="add_store">
                     <?php endif; ?>
                     <button type="submit" name="swaps_enabled" value="1" class="btn" style="width: 100%;"
-                            <?= $renderOnchain['hasXpub'] ? '' : 'disabled' ?>>
+                            <?= ($renderOnchain['hasXpub'] && $swapEnvError === null) ? '' : 'disabled' ?>>
                         Enable submarine swaps
                     </button>
                     <button type="submit" name="swaps_enabled" value="0" class="btn btn-secondary" style="width: 100%; margin-top: 0.5rem;">
@@ -2087,6 +2165,23 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                     vanish with your funds, so we move your money out the moment
                     we can.
                 </p>
+
+                <?php if (!function_exists('gmp_init') && !function_exists('bcadd')): ?>
+                    <div class="error" style="margin-bottom: 1rem;">
+                        Cashu mints need PHP's GMP or BCMath extension, and this
+                        server has neither. Ask your hosting provider to enable
+                        <code>php-gmp</code> before switching a mint on.
+                    </div>
+                <?php elseif (!function_exists('gmp_init')): ?>
+                    <div class="warning" style="margin-bottom: 1rem;">
+                        Mint payments will work on this server, but the automatic
+                        sweep to your on-chain wallet runs over a submarine swap,
+                        which needs PHP's GMP extension. Until your hosting
+                        provider enables <code>php-gmp</code>, funds will stay at
+                        the mint (or drain via your Lightning address if you set
+                        one up).
+                    </div>
+                <?php endif; ?>
 
                 <form method="POST" action="<?= htmlspecialchars(Urls::setup()) ?>" id="mints-form">
                     <input type="hidden" name="step" value="mints">

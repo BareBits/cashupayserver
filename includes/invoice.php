@@ -630,6 +630,16 @@ class Invoice {
                                           float $maxFeePct = 0.0, int $maxFeeSats = 0): ?array {
         if ($failureReasons === null) $failureReasons = [];
         if ($targetSats <= 0) return null;
+        // Swap claim keys and lockup verification are EC/Taproot math, which
+        // needs GMP. On a host without it, bail before any provider round-trip
+        // so the invoice falls straight through to the mint rail instead of
+        // burning a quote fetch per provider and logging a cryptic
+        // "undefined function gmp_init" for each.
+        require_once __DIR__ . '/onchain/wallet.php';
+        if (($envError = OnchainWallet::environmentError()) !== null) {
+            $failureReasons[] = "swap rail unavailable: {$envError}";
+            return null;
+        }
         $localMin = SwapsConfig::minimumTargetSats();
         if ($localMin !== null && $targetSats < $localMin) {
             $failureReasons[] = "site min override ({$localMin} sat) blocks {$targetSats} sat target";
