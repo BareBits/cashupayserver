@@ -15,7 +15,7 @@ final class SetupFlow {
     /** Every screen the wizard knows, in canonical order. */
     public const STEPS = [
         'terms', 'security', 'password', 'store', 'onchain', 'zeroconf',
-        'lightning', 'swaps', 'mints', 'cron', 'done',
+        'lightning', 'swaps', 'mints', 'discount', 'cron', 'done',
     ];
 
     /** The screens add_store mode walks before returning to admin. */
@@ -43,7 +43,7 @@ final class SetupFlow {
      * Screens that render after setup_complete has been set, and therefore
      * have to survive setup.php's redirect-if-set-up guard.
      */
-    public const POST_COMPLETION = ['cron', 'done'];
+    public const POST_COMPLETION = ['discount', 'cron', 'done'];
 
     public static function isKnownStep(string $step): bool {
         return in_array($step, self::STEPS, true) || $step === self::ADD_STORE_COMPLETE;
@@ -74,6 +74,11 @@ final class SetupFlow {
             if ($isWordPress) {
                 // WordPress supplies its own authentication.
                 $steps = array_values(array_diff($steps, ['password']));
+            } else {
+                // The Bitcoin-discount screen configures a WooCommerce
+                // checkout discount (via the ELEX plugin); outside WordPress
+                // there is no WooCommerce to apply it to.
+                $steps = array_values(array_diff($steps, ['discount']));
             }
         }
         if (!$includeZeroConf) {
@@ -124,6 +129,30 @@ final class SetupFlow {
         }
         $prev = self::prevStep($current, $steps);
         return in_array($prev, self::NO_BACK_TARGET, true) ? null : $prev;
+    }
+
+    /**
+     * Parse the Bitcoin-discount screen's answer: a whole number of percent,
+     * 0–100. Null means the value is unusable and the screen should re-render
+     * with an error rather than saving anything.
+     *
+     * Whole numbers only: the free ELEX plugin that applies the discount
+     * renders its own settings form with a step-1 number input, so a
+     * fractional value saved here would trap the merchant in browser
+     * validation if they ever edited the rule there.
+     */
+    public static function parseDiscountPercent(string $raw): ?int {
+        $raw = trim($raw);
+        // An empty submit means "no discount", not an error — the field
+        // defaults to 0 and clearing it reads as declining the offer.
+        if ($raw === '') {
+            return 0;
+        }
+        if (!preg_match('/^[0-9]{1,3}$/', $raw)) {
+            return null;
+        }
+        $value = (int)$raw;
+        return $value <= 100 ? $value : null;
     }
 
     /**

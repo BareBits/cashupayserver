@@ -16,6 +16,7 @@
  *   lightning  LNURL/Lightning address + CLINK noffer
  *   swaps      Submarine swaps on/off
  *   mints      Cashu mints on/off; auto-picks a main + backup when on
+ *   discount   Bitcoin checkout discount %, WordPress mode only
  *   cron       Reminder to install the cron entry
  *   done       Completion, seed phrase, e-commerce pairing
  *
@@ -670,6 +671,34 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $step = SetupFlow::nextStep('mints', $flowSteps) ?? 'cron';
                 break;
 
+            case 'discount':
+                // WordPress-only screen (there is no WooCommerce checkout to
+                // discount anywhere else). The tail-post guard lets any
+                // completed install POST this step, so re-check the mode
+                // server-side instead of trusting the sequence alone.
+                if (!Urls::isWordPress()) {
+                    $step = SetupFlow::nextStep('discount', $flowSteps) ?? 'cron';
+                    break;
+                }
+                if (!isset($_POST['btc_discount_percent'])) {
+                    // Landing without the field — fall through to render.
+                    break;
+                }
+                $discountPercent = SetupFlow::parseDiscountPercent(
+                    (string)$_POST['btc_discount_percent']
+                );
+                if ($discountPercent === null) {
+                    throw new Exception('The discount needs to be a whole number between 0 and 100.');
+                }
+                // Site-wide, not per-store: the discount attaches to the
+                // WooCommerce checkout (one per WordPress site), which is also
+                // why the add_store flow never shows this screen. The ELEX
+                // plugin install + rule happen on the completion screen, where
+                // WooCommerce's presence is already being checked.
+                Config::set('wp_btc_discount_percent', $discountPercent);
+                $step = SetupFlow::nextStep('discount', $flowSteps) ?? 'cron';
+                break;
+
             case 'cron':
                 $step = 'done';
                 break;
@@ -803,6 +832,7 @@ function getDataDirHttpPath(): ?string {
         input[type="text"],
         input[type="password"],
         input[type="url"],
+        input[type="number"],
         select,
         textarea {
             width: 100%;
@@ -2293,6 +2323,41 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                     Go to BareBits Admin
                 </a>
 
+            <?php elseif ($step === 'discount'): ?>
+                <!-- Screen: Bitcoin checkout discount (WordPress mode only).
+                     Saves a site-wide percentage; the completion screen
+                     installs the ELEX Discount Per Payment Method plugin and
+                     creates the rule once WooCommerce wiring is confirmed. -->
+                <?php $discountSaved = (int) Config::get('wp_btc_discount_percent', 0); ?>
+                <h2 style="margin-bottom: 1rem;">🏷️ Offer a discount to customers paying in Bitcoin?</h2>
+                <p style="margin-bottom: 1.5rem;">
+                    Many merchants offer discounts to Bitcoin customers as BTC
+                    payments save them significantly on fees charged by
+                    traditional payment processors. BareBits only charges 1%,
+                    we suggest splitting the difference to incentivize your
+                    customers to pay with BTC. This is completely optional and
+                    you can change your mind at any time
+                </p>
+
+                <form method="POST" action="<?= htmlspecialchars(Urls::setup()) ?>">
+                    <input type="hidden" name="step" value="discount">
+                    <div class="form-group">
+                        <label for="btc_discount_percent">Discount for Bitcoin payments (%)</label>
+                        <input type="number" id="btc_discount_percent" name="btc_discount_percent"
+                               min="0" max="100" step="1" inputmode="numeric"
+                               value="<?= $discountSaved ?>">
+                    </div>
+
+                    <p style="color: #a0aec0; font-size: 0.85rem; margin-bottom: 1.5rem;">
+                        If you choose a discount, the free
+                        <a href="https://wordpress.org/plugins/elex-discount-per-payment-method/"
+                           target="_blank" rel="noopener" style="color: #63b3ed;">Elex Discount Per Payment Method</a>
+                        will automatically be installed
+                    </p>
+
+                    <button type="submit" class="btn" style="width: 100%;">Continue →</button>
+                </form>
+
             <?php elseif ($step === 'cron'): ?>
                 <!-- Screen: cron reminder -->
                 <?php
@@ -2435,6 +2500,43 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                         $wooReady = ($wooStatus['status'] ?? '') === 'ready';
                     }
                 }
+
+                // Bitcoin-discount follow-through (the wizard's discount
+                // screen only saved a percentage). Gated on the gateway wiring
+                // being ready so a discount plugin is never installed on a
+                // site whose checkout we couldn't configure — including the
+                // existing-real-BTCPay case, which stays entirely untouched.
+                // Same dual-layout lookup as the BTCPay helper above.
+                $discountPercent = (int) Config::get('wp_btc_discount_percent', 0);
+                $elexStatus = null;
+                if ($wooReady && $discountPercent > 0) {
+                    $elexHelper = null;
+                    foreach ([
+                        __DIR__ . '/wordpress/elex-discount.php',
+                        __DIR__ . '/elex-discount.php',
+                    ] as $candidate) {
+                        if (is_file($candidate)) {
+                            $elexHelper = $candidate;
+                            break;
+                        }
+                    }
+                    if ($elexHelper !== null) {
+                        require_once $elexHelper;
+                        // Idempotent: activates/installs only when missing and
+                        // never overwrites an existing rule for the gateway.
+                        $elexStatus = cashupay_ensure_elex_discount($discountPercent);
+                    } else {
+                        error_log('CashuPayServer: elex-discount.php not found; '
+                            . 'skipping the Bitcoin-discount section of the setup completion screen.');
+                    }
+                }
+                // Still pending while a reload could complete it (WooCommerce
+                // or the ELEX plugin missing); settled once the rule is live,
+                // the merchant declined a discount, or the session no longer
+                // knows the store (nothing left to retry with).
+                $elexPending = $discountPercent > 0 && $storeId
+                    && ($elexStatus === null
+                        || !in_array($elexStatus['status'], ['ready', 'skipped'], true));
                 ?>
 
                 <?php if ($wooReady): ?>
@@ -2505,6 +2607,64 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                             Go to BTCPay Settings
                         </a>
                     </div>
+                <?php endif; ?>
+
+                <?php if ($discountPercent > 0 && $elexStatus !== null): ?>
+                    <?php if ($elexStatus['status'] === 'ready' && ($elexStatus['rule'] ?? '') === 'added'): ?>
+                        <div class="success" style="margin-bottom: 1rem;">
+                            ✅ Your <?= (int)$discountPercent ?>% Bitcoin discount is live at checkout.
+                            You can change or remove it any time under
+                            WooCommerce &rarr; Settings &rarr; ELEX Discount Per Payment Method.
+                        </div>
+                        <?php if (!empty($elexStatus['auto_installed'])): ?>
+                        <div class="warning" style="margin-bottom: 1.5rem;">
+                            <strong>ℹ️ We installed a plugin for you</strong>
+                            <p style="margin: 0.5rem 0 0; font-size: 0.9rem;">
+                                The <strong>ELEX Discount Per Payment Method</strong>
+                                plugin has been automatically installed &mdash; it's
+                                what applies your Bitcoin discount at checkout. Keep
+                                it enabled! 🙏
+                            </p>
+                        </div>
+                        <?php endif; ?>
+                    <?php elseif ($elexStatus['status'] === 'ready'): ?>
+                        <div class="warning" style="margin-bottom: 1.5rem;">
+                            <strong>⚠️ Existing Bitcoin discount rule found</strong>
+                            <p style="margin: 0.5rem 0 0; font-size: 0.9rem;">
+                                The ELEX Discount Per Payment Method plugin already
+                                has a discount rule for the BareBits payment method,
+                                so we left it as it was instead of applying your
+                                <?= (int)$discountPercent ?>% choice.
+                            </p>
+                            <a href="<?= admin_url('admin.php?page=wc-settings&tab=elex-discount-per-payment-method') ?>" class="btn btn-secondary" style="display: inline-block; margin-top: 0.75rem;">
+                                Review Discount Rules
+                            </a>
+                        </div>
+                    <?php elseif ($elexStatus['status'] === 'needs_plugin'): ?>
+                        <div style="background: rgba(0,0,0,0.2); padding: 1.5rem; border-radius: 8px; margin-bottom: 1.5rem;">
+                            <h3 style="margin-bottom: 0.75rem;">Bitcoin Discount</h3>
+                            <p style="color: #a0aec0; font-size: 0.9rem; margin-bottom: 0.75rem;">
+                                You chose a <?= (int)$discountPercent ?>% discount for Bitcoin payments, but we couldn't install the <strong>ELEX Discount Per Payment Method</strong> plugin automatically on this host, so please add it by hand:
+                            </p>
+                            <ol style="color: #a0aec0; font-size: 0.9rem; margin: 0 0 1rem 1.25rem; padding: 0;">
+                                <li>Go to Plugins &rarr; Add New in WordPress</li>
+                                <li>Search for "ELEX Discount Per Payment Method"</li>
+                                <li>Install and activate the plugin</li>
+                                <li>Reload this page &mdash; BareBits will create the discount rule automatically</li>
+                            </ol>
+                            <a href="<?= admin_url('plugin-install.php?s=elex+discount+per+payment+method&tab=search&type=term') ?>" class="btn btn-secondary" style="display: inline-block;">
+                                Install ELEX Plugin
+                            </a>
+                        </div>
+                    <?php else: ?>
+                        <div style="background: rgba(0,0,0,0.2); padding: 1.5rem; border-radius: 8px; margin-bottom: 1.5rem;">
+                            <h3 style="margin-bottom: 0.75rem;">Bitcoin Discount</h3>
+                            <div class="warning">
+                                <strong>Couldn't finish setting up your Bitcoin discount:</strong>
+                                <?= htmlspecialchars($elexStatus['message'] ?? '') ?>
+                            </div>
+                        </div>
+                    <?php endif; ?>
                 <?php endif; ?>
                 <?php endif; ?>
 
@@ -2586,10 +2746,13 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
 
                 <?php
                 // Clear temporary session data. In WordPress mode, keep the
-                // session around if the WooCommerce hookup didn't complete (the
-                // merchant may need to install WooCommerce / the gateway plugin
-                // and reload to let the auto-wiring finish).
-                if (!Urls::isWordPress() || (isset($wooReady) && $wooReady)) {
+                // session around if the WooCommerce hookup or the Bitcoin
+                // discount didn't complete (the merchant may need to install
+                // WooCommerce / the gateway plugin / the ELEX plugin and
+                // reload to let the auto-wiring finish — which needs the store
+                // id still in session).
+                if (!Urls::isWordPress()
+                    || ((isset($wooReady) && $wooReady) && empty($elexPending))) {
                     unset($_SESSION['setup_store_id'], $_SESSION['setup_store_mode'], $_SESSION['setup_generated_seed']);
                 }
                 ?>
