@@ -67,6 +67,100 @@ function cashupay_enable_btcpay_gateway(): void {
 }
 
 /**
+ * Ensure the bundled BareBits gateway logo exists as a media-library
+ * attachment and return its id (0 on failure).
+ *
+ * The attachment id is cached in an option so repeated completion-screen
+ * renders reuse the same attachment instead of re-uploading the file. The
+ * attachment metadata is written WITHOUT intermediate sizes on purpose: the
+ * BTCPay gateway resolves its icon via wp_get_attachment_image_src() at the
+ * default 'thumbnail' size, and a generated 150x150 crop would truncate the
+ * ~154px-wide wordmark. With no registered sizes WordPress falls back to the
+ * original file.
+ */
+function cashupay_ensure_gateway_icon_attachment(): int {
+    $existing = (int) get_option('cashupay_gateway_icon_attachment_id', 0);
+    if ($existing > 0 && wp_get_attachment_url($existing) !== false) {
+        return $existing;
+    }
+
+    $src = CASHUPAY_PLUGIN_DIR . '/assets/img/barebits-gateway-logo.png';
+    if (!is_file($src)) {
+        return 0;
+    }
+    $contents = file_get_contents($src);
+    if ($contents === false) {
+        return 0;
+    }
+
+    $bits = wp_upload_bits('barebits-gateway-logo.png', null, $contents);
+    if (!empty($bits['error'])) {
+        return 0;
+    }
+
+    $attachmentId = wp_insert_attachment([
+        'post_mime_type' => 'image/png',
+        'post_title'     => 'BareBits payment gateway logo',
+        'post_status'    => 'inherit',
+    ], $bits['file']);
+    if (is_wp_error($attachmentId) || !$attachmentId) {
+        return 0;
+    }
+
+    $size = @getimagesize($bits['file']);
+    wp_update_attachment_metadata((int) $attachmentId, [
+        'width'  => (int) ($size[0] ?? 0),
+        'height' => (int) ($size[1] ?? 0),
+        'file'   => _wp_relative_upload_path($bits['file']),
+    ]);
+
+    update_option('cashupay_gateway_icon_attachment_id', (int) $attachmentId);
+    return (int) $attachmentId;
+}
+
+/**
+ * Apply BareBits branding (checkout title, customer message, gateway logo) to
+ * the BTCPay gateway's WooCommerce settings.
+ *
+ * Deliberately conservative: each field is written only when it is empty or
+ * still carries the stock BTCPay default, so a merchant's manual edits under
+ * WooCommerce -> Settings -> Payments -> BTCPay survive every re-run of the
+ * setup completion screen.
+ */
+function cashupay_apply_btcpay_gateway_branding(): void {
+    $optionKey = 'woocommerce_btcpaygf_default_settings';
+    $settings = get_option($optionKey, []);
+    if (!is_array($settings)) {
+        $settings = [];
+    }
+
+    // Stock defaults from the BTCPay plugin's DefaultGateway::getTitle() /
+    // getDescription(). Anything else means the merchant customized it.
+    $stockTitle = 'BTCPay (Bitcoin, Lightning Network, ...)';
+    $stockDescription = 'You will be redirected to BTCPay to complete your purchase.';
+
+    $title = trim((string) ($settings['title'] ?? ''));
+    if ($title === '' || $title === $stockTitle) {
+        $settings['title'] = 'BareBits (Bitcoin + Lightning)';
+    }
+
+    $description = trim((string) ($settings['description'] ?? ''));
+    if ($description === '' || $description === $stockDescription) {
+        $settings['description'] = 'CashApp, PayPal, and Venmo are all Bitcoin wallets. '
+            . 'You will be redirected to BareBits to complete your payment.';
+    }
+
+    if (empty($settings['icon_media_id'])) {
+        $iconId = cashupay_ensure_gateway_icon_attachment();
+        if ($iconId > 0) {
+            $settings['icon_media_id'] = (string) $iconId;
+        }
+    }
+
+    update_option($optionKey, $settings);
+}
+
+/**
  * Whether this WordPress install can install plugins programmatically without
  * prompting for FTP/SSH credentials.
  *
@@ -227,6 +321,7 @@ function cashupay_ensure_woocommerce_integration(string $store_id, string $api_k
     }
 
     cashupay_enable_btcpay_gateway();
+    cashupay_apply_btcpay_gateway_branding();
 
     return [
         'status' => 'ready',

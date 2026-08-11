@@ -14,7 +14,7 @@
  *   2. If the probe succeeds and the fee-override gate does not fire, the
  *      LNURL-issued BOLT11 becomes the invoice (payment_rail='lnaddress').
  *   3. If the override gate fires (this invoice is smaller than the
- *      accumulated fees the operator owes upstream/dev/hosting), the LNURL
+ *      accumulated dev/hosting fees the operator owes), the LNURL
  *      path is skipped and we fall through to mint/swap. The resulting
  *      mint-rail invoice is flagged with lnurl_override_reason so settlement
  *      triggers an immediate DevFee::settleStore + auto-melt.
@@ -51,7 +51,7 @@ class LnUrlReceive {
      * for an invoice of this size given the store's current fees-due?
      *
      * Single rule: when the invoice amount is smaller than the accumulated
-     * upstream/dev/hosting fees the operator owes, route via the mint so the
+     * dev/hosting fees the operator owes, route via the mint so the
      * resulting mint balance can clear the owed fees. Larger invoices take
      * the LNURL direct path even if some fees are outstanding — the next
      * small invoice (or the cron) will catch the debt up.
@@ -70,15 +70,14 @@ class LnUrlReceive {
     }
 
     /**
-     * Sum of all three owed fee buckets for a store, in sats. Used as the
+     * Sum of the owed fee buckets for a store, in sats. Used as the
      * feesDue input to {@see shouldOverride}. Delegates to the existing
      * {@see DevFee::computeOwed} so the override math stays consistent with
      * what the cron will actually try to collect.
      */
     public static function feesDueSats(string $storeId): int {
         $owed = DevFee::computeOwed($storeId);
-        return ((int)$owed['upstream_owed'])
-             + ((int)$owed['dev_owed'])
+        return ((int)$owed['dev_owed'])
              + ((int)$owed['hosting_owed']);
     }
 
@@ -265,7 +264,7 @@ class LnUrlReceive {
      * the merchant's LN address.
      *
      * Steps:
-     *   1. Run DevFee::settleStore to pay out owed upstream/dev/hosting fees
+     *   1. Run DevFee::settleStore to pay out owed dev/hosting fees
      *      from the just-received mint tokens.
      *   2. Melt the remaining balance to the merchant's auto_melt_address.
      *

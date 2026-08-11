@@ -2,7 +2,7 @@
 /**
  * CashuPayServer — Free trial gate.
  *
- * Suppresses the upstream dev fee, dev fee, and per-store hosting fee while
+ * Suppresses the dev fee and per-store hosting fee while
  * an operator-configured free-trial window is open. Network fees (Lightning
  * routing / mint fees) are never suppressed — they leave the deployment as
  * actual sats spent on melts.

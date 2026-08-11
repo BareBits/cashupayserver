@@ -133,7 +133,8 @@ jobs:
             admin.php \
             api.php \
             pay.php \
-            includes/database.php
+            includes/database.php \
+            assets/img/barebits-gateway-logo.png
 
       - name: Version-stamp the release assets
         # Rename the fixed build outputs to version-stamped asset names. The

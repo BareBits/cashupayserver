@@ -26,30 +26,25 @@ Database::insert('invoices', [
 ]);
 Database::update('stores', ['hosting_fee_percent' => 1.0], 'id = ?', [$store]);
 
-// Initial owed: upstream = 2500, dev = 5000 (upstream not yet paid), hosting = 5000.
+// Initial owed: dev = 5000, hosting = 5000. No upstream bucket accrues.
 $o = DevFee::computeOwed($store);
-assert_eq(2500, $o['upstream_owed']);
+assert_true(!array_key_exists('upstream_owed', $o), 'no upstream owed bucket');
 assert_eq(5000, $o['dev_owed']);
 assert_eq(5000, $o['hosting_owed']);
 
-// Simulate a SUCCESSFUL upstream payment by inserting the melts row directly
-// (the real path goes through UpstreamDevFee::sendToSink + MeltLog::record).
-MeltLog::record($store, 2500, 0, 'https://sink', null, FEE_NOTE_UPSTREAM);
-
-// Next pass: upstream_owed drops to 0; dev_owed shrinks (upstream paid counts).
+// A HISTORICAL upstream payment (row from before the fee was retired) still
+// shrinks the dev base but never re-accrues as owed.
 //   dev_base = 500000 - 0 - 2500 = 497500 → floor * 0.01 = 4975
-//   dev_owed = 4975 - 0 = 4975
+MeltLog::record($store, 2500, 0, 'https://sink', null, FEE_NOTE_UPSTREAM);
 $o = DevFee::computeOwed($store);
-assert_eq(0, $o['upstream_owed'], 'upstream paid, owed clamps to 0');
-assert_eq(2500, $o['upstream_paid']);
-assert_eq(4975, $o['dev_owed'], 'dev unchanged because upstream paid - upstream subtracted match exactly');
+assert_eq(2500, $o['upstream_paid'], 'historical upstream payment reported');
+assert_eq(4975, $o['dev_owed'], 'dev base shrunk by historical upstream paid');
 
 // Now pay dev and hosting; their owed clamps to 0 on the next pass.
 MeltLog::record($store, 4975, 50, 'fees@getbarebits.com', 'pre1', FEE_NOTE_DEV);
 MeltLog::record($store, 5000, 25, 'host@op.com', 'pre2', FEE_NOTE_HOSTING);
 
 $o = DevFee::computeOwed($store);
-assert_eq(0, $o['upstream_owed']);
 assert_eq(75, $o['network_cost'], 'both fee payments contributed network cost');
 
 // Dev base after second pass: 500000 - 75 - 2500 = 497425 → floor * 0.01 = 4974
@@ -59,7 +54,6 @@ assert_eq(0, $o['hosting_owed'], 'hosting clamps to 0');
 
 // A second settle attempt (without new revenue) finds nothing to pay — none
 // of the *_owed values rise above CASHUPAY_FEE_SETTLE_THRESHOLD_SATS.
-assert_true($o['upstream_owed'] < CASHUPAY_FEE_SETTLE_THRESHOLD_SATS);
 assert_true($o['dev_owed'] < CASHUPAY_FEE_SETTLE_THRESHOLD_SATS);
 assert_true($o['hosting_owed'] < CASHUPAY_FEE_SETTLE_THRESHOLD_SATS);
 

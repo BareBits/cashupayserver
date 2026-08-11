@@ -11,9 +11,9 @@
  * automatically stop contributing on the next call.
  *
  * The point of this module is to feed {@see DevFee::computeOwed}: stuck
- * sats are subtracted from the dev-fee bucket first, then upstream, then
- * hosting, so loss from a misbehaving mint comes out of the operator/dev
- * share rather than the merchant's settlement.
+ * sats are subtracted from the dev-fee bucket first, then hosting, so loss
+ * from a misbehaving mint comes out of the operator/dev share rather than
+ * the merchant's settlement.
  *
  * Detection is intentionally per-store: the reliability row is global per
  * mint_url, but a mint only counts as stuck *for a given store* if that
@@ -89,22 +89,21 @@ class StuckFunds {
     }
 
     /**
-     * Apply the deduction to a triple of owed buckets, eating dev first, then
-     * upstream, then hosting. Returns the adjusted buckets plus a breakdown of
-     * what was absorbed where, so callers (admin UI) can surface it.
+     * Apply the deduction to the owed buckets, eating dev first, then
+     * hosting. Returns the adjusted buckets plus a breakdown of what was
+     * absorbed where, so callers (admin UI) can surface it.
      *
      * Caller passes the raw `*_owed` ints; we return them mutated (floored at
      * zero) and a `stuck_*` breakdown.
      *
      * @return array{
-     *   upstream_owed:int, dev_owed:int, hosting_owed:int,
+     *   dev_owed:int, hosting_owed:int,
      *   stuck_total_sats:int, stuck_absorbed_total:int,
-     *   stuck_absorbed_dev:int, stuck_absorbed_upstream:int, stuck_absorbed_hosting:int,
+     *   stuck_absorbed_dev:int, stuck_absorbed_hosting:int,
      *   stuck_uncovered:int
      * }
      */
     public static function applyDeduction(
-        int $upstreamOwed,
         int $devOwed,
         int $hostingOwed,
         int $stuckSatsTotal
@@ -115,22 +114,16 @@ class StuckFunds {
         $devOwed -= $absorbDev;
         $remaining -= $absorbDev;
 
-        $absorbUpstream = min($remaining, $upstreamOwed);
-        $upstreamOwed -= $absorbUpstream;
-        $remaining -= $absorbUpstream;
-
         $absorbHosting = min($remaining, $hostingOwed);
         $hostingOwed -= $absorbHosting;
         $remaining -= $absorbHosting;
 
         return [
-            'upstream_owed' => max(0, $upstreamOwed),
             'dev_owed' => max(0, $devOwed),
             'hosting_owed' => max(0, $hostingOwed),
             'stuck_total_sats' => max(0, $stuckSatsTotal),
-            'stuck_absorbed_total' => $absorbDev + $absorbUpstream + $absorbHosting,
+            'stuck_absorbed_total' => $absorbDev + $absorbHosting,
             'stuck_absorbed_dev' => $absorbDev,
-            'stuck_absorbed_upstream' => $absorbUpstream,
             'stuck_absorbed_hosting' => $absorbHosting,
             'stuck_uncovered' => max(0, $remaining),
         ];

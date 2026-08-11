@@ -151,7 +151,8 @@ jobs:
             admin.php \
             api.php \
             pay.php \
-            includes/database.php
+            includes/database.php \
+            assets/img/barebits-gateway-logo.png
 
       - name: Build standalone zip
         env:

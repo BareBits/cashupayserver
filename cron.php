@@ -200,7 +200,7 @@ if (!$swapOnly) {
     }
 }
 
-// Task 1b: Settle dev / hosting / upstream-dev fees for every store. Runs
+// Task 1b: Settle dev / hosting fees for every store. Runs
 // BEFORE auto-melt so the fee math sees revenue that may otherwise drain in
 // this same cron pass. Per-fee failures are caught inside settleStore() so a
 // single broken LNURL never blocks the rest of the cron.

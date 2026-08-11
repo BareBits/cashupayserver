@@ -169,7 +169,7 @@ class Invoice {
             $exchangeRate = ExchangeRates::getBtcPrice($currency, $primaryProvider, $secondaryProvider);
         }
 
-        // ---- Fee-redirect path: when a fee (dev / upstream / hosting) is
+        // ---- Fee-redirect path: when a fee (dev / hosting) is
         // already owed in an amount >= this invoice, route the rails that fee
         // can cover straight to its destination instead of the merchant. The
         // remaining offered rails fall through to the normal merchant logic

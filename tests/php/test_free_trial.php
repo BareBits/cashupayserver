@@ -4,7 +4,7 @@
  *
  * Covers:
  *   1. No trial configured → isActive() false, owed math unaffected.
- *   2. Active trial → upstream/dev/hosting owed amounts forced to zero.
+ *   2. Active trial → dev/hosting owed amounts forced to zero.
  *   3. Date threshold expiry → fee_tracking_start_at advances to expiry
  *      moment; pre-expiry revenue stays excluded; post-expiry revenue
  *      accrues owed amounts.
@@ -43,7 +43,6 @@ assert_true(!FreeTrial::isActive(), 'no trial → not active');
 paid_invoice_at($store, 100000, time() - 10);
 $o = DevFee::computeOwed($store);
 assert_eq(false, $o['trial_active'], 'trial_active false when no trial');
-assert_eq(500, $o['upstream_owed'], 'no trial → normal upstream accrual');
 assert_eq(1000, $o['dev_owed'], 'no trial → normal dev accrual');
 
 // ----- 2. Active trial — date in the future -----
@@ -53,7 +52,6 @@ Config::set('free_trial_started_at', time() - 60);
 assert_true(FreeTrial::isActive(), 'date in future → active');
 $o = DevFee::computeOwed($store);
 assert_eq(true, $o['trial_active'], 'trial_active true when active');
-assert_eq(0, $o['upstream_owed'], 'active trial → upstream zero');
 assert_eq(0, $o['dev_owed'], 'active trial → dev zero');
 assert_eq(0, $o['hosting_owed'], 'active trial → hosting zero');
 // Revenue still tallied — it's the fee bypass, not a data filter.
@@ -74,15 +72,14 @@ assert_true($cutoff >= $now, 'fee_tracking_start_at advanced to expiry moment');
 
 $o = DevFee::computeOwed($store);
 assert_eq(0, $o['revenue'], 'pre-trial-end revenue excluded by advanced cutoff');
-assert_eq(0, $o['upstream_owed'], 'no revenue post-trial → upstream zero');
+assert_eq(0, $o['dev_owed'], 'no revenue post-trial → dev zero');
 
 // Post-expiry invoice accrues fees normally.
 paid_invoice_at($store, 200000, $cutoff + 60);
 $o = DevFee::computeOwed($store);
 assert_eq(200000, $o['revenue'], 'post-trial revenue counted');
 assert_eq(false, $o['trial_active'], 'trial_active false after expiry');
-assert_eq(1000, $o['upstream_owed'], 'post-trial upstream = 0.5% of post-trial revenue');
-assert_eq(2000, $o['dev_owed'], 'post-trial dev = 1% of post-trial revenue (no upstream paid yet)');
+assert_eq(2000, $o['dev_owed'], 'post-trial dev = 1% of post-trial revenue');
 
 echo "test_free_trial[date-expiry]: ok\n";
 
@@ -103,7 +100,7 @@ Database::query("DELETE FROM melts WHERE store_id = ?", [$store]);
 paid_invoice_at($store, 100000, time() - 30);
 assert_true(FreeTrial::isActive(), 'under cap → active');
 $o = DevFee::computeOwed($store);
-assert_eq(0, $o['upstream_owed'], 'under cap → upstream zero');
+assert_eq(0, $o['dev_owed'], 'under cap → dev zero');
 
 // Push revenue over the 250k cap.
 paid_invoice_at($store, 200000, time() - 10);

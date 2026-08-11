@@ -23,13 +23,12 @@ $store = [
     'hosting_fee_onchain_address_type' => 'P2WPKH',
     'onchain_network' => 'mainnet',
 ];
-$owed = ['upstream_owed' => 300, 'dev_owed' => 9000, 'hosting_owed' => 5000];
+$owed = ['dev_owed' => 9000, 'hosting_owed' => 5000];
 $cands = FeeRedirect::candidates($store, $owed);
-assert_eq(3, count($cands), 'three fee candidates');
-// Largest owed first: dev (9000) > hosting (5000) > upstream (300).
+assert_eq(2, count($cands), 'two fee candidates (upstream fee retired)');
+// Largest owed first: dev (9000) > hosting (5000).
 assert_eq('dev', $cands[0]['key'], 'dev sorts first');
 assert_eq('hosting', $cands[1]['key'], 'hosting second');
-assert_eq('upstream', $cands[2]['key'], 'upstream last');
 assert_eq(FEE_NOTE_DEV, $cands[0]['note']);
 assert_eq(9000, $cands[0]['owed']);
 // Hosting destinations come from the store row.
@@ -98,7 +97,7 @@ assert_null(
 );
 
 // Revenue accrues a dev fee, but the store offers ONLY an on-chain rail and no
-// fee xpub is configured (dev/upstream/hosting xpubs all empty by default), so
+// fee xpub is configured (dev/hosting xpubs all empty by default), so
 // coveredRails is empty for every fee -> no redirect, and crucially no LNURL
 // probe (lightning isn't offered), so this path stays offline.
 Database::insert('invoices', [
