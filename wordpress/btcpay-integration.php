@@ -126,8 +126,12 @@ function cashupay_ensure_gateway_icon_attachment(): int {
  * still carries the stock BTCPay default, so a merchant's manual edits under
  * WooCommerce -> Settings -> Payments -> BTCPay survive every re-run of the
  * setup completion screen.
+ *
+ * $discountPercent (the wizard's site-wide wp_btc_discount_percent, validated
+ * 0-100) is advertised in the checkout title so customers see the incentive
+ * before picking a payment method.
  */
-function cashupay_apply_btcpay_gateway_branding(): void {
+function cashupay_apply_btcpay_gateway_branding(int $discountPercent = 0): void {
     $optionKey = 'woocommerce_btcpaygf_default_settings';
     $settings = get_option($optionKey, []);
     if (!is_array($settings)) {
@@ -141,13 +145,14 @@ function cashupay_apply_btcpay_gateway_branding(): void {
 
     $title = trim((string) ($settings['title'] ?? ''));
     if ($title === '' || $title === $stockTitle) {
-        $settings['title'] = 'BareBits (Bitcoin + Lightning)';
+        $settings['title'] = 'BareBits (Bitcoin + Lightning)'
+            . ($discountPercent > 0 ? sprintf(' %d%% discount', $discountPercent) : '');
     }
 
     $description = trim((string) ($settings['description'] ?? ''));
     if ($description === '' || $description === $stockDescription) {
         $settings['description'] = 'CashApp, PayPal, and Venmo are all Bitcoin wallets. '
-            . 'You will be redirected to BareBits to complete your payment.';
+            . 'You will be redirected to BareBits to complete this payment.';
     }
 
     if (empty($settings['icon_media_id'])) {
@@ -282,7 +287,7 @@ function cashupay_install_btcpay_plugin(): array {
  *
  * @return array{status:string, auto_installed:bool, message?:string, current_url?:string, webhook?:mixed}
  */
-function cashupay_ensure_woocommerce_integration(string $store_id, string $api_key): array {
+function cashupay_ensure_woocommerce_integration(string $store_id, string $api_key, int $discountPercent = 0): array {
     // Never overwrite a merchant's real BTCPay Server connection.
     if (cashupay_is_real_btcpay_configured()) {
         return [
@@ -321,7 +326,7 @@ function cashupay_ensure_woocommerce_integration(string $store_id, string $api_k
     }
 
     cashupay_enable_btcpay_gateway();
-    cashupay_apply_btcpay_gateway_branding();
+    cashupay_apply_btcpay_gateway_branding($discountPercent);
 
     return [
         'status' => 'ready',
