@@ -54,6 +54,12 @@ def test_full_flow_persists_every_answer(payserver: PayserverHandle) -> None:
     # Saving an on-chain destination pulls zero-conf into the sequence.
     assert _heading(body) == "Zero-conf payments"
     assert "of 11" in body
+    # The zero-conf risk mention links out to the help article explaining it.
+    assert (
+        '<a href="https://getbarebits.com/help/Understanding%20Bitcoin/'
+        'Zero-conf%20transactions/" target="_blank" rel="noopener"'
+    ) in body, "the zero-conf screen must link the gaming risk to the help article"
+    assert "could try to game it</a>" in body
 
     body = w.post(step="zeroconf", zero_conf="1")
     assert _heading(body) == "Lightning payments"
@@ -289,6 +295,10 @@ def test_terms_gate_requires_all_three_checkboxes(payserver: PayserverHandle) ->
     # The mandatory fee acknowledgement shows the configured dev fee (1%).
     assert "1% fee is assessed on all incoming payments" in landing, (
         "the fee acknowledgement must state the incoming-payment fee"
+    )
+    # The warranty box opens with "I agree", not the older casual "I get".
+    assert "I agree that this software comes as-is" in landing, (
+        "the warranty acknowledgement must read 'I agree'"
     )
 
     # No box, then any two of the three alone: all rejected, none advances.

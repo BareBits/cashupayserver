@@ -1203,7 +1203,7 @@ function getDataDirHttpPath(): ?string {
                     <div class="checkbox-group" style="margin: 1.5rem 0;">
                         <input type="checkbox" id="terms_warranty" name="terms_warranty" required>
                         <label for="terms_warranty">
-                            I get that this software comes as-is — no warranty —
+                            I agree that this software comes as-is — no warranty —
                             and the developers can't be blamed for any lost funds.
                         </label>
                     </div>
@@ -2021,9 +2021,10 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                     depending on fees).
                 </p>
                 <p style="margin-bottom: 1.5rem;">
-                    There's a small catch: a customer could try to game it. For
-                    most merchants, though, the extra speed is well worth that
-                    tiny risk.
+                    There's a small catch: a customer
+                    <a href="https://getbarebits.com/help/Understanding%20Bitcoin/Zero-conf%20transactions/" target="_blank" rel="noopener" style="color: #63b3ed;">could try to game it</a>.
+                    For most merchants, though, the extra speed is well worth
+                    that tiny risk.
                 </p>
 
                 <form method="POST" action="<?= htmlspecialchars(Urls::setup()) ?>">
@@ -2489,6 +2490,10 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                 $storeId = $_SESSION['setup_store_id'] ?? null;
                 $wooStatus = null;
                 $wooReady = false;
+                // Read the wizard's saved discount up front: the gateway
+                // wiring advertises it in the checkout title, and the ELEX
+                // follow-through below installs the matching discount rule.
+                $discountPercent = (int) Config::get('wp_btc_discount_percent', 0);
 
                 if ($btcpayHelper !== null && $storeId) {
                     $apiKey = Auth::getOrCreateInternalApiKey($storeId);
@@ -2496,7 +2501,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                         // Idempotent: installs/activates the gateway plugin if
                         // needed, then configures + enables it. Safe to re-run
                         // on refresh.
-                        $wooStatus = cashupay_ensure_woocommerce_integration($storeId, $apiKey);
+                        $wooStatus = cashupay_ensure_woocommerce_integration($storeId, $apiKey, $discountPercent);
                         $wooReady = ($wooStatus['status'] ?? '') === 'ready';
                     }
                 }
@@ -2507,7 +2512,6 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                 // site whose checkout we couldn't configure — including the
                 // existing-real-BTCPay case, which stays entirely untouched.
                 // Same dual-layout lookup as the BTCPay helper above.
-                $discountPercent = (int) Config::get('wp_btc_discount_percent', 0);
                 $elexStatus = null;
                 if ($wooReady && $discountPercent > 0) {
                     $elexHelper = null;

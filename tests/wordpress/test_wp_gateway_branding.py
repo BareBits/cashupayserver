@@ -24,7 +24,7 @@ pytestmark = pytest.mark.wordpress
 BAREBITS_TITLE = "BareBits (Bitcoin + Lightning)"
 BAREBITS_DESCRIPTION = (
     "CashApp, PayPal, and Venmo are all Bitcoin wallets. "
-    "You will be redirected to BareBits to complete your payment."
+    "You will be redirected to BareBits to complete this payment."
 )
 STOCK_TITLE = "BTCPay (Bitcoin, Lightning Network, ...)"
 STOCK_DESCRIPTION = "You will be redirected to BTCPay to complete your purchase."
@@ -32,6 +32,10 @@ STOCK_DESCRIPTION = "You will be redirected to BTCPay to complete your purchase.
 APPLY = (
     "require_once CASHUPAY_PLUGIN_DIR . '/btcpay-integration.php';"
     "cashupay_apply_btcpay_gateway_branding();"
+)
+APPLY_WITH_DISCOUNT = (
+    "require_once CASHUPAY_PLUGIN_DIR . '/btcpay-integration.php';"
+    "cashupay_apply_btcpay_gateway_branding(5);"
 )
 DUMP = "echo json_encode(get_option('woocommerce_btcpaygf_default_settings'));"
 
@@ -83,6 +87,33 @@ def test_branding_replaces_stock_btcpay_defaults(wordpress: WordPressHandle) -> 
     assert settings["enabled"] == "yes", "unrelated keys survive"
 
 
+def test_discount_percent_lands_in_the_checkout_title(wordpress: WordPressHandle) -> None:
+    """A wizard-chosen Bitcoin discount is advertised in the gateway title so
+    customers see the incentive before picking a payment method."""
+    wordpress.wp_cli(
+        "eval", "delete_option('woocommerce_btcpaygf_default_settings');"
+    )
+    wordpress.wp_cli("eval", APPLY_WITH_DISCOUNT)
+    settings = _settings(wordpress)
+    assert settings["title"] == f"{BAREBITS_TITLE} 5% discount"
+    assert settings["description"] == BAREBITS_DESCRIPTION
+
+
+def test_discount_title_is_write_once_like_the_rest_of_branding(wordpress: WordPressHandle) -> None:
+    """The branding pass is deliberately write-once: a title we already wrote
+    (with or without a discount) is neither re-suffixed nor updated when the
+    percentage changes later."""
+    wordpress.wp_cli(
+        "eval", "delete_option('woocommerce_btcpaygf_default_settings');"
+    )
+    wordpress.wp_cli("eval", APPLY)
+    wordpress.wp_cli("eval", APPLY_WITH_DISCOUNT)
+    settings = _settings(wordpress)
+    assert settings["title"] == BAREBITS_TITLE, (
+        "an already-written title must not gain a discount suffix on re-run"
+    )
+
+
 def test_branding_never_clobbers_merchant_customization(wordpress: WordPressHandle) -> None:
     seed = json.dumps({
         "title": "My Custom Gateway",
@@ -94,6 +125,7 @@ def test_branding_never_clobbers_merchant_customization(wordpress: WordPressHand
         f"update_option('woocommerce_btcpaygf_default_settings', json_decode({seed!r}, true));",
     )
     wordpress.wp_cli("eval", APPLY)
+    wordpress.wp_cli("eval", APPLY_WITH_DISCOUNT)
     settings = _settings(wordpress)
     assert settings["title"] == "My Custom Gateway"
     assert settings["description"] == "Pay me in corn."
