@@ -2435,7 +2435,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
                 // Per-store newsletter checkbox default. Tri-state: '' = inherit
                 // the site-wide default (stored NULL); '1'/'0' = force checked/
-                // unchecked. See Config::getNewsletterDefaultChecked().
+                // unchecked. See Config::getNewsletterDefaultChecked(). WordPress
+                // installs hide the selector (the payment page never shows the
+                // newsletter checkbox there), so the stored value must survive a
+                // save that carries no newsletter field.
                 $newsletterDefault = (string)($_POST['newsletter_default_checked'] ?? '');
                 $newsletterDefaultVal = ($newsletterDefault === '1' || $newsletterDefault === '0')
                     ? (int)$newsletterDefault
@@ -2444,7 +2447,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $update = [
                     'notifications_enabled' => $enabled,
                     'notification_email' => $email !== '' ? $email : null,
-                    'newsletter_default_checked' => $newsletterDefaultVal,
                     'smtp_override_enabled' => $smtpOverride,
                     'smtp_host' => $smtp['host'] !== '' ? $smtp['host'] : null,
                     'smtp_port' => $smtp['port'] !== '' ? (int)$smtp['port'] : null,
@@ -2453,6 +2455,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'smtp_from_address' => $smtp['from_address'] !== '' ? $smtp['from_address'] : null,
                     'smtp_from_name' => $smtp['from_name'] !== '' ? $smtp['from_name'] : null,
                 ];
+                if (!Urls::isWordPress()) {
+                    $update['newsletter_default_checked'] = $newsletterDefaultVal;
+                }
                 // Password: preserve on blank, overwrite on new value, wipe on clear.
                 if ($smtp['password_clear']) {
                     $update['smtp_password'] = null;
@@ -2519,8 +2524,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 Config::set('notifications_enabled', $enabled);
                 Config::set('notifications_invoice_paid_enabled', $invoicePaidEnabled);
                 Config::set('notifications_auto_cashout_enabled', $autoCashoutEnabled);
-                Config::set('notifications_payer_receipt_enabled', $payerReceiptEnabled);
-                Config::set('newsletter_default_checked', $newsletterDefaultChecked);
+                // WordPress installs hide the payer-receipt and newsletter
+                // toggles (the payment page never renders the email form there),
+                // so a save must not clobber their stored values with defaults.
+                if (!Urls::isWordPress()) {
+                    Config::set('notifications_payer_receipt_enabled', $payerReceiptEnabled);
+                    Config::set('newsletter_default_checked', $newsletterDefaultChecked);
+                }
                 Config::set('notifications_to_email', $toEmail);
 
                 Config::set('smtp_host', $smtp['host']);
@@ -5932,6 +5942,9 @@ header('Cache-Control: no-cache, must-revalidate');
                                 <p class="form-help">If blank, the site-wide notification address from Settings is used.</p>
                             </div>
 
+                            <?php if (!$isWp): ?>
+                            <!-- Hidden in WordPress installs: the payment page never
+                                 shows the newsletter checkbox there. -->
                             <div class="form-group" style="margin-top: 1rem;">
                                 <label class="form-label">Newsletter checkbox default</label>
                                 <select class="form-input" id="store-newsletter-default">
@@ -5944,6 +5957,7 @@ header('Cache-Control: no-cache, must-revalidate');
                                     payment page.
                                 </p>
                             </div>
+                            <?php endif; ?>
 
                             <?php if ($isWp): ?>
                             <div style="margin-top: 1rem; background: rgba(247,147,26,0.15); border: 1px solid rgba(247,147,26,0.4); padding: 0.6rem; border-radius: 6px; font-size: 0.85rem;">
@@ -6323,6 +6337,10 @@ header('Cache-Control: no-cache, must-revalidate');
                                     <span class="toggle-slider"></span>
                                 </label>
                             </div>
+                            <?php if (!$isWp): ?>
+                            <!-- WordPress installs never render the payment-page
+                                 email/newsletter form (WooCommerce owns customer
+                                 emails), so both toggles below would be dead there. -->
                             <div class="toggle-container" style="margin-top: 0.5rem;">
                                 <span>Offer payer receipt on payment page</span>
                                 <label class="toggle">
@@ -6348,6 +6366,7 @@ header('Cache-Control: no-cache, must-revalidate');
                                 shown regardless of whether receipts are enabled. Individual
                                 stores can override this default in their store settings.
                             </p>
+                            <?php endif; ?>
                         </div>
 
                         <?php if ($isWp): ?>
@@ -11349,11 +11368,14 @@ header('Cache-Control: no-cache, must-revalidate');
             const email = document.getElementById('store-notification-email').value.trim();
             const passwordCleared = document.getElementById('store-smtp-password-clear').checked;
             const passwordTyped = document.getElementById('store-smtp-password').value !== '';
+            // Absent in WordPress installs (the payment page never shows the
+            // newsletter checkbox there); the backend keeps the stored value.
+            const storeNewsletterEl = document.getElementById('store-newsletter-default');
             const params = new URLSearchParams({
                 action: 'save_store_notifications',
                 store_id: currentStoreId,
                 enabled, email,
-                newsletter_default_checked: document.getElementById('store-newsletter-default').value,
+                newsletter_default_checked: storeNewsletterEl ? storeNewsletterEl.value : '',
                 smtp_override_enabled: document.getElementById('store-smtp-override-enabled').checked ? '1' : '0',
                 smtp_host: document.getElementById('store-smtp-host').value.trim(),
                 smtp_port: document.getElementById('store-smtp-port').value.trim(),
@@ -11463,8 +11485,12 @@ header('Cache-Control: no-cache, must-revalidate');
                 document.getElementById('notifications-enabled').checked = !!data.enabled;
                 document.getElementById('notifications-invoice-paid').checked = !!data.invoicePaidEnabled;
                 document.getElementById('notifications-auto-cashout').checked = !!data.autoCashoutEnabled;
-                document.getElementById('notifications-payer-receipt').checked = !!data.payerReceiptEnabled;
-                document.getElementById('notifications-newsletter-default').checked = !!data.newsletterDefaultChecked;
+                // Both are absent in WordPress installs, where the payment page
+                // never renders the email/newsletter form.
+                const payerReceiptEl = document.getElementById('notifications-payer-receipt');
+                if (payerReceiptEl) payerReceiptEl.checked = !!data.payerReceiptEnabled;
+                const newsletterDefaultEl = document.getElementById('notifications-newsletter-default');
+                if (newsletterDefaultEl) newsletterDefaultEl.checked = !!data.newsletterDefaultChecked;
                 document.getElementById('notifications-to-email').value = data.toEmail || '';
                 document.getElementById('notifications-smtp-warning').classList.toggle('hidden', !!data.smtpConfigured);
                 // Global SMTP server fields. Password is write-only: it's never
@@ -11495,8 +11521,12 @@ header('Cache-Control: no-cache, must-revalidate');
             const enabled = document.getElementById('notifications-enabled').checked ? '1' : '0';
             const invoicePaid = document.getElementById('notifications-invoice-paid').checked ? '1' : '0';
             const autoCashout = document.getElementById('notifications-auto-cashout').checked ? '1' : '0';
-            const payerReceipt = document.getElementById('notifications-payer-receipt').checked ? '1' : '0';
-            const newsletterDefault = document.getElementById('notifications-newsletter-default').checked ? '1' : '0';
+            // Absent in WordPress installs; the backend ignores these fields
+            // there, so the sent value is only a placeholder.
+            const payerReceiptEl = document.getElementById('notifications-payer-receipt');
+            const payerReceipt = payerReceiptEl && payerReceiptEl.checked ? '1' : '0';
+            const newsletterDefaultEl = document.getElementById('notifications-newsletter-default');
+            const newsletterDefault = newsletterDefaultEl && newsletterDefaultEl.checked ? '1' : '0';
             const toEmail = document.getElementById('notifications-to-email').value.trim();
             const params = new URLSearchParams({
                 action: 'save_notifications_settings',
