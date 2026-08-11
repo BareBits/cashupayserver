@@ -1,22 +1,22 @@
 <?php
 /**
- * CashuPayServer — Development Fee + Hosting Fee + Upstream Dev Fee
+ * CashuPayServer — Development Fee + Hosting Fee
  *
- * Implements the three-tier fee structure introduced under the Modified MIT
- * License (see LICENSE.md). All math is in sats. Settlement is driven from
- * the cron tick (see cron.php → "Task 2.5"); each fee fires independently
+ * Implements the fee structure introduced under the Modified MIT License
+ * (see LICENSE.md). All math is in sats. Settlement is driven from the
+ * cron tick (see cron.php → "Task 2.5"); each fee fires independently
  * once the owed amount crosses the per-fee threshold.
  *
  * Fee semantics:
- *   - Upstream dev fee (CASHUPAY_UPSTREAM_DEV_FEE_PERCENT, default 0.5%):
- *       base = revenue − network_costs. Paid to the original CashuPayServer
- *       author via the existing cypherpunk.today Cashu-token sink.
  *   - Dev fee (CASHUPAY_DEV_FEE_PERCENT, hard-coded 1%):
  *       base = revenue − network_costs − upstream_paid. Paid to the LNURL
  *       configured by CASHUPAY_DEV_FEE_LNURL (default fees@getbarebits.com)
  *       with "Deployment: $DEPLOYMENT_ID" attached as a memo (LUD-12 comment
  *       if commentAllowed permits; otherwise LUD-18 payerdata.name; otherwise
- *       paid without a memo and a warning is logged).
+ *       paid without a memo and a warning is logged). upstream_paid is the
+ *       historical total of the retired 0.5% upstream dev fee (removed
+ *       2026-08); it stays in the base so deployments that paid it don't see
+ *       their dev fee retroactively increase, and is 0 on fresh installs.
  *   - Hosting fee (per-store hosting_fee_percent, default 0%):
  *       base = revenue (no network-cost decrement). Paid to the store's
  *       configured hosting_fee_destination LNURL.
@@ -101,25 +101,12 @@ if (!defined('CASHUPAY_DEV_FEE_ONCHAIN_ADDRESS_TYPE')) {
     define('CASHUPAY_DEV_FEE_ONCHAIN_ADDRESS_TYPE', $ff_env('CASHUPAY_DEV_FEE_ONCHAIN_ADDRESS_TYPE', 'P2WPKH'));
 }
 
-// Upstream dev fee destinations. The existing path POSTs a Cashu token to
-// CASHUPAY_UPSTREAM_DEV_FEE_SINK_URL; these add an LNURL + on-chain xpub so
-// the upstream fee can also be settled by redirect. Empty (default) = not
-// redirect-eligible; the token-sink path remains the fallback.
-if (!defined('CASHUPAY_UPSTREAM_DEV_FEE_LNURL')) {
-    define('CASHUPAY_UPSTREAM_DEV_FEE_LNURL', $ff_env('CASHUPAY_UPSTREAM_DEV_FEE_LNURL', ''));
-}
-if (!defined('CASHUPAY_UPSTREAM_DEV_FEE_ONCHAIN_XPUB')) {
-    define('CASHUPAY_UPSTREAM_DEV_FEE_ONCHAIN_XPUB', $ff_env('CASHUPAY_UPSTREAM_DEV_FEE_ONCHAIN_XPUB', ''));
-}
-if (!defined('CASHUPAY_UPSTREAM_DEV_FEE_ONCHAIN_NETWORK')) {
-    define('CASHUPAY_UPSTREAM_DEV_FEE_ONCHAIN_NETWORK', $ff_env('CASHUPAY_UPSTREAM_DEV_FEE_ONCHAIN_NETWORK', 'mainnet'));
-}
-if (!defined('CASHUPAY_UPSTREAM_DEV_FEE_ONCHAIN_ADDRESS_TYPE')) {
-    define('CASHUPAY_UPSTREAM_DEV_FEE_ONCHAIN_ADDRESS_TYPE', $ff_env('CASHUPAY_UPSTREAM_DEV_FEE_ONCHAIN_ADDRESS_TYPE', 'P2WPKH'));
-}
 unset($ff_env);
 
-// Melt note tags written to the `melts.note` column.
+// Melt note tags written to the `melts.note` column. FEE_NOTE_UPSTREAM is the
+// tag of the retired 0.5% upstream dev fee — no new rows are written with it,
+// but historical rows still carry it and are read by computeOwed() (dev-fee
+// base) and the stats/diagnostics aggregations.
 const FEE_NOTE_UPSTREAM = 'UPSTREAM_DEV_FEE';
 const FEE_NOTE_DEV      = 'DEV_FEE';
 const FEE_NOTE_HOSTING  = 'HOSTING_FEE';
@@ -212,8 +199,8 @@ class MeltLog {
  */
 class DevFee {
     /**
-     * Settle dev / hosting / upstream fees for every store with accrued
-     * revenue. Called from cron.php as a separate task before auto-melt.
+     * Settle dev / hosting fees for every store with accrued revenue.
+     * Called from cron.php as a separate task before auto-melt.
      */
     public static function settleAllStores(): array {
         $results = [];
@@ -230,8 +217,8 @@ class DevFee {
     }
 
     /**
-     * Settle dev / hosting / upstream fees for a single store. Returns null
-     * if nothing was owed; otherwise an array describing what was attempted.
+     * Settle dev / hosting fees for a single store. Returns null if nothing
+     * was owed; otherwise an array describing what was attempted.
      */
     public static function settleStore(string $storeId): ?array {
         $owed = self::computeOwed($storeId);
@@ -242,19 +229,6 @@ class DevFee {
         $threshold = CASHUPAY_FEE_SETTLE_THRESHOLD_SATS;
         $outcomes = [];
 
-        // 1) Upstream dev fee first — counts as a network cost reducing the
-        //    dev-fee base, so paying it before the dev fee keeps the math
-        //    self-consistent within a single tick.
-        if ($owed['upstream_owed'] >= $threshold) {
-            $outcomes['upstream'] = self::payUpstream($storeId, $owed['upstream_owed']);
-            // After paying upstream, recompute so the dev fee math uses the
-            // updated upstream_paid.
-            if (($outcomes['upstream']['success'] ?? false) === true) {
-                $owed = self::computeOwed($storeId);
-            }
-        }
-
-        // 2) Dev fee.
         if ($owed['dev_owed'] >= $threshold) {
             $outcomes['dev'] = self::payViaLnurl(
                 $storeId,
@@ -264,7 +238,7 @@ class DevFee {
             );
         }
 
-        // 3) Hosting fee.
+        // Hosting fee.
         if ($owed['hosting_owed'] >= $threshold) {
             $store = Config::getStore($storeId);
             $hostingDest = $store['hosting_fee_destination'] ?? null;
@@ -295,7 +269,6 @@ class DevFee {
      * $graceSeconds avoids racing a settle pass that is finalizing right now.
      *
      * Only the LNURL fee path (dev + hosting) writes quote-bearing intents.
-     * The upstream token-sink path has no verifiable quote and is unchanged.
      */
     public static function reconcilePendingFeeMelts(int $graceSeconds = 120): array {
         $cutoff = time() - max(0, $graceSeconds);
@@ -361,15 +334,16 @@ class DevFee {
             [$storeId]
         )['s'];
 
+        // Historical total of the retired 0.5% upstream dev fee. No new
+        // upstream fee accrues or settles, but amounts already paid stay
+        // subtracted from the dev-fee base so existing deployments don't see
+        // their dev fee retroactively increase. 0 on fresh installs.
         $upstreamPaid = self::sumPaid($storeId, FEE_NOTE_UPSTREAM);
         $devPaid      = self::sumPaid($storeId, FEE_NOTE_DEV);
         $hostingPaid  = self::sumPaid($storeId, FEE_NOTE_HOSTING);
 
         $store = Config::getStore($storeId);
         $hostingPct = (float)($store['hosting_fee_percent'] ?? 0);
-
-        $upstreamBase = max(0, $revenue - $networkCost);
-        $upstreamOwed = max(0, (int) floor($upstreamBase * CASHUPAY_UPSTREAM_DEV_FEE_PERCENT / 100) - $upstreamPaid);
 
         $devBase = max(0, $revenue - $networkCost - $upstreamPaid);
         $devOwed = max(0, (int) floor($devBase * CASHUPAY_DEV_FEE_PERCENT / 100) - $devPaid);
@@ -378,21 +352,18 @@ class DevFee {
 
         $trialActive = FreeTrial::isActive();
         if ($trialActive) {
-            $upstreamOwed = 0;
             $devOwed = 0;
             $hostingOwed = 0;
         }
 
         // Stuck-funds absorption: sats currently stranded in a mint with a
         // pending withdrawal-failure flag come out of the dev share first
-        // (then upstream, then hosting) so the loss doesn't shift onto the
-        // merchant's settlement. Live read — once the mint recovers and the
-        // proofs drain or the flag clears, the next call returns 0 here.
+        // (then hosting) so the loss doesn't shift onto the merchant's
+        // settlement. Live read — once the mint recovers and the proofs
+        // drain or the flag clears, the next call returns 0 here.
         $stuckPerMint = StuckFunds::computeStuckSatsPerMint($storeId);
         $stuckTotal = array_sum($stuckPerMint);
-        $deduction = StuckFunds::applyDeduction(
-            $upstreamOwed, $devOwed, $hostingOwed, $stuckTotal
-        );
+        $deduction = StuckFunds::applyDeduction($devOwed, $hostingOwed, $stuckTotal);
 
         return [
             'revenue' => $revenue,
@@ -400,14 +371,12 @@ class DevFee {
             'upstream_paid' => $upstreamPaid,
             'dev_paid' => $devPaid,
             'hosting_paid' => $hostingPaid,
-            'upstream_owed' => $deduction['upstream_owed'],
             'dev_owed' => $deduction['dev_owed'],
             'hosting_owed' => $deduction['hosting_owed'],
             'trial_active' => $trialActive,
             'stuck_total_sats' => $deduction['stuck_total_sats'],
             'stuck_absorbed_total' => $deduction['stuck_absorbed_total'],
             'stuck_absorbed_dev' => $deduction['stuck_absorbed_dev'],
-            'stuck_absorbed_upstream' => $deduction['stuck_absorbed_upstream'],
             'stuck_absorbed_hosting' => $deduction['stuck_absorbed_hosting'],
             'stuck_uncovered' => $deduction['stuck_uncovered'],
             'stuck_per_mint' => $stuckPerMint,
@@ -420,46 +389,6 @@ class DevFee {
             [$storeId, $note]
         );
         return (int)($row['s'] ?? 0);
-    }
-
-    /**
-     * Pay the upstream dev fee in mint units via the existing Cashu-token
-     * sink (cypherpunk.today). The owed amount is in sats; we convert to
-     * the store's mint unit before splitting proofs.
-     */
-    private static function payUpstream(string $storeId, int $owedSats): array {
-        $store = Config::getStore($storeId);
-        $mintUnit = strtolower($store['mint_unit'] ?? 'sat');
-        $isFiatMint = !in_array($mintUnit, ['sat', 'sats', 'msat']);
-
-        if ($isFiatMint) {
-            $providers = Config::getStorePriceProviders($storeId);
-            $amountInMintUnit = (int) ExchangeRates::convertSatsToMintUnit(
-                $owedSats, $mintUnit, $providers['primary'], $providers['secondary']
-            );
-        } else {
-            $amountInMintUnit = $owedSats;
-        }
-
-        if ($amountInMintUnit < 1) {
-            return ['success' => false, 'error' => 'amount too small after conversion'];
-        }
-
-        $send = UpstreamDevFee::sendToSink($storeId, $amountInMintUnit);
-        if (($send['success'] ?? false) !== true) {
-            return ['success' => false, 'error' => $send['error'] ?? 'unknown'];
-        }
-
-        MeltLog::record(
-            $storeId,
-            $owedSats,
-            0,
-            CASHUPAY_UPSTREAM_DEV_FEE_SINK_URL,
-            null,
-            FEE_NOTE_UPSTREAM
-        );
-
-        return ['success' => true, 'amount_sats' => $owedSats];
     }
 
     /**

@@ -1034,7 +1034,6 @@ if (isset($_GET['api'])) {
                     'stuckTotalSats' => $stuckTotal,
                     'absorbedTotalSats' => (int)($owed['stuck_absorbed_total'] ?? 0),
                     'absorbedDevSats' => (int)($owed['stuck_absorbed_dev'] ?? 0),
-                    'absorbedUpstreamSats' => (int)($owed['stuck_absorbed_upstream'] ?? 0),
                     'absorbedHostingSats' => (int)($owed['stuck_absorbed_hosting'] ?? 0),
                     'uncoveredSats' => (int)($owed['stuck_uncovered'] ?? 0),
                     'mints' => $mintsOut,
@@ -2911,7 +2910,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     throw new Exception('Amount required');
                 }
 
-                // Fees (upstream dev / dev / hosting) are no longer assessed on
+                // Fees (dev / hosting) are no longer assessed on
                 // manual withdrawals — they settle on the cron fee-settlement
                 // tick (see DevFee::settleStore) against accumulated revenue.
                 if ($isLightningDestination && $isFiatMint && $amountIsSats) {
@@ -5752,9 +5751,11 @@ header('Cache-Control: no-cache, must-revalidate');
                         </div>
                         <div class="card-body">
                             <p style="font-size: 0.85rem; color: var(--text-secondary); margin: 0 0 0.75rem 0;">
-                                When your customers try to pay with lightning, let them, but have them
-                                automatically pay the lightning -&gt; on-chain conversion fee (around 10c
-                                in low fee environments). Requires an on-chain xpub on the Bitcoin tab.
+                                When your customers try to pay with lightning and you have no viable
+                                lightning destination (LNURL provider down, no inbound liquidity, etc),
+                                let them, but have them automatically pay the lightning -&gt; on-chain
+                                conversion fee (around 10c in low fee environments). Requires an
+                                on-chain xpub on the Bitcoin tab.
                                 Site default: <strong id="store-swaps-site-default">&mdash;</strong>.
                             </p>
                             <?php if ($gmpEnvError !== null): ?>
@@ -6108,8 +6109,7 @@ header('Cache-Control: no-cache, must-revalidate');
                                 Intended for white-label deployers who collect a deployment fee. Default 0%.
                                 Settled automatically on the cron tick once at least
                                 <?= (int) (defined('CASHUPAY_FEE_SETTLE_THRESHOLD_SATS') ? CASHUPAY_FEE_SETTLE_THRESHOLD_SATS : 1000) ?> sats are owed.
-                                The mandatory <?= (int) CASHUPAY_DEV_FEE_PERCENT ?>% development fee
-                                and <?= number_format(CASHUPAY_UPSTREAM_DEV_FEE_PERCENT, 1) ?>% upstream dev fee are not configurable here.
+                                The mandatory <?= (int) CASHUPAY_DEV_FEE_PERCENT ?>% development fee is not configurable here.
                             </p>
                             <div class="form-group">
                                 <label class="form-label">Hosting Fee (%)</label>
@@ -6859,7 +6859,7 @@ header('Cache-Control: no-cache, must-revalidate');
                         <p style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 0.75rem;">
                             Sats currently held in a mint whose last withdrawal attempt failed.
                             While funds are stuck, the equivalent amount is deducted from owed dev
-                            fees (then upstream, then hosting) so any unrecoverable loss comes out
+                            fees (then hosting) so any unrecoverable loss comes out
                             of the operator share, not the merchant. Once a withdrawal succeeds
                             against that mint, the deduction stops automatically.
                         </p>
@@ -7028,10 +7028,7 @@ header('Cache-Control: no-cache, must-revalidate');
                         <div id="stats-free-trial-banner" class="hidden" style="margin-bottom: 1rem; padding: 0.75rem 1rem; border-radius: 8px; font-size: 0.9rem; line-height: 1.4;"></div>
                         <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1rem;">
                             <div>
-                                <div class="stats-stat-row" title="Donated to upstream development (cypherpunk.today). 0.5% of (revenue − network costs).">
-                                    <span class="stats-stat-label">Upstream dev fee</span><span class="stats-stat-value" id="stats-fee-upstream-paid">—</span>
-                                </div>
-                                <div class="stats-stat-row" title="Dev fee from your deployment configuration. <?= (int) CASHUPAY_DEV_FEE_PERCENT ?>% of (revenue − network costs − upstream paid).">
+                                <div class="stats-stat-row" title="Dev fee from your deployment configuration. <?= (int) CASHUPAY_DEV_FEE_PERCENT ?>% of (revenue − network costs).">
                                     <span class="stats-stat-label">Dev fee</span><span class="stats-stat-value" id="stats-fee-dev-paid">—</span>
                                 </div>
                                 <div class="stats-stat-row" title="Hosting / referral / deployment fee, configured per-store and paid to the hosting destination.">
@@ -9100,7 +9097,6 @@ header('Cache-Control: no-cache, must-revalidate');
             document.getElementById('stats-total-fees').innerHTML = formatStatsAmount(s.fees_paid.total);
             document.getElementById('stats-profit').innerHTML = formatStatsAmount(s.profit_sats);
 
-            document.getElementById('stats-fee-upstream-paid').innerHTML = formatStatsAmount(s.fees_paid.upstream);
             document.getElementById('stats-fee-dev-paid').innerHTML = formatStatsAmount(s.fees_paid.dev);
             document.getElementById('stats-fee-hosting-paid').innerHTML = formatStatsAmount(s.fees_paid.hosting);
             document.getElementById('stats-fee-network-paid').innerHTML = formatStatsAmount(s.fees_paid.network);
@@ -9150,7 +9146,7 @@ header('Cache-Control: no-cache, must-revalidate');
                 el.style.background = 'rgba(16, 185, 129, 0.12)';
                 el.style.border = '1px solid rgba(16, 185, 129, 0.4)';
                 el.style.color = 'inherit';
-                el.innerHTML = `<strong>Free trial active</strong> — no upstream, dev, or hosting fees will be charged ${conds.join(joiner)}. Network fees (Lightning routing) still apply.`;
+                el.innerHTML = `<strong>Free trial active</strong> — no dev or hosting fees will be charged ${conds.join(joiner)}. Network fees (Lightning routing) still apply.`;
                 el.classList.remove('hidden');
             } else if (ft.expired_at) {
                 const reasonLabel = ft.expired_reason === 'revenue'
@@ -13049,7 +13045,6 @@ header('Cache-Control: no-cache, must-revalidate');
                                 ${Number(s.stuckTotalSats || 0).toLocaleString()} sats stuck &middot;
                                 ${Number(s.absorbedTotalSats || 0).toLocaleString()} sats absorbed
                                 (${Number(s.absorbedDevSats || 0).toLocaleString()} dev,
-                                ${Number(s.absorbedUpstreamSats || 0).toLocaleString()} upstream,
                                 ${Number(s.absorbedHostingSats || 0).toLocaleString()} hosting)${uncoveredNote}
                             </div>
                             ${mintsHtml}

@@ -3,8 +3,8 @@
  * CashuPayServer — Fee-Redirect Module
  *
  * Decides, at invoice-creation time, whether an invoice's payment should be
- * pointed straight at a fee destination (dev / upstream / hosting) instead of
- * the merchant, and builds the rail destinations when it should.
+ * pointed straight at a fee destination (dev / hosting) instead of the
+ * merchant, and builds the rail destinations when it should.
  *
  * Why: fees are normally accrued and later melted out of the merchant's cashu
  * wallet by the cron (see DevFee::settleStore). That path is kept. This module
@@ -28,9 +28,9 @@
  *     on-chain -> merchant. Whichever rail the customer actually pays decides
  *     whether this settlement is a fee payment or a merchant payment
  *     (see Invoice::railIsFeeRouted). We never disable a payment type.
- *   - Upstream, dev and hosting all participate. Upstream/dev destinations are
- *     global config; hosting's are per-store. A fee with no destination for a
- *     given rail simply can't cover that rail (that rail goes to the merchant).
+ *   - Dev and hosting both participate. Dev destinations are global config;
+ *     hosting's are per-store. A fee with no destination for a given rail
+ *     simply can't cover that rail (that rail goes to the merchant).
  *   - We never split rails across DIFFERENT fee payees on one invoice; a
  *     single fee owns whichever rails it covers, the merchant owns the rest.
  *
@@ -59,15 +59,6 @@ class FeeRedirect {
      */
     public static function candidates(array $store, array $owed): array {
         $list = [
-            [
-                'key'     => 'upstream',
-                'note'    => FEE_NOTE_UPSTREAM,
-                'owed'    => (int)($owed['upstream_owed'] ?? 0),
-                'lnurl'   => (string)CASHUPAY_UPSTREAM_DEV_FEE_LNURL,
-                'xpub'    => (string)CASHUPAY_UPSTREAM_DEV_FEE_ONCHAIN_XPUB,
-                'network' => (string)CASHUPAY_UPSTREAM_DEV_FEE_ONCHAIN_NETWORK,
-                'type'    => (string)CASHUPAY_UPSTREAM_DEV_FEE_ONCHAIN_ADDRESS_TYPE,
-            ],
             [
                 'key'     => 'dev',
                 'note'    => FEE_NOTE_DEV,

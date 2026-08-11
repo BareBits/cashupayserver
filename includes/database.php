@@ -673,7 +673,7 @@ HTACCESS;
         }
 
         // Fee-redirect feature: invoices whose entire payment is pointed at a
-        // fee destination (dev / upstream / hosting) instead of the merchant.
+        // fee destination (dev / hosting) instead of the merchant.
         //   - invoices.fee_redirect_note: which fee this invoice settles
         //     (one of the FEE_NOTE_* tags) or NULL for a normal invoice.
         //   - invoices.fee_redirect_destination: the LNURL / xpub-derived
@@ -725,9 +725,9 @@ HTACCESS;
             $pdo->exec("CREATE UNIQUE INDEX idx_melts_redirect_once ON melts(invoice_id) WHERE via = 'redirect';");
         }
 
-        // Per-store on-chain destination for the hosting fee. The dev and
-        // upstream fee on-chain xpubs are global config (see dev_fee.php);
-        // hosting is per-store because each deployer's hosting payout differs.
+        // Per-store on-chain destination for the hosting fee. The dev fee
+        // on-chain xpub is global config (see dev_fee.php); hosting is
+        // per-store because each deployer's hosting payout differs.
         // Written directly via Database::update (NOT the Config::updateStore
         // allowlist) and intentionally absent from the settings UI.
         if (!self::columnExists($pdo, 'stores', 'hosting_fee_onchain_xpub')) {

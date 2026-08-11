@@ -39,8 +39,7 @@
 // =============================================================================
 // FREE TRIAL  (seeded once on first migration)
 // =============================================================================
-// While a free trial is active, all three platform fees are waived:
-//   - upstream dev fee (0.5%)
+// While a free trial is active, the platform fees are waived:
 //   - dev fee (1%)
 //   - per-store hosting fee
 // Network fees (Lightning routing, on-chain miner fees) are real sats spent
@@ -231,7 +230,7 @@
 // When a store has an auto-cashout Lightning address configured and the
 // host supports LUD-21 verify URLs, incoming Lightning payments route
 // directly to that address instead of through the cashu mint. An invoice
-// smaller than the accumulated upstream/dev/hosting fees the store owes
+// smaller than the accumulated dev/hosting fees the store owes
 // routes via the mint instead, so the resulting balance can cover the
 // owed fees before the merchant payout.
 //

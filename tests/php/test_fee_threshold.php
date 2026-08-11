@@ -27,24 +27,20 @@ function add_paid_invoice(string $storeId, int $sats): void {
     ]);
 }
 
-// Revenue = 100 sats. upstream_owed = 0 (floor(100 * 0.005)=0), dev_owed=2,
-// hosting_owed=0. All below 1000-sat threshold.
+// Revenue = 100 sats. dev_owed=1, hosting_owed=0. All below 1000-sat threshold.
 add_paid_invoice($store, 100);
 $o = DevFee::computeOwed($store);
 assert_eq(100, $o['revenue']);
-assert_true($o['upstream_owed'] < 1000, 'upstream below threshold');
 assert_true($o['dev_owed'] < 1000, 'dev below threshold');
 assert_true($o['hosting_owed'] < 1000, 'hosting below threshold');
 
-// Bump revenue so dev fee crosses 1000 (need dev_owed ≥ 1000 → revenue ≥ 50000).
+// Bump revenue so dev fee crosses 1000 (need dev_owed ≥ 1000 → revenue ≥ 100000).
 //   revenue = 250_000 sats
-//   upstream_owed = floor(250000 * 0.005) = 1250  ← ≥ 1000 ✓
-//   dev_base = 250000 - 0 - 0 = 250000 → floor * 0.02 = 5000 ← ≥ 1000 ✓
+//   dev_base = 250000 - 0 - 0 = 250000 → floor * 0.01 = 2500 ← ≥ 1000 ✓
 //   hosting_owed = 0 (hosting % still 0)
 add_paid_invoice($store, 249900);
 $o = DevFee::computeOwed($store);
 assert_eq(250000, $o['revenue']);
-assert_true($o['upstream_owed'] >= 1000, 'upstream now above threshold');
 assert_true($o['dev_owed'] >= 1000, 'dev now above threshold');
 assert_eq(0, $o['hosting_owed'], 'hosting still zero (no % set)');
 

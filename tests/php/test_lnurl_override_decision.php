@@ -5,7 +5,7 @@
  *   invoiceAmount < feesDue  →  override (reason=fees_due)
  *
  * The override only fires when the invoice on its own can't cover the
- * accumulated upstream/dev/hosting fees the operator owes. Larger invoices
+ * accumulated dev/hosting fees the operator owes. Larger invoices
  * take the LNURL direct path even with some fees outstanding — the next
  * small invoice (or the cron) will catch the debt up.
  *
