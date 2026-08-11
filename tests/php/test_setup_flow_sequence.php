@@ -39,7 +39,44 @@ assert_eq('terms', $withOnchain[0], 'a first run opens on the terms-of-service g
 $wp = SetupFlow::stepSequence('', true, true);
 assert_false(in_array('password', $wp, true), 'WordPress mode supplies its own auth');
 assert_eq('terms', $wp[0], 'WordPress mode still opens on the terms gate');
-assert_eq(10, count($wp), 'WordPress with on-chain is one screen shorter than standalone');
+assert_eq(
+    ['terms', 'security', 'store', 'onchain', 'zeroconf', 'lightning', 'swaps', 'mints', 'discount', 'cron', 'done'],
+    $wp,
+    'WordPress swaps the password screen for the Bitcoin-discount screen'
+);
+
+// --- The Bitcoin-discount screen is WordPress-only ------------------------
+//
+// It configures a WooCommerce checkout discount, so outside WordPress there
+// is nothing for it to act on; and it sits after mints, meaning it renders
+// post-setup_complete and must survive the redirect-if-set-up guard.
+assert_false(in_array('discount', $withOnchain, true), 'standalone installs never see the discount screen');
+assert_false(in_array('discount', $noOnchain, true), 'standalone without on-chain never sees it either');
+assert_eq('discount', SetupFlow::nextStep('mints', $wp), 'in WordPress the discount screen follows mints');
+assert_eq('cron', SetupFlow::nextStep('discount', $wp), 'and cron follows the discount screen');
+assert_eq('cron', SetupFlow::nextStep('mints', $withOnchain), 'standalone still goes mints straight to cron');
+assert_true(
+    in_array('discount', SetupFlow::POST_COMPLETION, true),
+    'discount renders after setup_complete and must survive the redirect guard'
+);
+assert_null(SetupFlow::backStep('discount', $wp), 'discount is past the point of no return — no Back');
+assert_true(SetupFlow::isKnownStep('discount'), 'discount is a real screen');
+
+// --- Discount percent parsing ---------------------------------------------
+//
+// Whole numbers 0–100 only; the ELEX plugin that applies the discount blocks
+// fractional values in its own settings form, so accepting them here would
+// strand the merchant later. Empty means "no discount", not an error.
+assert_eq(0, SetupFlow::parseDiscountPercent(''), 'empty input reads as declining the discount');
+assert_eq(0, SetupFlow::parseDiscountPercent('0'), 'zero is a valid answer');
+assert_eq(2, SetupFlow::parseDiscountPercent(' 2 '), 'surrounding whitespace is tolerated');
+assert_eq(100, SetupFlow::parseDiscountPercent('100'), 'the top of the range is inclusive');
+assert_null(SetupFlow::parseDiscountPercent('101'), 'above 100 is rejected');
+assert_null(SetupFlow::parseDiscountPercent('-1'), 'negative is rejected');
+assert_null(SetupFlow::parseDiscountPercent('1.5'), 'fractional values are rejected, not rounded');
+assert_null(SetupFlow::parseDiscountPercent('2,5'), 'comma decimals are rejected too');
+assert_null(SetupFlow::parseDiscountPercent('abc'), 'non-numeric input is rejected');
+assert_null(SetupFlow::parseDiscountPercent('1e2'), 'scientific notation is not a percent');
 
 // --- add_store mode runs only the store-scoped screens --------------------
 
@@ -58,6 +95,9 @@ assert_eq('store', SetupFlow::firstStep('add_store'), 'add_store opens on the st
 assert_eq('terms', SetupFlow::firstStep(''), 'a first run opens on the terms gate');
 // add_store belongs to an already-configured instance, so it never re-shows terms.
 assert_false(in_array('terms', $addStore, true), 'add_store never re-shows the terms gate');
+// The Bitcoin discount is a site-wide WooCommerce setting, not a per-store
+// one — asking again while adding a second store would silently rewrite it.
+assert_false(in_array('discount', $addStore, true), 'add_store never shows the discount screen');
 
 // --- next / prev ----------------------------------------------------------
 

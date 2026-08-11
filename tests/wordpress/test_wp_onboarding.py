@@ -77,10 +77,10 @@ def test_wizard_skips_the_password_screen_and_completes(wp_ready) -> None:
 
     body = w.get("security")
     assert wizard_heading(body) == "Quick safety check", wizard_heading(body)
-    # 9 screens, not the standalone 10 — the password screen is absent (the
-    # terms gate and safety check remain), and zero-conf has not joined yet
+    # 10 screens, not the standalone 10: WordPress drops the password screen
+    # but gains the Bitcoin-discount screen, and zero-conf has not joined yet
     # because no on-chain rail exists.
-    assert "of 9" in body, "WordPress with no on-chain rail should be 9 screens"
+    assert "of 10" in body, "WordPress with no on-chain rail should be 10 screens"
 
     body = w.post(step="security", security_acknowledged="1")
     assert wizard_heading(body) == "Let's name your store", (
@@ -101,6 +101,22 @@ def test_wizard_skips_the_password_screen_and_completes(wp_ready) -> None:
     assert wizard_error(body) is None, wizard_error(body)
     body = w.post(step="mints", mints_enabled="0")
     assert wizard_error(body) is None, wizard_error(body)
+    # WordPress-only screen: the Bitcoin checkout discount. It renders after
+    # setup_complete flips (the mints screen set it), which is exactly the
+    # path that breaks if the step is missing from POST_COMPLETION.
+    assert wizard_heading(body) == "Offer a discount to customers paying in Bitcoin?", (
+        f"WordPress mode must show the discount screen after mints, landed on {wizard_heading(body)!r}"
+    )
+    assert "Elex Discount Per Payment Method" in body, (
+        "the discount screen must name the plugin it would install"
+    )
+
+    # An out-of-range answer re-renders the screen with an error...
+    body = w.post(step="discount", btc_discount_percent="101")
+    assert wizard_error(body) is not None, "101% must be rejected"
+    # ...and a valid whole number advances to the cron screen.
+    body = w.post(step="discount", btc_discount_percent="2")
+    assert wizard_error(body) is None, wizard_error(body)
     assert wizard_heading(body) == "Enable cron", wizard_heading(body)
 
     # The completion screen is where the WordPress-only branches live.
@@ -119,6 +135,12 @@ def test_wizard_skips_the_password_screen_and_completes(wp_ready) -> None:
         assert db.execute(
             "SELECT value FROM config WHERE key = 'setup_complete'"
         ).fetchone()[0] == "true"
+        # The discount answer is saved site-wide; the ELEX plugin install is
+        # deferred to the completion screen and (correctly) did not run here —
+        # this bare WordPress has no WooCommerce for it to act on.
+        assert db.execute(
+            "SELECT value FROM config WHERE key = 'wp_btc_discount_percent'"
+        ).fetchone()[0] == "2"
         store = db.execute("SELECT * FROM stores WHERE name = 'WP Wizard Store'").fetchone()
         assert store is not None
         assert store["onchain_xpub"] == MAINNET_XPUB
