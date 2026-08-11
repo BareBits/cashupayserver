@@ -109,6 +109,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'send_
     require_once __DIR__ . '/includes/notification_sender.php';
     header('Content-Type: application/json');
 
+    // WordPress installs don't render the email/newsletter form (WooCommerce
+    // owns customer emails there), so reject the endpoint outright rather
+    // than trusting the client not to POST.
+    if (Urls::isWordPress()) {
+        cashupay_status(404);
+        echo json_encode(['error' => 'Not available.']);
+        exit;
+    }
+
     if ($invoice['status'] !== 'Settled') {
         cashupay_status(400);
         echo json_encode(['error' => 'Invoice is not paid yet.']);
@@ -176,14 +185,17 @@ $invoiceNote = is_array($invoiceMetadata) ? trim((string)($invoiceMetadata['item
 
 // Decide whether to render the payer-receipt form. The check is composed of
 // site-wide master switch + per-type toggle + SMTP. When false, the success
-// modal shows a "screenshot this page" fallback instead.
+// modal shows a "screenshot this page" fallback instead. WordPress installs
+// never render the email/newsletter form at all — WooCommerce owns customer
+// emails and order confirmations there — so they always get the fallback.
 require_once __DIR__ . '/includes/notification_sender.php';
-$payerReceiptOffered = NotificationSender::isPayerReceiptOffered();
+$emailFormOffered = !Urls::isWordPress();
+$payerReceiptOffered = $emailFormOffered && NotificationSender::isPayerReceiptOffered();
 
 // Resolve the newsletter checkbox's initial state for this store (per-store
 // override → site-wide default). The email/newsletter capture form is shown
 // regardless of whether receipts are offered.
-$newsletterDefaultChecked = Config::getNewsletterDefaultChecked($invoice['store_id']);
+$newsletterDefaultChecked = $emailFormOffered && Config::getNewsletterDefaultChecked($invoice['store_id']);
 
 // Format amount for display - use store's mint unit
 $mintUnit = Config::getStoreMintUnit($invoice['store_id']);
@@ -1068,6 +1080,7 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                     <div><span class="label">Note:</span><span class="invoice-note-value"><?= htmlspecialchars($invoiceNote) ?></span></div>
                     <?php endif; ?>
                 </div>
+                <?php if ($emailFormOffered): ?>
                 <form class="receipt-form" id="receipt-form" data-receipt-offered="<?= $payerReceiptOffered ? '1' : '0' ?>" novalidate>
                     <div class="receipt-prompt">
                         <?= $payerReceiptOffered ? 'Email me a payment confirmation' : 'Leave your email' ?>
@@ -1083,6 +1096,7 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                     <button type="button" class="receipt-skip" id="receipt-skip">No thanks</button>
                     <div class="receipt-status hidden" id="receipt-status"></div>
                 </form>
+                <?php endif; ?>
                 <?php if (!$payerReceiptOffered): ?>
                 <div class="receipt-fallback">
                     Screenshot this page or save your invoice ID for your records.
