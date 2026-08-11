@@ -1,6 +1,6 @@
 <?php
 /**
- * Plugin Name: BareBits - Lightning Payments via Bitcoin
+ * Plugin Name: BareBits - Easy Bitcoin + Lightning Payments
  * Plugin URI: https://github.com/BareBits/cashupayserver
  * Description: Accept Bitcoin payments (on-chain and lightning). No approval process, no middlemen. 1% fee.
  * Version: 1.2
