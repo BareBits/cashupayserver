@@ -133,12 +133,12 @@ def test_completion_screen_applies_the_wizard_discount(woocommerce) -> None:
     assert wizard_heading(body) == "Offer a discount to customers paying in Bitcoin?", (
         wizard_heading(body)
     )
+    # With the WP-cron loopback working (CI's WordPress fixture passes the
+    # self-test), the wizard skips the manual-cron screen, so the discount
+    # POST's own response is the completion screen. That render runs the
+    # WooCommerce wiring and, once that reports ready, the discount
+    # follow-through.
     body = w.post(step="discount", btc_discount_percent="3")
-    assert wizard_error(body) is None, wizard_error(body)
-
-    # The completion screen runs the WooCommerce wiring and, once that reports
-    # ready, the discount follow-through — all during this render.
-    body = w.post(step="cron")
     assert wizard_error(body) is None, wizard_error(body)
     assert "WooCommerce is wired up" in body, body[:500]
     assert "3% Bitcoin discount is live at checkout" in body, (
@@ -153,7 +153,9 @@ def test_completion_screen_applies_the_wizard_discount(woocommerce) -> None:
 
     # A refresh of the completion screen must not disturb the rule. (With
     # everything wired the session was cleared, so the refreshed page renders
-    # the generic completion screen — no re-run, no duplicate.)
+    # the generic completion screen — no re-run, no duplicate. The tail-post
+    # guard admits this post-completion POST even though the cron screen was
+    # skipped on the way through.)
     body = w.post(step="cron")
     assert wizard_error(body) is None, wizard_error(body)
     assert len(_rules(wp)) == 1, "a completion-screen refresh must not duplicate the rule"
