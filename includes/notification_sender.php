@@ -158,6 +158,52 @@ class NotificationSender {
     }
 
     /**
+     * Queue payer receipts that were requested before settlement (the payer
+     * left their email on the on-chain "payment detected" screen while the tx
+     * was still confirming). Settlement happens on several rails with no
+     * shared choke-point, so this is a sweep: the payment page's status poll
+     * calls it for its own invoice (instant receipt while the tab is open)
+     * and cron calls it for everything (payer walked away). The CAS on
+     * payer_receipt_requested makes each request queue at most one receipt
+     * even when both callers race.
+     *
+     * Returns the number of receipts queued.
+     */
+    public static function flushRequestedPayerReceipts(?string $invoiceId = null): int {
+        $sql = "SELECT * FROM invoices
+                WHERE status = 'Settled' AND payer_receipt_requested = 1
+                  AND customer_email IS NOT NULL AND customer_email != ''";
+        $params = [];
+        if ($invoiceId !== null) {
+            $sql .= " AND id = ?";
+            $params[] = $invoiceId;
+        }
+
+        $queued = 0;
+        foreach (Database::fetchAll($sql, $params) as $invoice) {
+            $claimed = Database::update(
+                'invoices',
+                ['payer_receipt_requested' => 0],
+                'id = ? AND payer_receipt_requested = 1',
+                [$invoice['id']]
+            );
+            if ($claimed !== 1) {
+                continue; // another caller already claimed this request
+            }
+            // If receipts were switched off between the request and settlement,
+            // the claim still clears the flag — the email stays saved on the
+            // invoice, mirroring the settled-page behaviour when receipts are
+            // not offered.
+            if (self::isPayerReceiptOffered()) {
+                if (self::queuePayerReceipt($invoice, (string)$invoice['customer_email'])) {
+                    $queued++;
+                }
+            }
+        }
+        return $queued;
+    }
+
+    /**
      * Build the plain-text body of a payer-facing payment confirmation.
      * Format mirrors the operator-facing InvoicePaid template — same
      * label-aligned style, plus payment-method-specific lines (on-chain

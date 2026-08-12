@@ -102,7 +102,7 @@ class Database {
             // that migration ran — getInstance() will then trigger runMigrations()
             // on existing installs that haven't yet picked it up. All migrations
             // are idempotent, so a fire is safe.
-            $hasLatestMigration = $hasConfig && self::columnExists(self::$instance, 'stores', 'onchain_offer_enabled');
+            $hasLatestMigration = $hasConfig && self::columnExists(self::$instance, 'invoices', 'payer_receipt_requested');
             // The auto-withdraw → auto-cashout rename is a data-only migration
             // (config key + notification event labels) with no schema artifact
             // to mark it done, so probe for the legacy config key directly. The
@@ -308,6 +308,11 @@ HTACCESS;
             -- submits the form; 0/1 once they do. See payment.php capture path.
             customer_email TEXT DEFAULT NULL,
             newsletter_opt_in INTEGER DEFAULT NULL,
+            -- Set when the payer submits their email while an on-chain payment
+            -- is still confirming (unified detected/complete screen). The
+            -- receipt is queued once the invoice settles (payment-page poll +
+            -- cron sweep), then the flag is cleared.
+            payer_receipt_requested INTEGER NOT NULL DEFAULT 0,
             FOREIGN KEY (store_id) REFERENCES stores(id) ON DELETE CASCADE
         );
 
@@ -1556,13 +1561,21 @@ HTACCESS;
         // stranded intent against the mint's melt-quote state (PAID -> finalize,
         // UNPAID -> drop and retry). `status` defaults to 'paid' so existing
         // rows and every non-fee caller (user withdraw, auto-melt) are
-        // unaffected. melts.melt_quote_id is this set's "latest" marker (see
-        // getInstance), so these two must stay last.
+        // unaffected.
         if (!self::columnExists($pdo, 'melts', 'status')) {
             $pdo->exec("ALTER TABLE melts ADD COLUMN status TEXT NOT NULL DEFAULT 'paid'");
         }
         if (!self::columnExists($pdo, 'melts', 'melt_quote_id')) {
             $pdo->exec("ALTER TABLE melts ADD COLUMN melt_quote_id TEXT DEFAULT NULL");
+        }
+
+        // Payer receipt requested before settlement: the unified on-chain
+        // "payment detected" screen lets the payer leave their email while the
+        // tx is still confirming; the receipt itself is queued at settlement.
+        // This is the "latest" migration marker (see getInstance), so it stays
+        // last.
+        if (!self::columnExists($pdo, 'invoices', 'payer_receipt_requested')) {
+            $pdo->exec("ALTER TABLE invoices ADD COLUMN payer_receipt_requested INTEGER NOT NULL DEFAULT 0");
         }
     }
 
