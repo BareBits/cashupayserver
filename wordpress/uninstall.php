@@ -30,6 +30,9 @@ if ($timestamp) {
 // Remove rewrite-version marker so a reinstall flushes again.
 delete_option('cashupay_rewrite_version');
 
+// Remove review-banner dismissal state.
+delete_option('cashupay_review_banner');
+
 // Flush rewrite rules
 flush_rewrite_rules();
 
