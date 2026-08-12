@@ -32,6 +32,43 @@ if (empty($invoiceId)) {
     exit;
 }
 
+/**
+ * Public mempool.space URL for the invoice's first-seen on-chain tx, or null
+ * when none has been observed. First-seen matches the admin invoices view
+ * when several txs pay the same address. The store's network picks the
+ * explorer path; regtest has no public explorer so it falls back to the
+ * mainnet URL (same behavior as the admin UI's mempoolUrl helper). Always
+ * links the public explorer even when detection runs against a custom
+ * Esplora backend — the configured URL is an API base, not a browsable site.
+ */
+function cashupay_onchain_tx_url(array $invoice): ?string {
+    // Rows exist only once a tx is seen; skip the lookup for states that
+    // cannot have one (New/Expired) to keep the 2 s poll cheap.
+    if ($invoice['status'] !== 'Settled'
+            && !($invoice['status'] === 'Processing' && !empty($invoice['onchain_first_seen_at']))) {
+        return null;
+    }
+    $oc = Database::fetchOne(
+        "SELECT txid FROM onchain_payments
+          WHERE invoice_id = ?
+          ORDER BY first_seen_at ASC, id ASC
+          LIMIT 1",
+        [$invoice['id']]
+    );
+    if (!$oc || empty($oc['txid'])) {
+        return null;
+    }
+    $store = Database::fetchOne(
+        "SELECT onchain_network FROM stores WHERE id = ?",
+        [$invoice['store_id']]
+    );
+    $network = $store['onchain_network'] ?? 'mainnet';
+    $base = $network === 'testnet' ? 'https://mempool.space/testnet'
+          : ($network === 'signet' ? 'https://mempool.space/signet'
+          : 'https://mempool.space');
+    return $base . '/tx/' . rawurlencode($oc['txid']);
+}
+
 // CLINK noffer receipt endpoint: the payment page holds a live Nostr
 // subscription (native WebSocket) for the merchant's kind-21001 payment
 // receipt and forwards the raw signed event here. We verify the merchant's
@@ -84,6 +121,10 @@ if (isset($_GET['json'])) {
         // yet confirmed — drives the "waiting for on-chain confirmation" copy.
         'onchainPending' => $invoice['status'] === 'Processing'
             && !empty($invoice['onchain_first_seen_at']),
+        // Explorer link for the detected on-chain tx; null for non-on-chain
+        // payments. Sent while confirming AND after settlement so the link
+        // survives the pending -> settled transition.
+        'onchainTxUrl' => cashupay_onchain_tx_url($invoice),
     ]);
     exit;
 }
@@ -243,6 +284,12 @@ $newsletterDefaultChecked = $emailFormOffered && Config::getNewsletterDefaultChe
 // payment).
 $onchainPendingInitial = $invoice['status'] === 'Processing'
     && !empty($invoice['onchain_first_seen_at']);
+
+// Explorer link for the detected on-chain tx (null for non-on-chain
+// payments). Rendered on the unified screen in both pending and settled
+// modes; the poll also carries it so JS can inject the link when the tx is
+// detected while the page is open.
+$onchainTxUrl = cashupay_onchain_tx_url($invoice);
 
 // Format amount for display - use store's mint unit
 $mintUnit = Config::getStoreMintUnit($invoice['store_id']);
@@ -730,6 +777,19 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
             text-align: center;
         }
 
+        /* Explorer link for the detected on-chain tx. Visible in both the
+           pending and settled modes of the unified screen. */
+        .onchain-tx-link {
+            display: inline-block;
+            color: #63b3ed;
+            font-size: 0.85rem;
+            margin: 0 0 0.5rem;
+            text-decoration: underline;
+        }
+        .onchain-tx-link.hidden {
+            display: none;
+        }
+
         .hidden {
             display: none;
         }
@@ -1157,6 +1217,14 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                     close this window. Confirmation usually takes up to 10 minutes, but
                     may take longer if you elected to pay a low network fee.
                 </p>
+                <!-- Explorer link for the detected tx. Always in the DOM so the
+                     poll can populate it when the tx is detected mid-session;
+                     shown in both pending and settled modes once a txid is
+                     known (setSuccessMode deliberately doesn't toggle it). -->
+                <a class="onchain-tx-link <?= $onchainTxUrl ? '' : 'hidden' ?>" id="onchain-tx-link"
+                   href="<?= htmlspecialchars($onchainTxUrl ?? '') ?>" target="_blank" rel="noopener">
+                    View transaction on mempool.space
+                </a>
                 <div class="invoice-details">
                     <div><span class="label">Invoice:</span><span class="invoice-id-value"><?= htmlspecialchars($invoice['id']) ?></span></div>
                     <?php if ($invoiceNote !== ''): ?>
@@ -1495,6 +1563,17 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                 pollUrl.searchParams.set('json', '1');
                 const response = await fetch(pollUrl.toString());
                 const data = await response.json();
+
+                // Populate the explorer link as soon as the poll knows the
+                // txid; independent of the status transition below so a page
+                // that already shows the pending screen still picks it up.
+                if (data.onchainTxUrl) {
+                    const txLink = document.getElementById('onchain-tx-link');
+                    if (txLink) {
+                        txLink.href = data.onchainTxUrl;
+                        txLink.classList.remove('hidden');
+                    }
+                }
 
                 const onchainPending = !!data.onchainPending;
                 if (data.status !== currentStatus || onchainPending !== currentOnchainPending) {
