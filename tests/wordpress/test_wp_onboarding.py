@@ -114,15 +114,19 @@ def test_wizard_skips_the_password_screen_and_completes(wp_ready) -> None:
     # An out-of-range answer re-renders the screen with an error...
     body = w.post(step="discount", btc_discount_percent="101")
     assert wizard_error(body) is not None, "101% must be rejected"
-    # ...and a valid whole number advances to the cron screen.
+    # ...and a valid whole number skips the cron screen entirely: WP-cron
+    # drives the full cron.php via loopback (wordpress/cron-integration.php),
+    # and the wizard's live self-test passes against this fixture, so the
+    # manual-crontab instructions are advisory noise here. The completion
+    # screen is where the WordPress-only branches live.
     body = w.post(step="discount", btc_discount_percent="2")
     assert wizard_error(body) is None, wizard_error(body)
-    assert wizard_heading(body) == "Enable cron", wizard_heading(body)
-
-    # The completion screen is where the WordPress-only branches live.
-    body = w.post(step="cron")
-    assert wizard_error(body) is None, wizard_error(body)
-    assert wizard_heading(body).startswith("You"), wizard_heading(body)
+    assert wizard_heading(body).startswith("You"), (
+        f"working WP-cron loopback must skip the cron screen, landed on {wizard_heading(body)!r}"
+    )
+    assert "no crontab entry needed" in body, (
+        "the completion screen should say WordPress handles background jobs"
+    )
     assert "WooCommerce" in body, "the WordPress completion screen should offer WooCommerce wiring"
     assert "Back to WordPress Dashboard" in body
     # In WordPress mode the manual e-commerce integration sections are dropped —
@@ -150,6 +154,23 @@ def test_wizard_skips_the_password_screen_and_completes(wp_ready) -> None:
         assert store["auto_melt_enabled"] == 1
         # No BareBits admin row is ever created in WordPress mode.
         assert db.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0
+
+    # Loopback-hostile hosts must still get the manual cron instructions:
+    # without a cron key the self-test cannot pass, and the tail-post guard
+    # lets a completed install re-enter the post-completion screens. The cron
+    # screen re-seeds the key it displays, so the mechanism heals itself.
+    with wp.db() as db:
+        db.execute("DELETE FROM config WHERE key = 'cron_key'")
+    body = w.post(step="discount", btc_discount_percent="2")
+    assert wizard_heading(body) == "Enable cron", (
+        f"a failing self-test must keep the manual cron screen, landed on {wizard_heading(body)!r}"
+    )
+    with wp.db() as db:
+        assert db.execute(
+            "SELECT value FROM config WHERE key = 'cron_key'"
+        ).fetchone() is not None, "the cron screen re-seeds a missing key"
+    body = w.post(step="cron")
+    assert wizard_heading(body).startswith("You"), wizard_heading(body)
 
 
 def test_wizard_refuses_an_unauthenticated_visitor(wp_ready) -> None:

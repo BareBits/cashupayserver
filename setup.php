@@ -703,6 +703,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $step = 'done';
                 break;
         }
+
+        // WordPress runs the full cron.php task set through WP-cron (see
+        // wordpress/cron.php), so the manual-crontab screen is only needed on
+        // hosts where that mechanism can't work. A live self-test proves the
+        // loopback path (rewrite rule → cron.php → key auth) right now; on
+        // success the screen is skipped. Any failure — blocked self-requests,
+        // timeout — keeps the screen with the manual instructions, and the
+        // dashboard's cron staleness warning remains the runtime safety net.
+        if ($step === 'cron' && Urls::isWordPress()
+                && function_exists('cashupay_wp_cron_selftest')
+                && cashupay_wp_cron_selftest()) {
+            $step = SetupFlow::nextStep('cron', $flowSteps) ?? 'done';
+        }
     } catch (Exception $e) {
         $error = $e->getMessage();
     }
@@ -2399,6 +2412,13 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                 <div class="success">
                     BareBits is ready to accept payments. ✅
                 </div>
+
+                <?php if (Urls::isWordPress() && (int)Config::get('wp_cron_selftest_ok_at', 0) > 0): ?>
+                <p style="margin-bottom: 1.25rem; font-size: 0.9rem; color: #a0aec0;">
+                    ⏰ Background jobs are handled automatically through
+                    WordPress &mdash; no crontab entry needed.
+                </p>
+                <?php endif; ?>
 
                 <?php
                 // Warn when the operator skipped every payment rail — the

@@ -69,9 +69,21 @@ if (isset($_GET['json'])) {
         echo json_encode(['error' => 'Invoice not found']);
         exit;
     }
+    // If the payer left their email while the on-chain tx was confirming and
+    // the invoice just settled, queue the receipt now — this poll is the
+    // fastest observer of the settlement while the tab is still open (cron's
+    // sweep covers payers who closed it).
+    if ($invoice['status'] === 'Settled' && !empty($invoice['payer_receipt_requested'])) {
+        require_once __DIR__ . '/includes/notification_sender.php';
+        NotificationSender::flushRequestedPayerReceipts($invoiceId);
+    }
     echo json_encode([
         'status' => $invoice['status'],
         'additionalStatus' => $invoice['additional_status'],
+        // True while an on-chain payment is detected in the mempool but not
+        // yet confirmed — drives the "waiting for on-chain confirmation" copy.
+        'onchainPending' => $invoice['status'] === 'Processing'
+            && !empty($invoice['onchain_first_seen_at']),
     ]);
     exit;
 }
@@ -118,7 +130,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'send_
         exit;
     }
 
-    if ($invoice['status'] !== 'Settled') {
+    // Accepted for a settled invoice (receipt queued immediately) or while a
+    // detected on-chain payment is still confirming (email saved now, receipt
+    // queued at settlement — see NotificationSender::flushRequestedPayerReceipts).
+    $onchainConfirming = $invoice['status'] === 'Processing'
+        && !empty($invoice['onchain_first_seen_at']);
+    if ($invoice['status'] !== 'Settled' && !$onchainConfirming) {
         cashupay_status(400);
         echo json_encode(['error' => 'Invoice is not paid yet.']);
         exit;
@@ -141,6 +158,25 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'send_
         'id = ?',
         [$invoice['id']]
     );
+
+    // Still confirming: don't queue anything yet — a receipt sent before
+    // confirmation would confirm a payment that could still time out. Flag the
+    // request so the settlement sweep queues exactly one receipt (to the
+    // latest saved email) once the invoice settles.
+    if ($onchainConfirming) {
+        $receiptPending = false;
+        if (NotificationSender::isPayerReceiptOffered()) {
+            Database::update(
+                'invoices',
+                ['payer_receipt_requested' => 1],
+                'id = ?',
+                [$invoice['id']]
+            );
+            $receiptPending = true;
+        }
+        echo json_encode(['success' => true, 'receiptQueued' => false, 'receiptPending' => $receiptPending]);
+        exit;
+    }
 
     // Queue a payment-confirmation email only when receipts are offered. The
     // per-invoice cap still bounds how many receipts can be sent.
@@ -196,6 +232,17 @@ $payerReceiptOffered = $emailFormOffered && NotificationSender::isPayerReceiptOf
 // override → site-wide default). The email/newsletter capture form is shown
 // regardless of whether receipts are offered.
 $newsletterDefaultChecked = $emailFormOffered && Config::getNewsletterDefaultChecked($invoice['store_id']);
+
+// An on-chain payment was seen in the mempool but hasn't confirmed yet. This
+// drives the unified detected/complete screen: same layout as the settled
+// state (amount, invoice details, email form) with a "waiting for on-chain
+// confirmation" badge + copy instead of the checkmark, and without the
+// Continue-to-Store link (the WooCommerce order isn't marked paid until the
+// Settled webhook). The generic #payment-processing block remains for the
+// transient non-on-chain Processing state (Cashu minting after a Lightning
+// payment).
+$onchainPendingInitial = $invoice['status'] === 'Processing'
+    && !empty($invoice['onchain_first_seen_at']);
 
 // Format amount for display - use store's mint unit
 $mintUnit = Config::getStoreMintUnit($invoice['store_id']);
@@ -663,6 +710,26 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
             color: white;
         }
 
+        /* Large spinner shown in place of the checkmark while a detected
+           on-chain payment waits for confirmation. */
+        .confirming-icon {
+            width: 80px;
+            height: 80px;
+            border-radius: 50%;
+            border: 6px solid rgba(66, 153, 225, 0.25);
+            border-top-color: #63b3ed;
+            animation: spin 1.2s linear infinite;
+            margin-bottom: 1.5rem;
+        }
+
+        .onchain-pending-copy {
+            color: var(--text-secondary);
+            font-size: 0.9rem;
+            line-height: 1.5;
+            margin: 0 0 0.5rem;
+            text-align: center;
+        }
+
         .hidden {
             display: none;
         }
@@ -1054,7 +1121,7 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                 </div>
             </div>
 
-            <div id="payment-processing" class="<?= $invoice['status'] !== 'Processing' ? 'hidden' : '' ?>">
+            <div id="payment-processing" class="<?= ($invoice['status'] !== 'Processing' || $onchainPendingInitial) ? 'hidden' : '' ?>">
                 <div class="status-badge processing">
                     <div class="spinner"></div>
                     Processing payment...
@@ -1064,16 +1131,32 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                 </p>
             </div>
 
-            <div id="payment-success" class="success-animation <?= $invoice['status'] === 'Settled' ? 'show' : '' ?>">
-                <div class="success-icon">
+            <!-- Unified detected/complete screen. Shown from the moment an
+                 on-chain payment is detected (pending mode: spinner badge +
+                 confirmation copy) and stays up through settlement (settled
+                 mode: checkmark + Continue-to-Store). Only the mode-specific
+                 elements toggle, so anything the payer typed into the email
+                 form survives the transition. -->
+            <div id="payment-success" class="success-animation <?= ($invoice['status'] === 'Settled' || $onchainPendingInitial) ? 'show' : '' ?>">
+                <div class="success-icon <?= $onchainPendingInitial ? 'hidden' : '' ?>" id="success-icon">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3">
                         <polyline points="20 6 9 17 4 12"></polyline>
                     </svg>
                 </div>
+                <div class="confirming-icon <?= $onchainPendingInitial ? '' : 'hidden' ?>" id="confirming-icon"></div>
                 <div class="amount"><?= htmlspecialchars($displayAmount) ?></div>
-                <div class="status-badge settled">
+                <div class="status-badge settled <?= $onchainPendingInitial ? 'hidden' : '' ?>" id="success-badge-settled">
                     Payment Complete
                 </div>
+                <div class="status-badge processing <?= $onchainPendingInitial ? '' : 'hidden' ?>" id="success-badge-pending">
+                    <div class="spinner"></div>
+                    Waiting for on-chain confirmation
+                </div>
+                <p class="onchain-pending-copy <?= $onchainPendingInitial ? '' : 'hidden' ?>" id="onchain-pending-copy">
+                    Payment detected, waiting for on-chain confirmation. Please do not
+                    close this window. Confirmation usually takes up to 10 minutes, but
+                    may take longer if you elected to pay a low network fee.
+                </p>
                 <div class="invoice-details">
                     <div><span class="label">Invoice:</span><span class="invoice-id-value"><?= htmlspecialchars($invoice['id']) ?></span></div>
                     <?php if ($invoiceNote !== ''): ?>
@@ -1098,12 +1181,12 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                 </form>
                 <?php endif; ?>
                 <?php if (!$payerReceiptOffered): ?>
-                <div class="receipt-fallback">
+                <div class="receipt-fallback <?= $onchainPendingInitial ? 'hidden' : '' ?>" id="receipt-fallback">
                     Screenshot this page or save your invoice ID for your records.
                 </div>
                 <?php endif; ?>
                 <?php if ($redirectUrl): ?>
-                    <a href="<?= htmlspecialchars($redirectUrl) ?>" class="btn" id="redirect-btn">
+                    <a href="<?= htmlspecialchars($redirectUrl) ?>" class="btn <?= $onchainPendingInitial ? 'hidden' : '' ?>" id="redirect-btn">
                         Continue to Store
                     </a>
                 <?php endif; ?>
@@ -1165,6 +1248,10 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                 : null
         ) ?>;
         let currentStatus = <?= json_encode($invoice['status']) ?>;
+        // Whether a detected on-chain payment is still waiting for
+        // confirmation — selects the unified screen's pending mode while
+        // status is Processing.
+        let currentOnchainPending = <?= json_encode($onchainPendingInitial) ?>;
 
         function renderQR(targetId, data) {
             const target = document.getElementById(targetId);
@@ -1409,8 +1496,10 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                 const response = await fetch(pollUrl.toString());
                 const data = await response.json();
 
-                if (data.status !== currentStatus) {
+                const onchainPending = !!data.onchainPending;
+                if (data.status !== currentStatus || onchainPending !== currentOnchainPending) {
                     currentStatus = data.status;
+                    currentOnchainPending = onchainPending;
                     updateUI(data.status);
                 }
             } catch (e) {
@@ -1418,6 +1507,24 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
             }
 
             setTimeout(pollStatus, 2000);
+        }
+
+        // Toggle the unified detected/complete screen between its two modes.
+        // Only mode-specific elements flip; the email form and invoice details
+        // are shared DOM nodes, so anything the payer typed survives the
+        // pending -> settled transition.
+        function setSuccessMode(pending) {
+            const toggle = (id, show) => {
+                const el = document.getElementById(id);
+                if (el) el.classList.toggle('hidden', !show);
+            };
+            toggle('success-icon', !pending);
+            toggle('confirming-icon', pending);
+            toggle('success-badge-settled', !pending);
+            toggle('success-badge-pending', pending);
+            toggle('onchain-pending-copy', pending);
+            toggle('receipt-fallback', !pending);
+            toggle('redirect-btn', !pending);
         }
 
         // Update UI based on status
@@ -1434,12 +1541,22 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                     document.getElementById('payment-pending').classList.remove('hidden');
                     break;
                 case 'Processing':
-                    document.getElementById('payment-processing').classList.remove('hidden');
+                    if (currentOnchainPending) {
+                        // On-chain payment detected, awaiting confirmation:
+                        // show the unified screen in pending mode so the payer
+                        // can already leave their email.
+                        setSuccessMode(true);
+                        document.getElementById('payment-success').classList.add('show');
+                        wireReceiptForm();
+                    } else {
+                        document.getElementById('payment-processing').classList.remove('hidden');
+                    }
                     break;
                 case 'Provisional':
                     if (provisionalEl) provisionalEl.classList.remove('hidden');
                     break;
                 case 'Settled':
+                    setSuccessMode(false);
                     document.getElementById('payment-success').classList.add('show');
                     onSettled();
                     break;
@@ -1460,16 +1577,14 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
             }
         }
 
-        // Settled-state entry point. Wires up the receipt form (if offered)
+        // Settled-state entry point. Wires up the receipt form (if rendered)
         // so the payer can opt into a receipt. We deliberately do NOT auto-
         // redirect: the success modal stays visible until the payer clicks
         // the "Continue to Store" link (when the merchant configured one) or
         // navigates away themselves. Auto-redirect used to flash the modal
         // for ~2 seconds, which made the invoice ID + note unreadable.
         function onSettled() {
-            if (payerReceiptOffered) {
-                wireReceiptForm();
-            }
+            wireReceiptForm();
         }
 
         // Wire up the receipt form: submit POSTs to this same URL with
@@ -1520,9 +1635,11 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                     });
                     const data = await response.json().catch(() => ({}));
                     if (response.ok && data.success) {
-                        setStatus(data.receiptQueued
-                            ? 'Receipt queued — check your inbox.'
-                            : 'Thanks — your email has been saved.', 'success');
+                        setStatus(data.receiptPending
+                            ? 'Saved — your receipt will be emailed once the payment confirms.'
+                            : (data.receiptQueued
+                                ? 'Receipt queued — check your inbox.'
+                                : 'Thanks — your email has been saved.'), 'success');
                         emailInput.disabled = true;
                         if (newsletterInput) newsletterInput.disabled = true;
                         submitBtn.style.display = 'none';
@@ -1541,6 +1658,12 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
         // Handle settled state on initial page load.
         if (currentStatus === 'Settled') {
             onSettled();
+        }
+        // Page loaded while an on-chain payment awaits confirmation: the
+        // unified screen is already rendered in pending mode server-side;
+        // just wire the email form.
+        if (currentStatus === 'Processing' && currentOnchainPending) {
+            wireReceiptForm();
         }
     </script>
 </body>

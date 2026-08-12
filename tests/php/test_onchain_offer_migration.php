@@ -36,20 +36,25 @@ function has_col(string $table, string $col): bool {
     return (int)($r['n'] ?? 0) > 0;
 }
 
-// A fresh install has the new column AND the previous marker column.
+// A fresh install has the newest marker column (invoices.payer_receipt_requested)
+// AND the older migration artifacts.
+assert_true(has_col('invoices', 'payer_receipt_requested'), 'fresh install has the current marker column');
 assert_true(has_col('stores', 'onchain_offer_enabled'), 'fresh install has onchain_offer_enabled');
 assert_true(has_col('melts', 'melt_quote_id'), 'fresh install has the previous marker column');
 
-// Simulate a pre-merge install: the newest column is missing, but the old
-// marker (melt_quote_id) is still present — exactly the state of a running
-// instance when it pulls code that adds a new migration.
+// Simulate a pre-merge install: the newest columns are missing, but older
+// artifacts are still present — exactly the state of a running instance when
+// it pulls code that adds a new migration.
+Database::getInstance()->exec("ALTER TABLE invoices DROP COLUMN payer_receipt_requested");
 Database::getInstance()->exec("ALTER TABLE stores DROP COLUMN onchain_offer_enabled");
+assert_false(has_col('invoices', 'payer_receipt_requested'), 'pre-merge: marker column dropped');
 assert_false(has_col('stores', 'onchain_offer_enabled'), 'pre-merge: column dropped');
 assert_true(has_col('melts', 'melt_quote_id'), 'pre-merge: old marker still present');
 
-// First DB access after the "deploy" must re-run migrations and re-add it.
+// First DB access after the "deploy" must re-run migrations and re-add them.
 reset_db_singleton();
 Database::getInstance();
+assert_true(has_col('invoices', 'payer_receipt_requested'), 'getInstance() self-heals the marker column');
 assert_true(has_col('stores', 'onchain_offer_enabled'), 'getInstance() self-heals the missing column');
 
 // And the resolver that Invoice::create() calls now works instead of throwing.
@@ -65,5 +70,6 @@ assert_true(OnchainConfig::isEnabledForStore('store_offer_mig'), 'OnchainConfig 
 reset_db_singleton();
 Database::getInstance();
 assert_true(has_col('stores', 'onchain_offer_enabled'), 're-run leaves the column in place');
+assert_true(has_col('invoices', 'payer_receipt_requested'), 're-run leaves the marker column in place');
 
 echo "test_onchain_offer_migration: ok\n";
