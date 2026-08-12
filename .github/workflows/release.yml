@@ -127,6 +127,7 @@ jobs:
             bootstrap.php \
             rewrite-rules.php \
             admin-menu.php \
+            cron-integration.php \
             activation.php \
             btcpay-integration.php \
             setup.php \
