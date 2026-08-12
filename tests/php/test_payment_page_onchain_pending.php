@@ -123,6 +123,40 @@ $json = json_decode(trim(run_payment_page('inv_onchain', 'GET', true)), true);
 assert_eq('Processing', $json['status'] ?? null, 'on-chain pending poll status');
 assert_eq(true, $json['onchainPending'] ?? null, 'on-chain pending poll reports onchainPending=true');
 
+// --- explorer link: hidden until an observation row exists ---
+assert_true(str_contains($html, 'id="onchain-tx-link"'), 'tx link element is always in the DOM');
+assert_true(str_contains($html, 'onchain-tx-link hidden'), 'tx link hidden while no observation row exists');
+assert_true(array_key_exists('onchainTxUrl', $json), 'poll carries the onchainTxUrl key');
+assert_eq(null, $json['onchainTxUrl'], 'poll reports no tx URL before an observation exists');
+
+// First-seen tx drives the link; a later observation must not displace it.
+$txidFirst = str_repeat('aa', 32);
+$txidLater = str_repeat('bb', 32);
+$now = Database::timestamp();
+Database::insert('onchain_payments', [
+    'id' => 'ocp_first', 'invoice_id' => 'inv_onchain', 'txid' => $txidFirst, 'vout' => 0,
+    'amount_sat' => 21, 'confirmations' => 0, 'first_seen_at' => $now, 'last_seen_at' => $now,
+]);
+Database::insert('onchain_payments', [
+    'id' => 'ocp_later', 'invoice_id' => 'inv_onchain', 'txid' => $txidLater, 'vout' => 0,
+    'amount_sat' => 21, 'confirmations' => 0, 'first_seen_at' => $now + 60, 'last_seen_at' => $now + 60,
+]);
+
+$expectedTxUrl = 'https://mempool.space/tx/' . $txidFirst;
+$html = run_payment_page('inv_onchain');
+assert_true(str_contains($html, 'href="' . $expectedTxUrl . '"'), 'pending page links the first-seen tx on mempool.space');
+assert_false(str_contains($html, 'onchain-tx-link hidden'), 'tx link visible once the observation exists');
+assert_false(str_contains($html, $txidLater), 'later observation does not displace the first-seen link');
+assert_true(str_contains($html, 'View transaction on mempool.space'), 'tx link label rendered');
+
+$json = json_decode(trim(run_payment_page('inv_onchain', 'GET', true)), true);
+assert_eq($expectedTxUrl, $json['onchainTxUrl'] ?? null, 'poll carries the first-seen tx URL');
+
+// The transient (non-on-chain) invoice never gets a link.
+$json = json_decode(trim(run_payment_page('inv_transient', 'GET', true)), true);
+assert_true(array_key_exists('onchainTxUrl', $json), 'transient poll still carries the onchainTxUrl key');
+assert_eq(null, $json['onchainTxUrl'], 'transient poll has no tx URL');
+
 // --- email POST during transient Processing: still rejected ---
 $out = run_payment_page('inv_transient', 'POST');
 $json = json_decode(trim($out), true);
@@ -153,6 +187,12 @@ assert_eq(0, (int)$queue['c'], 'no receipt queued before settlement');
 Database::update('invoices', ['status' => 'Settled', 'paid_at' => time()], 'id = ?', ['inv_onchain']);
 $json = json_decode(trim(run_payment_page('inv_onchain', 'GET', true)), true);
 assert_eq('Settled', $json['status'] ?? null, 'poll sees settlement');
+assert_eq($expectedTxUrl, $json['onchainTxUrl'] ?? null, 'tx URL survives settlement in the poll');
+
+// The settled page render keeps the explorer link visible.
+$html = run_payment_page('inv_onchain');
+assert_true(str_contains($html, 'href="' . $expectedTxUrl . '"'), 'settled page keeps the mempool.space link');
+assert_false(str_contains($html, 'onchain-tx-link hidden'), 'tx link stays visible after settlement');
 
 $queue = Database::fetchOne(
     "SELECT COUNT(*) AS c FROM notification_queue WHERE invoice_id = ? AND event_type = ? AND to_email = ?",
@@ -189,5 +229,39 @@ $queue = Database::fetchOne(
     ['inv_walkaway', NotificationSender::EVENT_PAYER_RECEIPT, 'gone@example.com']
 );
 assert_eq(1, (int)$queue['c'], 'sweep queued the receipt for the walked-away payer');
+
+// --- network -> explorer URL mapping (regtest falls back to mainnet, like
+// the admin UI's mempoolUrl helper — no public regtest explorer exists) ---
+$networkBases = [
+    'testnet' => 'https://mempool.space/testnet',
+    'signet'  => 'https://mempool.space/signet',
+    'regtest' => 'https://mempool.space',
+];
+$i = 0;
+foreach ($networkBases as $network => $base) {
+    $i++;
+    $storeId = 'store_net_' . $network;
+    $invId = 'inv_net_' . $network;
+    make_store($storeId);
+    Database::update('stores', ['onchain_network' => $network], 'id = ?', [$storeId]);
+    Database::insert('invoices', [
+        'id' => $invId,
+        'store_id' => $storeId,
+        'status' => 'Processing',
+        'amount' => '21',
+        'currency' => 'sat',
+        'created_at' => Database::timestamp(),
+        'expiration_time' => Database::timestamp() + 3600,
+        'onchain_first_seen_at' => Database::timestamp(),
+    ]);
+    $txid = str_repeat(sprintf('%02x', 0xc0 + $i), 32);
+    Database::insert('onchain_payments', [
+        'id' => 'ocp_net_' . $network, 'invoice_id' => $invId, 'txid' => $txid, 'vout' => 0,
+        'amount_sat' => 21, 'confirmations' => 0,
+        'first_seen_at' => Database::timestamp(), 'last_seen_at' => Database::timestamp(),
+    ]);
+    $json = json_decode(trim(run_payment_page($invId, 'GET', true)), true);
+    assert_eq($base . '/tx/' . $txid, $json['onchainTxUrl'] ?? null, "$network maps to $base");
+}
 
 echo "test_payment_page_onchain_pending: ok\n";
