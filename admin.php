@@ -2338,6 +2338,29 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     }
                 }
 
+                // Environment gate: the CLINK client can't sign Nostr requests
+                // without GMP, so a noffer added on such a host would silently
+                // drop Lightning from the checkout. Refuse NEW noffers with the
+                // actionable message; ones already stored pass through so the
+                // operator can still keep (or remove) them while editing the
+                // rest of the card. The UI greys the section out — this catches
+                // a direct POST past that.
+                require_once __DIR__ . '/includes/clink/client.php';
+                if (($nofferEnvError = ClinkClient::environmentError()) !== null) {
+                    $storedNoffers = [];
+                    foreach (StoreLnAddresses::listForStore($storeId) as $row) {
+                        if ($row['type'] === StoreLnAddresses::TYPE_NOFFER) {
+                            $storedNoffers[strtolower($row['address'])] = true;
+                        }
+                    }
+                    foreach ($destinations as $dest) {
+                        if ($dest['type'] === StoreLnAddresses::TYPE_NOFFER
+                                && !isset($storedNoffers[strtolower($dest['value'])])) {
+                            throw new Exception('noffers can\'t be added on this server yet. ' . $nofferEnvError);
+                        }
+                    }
+                }
+
                 // On-chain auto-cashout requires the store to have an on-chain
                 // xpub / static address — refuse to save otherwise so we never
                 // select a destination that can't actually receive funds.
@@ -5480,9 +5503,13 @@ header('Cache-Control: no-cache, must-revalidate');
                             // in this settings view: features that run EC math
                             // (xpub derivation, swap signing) are dead on a host
                             // without GMP, so each affected card says so instead
-                            // of failing on save.
+                            // of failing on save. The CLINK client has the same
+                            // dependency (Schnorr-signed Nostr requests), so the
+                            // noffer section below gets its own gate.
                             require_once __DIR__ . '/includes/onchain/wallet.php';
+                            require_once __DIR__ . '/includes/clink/client.php';
                             $gmpEnvError = OnchainWallet::environmentError();
+                            $nofferEnvError = ClinkClient::environmentError();
                             ?>
                             <div id="aw-store" data-aw data-aw-scope="store">
                             <p class="aw-title">auto-cashout settings</p>
@@ -5490,7 +5517,7 @@ header('Cache-Control: no-cache, must-revalidate');
                                 <div style="margin-bottom:0.75rem; padding:0.6rem 0.8rem; border-radius:8px; background:rgba(245,158,11,0.12); border:1px solid rgba(245,158,11,0.4); font-size:0.82rem;">
                                     &#9888; <strong>On-chain withdrawal is unavailable on this server.</strong>
                                     <?= htmlspecialchars($gmpEnvError) ?>
-                                    Lightning-address and noffer withdrawals still work.
+                                    Lightning-address withdrawals still work<?= $nofferEnvError === null ? ', as do noffers' : '' ?>.
                                 </div>
                             <?php endif; ?>
                             <div id="aw-store-warning" class="hidden" style="margin-bottom:0.75rem; padding:0.6rem 0.8rem; border-radius:8px; background:rgba(245,158,11,0.12); border:1px solid rgba(245,158,11,0.4); font-size:0.82rem;">
@@ -5542,8 +5569,17 @@ header('Cache-Control: no-cache, must-revalidate');
                                 </button>
                             </div>
 
-                            <div class="form-group" id="auto-melt-noffer-group">
+                            <div class="form-group" id="auto-melt-noffer-group"
+                                 <?= $nofferEnvError !== null ? 'data-env-error="1"' : '' ?>>
                                 <label class="form-label">CLINK noffers (priority order)</label>
+                                <?php if ($nofferEnvError !== null): ?>
+                                    <div style="margin-bottom:0.75rem; padding:0.6rem 0.8rem; border-radius:8px; background:rgba(245,158,11,0.12); border:1px solid rgba(245,158,11,0.4); font-size:0.82rem;">
+                                        &#9888; <strong>noffers are unavailable on this server.</strong>
+                                        <?= htmlspecialchars($nofferEnvError) ?>
+                                        Existing entries stay saved (and can be removed) but are
+                                        skipped at checkout until then.
+                                    </div>
+                                <?php endif; ?>
                                 <p class="form-help">
                                     CLINK noffers (NIP-69) request a Lightning invoice over Nostr and
                                     settle via the merchant&rsquo;s payment receipt. They are tried
@@ -5551,7 +5587,8 @@ header('Cache-Control: no-cache, must-revalidate');
                                     can&rsquo;t produce an invoice. Paste a <code>noffer1&hellip;</code> string.
                                 </p>
                                 <div id="auto-melt-noffer-list"></div>
-                                <button type="button" class="btn btn-secondary" id="btn-add-noffer" style="margin-top: 0.5rem;">
+                                <button type="button" class="btn btn-secondary" id="btn-add-noffer" style="margin-top: 0.5rem;<?= $nofferEnvError !== null ? ' opacity: 0.4;' : '' ?>"
+                                        <?= $nofferEnvError !== null ? 'disabled' : '' ?>>
                                     + Add noffer
                                 </button>
                             </div>
@@ -10857,7 +10894,10 @@ header('Cache-Control: no-cache, must-revalidate');
                 }
                 for (const a of lnAddresses) {
                     if (isNofferValue(a)) {
-                        return awError('aw-store-error', `"${a}" is a CLINK noffer — add it in the CLINK noffers section, not Lightning Addresses.`);
+                        const nofferGated = !!document.getElementById('auto-melt-noffer-group')?.dataset.envError;
+                        return awError('aw-store-error', nofferGated
+                            ? `"${a}" is a CLINK noffer — those are unavailable on this server (see the CLINK noffers section).`
+                            : `"${a}" is a CLINK noffer — add it in the CLINK noffers section, not Lightning Addresses.`);
                     }
                     if (!isValidLightningAddress(a)) {
                         return awError('aw-store-error', `"${a}" doesn't look like a valid lightning address (name@domain.tld).`);
@@ -11266,6 +11306,10 @@ header('Cache-Control: no-cache, must-revalidate');
         function renderNofferRows() {
             const list = document.getElementById('auto-melt-noffer-list');
             if (!list) return;
+            // Environment gate (host can't run the CLINK client, e.g. no GMP):
+            // existing entries stay visible and removable, but read-only — the
+            // server rejects new noffers on such a host anyway.
+            const envGated = !!document.getElementById('auto-melt-noffer-group')?.dataset.envError;
             list.innerHTML = '';
             awNoffers.forEach((entry, i) => {
                 const row = document.createElement('div');
@@ -11283,6 +11327,7 @@ header('Cache-Control: no-cache, must-revalidate');
                 input.placeholder = 'noffer1…';
                 input.value = entry.address || '';
                 input.style.flex = '1';
+                if (envGated) { input.disabled = true; input.style.opacity = '0.5'; }
                 row.appendChild(input);
 
                 const mkBtn = (label, title, handler, disabled) => {
@@ -11296,8 +11341,8 @@ header('Cache-Control: no-cache, must-revalidate');
                     else b.addEventListener('click', handler);
                     return b;
                 };
-                row.appendChild(mkBtn('↑', 'Move up', () => moveNofferRow(i, -1), i === 0));
-                row.appendChild(mkBtn('↓', 'Move down', () => moveNofferRow(i, 1), i === awNoffers.length - 1));
+                row.appendChild(mkBtn('↑', 'Move up', () => moveNofferRow(i, -1), envGated || i === 0));
+                row.appendChild(mkBtn('↓', 'Move down', () => moveNofferRow(i, 1), envGated || i === awNoffers.length - 1));
                 row.appendChild(mkBtn('✕', 'Remove', () => removeNofferRow(i), false));
 
                 list.appendChild(row);

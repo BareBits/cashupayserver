@@ -500,11 +500,37 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     throw new Exception('That noffer doesn\'t look right. It should start with noffer1 — copy the whole string from your wallet.');
                 }
 
+                // Environment gate, same as the swaps screen's: the CLINK
+                // client can't sign Nostr requests without GMP, so a noffer
+                // saved here would silently drop Lightning from the checkout.
+                // The screen renders the field disabled; this catches a direct
+                // POST past that.
+                require_once __DIR__ . '/includes/clink/client.php';
+                $nofferEnvError = ClinkClient::environmentError();
+                $storedNoffers = [];
+                foreach (StoreLnAddresses::listForStore($storeId) as $lnRow) {
+                    if ($lnRow['type'] === StoreLnAddresses::TYPE_NOFFER) {
+                        $storedNoffers[] = $lnRow['address'];
+                    }
+                }
+                if ($noffer !== '' && $nofferEnvError !== null
+                        && !in_array(strtolower($noffer), array_map('strtolower', $storedNoffers), true)) {
+                    throw new Exception('noffers can\'t be used on this server yet. ' . $nofferEnvError);
+                }
+                // A disabled input doesn't submit, so on a gated host a save
+                // would silently delete a previously stored noffer. Keep it —
+                // it starts working the moment the host gains GMP, and the
+                // screen says why it's inert until then.
+                $noffers = $noffer !== '' ? [$noffer] : [];
+                if ($lnAction === 'save' && $nofferEnvError !== null && $noffers === []) {
+                    $noffers = $storedNoffers;
+                }
+
                 // Address first, noffer as fallback — the order Invoice::create
                 // walks the chain at payment time.
                 $chain = StoreLnAddresses::chainFromLists(
                     $lnAddress !== '' ? [$lnAddress] : [],
-                    $noffer !== '' ? [$noffer] : []
+                    $noffers
                 );
                 StoreLnAddresses::replaceForStore($storeId, $chain);
                 // Auto-cashout mode isn't decided here: which rail sweeps the
@@ -2065,6 +2091,12 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                         $lnExistingAddress = $lnRow['address'];
                     }
                 }
+                // Same environment gate as the swaps screen: the CLINK client
+                // needs GMP, so on a host without it the noffer field is
+                // disabled with the reason instead of accepting a destination
+                // that would silently fail at checkout.
+                require_once __DIR__ . '/includes/clink/client.php';
+                $lnNofferEnvError = ClinkClient::environmentError();
                 ?>
                 <h2 style="margin-bottom: 1rem;">⚡ Lightning payments</h2>
                 <p style="margin-bottom: 0.75rem;">
@@ -2092,10 +2124,17 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
 
                     <div class="form-group">
                         <label for="noffer">noffer</label>
+                        <?php if ($lnNofferEnvError !== null): ?>
+                            <div class="warning" style="margin-bottom: 0.5rem;">
+                                <strong>noffers aren't available on this server yet:</strong>
+                                <?= htmlspecialchars($lnNofferEnvError) ?>
+                            </div>
+                        <?php endif; ?>
                         <input type="text" id="noffer" name="noffer"
-                               style="font-family: monospace; font-size: 0.9rem;"
+                               style="font-family: monospace; font-size: 0.9rem;<?= $lnNofferEnvError !== null ? ' opacity: 0.5;' : '' ?>"
                                value="<?= htmlspecialchars($_POST['noffer'] ?? $lnExistingNoffer) ?>"
-                               placeholder="noffer1&hellip;">
+                               placeholder="noffer1&hellip;"
+                               <?= $lnNofferEnvError !== null ? 'disabled' : '' ?>>
                     </div>
 
                     <button type="submit" class="btn" style="width: 100%;">Continue</button>

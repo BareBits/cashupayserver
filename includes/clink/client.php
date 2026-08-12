@@ -56,6 +56,31 @@ class ClinkClient
 {
     public const KIND = 21001;
 
+    /**
+     * Why this exists: the CLINK payer path Schnorr-signs Nostr events and
+     * derives NIP-44 conversation keys through swentel/nostr-php, which
+     * hard-requires ext-gmp with no fallback. Shared WordPress hosts
+     * frequently ship PHP without GMP, and before this check that surfaced
+     * only as a per-invoice error_log line while the checkout silently lost
+     * its Lightning option. The mirror of OnchainWallet::environmentError()
+     * for the noffer stack: checked up front by the onboarding wizard and the
+     * admin settings so the operator gets one actionable sentence instead.
+     *
+     * Returns null when the environment can run the CLINK client.
+     */
+    public static function environmentError(): ?string
+    {
+        if (PHP_INT_SIZE < 8) {
+            return 'This server runs 32-bit PHP; CLINK noffers require 64-bit PHP.';
+        }
+        if (!function_exists('gmp_init')) {
+            return 'This server\'s PHP is missing the GMP extension, which is required to'
+                . ' sign the Nostr payment requests CLINK noffers work over. Ask your'
+                . ' hosting provider to enable php-gmp, or use a Lightning address instead.';
+        }
+        return null;
+    }
+
     // Total wall-clock budget for a request→reply round trip. Relays + the
     // merchant's invoice generation are the slow parts; keep it snappy enough
     // not to wedge invoice creation but tolerant of a sluggish relay. Override
@@ -84,6 +109,11 @@ class ClinkClient
         ?string $description = null,
         ?int $timeoutSec = null
     ): array {
+        // Fail with the actionable environment message rather than the raw
+        // Error nostr-php raises from gmp_* two frames deeper.
+        if (($envError = self::environmentError()) !== null) {
+            throw new ClinkException($envError, 0);
+        }
         $decoded = ClinkNoffer::decode($noffer); // throws on malformed
         $timeout = $timeoutSec ?? self::timeoutSec();
 
