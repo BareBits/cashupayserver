@@ -150,6 +150,12 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.TAG }}
+          # When the tag doesn't exist yet (the workflow_call path), GitHub
+          # creates it while publishing — and without an explicit target it
+          # points the tag at the default branch's head, not the commit that
+          # was built. Pin it to the built commit. Ignored when the tag
+          # already exists (the tag-push path).
+          target_commitish: ${{ github.sha }}
           name: "CashuPayServer ${{ env.TAG }}"
           body: |
             CashuPayServer ${{ env.TAG }}, built from ${{ github.sha }}.

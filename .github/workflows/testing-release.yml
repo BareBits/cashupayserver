@@ -18,6 +18,10 @@ on:
   push:
     branches:
       - testing
+  # Manual re-cut for when a run fails transiently (network flakes). GitHub
+  # refuses `gh run rerun` for these runs, so dispatch a fresh one instead:
+  #   gh workflow run testing-release.yml --ref testing
+  workflow_dispatch:
 
 permissions:
   contents: write
