@@ -43,11 +43,15 @@ def _config_value(payserver: PayserverHandle, key: str) -> str | None:
 
 
 def test_setup_wizard_completes_in_browser(
-    payserver: PayserverHandle,
+    payserver_with_lnurlp: PayserverHandle,
     mint: MintHandle,
     backup_mint: MintHandle,
     page,
 ) -> None:
+    # The lnurlp-backed stack routes the typed Lightning address to the mock
+    # LNURL host (which serves a LUD-21 verify URL), so the setup step's
+    # save-time gate passes.
+    payserver = payserver_with_lnurlp
     page.set_default_timeout(30000)
     page.goto(f"{payserver.url}/setup")
 

@@ -119,10 +119,12 @@ def test_swaps_cannot_be_enabled_without_an_xpub(
 
 
 def test_noffer_is_stored_after_the_lightning_address(
-    payserver: PayserverHandle, mint: MintHandle, backup_mint: MintHandle, page
+    payserver_with_lnurlp: PayserverHandle, mint: MintHandle, backup_mint: MintHandle, page
 ) -> None:
     """Both destination types are accepted on one screen and saved as an
-    ordered chain: LNURL address first, noffer as the fallback."""
+    ordered chain: LNURL address first, noffer as the fallback. Uses the
+    lnurlp-backed stack so the setup step's LUD-21 gate passes."""
+    payserver = payserver_with_lnurlp
     _walk_to_store(page, payserver)
     page.fill("#store_name", "Noffer Store")
     page.click("button[type=submit]")

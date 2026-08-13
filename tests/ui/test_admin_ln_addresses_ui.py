@@ -5,6 +5,12 @@ reorder them with the up/down arrows, save, and verify the store_ln_addresses
 table reflects the on-screen priority order. Also checks that the save button
 enforces client-side validation (duplicate + malformed address).
 
+Saving now runs the server-side LUD-21 gate, so the persistence tests use the
+`configured_with_lnurlp` stack — its CASHU_LNURL_URL_TEMPLATE routes every
+address to the mock LNURL host, which advertises a verify URL. The last test
+runs against the plain `configured` stack (no LNURL host reachable) and
+asserts the gate blocks the save with a visible error.
+
 Run with: pytest tests/ui/test_admin_ln_addresses_ui.py -v -s
 """
 from __future__ import annotations
@@ -56,7 +62,8 @@ def _fill_rows(page, addresses: list[str]) -> None:
         inputs.nth(i).fill(addr)
 
 
-def test_add_reorder_and_save_chain(configured: ConfiguredPayserver, page) -> None:
+def test_add_reorder_and_save_chain(configured_with_lnurlp: ConfiguredPayserver, page) -> None:
+    configured = configured_with_lnurlp
     _open_auto_cashout(page, configured)
 
     # Add three addresses in order A, B, C.
@@ -84,7 +91,8 @@ def test_add_reorder_and_save_chain(configured: ConfiguredPayserver, page) -> No
     ], "saved chain should match on-screen priority order after reorder"
 
 
-def test_remove_row(configured: ConfiguredPayserver, page) -> None:
+def test_remove_row(configured_with_lnurlp: ConfiguredPayserver, page) -> None:
+    configured = configured_with_lnurlp
     _open_auto_cashout(page, configured)
     _fill_rows(page, [ADDR_A, ADDR_B])
     # Enable auto-melt. The toggle is a CSS-hidden checkbox positioned off the
@@ -119,4 +127,25 @@ def test_duplicate_rejected_client_side(configured: ConfiguredPayserver, page) -
     err = page.locator("#aw-store-error")
     assert err.is_visible(), "expected inline duplicate-address error"
     assert "Duplicate" in err.text_content()
+    assert _ln_addresses(configured.handle, configured.store_id) == []
+
+
+def test_unverifiable_address_blocked_server_side(
+    configured: ConfiguredPayserver, page
+) -> None:
+    """On the plain stack no LNURL host is reachable, so the server-side
+    LUD-21 gate rejects the save: the error toast shows and nothing lands in
+    store_ln_addresses."""
+    _open_auto_cashout(page, configured)
+    _fill_rows(page, [ADDR_A])
+    # Enable auto-melt. The toggle is a CSS-hidden checkbox positioned off the
+    # viewport, so set it directly rather than clicking; its value is only read
+    # on save (no change handler).
+    page.evaluate("() => { document.getElementById('auto-melt-enabled').checked = true; }")
+    page.fill("#auto-melt-threshold", "100")
+
+    page.click("#btn-save-auto-melt")
+    # The probe times out server-side before the 400 comes back — allow for it.
+    page.wait_for_selector("#toast.show.error", timeout=20000)
+    assert "didn't respond" in page.locator("#toast").text_content()
     assert _ln_addresses(configured.handle, configured.store_id) == []

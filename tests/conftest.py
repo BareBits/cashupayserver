@@ -149,8 +149,12 @@ def onchain(bitcoind: BitcoindHandle) -> Iterator[OnchainContext]:
 
 
 @pytest.fixture
-def lnurlp_server(lnd_payer: LndHandle) -> Iterator[LnurlpServer]:
-    """Mock LNURL-pay endpoint backed by lnd_payer for auto-melt tests."""
+def lnurlp_server(lnd_payer: LndHandle, channels: None) -> Iterator[LnurlpServer]:
+    """Mock LNURL-pay endpoint backed by lnd_payer for auto-melt tests.
+
+    Depends on `channels` so lnd_payer is fully synced and funded before the
+    first invoice request — without it add_invoice can hang on a node that is
+    still coming up (seen when a test uses the mock without the mint stack)."""
     s = start_lnurlp_server(lnd_payer)
     yield s
     stop_lnurlp_server(s)

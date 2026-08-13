@@ -18,6 +18,7 @@
 
 require_once __DIR__ . '/database.php';
 require_once __DIR__ . '/clink/noffer.php';
+require_once __DIR__ . '/lnurl_receive.php';
 
 class StoreLnAddresses {
     /** Destination types stored in store_ln_addresses.type. */
@@ -90,6 +91,72 @@ class StoreLnAddresses {
             $out[] = ['type' => $type, 'value' => $val];
         }
         return $out;
+    }
+
+    /**
+     * Save-time probe + LUD-21 gate for an ordered destination chain
+     * ([['type'=>string,'value'=>string], ...] as produced by
+     * chainFromLists). The single gate both the admin save handler and
+     * the setup lightning step run before persisting a chain.
+     *
+     * Every lnaddress is probed. A NEW address (not already stored for
+     * this store) must confirm LUD-21 verify support: without a verify
+     * URL this server can't detect settlement (it doesn't run the LN
+     * node), so direct-receive would silently drop Lightning from the
+     * checkout and the operator would only find out from a customer.
+     * "Host unreachable" blocks too — at entry time that's usually a
+     * typo'd domain, and we can't tell it apart from a dead host.
+     *
+     * Addresses already stored pass through with a refreshed,
+     * non-blocking probe result (the per-address operator warning keeps
+     * working), so an operator editing the rest of the card is never
+     * locked out by a host that has since gone dark. noffers settle via
+     * Nostr receipts, not LUD-21 — they skip the probe entirely.
+     *
+     * Returns ['entries' => rows for replaceForStore(),
+     *          'results' => [['address','type','lud21Support'], ...]]
+     * with both lists in chain order.
+     */
+    public static function probeAndGateChain(string $storeId, array $destinations): array {
+        $stored = [];
+        foreach (self::listForStore($storeId) as $row) {
+            if ($row['type'] === self::TYPE_LNADDRESS) {
+                $stored[strtolower($row['address'])] = true;
+            }
+        }
+        $entries = [];
+        $results = [];
+        foreach ($destinations as $dest) {
+            if ($dest['type'] === self::TYPE_NOFFER) {
+                $entries[] = ['type' => self::TYPE_NOFFER, 'address' => $dest['value'], 'supports_verify' => null];
+                $results[] = ['address' => $dest['value'], 'type' => 'noffer', 'lud21Support' => null];
+                continue;
+            }
+            $support = null;
+            try {
+                $support = LnUrlReceive::probeLud21Support($dest['value']);
+            } catch (Throwable $e) {
+                error_log('[lnurl-receive] LUD-21 save-time probe threw: ' . $e->getMessage());
+            }
+            if ($support !== 1 && !isset($stored[strtolower($dest['value'])])) {
+                if ($support === 0) {
+                    throw new RuntimeException(
+                        "{$dest['value']} can't be saved: its wallet host doesn't support "
+                        . 'payment verification (LUD-21 verify), so Lightning payments to it '
+                        . 'could never be confirmed at checkout. Use a wallet whose Lightning '
+                        . 'address supports LUD-21.'
+                    );
+                }
+                throw new RuntimeException(
+                    "Couldn't verify {$dest['value']}: the wallet host didn't respond to a "
+                    . 'Lightning-address lookup. Check the spelling and that the host is '
+                    . 'online, then try saving again.'
+                );
+            }
+            $entries[] = ['type' => self::TYPE_LNADDRESS, 'address' => $dest['value'], 'supports_verify' => $support];
+            $results[] = ['address' => $dest['value'], 'type' => 'lnaddress', 'lud21Support' => $support];
+        }
+        return ['entries' => $entries, 'results' => $results];
     }
 
     /**

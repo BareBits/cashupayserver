@@ -2386,31 +2386,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     }
                 }
 
-                // Probe LUD-21 support for each address. The result drives the
-                // receive-rail decision in Invoice::create and (when 0) the
-                // per-address operator warning that lightning payments will
-                // route via the mint instead of direct-receive. Null on an
-                // unreachable host — "unknown, runtime probe will retry" rather
-                // than blocking the save.
-                $entries = [];
-                $addressResults = [];
-                foreach ($destinations as $dest) {
-                    // noffers settle via Nostr receipts, not LUD-21 — skip the
-                    // verify probe for them (supports_verify stays NULL).
-                    if ($dest['type'] === StoreLnAddresses::TYPE_NOFFER) {
-                        $entries[] = ['type' => 'noffer', 'address' => $dest['value'], 'supports_verify' => null];
-                        $addressResults[] = ['address' => $dest['value'], 'type' => 'noffer', 'lud21Support' => null];
-                        continue;
-                    }
-                    $support = null;
-                    try {
-                        $support = LnUrlReceive::probeLud21Support($dest['value']);
-                    } catch (Throwable $e) {
-                        error_log('[lnurl-receive] LUD-21 save-time probe threw: ' . $e->getMessage());
-                    }
-                    $entries[] = ['type' => 'lnaddress', 'address' => $dest['value'], 'supports_verify' => $support];
-                    $addressResults[] = ['address' => $dest['value'], 'type' => 'lnaddress', 'lud21Support' => $support];
-                }
+                // Probe LUD-21 support for each address and gate the save:
+                // a NEW lnaddress whose host can't confirm a verify URL (or
+                // can't be reached) is refused, so a broken direct-receive
+                // rail is caught here instead of silently dropping Lightning
+                // from the checkout. Already-stored addresses pass through
+                // with a refreshed probe result (and the per-address warning)
+                // so the operator can still edit the rest of the card.
+                $gate = StoreLnAddresses::probeAndGateChain($storeId, $destinations);
+                $entries = $gate['entries'];
+                $addressResults = $gate['results'];
 
                 Database::update('stores', [
                     'auto_melt_enabled' => $enabled,
