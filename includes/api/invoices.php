@@ -7,6 +7,52 @@ require_once __DIR__ . '/../invoice.php';
 require_once __DIR__ . '/../security.php';
 
 /**
+ * Normalize an API-supplied invoice amount to a plain decimal string, or
+ * return null when it isn't a positive number in an accepted format.
+ *
+ * The Greenfield body is untrusted JSON: `amount` can arrive as an int,
+ * float, string — or anything else. Invoice::create coerces blindly
+ * ((int)"-5" is -5, (int)"abc" is 0) and the fiat path feeds bcmath, which
+ * throws ValueError on non-numeric input, so every shape must be rejected
+ * here. Mirrors SelfServe::validateAmount semantics: whole numbers for
+ * sat/msat, up to 8 decimals for BTC, 2 for fiat; no signs, exponents,
+ * or thousands separators.
+ */
+function normalizeApiInvoiceAmount($amount, string $currency): ?string {
+    if (is_int($amount)) {
+        $raw = (string)$amount;
+    } elseif (is_float($amount)) {
+        if (!is_finite($amount)) {
+            return null;
+        }
+        // Fixed-point render so floats never reach the regex in exponent
+        // notation ("1.0E-9"); trim the trailing zeros it introduces.
+        $raw = rtrim(rtrim(number_format($amount, 8, '.', ''), '0'), '.');
+    } elseif (is_string($amount)) {
+        $raw = trim($amount);
+    } else {
+        return null; // bool, array, object — never a valid amount
+    }
+
+    $cur = strtoupper($currency);
+    if (in_array($cur, ['SAT', 'SATS', 'MSAT'], true)) {
+        if (!preg_match('/^\d{1,15}$/', $raw) || (int)$raw < 1) {
+            return null;
+        }
+        return (string)(int)$raw; // strip leading zeros
+    }
+
+    $maxDecimals = ($cur === 'BTC') ? 8 : 2;
+    if (!preg_match('/^\d{1,15}(\.\d{1,' . $maxDecimals . '})?$/', $raw)) {
+        return null;
+    }
+    if ((float)$raw <= 0) {
+        return null;
+    }
+    return $raw;
+}
+
+/**
  * Create a new invoice
  */
 function handleCreateInvoice(array $auth, array $params, array $body): void {
@@ -25,6 +71,16 @@ function handleCreateInvoice(array $auth, array $params, array $body): void {
 
     if ($amount === null || $amount === '') {
         errorResponse('validation-error', 'Amount is required');
+    }
+    if (!is_string($currency)) {
+        errorResponse('validation-error', 'Currency must be a string');
+    }
+    $amount = normalizeApiInvoiceAmount($amount, $currency);
+    if ($amount === null) {
+        errorResponse(
+            'validation-error',
+            'Amount must be a positive number (whole sats for sat/msat; up to 8 decimals for BTC, 2 for fiat)'
+        );
     }
 
     // Reject non-http(s) redirectURL: payment.php renders it into an <a href>
@@ -50,6 +106,12 @@ function handleCreateInvoice(array $auth, array $params, array $body): void {
         jsonResponse(Invoice::formatForApi($invoice), 200);
     } catch (Exception $e) {
         errorResponse('invoice-error', $e->getMessage());
+    } catch (Throwable $t) {
+        // Engine errors (TypeError, bcmath ValueError, …) must not escape as
+        // a raw PHP fatal: log the detail, answer with a clean opaque 500.
+        error_log('[api] invoice creation failed for store ' . $storeId . ': '
+            . get_class($t) . ': ' . $t->getMessage());
+        errorResponse('internal-error', 'Invoice creation failed', 500);
     }
 }
 

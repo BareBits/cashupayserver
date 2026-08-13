@@ -125,7 +125,16 @@ class Security {
         if ($s === '') {
             return $s;
         }
-        if (strpos("=+-@\t\r\n", $s[0]) !== false) {
+        // Neutralize when the FIRST character is dangerous, OR when the first
+        // non-whitespace character is a formula lead-in: some parsers strip
+        // leading spaces/tabs/newlines before evaluating, so " =cmd|..." (note
+        // the leading space) would otherwise execute despite passing a raw
+        // $s[0] check. ltrim of all ASCII whitespace covers space, tab, CR, LF,
+        // vertical tab and form feed.
+        $firstVisible = ltrim($s, " \t\r\n\v\f");
+        $startsDangerous = strpos("=+-@\t\r\n", $s[0]) !== false
+            || ($firstVisible !== '' && strpos("=+-@", $firstVisible[0]) !== false);
+        if ($startsDangerous) {
             return "'" . $s;
         }
         return $s;

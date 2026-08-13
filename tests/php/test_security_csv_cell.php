@@ -33,4 +33,16 @@ assert_eq('1000', Security::csvCell(1000), 'int -> string');
 // A formula char that is NOT first is fine (only the leading char matters).
 assert_eq('a=b', Security::csvCell('a=b'), 'equals not first');
 
+// Leading-whitespace bypass: a formula hidden behind spaces/tabs that a parser
+// trims before evaluating must still be neutralized (the whole original value,
+// whitespace included, is quoted).
+assert_eq("' =cmd|'/c calc'!A1", Security::csvCell(" =cmd|'/c calc'!A1"), 'space then equals');
+assert_eq("'   =1+1", Security::csvCell('   =1+1'), 'multiple spaces then equals');
+assert_eq("' @SUM(A1)", Security::csvCell(' @SUM(A1)'), 'space then at');
+assert_eq("' \t-2+3", Security::csvCell(" \t-2+3"), 'space+tab then minus');
+
+// Whitespace that does NOT hide a formula stays untouched.
+assert_eq(' hello', Security::csvCell(' hello'), 'leading space, benign');
+assert_eq('   ', Security::csvCell('   '), 'only whitespace');
+
 fwrite(STDERR, "ok\n");
