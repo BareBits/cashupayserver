@@ -225,6 +225,43 @@ class Config {
     }
 
     /**
+     * Secret columns of the stores table that must never be serialized into a
+     * response payload. seed_phrase is the spendable wallet key (whoever holds
+     * it can move every sat of the store's ecash); smtp_password and the raw
+     * internal_api_key are credentials; the xpubs let an observer derive every
+     * receive address. These are read into memory by the many `SELECT *`
+     * dashboard/store reads, so redaction happens at the response boundary
+     * (see Config::redactStoreSecrets). Reading the seed for actual signing
+     * goes through Config::getStoreSeedPhrase, not these payloads.
+     */
+    public const STORE_SECRET_COLUMNS = [
+        'seed_phrase',
+        'internal_api_key',
+        'smtp_password',
+        'onchain_xpub',
+        'hosting_fee_onchain_xpub',
+    ];
+
+    /**
+     * Strip the store-table secret columns from a single store row before it
+     * is returned to a browser. The admin panel is reachable by the lower
+     * privilege ROLE_USER (not just admins), so these JSON reads must not leak
+     * wallet keys or credentials to a logged-in-but-not-admin user. Any
+     * derived non-secret fields already added to the row (e.g. the camelCase
+     * `internalApiKey` the dashboard needs for the Request Payment feature)
+     * are preserved — only the raw secret columns above are removed.
+     *
+     * @param array<string,mixed> $store
+     * @return array<string,mixed>
+     */
+    public static function redactStoreSecrets(array $store): array {
+        foreach (self::STORE_SECRET_COLUMNS as $col) {
+            unset($store[$col]);
+        }
+        return $store;
+    }
+
+    /**
      * Get store's mint URL
      */
     public static function getStoreMintUrl(string $storeId): ?string {

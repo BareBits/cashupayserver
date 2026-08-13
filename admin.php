@@ -208,10 +208,15 @@ if (isset($_GET['api'])) {
             // Get all stores for selector
             $stores = Database::fetchAll("SELECT * FROM stores ORDER BY created_at DESC");
 
-            // Ensure each store has an internal API key
+            // Ensure each store has an internal API key. Redact the raw secret
+            // columns (seed phrase, SMTP password, xpubs, raw internal_api_key)
+            // AFTER attaching the receive-only camelCase internalApiKey the
+            // Request Payment feature needs — this endpoint is reachable by the
+            // non-admin ROLE_USER, who must not receive spendable key material.
             foreach ($stores as &$store) {
                 $store['internalApiKey'] = Auth::getOrCreateInternalApiKey($store['id']);
                 $store['isConfigured'] = Config::isStoreConfigured($store['id']);
+                $store = Config::redactStoreSecrets($store);
             }
             unset($store);
 
@@ -707,7 +712,11 @@ if (isset($_GET['api'])) {
             break;
 
         case 'stores':
+            // Store selector list. Consumers only read id/name/mint_url, so
+            // strip every secret column — this endpoint is reachable by the
+            // non-admin ROLE_USER (no requireAdmin gate on ?api=).
             $stores = Database::fetchAll("SELECT * FROM stores ORDER BY created_at DESC");
+            $stores = array_map([Config::class, 'redactStoreSecrets'], $stores);
             echo json_encode($stores);
             break;
 
