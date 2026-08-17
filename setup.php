@@ -532,7 +532,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $lnAddress !== '' ? [$lnAddress] : [],
                     $noffers
                 );
-                StoreLnAddresses::replaceForStore($storeId, $chain);
+                // Same LUD-21 gate as the admin auto-cashout card: a new
+                // address whose host can't confirm a verify URL (or can't be
+                // reached) throws here, keeping the operator on this screen
+                // with the reason instead of onboarding a Lightning rail that
+                // silently vanishes from checkout. An address already stored
+                // for this store passes through, so revisiting the screen
+                // never locks the operator out.
+                $gated = StoreLnAddresses::probeAndGateChain($storeId, $chain);
+                StoreLnAddresses::replaceForStore($storeId, $gated['entries']);
                 // Auto-cashout mode isn't decided here: which rail sweeps the
                 // mint balance depends on the swaps and mints answers still to
                 // come. setupResolveAutoCashout() settles it at the end.
@@ -2120,6 +2128,11 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                                style="font-family: monospace; font-size: 0.9rem;"
                                value="<?= htmlspecialchars($_POST['lightning_address'] ?? $lnExistingAddress) ?>"
                                placeholder="myname@strike.me">
+                        <p style="margin-top: 0.35rem; font-size: 0.85rem; opacity: 0.75;">
+                            When you continue we check that this wallet supports payment
+                            verification (LUD-21) &mdash; without it Lightning payments
+                            can't be confirmed, so the address can't be saved.
+                        </p>
                     </div>
 
                     <div class="form-group">

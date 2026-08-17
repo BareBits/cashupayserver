@@ -56,7 +56,12 @@ def _chain_rows(payserver, store_id: str) -> list[sqlite3.Row]:
         ))
 
 
-def test_noffer_added_to_chain_and_persisted(configured: ConfiguredPayserver) -> None:
+def test_noffer_added_to_chain_and_persisted(
+    configured_with_lnurlp: ConfiguredPayserver,
+) -> None:
+    # The chain includes a plain lnaddress, which the save-time LUD-21
+    # gate probes — the lnurlp-backed stack resolves it on the mock host.
+    configured = configured_with_lnurlp
     admin = configured.admin
     store_id = configured.store_id
 

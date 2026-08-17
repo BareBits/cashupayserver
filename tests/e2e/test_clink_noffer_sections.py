@@ -71,7 +71,11 @@ def _chain_rows(payserver, store_id: str) -> list[sqlite3.Row]:
 # ---------------------------------------------------------------- HTTP contract
 
 
-def test_split_lists_persist_ln_first_then_noffers(configured: ConfiguredPayserver) -> None:
+def test_split_lists_persist_ln_first_then_noffers(
+    configured_with_lnurlp: ConfiguredPayserver,
+) -> None:
+    # lnaddresses in the chain must pass the save-time LUD-21 gate.
+    configured = configured_with_lnurlp
     admin, store_id = configured.admin, configured.store_id
     r = _post_split(
         admin, store_id,

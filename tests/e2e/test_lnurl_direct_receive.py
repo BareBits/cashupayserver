@@ -19,11 +19,11 @@ Exercises the full stack — cashupayserver, the LUD-21 mock LNURL host
    funds to the merchant. The pure-PHP unit tests cover the decision truth
    table + accounting; this confirms the path is wired end-to-end.
 
-3. **LUD-21 fallback**: when the LN address host doesn't advertise a
-   verify URL, save_auto_melt records stores.lnurl_supports_verify=0 and
-   the runtime probe falls back transparently. New invoices land on the
-   mint rail with no override reason (the gate didn't fire — we just
-   couldn't use LNURL at all).
+3. **LUD-21 save gate**: when the LN address host doesn't advertise a
+   verify URL, save_auto_melt refuses to add the address (400 naming
+   LUD-21). An address already stored for the store is grandfathered:
+   re-saving it succeeds with lud21Support=0, and invoices for it fall
+   back transparently to the mint rail with no override reason.
 """
 from __future__ import annotations
 
@@ -508,24 +508,70 @@ def configured_no_lud21(
     return _configure(payserver_no_lud21, mint, backup_mint)
 
 
-def test_lnurl_lud21_missing_falls_back_to_mint(
+def _seed_ln_address(
+    payserver: PayserverHandle, store_id: str, address: str, supports_verify=None
+) -> None:
+    """Insert a store_ln_addresses row directly, bypassing the save-time
+    LUD-21 gate — models an address stored before the gate existed (the
+    grandfathered case)."""
+    db_path = payserver.data_dir / "cashupay.sqlite"
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute(
+            "INSERT INTO store_ln_addresses "
+            "(store_id, position, address, type, supports_verify) "
+            "VALUES (?, 0, ?, 'lnaddress', ?)",
+            (store_id, address, supports_verify),
+        )
+        conn.commit()
+
+
+def test_lnurl_lud21_missing_blocks_save(
     configured_no_lud21: ConfiguredPayserver,
     lnurlp_server_no_lud21: LnurlpServer,
 ) -> None:
-    """Without LUD-21, the LNURL probe rejects and the invoice routes via
-    the mint. The save_auto_melt response should reflect lnurl_supports_verify=0,
-    and the stores table should match."""
+    """Without LUD-21, save_auto_melt refuses a NEW address outright — the
+    broken direct-receive rail is caught at save time instead of silently
+    dropping Lightning from the checkout."""
     configured = configured_no_lud21
+
+    with pytest.raises(RuntimeError, match="LUD-21"):
+        _enable_auto_melt(configured)
+
+    # Nothing was persisted: neither the address chain nor the toggle.
+    assert _primary_ln_address_support(configured.handle, configured.store_id) is None
+    store = _read_store_row(configured.handle, configured.store_id)
+    assert store["auto_melt_enabled"] == 0, dict(store)
+
+
+def test_lnurl_lud21_grandfathered_address_falls_back_to_mint(
+    configured_no_lud21: ConfiguredPayserver,
+    lnurlp_server_no_lud21: LnurlpServer,
+) -> None:
+    """An address stored before the gate existed keeps working: re-saving it
+    succeeds (refreshing its probe result to 0) and invoices fall back to the
+    mint rail with no override reason — the pre-gate runtime behaviour."""
+    configured = configured_no_lud21
+    _seed_ln_address(configured.handle, configured.store_id, LNURL_ADDRESS)
 
     save_result = _enable_auto_melt(configured)
     assert save_result.get("success") is True, save_result
     assert _primary_lud21(save_result) == 0, (
-        "host without verify URL should report unsupported; "
+        "grandfathered address should re-probe to lud21Support=0; "
         f"got {save_result}"
     )
 
     # The per-address cache mirrors the response.
     assert _primary_ln_address_support(configured.handle, configured.store_id) == 0
+
+    # Adding a second, NEW address alongside the grandfathered one still fails.
+    with pytest.raises(RuntimeError, match="LUD-21"):
+        configured.admin._post_action(
+            "save_auto_melt",
+            store_id=configured.store_id,
+            enabled="1",
+            threshold="100",
+            **{"ln_addresses[]": [LNURL_ADDRESS, "brandnew@example.test"]},
+        )
 
     invoice = configured.greenfield.create_invoice(
         configured.store_id, amount=str(INVOICE_AMOUNT_SAT), currency="sat"

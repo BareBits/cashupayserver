@@ -49,11 +49,14 @@ GMP_FUNCS = (
 
 
 @pytest.fixture()
-def gmpless_payserver() -> Iterator[PayserverHandle]:
+def gmpless_payserver(lnurlp_server) -> Iterator[PayserverHandle]:
+    # The lnurlp mock is routed in so the plain lnaddresses these tests save
+    # alongside noffers pass the save-time LUD-21 gate.
     workdir = SESSION_TMP / f"payserver-noffer-gmpless-{uuid.uuid4().hex[:8]}"
     handle = start_payserver(
         workdir,
         extra_php_args=["-d", f"disable_functions={GMP_FUNCS}"],
+        extra_env={"CASHU_LNURL_URL_TEMPLATE": lnurlp_server.url_template},
     )
     yield handle
     stop_payserver(handle)

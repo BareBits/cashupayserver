@@ -40,7 +40,12 @@ def Wizard(handle: PayserverHandle) -> SetupWizard:
     return SetupWizard(handle.url)
 
 
-def test_full_flow_persists_every_answer(payserver: PayserverHandle) -> None:
+def test_full_flow_persists_every_answer(
+    payserver_with_lnurlp: PayserverHandle,
+) -> None:
+    # The lightning step's LUD-21 gate probes the typed address; the lnurlp
+    # stack routes it to the mock host, which serves a verify URL.
+    payserver = payserver_with_lnurlp
     w = Wizard(payserver)
     body = w.through_store("Persisted Store")
     assert _heading(body) == "On-chain Bitcoin payments"
@@ -175,6 +180,17 @@ def test_invalid_inputs_are_rejected_with_readable_messages(payserver: Payserver
 
     body = w.post(step="lightning", lightning_action="save", noffer="noffer1garbage")
     assert "noffer1" in (_error(body) or ""), _error(body)
+
+    # A well-formed address whose host can't be reached fails the LUD-21
+    # save-time gate (.invalid never resolves, so this is deterministic
+    # with or without outbound network).
+    body = w.post(
+        step="lightning",
+        lightning_action="save",
+        lightning_address="merchant@unreachable.invalid",
+    )
+    assert "didn't respond" in (_error(body) or ""), _error(body)
+    assert _heading(body) == "Lightning payments", "a blocked save stays on the screen"
 
     # Nothing partial should have been written by the rejected submissions.
     conn = sqlite3.connect(payserver.data_dir / "cashupay.sqlite")

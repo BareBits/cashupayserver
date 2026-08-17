@@ -95,8 +95,23 @@ def test_wizard_skips_the_password_screen_and_completes(wp_ready) -> None:
     )
     assert wizard_heading(body) == "Zero-conf payments", wizard_heading(body)
     body = w.post(step="zeroconf", zero_conf="1")
+    # No LNURL host is reachable from this fixture, so a brand-new address
+    # would be blocked by the save-time LUD-21 gate. Pre-seed it and re-save
+    # the same value — the grandfathered path a WP host upgrading with a
+    # stored address takes. (.invalid never resolves, so the non-blocking
+    # re-probe fails fast and deterministically.)
+    with wp.db() as db:
+        store_id = db.execute(
+            "SELECT id FROM stores WHERE name = 'WP Wizard Store'"
+        ).fetchone()[0]
+        db.execute(
+            "INSERT INTO store_ln_addresses "
+            "(store_id, position, address, type, supports_verify) "
+            "VALUES (?, 0, 'wpmerchant@wp.invalid', 'lnaddress', NULL)",
+            (store_id,),
+        )
     body = w.post(step="lightning", lightning_action="save",
-                  lightning_address="wpmerchant@strike.me")
+                  lightning_address="wpmerchant@wp.invalid")
     body = w.post(step="swaps", swaps_enabled="1")
     assert wizard_error(body) is None, wizard_error(body)
     body = w.post(step="mints", mints_enabled="0")

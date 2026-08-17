@@ -257,8 +257,11 @@ MINTLESS_MATRIX = [
 
 @pytest.mark.parametrize("choices,expect", MINTLESS_MATRIX)
 def test_choice_matrix_without_mints(
-    payserver: PayserverHandle, choices: Choices, expect: Expect
+    payserver_with_lnurlp: PayserverHandle, choices: Choices, expect: Expect
 ) -> None:
+    # The lnurlp-backed stack routes LN_ADDRESS to the mock LUD-21 host, so
+    # the lightning step's save-time gate passes for the rows that type one.
+    payserver = payserver_with_lnurlp
     walk(payserver, choices)
     assert_state(payserver, expect)
 
@@ -321,12 +324,13 @@ MINTED_MATRIX = [
 
 @pytest.mark.parametrize("choices,expect", MINTED_MATRIX)
 def test_choice_matrix_with_mints(
-    payserver: PayserverHandle,
+    payserver_with_lnurlp: PayserverHandle,
     mint: MintHandle,
     backup_mint: MintHandle,
     choices: Choices,
     expect: Expect,
 ) -> None:
+    payserver = payserver_with_lnurlp
     walk(payserver, choices, mint, backup_mint)
     assert_state(payserver, expect)
 
@@ -424,20 +428,22 @@ def test_completion_screen_warns_when_no_rail_was_configured(
 
 
 def test_completion_screen_is_clean_when_a_rail_exists(
-    payserver: PayserverHandle,
+    payserver_with_lnurlp: PayserverHandle,
 ) -> None:
+    payserver = payserver_with_lnurlp
     w = walk(payserver, Choices(onchain="xpub", lightning="address", swaps=True, mints=False))
     body = w.post(step="cron")
     assert "No payment method is set up yet" not in body
 
 
 def test_completion_screen_does_not_cry_wolf_on_a_fresh_session(
-    payserver: PayserverHandle,
+    payserver_with_lnurlp: PayserverHandle,
 ) -> None:
     """Reaching the final screen without the wizard's session — browser
     restarted, cookie expired, link reopened in another tab — leaves no store
     id to inspect. An unknown store must not be reported as unpayable: that
     reads as "your setup failed" to an operator whose setup went fine."""
+    payserver = payserver_with_lnurlp
     walk(payserver, Choices(onchain="skip", lightning="address", swaps=False, mints=False))
 
     stranger = SetupWizard(payserver.url)  # brand new cookie jar
