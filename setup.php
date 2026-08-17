@@ -2158,10 +2158,13 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                 require_once __DIR__ . '/includes/nwc/client.php';
                 $lnNofferEnvError = ClinkClient::environmentError();
                 $lnNwcEnvError = NwcClient::environmentError();
-                // A POSTed value (validation error re-render) wins over the
-                // stored prefill; it may be a full URI the operator just
-                // pasted, or the keep ref from a prior render.
-                $lnNwcValue = trim((string)($_POST['nwc'] ?? $lnExistingNwcRef));
+                // Unlike the address/noffer fields, a POSTed NWC value is
+                // NEVER echoed back into the re-rendered form: the paste
+                // embeds the wallet secret, and the invariant "the secret
+                // appears in no server response" beats saving the operator a
+                // re-paste after a failed save. Only the opaque keep ref of a
+                // stored connection round-trips.
+                $lnNwcValue = trim((string)($_POST['nwc_keep_ref'] ?? $lnExistingNwcRef));
                 $lnNwcShowsSaved = $lnNwcValue !== '' && str_starts_with($lnNwcValue, StoreLnAddresses::KEEP_REF_PREFIX);
                 ?>
                 <h2 style="margin-bottom: 1rem;">⚡ Lightning payments</h2>
@@ -2222,7 +2225,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                         <?php else: ?>
                             <input type="text" id="nwc" name="nwc"
                                    style="font-family: monospace; font-size: 0.9rem;<?= $lnNwcEnvError !== null ? ' opacity: 0.5;' : '' ?>"
-                                   value="<?= htmlspecialchars($lnNwcValue) ?>"
+                                   value=""
                                    placeholder="nostr+walletconnect://&hellip;"
                                    <?= $lnNwcEnvError !== null ? 'disabled' : '' ?>>
                         <?php endif; ?>

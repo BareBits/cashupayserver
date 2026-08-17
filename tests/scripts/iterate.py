@@ -560,6 +560,20 @@ def main() -> int:
         clink_relay = start_clink_relay(workdir)
         handles.append(("clink-relay", stop_clink_relay, clink_relay))
         print(f"[iterate] CLINK relay: {clink_relay.ws_url}")
+
+        # Fake NWC wallet on the same relay, minting from lnd_payer (which
+        # lnd_mint can pay over the dual channels — so both direct-receive
+        # invoices, paid from lnd_mint, and auto-melt drains, paid BY the
+        # store's mint, settle in-rig). Paste the printed connection string
+        # into a store's NWC section or the wizard's NWC field.
+        print("[iterate] starting fake NWC wallet (NIP-47) on the in-rig relay ...")
+        from fixtures.nwc_wallet import start_nwc_wallet
+        nwc_wallet = start_nwc_wallet(
+            clink_relay.ws_url, lnd_payer,
+            info_methods=["make_invoice", "lookup_invoice", "get_info"],
+        )
+        handles.append(("nwc-wallet", lambda h: h.stop(), nwc_wallet))
+        nwc_demo_uri = nwc_wallet.connection_uri()
         # Redirect the plugin's opt-out dev-fee payout to the local LNURL host so
         # nothing ever leaves the rig (default is a real mainnet address).
         clink_devfee_dest = f"{lnurlp.base_url}/.well-known/lnurlp/{CLINK_FEES_LN_USER}"
@@ -956,6 +970,9 @@ def main() -> int:
             print(f"                  (pay it from {CLINK_SENDER_WALLET_NAME}, or add it to a store's")
             print(f"                   auto-cashout chain in admin to direct-receive over CLINK)")
         print(f"CLINK dev-fee:    redirected to {clink_devfee_dest} (local; never leaves the rig)")
+        print(f"NWC demo string:  {nwc_demo_uri}")
+        print(f"                  (fake NIP-47 wallet backed by lnd_payer; paste it into a store's")
+        print(f"                   NWC section — invoices it mints are payable from lnd_mint)")
         print(f"cashu.me:         {cashume_url}")
         print(f"                  opened in Chromium with {CASHUME_FUNDING_SAT} sat pre-loaded")
 

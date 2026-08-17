@@ -147,6 +147,57 @@ def test_noffer_is_stored_after_the_lightning_address(
     assert chain[1]["address"] == REFERENCE_NOFFER
 
 
+def test_all_three_destination_types_store_in_chain_order(
+    payserver_with_lnurlp: PayserverHandle, mint: MintHandle, backup_mint: MintHandle,
+    lnd_mint, channels, page
+) -> None:
+    """The lightning screen accepts all three destination types at once and
+    persists the chain in the order Invoice::create walks it: LNURL address,
+    then the NWC connection, then the noffer. Uses the lnurlp-backed stack for
+    the LUD-21 gate and a live fake NWC wallet for the save-time probe."""
+    import time as _time
+
+    from conftest import SESSION_TMP
+    from fixtures.nwc_wallet import start_nwc_stack, stop_nwc_stack
+
+    workdir = SESSION_TMP / f"nwc-wizard-ui-{int(_time.time())}"
+    workdir.mkdir(parents=True, exist_ok=True)
+    stack = start_nwc_stack(
+        workdir, lnd_mint, info_methods=["make_invoice", "lookup_invoice", "get_info"]
+    )
+    try:
+        nwc_uri = stack.wallet.connection_uri()
+        payserver = payserver_with_lnurlp
+        _walk_to_store(page, payserver)
+        page.fill("#store_name", "Three Rails Store")
+        page.click("button[type=submit]")
+
+        page.wait_for_selector("#onchain-form")
+        page.click("button:has-text('Skip for now')")
+
+        page.wait_for_selector("#lightning_address")
+        page.fill("#lightning_address", "merchant@strike.me")
+        page.fill("#nwc", nwc_uri)
+        page.fill("#noffer", REFERENCE_NOFFER)
+        page.click("button:has-text('Continue')")
+
+        page.wait_for_selector("button:has-text('No thanks')")
+
+        chain = _rows(
+            payserver,
+            "SELECT address, type, position FROM store_ln_addresses ORDER BY position ASC",
+        )
+        assert [(r["type"], r["position"]) for r in chain] == [
+            ("lnaddress", 0), ("nwc", 1), ("noffer", 2),
+        ]
+        assert chain[1]["address"] == nwc_uri
+        # The wizard page itself must never re-render the secret.
+        secret = nwc_uri.split("secret=", 1)[1].split("&", 1)[0]
+        assert secret not in page.content()
+    finally:
+        stop_nwc_stack(stack)
+
+
 def test_back_to_store_screen_renames_instead_of_duplicating(
     payserver: PayserverHandle, mint: MintHandle, page
 ) -> None:
