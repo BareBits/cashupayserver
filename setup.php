@@ -485,10 +485,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
                 $lnAddress = trim($_POST['lightning_address'] ?? '');
                 $noffer = trim($_POST['noffer'] ?? '');
+                $nwc = trim($_POST['nwc'] ?? '');
+                // Saved-connection controls (see the render below): a pasted
+                // URI replaces, the clear checkbox removes, and otherwise the
+                // hidden keep ref preserves the stored connection.
+                if ($nwc === '' && ($_POST['nwc_clear'] ?? '') !== '1') {
+                    $nwc = trim($_POST['nwc_keep_ref'] ?? '');
+                }
 
                 if ($lnAction === 'skip') {
                     $lnAddress = '';
                     $noffer = '';
+                    $nwc = '';
                 }
 
                 // Validate separately so the operator gets a message naming the
@@ -498,6 +506,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 }
                 if ($noffer !== '' && !ClinkNoffer::isValid($noffer)) {
                     throw new Exception('That noffer doesn\'t look right. It should start with noffer1 — copy the whole string from your wallet.');
+                }
+                // A previously stored connection round-trips as an opaque
+                // keep:<id> ref (the raw URI embeds the wallet secret and is
+                // never sent to the browser); resolveKeepRefs turns it back
+                // into the stored value below. Only a full new URI is
+                // shape-checked here.
+                if ($nwc !== '' && !str_starts_with($nwc, StoreLnAddresses::KEEP_REF_PREFIX)
+                        && !NwcUri::isValid($nwc)) {
+                    throw new Exception('That NWC connection string doesn\'t look right. It should start with nostr+walletconnect:// — copy the whole string from your wallet.');
                 }
 
                 // Environment gate, same as the swaps screen's: the CLINK
@@ -526,11 +543,34 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $noffers = $storedNoffers;
                 }
 
-                // Address first, noffer as fallback — the order Invoice::create
-                // walks the chain at payment time.
+                // NWC: resolve a keep:<id> ref back to the stored connection
+                // string, then apply the same env gate + keep-on-gated-host
+                // rules as the noffer field above. NWC signs Nostr requests
+                // through the same stack, so it shares the GMP requirement.
+                require_once __DIR__ . '/includes/nwc/client.php';
+                $nwcEnvError = NwcClient::environmentError();
+                [$nwcList, $nwcKeptKeys] = StoreLnAddresses::resolveKeepRefs(
+                    $storeId, $nwc !== '' ? [$nwc] : []
+                );
+                if ($nwcList !== [] && $nwcEnvError !== null && $nwcKeptKeys === []) {
+                    throw new Exception('NWC connections can\'t be used on this server yet. ' . $nwcEnvError);
+                }
+                if ($lnAction === 'save' && $nwcEnvError !== null && $nwcList === []) {
+                    $storedNwc = [];
+                    foreach (StoreLnAddresses::listForStore($storeId) as $lnRow) {
+                        if ($lnRow['type'] === StoreLnAddresses::TYPE_NWC) {
+                            $storedNwc[] = $lnRow['address'];
+                        }
+                    }
+                    $nwcList = $storedNwc;
+                }
+
+                // Address first, then NWC, noffer as final fallback — the
+                // order Invoice::create walks the chain at payment time.
                 $chain = StoreLnAddresses::chainFromLists(
                     $lnAddress !== '' ? [$lnAddress] : [],
-                    $noffers
+                    $noffers,
+                    $nwcList
                 );
                 // Same LUD-21 gate as the admin auto-cashout card: a new
                 // address whose host can't confirm a verify URL (or can't be
@@ -2088,13 +2128,23 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                 </form>
 
             <?php elseif ($step === 'lightning'): ?>
-                <!-- Screen: Lightning destinations (LNURL + CLINK noffer) -->
+                <!-- Screen: Lightning destinations (LNURL + NWC + CLINK noffer) -->
                 <?php
                 $lnExistingAddress = '';
                 $lnExistingNoffer = '';
+                // A stored NWC connection prefills as a masked label + keep:<id>
+                // ref — the raw URI embeds the wallet secret and never reaches
+                // the browser.
+                $lnExistingNwcRef = '';
+                $lnExistingNwcLabel = '';
                 foreach ($renderStoreId ? StoreLnAddresses::listForStore($renderStoreId) : [] as $lnRow) {
                     if ($lnRow['type'] === StoreLnAddresses::TYPE_NOFFER) {
                         if ($lnExistingNoffer === '') { $lnExistingNoffer = $lnRow['address']; }
+                    } elseif ($lnRow['type'] === StoreLnAddresses::TYPE_NWC) {
+                        if ($lnExistingNwcRef === '') {
+                            $lnExistingNwcRef = StoreLnAddresses::KEEP_REF_PREFIX . $lnRow['id'];
+                            $lnExistingNwcLabel = StoreLnAddresses::displayValue($lnRow['type'], $lnRow['address']);
+                        }
                     } elseif ($lnExistingAddress === '') {
                         $lnExistingAddress = $lnRow['address'];
                     }
@@ -2102,9 +2152,20 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                 // Same environment gate as the swaps screen: the CLINK client
                 // needs GMP, so on a host without it the noffer field is
                 // disabled with the reason instead of accepting a destination
-                // that would silently fail at checkout.
+                // that would silently fail at checkout. NWC signs its Nostr
+                // requests through the same stack and gets the same gate.
                 require_once __DIR__ . '/includes/clink/client.php';
+                require_once __DIR__ . '/includes/nwc/client.php';
                 $lnNofferEnvError = ClinkClient::environmentError();
+                $lnNwcEnvError = NwcClient::environmentError();
+                // Unlike the address/noffer fields, a POSTed NWC value is
+                // NEVER echoed back into the re-rendered form: the paste
+                // embeds the wallet secret, and the invariant "the secret
+                // appears in no server response" beats saving the operator a
+                // re-paste after a failed save. Only the opaque keep ref of a
+                // stored connection round-trips.
+                $lnNwcValue = trim((string)($_POST['nwc_keep_ref'] ?? $lnExistingNwcRef));
+                $lnNwcShowsSaved = $lnNwcValue !== '' && str_starts_with($lnNwcValue, StoreLnAddresses::KEEP_REF_PREFIX);
                 ?>
                 <h2 style="margin-bottom: 1rem;">⚡ Lightning payments</h2>
                 <p style="margin-bottom: 0.75rem;">
@@ -2132,6 +2193,48 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                             When you continue we check that this wallet supports payment
                             verification (LUD-21) &mdash; without it Lightning payments
                             can't be confirmed, so the address can't be saved.
+                        </p>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="nwc">Nostr Wallet Connect (NWC)</label>
+                        <?php if ($lnNwcEnvError !== null): ?>
+                            <div class="warning" style="margin-bottom: 0.5rem;">
+                                <strong>NWC isn't available on this server yet:</strong>
+                                <?= htmlspecialchars($lnNwcEnvError) ?>
+                            </div>
+                        <?php endif; ?>
+                        <?php if ($lnNwcShowsSaved): ?>
+                            <!-- A connection is stored. Its secret-bearing URI never
+                                 reaches the browser: the hidden keep ref keeps it on
+                                 save, pasting a new string replaces it, and the
+                                 checkbox removes it. -->
+                            <input type="hidden" name="nwc_keep_ref" value="<?= htmlspecialchars($lnNwcValue) ?>">
+                            <input type="text" readonly
+                                   style="font-family: monospace; font-size: 0.9rem; opacity: 0.7; margin-bottom: 0.5rem;"
+                                   value="<?= htmlspecialchars($lnExistingNwcLabel !== '' ? $lnExistingNwcLabel : 'Saved NWC connection') ?>">
+                            <label style="display:block; font-size: 0.85rem; margin-bottom: 0.5rem;">
+                                <input type="checkbox" name="nwc_clear" value="1">
+                                Remove this saved connection
+                            </label>
+                            <input type="text" id="nwc" name="nwc"
+                                   style="font-family: monospace; font-size: 0.9rem;<?= $lnNwcEnvError !== null ? ' opacity: 0.5;' : '' ?>"
+                                   value=""
+                                   placeholder="paste a new nostr+walletconnect://&hellip; to replace"
+                                   <?= $lnNwcEnvError !== null ? 'disabled' : '' ?>>
+                        <?php else: ?>
+                            <input type="text" id="nwc" name="nwc"
+                                   style="font-family: monospace; font-size: 0.9rem;<?= $lnNwcEnvError !== null ? ' opacity: 0.5;' : '' ?>"
+                                   value=""
+                                   placeholder="nostr+walletconnect://&hellip;"
+                                   <?= $lnNwcEnvError !== null ? 'disabled' : '' ?>>
+                        <?php endif; ?>
+                        <p style="margin-top: 0.35rem; font-size: 0.85rem; opacity: 0.75;">
+                            Lets BareBits request invoices straight from your own
+                            Lightning wallet and confirm payments automatically. Use a
+                            <strong>receive-only</strong> connection (make_invoice +
+                            lookup_invoice). When you continue, the connection is
+                            tested with a 1-sat test invoice (it's never paid).
                         </p>
                     </div>
 

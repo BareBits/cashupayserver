@@ -277,6 +277,20 @@ if (isset($_GET['api'])) {
             // 0 = unsupported → payments route via the mint, 1 = direct-receive ok).
             $lnAddressRows = StoreLnAddresses::listForStore($storeId);
             $autoMeltAddresses = array_map(static function (array $r): array {
+                // NWC connection URIs embed the wallet secret and this
+                // endpoint is reachable by the non-admin ROLE_USER, so nwc
+                // rows go out as their masked display label plus an opaque
+                // keep:<id> ref. On save, the UI posts the ref back and the
+                // server resolves it to the stored value — the raw URI never
+                // round-trips through the browser.
+                if ($r['type'] === StoreLnAddresses::TYPE_NWC) {
+                    return [
+                        'address' => StoreLnAddresses::displayValue($r['type'], $r['address']),
+                        'type' => $r['type'],
+                        'lud21Support' => null,
+                        'ref' => StoreLnAddresses::KEEP_REF_PREFIX . $r['id'],
+                    ];
+                }
                 return [
                     'address' => $r['address'],
                     'type' => $r['type'],
@@ -2305,16 +2319,26 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 // returns the ordered LN-first chain. Older callers may still
                 // send a single auto-detected addresses[] / address; honour that
                 // by classifying each entry by shape ('noffer1…' vs local@host).
-                if (isset($_POST['ln_addresses']) || isset($_POST['noffers'])) {
+                if (isset($_POST['ln_addresses']) || isset($_POST['noffers']) || isset($_POST['nwc'])) {
                     $lnList = $_POST['ln_addresses'] ?? [];
                     $nofferList = $_POST['noffers'] ?? [];
+                    $nwcList = $_POST['nwc'] ?? [];
                     if (!is_array($lnList)) {
                         $lnList = [(string)$lnList];
                     }
                     if (!is_array($nofferList)) {
                         $nofferList = [(string)$nofferList];
                     }
-                    $destinations = StoreLnAddresses::chainFromLists($lnList, $nofferList);
+                    if (!is_array($nwcList)) {
+                        $nwcList = [(string)$nwcList];
+                    }
+                    // NWC entries arrive either as full connection URIs (new)
+                    // or opaque keep:<row-id> refs (kept) — the browser never
+                    // holds the stored secret-bearing URIs. Resolve refs to
+                    // the stored values before validation; kept entries also
+                    // skip the save-time probe in probeAndGateChain.
+                    [$nwcList, ] = StoreLnAddresses::resolveKeepRefs($storeId, $nwcList);
+                    $destinations = StoreLnAddresses::chainFromLists($lnList, $nofferList, $nwcList);
                 } else {
                     // Legacy single auto-detected chain.
                     $rawAddresses = $_POST['addresses'] ?? null;
@@ -2331,16 +2355,25 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         if ($val === '') {
                             continue;
                         }
-                        $type = ClinkNoffer::isValid($val)
-                            ? StoreLnAddresses::TYPE_NOFFER
-                            : StoreLnAddresses::TYPE_LNADDRESS;
+                        if (ClinkNoffer::isValid($val)) {
+                            $type = StoreLnAddresses::TYPE_NOFFER;
+                        } elseif (NwcUri::isValid($val)) {
+                            $type = StoreLnAddresses::TYPE_NWC;
+                        } elseif (stripos($val, 'nostr+walletconnect:') === 0) {
+                            // Malformed NWC paste: reject WITHOUT echoing it —
+                            // even a broken one may carry the wallet secret.
+                            throw new Exception('Invalid NWC connection string (value hidden).');
+                        } else {
+                            $type = StoreLnAddresses::TYPE_LNADDRESS;
+                        }
                         if (!StoreLnAddresses::isValidEntry($type, $val)) {
                             $label = $type === StoreLnAddresses::TYPE_NOFFER ? 'noffer' : 'Lightning address';
                             throw new Exception("Invalid {$label} format: {$val}");
                         }
                         $key = strtolower($val);
                         if (isset($seen[$key])) {
-                            throw new Exception("Duplicate destination: {$val}");
+                            throw new Exception('Duplicate destination: '
+                                . StoreLnAddresses::displayValue($type, $val));
                         }
                         $seen[$key] = true;
                         $destinations[] = ['type' => $type, 'value' => $val];
@@ -2355,6 +2388,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 // rest of the card. The UI greys the section out — this catches
                 // a direct POST past that.
                 require_once __DIR__ . '/includes/clink/client.php';
+                require_once __DIR__ . '/includes/nwc/client.php';
                 if (($nofferEnvError = ClinkClient::environmentError()) !== null) {
                     $storedNoffers = [];
                     foreach (StoreLnAddresses::listForStore($storeId) as $row) {
@@ -2366,6 +2400,24 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         if ($dest['type'] === StoreLnAddresses::TYPE_NOFFER
                                 && !isset($storedNoffers[strtolower($dest['value'])])) {
                             throw new Exception('noffers can\'t be added on this server yet. ' . $nofferEnvError);
+                        }
+                    }
+                }
+                // Same gate for NWC: signing NIP-47 requests needs GMP too.
+                // NEW connections are refused with the actionable message;
+                // kept ones (resolved from keep: refs above) pass through so
+                // the operator can still edit the rest of the card.
+                if (($nwcEnvError = NwcClient::environmentError()) !== null) {
+                    $storedNwcKeys = [];
+                    foreach (StoreLnAddresses::listForStore($storeId) as $row) {
+                        if ($row['type'] === StoreLnAddresses::TYPE_NWC) {
+                            $storedNwcKeys[NwcUri::dedupKey($row['address'])] = true;
+                        }
+                    }
+                    foreach ($destinations as $dest) {
+                        if ($dest['type'] === StoreLnAddresses::TYPE_NWC
+                                && !isset($storedNwcKeys[NwcUri::dedupKey($dest['value'])])) {
+                            throw new Exception('NWC connections can\'t be added on this server yet. ' . $nwcEnvError);
                         }
                     }
                 }
@@ -5502,8 +5554,10 @@ header('Cache-Control: no-cache, must-revalidate');
                             // noffer section below gets its own gate.
                             require_once __DIR__ . '/includes/onchain/wallet.php';
                             require_once __DIR__ . '/includes/clink/client.php';
+                            require_once __DIR__ . '/includes/nwc/client.php';
                             $gmpEnvError = OnchainWallet::environmentError();
                             $nofferEnvError = ClinkClient::environmentError();
+                            $nwcEnvError = NwcClient::environmentError();
                             ?>
                             <div id="aw-store" data-aw data-aw-scope="store">
                             <p class="aw-title">auto-cashout settings</p>
@@ -5563,6 +5617,36 @@ header('Cache-Control: no-cache, must-revalidate');
                                 </button>
                             </div>
 
+                            <div class="form-group" id="auto-melt-nwc-group"
+                                 <?= $nwcEnvError !== null ? 'data-env-error="1"' : '' ?>>
+                                <label class="form-label">NWC connections (priority order)</label>
+                                <?php if ($nwcEnvError !== null): ?>
+                                    <div style="margin-bottom:0.75rem; padding:0.6rem 0.8rem; border-radius:8px; background:rgba(245,158,11,0.12); border:1px solid rgba(245,158,11,0.4); font-size:0.82rem;">
+                                        &#9888; <strong>NWC is unavailable on this server.</strong>
+                                        <?= htmlspecialchars($nwcEnvError) ?>
+                                        Existing entries stay saved (and can be removed) but are
+                                        skipped at checkout until then.
+                                    </div>
+                                <?php endif; ?>
+                                <p class="form-help">
+                                    Nostr Wallet Connect (NIP-47) lets BareBits request Lightning
+                                    invoices straight from your own wallet and confirm payment
+                                    automatically. Tried <em>after</em> the lightning addresses
+                                    above and before noffers. Paste a
+                                    <code>nostr+walletconnect://&hellip;</code> string &mdash; ideally a
+                                    <strong>receive-only</strong> connection (make_invoice +
+                                    lookup_invoice). New connections are tested with a 1-sat test
+                                    invoice when you save. Saved connections show only wallet +
+                                    relay; the secret stays on the server.
+                                </p>
+                                <div id="auto-melt-nwc-list"></div>
+                                <div id="auto-melt-nwc-warning" class="hidden" style="margin-top:0.5rem; padding:0.6rem 0.8rem; border-radius:8px; background:rgba(245,158,11,0.12); border:1px solid rgba(245,158,11,0.4); font-size:0.82rem;"></div>
+                                <button type="button" class="btn btn-secondary" id="btn-add-nwc" style="margin-top: 0.5rem;<?= $nwcEnvError !== null ? ' opacity: 0.4;' : '' ?>"
+                                        <?= $nwcEnvError !== null ? 'disabled' : '' ?>>
+                                    + Add NWC connection
+                                </button>
+                            </div>
+
                             <div class="form-group" id="auto-melt-noffer-group"
                                  <?= $nofferEnvError !== null ? 'data-env-error="1"' : '' ?>>
                                 <label class="form-label">CLINK noffers (priority order)</label>
@@ -5577,8 +5661,9 @@ header('Cache-Control: no-cache, must-revalidate');
                                 <p class="form-help">
                                     CLINK noffers (NIP-69) request a Lightning invoice over Nostr and
                                     settle via the merchant&rsquo;s payment receipt. They are tried
-                                    <em>after</em> the lightning addresses above, in order, if those
-                                    can&rsquo;t produce an invoice. Paste a <code>noffer1&hellip;</code> string.
+                                    <em>after</em> the lightning addresses and NWC connections above,
+                                    in order, if those can&rsquo;t produce an invoice. Paste a
+                                    <code>noffer1&hellip;</code> string.
                                 </p>
                                 <div id="auto-melt-noffer-list"></div>
                                 <button type="button" class="btn btn-secondary" id="btn-add-noffer" style="margin-top: 0.5rem;<?= $nofferEnvError !== null ? ' opacity: 0.4;' : '' ?>"
@@ -8008,6 +8093,8 @@ header('Cache-Control: no-cache, must-revalidate');
             if (btnAddLnAddr) btnAddLnAddr.addEventListener('click', addLnAddressRow);
             const btnAddNoffer = document.getElementById('btn-add-noffer');
             if (btnAddNoffer) btnAddNoffer.addEventListener('click', addNofferRow);
+            const btnAddNwc = document.getElementById('btn-add-nwc');
+            if (btnAddNwc) btnAddNwc.addEventListener('click', addNwcRow);
             // Live-update LN-address vs swap-mode hint pane when the operator
             // changes the dropdown, even before they save.
             const autoMeltModeSel = document.getElementById('auto-melt-mode-override');
@@ -10873,18 +10960,24 @@ header('Cache-Control: no-cache, must-revalidate');
             // so what the operator sees is exactly what's saved.
             syncLnAddressesFromInputs();
             syncNoffersFromInputs();
+            syncNwcFromInputs();
             const lnAddresses = awLnAddresses
                 .map(a => (a.address || '').trim())
                 .filter(a => a.length > 0);
             const noffers = awNoffers
                 .map(a => (a.address || '').trim())
                 .filter(a => a.length > 0);
+            // NWC entries post as keep:<id> refs (saved rows) or full URIs
+            // (new rows); blanks are dropped.
+            const nwcEntries = awNwc
+                .map(a => a.ref ? a.ref : (a.uri || '').trim())
+                .filter(a => a.length > 0);
 
             // Validate each section against its own type before saving so bad
             // data surfaces inline rather than failing silently on the server.
             if (modeOverride === '0') {
-                if (enabled === '1' && lnAddresses.length === 0 && noffers.length === 0) {
-                    return awError('aw-store-error', 'Add at least one lightning address or noffer to withdraw to.');
+                if (enabled === '1' && lnAddresses.length === 0 && noffers.length === 0 && nwcEntries.length === 0) {
+                    return awError('aw-store-error', 'Add at least one lightning address, NWC connection, or noffer to withdraw to.');
                 }
                 for (const a of lnAddresses) {
                     if (isNofferValue(a)) {
@@ -10902,8 +10995,18 @@ header('Cache-Control: no-cache, must-revalidate');
                         return awError('aw-store-error', `"${n}" doesn't look like a valid CLINK noffer (noffer1…).`);
                     }
                 }
-                // Reject duplicates (case-insensitive) across both lists — the
-                // combined chain should never contain the same destination twice.
+                for (const w of nwcEntries) {
+                    if (w.startsWith('keep:')) continue; // saved row reference
+                    if (!isNwcValue(w)) {
+                        // Don't echo the paste back — a malformed NWC string may
+                        // still contain the wallet secret.
+                        return awError('aw-store-error', 'That NWC entry doesn\'t look like a valid connection string (nostr+walletconnect://…).');
+                    }
+                }
+                // Reject duplicates (case-insensitive) across the lists — the
+                // combined chain should never contain the same destination
+                // twice. (NWC duplicates are caught server-side, where the
+                // stored values behind keep: refs are known.)
                 const all = lnAddresses.concat(noffers).map(a => a.toLowerCase());
                 const dup = all.find((a, i) => all.indexOf(a) !== i);
                 if (dup) {
@@ -10932,6 +11035,9 @@ header('Cache-Control: no-cache, must-revalidate');
                 for (const n of noffers) {
                     body += `&noffers%5B%5D=${encodeURIComponent(n)}`;
                 }
+                for (const w of nwcEntries) {
+                    body += `&nwc%5B%5D=${encodeURIComponent(w)}`;
+                }
 
                 const response = await postWithCsrf(adminUrl, body);
 
@@ -10939,8 +11045,25 @@ header('Cache-Control: no-cache, must-revalidate');
 
                 if (response.ok) {
                     showToast('Settings saved!', 'success');
+                    // Surface the NWC probe's spend-permission warning (the
+                    // connection works but can also pay out of the wallet).
+                    const nwcWarnEl = document.getElementById('auto-melt-nwc-warning');
+                    const nwcWarnings = Array.isArray(result.addresses)
+                        ? result.addresses.filter(r => r.type === 'nwc' && r.warning).map(r => r.warning)
+                        : [];
+                    if (nwcWarnEl) {
+                        if (nwcWarnings.length) {
+                            nwcWarnEl.textContent = '⚠ ' + nwcWarnings.join(' ');
+                            nwcWarnEl.classList.remove('hidden');
+                        } else {
+                            nwcWarnEl.classList.add('hidden');
+                        }
+                    }
                     // Update per-address LUD-21 hints from the save response so
                     // the operator sees probe results without a full reload.
+                    // (nwc rows are excluded here: the save response carries
+                    // their masked label but not the keep-ref, so the reliable
+                    // masked+ref state comes from the loadDashboard() below.)
                     if (Array.isArray(result.addresses)) {
                         const mapped = result.addresses.map(r => ({
                             address: r.address,
@@ -10948,15 +11071,22 @@ header('Cache-Control: no-cache, must-revalidate');
                             lud21Support: (r.lud21Support === null || r.lud21Support === undefined)
                                 ? null : Number(r.lud21Support),
                         }));
-                        awLnAddresses = mapped.filter(a => a.type !== 'noffer');
+                        awLnAddresses = mapped.filter(a => a.type !== 'noffer' && a.type !== 'nwc');
                         awNoffers = mapped.filter(a => a.type === 'noffer');
                         if (dashboardData && dashboardData.autoMelt) {
-                            dashboardData.autoMelt.addresses = mapped.map(a => ({ ...a }));
+                            // nwc rows are cached from loadDashboard() only —
+                            // the save response has their masked label but not
+                            // the keep-ref, and a ref-less row would rerender
+                            // as an editable (bogus) URI input.
+                            dashboardData.autoMelt.addresses = mapped
+                                .filter(a => a.type !== 'nwc')
+                                .map(a => ({ ...a }));
                         }
                         renderLnAddressRows();
                         renderNofferRows();
                     }
-                    // Reload dashboard so the effective-mode badge reflects the save.
+                    // Reload dashboard so the effective-mode badge reflects the
+                    // save (and re-renders saved NWC rows masked, with refs).
                     if (typeof loadDashboard === 'function') loadDashboard();
                 } else {
                     showToast(result.error || 'Failed to save', 'error');
@@ -11098,12 +11228,24 @@ header('Cache-Control: no-cache, must-revalidate');
         // section below the lightning addresses. On save they are appended
         // after the addresses (LN first, noffers as fallback).
         let awNoffers = [];
+        // NWC connections, own section between addresses and noffers (their
+        // priority position in the chain). Entries are either kept rows
+        // ({label, ref:'keep:<id>'} — the server never sends the raw URI,
+        // which embeds the wallet secret; shown read-only) or new rows
+        // ({uri, ref:null} — an editable input the operator pastes into).
+        let awNwc = [];
 
         // A destination is a CLINK noffer if it's a bech32 'noffer1…' string
         // (optionally lightning:-prefixed), otherwise it's a Lightning address.
         // Mirrors the server-side auto-detection in save_auto_melt.
         function isNofferValue(v) {
             return /^(lightning:)?noffer1[02-9ac-hj-np-z]+$/i.test(String(v || '').trim());
+        }
+
+        // Cheap client-side shape check for an NWC connection URI; the server
+        // fully re-validates (and probes) on save.
+        function isNwcValue(v) {
+            return /^nostr\+walletconnect:(\/\/)?[0-9a-f]{64}\?/i.test(String(v || '').trim());
         }
 
         function setLnAddressRowsFromData() {
@@ -11117,11 +11259,17 @@ header('Cache-Control: no-cache, must-revalidate');
                 type: a.type || (isNofferValue(a.address) ? 'noffer' : 'lnaddress'),
                 lud21Support: (a.lud21Support === null || a.lud21Support === undefined)
                     ? null : Number(a.lud21Support),
+                ref: a.ref || null,
             }));
-            awLnAddresses = mapped.filter(a => a.type !== 'noffer');
+            awLnAddresses = mapped.filter(a => a.type !== 'noffer' && a.type !== 'nwc');
             awNoffers = mapped.filter(a => a.type === 'noffer');
+            // Stored nwc rows arrive masked: address is the display label and
+            // ref the opaque keep:<id> the save posts back.
+            awNwc = mapped.filter(a => a.type === 'nwc')
+                .map(a => ({ label: a.address, uri: '', ref: a.ref }));
             renderLnAddressRows();
             renderNofferRows();
+            renderNwcRows();
         }
 
         // Read the current input values back into awLnAddresses (preserving the
@@ -11338,6 +11486,112 @@ header('Cache-Control: no-cache, must-revalidate');
                 row.appendChild(mkBtn('↑', 'Move up', () => moveNofferRow(i, -1), envGated || i === 0));
                 row.appendChild(mkBtn('↓', 'Move down', () => moveNofferRow(i, 1), envGated || i === awNoffers.length - 1));
                 row.appendChild(mkBtn('✕', 'Remove', () => removeNofferRow(i), false));
+
+                list.appendChild(row);
+            });
+        }
+
+        // ---- NWC connection list (own section, between addresses and noffers) ----
+        //
+        // Saved rows are shown as a read-only masked label (wallet + relay) —
+        // the raw URI embeds the connection secret and never reaches the
+        // browser, so "editing" a saved connection means removing it and
+        // adding the replacement. New rows are normal paste inputs.
+
+        function syncNwcFromInputs() {
+            const list = document.getElementById('auto-melt-nwc-list');
+            if (!list) return;
+            const next = [];
+            list.querySelectorAll('[data-nwc-entry]').forEach((el) => {
+                if (el.dataset.nwcRef) {
+                    next.push({ label: el.dataset.nwcLabel || '', uri: '', ref: el.dataset.nwcRef });
+                } else {
+                    const inp = el.querySelector('input.nwc-input');
+                    next.push({ label: '', uri: inp ? inp.value : '', ref: null });
+                }
+            });
+            awNwc = next;
+        }
+
+        function addNwcRow() {
+            syncNwcFromInputs();
+            awNwc.push({ label: '', uri: '', ref: null });
+            renderNwcRows();
+            const list = document.getElementById('auto-melt-nwc-list');
+            if (list) {
+                const inputs = list.querySelectorAll('input.nwc-input');
+                if (inputs.length) inputs[inputs.length - 1].focus();
+            }
+        }
+
+        function removeNwcRow(index) {
+            syncNwcFromInputs();
+            awNwc.splice(index, 1);
+            renderNwcRows();
+        }
+
+        function moveNwcRow(index, delta) {
+            syncNwcFromInputs();
+            const target = index + delta;
+            if (target < 0 || target >= awNwc.length) return;
+            const tmp = awNwc[index];
+            awNwc[index] = awNwc[target];
+            awNwc[target] = tmp;
+            renderNwcRows();
+        }
+
+        function renderNwcRows() {
+            const list = document.getElementById('auto-melt-nwc-list');
+            if (!list) return;
+            const envGated = !!document.getElementById('auto-melt-nwc-group')?.dataset.envError;
+            list.innerHTML = '';
+            awNwc.forEach((entry, i) => {
+                const row = document.createElement('div');
+                row.className = 'nwc-row';
+                row.setAttribute('data-nwc-entry', '1');
+                if (entry.ref) {
+                    row.dataset.nwcRef = entry.ref;
+                    row.dataset.nwcLabel = entry.label || '';
+                }
+                row.style.cssText = 'display:flex; align-items:center; gap:0.4rem; margin-bottom:0.4rem;';
+
+                const prio = document.createElement('span');
+                prio.textContent = (i + 1) + '.';
+                prio.style.cssText = 'min-width:1.4rem; text-align:right; opacity:0.7; font-size:0.85rem;';
+                row.appendChild(prio);
+
+                if (entry.ref) {
+                    const label = document.createElement('span');
+                    label.className = 'nwc-saved-label';
+                    label.textContent = entry.label || 'NWC connection';
+                    label.title = 'Saved NWC connection — the secret stays on the server. Remove and re-add to change it.';
+                    label.style.cssText = 'flex:1; padding:0.45rem 0.6rem; border:1px dashed var(--border, #ccc); border-radius:6px; opacity:0.85; font-size:0.9rem;';
+                    row.appendChild(label);
+                } else {
+                    const input = document.createElement('input');
+                    input.type = 'text';
+                    input.className = 'form-input nwc-input';
+                    input.placeholder = 'nostr+walletconnect://…';
+                    input.value = entry.uri || '';
+                    input.style.flex = '1';
+                    if (envGated) { input.disabled = true; input.style.opacity = '0.5'; }
+                    row.appendChild(input);
+                }
+
+                const mkBtn = (label, title, handler, disabled) => {
+                    const b = document.createElement('button');
+                    b.type = 'button';
+                    b.className = 'btn btn-secondary';
+                    b.textContent = label;
+                    b.title = title;
+                    b.style.cssText = 'padding:0.3rem 0.55rem; line-height:1;';
+                    if (disabled) { b.disabled = true; b.style.opacity = '0.4'; }
+                    else b.addEventListener('click', handler);
+                    return b;
+                };
+                row.appendChild(mkBtn('↑', 'Move up', () => moveNwcRow(i, -1), envGated || i === 0));
+                row.appendChild(mkBtn('↓', 'Move down', () => moveNwcRow(i, 1), envGated || i === awNwc.length - 1));
+                row.appendChild(mkBtn('✕', 'Remove', () => removeNwcRow(i), false));
 
                 list.appendChild(row);
             });

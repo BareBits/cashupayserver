@@ -200,6 +200,19 @@ if (!$swapOnly) {
     }
 }
 
+// Task 1a'': Poll NWC-direct-receive invoices via NIP-47 lookup_invoice.
+// Reliable (stored-state query against the merchant's wallet, unlike the
+// ephemeral noffer receipts above) — this is what settles an NWC invoice
+// whose customer paid and closed the tab before the page poll caught it.
+if (!$swapOnly) {
+    try {
+        Invoice::pollPendingNwc();
+        $results['tasks']['poll_nwc'] = 'success';
+    } catch (\Throwable $e) {
+        $results['tasks']['poll_nwc'] = 'error: ' . $e->getMessage();
+    }
+}
+
 // Task 1b: Settle dev / hosting fees for every store. Runs
 // BEFORE auto-melt so the fee math sees revenue that may otherwise drain in
 // this same cron pass. Per-fee failures are caught inside settleStore() so a

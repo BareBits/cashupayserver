@@ -17,6 +17,7 @@ require_once __DIR__ . '/safe_http.php';
 require_once __DIR__ . '/swap/auto_melt.php';
 require_once __DIR__ . '/store_ln_addresses.php';
 require_once __DIR__ . '/clink/client.php';
+require_once __DIR__ . '/nwc/client.php';
 require_once __DIR__ . '/../cashu-wallet-php/CashuWallet.php';
 
 use Cashu\Wallet;
@@ -246,7 +247,11 @@ class LightningAddress {
             if (empty($destinations)) {
                 continue;
             }
-            $primaryAddress = $destinations[0]['value'];
+            // Display-safe form (masks NWC connection URIs) — this string ends
+            // up in notifications and logs, never used to actually melt.
+            $primaryAddress = StoreLnAddresses::displayValue(
+                $destinations[0]['type'], $destinations[0]['value']
+            );
             try {
                 // Check store balance from local storage (offline-first, no mint contact)
                 // This prevents crashes when mint is unreachable
@@ -303,7 +308,8 @@ class LightningAddress {
                     $usedAddress = null;
                     $lastMeltError = null;
                     foreach ($destinations as $priority => $dest) {
-                        $destValue = $dest['value'];
+                        // Log/notification-safe form (masks NWC secrets).
+                        $destShown = StoreLnAddresses::displayValue($dest['type'], $dest['value']);
                         try {
                             $meltResult = self::meltToDestination(
                                 $store['id'],
@@ -311,14 +317,14 @@ class LightningAddress {
                                 $meltAmountSats,
                                 'BareBits auto-cashout'
                             );
-                            $usedAddress = $destValue;
+                            $usedAddress = $destShown;
                             if ($priority > 0) {
-                                error_log("Auto-melt: used fallback destination (priority {$priority}, {$dest['type']}) {$destValue} for store {$store['id']}");
+                                error_log("Auto-melt: used fallback destination (priority {$priority}, {$dest['type']}) {$destShown} for store {$store['id']}");
                             }
                             break;
                         } catch (Exception $meltError) {
                             $lastMeltError = $meltError;
-                            error_log("Auto-melt attempt to {$destValue} ({$dest['type']}, priority {$priority}) failed for store {$store['id']}: " . $meltError->getMessage());
+                            error_log("Auto-melt attempt to {$destShown} ({$dest['type']}, priority {$priority}) failed for store {$store['id']}: " . $meltError->getMessage());
                         }
                     }
 
@@ -640,10 +646,15 @@ class LightningAddress {
 
     /**
      * Withdraw to a typed destination from the ordered chain, dispatching on
-     * type so callers can walk a mixed list of Lightning addresses and CLINK
-     * noffers uniformly.
+     * type so callers can walk a mixed list of Lightning addresses, NWC
+     * connections, and CLINK noffers uniformly.
      *
      *   lnaddress → meltToAddress (LNURL-pay resolution).
+     *   nwc       → ask the merchant's own wallet for a BOLT11 over Nostr
+     *               Wallet Connect (make_invoice), then melt to that one-shot
+     *               invoice. Only invoice creation is requested of the wallet;
+     *               the mint pays it, and the cashu melt preimage is the proof
+     *               of payment — no lookup_invoice needed on this side.
      *   noffer    → ask the noffer's Nostr service for a BOLT11 (acting as the
      *               payer), then melt to that one-shot invoice. The cashu melt
      *               preimage is the proof of payment, so noffer withdrawal needs
@@ -661,6 +672,13 @@ class LightningAddress {
             // Resolve a fresh invoice for exactly this amount, then pay it.
             $resolved = ClinkClient::requestInvoice($value, $amountSats, $comment);
             return self::meltToBolt11($storeId, $resolved['bolt11'], $amountSats);
+        }
+        if ($type === StoreLnAddresses::TYPE_NWC) {
+            // makeInvoice verifies the returned bolt11 encodes exactly
+            // $amountSats; meltToBolt11's expectedAmount bound re-checks
+            // against the mint's melt quote before proofs are spent.
+            $made = NwcClient::makeInvoice($value, $amountSats, $comment);
+            return self::meltToBolt11($storeId, $made['bolt11'], $amountSats);
         }
         return self::meltToAddress($storeId, $value, $amountSats, $comment);
     }

@@ -162,8 +162,9 @@ final class SetupFlow {
      * submarine swap depends on the swaps and mints answers that come after.
      *
      * The rules, in priority order:
-     *   1. Any Lightning destination (LNURL address or CLINK noffer) → sweep
-     *      over Lightning. Cheapest and fastest, so it wins when available.
+     *   1. Any Lightning destination (LNURL address, NWC connection, or CLINK
+     *      noffer) → sweep over Lightning. Cheapest and fastest, so it wins
+     *      when available.
      *   2. Otherwise, a mint plus swaps plus an xpub → sweep via submarine
      *      swap to the on-chain wallet. This is the case the mints screen
      *      promises: "funds are automatically withdrawn to your on-chain
