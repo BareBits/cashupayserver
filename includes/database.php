@@ -1150,6 +1150,25 @@ HTACCESS;
             }
         }
 
+        // NWC receive rail (payment_rail='nwc'): the customer pays a BOLT11 the
+        // merchant's own wallet minted for us over Nostr Wallet Connect
+        // (NIP-47 make_invoice). We persist the connection URI so the payment
+        // page poll and cron can run lookup_invoice on the payment hash. Like
+        // noffer_ephemeral_sk above, nwc_uri is secret-bearing and must never
+        // ride an API/browser payload (see Invoice::formatForApi); unlike it,
+        // the secret is the store's long-lived connection key, which already
+        // lives in this database in store_ln_addresses. nwc_preimage is the
+        // settlement proof lookup_invoice returned, mirroring lnurl_preimage.
+        foreach ([
+            'nwc_uri' => 'TEXT DEFAULT NULL',
+            'nwc_payment_hash' => 'TEXT DEFAULT NULL',
+            'nwc_preimage' => 'TEXT DEFAULT NULL',
+        ] as $col => $decl) {
+            if (!self::columnExists($pdo, 'invoices', $col)) {
+                $pdo->exec("ALTER TABLE invoices ADD COLUMN {$col} {$decl}");
+            }
+        }
+
         // Ordered, multi-address Lightning-address fallback. Replaces the single
         // stores.auto_melt_address column: a merchant can list several addresses
         // tried in priority order (position ASC) for both receiving (LNURL

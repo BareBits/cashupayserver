@@ -347,7 +347,8 @@ class LnUrlReceive {
 
         $lastError = null;
         foreach ($destinations as $priority => $dest) {
-            $address = $dest['value'];
+            // Log/notification-safe form (masks NWC connection secrets).
+            $address = StoreLnAddresses::displayValue($dest['type'], $dest['value']);
             try {
                 $result = LightningAddress::meltToDestination(
                     $storeId,
@@ -386,7 +387,8 @@ class LnUrlReceive {
         // sees the payout is wedged. Cron auto-melt will retry on the next tick.
         error_log("[lnurl-override] all auto-melt destinations failed for store {$storeId}");
         NotificationSender::queueAutoCashoutFailure(
-            $storeId, $destinations[0]['value'],
+            $storeId,
+            StoreLnAddresses::displayValue($destinations[0]['type'], $destinations[0]['value']),
             $lastError ? $lastError->getMessage() : 'unknown error',
             null
         );

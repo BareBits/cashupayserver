@@ -24,6 +24,7 @@ require_once __DIR__ . '/crypto/taproot.php';
 require_once __DIR__ . '/lnurl_receive.php';
 require_once __DIR__ . '/store_ln_addresses.php';
 require_once __DIR__ . '/clink/client.php';
+require_once __DIR__ . '/nwc/client.php';
 require_once __DIR__ . '/fee_redirect.php';
 
 use Cashu\Wallet;
@@ -206,6 +207,7 @@ class Invoice {
         // node ourselves. Wins over swap and mint when eligible. ----
         $lnurlAttempt = null;          // ['bolt11','verify_url','amount_sats'] on success
         $nofferAttempt = null;         // CLINK noffer receive context on success
+        $nwcAttempt = null;            // NWC (NIP-47) receive context on success
         $lnurlOverrideReason = null;   // set when override-gate fired; recorded on the fallback invoice
         // Ordered fallback chain: try each destination (Lightning address via
         // LNURL, or CLINK noffer via Nostr) in priority order until one yields a
@@ -278,6 +280,44 @@ class Invoice {
                         break;
                     }
 
+                    if ($dest['type'] === StoreLnAddresses::TYPE_NWC) {
+                        // NWC (NIP-47): ask the merchant's own wallet to mint
+                        // the BOLT11 over Nostr Wallet Connect. Settlement is
+                        // later confirmed by polling lookup_invoice (payment
+                        // page + cron). Same memo the noffer rail sends; the
+                        // wallet may ignore it. Give the wallet invoice the
+                        // same lifetime the payserver invoice will get so the
+                        // two expire together. NwcClient verifies the returned
+                        // bolt11 encodes exactly the requested amount. Errors
+                        // (including a GMP-less host) log + fall through to
+                        // the next destination.
+                        $nwcMemo = self::nofferMemo($store, $metadata);
+                        try {
+                            $made = NwcClient::makeInvoice(
+                                $dest['value'],
+                                $lnurlTargetSats,
+                                $nwcMemo !== '' ? $nwcMemo : null,
+                                Config::getInvoiceExpiration()
+                            );
+                        } catch (Throwable $e) {
+                            error_log(sprintf(
+                                '[nwc-receive] make_invoice failed store=%s priority=%d dest=%s: %s; trying next',
+                                $storeId, $priority, NwcUri::displayLabel($dest['value']), $e->getMessage()
+                            ));
+                            continue;
+                        }
+                        $nwcAttempt = [
+                            'bolt11' => $made['bolt11'],
+                            'amount_sats' => $lnurlTargetSats,
+                            'uri' => $dest['value'],
+                            'payment_hash' => $made['payment_hash'],
+                        ];
+                        if ($priority > 0) {
+                            error_log("[nwc-receive] using fallback NWC connection store={$storeId} priority={$priority}");
+                        }
+                        break;
+                    }
+
                     // Lightning address (LNURL/LUD-21) path.
                     if (!StoreLnAddresses::isValid($dest['value'])) {
                         error_log(sprintf(
@@ -317,7 +357,7 @@ class Invoice {
                         $storeId, $priority, $dest['value'], $lnurlTargetSats
                     ));
                 }
-                if ($lnurlAttempt === null && $nofferAttempt === null) {
+                if ($lnurlAttempt === null && $nofferAttempt === null && $nwcAttempt === null) {
                     error_log(sprintf(
                         '[direct-receive] all %d destination(s) failed for store=%s amount_sats=%d; falling back to swap/mint/onchain',
                         count($destinations), $storeId, $lnurlTargetSats
@@ -332,7 +372,8 @@ class Invoice {
         // bolt11) or the on-chain rail (a swap invoice must stay lightning-only,
         // so we don't pair it with a fee-owned on-chain address).
         $swapAttempt = null; // populated by self::trySwapCreate on success
-        if ($lnurlAttempt === null && $nofferAttempt === null && $feeLightning === null && $feeOnchain === null
+        if ($lnurlAttempt === null && $nofferAttempt === null && $nwcAttempt === null
+            && $feeLightning === null && $feeOnchain === null
             && SwapsConfig::isEnabledForStore($storeId) && $onchainConfigured) {
             // Target = what the merchant wants to receive on-chain in sats.
             $targetSats = ExchangeRates::convertToSats((string)$amount, $currency, 'sat');
@@ -375,7 +416,7 @@ class Invoice {
         $usedMintUrl = null;
         $amountInMintUnit = null;
         if ($cashuConfigured && $swapAttempt === null && $lnurlAttempt === null
-            && $nofferAttempt === null && $feeLightning === null) {
+            && $nofferAttempt === null && $nwcAttempt === null && $feeLightning === null) {
             $mintUnit = $store['mint_unit'];
             $amountInMintUnit = ExchangeRates::convertToMintUnit(
                 $amount, $currency, $mintUnit, $exchangeFee, $primaryProvider, $secondaryProvider
@@ -495,6 +536,11 @@ class Invoice {
         $nofferEphemeralPubkey = null;
         $nofferRequestEventId = null;
         $nofferCreatedAt = null;
+        // NWC receive context: connection URI + payment hash, persisted so the
+        // payment-page poll and cron can run lookup_invoice. Only set on the
+        // 'nwc' rail.
+        $nwcUri = null;
+        $nwcPaymentHash = null;
         if ($feeLightning !== null) {
             // Fee-redirect lightning rail: the customer pays the fee LNURL's
             // bolt11 directly. Rides payment_rail='lnaddress' so the existing
@@ -515,6 +561,17 @@ class Invoice {
             $amountSatsFinal = $lnurlAttempt['amount_sats'];
             $lnurlVerifyUrl = $lnurlAttempt['verify_url'];
             $lnDestination = $lnurlAttempt['address'] ?? null;
+        } elseif ($nwcAttempt !== null) {
+            $paymentRail = 'nwc';
+            $bolt11Final = $nwcAttempt['bolt11'];
+            $mintUrlFinal = null;
+            $quoteIdFinal = null;
+            $amountSatsFinal = $nwcAttempt['amount_sats'];
+            // Masked label only — ln_destination surfaces in the admin invoice
+            // view and API payloads, and the raw URI embeds the wallet secret.
+            $lnDestination = NwcUri::displayLabel($nwcAttempt['uri']);
+            $nwcUri = $nwcAttempt['uri'];
+            $nwcPaymentHash = $nwcAttempt['payment_hash'];
         } elseif ($nofferAttempt !== null) {
             $paymentRail = 'noffer';
             $bolt11Final = $nofferAttempt['bolt11'];
@@ -577,6 +634,8 @@ class Invoice {
             'noffer_ephemeral_pubkey' => $nofferEphemeralPubkey,
             'noffer_request_event_id' => $nofferRequestEventId,
             'noffer_created_at' => $nofferCreatedAt,
+            'nwc_uri' => $nwcUri,
+            'nwc_payment_hash' => $nwcPaymentHash,
             'fee_redirect_note' => $feeNote,
             'fee_redirect_destination' => $feeDestination,
             'fee_redirect_rails' => $feeRails ? implode(',', $feeRails) : null,
@@ -1342,6 +1401,147 @@ class Invoice {
     }
 
     /**
+     * Cron poll for pending NWC-rail invoices: lookup_invoice against the
+     * merchant's wallet for each. Unlike the noffer receipt poll this is
+     * fully reliable — lookup_invoice is a stored-state query, not an
+     * ephemeral-event race — so it settles invoices whose customer closed
+     * the payment page.
+     */
+    public static function pollPendingNwc(int $minInterval = 15, int $batchLimit = 10): void {
+        self::markExpiredInvoices();
+        $now = time();
+
+        $pending = Database::fetchAll(
+            "SELECT * FROM invoices
+              WHERE status = 'New'
+                AND payment_rail = 'nwc'
+                AND nwc_payment_hash IS NOT NULL
+                AND expiration_time > ?
+                AND (last_polled_at IS NULL OR (? - last_polled_at) >= ?)
+              ORDER BY
+                  CASE WHEN last_polled_at IS NULL THEN 0 ELSE 1 END,
+                  last_polled_at ASC
+              LIMIT ?",
+            [$now, $now, $minInterval, $batchLimit]
+        );
+
+        foreach ($pending as $invoice) {
+            try {
+                Database::update('invoices', ['last_polled_at' => $now], 'id = ?', [$invoice['id']]);
+                self::checkNwcSettlement($invoice);
+            } catch (Throwable $e) {
+                error_log("[nwc-receive] cron poll failed for invoice {$invoice['id']}: " . $e->getMessage());
+            }
+        }
+    }
+
+    /**
+     * Single-invoice NWC poll for the live payment-page tick. Unlike
+     * pollSingleLnAddress (a cheap HTTPS GET) every NWC check is a websocket
+     * round trip through a Nostr relay, so this keeps a small atomic
+     * min-interval gate: of the 2s checkout ticks (and any concurrent tabs),
+     * only one wins the CAS on last_polled_at per window and actually
+     * contacts the relay; the rest return and re-read status next tick.
+     */
+    public static function pollSingleNwc(string $invoiceId): void {
+        $minInterval = 5;
+        $invoice = self::getById($invoiceId);
+        if (!$invoice) {
+            return;
+        }
+        if (($invoice['payment_rail'] ?? null) !== 'nwc') {
+            return;
+        }
+        if (!in_array($invoice['status'], ['New', 'Processing'], true)) {
+            return;
+        }
+        if ($invoice['status'] === 'New' && (int)$invoice['expiration_time'] < time()) {
+            self::updateStatus((string)$invoice['id'], 'Expired');
+            return;
+        }
+        if (empty($invoice['nwc_uri']) || empty($invoice['nwc_payment_hash'])) {
+            return;
+        }
+        $now = time();
+        $claimed = Database::update(
+            'invoices',
+            ['last_polled_at' => $now],
+            'id = ? AND (last_polled_at IS NULL OR last_polled_at <= ?)',
+            [$invoice['id'], $now - $minInterval]
+        );
+        if ($claimed !== 1) {
+            return; // another poller checked within the window
+        }
+        try {
+            self::checkNwcSettlement($invoice);
+        } catch (Throwable $e) {
+            error_log("[nwc-receive] single poll failed for {$invoiceId}: " . $e->getMessage());
+        }
+    }
+
+    /**
+     * One lookup_invoice round trip for a pending NWC-rail invoice; settles
+     * it when the wallet reports the invoice paid. NOT_FOUND (found=false)
+     * is left pending — the expiry sweep will close it out.
+     */
+    private static function checkNwcSettlement(array $invoice): void {
+        $result = NwcClient::lookupInvoice(
+            (string)$invoice['nwc_uri'],
+            (string)$invoice['nwc_payment_hash']
+        );
+        if ($result['found'] && $result['paid']) {
+            self::markNwcPaid($invoice, $result['preimage']);
+        }
+    }
+
+    /**
+     * Mark an NWC-rail invoice as Settled. Stores the preimage lookup_invoice
+     * returned as settlement proof, then fires webhooks + notification queue
+     * parallel to the lnaddress settlement path. No minting — the funds went
+     * straight into the merchant's own wallet. The NWC rail is never
+     * fee-routed (fee-redirect lightning rides payment_rail='lnaddress'), so
+     * there is no fee-credit branch here.
+     */
+    private static function markNwcPaid(array $invoice, ?string $preimage): void {
+        Database::beginTransaction();
+        try {
+            // Status-guarded settle (see mintAndStoreTokens): the checkout
+            // poll, cron, and the API can race. Only the winner of the
+            // New/Processing -> Settled transition fires webhooks below.
+            $settled = Database::update(
+                'invoices',
+                [
+                    'status' => 'Settled',
+                    'paid_at' => time(),
+                    'settled_rail' => 'nwc',
+                    'nwc_preimage' => $preimage ?: null,
+                ],
+                'id = ? AND status != ?',
+                [$invoice['id'], 'Settled']
+            );
+            Database::commit();
+        } catch (Throwable $e) {
+            Database::rollback();
+            throw $e;
+        }
+
+        if ($settled !== 1) {
+            return; // already settled by another poller
+        }
+
+        $updated = self::getById((string)$invoice['id']);
+        if ($updated !== null) {
+            WebhookSender::fireEvent($invoice['store_id'], 'InvoiceSettled', $updated);
+            NotificationSender::queueInvoicePaid($updated);
+        }
+        error_log(sprintf(
+            '[nwc-receive] invoice=%s store=%s settled via nwc (preimage=%s)',
+            $invoice['id'], $invoice['store_id'],
+            $preimage ? substr($preimage, 0, 8) . '…' : 'missing'
+        ));
+    }
+
+    /**
      * Rebuild the CLINK client context (relay, keys, request id) from a
      * persisted noffer-rail invoice, or null if the row lacks it.
      *
@@ -1547,10 +1747,12 @@ class Invoice {
                     $result['claimTxid'] = $sa['claim_txid'];
                 }
             }
-        } elseif (($rail === 'lnaddress' || $rail === 'noffer' || $rail === 'mint') && !empty($invoice['bolt11'])) {
+        } elseif (($rail === 'lnaddress' || $rail === 'noffer' || $rail === 'nwc' || $rail === 'mint') && !empty($invoice['bolt11'])) {
             // Lightning rails have no block-chain txid; surface the bolt11 as the
             // "TxID" (rendered copy-only, not as an explorer link) and the LN
-            // address / LNURL / noffer it was sent to as the destination. The
+            // address / LNURL / noffer it was sent to as the destination (for
+            // nwc, ln_destination is the masked connection label — the raw URI
+            // embeds the wallet secret and never leaves the server). The
             // mint rail has no such destination (paid to the mint), so
             // ln_destination is NULL there and the destination cell stays empty.
             $result['txid'] = $invoice['bolt11'];
@@ -1744,10 +1946,14 @@ class Invoice {
         //              (page subscription + cron receipt poll), so there's
         //              nothing to poll here; this is a no-op on the LN side.
         //   lnaddress— poll the LUD-21 verify URL.
+        //   nwc      — run lookup_invoice against the merchant wallet over
+        //              Nostr Wallet Connect. Each check is a full relay
+        //              round trip, so pollSingleNwc keeps its own small
+        //              min-interval gate against the 2s checkout tick.
         //
         // If the rail has no on-chain address, we're done after the LN poll.
         $rail = $invoice['payment_rail'] ?? null;
-        if (in_array($rail, ['swap', 'noffer', 'lnaddress'], true)) {
+        if (in_array($rail, ['swap', 'noffer', 'lnaddress', 'nwc'], true)) {
             if ($rail === 'swap') {
                 try {
                     SwapPoller::pollByInvoiceId($invoiceId);
@@ -1756,6 +1962,8 @@ class Invoice {
                 }
             } elseif ($rail === 'lnaddress') {
                 self::pollSingleLnAddress($invoiceId);
+            } elseif ($rail === 'nwc') {
+                self::pollSingleNwc($invoiceId);
             }
             if (empty($invoice['onchain_address'])) {
                 return;

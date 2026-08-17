@@ -2,15 +2,17 @@
 /**
  * CashuPayServer - Store Lightning Address list
  *
- * A store can have multiple Lightning addresses tried in an ordered priority
- * (fallback) chain. They are used for two things:
+ * A store can have multiple Lightning destinations tried in an ordered
+ * priority (fallback) chain — Lightning addresses (LUD-16), NWC connections
+ * (NIP-47), and CLINK noffers (NIP-69). They are used for two things:
  *
  *   1. Receiving — Invoice::create walks the list and presents the first
- *      working LNURL-pay invoice (LUD-21 direct-receive), falling through to
- *      the next address when a host is down or can't produce an invoice.
+ *      destination that produces a working invoice (LUD-21 direct-receive
+ *      for addresses, make_invoice for NWC, NIP-69 request for noffers),
+ *      falling through when a host is down or can't produce one.
  *   2. Withdrawing — auto-melt (LightningAddress::checkAutoMelt) and the
- *      override-settle-and-forward handler melt to the first address that
- *      accepts the payment.
+ *      override-settle-and-forward handler melt to the first destination
+ *      that accepts the payment.
  *
  * Storage is the store_ln_addresses table, ordered by `position` ASC. This
  * replaced the single stores.auto_melt_address column.
@@ -18,12 +20,62 @@
 
 require_once __DIR__ . '/database.php';
 require_once __DIR__ . '/clink/noffer.php';
+require_once __DIR__ . '/nwc/uri.php';
 require_once __DIR__ . '/lnurl_receive.php';
 
 class StoreLnAddresses {
     /** Destination types stored in store_ln_addresses.type. */
     public const TYPE_LNADDRESS = 'lnaddress';
     public const TYPE_NOFFER = 'noffer';
+    public const TYPE_NWC = 'nwc';
+
+    /**
+     * Prefix of the opaque reference the admin/setup UIs post in place of a
+     * stored NWC connection string. NWC URIs embed a secret, so browsers only
+     * ever receive a masked label plus `keep:<row-id>`; resolveKeepRefs()
+     * turns the ref back into the stored value server-side on save.
+     */
+    public const KEEP_REF_PREFIX = 'keep:';
+
+    /**
+     * User/log-safe representation of a destination value. Addresses and
+     * noffers are public strings and pass through; NWC connection URIs embed
+     * the wallet secret and collapse to their masked label. Every consumer
+     * that surfaces a chain value outside the server (dashboard payloads,
+     * notifications, melt log, error_log lines) must go through this.
+     */
+    public static function displayValue(string $type, string $value): string {
+        if ($type === self::TYPE_NWC) {
+            return NwcUri::displayLabel($value);
+        }
+        return $value;
+    }
+
+    /** Human label for a destination type, for validation error messages. */
+    private static function typeLabel(string $type): string {
+        if ($type === self::TYPE_NOFFER) {
+            return 'noffer';
+        }
+        if ($type === self::TYPE_NWC) {
+            return 'NWC connection';
+        }
+        return 'Lightning address';
+    }
+
+    /**
+     * Chain-wide duplicate-detection key. Addresses/noffers fold case (bech32
+     * noffers are lowercase already); NWC URIs collapse to wallet pubkey +
+     * secret so re-pastes with reordered query params still count as the same
+     * connection.
+     */
+    private static function dedupKeyFor(string $type, string $value): string {
+        if ($type === self::TYPE_NWC && NwcUri::isValid($value)) {
+            return self::TYPE_NWC . ':' . NwcUri::dedupKey($value);
+        }
+        return $type === self::TYPE_NWC
+            ? self::TYPE_NWC . ':' . strtolower($value)
+            : strtolower($value);
+    }
 
     /**
      * Lightning-address shape check (LUD-16: local-part@host.tld). Kept in
@@ -47,27 +99,79 @@ class StoreLnAddresses {
         if ($type === self::TYPE_NOFFER) {
             return ClinkNoffer::isValid($value);
         }
+        if ($type === self::TYPE_NWC) {
+            return NwcUri::isValid($value);
+        }
         return self::isValid($value);
     }
 
     /**
-     * Build an ordered, validated destination chain from two separate operator
-     * lists kept apart in the admin UI: Lightning addresses first, then CLINK
-     * noffers as fallback. This is both the order the UI presents (a dedicated
-     * noffer section below the lightning-address section) and the order
-     * Invoice::create walks at runtime.
+     * Resolve `keep:<row-id>` references in a UI-posted NWC list back to the
+     * stored connection strings. A ref must name a row that belongs to this
+     * store AND is of type nwc — anything else throws, so a forged or stale
+     * ref can never smuggle another store's secret into this chain. Full URIs
+     * (new entries) pass through untouched.
+     *
+     * Returns [values (resolved, chain order), keptKeys (dedup keys of the
+     * resolved rows — probeAndGateChain treats those as already-stored)].
+     *
+     * @param string[] $values raw posted nwc[] entries
+     * @return array{0: string[], 1: array<string,bool>}
+     */
+    public static function resolveKeepRefs(string $storeId, array $values): array {
+        $byId = [];
+        foreach (self::listForStore($storeId) as $row) {
+            if ($row['type'] === self::TYPE_NWC) {
+                $byId[$row['id']] = $row['address'];
+            }
+        }
+        $resolved = [];
+        $keptKeys = [];
+        foreach ($values as $v) {
+            $v = trim((string)$v);
+            if ($v === '') {
+                continue;
+            }
+            if (str_starts_with($v, self::KEEP_REF_PREFIX)) {
+                $id = (int)substr($v, strlen(self::KEEP_REF_PREFIX));
+                if (!isset($byId[$id])) {
+                    throw new InvalidArgumentException(
+                        'Unknown NWC connection reference — reload the page and try again.'
+                    );
+                }
+                $resolved[] = $byId[$id];
+                $keptKeys[self::dedupKeyFor(self::TYPE_NWC, $byId[$id])] = true;
+                continue;
+            }
+            $resolved[] = $v;
+        }
+        return [$resolved, $keptKeys];
+    }
+
+    /**
+     * Build an ordered, validated destination chain from the separate operator
+     * lists kept apart in the admin UI: Lightning addresses first, then NWC
+     * connections, then CLINK noffers as final fallback. This is both the
+     * order the UI presents (dedicated sections below the lightning-address
+     * section) and the order Invoice::create walks at runtime.
      *
      * Each value is trimmed and blanks are dropped; each is validated against
      * its declared type (so a noffer pasted into the address list, or an
      * address pasted into the noffer list, is rejected with a clear message);
-     * duplicates across both lists (case-insensitive) throw. Returns
+     * duplicates across all lists throw. Returns
      * [['type'=>string,'value'=>string], ...] in priority order — the shape the
      * save handler's probe loop and replaceForStore() consume.
+     *
+     * NWC values must be full connection URIs here — callers resolve the UI's
+     * `keep:` references via resolveKeepRefs() first.
      */
-    public static function chainFromLists(array $lnAddresses, array $noffers): array {
+    public static function chainFromLists(array $lnAddresses, array $noffers, array $nwcConnections = []): array {
         $typed = [];
         foreach ($lnAddresses as $v) {
             $typed[] = [self::TYPE_LNADDRESS, (string)$v];
+        }
+        foreach ($nwcConnections as $v) {
+            $typed[] = [self::TYPE_NWC, (string)$v];
         }
         foreach ($noffers as $v) {
             $typed[] = [self::TYPE_NOFFER, (string)$v];
@@ -80,12 +184,15 @@ class StoreLnAddresses {
                 continue;
             }
             if (!self::isValidEntry($type, $val)) {
-                $label = $type === self::TYPE_NOFFER ? 'noffer' : 'Lightning address';
-                throw new InvalidArgumentException("Invalid {$label} format: {$val}");
+                // Never echo an NWC paste back — a malformed one may still
+                // carry a wallet secret.
+                $shown = $type === self::TYPE_NWC ? '(value hidden)' : $val;
+                throw new InvalidArgumentException('Invalid ' . self::typeLabel($type) . " format: {$shown}");
             }
-            $key = strtolower($val);
+            $key = self::dedupKeyFor($type, $val);
             if (isset($seen[$key])) {
-                throw new InvalidArgumentException("Duplicate destination: {$val}");
+                $shown = $type === self::TYPE_NWC ? NwcUri::displayLabel($val) : $val;
+                throw new InvalidArgumentException("Duplicate destination: {$shown}");
             }
             $seen[$key] = true;
             $out[] = ['type' => $type, 'value' => $val];
@@ -113,15 +220,30 @@ class StoreLnAddresses {
      * locked out by a host that has since gone dark. noffers settle via
      * Nostr receipts, not LUD-21 — they skip the probe entirely.
      *
+     * NWC connections get the analogous treatment over NIP-47: a NEW
+     * connection must pass NwcClient::probeConnection (a real 1-sat
+     * make_invoice + lookup_invoice round trip) — if the wallet can't
+     * mint and re-find invoices at save time, the rail could never
+     * settle a checkout. Already-stored connections are grandfathered
+     * without re-probing (each probe mints a visible test invoice in
+     * the merchant's wallet, so re-running it on every unrelated card
+     * edit would be noise). The probe's spend-permission warning is
+     * passed through in `results` for the UI; it never blocks.
+     *
      * Returns ['entries' => rows for replaceForStore(),
-     *          'results' => [['address','type','lud21Support'], ...]]
-     * with both lists in chain order.
+     *          'results' => [['address','type','lud21Support','warning'], ...]]
+     * with both lists in chain order. For nwc rows, `address` in
+     * `results` is the masked display label — raw connection URIs never
+     * leave the server.
      */
     public static function probeAndGateChain(string $storeId, array $destinations): array {
         $stored = [];
+        $storedNwc = [];
         foreach (self::listForStore($storeId) as $row) {
             if ($row['type'] === self::TYPE_LNADDRESS) {
                 $stored[strtolower($row['address'])] = true;
+            } elseif ($row['type'] === self::TYPE_NWC) {
+                $storedNwc[self::dedupKeyFor(self::TYPE_NWC, $row['address'])] = true;
             }
         }
         $entries = [];
@@ -130,6 +252,25 @@ class StoreLnAddresses {
             if ($dest['type'] === self::TYPE_NOFFER) {
                 $entries[] = ['type' => self::TYPE_NOFFER, 'address' => $dest['value'], 'supports_verify' => null];
                 $results[] = ['address' => $dest['value'], 'type' => 'noffer', 'lud21Support' => null];
+                continue;
+            }
+            if ($dest['type'] === self::TYPE_NWC) {
+                require_once __DIR__ . '/nwc/client.php';
+                $label = NwcUri::displayLabel($dest['value']);
+                $warning = null;
+                if (!isset($storedNwc[self::dedupKeyFor(self::TYPE_NWC, $dest['value'])])) {
+                    $probe = NwcClient::probeConnection($dest['value']);
+                    if (!$probe['ok']) {
+                        throw new RuntimeException(
+                            "{$label} can't be saved: the wallet didn't pass the connection test ("
+                            . $probe['error'] . '). Check the connection string and that the wallet '
+                            . 'and its relay are online, then try saving again.'
+                        );
+                    }
+                    $warning = $probe['warning'];
+                }
+                $entries[] = ['type' => self::TYPE_NWC, 'address' => $dest['value'], 'supports_verify' => null];
+                $results[] = ['address' => $label, 'type' => 'nwc', 'lud21Support' => null, 'warning' => $warning];
                 continue;
             }
             $support = null;
@@ -245,23 +386,24 @@ class StoreLnAddresses {
             if ($address === '') {
                 continue;
             }
-            if ($type !== self::TYPE_LNADDRESS && $type !== self::TYPE_NOFFER) {
+            if ($type !== self::TYPE_LNADDRESS && $type !== self::TYPE_NOFFER && $type !== self::TYPE_NWC) {
                 throw new InvalidArgumentException("Invalid destination type: {$type}");
             }
             if (!self::isValidEntry($type, $address)) {
-                $label = $type === self::TYPE_NOFFER ? 'noffer' : 'Lightning address';
-                throw new InvalidArgumentException("Invalid {$label}: {$address}");
+                $shown = $type === self::TYPE_NWC ? '(value hidden)' : $address;
+                throw new InvalidArgumentException('Invalid ' . self::typeLabel($type) . ": {$shown}");
             }
-            // Dedup case-insensitively across the whole chain so the same host
-            // never appears twice. noffer strings are all-lowercase bech32, so
-            // case-folding is a no-op for them and exact for addresses.
-            $key = strtolower($address);
+            // Dedup across the whole chain so the same destination never
+            // appears twice: case-folded for addresses/noffers, pubkey+secret
+            // identity for NWC connections.
+            $key = self::dedupKeyFor($type, $address);
             if (isset($seen[$key])) {
-                throw new InvalidArgumentException("Duplicate destination: {$address}");
+                $shown = $type === self::TYPE_NWC ? NwcUri::displayLabel($address) : $address;
+                throw new InvalidArgumentException("Duplicate destination: {$shown}");
             }
             $seen[$key] = true;
-            // supports_verify only has meaning for LNURL/LUD-21; force NULL for
-            // noffers so the column isn't misread by the receive resolver.
+            // supports_verify only has meaning for LNURL/LUD-21; force NULL
+            // for noffers/NWC so the column isn't misread by the resolvers.
             $normalized[] = [
                 'address' => $address,
                 'type' => $type,
