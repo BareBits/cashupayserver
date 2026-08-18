@@ -2738,8 +2738,10 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                             A real BTCPay Server is already connected. To use BareBits instead, disconnect it first via WooCommerce settings, then reload this page.
                         </p>
                         <div class="btn-group">
-                            <a href="<?= admin_url('admin.php?page=wc-settings&tab=checkout&section=btcpay_greenfield') ?>" class="btn btn-secondary" style="text-align: center;">Go to BTCPay Settings</a>
-                            <a href="<?= admin_url('admin.php?page=cashupay') ?>" class="btn" style="text-align: center;">Skip</a>
+                            <!-- target="_top": the wizard can run inside the wp-admin
+                                 iframe, and wp-admin links must not nest inside it. -->
+                            <a href="<?= admin_url('admin.php?page=wc-settings&tab=checkout&section=btcpay_greenfield') ?>" target="_top" class="btn btn-secondary" style="text-align: center;">Go to BTCPay Settings</a>
+                            <a href="<?= admin_url('admin.php?page=cashupay') ?>" target="_top" class="btn" style="text-align: center;">Skip</a>
                         </div>
                     </div>
                 <?php elseif ($wooStatus !== null && $wooStatus['status'] === 'needs_woocommerce'): ?>
@@ -2748,7 +2750,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                         <p style="color: #a0aec0; font-size: 0.9rem; margin-bottom: 1rem;">
                             WooCommerce isn't active yet. Install and activate WooCommerce, then reload this page and BareBits will finish wiring up payments for you.
                         </p>
-                        <a href="<?= admin_url('plugin-install.php?s=woocommerce&tab=search&type=term') ?>" class="btn btn-secondary" style="display: inline-block;">
+                        <a href="<?= admin_url('plugin-install.php?s=woocommerce&tab=search&type=term') ?>" target="_top" class="btn btn-secondary" style="display: inline-block;">
                             Install WooCommerce
                         </a>
                     </div>
@@ -2764,7 +2766,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                             <li>Install and activate the plugin</li>
                             <li>Reload this page &mdash; BareBits will finish the setup automatically</li>
                         </ol>
-                        <a href="<?= admin_url('plugin-install.php?s=btcpay+greenfield+woocommerce&tab=search&type=term') ?>" class="btn btn-secondary" style="display: inline-block;">
+                        <a href="<?= admin_url('plugin-install.php?s=btcpay+greenfield+woocommerce&tab=search&type=term') ?>" target="_top" class="btn btn-secondary" style="display: inline-block;">
                             Install BTCPay Plugin
                         </a>
                     </div>
@@ -2775,7 +2777,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                             <strong>Couldn't finish automatic setup:</strong>
                             <?= htmlspecialchars($wooStatus['message'] ?? '') ?>
                         </div>
-                        <a href="<?= admin_url('admin.php?page=wc-settings&tab=checkout&section=btcpay_greenfield') ?>" class="btn btn-secondary" style="display: inline-block; margin-top: 0.75rem;">
+                        <a href="<?= admin_url('admin.php?page=wc-settings&tab=checkout&section=btcpay_greenfield') ?>" target="_top" class="btn btn-secondary" style="display: inline-block; margin-top: 0.75rem;">
                             Go to BTCPay Settings
                         </a>
                     </div>
@@ -2808,7 +2810,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                                 so we left it as it was instead of applying your
                                 <?= (int)$discountPercent ?>% choice.
                             </p>
-                            <a href="<?= admin_url('admin.php?page=wc-settings&tab=elex-discount-per-payment-method') ?>" class="btn btn-secondary" style="display: inline-block; margin-top: 0.75rem;">
+                            <a href="<?= admin_url('admin.php?page=wc-settings&tab=elex-discount-per-payment-method') ?>" target="_top" class="btn btn-secondary" style="display: inline-block; margin-top: 0.75rem;">
                                 Review Discount Rules
                             </a>
                         </div>
@@ -2824,7 +2826,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                                 <li>Install and activate the plugin</li>
                                 <li>Reload this page &mdash; BareBits will create the discount rule automatically</li>
                             </ol>
-                            <a href="<?= admin_url('plugin-install.php?s=elex+discount+per+payment+method&tab=search&type=term') ?>" class="btn btn-secondary" style="display: inline-block;">
+                            <a href="<?= admin_url('plugin-install.php?s=elex+discount+per+payment+method&tab=search&type=term') ?>" target="_top" class="btn btn-secondary" style="display: inline-block;">
                                 Install ELEX Plugin
                             </a>
                         </div>
@@ -2907,11 +2909,11 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                 </details>
                 <?php endif; ?>
 
-                <a href="<?= Urls::isWordPress() ? admin_url('admin.php?page=cashupay') : Urls::admin() ?>" class="btn" style="width: 100%; text-align: center; display: block;">
+                <a href="<?= Urls::isWordPress() ? admin_url('admin.php?page=cashupay') : Urls::admin() ?>"<?= Urls::isWordPress() ? ' target="_top"' : '' ?> class="btn" style="width: 100%; text-align: center; display: block;">
                     Go to BareBits Admin
                 </a>
                 <?php if (Urls::isWordPress()): ?>
-                <a href="<?= admin_url() ?>" class="btn btn-secondary" style="width: 100%; text-align: center; display: block; margin-top: 0.5rem;">
+                <a href="<?= admin_url() ?>" target="_top" class="btn btn-secondary" style="width: 100%; text-align: center; display: block; margin-top: 0.5rem;">
                     Back to WordPress Dashboard
                 </a>
                 <?php endif; ?>

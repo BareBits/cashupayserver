@@ -27,13 +27,20 @@ function cashupay_admin_menu(): void {
         'BareBits',
         'manage_options',
         'cashupay',
-        'cashupay_admin_redirect',
+        'cashupay_admin_page',
         'dashicons-money-alt',
         58
     );
 }
 
-function cashupay_admin_redirect(): void {
+/**
+ * Render the BareBits admin (or the setup wizard while setup is incomplete)
+ * embedded in a full-height iframe, so clicking "BareBits" in the sidebar
+ * keeps the operator inside wp-admin instead of navigating away. The SPA is
+ * served same-origin at /cashupay-admin/ by the template_redirect handler,
+ * which also still works when visited directly.
+ */
+function cashupay_admin_page(): void {
     require_once CASHUPAY_PLUGIN_DIR . '/includes/database.php';
     require_once CASHUPAY_PLUGIN_DIR . '/includes/config.php';
 
@@ -42,8 +49,24 @@ function cashupay_admin_redirect(): void {
     } else {
         $url = Urls::admin();
     }
-    echo '<script>window.location.href = ' . wp_json_encode($url) . ';</script>';
-    exit;
+    ?>
+    <style>
+        /* Hand the whole content area to the iframe; wp-admin's own padding
+           and footer would otherwise add a page scrollbar under the SPA. */
+        #wpcontent, #wpbody-content { padding: 0; }
+        #wpfooter { display: none; }
+        #cashupay-admin-frame {
+            display: block;
+            width: 100%;
+            /* WP 5.9+ exposes the admin-bar height (32px, 46px on small
+               screens) as a custom property; older cores get the 32px
+               fallback. */
+            height: calc(100vh - var(--wp-admin--admin-bar--height, 32px));
+            border: 0;
+        }
+    </style>
+    <iframe id="cashupay-admin-frame" src="<?= esc_url($url) ?>" title="BareBits"></iframe>
+    <?php
 }
 
 function cashupay_admin_notice(): void {
@@ -57,7 +80,9 @@ function cashupay_admin_notice(): void {
     if (!Database::isInitialized() || !Config::isSetupComplete()) {
         echo '<div class="notice notice-info"><p>';
         echo '<strong>BareBits</strong> is almost ready — finish setup to start accepting Lightning payments via Bitcoin. ';
-        echo '<a class="button button-primary" href="' . esc_url(Urls::setup()) . '">Configure BareBits</a>';
+        // The menu page embeds the wizard while setup is incomplete, so the
+        // banner routes there rather than to the full-screen /cashupay-setup/.
+        echo '<a class="button button-primary" href="' . esc_url(admin_url('admin.php?page=cashupay')) . '">Configure BareBits</a>';
         echo '</p></div>';
         return;
     }
