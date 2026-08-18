@@ -284,16 +284,27 @@ def wait_for_status(gc: GreenfieldClient, store_id: str, invoice_id: str, expect
 def _enable_auto_melt(admin: AdminClient, store_id: str, address: str,
                       threshold_sat: int = 1) -> dict:
     """Configure a store's auto-cashout (auto-melt) LN address via the same
-    admin endpoint the dashboard uses. The handler probes the address for
-    LUD-21 support through the mock LNURL host. With it set, a lightning
-    invoice on this store routes to the lnaddress rail."""
-    return admin._post_action(
-        "save_auto_melt",
+    admin endpoints the dashboard uses. The destination chain moved to its own
+    action (save_lightning_payments — probes the address for LUD-21 support
+    through the mock LNURL host); save_auto_melt now carries only the
+    enabled/threshold/mode settings. With the address set, a lightning invoice
+    on this store routes to the lnaddress rail."""
+    chain_res = admin._post_action(
+        "save_lightning_payments",
         store_id=store_id,
         address=address,
+    )
+    melt_res = admin._post_action(
+        "save_auto_melt",
+        store_id=store_id,
         enabled="1",
         threshold=str(threshold_sat),
+        mode_override="0",
     )
+    return {
+        "success": bool(chain_res.get("success")) and bool(melt_res.get("success")),
+        "addresses": chain_res.get("addresses"),
+    }
 
 
 def _seed_fee_revenue(payserver: PayserverHandle, store_id: str, sats: int) -> None:

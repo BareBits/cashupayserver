@@ -165,6 +165,11 @@ def test_wizard_skips_the_password_screen_and_completes(wp_ready) -> None:
         assert store["onchain_xpub"] == MAINNET_XPUB
         assert store["onchain_min_confs"] == 0
         assert store["swaps_enabled"] == 1
+        # Swaps are store-only: the yes answer set the store flag above and
+        # must not have written a site-wide swaps_enabled config row.
+        assert db.execute(
+            "SELECT value FROM config WHERE key = 'swaps_enabled'"
+        ).fetchone() is None, "the wizard must not write a site-wide swaps config row"
         assert store["strict_no_mint_fallback"] == 1, "declining mints pins strict mode here too"
         assert store["auto_melt_enabled"] == 1
         # No BareBits admin row is ever created in WordPress mode.

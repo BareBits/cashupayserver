@@ -1,12 +1,12 @@
-"""Admin UI: the NWC connections section of the Auto-Cashout card.
+"""Admin UI: the NWC connections section of the "Lightning payments" card.
 
 Drives the browser flow end to end against a live fake wallet: paste a
-connection string, save (which runs the real save-time probe — a 1-sat
-make_invoice + lookup_invoice through the wallet), and verify persistence.
-Then the security contract: after a reload the saved row renders as a masked
-label (wallet + relay) with no secret anywhere in the DOM, and re-saving the
-card unchanged round-trips the keep ref without ever exposing the URI.
-Finally, removing the row clears the chain.
+connection string, save the lists via #btn-save-lightning-payments (which runs
+the real save-time probe — a 1-sat make_invoice + lookup_invoice through the
+wallet), and verify persistence. Then the security contract: after a reload
+the saved row renders as a masked label (wallet + relay) with no secret
+anywhere in the DOM, and re-saving the card unchanged round-trips the keep ref
+without ever exposing the URI. Finally, removing the row clears the chain.
 
 Run with: pytest tests/ui/test_admin_nwc_ui.py -v -s
 """
@@ -46,27 +46,46 @@ def _chain(handle, store_id: str) -> list[tuple[str, str]]:
     return [(r[0], r[1]) for r in rows]
 
 
-def _save_and_wait(page) -> None:
-    """Click save and wait for a fresh success toast. The #toast div keeps its
-    old text after hiding, so it is reset first — otherwise a second save could
-    match the stale toast from the first and race the actual request."""
+def _reset_toast(page) -> None:
+    """The #toast div keeps its old text after hiding, so it is reset first —
+    otherwise a second save could match the stale toast from the first and
+    race the actual request."""
     page.evaluate(
         "() => { const t = document.getElementById('toast'); t.textContent = ''; t.className = 'toast'; }"
     )
+
+
+def _save_lists_and_wait(page) -> None:
+    """Save the Lightning payments lists and wait for a fresh success toast."""
+    _reset_toast(page)
+    page.click("#btn-save-lightning-payments")
+    page.wait_for_selector("#toast.show:has-text('Settings saved!')", timeout=30000)
+
+
+def _save_cashout_and_wait(page) -> None:
+    """Save the Cashu automatic cashout card and wait for its success toast."""
+    _reset_toast(page)
     page.click("#btn-save-auto-melt")
     page.wait_for_selector("#toast.show:has-text('Settings saved!')", timeout=30000)
 
 
-def _open_auto_cashout(page, configured: ConfiguredPayserver) -> None:
+def _open_lightning_payments(page, configured: ConfiguredPayserver) -> None:
     page.set_default_timeout(20000)
     page.goto(f"{configured.handle.url}/admin")
     page.fill("#password-input", configured.admin_password)
     page.click("#password-submit")
     page.wait_for_selector("#app", state="visible")
     page.locator('.nav-item[data-view="stores"]').click()
-    page.wait_for_selector("#aw-store", state="visible")
-    page.locator('#aw-store .aw-col[data-aw-mode="0"]').click()
+    # The lists live in the always-visible "Lightning payments" card now — no
+    # cashout-mode column click needed to reveal them.
+    page.wait_for_selector("#card-lightning-payments", state="visible")
     page.wait_for_selector("#btn-add-nwc", state="visible")
+    # Wait for the dashboard payload to land (it re-renders the saved lists);
+    # rows added before that render would be wiped by it.
+    page.wait_for_function(
+        "() => { const el = document.getElementById('onchain-offer-effective');"
+        " return el && el.textContent.trim() && el.textContent.trim() !== '\\u2014'; }"
+    )
 
 
 def test_add_save_masked_rerender_and_remove(
@@ -77,14 +96,22 @@ def test_add_save_masked_rerender_and_remove(
     store_id = configured.store_id
 
     # --- add + save (runs the live probe) ---
-    _open_auto_cashout(page, configured)
+    _open_lightning_payments(page, configured)
     page.click("#btn-add-nwc")
     page.locator("#auto-melt-nwc-list input.nwc-input").fill(uri)
+    # Lists first, then the enable/threshold pair — they save through separate
+    # buttons now.
+    _save_lists_and_wait(page)
+    assert _chain(configured.handle, store_id) == [("nwc", uri)]
+
+    # Enable auto-melt + a threshold in the cashout card as well. Done after
+    # the list save: its dashboard reload resets these inputs to persisted
+    # values. The toggle is a CSS-hidden checkbox, so set it directly; the
+    # value is only read on save.
+    page.wait_for_timeout(1500)  # let the post-save dashboard reload land
     page.evaluate("() => { document.getElementById('auto-melt-enabled').checked = true; }")
     page.fill("#auto-melt-threshold", "100")
-    _save_and_wait(page)
-
-    assert _chain(configured.handle, store_id) == [("nwc", uri)]
+    _save_cashout_and_wait(page)
 
     # --- masked re-render: label row, keep ref, no secret in the DOM ---
     page.wait_for_selector("#auto-melt-nwc-list .nwc-saved-label", timeout=20000)
@@ -96,16 +123,18 @@ def test_add_save_masked_rerender_and_remove(
     )
 
     # --- re-save unchanged: the keep ref round-trips, row survives ---
-    _save_and_wait(page)
+    _save_lists_and_wait(page)
     assert _chain(configured.handle, store_id) == [("nwc", uri)]
 
     # --- remove + save clears the chain ---
-    # Auto-melt must be off for a destination-less save: with it enabled the
-    # client correctly blocks ("add at least one destination to withdraw to").
+    # Turn auto-melt off first (its own save button), then clear the list —
+    # leaving auto-cashout enabled with no destinations would be a dead config.
+    page.wait_for_timeout(1500)  # let the post-save dashboard reload land
+    page.evaluate("() => { document.getElementById('auto-melt-enabled').checked = false; }")
+    _save_cashout_and_wait(page)
     page.wait_for_selector("#auto-melt-nwc-list .nwc-saved-label", timeout=20000)
     page.locator("#auto-melt-nwc-list .nwc-row button[title='Remove']").click()
-    page.evaluate("() => { document.getElementById('auto-melt-enabled').checked = false; }")
-    _save_and_wait(page)
+    _save_lists_and_wait(page)
     assert _chain(configured.handle, store_id) == []
 
 
@@ -114,17 +143,15 @@ def test_malformed_paste_is_rejected_client_side(
 ) -> None:
     """A malformed NWC paste is caught by the client shape check with a message
     that does not echo the paste (it may carry a secret)."""
-    _open_auto_cashout(page, configured)
+    _open_lightning_payments(page, configured)
     page.click("#btn-add-nwc")
     bogus_secret = "cd" * 32
     page.locator("#auto-melt-nwc-list input.nwc-input").fill(
         "nostr+walletconnect://broken?secret=" + bogus_secret
     )
-    page.evaluate("() => { document.getElementById('auto-melt-enabled').checked = true; }")
-    page.fill("#auto-melt-threshold", "100")
-    page.click("#btn-save-auto-melt")
-    err = page.locator("#aw-store-error")
-    page.wait_for_selector("#aw-store-error:not(.hidden)")
+    page.click("#btn-save-lightning-payments")
+    err = page.locator("#lightning-payments-error")
+    page.wait_for_selector("#lightning-payments-error:not(.hidden)")
     text = err.inner_text()
     assert "connection string" in text, text
     assert bogus_secret not in text, "client error must not echo the paste"

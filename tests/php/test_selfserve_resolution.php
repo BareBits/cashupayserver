@@ -1,9 +1,9 @@
 <?php
 /**
- * Self-serve enable resolution (tri-state per-store override over the site
- * default, gated on the store being payment-capable) and max-sats resolution
- * (per-store override over the site value over the built-in default).
- * See includes/selfserve.php.
+ * Self-serve enable resolution (store-only flag, gated on the store being
+ * payment-capable; legacy -1 "inherit" rows resolve to off) and max-sats
+ * resolution (per-store value over the built-in default — there is no
+ * site-wide layer). See includes/selfserve.php.
  */
 declare(strict_types=1);
 require __DIR__ . '/harness.php';
@@ -20,72 +20,57 @@ make_store($bare);
 
 // ---- Enable resolution ----
 
-// Default: site disabled → off everywhere.
-assert_false(SelfServe::siteEnabled(), 'site default off');
-assert_false(SelfServe::isEnabledForStore($paid), 'off when site off + inherit');
+// Default: off (fresh stores carry the legacy -1 column default, which
+// resolves to off).
+assert_false(SelfServe::isEnabledForStore($paid), 'off by default');
 
-// Site on → capable store inherits on.
-SelfServe::setSiteEnabled(true);
-assert_true(SelfServe::isEnabledForStore($paid), 'inherits site on');
-
-// Per-store force off beats site on.
-SelfServe::setStoreOverride($paid, SelfServe::FORCE_OFF);
-assert_eq(SelfServe::FORCE_OFF, SelfServe::storeOverride($paid), 'override persisted (off)');
-assert_false(SelfServe::isEnabledForStore($paid), 'force off beats site on');
-
-// Per-store force on beats site off.
-SelfServe::setSiteEnabled(false);
+// Turning it on for the store enables it.
 SelfServe::setStoreOverride($paid, SelfServe::FORCE_ON);
-assert_true(SelfServe::isEnabledForStore($paid), 'force on beats site off');
+assert_eq(SelfServe::FORCE_ON, SelfServe::storeOverride($paid), 'flag persisted (on)');
+assert_true(SelfServe::isEnabledForStore($paid), 'on when store flag on');
 
-// Back to inherit → follows the (off) site default again.
-SelfServe::setStoreOverride($paid, SelfServe::INHERIT);
-assert_false(SelfServe::isEnabledForStore($paid), 'inherit follows site off again');
+// Turning it off disables it again.
+SelfServe::setStoreOverride($paid, SelfServe::FORCE_OFF);
+assert_eq(SelfServe::FORCE_OFF, SelfServe::storeOverride($paid), 'flag persisted (off)');
+assert_false(SelfServe::isEnabledForStore($paid), 'off when store flag off');
+
+// A legacy -1 row (pre-store-only installs) resolves to off.
+Database::query("UPDATE stores SET selfserve_enabled = -1 WHERE id = ?", [$paid]);
+assert_false(SelfServe::isEnabledForStore($paid), 'legacy -1 resolves to off');
 
 // ---- Payment-capability gate ----
 
-// A bare store is never enabled, even forced on with the site on.
-SelfServe::setSiteEnabled(true);
+// A bare store is never enabled, even with the flag on.
 SelfServe::setStoreOverride($bare, SelfServe::FORCE_ON);
 assert_false(SelfServe::isEnabledForStore($bare), 'bare store never enabled (no payment method)');
 
 // Unknown store id → false, not an error.
 assert_false(SelfServe::isEnabledForStore('store_does_not_exist'), 'unknown store false');
 
-// Invalid tri-state is rejected.
-$threw = false;
-try { SelfServe::setStoreOverride($paid, 7); } catch (InvalidArgumentException $e) { $threw = true; }
-assert_true($threw, 'invalid tri-state rejected');
+// The legacy inherit sentinel and anything else invalid are rejected —
+// the setter only accepts the plain on/off values now.
+foreach ([SelfServe::INHERIT, 7] as $bad) {
+    $threw = false;
+    try { SelfServe::setStoreOverride($paid, $bad); } catch (InvalidArgumentException $e) { $threw = true; }
+    assert_true($threw, "invalid value {$bad} rejected");
+}
 
 // ---- Max-sats resolution ----
 
-// Default built-in when nothing set.
-assert_eq(SelfServe::DEFAULT_MAX_SATS, SelfServe::siteMaxSats(), 'site max defaults to built-in');
+// Built-in default when nothing set.
 assert_eq(SelfServe::DEFAULT_MAX_SATS, SelfServe::effectiveMaxSats($paid), 'effective max = built-in default');
 
-// Site override.
-SelfServe::setSiteMaxSats(123456);
-assert_eq(123456, SelfServe::siteMaxSats(), 'site max set');
-assert_eq(123456, SelfServe::effectiveMaxSats($paid), 'effective = site max when no store override');
-
-// Per-store override wins.
+// Per-store value wins.
 SelfServe::setStoreMaxSats($paid, 1000);
-assert_eq(1000, SelfServe::storeMaxSats($paid), 'store max override persisted');
-assert_eq(1000, SelfServe::effectiveMaxSats($paid), 'effective = store override');
+assert_eq(1000, SelfServe::storeMaxSats($paid), 'store max persisted');
+assert_eq(1000, SelfServe::effectiveMaxSats($paid), 'effective = store max');
 
-// Clearing the store override falls back to the site value.
+// Clearing the store value falls back to the built-in default.
 SelfServe::setStoreMaxSats($paid, null);
 assert_null(SelfServe::storeMaxSats($paid), 'store max cleared');
-assert_eq(123456, SelfServe::effectiveMaxSats($paid), 'effective back to site max');
-
-// Clearing the site value falls back to the built-in default.
-SelfServe::setSiteMaxSats(null);
 assert_eq(SelfServe::DEFAULT_MAX_SATS, SelfServe::effectiveMaxSats($paid), 'effective back to built-in');
 
 // Non-positive maxes are rejected.
-$threw = false;
-try { SelfServe::setSiteMaxSats(0); } catch (InvalidArgumentException $e) { $threw = true; }
-assert_true($threw, 'zero site max rejected');
 $threw = false;
 try { SelfServe::setStoreMaxSats($paid, -5); } catch (InvalidArgumentException $e) { $threw = true; }
 assert_true($threw, 'negative store max rejected');

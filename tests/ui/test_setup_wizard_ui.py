@@ -118,6 +118,11 @@ def test_setup_wizard_completes_in_browser(
     assert len(seed_words) == 12, f"expected a 12-word phrase, got {len(seed_words)}"
 
     assert _config_value(payserver, "setup_complete") == "true"
+    # The swaps step is store-only now: enabling it must write the store flag
+    # (asserted below) without flipping any site-wide config key.
+    assert _config_value(payserver, "swaps_enabled") is None, (
+        "the wizard must not write the retired site-wide swaps_enabled key"
+    )
 
     row = _store_row(payserver)
     assert row["name"] == "Browser Store"
@@ -129,7 +134,9 @@ def test_setup_wizard_completes_in_browser(
     assert row["mint_url"].rstrip("/") == mint.url.rstrip("/")
     assert row["mint_unit"] == "sat"
     assert row["seed_phrase"], "a seed should have been generated for the mint wallet"
-    # Declining mints is what pins strict mode; enabling them leaves it inherit.
+    # Declining mints is what pins strict mode; enabling them leaves the
+    # column at its schema default (-1, a legacy value that resolves to
+    # "allow mint fallback").
     assert row["strict_no_mint_fallback"] == -1
 
 

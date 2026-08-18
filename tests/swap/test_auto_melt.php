@@ -45,19 +45,14 @@ Database::initialize();
 // =====================================================================
 // 2. Mode resolution (modeForStore).
 //
-// Truth table — site default off:
-//   override=-1, swaps off       → 'lightning' (LN address rail)
-//   override=-1, swaps on, no xpub → 'lightning' (falls back; no destination)
-//   override=-1, swaps on, xpub   → 'lightning' (site default off wins)
-//   override=0,  swaps on, xpub   → 'lightning' (force-off override)
-//   override=1,  swaps off        → 'lightning' (swap can't run; fall back)
-//   override=1,  swaps on, static → 'lightning' (static addr incompatible)
-//   override=1,  swaps on, xpub   → 'swap'      (the happy path)
+// Truth table (store-only; legacy -1 rows resolve to lightning):
+//   mode=-1 (legacy)              → 'lightning'
+//   mode=0,  swaps on, xpub       → 'lightning' (explicit lightning)
+//   mode=1,  swaps off            → 'lightning' (swap can't run; fall back)
+//   mode=1,  swaps on, static     → 'lightning' (static addr incompatible)
+//   mode=1,  swaps on, xpub       → 'swap'      (the happy path)
 // =====================================================================
 {
-    SwapAutoMelt::setSiteDefault(false);
-    SwapsConfig::setSiteEnabled(true);
-
     $storeOff = [
         'id' => 'so-1', 'auto_melt_use_swap' => SwapAutoMelt::INHERIT,
         'onchain_xpub' => null, 'onchain_address_mode' => 'xpub', 'swaps_enabled' => SwapsConfig::FORCE_OFF,
@@ -122,18 +117,16 @@ Database::initialize();
     tassert(SwapAutoMelt::modeForStore($storeStatic) === 'lightning',
             'mode: force-swap but static-address mode → lightning', $failures);
 
-    // site default flips override=-1 behaviour
-    SwapAutoMelt::setSiteDefault(true);
-    $storeInherit = [
+    // legacy -1 rows resolve to lightning even when a swap could run
+    $storeLegacy = [
         'id' => 'so-3',
         'auto_melt_use_swap' => SwapAutoMelt::INHERIT,
         'onchain_xpub' => 'tpubXYZ',
         'onchain_address_mode' => 'xpub',
         'swaps_enabled' => SwapsConfig::FORCE_ON,
     ];
-    tassert(SwapAutoMelt::modeForStore($storeInherit) === 'swap',
-            'mode: inherit with site default on + xpub → swap', $failures);
-    SwapAutoMelt::setSiteDefault(false);
+    tassert(SwapAutoMelt::modeForStore($storeLegacy) === 'lightning',
+            'mode: legacy -1 resolves to lightning', $failures);
 }
 
 // =====================================================================

@@ -1,14 +1,17 @@
-"""End-to-end tests for the auto-cashout / submarine-swap guard-rails added
-alongside the admin auto-cashout column-selector redesign.
+"""End-to-end tests for the auto-cashout / submarine-swap guard-rails.
 
-Covered behavior (all enforced server-side in admin.php):
+Covered behavior (all enforced server-side in admin.php; swaps are store-only
+— the old site-wide switch and its get/save_swap_settings actions are gone):
   - Forcing submarine swaps on for a store with no on-chain xpub/address is
     refused (save_store_swaps).
-  - Selecting on-chain auto-cashout (FORCE_SWAP) with no on-chain
-    xpub/address is refused (save_auto_melt).
+  - Selecting on-chain auto-cashout (mode '1') with no on-chain xpub/address
+    is refused (save_auto_melt).
+  - The legacy tri-state '-1' ("inherit") is rejected outright by both
+    save_auto_melt and save_store_swaps — the mode must be '0' or '1'.
   - Selecting on-chain auto-cashout on a store that DOES have on-chain
-    configured succeeds AND auto-forces the store's submarine-swap override on
-    + enables the site-wide swap master switch (without forcing other stores).
+    configured succeeds AND force-enables the STORE swaps flag (there is no
+    site key to flip, and the destination lists now live in
+    save_lightning_payments, so the response carries no addresses array).
   - Forcing swaps on for a store that has on-chain configured succeeds.
 """
 from __future__ import annotations
@@ -20,7 +23,7 @@ import requests
 from conftest import ConfiguredPayserver
 
 
-# Tri-state override values mirrored from SwapsConfig / SwapAutoMelt.
+# Store flag values mirrored from SwapsConfig / SwapAutoMelt.
 FORCE_ON = 1
 FORCE_SWAP = 1
 
@@ -50,7 +53,7 @@ def _set_static_onchain(db_path: str, store_id: str) -> None:
         conn.close()
 
 
-def _store_swap_override(db_path: str, store_id: str) -> int | None:
+def _store_swap_flag(db_path: str, store_id: str) -> int | None:
     conn = sqlite3.connect(db_path)
     try:
         conn.row_factory = sqlite3.Row
@@ -66,7 +69,12 @@ def _store_swap_override(db_path: str, store_id: str) -> int | None:
 
 
 def test_force_store_swap_without_onchain_is_rejected(configured: ConfiguredPayserver) -> None:
-    r = _post(configured, "save_store_swaps", store_id=configured.store_id, override=str(FORCE_ON))
+    r = _post(
+        configured, "save_store_swaps",
+        store_id=configured.store_id,
+        enabled="1",
+        provider_order="boltz",
+    )
     assert r.status_code == 400, r.text
     assert "on-chain" in r.json()["error"].lower()
 
@@ -75,7 +83,6 @@ def test_onchain_automelt_without_onchain_is_rejected(configured: ConfiguredPays
     r = _post(
         configured, "save_auto_melt",
         store_id=configured.store_id,
-        address="",
         enabled="1",
         threshold="2000",
         mode_override=str(FORCE_SWAP),
@@ -84,37 +91,90 @@ def test_onchain_automelt_without_onchain_is_rejected(configured: ConfiguredPays
     assert "on-chain" in r.json()["error"].lower()
 
 
-# ---------- positive: on-chain auto-cashout forces swaps on ----------
+# ---------- legacy tri-state values are dead ----------
 
 
-def test_onchain_automelt_forces_store_swap_and_enables_site(configured: ConfiguredPayserver) -> None:
+def test_automelt_rejects_legacy_inherit_mode(configured: ConfiguredPayserver) -> None:
+    # '-1' meant "inherit the site default"; the site default is gone, so the
+    # value is now a 400 rather than being silently normalized on write.
+    r = _post(
+        configured, "save_auto_melt",
+        store_id=configured.store_id,
+        enabled="1",
+        threshold="2000",
+        mode_override="-1",
+    )
+    assert r.status_code == 400, r.text
+    assert "mode" in r.json()["error"].lower()
+
+
+def test_store_swaps_rejects_legacy_inherit_value(configured: ConfiguredPayserver) -> None:
+    r = _post(
+        configured, "save_store_swaps",
+        store_id=configured.store_id,
+        enabled="-1",
+        provider_order="boltz",
+    )
+    assert r.status_code == 400, r.text
+    assert "enabled" in r.json()["error"].lower()
+
+
+# ---------- positive: on-chain auto-cashout forces the store swaps flag ----------
+
+
+def test_onchain_automelt_forces_store_swap_flag(configured: ConfiguredPayserver) -> None:
     _set_static_onchain(configured.handle.db_path, configured.store_id)
 
-    # Site-wide swaps start disabled on a fresh install.
-    pre = _post(configured, "get_swap_settings").json()
-    assert pre["enabled"] is False, pre
+    # The store flag starts non-forced (legacy -1 default on a fresh store).
+    assert _store_swap_flag(configured.handle.db_path, configured.store_id) != FORCE_ON
+
+    # There is no site-wide switch any more: the old site-settings actions
+    # fall through to the unknown-action handler.
+    for dead_action in ("get_swap_settings", "save_swap_settings"):
+        gone = _post(configured, dead_action)
+        assert gone.status_code == 400, (dead_action, gone.status_code, gone.text[:200])
+        assert gone.json().get("error") == "Unknown action", (dead_action, gone.text[:200])
 
     r = _post(
         configured, "save_auto_melt",
         store_id=configured.store_id,
-        address="",
         enabled="1",
         threshold="2000",
         mode_override=str(FORCE_SWAP),
     )
     assert r.ok, (r.status_code, r.text)
-    assert r.json()["success"] is True, r.text
+    body = r.json()
+    assert body["success"] is True, r.text
+    # Destination lists moved to save_lightning_payments; save_auto_melt no
+    # longer echoes an addresses array.
+    assert "addresses" not in body, body
 
-    # Store's submarine-swap override is now forced-on...
-    assert _store_swap_override(configured.handle.db_path, configured.store_id) == FORCE_ON
-    # ...and the site-wide master switch was enabled (without forcing others).
-    post = _post(configured, "get_swap_settings").json()
-    assert post["enabled"] is True, post
+    # The store's swaps flag is now forced-on — the only flag there is.
+    assert _store_swap_flag(configured.handle.db_path, configured.store_id) == FORCE_ON
 
 
 def test_force_store_swap_with_onchain_succeeds(configured: ConfiguredPayserver) -> None:
     _set_static_onchain(configured.handle.db_path, configured.store_id)
-    r = _post(configured, "save_store_swaps", store_id=configured.store_id, override=str(FORCE_ON))
+    r = _post(
+        configured, "save_store_swaps",
+        store_id=configured.store_id,
+        enabled="1",
+        provider_order="boltz",
+    )
     assert r.ok, r.text
     assert r.json()["success"] is True
-    assert _store_swap_override(configured.handle.db_path, configured.store_id) == FORCE_ON
+    assert _store_swap_flag(configured.handle.db_path, configured.store_id) == FORCE_ON
+
+
+def test_enabling_store_swaps_requires_a_provider(configured: ConfiguredPayserver) -> None:
+    # enabled=1 with an empty provider_order can never produce a working swap
+    # rail, so the save is refused rather than persisting a dead setting.
+    _set_static_onchain(configured.handle.db_path, configured.store_id)
+    r = _post(
+        configured, "save_store_swaps",
+        store_id=configured.store_id,
+        enabled="1",
+        provider_order="",
+    )
+    assert r.status_code == 400, r.text
+    assert "provider" in r.json()["error"].lower()

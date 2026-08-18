@@ -49,13 +49,12 @@ def nwc_stack(lnd_mint: LndHandle, channels: None) -> Iterator[NwcStack]:
 
 def save_nwc_destination(admin: AdminClient, store_id: str, uri: str,
                          enabled: str = "1") -> dict:
-    """Configure a single NWC destination via the split-list contract."""
+    """Configure a single NWC destination via the split-list contract:
+    save_lightning_payments carries the chain (and the probe results this
+    returns), save_auto_melt the cashout toggle."""
     data = [
-        ("action", "save_auto_melt"),
+        ("action", "save_lightning_payments"),
         ("store_id", store_id),
-        ("enabled", enabled),
-        ("threshold", "100"),
-        ("mode_override", "0"),
         ("nwc[]", uri),
     ]
     r = admin.s.post(
@@ -65,6 +64,20 @@ def save_nwc_destination(admin: AdminClient, store_id: str, uri: str,
     assert r.status_code == 200, r.text
     body = r.json()
     assert body.get("success"), body
+
+    r = admin.s.post(
+        admin._admin_url,
+        data=[
+            ("action", "save_auto_melt"),
+            ("store_id", store_id),
+            ("enabled", enabled),
+            ("threshold", "100"),
+            ("mode_override", "0"),
+        ],
+        headers={"X-CSRF-Token": admin.csrf_token}, timeout=60,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json().get("success"), r.text
     return body
 
 

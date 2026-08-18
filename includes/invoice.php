@@ -699,19 +699,19 @@ class Invoice {
             $failureReasons[] = "swap rail unavailable: {$envError}";
             return null;
         }
-        $localMin = SwapsConfig::minimumTargetSats();
+        $localMin = SwapsConfig::minimumTargetSatsForStore($storeId);
         if ($localMin !== null && $targetSats < $localMin) {
-            $failureReasons[] = "site min override ({$localMin} sat) blocks {$targetSats} sat target";
+            $failureReasons[] = "store min override ({$localMin} sat) blocks {$targetSats} sat target";
             return null;
         }
         $network = $store['onchain_network'] ?? 'mainnet';
 
-        // When auto-select-cheapest is on, rankedForSite() fetches quotes from
+        // When auto-select-cheapest is on, rankedForStore() fetches quotes from
         // every reachable provider in parallel and reorders them by total cost
         // (subject to the 10%-cheaper threshold). When off, it returns the
         // configured priority order with no cached quotes — behaviour matches
         // the historical sequential path.
-        foreach (SwapProviderFactory::rankedForSite($network, $targetSats) as ['provider' => $provider, 'quote' => $cachedQuote]) {
+        foreach (SwapProviderFactory::rankedForStore($storeId, $network, $targetSats) as ['provider' => $provider, 'quote' => $cachedQuote]) {
             $name = $provider->getName();
             try {
                 $pairInfo = $cachedQuote ?? $provider->getReversePairInfo($network);

@@ -176,13 +176,12 @@ def _settle_invoice(configured: ConfiguredPayserver, lnd_payer: LndHandle, amoun
 
 def _save_noffer_destination(admin: AdminClient, store_id: str, noffer: str) -> dict:
     """Configure a single noffer auto-cashout destination (enabled, low
-    threshold) via the addresses[] chain, mirroring the dashboard."""
+    threshold), mirroring the dashboard: the destination chain goes to
+    save_lightning_payments (legacy auto-detected addresses[]), then the
+    toggle/threshold to save_auto_melt."""
     data = [
-        ("action", "save_auto_melt"),
+        ("action", "save_lightning_payments"),
         ("store_id", store_id),
-        ("enabled", "1"),
-        ("threshold", "100"),
-        ("mode_override", "0"),
         ("addresses[]", noffer),
     ]
     r = admin.s.post(
@@ -193,6 +192,20 @@ def _save_noffer_destination(admin: AdminClient, store_id: str, noffer: str) -> 
     body = r.json()
     assert body.get("success"), body
     assert (body.get("addresses") or [])[0]["type"] == "noffer", body
+
+    r = admin.s.post(
+        admin._admin_url,
+        data=[
+            ("action", "save_auto_melt"),
+            ("store_id", store_id),
+            ("enabled", "1"),
+            ("threshold", "100"),
+            ("mode_override", "0"),
+        ],
+        headers={"X-CSRF-Token": admin.csrf_token}, timeout=30,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json().get("success"), r.text
     return body
 
 

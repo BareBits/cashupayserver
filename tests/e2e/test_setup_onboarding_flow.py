@@ -130,6 +130,8 @@ def test_swaps_require_an_xpub_not_a_static_address(payserver: PayserverHandle) 
 
     body = w.post(step="swaps", swaps_enabled="1")
     assert "need an xpub" in (_error(body) or ""), _error(body)
+    # -1 is the untouched legacy column default (it resolves to off; swaps are
+    # store-only) — the point is the rejected answer must not be saved.
     assert _stores(payserver)[0]["swaps_enabled"] == -1, "the rejected answer must not be saved"
 
     body = w.post(step="swaps", swaps_enabled="0")
