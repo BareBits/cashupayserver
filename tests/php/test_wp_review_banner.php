@@ -22,6 +22,7 @@ define('CASHUPAY_PLUGIN_DIR', dirname(__DIR__, 2));
 // stub instead of standalone base-URL config.
 define('CASHUPAY_WORDPRESS', true);
 function site_url($path = '') { return 'http://wp.test' . $path; }
+function admin_url($path = '') { return 'http://wp.test/wp-admin/' . $path; }
 require_once dirname(__DIR__, 2) . '/includes/urls.php';
 
 $GLOBALS['wp_options'] = [];

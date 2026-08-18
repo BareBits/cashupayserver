@@ -75,14 +75,21 @@ def test_admin_menu_is_a_top_level_section_not_under_tools(wordpress: WordPressH
 
 def test_unconfigured_admin_banner_invites_configuration(wordpress: WordPressHandle) -> None:
     """A freshly installed, not-yet-configured plugin shows an admin banner that
-    links operators straight into setup. Rendered for a manage_options user."""
+    links operators into setup via the embedded BareBits admin page (the menu
+    page iframes the wizard while setup is incomplete), keeping them inside
+    wp-admin. Rendered for a manage_options user."""
     snippet = (
         "wp_set_current_user(1);"
         "ob_start(); cashupay_admin_notice(); echo ob_get_clean();"
     )
     body = wordpress.wp_cli("eval", snippet).stdout
     assert "Configure BareBits" in body, body[:400]
-    assert "cashupay-setup" in body, "banner must link to the setup wizard: " + body[:400]
+    assert "admin.php?page=cashupay" in body, (
+        "banner must link to the embedded admin page: " + body[:400]
+    )
+    assert "cashupay-setup" not in body, (
+        "banner must no longer navigate out of wp-admin to the bare wizard: " + body[:400]
+    )
 
 
 def test_admin_banner_never_leaks_to_the_storefront(wordpress: WordPressHandle) -> None:
