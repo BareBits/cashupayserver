@@ -91,8 +91,6 @@ class FeeGateMockProvider implements SwapProvider {
 }
 
 Database::initialize();
-SwapsConfig::setSiteEnabled(true);
-SwapsConfig::setProviderOrder(['feegatemock']);
 SwapProviderFactory::setRegistry(['feegatemock' => new FeeGateMockProvider()]);
 
 $storeId = Database::generateId('store');
@@ -105,7 +103,9 @@ Database::insert('stores', [
     'onchain_xpub' => 'tpubD6NzVbkrYhZ4WaWSyoBvQwbpLkojyoTZPRsgXELWz3Popb3qkjcJyJUGLnL4qHHoQvao8ESaAstxYSnhyswJ76uZPStJRJCTKvosUCJZL5B',
     'onchain_address_type' => 'P2WPKH',
     'onchain_network' => 'regtest',
+    'swaps_enabled' => SwapsConfig::FORCE_ON,
 ]);
+SwapsConfig::setStoreProviderOrder($storeId, ['feegatemock']);
 $store = Config::getStore($storeId);
 
 $gate = new ReflectionMethod(Invoice::class, 'trySwapCreate');

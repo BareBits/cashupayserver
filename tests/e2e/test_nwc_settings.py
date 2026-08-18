@@ -2,8 +2,8 @@
 
 Covers the parts the live round trip (test_nwc_receive.py) doesn't:
   - the three-list chain contract: ln_addresses[] + nwc[] + noffers[]
-    persisted in the priority order Invoice::create walks
-    (lnaddress -> nwc -> noffer)
+    posted to save_lightning_payments and persisted in the priority order
+    Invoice::create walks (lnaddress -> nwc -> noffer)
   - keep:<id> reference round trip: the browser re-saves the masked row
     without ever holding the URI, and the stored secret survives unchanged
   - rejection paths: malformed URI (without echoing it back), dead-relay
@@ -52,12 +52,11 @@ def nwc_stack(lnd_mint: LndHandle, channels: None) -> Iterator[NwcStack]:
 
 def _post_save(admin: AdminClient, store_id: str, data: list[tuple[str, str]],
                expect_ok: bool = True) -> tuple[int, dict]:
+    """POST the destination chain to save_lightning_payments (the action that
+    now owns the ln_addresses[]/nwc[]/noffers[] lists and the probe gates)."""
     body = [
-        ("action", "save_auto_melt"),
+        ("action", "save_lightning_payments"),
         ("store_id", store_id),
-        ("enabled", "1"),
-        ("threshold", "100"),
-        ("mode_override", "0"),
         *data,
     ]
     r = admin.s.post(

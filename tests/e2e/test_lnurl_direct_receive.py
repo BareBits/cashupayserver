@@ -20,8 +20,8 @@ Exercises the full stack — cashupayserver, the LUD-21 mock LNURL host
    table + accounting; this confirms the path is wired end-to-end.
 
 3. **LUD-21 save gate**: when the LN address host doesn't advertise a
-   verify URL, save_auto_melt refuses to add the address (400 naming
-   LUD-21). An address already stored for the store is grandfathered:
+   verify URL, save_lightning_payments refuses to add the address (400
+   naming LUD-21). An address already stored for the store is grandfathered:
    re-saving it succeeds with lud21Support=0, and invoices for it fall
    back transparently to the mint rail with no override reason.
 """
@@ -67,18 +67,29 @@ def _enable_auto_melt(
     threshold_sat: int = 100,
     enabled: str = "1",
 ) -> dict:
-    """Hit the admin save_auto_melt endpoint, mimicking the dashboard UI.
-    Returns the response (includes an ordered `addresses` list, each carrying
-    the per-address lud21Support from the LUD-21 probe the handler runs
-    synchronously). Posts the legacy single `address` field, which the handler
-    still accepts and stores as a one-entry fallback chain."""
-    return configured.admin._post_action(
-        "save_auto_melt",
+    """Configure the destination + toggle, mimicking the dashboard UI: the
+    destination chain goes to save_lightning_payments (posted first, so its
+    LUD-21 gate fires before anything is toggled), then the enable/threshold
+    to save_auto_melt. Returns the save_lightning_payments response (includes
+    an ordered `addresses` list, each carrying the per-address lud21Support
+    from the LUD-21 probe the handler runs synchronously). Posts the legacy
+    single `address` field, which the handler still accepts and stores as a
+    one-entry fallback chain."""
+    result = configured.admin._post_action(
+        "save_lightning_payments",
         store_id=configured.store_id,
         address=address,
+    )
+    toggle = configured.admin._post_action(
+        "save_auto_melt",
+        store_id=configured.store_id,
         enabled=enabled,
         threshold=str(threshold_sat),
+        mode_override="0",
     )
+    assert toggle.get("success") is True, toggle
+    assert "addresses" not in toggle, toggle
+    return result
 
 
 def _poll_invoice_until(
@@ -129,9 +140,10 @@ def _read_store_row(payserver: PayserverHandle, store_id: str) -> dict:
 
 
 def _primary_lud21(save_result: dict):
-    """LUD-21 support for the highest-priority address in a save_auto_melt
-    response. The response now returns an ordered `addresses` list (each with
-    a per-address lud21Support) instead of a single lnurl_supports_verify."""
+    """LUD-21 support for the highest-priority address in a
+    save_lightning_payments response. The response returns an ordered
+    `addresses` list (each with a per-address lud21Support) instead of a
+    single lnurl_supports_verify."""
     addresses = save_result.get("addresses") or []
     if not addresses:
         return None
@@ -231,9 +243,9 @@ def test_lnurl_direct_receive_happy_path(
     the cashupayserver detects settlement via the verify URL."""
     configured = configured_with_lnurlp
 
-    # 1. Save the auto-melt LN address. The save_auto_melt handler probes the
-    #    mock LNURL host (which advertises a verify URL via lud21=True), so
-    #    lnurl_supports_verify on the response should be 1.
+    # 1. Save the auto-melt LN address. The save_lightning_payments handler
+    #    probes the mock LNURL host (which advertises a verify URL via
+    #    lud21=True), so lnurl_supports_verify on the response should be 1.
     save_result = _enable_auto_melt(configured)
     assert save_result.get("success") is True, save_result
     assert _primary_lud21(save_result) == 1, (
@@ -529,9 +541,10 @@ def test_lnurl_lud21_missing_blocks_save(
     configured_no_lud21: ConfiguredPayserver,
     lnurlp_server_no_lud21: LnurlpServer,
 ) -> None:
-    """Without LUD-21, save_auto_melt refuses a NEW address outright — the
-    broken direct-receive rail is caught at save time instead of silently
-    dropping Lightning from the checkout."""
+    """Without LUD-21, save_lightning_payments refuses a NEW address outright
+    — the broken direct-receive rail is caught at save time instead of
+    silently dropping Lightning from the checkout (and the toggle save that
+    would follow it is never posted)."""
     configured = configured_no_lud21
 
     with pytest.raises(RuntimeError, match="LUD-21"):
@@ -566,10 +579,8 @@ def test_lnurl_lud21_grandfathered_address_falls_back_to_mint(
     # Adding a second, NEW address alongside the grandfathered one still fails.
     with pytest.raises(RuntimeError, match="LUD-21"):
         configured.admin._post_action(
-            "save_auto_melt",
+            "save_lightning_payments",
             store_id=configured.store_id,
-            enabled="1",
-            threshold="100",
             **{"ln_addresses[]": [LNURL_ADDRESS, "brandnew@example.test"]},
         )
 

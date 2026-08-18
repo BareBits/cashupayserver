@@ -154,15 +154,15 @@ def create_store(db_path: Path) -> str:
     return store_id
 
 
-def configure_swaps(db_path: Path) -> None:
+def configure_swaps(db_path: Path, store_id: str) -> None:
+    """Enable swaps for the store. Swap settings are store-only now, so the
+    enable flag / provider order / strict flag land on the store row; only the
+    dev/test knobs (boltz regtest URL, cron key) remain config keys."""
     now = int(time.time())
     conn = sqlite3.connect(str(db_path))
     try:
         cur = conn.cursor()
         kvs = [
-            ("swaps_enabled", json.dumps(True)),
-            ("swaps_provider_order", json.dumps(["boltz"])),
-            ("swaps_strict_no_mint_fallback", json.dumps(True)),
             ("swaps_boltz_regtest_url", json.dumps(BOLTZ_REGTEST_URL)),
             # Cron key needed by Background::trigger paths
             ("cron_key", json.dumps("e2e-cron-key")),
@@ -173,6 +173,11 @@ def configure_swaps(db_path: Path) -> None:
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
                 (k, v, now, now),
             )
+        cur.execute(
+            "UPDATE stores SET swaps_enabled = 1, swaps_provider_order = ?, "
+            "strict_no_mint_fallback = 1 WHERE id = ?",
+            (json.dumps(["boltz"]), store_id),
+        )
         conn.commit()
     finally:
         conn.close()
@@ -281,7 +286,7 @@ def main() -> int:
     seed_setup_complete(db_path)
     store_id = create_store(db_path)
     echo(f"created store {store_id}")
-    configure_swaps(db_path)
+    configure_swaps(db_path, store_id)
     echo("swap config seeded")
 
     # Pick a free port and spawn the server

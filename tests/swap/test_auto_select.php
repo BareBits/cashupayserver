@@ -2,7 +2,7 @@
 /**
  * Tests for the auto-select-cheapest swap provider ranking.
  *
- * The ranking algorithm lives in SwapProviderFactory::rankedForSite() and
+ * The ranking algorithm lives in SwapProviderFactory::rankedForStore() and
  * is driven by SwapQuoteFetcher + SwapsConfig. We use plain SwapProvider
  * implementations (not BoltzLikeProvider) so the fetcher falls through to
  * its sequential path and we can avoid wiring up curl_multi.
@@ -68,6 +68,15 @@ class QuoteMockProvider implements SwapProvider {
 
 Database::initialize();
 
+// All swap prefs are per-store now. The pure ranking tests below share this
+// settings-only store; the Invoice::create() tests re-point the prefs at the
+// store they create.
+const AUTOSEL_STORE = 'autosel-settings-store';
+Database::insert('stores', [
+    'id' => AUTOSEL_STORE, 'name' => 'AutoSelect Settings',
+    'mint_unit' => 'sat', 'created_at' => time(),
+]);
+
 // ------------- Ranking: cheapest is >10% cheaper, wins -------------
 
 {
@@ -78,11 +87,11 @@ Database::initialize();
     $leader = new QuoteMockProvider('leader', new SwapPairInfo(0.5, 200, 150, 1000, 5_000_000, 'h1'));
     $cheap  = new QuoteMockProvider('cheap',  new SwapPairInfo(0.1, 100, 100, 1000, 5_000_000, 'h2'));
     SwapProviderFactory::setRegistry(['leader' => $leader, 'cheap' => $cheap]);
-    SwapsConfig::setProviderOrder(['leader', 'cheap']);
-    SwapsConfig::setAutoSelectCheapest(true);
-    SwapsConfig::setAutoSelectThresholdPct(10);
+    SwapsConfig::setStoreProviderOrder(AUTOSEL_STORE, ['leader', 'cheap']);
+    SwapsConfig::setStoreAutoSelectCheapest(AUTOSEL_STORE, true);
+    SwapsConfig::setStoreAutoSelectThresholdPct(AUTOSEL_STORE, 10);
 
-    $ranked = SwapProviderFactory::rankedForSite('mainnet', 10000);
+    $ranked = SwapProviderFactory::rankedForStore(AUTOSEL_STORE, 'mainnet', 10000);
     $order = array_map(fn($r) => $r['provider']->getName(), $ranked);
     tassert($order === ['cheap', 'leader'], 'cheapest >10% cheaper is promoted to first', $failures);
     tassert($ranked[0]['quote'] !== null, 'cheapest carries cached quote into ranking', $failures);
@@ -103,11 +112,11 @@ Database::initialize();
     $leader = new QuoteMockProvider('leader', new SwapPairInfo(1.0, 0, 0, 1000, 5_000_000, 'h1'));
     $exact  = new QuoteMockProvider('exact',  new SwapPairInfo(0.9, 0, 0, 1000, 5_000_000, 'h2'));
     SwapProviderFactory::setRegistry(['leader' => $leader, 'exact' => $exact]);
-    SwapsConfig::setProviderOrder(['leader', 'exact']);
-    SwapsConfig::setAutoSelectCheapest(true);
-    SwapsConfig::setAutoSelectThresholdPct(10);
+    SwapsConfig::setStoreProviderOrder(AUTOSEL_STORE, ['leader', 'exact']);
+    SwapsConfig::setStoreAutoSelectCheapest(AUTOSEL_STORE, true);
+    SwapsConfig::setStoreAutoSelectThresholdPct(AUTOSEL_STORE, 10);
 
-    $ranked = SwapProviderFactory::rankedForSite('mainnet', 10000);
+    $ranked = SwapProviderFactory::rankedForStore(AUTOSEL_STORE, 'mainnet', 10000);
     $order = array_map(fn($r) => $r['provider']->getName(), $ranked);
     tassert($order === ['leader', 'exact'], 'exactly 10% cheaper does NOT promote (strict >)', $failures);
     $audit = SwapQuoteFetcher::lastAuditTrail();
@@ -120,28 +129,28 @@ Database::initialize();
     $leader = new QuoteMockProvider('leader', new SwapPairInfo(1.0, 0, 0, 1000, 5_000_000, 'h1'));
     $slight = new QuoteMockProvider('slight', new SwapPairInfo(0.95, 0, 0, 1000, 5_000_000, 'h2'));
     SwapProviderFactory::setRegistry(['leader' => $leader, 'slight' => $slight]);
-    SwapsConfig::setProviderOrder(['leader', 'slight']);
-    SwapsConfig::setAutoSelectCheapest(true);
-    SwapsConfig::setAutoSelectThresholdPct(10);
+    SwapsConfig::setStoreProviderOrder(AUTOSEL_STORE, ['leader', 'slight']);
+    SwapsConfig::setStoreAutoSelectCheapest(AUTOSEL_STORE, true);
+    SwapsConfig::setStoreAutoSelectThresholdPct(AUTOSEL_STORE, 10);
 
-    $ranked = SwapProviderFactory::rankedForSite('mainnet', 10000);
+    $ranked = SwapProviderFactory::rankedForStore(AUTOSEL_STORE, 'mainnet', 10000);
     $order = array_map(fn($r) => $r['provider']->getName(), $ranked);
     tassert($order === ['leader', 'slight'], 'only 5% cheaper leaves priority order unchanged', $failures);
 }
 
-// ------------- Ranking: feature disabled → identical to orderedForSite -------------
+// ------------- Ranking: feature disabled → identical to orderedForStore -------------
 
 {
     $leader = new QuoteMockProvider('leader', new SwapPairInfo(1.0, 0, 0, 1000, 5_000_000, 'h1'));
     $cheap  = new QuoteMockProvider('cheap',  new SwapPairInfo(0.1, 0, 0, 1000, 5_000_000, 'h2'));
     SwapProviderFactory::setRegistry(['leader' => $leader, 'cheap' => $cheap]);
-    SwapsConfig::setProviderOrder(['leader', 'cheap']);
-    SwapsConfig::setAutoSelectCheapest(false);
-    SwapsConfig::setAutoSelectThresholdPct(10);
+    SwapsConfig::setStoreProviderOrder(AUTOSEL_STORE, ['leader', 'cheap']);
+    SwapsConfig::setStoreAutoSelectCheapest(AUTOSEL_STORE, false);
+    SwapsConfig::setStoreAutoSelectThresholdPct(AUTOSEL_STORE, 10);
 
     $leader->quoteCalls = 0;
     $cheap->quoteCalls = 0;
-    $ranked = SwapProviderFactory::rankedForSite('mainnet', 10000);
+    $ranked = SwapProviderFactory::rankedForStore(AUTOSEL_STORE, 'mainnet', 10000);
     $order = array_map(fn($r) => $r['provider']->getName(), $ranked);
     tassert($order === ['leader', 'cheap'], 'feature off: priority order preserved', $failures);
     tassert($ranked[0]['quote'] === null && $ranked[1]['quote'] === null,
@@ -159,11 +168,11 @@ Database::initialize();
     $leader->quoteThrows = true;
     $alt    = new QuoteMockProvider('alt',    new SwapPairInfo(0.5, 0, 0, 1000, 5_000_000, 'h2'));
     SwapProviderFactory::setRegistry(['leader' => $leader, 'alt' => $alt]);
-    SwapsConfig::setProviderOrder(['leader', 'alt']);
-    SwapsConfig::setAutoSelectCheapest(true);
-    SwapsConfig::setAutoSelectThresholdPct(10);
+    SwapsConfig::setStoreProviderOrder(AUTOSEL_STORE, ['leader', 'alt']);
+    SwapsConfig::setStoreAutoSelectCheapest(AUTOSEL_STORE, true);
+    SwapsConfig::setStoreAutoSelectThresholdPct(AUTOSEL_STORE, 10);
 
-    $ranked = SwapProviderFactory::rankedForSite('mainnet', 10000);
+    $ranked = SwapProviderFactory::rankedForStore(AUTOSEL_STORE, 'mainnet', 10000);
     $order = array_map(fn($r) => $r['provider']->getName(), $ranked);
     // alt is the only candidate. Leader gets appended at the end (unreachable).
     tassert($order === ['alt', 'leader'], 'unreachable leader falls to end of list', $failures);
@@ -181,10 +190,10 @@ Database::initialize();
     $a->quoteThrows = true;
     $b->quoteThrows = true;
     SwapProviderFactory::setRegistry(['a' => $a, 'b' => $b]);
-    SwapsConfig::setProviderOrder(['a', 'b']);
-    SwapsConfig::setAutoSelectCheapest(true);
+    SwapsConfig::setStoreProviderOrder(AUTOSEL_STORE, ['a', 'b']);
+    SwapsConfig::setStoreAutoSelectCheapest(AUTOSEL_STORE, true);
 
-    $ranked = SwapProviderFactory::rankedForSite('mainnet', 10000);
+    $ranked = SwapProviderFactory::rankedForStore(AUTOSEL_STORE, 'mainnet', 10000);
     $order = array_map(fn($r) => $r['provider']->getName(), $ranked);
     tassert($order === ['a', 'b'], 'all-quotes-failed returns priority order intact', $failures);
     tassert($ranked[0]['quote'] === null && $ranked[1]['quote'] === null,
@@ -201,10 +210,10 @@ Database::initialize();
     $normal     = new QuoteMockProvider('normal',
         new SwapPairInfo(1.0, 0, 0, 1000, 5_000_000, 'h2'));
     SwapProviderFactory::setRegistry(['smallrange' => $smallrange, 'normal' => $normal]);
-    SwapsConfig::setProviderOrder(['smallrange', 'normal']);
-    SwapsConfig::setAutoSelectCheapest(true);
+    SwapsConfig::setStoreProviderOrder(AUTOSEL_STORE, ['smallrange', 'normal']);
+    SwapsConfig::setStoreAutoSelectCheapest(AUTOSEL_STORE, true);
 
-    $ranked = SwapProviderFactory::rankedForSite('mainnet', 10000);
+    $ranked = SwapProviderFactory::rankedForStore(AUTOSEL_STORE, 'mainnet', 10000);
     $order = array_map(fn($r) => $r['provider']->getName(), $ranked);
     tassert($order === ['normal', 'smallrange'], 'out-of-range provider falls to end', $failures);
     tassert($ranked[1]['quote'] !== null,
@@ -222,11 +231,11 @@ Database::initialize();
     $p3 = new QuoteMockProvider('p3', new SwapPairInfo(0, 89,  0, 0, 1_000_000_000, 'h3'));
     $p4 = new QuoteMockProvider('p4', new SwapPairInfo(0, 84,  0, 0, 1_000_000_000, 'h4'));
     SwapProviderFactory::setRegistry(['p1' => $p1, 'p2' => $p2, 'p3' => $p3, 'p4' => $p4]);
-    SwapsConfig::setProviderOrder(['p1', 'p2', 'p3', 'p4']);
-    SwapsConfig::setAutoSelectCheapest(true);
-    SwapsConfig::setAutoSelectThresholdPct(10);
+    SwapsConfig::setStoreProviderOrder(AUTOSEL_STORE, ['p1', 'p2', 'p3', 'p4']);
+    SwapsConfig::setStoreAutoSelectCheapest(AUTOSEL_STORE, true);
+    SwapsConfig::setStoreAutoSelectThresholdPct(AUTOSEL_STORE, 10);
 
-    $ranked = SwapProviderFactory::rankedForSite('mainnet', 0);
+    $ranked = SwapProviderFactory::rankedForStore(AUTOSEL_STORE, 'mainnet', 0);
     $order = array_map(fn($r) => $r['provider']->getName(), $ranked);
     tassert($order === ['p4', 'p3', 'p1', 'p2'],
             '4-provider recursive rule matches plan example (P4, P3, P1, P2)', $failures);
@@ -296,11 +305,6 @@ class LockupTreeMockProvider extends QuoteMockProvider {
     $cheap = new LockupTreeMockProvider('cheaplt', new SwapPairInfo(0.1, 50, 50, 1000, 5_000_000, 'h1'));
     $leader = new LockupTreeMockProvider('leadlt', new SwapPairInfo(1.0, 500, 500, 1000, 5_000_000, 'h2'));
     SwapProviderFactory::setRegistry(['leadlt' => $leader, 'cheaplt' => $cheap]);
-    SwapsConfig::setProviderOrder(['leadlt', 'cheaplt']);
-    SwapsConfig::setAutoSelectCheapest(true);
-    SwapsConfig::setAutoSelectThresholdPct(10);
-    SwapsConfig::setSiteEnabled(true);
-    SwapsConfig::setStrictNoMintFallback(true);
 
     $storeId = Database::generateId('store');
     $now = time();
@@ -313,7 +317,12 @@ class LockupTreeMockProvider extends QuoteMockProvider {
         'onchain_xpub' => 'tpubD6NzVbkrYhZ4WaWSyoBvQwbpLkojyoTZPRsgXELWz3Popb3qkjcJyJUGLnL4qHHoQvao8ESaAstxYSnhyswJ76uZPStJRJCTKvosUCJZL5B',
         'onchain_address_type' => 'P2WPKH',
         'onchain_network' => 'regtest',
+        'swaps_enabled' => SwapsConfig::FORCE_ON,
     ]);
+    SwapsConfig::setStoreProviderOrder($storeId, ['leadlt', 'cheaplt']);
+    SwapsConfig::setStoreAutoSelectCheapest($storeId, true);
+    SwapsConfig::setStoreAutoSelectThresholdPct($storeId, 10);
+    SwapsConfig::setStoreStrictOverride($storeId, SwapsConfig::FORCE_ON);
 
     $invoice = Invoice::create($storeId, ['amount' => 50_000, 'currency' => 'sat']);
     tassert($invoice['payment_rail'] === 'swap', 'invoice ended up on swap rail', $failures);
@@ -334,10 +343,8 @@ class LockupTreeMockProvider extends QuoteMockProvider {
 // ------------- audit JSON null when feature off -------------
 
 {
-    SwapsConfig::setAutoSelectCheapest(false);
     $only = new LockupTreeMockProvider('only', new SwapPairInfo(1.0, 100, 100, 1000, 5_000_000, 'h1'));
     SwapProviderFactory::setRegistry(['only' => $only]);
-    SwapsConfig::setProviderOrder(['only']);
 
     $storeId = Database::generateId('store');
     Database::insert('stores', [
@@ -349,11 +356,15 @@ class LockupTreeMockProvider extends QuoteMockProvider {
         'onchain_xpub' => 'tpubD6NzVbkrYhZ4WaWSyoBvQwbpLkojyoTZPRsgXELWz3Popb3qkjcJyJUGLnL4qHHoQvao8ESaAstxYSnhyswJ76uZPStJRJCTKvosUCJZL5B',
         'onchain_address_type' => 'P2WPKH',
         'onchain_network' => 'regtest',
+        'swaps_enabled' => SwapsConfig::FORCE_ON,
     ]);
+    SwapsConfig::setStoreAutoSelectCheapest($storeId, false);
+    SwapsConfig::setStoreProviderOrder($storeId, ['only']);
+    SwapsConfig::setStoreStrictOverride($storeId, SwapsConfig::FORCE_ON);
 
     $invoice = Invoice::create($storeId, ['amount' => 50_000, 'currency' => 'sat']);
     $attempt = Database::fetchOne("SELECT * FROM swap_attempts WHERE invoice_id = ?", [$invoice['id']]);
-    // With feature off, rankedForSite still records an audit ('auto_select_disabled')
+    // With feature off, rankedForStore still records an audit ('auto_select_disabled')
     // and threads it through — that's the right behaviour so operators can see why a
     // particular row didn't compare. We just check the shape is sane.
     $decoded = $attempt['quotes_compared_json'] ? json_decode($attempt['quotes_compared_json'], true) : null;
@@ -391,10 +402,6 @@ class OverchargeMockProvider extends LockupTreeMockProvider {
     $greedy = new OverchargeMockProvider('greedy', new SwapPairInfo(0.1, 50, 50, 1000, 5_000_000, 'h1'));
     $good   = new LockupTreeMockProvider('good',   new SwapPairInfo(0.1, 50, 50, 1000, 5_000_000, 'h2'));
     SwapProviderFactory::setRegistry(['greedy' => $greedy, 'good' => $good]);
-    SwapsConfig::setProviderOrder(['greedy', 'good']);
-    SwapsConfig::setAutoSelectCheapest(false);
-    SwapsConfig::setSiteEnabled(true);
-    SwapsConfig::setStrictNoMintFallback(true);
 
     $storeId = Database::generateId('store');
     Database::insert('stores', [
@@ -406,7 +413,11 @@ class OverchargeMockProvider extends LockupTreeMockProvider {
         'onchain_xpub' => 'tpubD6NzVbkrYhZ4WaWSyoBvQwbpLkojyoTZPRsgXELWz3Popb3qkjcJyJUGLnL4qHHoQvao8ESaAstxYSnhyswJ76uZPStJRJCTKvosUCJZL5B',
         'onchain_address_type' => 'P2WPKH',
         'onchain_network' => 'regtest',
+        'swaps_enabled' => SwapsConfig::FORCE_ON,
     ]);
+    SwapsConfig::setStoreProviderOrder($storeId, ['greedy', 'good']);
+    SwapsConfig::setStoreAutoSelectCheapest($storeId, false);
+    SwapsConfig::setStoreStrictOverride($storeId, SwapsConfig::FORCE_ON);
 
     $invoice = Invoice::create($storeId, ['amount' => 50_000, 'currency' => 'sat']);
     $attempt = Database::fetchOne("SELECT * FROM swap_attempts WHERE invoice_id = ?", [$invoice['id']]);

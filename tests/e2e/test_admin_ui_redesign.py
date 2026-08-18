@@ -2,11 +2,14 @@
   - Export Token button removed.
   - Settings + store-settings cards are collapsible (default open) and toggle.
   - On-chain "Advanced" subsection is collapsed by default.
-  - Auto-cashout column selector renders (store: 3 cols, site: 2 cols) and
-    selecting a column updates the underlying mode control.
-  - Store-settings card order (Submarine Swaps under On-chain; API Keys near
+  - Auto-cashout column selector renders (store: 2 cols — the "-1"/inherit
+    column is gone with the site-wide layer) and selecting a column updates
+    the underlying mode control.
+  - Store-settings card order (Lightning payments between Store Info and
+    Cashu automatic cashout; Submarine Swaps under On-chain; API Keys near
     the bottom).
-  - Site settings shows Email Notifications as the first card.
+  - Site settings no longer carries the removed site-wide cards (#aw-site,
+    swaps, self-serve, on-chain default) but keeps Email Notifications.
   - Stats dashboard charts render (Chart.js loads — regression guard for the
     relative-asset-path bug that left charts blank).
   - The toast container is hidden when empty (no stray floating box).
@@ -54,6 +57,11 @@ def test_store_settings_collapsible_and_order(admin_page):
     # API Keys moved to the bottom (just above Danger Zone).
     assert titles.index("API Keys") > titles.index("Hosting Fee")
     assert titles[-1] == "Danger Zone"
+    # Lightning payments (the destination-chain card) sits between Store Info
+    # and the renamed Cashu automatic cashout card.
+    assert titles.index("Lightning payments") == titles.index("Store Info") + 1
+    assert titles.index("Cashu automatic cashout") == titles.index("Lightning payments") + 1
+    assert "Auto-Cashout" not in titles
     # Submarine Swaps directly beneath On-chain Bitcoin payments.
     assert titles.index("Submarine Swaps (LN→on-chain)") == titles.index("On-chain Bitcoin payments") + 1
 
@@ -84,32 +92,41 @@ def test_auto_cashout_columns_and_selection(admin_page):
     cols = page.eval_on_selector_all(
         "#aw-store .aw-col", "els => els.map(e => e.getAttribute('data-aw-mode'))"
     )
-    assert cols == ["-1", "0", "1"]  # global / lightning / on-chain
-    # Strike link wired from STRIKE_URL config.
-    assert page.eval_on_selector("#aw-store .aw-strike-link", "el => el.href").startswith("http")
+    assert cols == ["0", "1"]  # lightning / on-chain — no "use global" column
 
-    # Selecting Lightning updates the hidden mode control + reveals the address field.
+    # Selecting Lightning updates the hidden mode control.
     page.query_selector('#aw-store .aw-col[data-aw-mode="0"]').click()
     assert page.eval_on_selector("#auto-melt-mode-override", "el => el.value") == "0"
     assert page.eval_on_selector('#aw-store .aw-col[data-aw-mode="0"]',
                                  "el => el.classList.contains('selected')")
 
 
-def test_site_settings_email_card_and_aw_site(admin_page):
+def test_site_settings_email_card_and_site_cards_removed(admin_page):
     page, base = admin_page
     _goto(page, base, "settings")
     # Cards now live inside a .settings-scroll wrapper (pinned-footer redesign),
-    # so match by descendant rather than direct child. Email Notifications is no
-    # longer the first card — Developer/Debug and the site-wide on-chain default
-    # card were added above it — so assert it is present rather than first.
+    # so match by descendant rather than direct child. Email Notifications stays
+    # (deliberately unchanged); assert it is present rather than first.
     titles = page.eval_on_selector_all(
         "#view-settings .card .card-title", "els => els.map(e => e.textContent.trim())"
     )
     assert "Email Notifications" in titles, titles
-    site_cols = page.eval_on_selector_all(
-        "#aw-site .aw-col", "els => els.map(e => e.getAttribute('data-aw-mode'))"
+    # The site-wide swaps / self-serve / on-chain-default cards (and the
+    # #aw-site auto-cashout default selector) were removed with the
+    # store-only-settings refactor: none of their ids may exist anywhere.
+    removed_ids = [
+        "aw-site", "card-swaps", "card-selfserve", "card-onchain-site",
+        "btn-save-swaps", "btn-save-selfserve", "btn-save-onchain-site",
+        "swaps-enabled", "swaps-strict", "swaps-provider-checkboxes",
+        "swaps-auto-select", "swaps-auto-threshold", "swaps-min-sats",
+        "swaps-fee-max-pct", "swaps-fee-max-sats",
+        "selfserve-enabled", "selfserve-max-sats", "onchain-site-enabled",
+        "auto-melt-use-swap-default",
+    ]
+    present = page.evaluate(
+        "ids => ids.filter(id => !!document.getElementById(id))", removed_ids
     )
-    assert site_cols == ["0", "1"]  # lightning / on-chain, no global column
+    assert present == [], f"removed site-settings ids still present: {present}"
 
 
 def test_stats_charts_render(admin_page):

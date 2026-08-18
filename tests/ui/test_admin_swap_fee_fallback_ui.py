@@ -1,16 +1,18 @@
-"""Admin UI: submarine-swap fee-too-high → mint fallback thresholds.
+"""Admin UI: the per-store submarine-swap card.
 
-Drives the admin SPA to verify the new fee-fallback fields round-trip:
-  * site-wide (Settings view): #swaps-fee-max-pct / #swaps-fee-max-sats save
-    into the config table via action=save_swap_settings.
-  * store-wide (Stores view): #store-swaps-fee-pct / #store-swaps-fee-sats save
-    into the stores columns via action=save_store_swaps.
+The store-only settings refactor removed the site-wide swaps card entirely;
+every swap setting now lives on the store card (Stores view):
+  * #store-swaps-enabled checkbox (replaces the old tri-state select),
+    provider checkboxes, auto-select controls and the strict on/off select.
+  * fee-too-high → mint-fallback thresholds: #store-swaps-fee-pct /
+    #store-swaps-fee-sats save into the stores columns via
+    action=save_store_swaps; blank inherits the config-file constant and the
+    placeholder reads "default (N)" or "off".
 
 Run with: pytest tests/ui/test_admin_swap_fee_fallback_ui.py -v -s
 """
 from __future__ import annotations
 
-import json
 import sqlite3
 
 import pytest
@@ -28,73 +30,103 @@ def _login(page, configured: ConfiguredPayserver) -> None:
     page.wait_for_selector("#app", state="visible")
 
 
-def _config_value(db_path: str, key: str):
-    with sqlite3.connect(db_path) as db:
-        row = db.execute("SELECT value FROM config WHERE key = ?", (key,)).fetchone()
-    if row is None:
-        return None
-    try:
-        return json.loads(row[0])
-    except (ValueError, TypeError):
-        return row[0]
-
-
-def test_site_fee_fallback_round_trip(configured: ConfiguredPayserver, page) -> None:
+def _open_store_swaps_card(page, configured: ConfiguredPayserver) -> None:
     _login(page, configured)
+    page.locator('.nav-item[data-view="stores"]').click()
+    page.wait_for_selector("#store-swaps-fee-pct", state="visible")
+    # Wait until refreshStoreSwapsCard() has run: the fee placeholders flip
+    # from the static markup to "default (N)" / "off" once dashboardData lands.
+    page.wait_for_function(
+        "() => { const el = document.getElementById('store-swaps-fee-pct');"
+        " return el && (el.placeholder === 'off' || el.placeholder.startsWith('default (')); }"
+    )
 
-    # Settings view holds the site-wide submarine-swap card; opening it triggers
-    # loadSwapSettings(), which renders the fee-fallback inputs.
+
+def _store_swaps_row(configured: ConfiguredPayserver) -> tuple:
+    with sqlite3.connect(configured.handle.db_path) as db:
+        return db.execute(
+            "SELECT swaps_enabled, swaps_fee_fallback_max_pct, "
+            "swaps_fee_fallback_max_sats FROM stores WHERE id = ?",
+            (configured.store_id,),
+        ).fetchone()
+
+
+def test_site_swaps_card_is_gone(configured: ConfiguredPayserver, page) -> None:
+    """The Settings view must no longer render the site-wide swaps card (or
+    the site auto-cashout default selector) under any of the old ids."""
+    _login(page, configured)
     page.locator('.nav-item[data-view="settings"]').click()
-    page.wait_for_selector("#swaps-fee-max-pct", state="visible")
+    # The Email Notifications card survives the refactor — use it as the
+    # signal that the Settings view has rendered.
+    page.wait_for_selector("#card-notifications", state="visible")
 
-    page.fill("#swaps-fee-max-pct", "7.5")
-    page.fill("#swaps-fee-max-sats", "1500")
-    page.click("#btn-save-swaps")
-    # Give the POST + toast time to land.
-    page.wait_for_timeout(2000)
+    for selector in ("#card-swaps", "#btn-save-swaps", "#swaps-enabled",
+                     "#swaps-strict", "#swaps-provider-checkboxes",
+                     "#swaps-fee-max-pct", "#swaps-fee-max-sats",
+                     "#aw-site", "#auto-melt-use-swap-default"):
+        assert page.locator(selector).count() == 0, (
+            f"{selector} should no longer exist anywhere in the admin UI"
+        )
 
-    assert _config_value(configured.handle.db_path, "swaps_fee_fallback_max_pct") == 7.5
-    assert _config_value(configured.handle.db_path, "swaps_fee_fallback_max_sats") == 1500
 
-    # Clearing a field removes the site override so it inherits the config-file
-    # value (the config key is deleted rather than set to null).
-    page.fill("#swaps-fee-max-pct", "")
-    page.click("#btn-save-swaps")
-    page.wait_for_timeout(2000)
-    assert _config_value(configured.handle.db_path, "swaps_fee_fallback_max_pct") is None
+def test_store_swaps_card_controls(configured: ConfiguredPayserver, page) -> None:
+    _open_store_swaps_card(page, configured)
+
+    # The old tri-state select is gone; the checkbox replaces it.
+    assert page.locator("#store-swaps-override").count() == 0
+    assert page.locator("#store-swaps-enabled").count() == 1
+    assert page.locator("#store-swaps-site-default").count() == 0
+    assert page.locator("#store-swaps-strict-effective").count() == 0
+
+    # New provider / auto-select controls are present; the provider list is
+    # populated from dashboardData.swaps.knownProviders.
+    assert page.locator(
+        "#store-swaps-provider-checkboxes input[type=checkbox]"
+    ).count() >= 1
+    for selector in ("#store-swaps-auto-select", "#store-swaps-auto-threshold",
+                     "#store-swaps-min-sats"):
+        assert page.locator(selector).count() == 1, selector
+
+    # Strict select is a plain on/off pair (no "-1"/inherit).
+    strict_values = page.eval_on_selector_all(
+        "#store-swaps-strict option", "opts => opts.map(o => o.value)"
+    )
+    assert strict_values == ["0", "1"], strict_values
+
+
+def test_enable_without_xpub_is_blocked(configured: ConfiguredPayserver, page) -> None:
+    """The wizard-walked store has no on-chain xpub, so turning swaps on is
+    refused client-side with an inline error and nothing is saved."""
+    _open_store_swaps_card(page, configured)
+    assert _store_swaps_row(configured)[0] == 0, "wizard turned swaps off"
+
+    # The toggle's <input> is CSS-hidden, so set it directly.
+    page.evaluate("() => { document.getElementById('store-swaps-enabled').checked = true; }")
+    page.click("#btn-save-store-swaps")
+    page.wait_for_selector("#store-swaps-error:not(.hidden)")
+    assert "xpub" in page.locator("#store-swaps-error").inner_text()
+    assert _store_swaps_row(configured)[0] == 0, "blocked save must not persist"
 
 
 def test_store_fee_fallback_round_trip(configured: ConfiguredPayserver, page) -> None:
-    _login(page, configured)
-
-    page.locator('.nav-item[data-view="stores"]').click()
-    page.wait_for_selector("#store-swaps-fee-pct", state="visible")
+    _open_store_swaps_card(page, configured)
 
     page.fill("#store-swaps-fee-pct", "3.5")
     page.fill("#store-swaps-fee-sats", "900")
     page.click("#btn-save-store-swaps")
     page.wait_for_timeout(2000)
 
-    with sqlite3.connect(configured.handle.db_path) as db:
-        row = db.execute(
-            "SELECT swaps_fee_fallback_max_pct, swaps_fee_fallback_max_sats "
-            "FROM stores WHERE id = ?",
-            (configured.store_id,),
-        ).fetchone()
+    row = _store_swaps_row(configured)
     assert row is not None
-    assert float(row[0]) == 3.5
-    assert int(row[1]) == 900
+    assert float(row[1]) == 3.5
+    assert int(row[2]) == 900
 
-    # Blanking both fields clears the per-store override (back to inherit).
+    # Blanking both fields clears the per-store values (back to the
+    # config-file default, reflected by the "default (N)"/"off" placeholder).
     page.fill("#store-swaps-fee-pct", "")
     page.fill("#store-swaps-fee-sats", "")
     page.click("#btn-save-store-swaps")
     page.wait_for_timeout(2000)
 
-    with sqlite3.connect(configured.handle.db_path) as db:
-        row = db.execute(
-            "SELECT swaps_fee_fallback_max_pct, swaps_fee_fallback_max_sats "
-            "FROM stores WHERE id = ?",
-            (configured.store_id,),
-        ).fetchone()
-    assert row[0] is None and row[1] is None
+    row = _store_swaps_row(configured)
+    assert row[1] is None and row[2] is None

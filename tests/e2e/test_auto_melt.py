@@ -31,14 +31,25 @@ def _settle_invoice(configured: ConfiguredPayserver, lnd_payer: LndHandle, amoun
 
 
 def _enable_auto_melt(configured: ConfiguredPayserver, address: str, threshold_sat: int) -> None:
+    # Destination chain and cashout toggle are separate actions now: the
+    # Lightning destination goes to save_lightning_payments, then the
+    # enable/threshold toggle to save_auto_melt (which no longer accepts or
+    # returns addresses).
+    result = configured.admin._post_action(
+        "save_lightning_payments",
+        store_id=configured.store_id,
+        address=address,
+    )
+    assert result.get("success"), result
     result = configured.admin._post_action(
         "save_auto_melt",
         store_id=configured.store_id,
-        address=address,
         enabled="1",
         threshold=str(threshold_sat),
+        mode_override="0",
     )
     assert result.get("success"), result
+    assert "addresses" not in result, result
 
 
 def _store_balance(configured: ConfiguredPayserver) -> int:

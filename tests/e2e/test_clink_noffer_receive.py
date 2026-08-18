@@ -134,15 +134,14 @@ def clink_stack(
 def _save_noffer_destination(admin: AdminClient, store_id: str, noffer: str,
                              enabled: str = "1") -> dict:
     """Configure a single noffer destination, mirroring the dashboard's
-    addresses[] chain (see test_clink_noffer.py). ``enabled`` controls the
-    auto-cashout (threshold-melt) toggle — direct-receive at invoice creation
-    must work independent of it, so tests pass enabled="0" to assert that."""
+    addresses[] chain (see test_clink_noffer.py) via save_lightning_payments,
+    then set the auto-cashout toggle via save_auto_melt. ``enabled`` controls
+    the auto-cashout (threshold-melt) toggle — direct-receive at invoice
+    creation must work independent of it, so tests pass enabled="0" to assert
+    that. Returns the save_lightning_payments body (probe results)."""
     data = [
-        ("action", "save_auto_melt"),
+        ("action", "save_lightning_payments"),
         ("store_id", store_id),
-        ("enabled", enabled),
-        ("threshold", "100"),
-        ("mode_override", "0"),
         ("addresses[]", noffer),
     ]
     r = admin.s.post(
@@ -152,6 +151,20 @@ def _save_noffer_destination(admin: AdminClient, store_id: str, noffer: str,
     assert r.status_code == 200, r.text
     body = r.json()
     assert body.get("success"), body
+
+    r = admin.s.post(
+        admin._admin_url,
+        data=[
+            ("action", "save_auto_melt"),
+            ("store_id", store_id),
+            ("enabled", enabled),
+            ("threshold", "100"),
+            ("mode_override", "0"),
+        ],
+        headers={"X-CSRF-Token": admin.csrf_token}, timeout=30,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json().get("success"), r.text
     return body
 
 

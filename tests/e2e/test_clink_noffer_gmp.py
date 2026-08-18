@@ -14,9 +14,9 @@ test_setup_onchain_gmp.py's coverage for the on-chain screens):
     that message; a Lightning address alone still saves and advances.
   - wizard save must not silently DELETE a stored noffer just because the
     disabled field didn't submit it.
-  - admin save_auto_melt: a new noffer is rejected with the actionable
-    message; noffers already stored pass through (kept or removed) so the
-    rest of the card stays editable.
+  - admin save_lightning_payments: a new noffer is rejected with the
+    actionable message; noffers already stored pass through (kept or removed)
+    so the rest of the card stays editable.
 
 The GMP-less host is simulated by starting the payserver with the gmp_*
 functions disabled (calling a disabled function raises the same Error an
@@ -189,13 +189,10 @@ def _admin_for(handle: PayserverHandle, store: str) -> tuple[AdminClient, str]:
     return admin, stores[0]["id"]
 
 
-def _save_auto_melt(admin: AdminClient, store_id: str, *, ln=(), noffers=()):
+def _save_lightning_payments(admin: AdminClient, store_id: str, *, ln=(), noffers=()):
     data = [
-        ("action", "save_auto_melt"),
+        ("action", "save_lightning_payments"),
         ("store_id", store_id),
-        ("enabled", "1"),
-        ("threshold", "100"),
-        ("mode_override", "0"),
     ]
     for a in ln:
         data.append(("ln_addresses[]", a))
@@ -212,16 +209,17 @@ def _save_auto_melt(admin: AdminClient, store_id: str, *, ln=(), noffers=()):
 def test_admin_rejects_new_noffer_without_gmp(
     gmpless_payserver: PayserverHandle,
 ) -> None:
-    """GMP-less host: save_auto_melt refuses to ADD a noffer, names php-gmp,
-    and persists nothing."""
+    """GMP-less host: save_lightning_payments refuses to ADD a noffer, names
+    php-gmp, and persists nothing."""
     admin, store_id = _admin_for(gmpless_payserver, "Admin Gate Store")
-    r = _save_auto_melt(admin, store_id, noffers=[REFERENCE_NOFFER])
+    r = _save_lightning_payments(admin, store_id, noffers=[REFERENCE_NOFFER])
     body = r.json()
     assert body.get("success") is not True, body
     assert "GMP" in (body.get("error") or ""), body
     assert _chain_rows(gmpless_payserver) == []
 
-    # The settings page itself renders the section gated.
+    # The settings page itself renders the section gated (the noffer group
+    # now lives in the "Lightning payments" card).
     page = admin.s.get(admin._admin_url, timeout=15).text
     assert 'id="auto-melt-noffer-group"' in page
     assert "data-env-error" in page
@@ -238,7 +236,7 @@ def test_admin_keeps_and_removes_stored_noffers_without_gmp(
     _seed_noffer(gmpless_payserver, REFERENCE_NOFFER)
 
     # Re-saving the same chain (what the greyed-out UI submits) is allowed.
-    r = _save_auto_melt(admin, store_id, ln=["keep@example.test"], noffers=[REFERENCE_NOFFER])
+    r = _save_lightning_payments(admin, store_id, ln=["keep@example.test"], noffers=[REFERENCE_NOFFER])
     assert r.json().get("success") is True, r.text
     rows = _chain_rows(gmpless_payserver)
     assert [(r["address"], r["type"]) for r in rows] == [
@@ -247,7 +245,7 @@ def test_admin_keeps_and_removes_stored_noffers_without_gmp(
     ]
 
     # Removing it is allowed too.
-    r = _save_auto_melt(admin, store_id, ln=["keep@example.test"])
+    r = _save_lightning_payments(admin, store_id, ln=["keep@example.test"])
     assert r.json().get("success") is True, r.text
     rows = _chain_rows(gmpless_payserver)
     assert [(r["address"], r["type"]) for r in rows] == [("keep@example.test", "lnaddress")]

@@ -3,33 +3,29 @@
 Covers the customer-facing surface:
   - When self-serve is disabled (the default) the page 404s, so store IDs and
     the feature itself aren't discoverable.
-  - When enabled site-wide, the form renders and a customer can create + be
-    redirected to a real, payable invoice.
+  - When enabled for the store, the form renders and a customer can create +
+    be redirected to a real, payable invoice.
   - Untrusted input is enforced: an amount above the per-store maximum is
     rejected with a clear error instead of creating an oversized invoice.
 
-The enable toggle + max are seeded directly in the DB (the same shape Config /
-SelfServe write) to keep the test focused on the public page rather than the
-admin UI; the resolution + validation logic itself is unit-tested in
-tests/php/test_selfserve_resolution.php and test_selfserve_validation.php.
+Self-serve is store-only: the enable toggle + max are seeded directly on the
+stores row (the same columns SelfServe writes) to keep the test focused on the
+public page rather than the admin UI; the resolution + validation logic itself
+is unit-tested in tests/php/test_selfserve_resolution.php and
+test_selfserve_validation.php.
 """
 from __future__ import annotations
-
-import json
-import time
 
 import requests
 
 from conftest import ConfiguredPayserver, DEFAULT_ADMIN_PASSWORD
 
 
-def _enable_site_selfserve(configured: ConfiguredPayserver, enabled: bool = True) -> None:
-    now = int(time.time())
+def _enable_store_selfserve(configured: ConfiguredPayserver, enabled: bool = True) -> None:
     with configured.handle.db() as db:
         db.execute(
-            "INSERT INTO config (key, value, created_at, updated_at) VALUES (?, ?, ?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-            ("selfserve_enabled", json.dumps(enabled), now, now),
+            "UPDATE stores SET selfserve_enabled = ? WHERE id = ?",
+            (1 if enabled else 0, configured.store_id),
         )
 
 
@@ -58,7 +54,7 @@ def test_pay_page_404_when_disabled(configured: ConfiguredPayserver) -> None:
 
 
 def test_pay_page_404_unknown_store(configured: ConfiguredPayserver) -> None:
-    _enable_site_selfserve(configured)
+    _enable_store_selfserve(configured)
     r = requests.get(
         f"{configured.handle.url}/pay/store_does_not_exist", timeout=15, allow_redirects=False
     )
@@ -66,7 +62,7 @@ def test_pay_page_404_unknown_store(configured: ConfiguredPayserver) -> None:
 
 
 def test_pay_page_renders_when_enabled(configured: ConfiguredPayserver) -> None:
-    _enable_site_selfserve(configured)
+    _enable_store_selfserve(configured)
     r = requests.get(f"{configured.handle.url}/pay/{configured.store_id}", timeout=15)
     assert r.status_code == 200, r.text
     assert "Continue to payment" in r.text
@@ -79,7 +75,7 @@ def test_pay_page_defaults_to_store_currency(
 ) -> None:
     # A fiat store offers [sat, USD]; the selector must pre-select the store's
     # default display currency (USD), not sat.
-    _enable_site_selfserve(configured)
+    _enable_store_selfserve(configured)
     _set_store_currency(configured, "USD")
     ctx = browser.new_context(viewport={"width": 480, "height": 900})
     page = ctx.new_page()
@@ -96,7 +92,7 @@ def test_pay_page_defaults_to_store_currency(
 
 
 def test_over_max_amount_rejected(configured: ConfiguredPayserver) -> None:
-    _enable_site_selfserve(configured)
+    _enable_store_selfserve(configured)
     _set_store_max(configured, 1000)
     # Post an amount above the per-store cap; expect the form back with an error
     # and NO redirect to a created invoice.
@@ -112,7 +108,7 @@ def test_over_max_amount_rejected(configured: ConfiguredPayserver) -> None:
 
 
 def test_create_and_redirect_to_payment(configured: ConfiguredPayserver, browser) -> None:
-    _enable_site_selfserve(configured)
+    _enable_store_selfserve(configured)
     ctx = browser.new_context(viewport={"width": 480, "height": 900})
     page = ctx.new_page()
     try:
@@ -145,7 +141,7 @@ def test_create_and_redirect_to_payment(configured: ConfiguredPayserver, browser
 def test_admin_invoices_view_shows_selfserve_link(configured: ConfiguredPayserver, browser) -> None:
     # When self-serve is on for the store, the Invoices view surfaces a banner
     # with the public link so operators can discover + share it.
-    _enable_site_selfserve(configured)
+    _enable_store_selfserve(configured)
     ctx = browser.new_context(viewport={"width": 1280, "height": 900})
     ctx.request.post(
         f"{configured.handle.url}/admin",
@@ -168,7 +164,7 @@ def test_store_settings_info_no_unit_and_selfserve_link(
 ) -> None:
     # The store-info block drops the always-"sat" Unit row and, when self-serve
     # is effectively on, surfaces the public link with a Copy button.
-    _enable_site_selfserve(configured)
+    _enable_store_selfserve(configured)
     ctx = browser.new_context(viewport={"width": 1280, "height": 900})
     ctx.request.post(
         f"{configured.handle.url}/admin",
@@ -186,7 +182,7 @@ def test_store_settings_info_no_unit_and_selfserve_link(
         # The Unit row is gone entirely (element removed, not just hidden).
         assert page.locator("#store-settings-unit").count() == 0, "Unit row should be removed"
 
-        # Self-serve is inherited-on for a payment-capable store → link visible.
+        # Self-serve is on for this payment-capable store → link visible.
         row = page.locator("#store-info-selfserve-row")
         assert row.is_visible(), "self-serve link row should show when enabled"
         link = page.locator("#store-info-selfserve-link").input_value()
@@ -199,9 +195,9 @@ def test_store_settings_info_no_unit_and_selfserve_link(
 def test_store_settings_info_hides_selfserve_link_when_off(
     configured: ConfiguredPayserver, browser
 ) -> None:
-    # With self-serve disabled site-wide (the default) and no override, the
-    # info-grid link row stays hidden.
-    _enable_site_selfserve(configured, enabled=False)
+    # With self-serve off for the store (the default), the info-grid link row
+    # stays hidden.
+    _enable_store_selfserve(configured, enabled=False)
     ctx = browser.new_context(viewport={"width": 1280, "height": 900})
     ctx.request.post(
         f"{configured.handle.url}/admin",
@@ -229,30 +225,50 @@ def _login_page(configured: ConfiguredPayserver, browser):
     return ctx, ctx.new_page()
 
 
-def test_admin_save_global_selfserve_shows_success(
+def _store_selfserve_flag(configured: ConfiguredPayserver) -> int:
+    with configured.handle.db() as db:
+        row = db.execute(
+            "SELECT selfserve_enabled FROM stores WHERE id = ?",
+            (configured.store_id,),
+        ).fetchone()
+    return row["selfserve_enabled"]
+
+
+def test_site_selfserve_card_gone_and_store_card_round_trips(
     configured: ConfiguredPayserver, browser
 ) -> None:
-    # Regression: the save handlers used to call a non-existent loadDashboard*()
-    # in their success branch, so the ReferenceError was swallowed by the same
-    # try/catch and the user saw "Failed to save self-serve settings" even though
-    # the server returned {"success":true} and the setting persisted. Drive the
-    # real button and assert the SUCCESS toast wins (not the error toast).
+    # Self-serve became store-only: the site-wide card was removed from
+    # /admin/settings, and the per-store card is now the only toggle. Assert
+    # the old card really is gone, then round-trip the store card: flip the
+    # select (values "0"/"1", posted to save_store_selfserve as `enabled`) to
+    # "1", save, confirm the toast + the persisted stores row, then back to "0".
     ctx, page = _login_page(configured, browser)
     try:
         page.goto(f"{configured.handle.url}/admin/settings", wait_until="networkidle")
-        # The global-save refresh path is gated on a selected store; loading the
-        # dashboard auto-selects one, matching what an operator sees.
+        assert page.locator("#card-selfserve").count() == 0, "site self-serve card must be gone"
+        assert page.locator("#btn-save-selfserve").count() == 0
+        assert page.locator("#selfserve-enabled").count() == 0
+
+        page.goto(f"{configured.handle.url}/admin/stores", wait_until="networkidle")
         page.evaluate("async () => { await loadDashboard(); }")
+        page.wait_for_timeout(300)
         assert page.evaluate("currentStoreId") is not None, "a store should be selected"
 
-        page.click("#btn-save-selfserve")
-        # Let the (previously throwing) success branch settle so we read the
-        # final, stable toast rather than the momentary one.
+        # The configured store has a mint, so it is payment-capable and the
+        # enable path is legal both client- and server-side.
+        page.select_option("#store-selfserve-override", "1")
+        page.click("#btn-save-store-selfserve")
         page.wait_for_timeout(1000)
         toast_text = page.text_content("#toast")
         toast_class = page.get_attribute("#toast", "class") or ""
-        assert toast_text == "Self-serve settings saved!", toast_text
+        assert toast_text == "Store self-serve setting saved", toast_text
         assert "error" not in toast_class.split(), toast_class
+        assert _store_selfserve_flag(configured) == 1, "enable must persist on the stores row"
+
+        page.select_option("#store-selfserve-override", "0")
+        page.click("#btn-save-store-selfserve")
+        page.wait_for_timeout(1000)
+        assert _store_selfserve_flag(configured) == 0, "disable must persist on the stores row"
     finally:
         ctx.close()
 

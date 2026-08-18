@@ -3,8 +3,8 @@
  * Fee-too-high → mint fallback: threshold comparison + three-layer resolution.
  *
  * Covers SwapsConfig::swapFeeExceedsThreshold() (OR semantics, strict
- * greater-than, 0 disables a check) and the config-file → site → store
- * precedence in feeFallbackMaxPct/Sats + effectiveFeeFallbackForStore.
+ * greater-than, 0 disables a check) and the config-file → store precedence
+ * in effectiveFeeFallbackForStore (there is no site layer any more).
  *
  * The config-file layer is exercised by defining the constants below before
  * the config module loads (each test runs in its own PHP subprocess, so this
@@ -94,32 +94,12 @@ tassert(
     'zero target with pct cap does not trip'
 );
 
-// ---- Site layer inherits the config-file constant when unset ---------------
+// ---- Config-file constants are the base layer ------------------------------
 
-tassert(SwapsConfig::feeFallbackMaxPct() === 5.0, 'site pct inherits config-file default');
-tassert(SwapsConfig::feeFallbackMaxSats() === 2000, 'site sats inherits config-file default');
+tassert(SwapsConfig::configFileFeeFallbackMaxPct() === 5.0, 'config-file pct read');
+tassert(SwapsConfig::configFileFeeFallbackMaxSats() === 2000, 'config-file sats read');
 
-// Setting a site value overrides the config-file constant.
-SwapsConfig::setFeeFallbackMaxPct(8.0);
-SwapsConfig::setFeeFallbackMaxSats(750);
-tassert(SwapsConfig::feeFallbackMaxPct() === 8.0, 'site pct override wins over config-file');
-tassert(SwapsConfig::feeFallbackMaxSats() === 750, 'site sats override wins over config-file');
-
-// An explicit 0 at the site means "disabled", distinct from "inherit".
-SwapsConfig::setFeeFallbackMaxPct(0.0);
-tassert(SwapsConfig::feeFallbackMaxPct() === 0.0, 'site pct explicit 0 disables (not inherit)');
-
-// Clearing (null) restores inheritance of the config-file constant.
-SwapsConfig::setFeeFallbackMaxPct(null);
-SwapsConfig::setFeeFallbackMaxSats(null);
-tassert(SwapsConfig::feeFallbackMaxPct() === 5.0, 'clearing site pct re-inherits config-file');
-tassert(SwapsConfig::feeFallbackMaxSats() === 2000, 'clearing site sats re-inherits config-file');
-
-// ---- Store layer overrides site, NULL inherits -----------------------------
-
-// Re-establish a known site value to test store precedence against.
-SwapsConfig::setFeeFallbackMaxPct(8.0);
-SwapsConfig::setFeeFallbackMaxSats(750);
+// ---- Store layer overrides the config-file constant, NULL inherits ---------
 
 $storeId = 'store_feefallback_test';
 Database::insert('stores', [
@@ -131,29 +111,29 @@ Database::insert('stores', [
     'created_at' => time(),
 ]);
 
-// No per-store override yet → inherits the site values.
+// No per-store value yet → inherits the config-file constants.
 $eff = SwapsConfig::effectiveFeeFallbackForStore($storeId);
-tassert($eff['pct'] === 8.0 && $eff['sats'] === 750, 'store with no override inherits site');
+tassert($eff['pct'] === 5.0 && $eff['sats'] === 2000, 'store with no value inherits config-file');
 
-// Set both per-store overrides → they win.
+// Set both per-store values → they win.
 SwapsConfig::setStoreFeeFallback($storeId, 3.5, 1200);
 $eff = SwapsConfig::effectiveFeeFallbackForStore($storeId);
-tassert($eff['pct'] === 3.5 && $eff['sats'] === 1200, 'store override wins over site');
+tassert($eff['pct'] === 3.5 && $eff['sats'] === 1200, 'store value wins over config-file');
 
-// Override only the percent (sats null) → pct from store, sats from site.
+// Set only the percent (sats null) → pct from store, sats from config-file.
 SwapsConfig::setStoreFeeFallback($storeId, 2.0, null);
 $eff = SwapsConfig::effectiveFeeFallbackForStore($storeId);
-tassert($eff['pct'] === 2.0 && $eff['sats'] === 750, 'mixed: store pct + inherited site sats');
+tassert($eff['pct'] === 2.0 && $eff['sats'] === 2000, 'mixed: store pct + inherited config-file sats');
 
 // A per-store explicit 0 disables that check for the store (distinct from null).
 SwapsConfig::setStoreFeeFallback($storeId, 0.0, 0);
 $eff = SwapsConfig::effectiveFeeFallbackForStore($storeId);
 tassert($eff['pct'] === 0.0 && $eff['sats'] === 0, 'store explicit 0 disables (not inherit)');
 
-// Clearing both → back to inheriting site.
+// Clearing both → back to inheriting the config-file constants.
 SwapsConfig::setStoreFeeFallback($storeId, null, null);
 $eff = SwapsConfig::effectiveFeeFallbackForStore($storeId);
-tassert($eff['pct'] === 8.0 && $eff['sats'] === 750, 'clearing store override re-inherits site');
+tassert($eff['pct'] === 5.0 && $eff['sats'] === 2000, 'clearing store values re-inherits config-file');
 
 echo "\n{$total} checks, {$failures} failed\n";
 exit($failures === 0 ? 0 : 1);

@@ -63,12 +63,11 @@ def _settle_mint_invoice(configured: ConfiguredPayserver, lnd_payer: LndHandle, 
 
 
 def _save_nwc_destination(admin: AdminClient, store_id: str, uri: str) -> dict:
+    # Destination chain first (save_lightning_payments carries the probe
+    # results), then the cashout toggle via save_auto_melt.
     data = [
-        ("action", "save_auto_melt"),
+        ("action", "save_lightning_payments"),
         ("store_id", store_id),
-        ("enabled", "1"),
-        ("threshold", "100"),
-        ("mode_override", "0"),
         ("nwc[]", uri),
     ]
     r = admin.s.post(
@@ -79,6 +78,20 @@ def _save_nwc_destination(admin: AdminClient, store_id: str, uri: str) -> dict:
     body = r.json()
     assert body.get("success"), body
     assert (body.get("addresses") or [])[0]["type"] == "nwc", body
+
+    r = admin.s.post(
+        admin._admin_url,
+        data=[
+            ("action", "save_auto_melt"),
+            ("store_id", store_id),
+            ("enabled", "1"),
+            ("threshold", "100"),
+            ("mode_override", "0"),
+        ],
+        headers={"X-CSRF-Token": admin.csrf_token}, timeout=60,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json().get("success"), r.text
     return body
 
 

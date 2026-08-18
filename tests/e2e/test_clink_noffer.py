@@ -1,9 +1,10 @@
 """CLINK noffer admin configuration e2e.
 
-Verifies that an operator can add a CLINK noffer to a store's auto-cashout
+Verifies that an operator can add a CLINK noffer to a store's Lightning
 destination chain "the same way they add LNURLs" — pasted into the same
-addresses list — and that it is auto-detected, validated, and persisted with
-type='noffer' alongside Lightning addresses in priority order.
+addresses list, saved via the save_lightning_payments action — and that it is
+auto-detected, validated, and persisted with type='noffer' alongside Lightning
+addresses in priority order.
 
 This covers the admin/config surface without needing a live Nostr relay or
 merchant service (those paths are exercised by the PHP round-trip suite against
@@ -25,15 +26,12 @@ REFERENCE_NOFFER = (
 )
 
 
-def _post_auto_melt(admin: AdminClient, store_id: str, addresses: list[str]) -> "object":
-    """Post save_auto_melt with an ordered addresses[] chain (mixed types),
-    mirroring the dashboard. Returns the raw requests.Response."""
+def _post_lightning_payments(admin: AdminClient, store_id: str, addresses: list[str]) -> "object":
+    """Post save_lightning_payments with an ordered addresses[] chain (mixed
+    types), mirroring the dashboard. Returns the raw requests.Response."""
     data = [
-        ("action", "save_auto_melt"),
+        ("action", "save_lightning_payments"),
         ("store_id", store_id),
-        ("enabled", "1"),
-        ("threshold", "100"),
-        ("mode_override", "0"),
     ]
     for a in addresses:
         data.append(("addresses[]", a))
@@ -66,7 +64,7 @@ def test_noffer_added_to_chain_and_persisted(
     store_id = configured.store_id
 
     # noffer first, Lightning address as fallback — mixed, ordered chain.
-    r = _post_auto_melt(admin, store_id, [REFERENCE_NOFFER, "fallback@example.test"])
+    r = _post_lightning_payments(admin, store_id, [REFERENCE_NOFFER, "fallback@example.test"])
     assert r.status_code == 200, r.text
     body = r.json()
     assert body.get("success"), body
@@ -93,6 +91,6 @@ def test_invalid_noffer_rejected(configured: ConfiguredPayserver) -> None:
     # A noffer-shaped but undecodable string fails validation. (Auto-detection
     # only classifies a value as a noffer when it fully decodes, so a broken one
     # is rejected as an invalid destination rather than silently accepted.)
-    r = _post_auto_melt(admin, store_id, [REFERENCE_NOFFER[:-4] + "zzzz"])
+    r = _post_lightning_payments(admin, store_id, [REFERENCE_NOFFER[:-4] + "zzzz"])
     assert r.status_code == 400, r.text
     assert r.json().get("error"), r.text

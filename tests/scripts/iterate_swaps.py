@@ -205,9 +205,10 @@ def setup_payserver_with_stores(workdir: Path, vpub: str, mint_url: str,
                                   boltz_api_url: str) -> MultiStorePayserver:
     """Set up cashupayserver with the four-store layout described in the
     module docstring. All stores share the given vpub; swap stores have
-    swaps_enabled tri-state set to FORCE_ON (1), non-swap stores set to
-    FORCE_OFF (0). Site-wide strict-no-mint-fallback is on so the swap
-    stores can't quietly degrade to mint.
+    stores.swaps_enabled set to FORCE_ON (1), non-swap stores set to
+    FORCE_OFF (0). Swap settings are store-only now, so every store carries
+    its own boltz-only provider order and strict-no-mint-fallback flag
+    (strict on, so the swap stores can't quietly degrade to mint).
 
     Uses direct DB seeding rather than walking the Playwright wizard.
     """
@@ -233,11 +234,14 @@ def setup_payserver_with_stores(workdir: Path, vpub: str, mint_url: str,
         seed_phrase = swap_stack._php_eval(
             data_dir, "echo \\Cashu\\Mnemonic::generate();"
         ).strip()
-        # Swap-rail stores use tri-state 1 (force on); non-swap = 0 (force off).
-        swaps_enabled_tri = 1 if cfg["swaps_force_on"] else 0
+        # Swap-rail stores get swaps_enabled=1; non-swap = 0. Provider order
+        # + strict flag are per-store columns now (boltz only; strict on so
+        # a swap store errors rather than quietly falling back to the mint).
+        swaps_enabled_flag = 1 if cfg["swaps_force_on"] else 0
         store_inserts.append((
             sid, cfg["name"], mint_url, seed_phrase, now, vpub,
-            cfg["min_confs"], swaps_enabled_tri, token_internal,
+            cfg["min_confs"], swaps_enabled_flag, json.dumps(["boltz"]), 1,
+            token_internal,
         ))
         api_key_inserts.append(("key_" + uuid.uuid4().hex[:12],
                                 hashlib.sha256(token_public.encode()).hexdigest(),
@@ -256,12 +260,9 @@ def setup_payserver_with_stores(workdir: Path, vpub: str, mint_url: str,
         kvs = [
             ("setup_complete", json.dumps(True)),
             ("url_mode", json.dumps("direct")),
-            ("swaps_enabled", json.dumps(True)),
-            ("swaps_provider_order", json.dumps(["boltz"])),
-            # Strict: when a swap-rail store can't create a swap (boltz
-            # unreachable or amount out of range), invoice creation errors
-            # rather than silently falling back to the cashu mint.
-            ("swaps_strict_no_mint_fallback", json.dumps(True)),
+            # swaps_boltz_regtest_url is still a live config key (dev/test
+            # knob); the enable/provider/strict settings moved to per-store
+            # columns seeded in the store rows below.
             ("swaps_boltz_regtest_url", json.dumps(boltz_api_url)),
             ("cron_key", json.dumps("dev-cron-key")),
         ]
@@ -280,8 +281,9 @@ def setup_payserver_with_stores(workdir: Path, vpub: str, mint_url: str,
             cur.execute(
                 "INSERT INTO stores (id, name, mint_url, mint_unit, default_currency, "
                 "seed_phrase, created_at, onchain_xpub, onchain_address_type, "
-                "onchain_network, onchain_min_confs, swaps_enabled, internal_api_key) VALUES "
-                "(?, ?, ?, 'sat', 'sat', ?, ?, ?, 'P2WPKH', 'regtest', ?, ?, ?)",
+                "onchain_network, onchain_min_confs, swaps_enabled, "
+                "swaps_provider_order, strict_no_mint_fallback, internal_api_key) VALUES "
+                "(?, ?, ?, 'sat', 'sat', ?, ?, ?, 'P2WPKH', 'regtest', ?, ?, ?, ?, ?)",
                 row,
             )
         for row in api_key_inserts:
