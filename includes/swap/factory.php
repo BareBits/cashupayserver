@@ -5,7 +5,7 @@
  * Adding a new provider means:
  *   1. Implement SwapProvider (typically by extending BoltzLikeProvider).
  *   2. Add the name → class entry to {@see REGISTRY} below.
- *   3. The site config swaps_provider_order can now include the new name.
+ *   3. The per-store swaps_provider_order can now include the new name.
  */
 
 require_once __DIR__ . '/provider.php';
@@ -38,16 +38,17 @@ final class SwapProviderFactory {
     }
 
     /**
-     * Build all configured providers in preference order. Unknown names in
-     * the configured order are silently skipped (so misconfiguration doesn't
-     * brick invoice creation).
+     * Build the store's configured providers in preference order (null
+     * storeId → built-in default order). Unknown names in the configured
+     * order are silently skipped (so misconfiguration doesn't brick invoice
+     * creation).
      *
      * @return SwapProvider[]
      */
-    public static function orderedForSite(): array {
+    public static function orderedForStore(?string $storeId): array {
         $out = [];
         $reg = self::registry();
-        foreach (SwapsConfig::providerOrder() as $name) {
+        foreach (SwapsConfig::providerOrderForStore($storeId) as $name) {
             $entry = $reg[$name] ?? null;
             if ($entry === null) continue;
             $out[] = is_object($entry) ? $entry : new $entry();
@@ -89,23 +90,23 @@ final class SwapProviderFactory {
      *
      * @return array<int, array{provider: SwapProvider, quote: ?SwapPairInfo}>
      */
-    public static function rankedForSite(string $network, int $targetSats): array {
+    public static function rankedForStore(?string $storeId, string $network, int $targetSats): array {
         SwapQuoteFetcher::resetAudit();
-        $priorityList = self::orderedForSite();
+        $priorityList = self::orderedForStore($storeId);
         if (!$priorityList) return [];
 
-        if (!SwapsConfig::autoSelectCheapest()) {
+        if (!SwapsConfig::autoSelectCheapestForStore($storeId)) {
             SwapQuoteFetcher::annotateAudit([
                 'reason'        => 'auto_select_disabled',
                 'target_sats'   => $targetSats,
                 'ranked_order'  => array_map(fn($p) => $p->getName(), $priorityList),
                 'chosen'        => $priorityList[0]->getName(),
-                'threshold_pct' => SwapsConfig::autoSelectThresholdPct(),
+                'threshold_pct' => SwapsConfig::autoSelectThresholdPctForStore($storeId),
             ]);
             return array_map(fn($p) => ['provider' => $p, 'quote' => null], $priorityList);
         }
 
-        $threshold = SwapsConfig::autoSelectThresholdPct();
+        $threshold = SwapsConfig::autoSelectThresholdPctForStore($storeId);
         $quotes = SwapQuoteFetcher::fetchAll($priorityList, $network, 5);
 
         // Build candidate set: only reachable providers whose target is in range.

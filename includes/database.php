@@ -250,10 +250,9 @@ HTACCESS;
             -- (config key newsletter_default_checked); 0/1 = force unchecked/checked.
             newsletter_default_checked INTEGER DEFAULT NULL,
             -- Self-serve invoices (public, unauthenticated /pay/{storeId} page).
-            -- selfserve_enabled is a tri-state override: -1 inherit the site
-            -- default (config key selfserve_enabled), 0 force off, 1 force on.
-            -- selfserve_max_sats overrides the site-wide per-invoice max in sats
-            -- (NULL = inherit config key selfserve_max_sats).
+            -- selfserve_enabled: 0 off / 1 on (legacy -1 rows resolve to off).
+            -- selfserve_max_sats caps a single invoice in sats (NULL = the
+            -- built-in default, SelfServe::DEFAULT_MAX_SATS).
             selfserve_enabled INTEGER NOT NULL DEFAULT -1,
             selfserve_max_sats INTEGER DEFAULT NULL,
             -- Invoice privacy. Per-store defaults for whether the store name and
@@ -495,8 +494,8 @@ HTACCESS;
         // Whether the on-chain rail is OFFERED to customers, independent of
         // whether an xpub/static address is CONFIGURED. Lets a merchant keep an
         // xpub (needed for submarine-swap claims) while presenting a
-        // Lightning-only checkout. Tri-state: -1 inherit the site default
-        // (config key onchain_payments_enabled), 0 force off, 1 force on.
+        // Lightning-only checkout. 0 off / 1 on; NULL and legacy -1 rows
+        // resolve to on (the historical default).
         if (!self::columnExists($pdo, 'stores', 'onchain_offer_enabled')) {
             $pdo->exec("ALTER TABLE stores ADD COLUMN onchain_offer_enabled INTEGER NOT NULL DEFAULT -1");
         }
@@ -897,31 +896,48 @@ HTACCESS;
 
         // Submarine swaps (LN→on-chain via Boltz/Zeus). Replaces the cashu
         // mint in the LN invoice flow with a non-custodial swap that settles
-        // directly to the merchant's xpub. Feature is off by default; site-
-        // wide and per-store toggles control activation.
+        // directly to the merchant's xpub. All swap settings are per-store;
+        // the historical -1 default meant "inherit the (removed) site-wide
+        // default" and now resolves to each setting's built-in default.
         if (!self::columnExists($pdo, 'stores', 'swaps_enabled')) {
-            // Tri-state: -1 inherit site default, 0 force off, 1 force on.
+            // 0 off / 1 on; legacy -1 rows resolve to off.
             $pdo->exec("ALTER TABLE stores ADD COLUMN swaps_enabled INTEGER NOT NULL DEFAULT -1");
         }
         // Fee-too-high → mint fallback thresholds. When a store has a cashu
         // mint enabled, a prospective swap whose total cost exceeds either
         // threshold is skipped in favour of a mint-issued LN invoice. NULL on
-        // either column = inherit the site-wide / config-file value. Nullable
-        // with no default so behaviour is unchanged until an operator opts in.
+        // either column = inherit the config-file value. Nullable with no
+        // default so behaviour is unchanged until an operator opts in.
         if (!self::columnExists($pdo, 'stores', 'swaps_fee_fallback_max_pct')) {
             $pdo->exec("ALTER TABLE stores ADD COLUMN swaps_fee_fallback_max_pct REAL DEFAULT NULL");
         }
         if (!self::columnExists($pdo, 'stores', 'swaps_fee_fallback_max_sats')) {
             $pdo->exec("ALTER TABLE stores ADD COLUMN swaps_fee_fallback_max_sats INTEGER DEFAULT NULL");
         }
-        // Per-store "never fall back to a cashu mint" override. The onboarding
+        // Per-store "never fall back to a cashu mint" flag. The onboarding
         // wizard sets this to 1 when the operator declines mints, so a store
         // that was set up mint-free errors instead of silently acquiring a mint
-        // rail later (e.g. from the trusted-mints list). Tri-state mirrors
-        // swaps_enabled: -1 inherit the site-wide swaps_strict_no_mint_fallback
-        // config key, 0 force off, 1 force on.
+        // rail later (e.g. from the trusted-mints list). 0 off / 1 strict;
+        // legacy -1 rows resolve to off (mint fallback allowed).
         if (!self::columnExists($pdo, 'stores', 'strict_no_mint_fallback')) {
             $pdo->exec("ALTER TABLE stores ADD COLUMN strict_no_mint_fallback INTEGER NOT NULL DEFAULT -1");
+        }
+        // Per-store swap-provider preferences (formerly site-wide config
+        // keys). NULL = the built-in default for each: provider order
+        // ["zeus","boltz"], auto-select-cheapest on, threshold 10%, no local
+        // minimum-target floor.
+        if (!self::columnExists($pdo, 'stores', 'swaps_provider_order')) {
+            // JSON array of lowercase provider names in preference order.
+            $pdo->exec("ALTER TABLE stores ADD COLUMN swaps_provider_order TEXT DEFAULT NULL");
+        }
+        if (!self::columnExists($pdo, 'stores', 'swaps_auto_select_cheapest')) {
+            $pdo->exec("ALTER TABLE stores ADD COLUMN swaps_auto_select_cheapest INTEGER DEFAULT NULL");
+        }
+        if (!self::columnExists($pdo, 'stores', 'swaps_auto_select_threshold_pct')) {
+            $pdo->exec("ALTER TABLE stores ADD COLUMN swaps_auto_select_threshold_pct INTEGER DEFAULT NULL");
+        }
+        if (!self::columnExists($pdo, 'stores', 'swaps_minimum_target_sats')) {
+            $pdo->exec("ALTER TABLE stores ADD COLUMN swaps_minimum_target_sats INTEGER DEFAULT NULL");
         }
         if (!self::columnExists($pdo, 'invoices', 'payment_rail')) {
             // 'mint' (cashu mint, existing default) / 'swap' (submarine swap) /
@@ -1009,9 +1025,8 @@ HTACCESS;
 
         // Auto-melt via submarine swap: a per-store opt-in that replaces
         // Lightning-address auto-melt with an on-chain sweep over the
-        // existing reverse-swap infrastructure. Tri-state matches the
-        // swaps_enabled override convention: -1 inherit site default,
-        // 0 force lightning, 1 force swap.
+        // existing reverse-swap infrastructure. 0 lightning / 1 swap;
+        // legacy -1 rows resolve to lightning.
         if (!self::columnExists($pdo, 'stores', 'auto_melt_use_swap')) {
             $pdo->exec("ALTER TABLE stores ADD COLUMN auto_melt_use_swap INTEGER NOT NULL DEFAULT -1");
         }

@@ -2,7 +2,7 @@
 /**
  * Parallel quote fetcher for submarine-swap providers.
  *
- * Used by SwapProviderFactory::rankedForSite() when the auto-select-cheapest
+ * Used by SwapProviderFactory::rankedForStore() when the auto-select-cheapest
  * feature is enabled. Fetches /v2/swap/reverse from every Boltz-like provider
  * in parallel via curl_multi, with a graceful sequential fallback for any
  * provider that does not extend BoltzLikeProvider (e.g. mock providers in
@@ -237,7 +237,7 @@ final class SwapQuoteFetcher {
     }
 
     /**
-     * Caller hook (SwapProviderFactory::rankedForSite) to record the ranking
+     * Caller hook (SwapProviderFactory::rankedForStore) to record the ranking
      * decision into the audit trail before it gets persisted.
      */
     public static function annotateAudit(array $extra): void {

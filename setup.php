@@ -608,13 +608,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $storeId,
                     $swapsWanted ? SwapsConfig::FORCE_ON : SwapsConfig::FORCE_OFF
                 );
-                // On a first run also flip the site default, so stores added
-                // later inherit the operator's answer instead of the built-in
-                // off. add_store leaves the site setting alone — the operator
-                // is answering for one store, not re-deciding for the install.
-                if ($mode !== 'add_store' && $swapsWanted) {
-                    SwapsConfig::setSiteEnabled(true);
-                }
                 $step = SetupFlow::nextStep('swaps', $flowSteps) ?? 'mints';
                 break;
 

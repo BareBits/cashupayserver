@@ -267,9 +267,12 @@ if (isset($_GET['api'])) {
             $store = Config::getStore($storeId);
             require_once __DIR__ . '/includes/swap/auto_melt.php';
             $autoMeltMode = SwapAutoMelt::modeForStore($store);
-            $autoMeltUseSwap = isset($store['auto_melt_use_swap'])
-                ? (int)$store['auto_melt_use_swap']
-                : SwapAutoMelt::INHERIT;
+            // Legacy -1 "inherit" rows (from when a site-wide default existed)
+            // resolve to lightning, so the UI only ever sees 0/1.
+            $autoMeltUseSwap = (isset($store['auto_melt_use_swap'])
+                && (int)$store['auto_melt_use_swap'] === SwapAutoMelt::FORCE_SWAP)
+                ? SwapAutoMelt::FORCE_SWAP
+                : SwapAutoMelt::FORCE_LIGHTNING;
             require_once __DIR__ . '/includes/lnurl_receive.php';
             require_once __DIR__ . '/includes/store_ln_addresses.php';
             // Ordered Lightning-address fallback chain. Each entry carries its
@@ -304,7 +307,6 @@ if (isset($_GET['api'])) {
                 'threshold' => (int)($store['auto_melt_threshold'] ?? 2000),
                 'modeOverride' => $autoMeltUseSwap,
                 'mode' => $autoMeltMode,
-                'siteSwapDefault' => SwapAutoMelt::siteDefault(),
                 'swapMinSats' => SwapAutoMelt::minSats(),
                 'swapMaxFeePct' => SwapAutoMelt::maxFeePct(),
             ];
@@ -332,40 +334,47 @@ if (isset($_GET['api'])) {
                 'smtpPasswordSet' => ((string)($store['smtp_password'] ?? '')) !== '',
             ];
 
-            // Submarine swap (LN→onchain) tri-state override:
-            //   -1=inherit site default, 0=force off, 1=force on.
+            // Submarine swap (LN→onchain) per-store settings. Legacy -1
+            // "inherit" rows (from when a site-wide default existed) are
+            // normalized to their built-in default so the UI only sees 0/1.
             require_once __DIR__ . '/includes/swap/config.php';
-            $swapOverride = isset($store['swaps_enabled']) ? (int)$store['swaps_enabled'] : SwapsConfig::INHERIT;
+            require_once __DIR__ . '/includes/swap/factory.php';
+            $swapEnabled = isset($store['swaps_enabled']) && (int)$store['swaps_enabled'] === SwapsConfig::FORCE_ON;
             $swapFeeEff = SwapsConfig::effectiveFeeFallbackForStore($storeId);
             $storeSwaps = [
-                'override' => $swapOverride,             // tri-state
-                'siteDefault' => SwapsConfig::siteEnabled(),
+                'enabled' => $swapEnabled,
                 'effective' => SwapsConfig::isEnabledForStore($storeId),
-                // Per-store fee-fallback overrides (null = inherit) for the
-                // input boxes, plus the resolved effective values for help text.
+                // Provider preferences (per-store; null column = built-in default).
+                'providerOrder' => SwapsConfig::providerOrderForStore($storeId),
+                'knownProviders' => SwapProviderFactory::knownProviderNames(),
+                'autoSelectCheapest' => SwapsConfig::autoSelectCheapestForStore($storeId),
+                'autoSelectThresholdPct' => SwapsConfig::autoSelectThresholdPctForStore($storeId),
+                'minimumTargetSats' => SwapsConfig::minimumTargetSatsForStore($storeId),
+                // Per-store fee-fallback values (null = inherit the config-file
+                // constant) for the input boxes, plus the resolved effective
+                // values for help text and the config-file defaults for the
+                // placeholders.
                 'feeFallbackMaxPct' => ($store['swaps_fee_fallback_max_pct'] ?? null) !== null
                     ? (float)$store['swaps_fee_fallback_max_pct'] : null,
                 'feeFallbackMaxSats' => ($store['swaps_fee_fallback_max_sats'] ?? null) !== null
                     ? (int)$store['swaps_fee_fallback_max_sats'] : null,
                 'feeFallbackEffectivePct' => $swapFeeEff['pct'],
                 'feeFallbackEffectiveSats' => $swapFeeEff['sats'],
-                // Per-store "never fall back to a cashu mint" tri-state plus
-                // its resolved value (store override, else the site key).
-                'strictOverride' => isset($store['strict_no_mint_fallback'])
-                    ? (int)$store['strict_no_mint_fallback'] : SwapsConfig::INHERIT,
-                'strictEffective' => SwapsConfig::strictNoMintFallbackForStore($storeId),
+                'feeFallbackDefaultPct' => SwapsConfig::configFileFeeFallbackMaxPct(),
+                'feeFallbackDefaultSats' => SwapsConfig::configFileFeeFallbackMaxSats(),
+                // Per-store "never fall back to a cashu mint" flag.
+                'strict' => SwapsConfig::strictNoMintFallbackForStore($storeId),
             ];
 
-            // Self-serve invoice tri-state override + per-store max override.
+            // Self-serve invoice per-store settings.
             require_once __DIR__ . '/includes/selfserve.php';
             $storeSelfServe = [
-                'override'         => SelfServe::storeOverride($storeId),  // tri-state
-                'siteDefault'      => SelfServe::siteEnabled(),
+                'enabled'          => SelfServe::storeOverride($storeId) === SelfServe::FORCE_ON,
                 'effective'        => SelfServe::isEnabledForStore($storeId),
                 'paymentCapable'   => SelfServe::storeIsPaymentCapable($store),
-                'maxSatsOverride'  => SelfServe::storeMaxSats($storeId),   // null = inherit
+                'maxSatsOverride'  => SelfServe::storeMaxSats($storeId),   // null = built-in default
                 'effectiveMaxSats' => SelfServe::effectiveMaxSats($storeId),
-                'siteMaxSats'      => SelfServe::siteMaxSats(),
+                'maxSatsDefault'   => SelfServe::DEFAULT_MAX_SATS,
                 'payUrl'           => Urls::selfServe($storeId),
             ];
 
@@ -391,12 +400,9 @@ if (isset($_GET['api'])) {
                 'nextIndex' => (int)($store['onchain_next_index'] ?? 0),
                 'providerUrl' => $store['onchain_provider_url'] ?? '',
                 'needsManualConfirmation' => OnchainPayments::countNeedingManualConfirmation($storeId),
-                // Whether the on-chain rail is OFFERED to customers. Tri-state
-                // per-store override + resolved effective value + site default,
-                // so the UI can show "Inherit (on/off) / On / Off".
-                'offerOverride' => OnchainConfig::storeOverride($storeId),
-                'offerEffective' => OnchainConfig::isEnabledForStore($storeId),
-                'offerSiteDefault' => OnchainConfig::siteEnabled(),
+                // Whether the on-chain rail is OFFERED to customers (per-store
+                // flag; legacy -1 rows resolve to on).
+                'offerEnabled' => OnchainConfig::isEnabledForStore($storeId),
             ];
 
             // Calculate balance in sats for fiat mints (uses cached exchange rates)
@@ -2014,13 +2020,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     throw new Exception('Store ID required');
                 }
                 require_once __DIR__ . '/includes/onchain/config.php';
-                // Tri-state: -1 inherit site default, 0 force off, 1 force on.
-                $tri = (int)($_POST['offer_enabled'] ?? OnchainConfig::INHERIT);
-                OnchainConfig::setStoreOverride($storeId, $tri);
+                $raw = (string)($_POST['offer_enabled'] ?? '1');
+                if (!in_array($raw, ['0', '1'], true)) {
+                    throw new Exception('Invalid on-chain offer value');
+                }
+                OnchainConfig::setStoreOverride($storeId, (int)$raw);
                 echo json_encode([
                     'success' => true,
-                    'offerOverride' => OnchainConfig::storeOverride($storeId),
-                    'offerEffective' => OnchainConfig::isEnabledForStore($storeId),
+                    'offerEnabled' => OnchainConfig::isEnabledForStore($storeId),
                 ]);
             } catch (Throwable $e) {
                 http_response_code(400);
@@ -2291,34 +2298,28 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
             break;
 
-        case 'save_auto_melt':
+        case 'save_lightning_payments':
+            // The store's ordered Lightning destination chain (LNURL/lightning
+            // addresses, NWC connections, CLINK noffers). Used both for
+            // invoice receive routing and for the Lightning auto-cashout rail;
+            // lives in the store-settings "Lightning payments" card.
             Auth::requireAdmin();
-            require_once __DIR__ . '/includes/swap/auto_melt.php';
-            require_once __DIR__ . '/includes/swap/config.php';
             require_once __DIR__ . '/includes/lnurl_receive.php';
             require_once __DIR__ . '/includes/store_ln_addresses.php';
             try {
                 $storeId = $_POST['store_id'] ?? '';
-                $enabled = ($_POST['enabled'] ?? '0') === '1' ? 1 : 0;
-                $threshold = (int)($_POST['threshold'] ?? 2000);
-                // Tri-state per-store override: -1 inherit, 0 force LN, 1 force swap.
-                $modeOverrideRaw = $_POST['mode_override'] ?? (string)SwapAutoMelt::INHERIT;
-                $modeOverride = (int)$modeOverrideRaw;
-                if (!in_array($modeOverride, [SwapAutoMelt::INHERIT, SwapAutoMelt::FORCE_LIGHTNING, SwapAutoMelt::FORCE_SWAP], true)) {
-                    throw new Exception('Invalid auto-melt mode override');
-                }
-
                 if (empty($storeId)) {
                     throw new Exception('Store ID required');
                 }
 
-                // Destination chain. Preferred contract: two separate operator
-                // lists kept apart in the UI — ln_addresses[] (tried first) and
-                // noffers[] (fallback). chainFromLists validates each value
-                // against its declared type, dedups across both lists, and
-                // returns the ordered LN-first chain. Older callers may still
-                // send a single auto-detected addresses[] / address; honour that
-                // by classifying each entry by shape ('noffer1…' vs local@host).
+                // Destination chain. Preferred contract: three separate operator
+                // lists kept apart in the UI — ln_addresses[] (tried first),
+                // nwc[] (second) and noffers[] (final fallback). chainFromLists
+                // validates each value against its declared type, dedups across
+                // the lists, and returns the ordered LN-first chain. Older
+                // callers may still send a single auto-detected addresses[] /
+                // address; honour that by classifying each entry by shape
+                // ('noffer1…' vs nostr+walletconnect://… vs local@host).
                 if (isset($_POST['ln_addresses']) || isset($_POST['noffers']) || isset($_POST['nwc'])) {
                     $lnList = $_POST['ln_addresses'] ?? [];
                     $nofferList = $_POST['noffers'] ?? [];
@@ -2422,6 +2423,52 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     }
                 }
 
+                // Probe LUD-21 support for each address and gate the save:
+                // a NEW lnaddress whose host can't confirm a verify URL (or
+                // can't be reached) is refused, so a broken direct-receive
+                // rail is caught here instead of silently dropping Lightning
+                // from the checkout. Already-stored addresses pass through
+                // with a refreshed probe result (and the per-address warning)
+                // so the operator can still edit the rest of the card.
+                $gate = StoreLnAddresses::probeAndGateChain($storeId, $destinations);
+                $entries = $gate['entries'];
+                $addressResults = $gate['results'];
+
+                // Replace the whole ordered chain in one transaction.
+                StoreLnAddresses::replaceForStore($storeId, $entries);
+
+                echo json_encode([
+                    'success' => true,
+                    // Per-address LUD-21 results, in priority order.
+                    'addresses' => $addressResults,
+                ]);
+            } catch (Exception $e) {
+                cashupay_status(400);
+                echo json_encode(['error' => $e->getMessage()]);
+            }
+            break;
+
+        case 'save_auto_melt':
+            // Cashu automatic cashout: mode (lightning vs on-chain swap),
+            // enable toggle and threshold. The Lightning destination chain
+            // itself is saved by save_lightning_payments above.
+            Auth::requireAdmin();
+            require_once __DIR__ . '/includes/swap/auto_melt.php';
+            require_once __DIR__ . '/includes/swap/config.php';
+            try {
+                $storeId = $_POST['store_id'] ?? '';
+                $enabled = ($_POST['enabled'] ?? '0') === '1' ? 1 : 0;
+                $threshold = (int)($_POST['threshold'] ?? 2000);
+                $modeOverrideRaw = (string)($_POST['mode_override'] ?? (string)SwapAutoMelt::FORCE_LIGHTNING);
+                $modeOverride = (int)$modeOverrideRaw;
+                if (!in_array($modeOverride, [SwapAutoMelt::FORCE_LIGHTNING, SwapAutoMelt::FORCE_SWAP], true)) {
+                    throw new Exception('Invalid auto-melt mode');
+                }
+
+                if (empty($storeId)) {
+                    throw new Exception('Store ID required');
+                }
+
                 // On-chain auto-cashout requires the store to have an on-chain
                 // xpub / static address — refuse to save otherwise so we never
                 // select a destination that can't actually receive funds.
@@ -2438,41 +2485,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     }
                 }
 
-                // Probe LUD-21 support for each address and gate the save:
-                // a NEW lnaddress whose host can't confirm a verify URL (or
-                // can't be reached) is refused, so a broken direct-receive
-                // rail is caught here instead of silently dropping Lightning
-                // from the checkout. Already-stored addresses pass through
-                // with a refreshed probe result (and the per-address warning)
-                // so the operator can still edit the rest of the card.
-                $gate = StoreLnAddresses::probeAndGateChain($storeId, $destinations);
-                $entries = $gate['entries'];
-                $addressResults = $gate['results'];
-
                 Database::update('stores', [
                     'auto_melt_enabled' => $enabled,
                     'auto_melt_threshold' => $threshold,
                     'auto_melt_use_swap' => $modeOverride,
                 ], 'id = ?', [$storeId]);
 
-                // Replace the whole ordered chain in one transaction.
-                StoreLnAddresses::replaceForStore($storeId, $entries);
-
                 // Choosing on-chain auto-cashout forces submarine swaps on for
-                // this store, and enables the site-wide master switch if it was
-                // off (without forcing swaps on for any other store).
+                // this store (they are the mechanism that settles the sweep).
                 if ($modeOverride === SwapAutoMelt::FORCE_SWAP) {
                     SwapsConfig::setStoreOverride($storeId, SwapsConfig::FORCE_ON);
-                    if (!SwapsConfig::siteEnabled()) {
-                        SwapsConfig::setSiteEnabled(true);
-                    }
                 }
 
-                echo json_encode([
-                    'success' => true,
-                    // Per-address LUD-21 results, in priority order.
-                    'addresses' => $addressResults,
-                ]);
+                echo json_encode(['success' => true]);
             } catch (Exception $e) {
                 cashupay_status(400);
                 echo json_encode(['error' => $e->getMessage()]);
@@ -2646,149 +2671,24 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
             break;
 
-        // ----- Site-wide on-chain payment default -----
-
-        case 'get_onchain_site_settings':
-            Auth::requireAdmin();
-            require_once __DIR__ . '/includes/onchain/config.php';
-            echo json_encode([
-                'onchainPaymentsEnabled' => OnchainConfig::siteEnabled(),
-            ]);
-            break;
-
-        case 'save_onchain_site_settings':
-            Auth::requireAdmin();
-            require_once __DIR__ . '/includes/onchain/config.php';
-            try {
-                $enabled = ($_POST['onchain_payments_enabled'] ?? '1') === '1';
-                OnchainConfig::setSiteEnabled($enabled);
-                echo json_encode(['success' => true]);
-            } catch (Exception $e) {
-                cashupay_status(400);
-                echo json_encode(['error' => $e->getMessage()]);
-            }
-            break;
-
-        // ----- Submarine swap settings -----
-
-        case 'get_swap_settings':
-            Auth::requireAdmin();
-            require_once __DIR__ . '/includes/swap/config.php';
-            require_once __DIR__ . '/includes/swap/factory.php';
-            require_once __DIR__ . '/includes/swap/auto_melt.php';
-            echo json_encode([
-                'enabled'                => SwapsConfig::siteEnabled(),
-                'providerOrder'          => SwapsConfig::providerOrder(),
-                'knownProviders'         => SwapProviderFactory::knownProviderNames(),
-                'strictNoMintFallback'   => SwapsConfig::strictNoMintFallback(),
-                'minimumTargetSats'      => SwapsConfig::minimumTargetSats(),
-                'autoSelectCheapest'     => SwapsConfig::autoSelectCheapest(),
-                'autoSelectThresholdPct' => SwapsConfig::autoSelectThresholdPct(),
-                // Raw site values (null = inherit the config-file constant) for
-                // the input boxes, plus the resolved config-file/built-in
-                // default for the placeholder/help text.
-                'feeFallbackMaxPct'         => Config::get('swaps_fee_fallback_max_pct', null),
-                'feeFallbackMaxSats'        => Config::get('swaps_fee_fallback_max_sats', null),
-                'feeFallbackMaxPctDefault'  => SwapsConfig::configFileFeeFallbackMaxPct(),
-                'feeFallbackMaxSatsDefault' => SwapsConfig::configFileFeeFallbackMaxSats(),
-                'autoMeltUseSwapDefault' => SwapAutoMelt::siteDefault(),
-                'autoMeltSwapMinSats'    => SwapAutoMelt::minSats(),
-                'autoMeltSwapMaxFeePct'  => SwapAutoMelt::maxFeePct(),
-            ]);
-            break;
-
-        case 'save_swap_settings':
-            Auth::requireAdmin();
-            require_once __DIR__ . '/includes/swap/config.php';
-            require_once __DIR__ . '/includes/swap/factory.php';
-            require_once __DIR__ . '/includes/swap/auto_melt.php';
-            try {
-                $enabled = ($_POST['enabled'] ?? '0') === '1';
-                $strict = ($_POST['strict_no_mint_fallback'] ?? '0') === '1';
-                $autoMeltUseSwap = ($_POST['auto_melt_use_swap_default'] ?? '0') === '1';
-                $rawMin = trim((string)($_POST['minimum_target_sats'] ?? ''));
-                $minSats = ($rawMin === '') ? null : max(0, (int)$rawMin);
-
-                $autoSelect = ($_POST['auto_select_cheapest'] ?? '0') === '1';
-                $rawThreshold = trim((string)($_POST['auto_select_threshold_pct'] ?? ''));
-                if ($rawThreshold === '' || !is_numeric($rawThreshold)) {
-                    $autoThreshold = SwapsConfig::DEFAULT_AUTO_SELECT_THRESHOLD_PCT;
-                } else {
-                    $autoThreshold = (int)$rawThreshold;
-                    if ($autoThreshold < 1 || $autoThreshold > 90) {
-                        throw new Exception('Threshold must be between 1 and 90 percent');
-                    }
-                }
-
-                $orderRaw = trim((string)($_POST['provider_order'] ?? ''));
-                $known = SwapProviderFactory::knownProviderNames();
-                $order = [];
-                foreach (explode(',', $orderRaw) as $p) {
-                    $p = strtolower(trim($p));
-                    if ($p !== '' && in_array($p, $known, true) && !in_array($p, $order, true)) {
-                        $order[] = $p;
-                    }
-                }
-                if ($enabled && empty($order)) {
-                    throw new Exception('At least one provider must be selected when swaps are enabled');
-                }
-                if (!empty($order)) {
-                    SwapsConfig::setProviderOrder($order);
-                }
-                SwapsConfig::setSiteEnabled($enabled);
-                SwapsConfig::setStrictNoMintFallback($strict);
-                SwapsConfig::setMinimumTargetSats($minSats);
-                SwapsConfig::setAutoSelectCheapest($autoSelect);
-                SwapsConfig::setAutoSelectThresholdPct($autoThreshold);
-
-                // Fee-too-high → mint fallback thresholds. Blank clears the site
-                // value so it inherits the config-file constant; 0 explicitly
-                // disables that check.
-                $rawFeePct = trim((string)($_POST['fee_fallback_max_pct'] ?? ''));
-                if ($rawFeePct === '') {
-                    SwapsConfig::setFeeFallbackMaxPct(null);
-                } else {
-                    if (!is_numeric($rawFeePct)) {
-                        throw new Exception('Fee % threshold must be a number');
-                    }
-                    $feePct = (float)$rawFeePct;
-                    if ($feePct < 0 || $feePct > 100) {
-                        throw new Exception('Fee % threshold must be between 0 and 100');
-                    }
-                    SwapsConfig::setFeeFallbackMaxPct($feePct);
-                }
-                $rawFeeSats = trim((string)($_POST['fee_fallback_max_sats'] ?? ''));
-                if ($rawFeeSats === '') {
-                    SwapsConfig::setFeeFallbackMaxSats(null);
-                } else {
-                    if (!ctype_digit($rawFeeSats)) {
-                        throw new Exception('Fee sats threshold must be a whole number ≥ 0');
-                    }
-                    SwapsConfig::setFeeFallbackMaxSats((int)$rawFeeSats);
-                }
-
-                SwapAutoMelt::setSiteDefault($autoMeltUseSwap);
-
-                echo json_encode(['success' => true]);
-            } catch (Exception $e) {
-                cashupay_status(400);
-                echo json_encode(['error' => $e->getMessage()]);
-            }
-            break;
-
         case 'save_store_swaps':
             Auth::requireAdmin();
             require_once __DIR__ . '/includes/swap/config.php';
+            require_once __DIR__ . '/includes/swap/factory.php';
             try {
                 $storeId = $_POST['store_id'] ?? '';
-                $override = (int)($_POST['override'] ?? SwapsConfig::INHERIT);
                 if (empty($storeId)) {
                     throw new Exception('Store ID required');
                 }
-                // Submarine swaps settle on-chain, so forcing them on requires the
-                // store to have an on-chain xpub / static address. Refuse + warn
-                // otherwise rather than saving a setting that can't work.
-                if ($override === SwapsConfig::FORCE_ON) {
+                $rawEnabled = (string)($_POST['enabled'] ?? '0');
+                if (!in_array($rawEnabled, ['0', '1'], true)) {
+                    throw new Exception('Invalid swaps enabled value');
+                }
+                $enabled = (int)$rawEnabled;
+                // Submarine swaps settle on-chain, so turning them on requires
+                // the store to have an on-chain xpub / static address. Refuse +
+                // warn otherwise rather than saving a setting that can't work.
+                if ($enabled === SwapsConfig::FORCE_ON) {
                     $ocRow = Database::fetchOne(
                         "SELECT onchain_address_mode, onchain_xpub, onchain_static_address FROM stores WHERE id = ?",
                         [$storeId]
@@ -2800,11 +2700,49 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         throw new Exception('Submarine swaps require an on-chain xpub or address on the Bitcoin tab.');
                     }
                 }
-                SwapsConfig::setStoreOverride($storeId, $override);
+                SwapsConfig::setStoreOverride($storeId, $enabled);
 
-                // Per-store fee-too-high → mint fallback overrides. Blank on a
-                // field clears the override so it inherits the site/config-file
-                // value; 0 explicitly disables that check for this store.
+                // Provider preference order (comma-separated, validated against
+                // the registry). Empty while swaps are on is refused — an
+                // enabled swap rail with zero providers can never work.
+                $orderRaw = trim((string)($_POST['provider_order'] ?? ''));
+                $known = SwapProviderFactory::knownProviderNames();
+                $order = [];
+                foreach (explode(',', $orderRaw) as $p) {
+                    $p = strtolower(trim($p));
+                    if ($p !== '' && in_array($p, $known, true) && !in_array($p, $order, true)) {
+                        $order[] = $p;
+                    }
+                }
+                if ($enabled === SwapsConfig::FORCE_ON && empty($order)) {
+                    throw new Exception('At least one provider must be selected when swaps are enabled');
+                }
+                SwapsConfig::setStoreProviderOrder($storeId, $order);
+
+                $autoSelect = ($_POST['auto_select_cheapest'] ?? '0') === '1';
+                SwapsConfig::setStoreAutoSelectCheapest($storeId, $autoSelect);
+
+                $rawThreshold = trim((string)($_POST['auto_select_threshold_pct'] ?? ''));
+                if ($rawThreshold === '' || !is_numeric($rawThreshold)) {
+                    $autoThreshold = SwapsConfig::DEFAULT_AUTO_SELECT_THRESHOLD_PCT;
+                } else {
+                    $autoThreshold = (int)$rawThreshold;
+                    if ($autoThreshold < 1 || $autoThreshold > 90) {
+                        throw new Exception('Threshold must be between 1 and 90 percent');
+                    }
+                }
+                SwapsConfig::setStoreAutoSelectThresholdPct($storeId, $autoThreshold);
+
+                // Optional local swap floor. Blank clears it.
+                $rawMin = trim((string)($_POST['minimum_target_sats'] ?? ''));
+                SwapsConfig::setStoreMinimumTargetSats(
+                    $storeId,
+                    $rawMin === '' ? null : max(0, (int)$rawMin)
+                );
+
+                // Per-store fee-too-high → mint fallback thresholds. Blank on a
+                // field clears the value so it inherits the config-file
+                // constant; 0 explicitly disables that check for this store.
                 $rawPct = trim((string)($_POST['fee_fallback_max_pct'] ?? ''));
                 $rawSats = trim((string)($_POST['fee_fallback_max_sats'] ?? ''));
                 $pct = null;
@@ -2823,54 +2761,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 }
                 SwapsConfig::setStoreFeeFallback($storeId, $pct, $sats);
 
-                // Per-store strict-no-mint-fallback tri-state. Absent from the
+                // Per-store strict-no-mint-fallback flag. Absent from the
                 // POST means "leave as-is" so older clients don't clobber it.
                 if (array_key_exists('strict_no_mint_fallback', $_POST)) {
                     $rawStrict = (string)$_POST['strict_no_mint_fallback'];
-                    if (!in_array($rawStrict, ['-1', '0', '1'], true)) {
+                    if (!in_array($rawStrict, ['0', '1'], true)) {
                         throw new Exception('Invalid mint-fallback mode');
                     }
                     SwapsConfig::setStoreStrictOverride($storeId, (int)$rawStrict);
-                }
-
-                echo json_encode(['success' => true]);
-            } catch (Exception $e) {
-                cashupay_status(400);
-                echo json_encode(['error' => $e->getMessage()]);
-            }
-            break;
-
-        // ----- Self-serve invoice settings -----
-
-        case 'get_selfserve_settings':
-            Auth::requireAdmin();
-            require_once __DIR__ . '/includes/selfserve.php';
-            echo json_encode([
-                'enabled' => SelfServe::siteEnabled(),
-                // Raw site max (null when inheriting the built-in default) for
-                // the input box, plus the built-in default for the placeholder.
-                'maxSats'        => Config::get('selfserve_max_sats', null),
-                'maxSatsDefault' => SelfServe::DEFAULT_MAX_SATS,
-            ]);
-            break;
-
-        case 'save_selfserve_settings':
-            Auth::requireAdmin();
-            require_once __DIR__ . '/includes/selfserve.php';
-            try {
-                $enabled = ($_POST['enabled'] ?? '0') === '1';
-                SelfServe::setSiteEnabled($enabled);
-
-                // Blank clears the site max back to the built-in default; a
-                // positive whole number sets it.
-                $rawMax = trim((string)($_POST['max_sats'] ?? ''));
-                if ($rawMax === '') {
-                    SelfServe::setSiteMaxSats(null);
-                } else {
-                    if (!ctype_digit($rawMax) || (int)$rawMax <= 0) {
-                        throw new Exception('Maximum must be a positive whole number of sats');
-                    }
-                    SelfServe::setSiteMaxSats((int)$rawMax);
                 }
 
                 echo json_encode(['success' => true]);
@@ -2892,16 +2790,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if (!$store) {
                     throw new Exception('Store not found');
                 }
-                $override = (int)($_POST['override'] ?? SelfServe::INHERIT);
-                // Forcing self-serve on only makes sense if the store can take a
+                $rawEnabled = (string)($_POST['enabled'] ?? '0');
+                if (!in_array($rawEnabled, ['0', '1'], true)) {
+                    throw new Exception('Invalid self-serve enabled value');
+                }
+                $enabled = (int)$rawEnabled;
+                // Turning self-serve on only makes sense if the store can take a
                 // payment — otherwise every customer submission would error.
-                if ($override === SelfServe::FORCE_ON && !SelfServe::storeIsPaymentCapable($store)) {
+                if ($enabled === SelfServe::FORCE_ON && !SelfServe::storeIsPaymentCapable($store)) {
                     throw new Exception('This store has no payment method configured (add a Cashu mint or on-chain address first).');
                 }
-                SelfServe::setStoreOverride($storeId, $override);
+                SelfServe::setStoreOverride($storeId, $enabled);
 
-                // Per-store max override. Blank clears it (inherit the site
-                // value); a positive whole number sets it.
+                // Per-store max. Blank clears it (use the built-in default);
+                // a positive whole number sets it.
                 $rawMax = trim((string)($_POST['max_sats'] ?? ''));
                 if ($rawMax === '') {
                     SelfServe::setStoreMaxSats($storeId, null);
@@ -5539,68 +5441,34 @@ header('Cache-Control: no-cache, must-revalidate');
                         </div>
                     </div>
 
-                    <div class="card collapsible">
+                    <div class="card collapsible" id="card-lightning-payments">
                         <div class="card-header">
-                            <div class="card-title">Auto-Cashout</div>
+                            <div class="card-title">Lightning payments</div>
                         </div>
                         <div class="card-body">
                             <?php
-                            // Shared by the auto-cashout / on-chain / swap cards
-                            // in this settings view: features that run EC math
-                            // (xpub derivation, swap signing) are dead on a host
-                            // without GMP, so each affected card says so instead
-                            // of failing on save. The CLINK client has the same
-                            // dependency (Schnorr-signed Nostr requests), so the
-                            // noffer section below gets its own gate.
+                            // Shared by this card and the cashout / on-chain /
+                            // swap cards below it in this settings view:
+                            // features that run EC math (xpub derivation, swap
+                            // signing) are dead on a host without GMP, so each
+                            // affected card says so instead of failing on save.
+                            // The CLINK client has the same dependency
+                            // (Schnorr-signed Nostr requests), so the noffer
+                            // section below gets its own gate, as does NWC.
+                            // Cashu itself runs on GMP or BCMath — only when
+                            // neither is usable is the cashout card dead.
                             require_once __DIR__ . '/includes/onchain/wallet.php';
                             require_once __DIR__ . '/includes/clink/client.php';
                             require_once __DIR__ . '/includes/nwc/client.php';
+                            require_once __DIR__ . '/includes/cashu_env.php';
                             $gmpEnvError = OnchainWallet::environmentError();
                             $nofferEnvError = ClinkClient::environmentError();
                             $nwcEnvError = NwcClient::environmentError();
+                            $cashuEnvError = CashuEnv::environmentError();
                             ?>
-                            <div id="aw-store" data-aw data-aw-scope="store">
-                            <p class="aw-title">auto-cashout settings</p>
-                            <?php if ($gmpEnvError !== null): ?>
-                                <div style="margin-bottom:0.75rem; padding:0.6rem 0.8rem; border-radius:8px; background:rgba(245,158,11,0.12); border:1px solid rgba(245,158,11,0.4); font-size:0.82rem;">
-                                    &#9888; <strong>On-chain withdrawal is unavailable on this server.</strong>
-                                    <?= htmlspecialchars($gmpEnvError) ?>
-                                    Lightning-address withdrawals still work<?= $nofferEnvError === null ? ', as do noffers' : '' ?>.
-                                </div>
-                            <?php endif; ?>
-                            <div id="aw-store-warning" class="hidden" style="margin-bottom:0.75rem; padding:0.6rem 0.8rem; border-radius:8px; background:rgba(245,158,11,0.12); border:1px solid rgba(245,158,11,0.4); font-size:0.82rem;">
-                                &#9888; This store has no on-chain xpub or withdrawal address configured on the Bitcoin tab. On-chain withdrawal cannot be used until you add one.
-                            </div>
-                            <input type="hidden" id="auto-melt-mode-override" value="-1">
-                            <div class="aw-cols">
-                                <div class="aw-col" data-aw-mode="-1" tabindex="0" role="button" aria-pressed="false">
-                                    <span class="aw-col-check">&#10003;</span>
-                                    <div class="aw-col-head"><span class="aw-col-name">Use global settings</span></div>
-                                    <div class="aw-col-desc">Follow the site-wide auto-cashout default (<strong id="auto-melt-mode-default-label">Lightning address</strong>).</div>
-                                </div>
-                                <div class="aw-col" data-aw-mode="0" tabindex="0" role="button" aria-pressed="false">
-                                    <span class="aw-col-check">&#10003;</span>
-                                    <div class="aw-col-head"><span class="aw-col-name">Lightning Withdrawal</span><span class="aw-col-badge">Suggested</span></div>
-                                    <div class="aw-col-desc">Withdraw to LNURL (lightning address) like myawesomestore@strike.me. Don&rsquo;t have a lightning address? Get one for free at <a class="aw-strike-link" href="http://strike.me" target="_blank" rel="noopener noreferrer">Strike</a> or <a href="https://coinos.io/" target="_blank" rel="noopener noreferrer">CoinOS</a> (all merchants).</div>
-                                    <ul>
-                                        <li>Get your funds the fastest</li>
-                                        <li>Automatic conversion to USD on Strike</li>
-                                        <li>Lowest fees</li>
-                                    </ul>
-                                </div>
-                                <div class="aw-col" data-aw-mode="1" tabindex="0" role="button" aria-pressed="false">
-                                    <span class="aw-col-check">&#10003;</span>
-                                    <div class="aw-col-head"><span class="aw-col-name">On-chain Withdrawal</span></div>
-                                    <div class="aw-col-desc">Withdraw to On-chain Address.</div>
-                                    <ul>
-                                        <li>Slower funds transfers</li>
-                                        <li>Works with all Bitcoin wallets</li>
-                                        <li>Funds may sit in the mint until sufficient for the on-chain transaction fee (custodial risk)</li>
-                                    </ul>
-                                </div>
-                            </div>
-                            <p class="form-help" style="margin-top:0.6rem;">
-                                Currently effective: <strong id="auto-melt-mode-effective">Lightning address</strong>.
+                            <p class="form-help" style="margin-top:0;">
+                                Lightning payment paths are tried in the following order &mdash;
+                                you can use multiple paths: LNURL/lightning address, NWC, noffer.
                             </p>
 
                             <div class="form-group" id="auto-melt-address-group">
@@ -5672,6 +5540,75 @@ header('Cache-Control: no-cache, must-revalidate');
                                 </button>
                             </div>
 
+                            <div id="lightning-payments-error" class="hidden" style="margin-top:0.75rem; color: var(--error); font-size: 0.85rem;"></div>
+                            <button class="btn btn-full" id="btn-save-lightning-payments" style="margin-top: 1rem;">
+                                Save Lightning payments
+                            </button>
+                        </div>
+                    </div>
+
+                    <div class="card collapsible" id="card-cashu-cashout">
+                        <div class="card-header">
+                            <div class="card-title">Cashu automatic cashout</div>
+                        </div>
+                        <div class="card-body">
+                            <?php if ($cashuEnvError !== null): ?>
+                                <div style="margin-bottom:0.75rem; padding:0.6rem 0.8rem; border-radius:8px; background:rgba(245,158,11,0.12); border:1px solid rgba(245,158,11,0.4); font-size:0.82rem;">
+                                    &#9888; <strong>Cashu is unavailable on this server.</strong>
+                                    <?= htmlspecialchars($cashuEnvError) ?>
+                                    Automatic cashout of a Cashu mint balance can't run until one of them is enabled.
+                                </div>
+                            <?php endif; ?>
+                            <div id="cashu-cashout-mint-warning" class="hidden" style="margin-bottom:0.75rem; padding:0.6rem 0.8rem; border-radius:8px; background:rgba(245,158,11,0.12); border:1px solid rgba(245,158,11,0.4); font-size:0.82rem;">
+                                &#9888; <strong>Cashu is disabled for this store.</strong>
+                                This store has no Cashu mint wallet configured, so there is no mint
+                                balance to cash out. Add a mint to use automatic cashout.
+                            </div>
+                            <!-- Everything below greys out when Cashu can't run: either the
+                                 server lacks GMP/BCMath (rendered inert here) or the selected
+                                 store has no mint wallet (toggled by renderAutoMeltMode). -->
+                            <div id="cashu-cashout-body"<?= $cashuEnvError !== null
+                                ? ' data-env-error="1" style="opacity: 0.5; pointer-events: none;"'
+                                : '' ?>>
+                            <div id="aw-store" data-aw data-aw-scope="store">
+                            <p class="aw-title">auto-cashout settings</p>
+                            <?php if ($gmpEnvError !== null): ?>
+                                <div style="margin-bottom:0.75rem; padding:0.6rem 0.8rem; border-radius:8px; background:rgba(245,158,11,0.12); border:1px solid rgba(245,158,11,0.4); font-size:0.82rem;">
+                                    &#9888; <strong>On-chain withdrawal is unavailable on this server.</strong>
+                                    <?= htmlspecialchars($gmpEnvError) ?>
+                                    Lightning-address withdrawals still work<?= $nofferEnvError === null ? ', as do noffers' : '' ?>.
+                                </div>
+                            <?php endif; ?>
+                            <div id="aw-store-warning" class="hidden" style="margin-bottom:0.75rem; padding:0.6rem 0.8rem; border-radius:8px; background:rgba(245,158,11,0.12); border:1px solid rgba(245,158,11,0.4); font-size:0.82rem;">
+                                &#9888; This store has no on-chain xpub or withdrawal address configured on the Bitcoin tab. On-chain withdrawal cannot be used until you add one.
+                            </div>
+                            <input type="hidden" id="auto-melt-mode-override" value="0">
+                            <div class="aw-cols">
+                                <div class="aw-col" data-aw-mode="0" tabindex="0" role="button" aria-pressed="false">
+                                    <span class="aw-col-check">&#10003;</span>
+                                    <div class="aw-col-head"><span class="aw-col-name">Lightning Withdrawal</span><span class="aw-col-badge">Suggested</span></div>
+                                    <div class="aw-col-desc">Withdraw to a Lightning payment path from the Lightning payments section above (LNURL address, NWC connection, or noffer).</div>
+                                    <ul>
+                                        <li>Get your funds the fastest</li>
+                                        <li>Automatic conversion to USD on Strike</li>
+                                        <li>Lowest fees</li>
+                                    </ul>
+                                </div>
+                                <div class="aw-col" data-aw-mode="1" tabindex="0" role="button" aria-pressed="false">
+                                    <span class="aw-col-check">&#10003;</span>
+                                    <div class="aw-col-head"><span class="aw-col-name">On-chain Withdrawal</span></div>
+                                    <div class="aw-col-desc">Withdraw to On-chain Address.</div>
+                                    <ul>
+                                        <li>Slower funds transfers</li>
+                                        <li>Works with all Bitcoin wallets</li>
+                                        <li>Funds may sit in the mint until sufficient for the on-chain transaction fee (custodial risk)</li>
+                                    </ul>
+                                </div>
+                            </div>
+                            <p class="form-help" style="margin-top:0.6rem;">
+                                Currently effective: <strong id="auto-melt-mode-effective">Lightning address</strong>.
+                            </p>
+
                             <p class="form-help" id="auto-melt-swap-info" style="display: none;">
                                 Sweeps the mint balance through a reverse submarine swap to the store's
                                 on-chain xpub. May result in longer intervals between auto-cashouts
@@ -5696,9 +5633,10 @@ header('Cache-Control: no-cache, must-revalidate');
                                 <p class="form-help" style="margin-top:0.5rem;">
                                     This threshold applies only to <strong>on-chain</strong>
                                     withdrawals &mdash; it sets the minimum mint balance before an
-                                    on-chain swap is attempted. Lightning address / noffer
-                                    withdrawals ignore it: whenever a Lightning address or noffer is
-                                    configured, the mint balance is cashed out to it automatically
+                                    on-chain swap is attempted. Lightning withdrawals ignore it:
+                                    whenever a Lightning payment path (LNURL address, NWC
+                                    connection, or noffer) is configured in the Lightning payments
+                                    section, the mint balance is cashed out to it automatically
                                     each cycle (no minimum), so funds don&rsquo;t sit in the mint
                                     waiting for the on-chain fee to become economical.
                                 </p>
@@ -5708,7 +5646,8 @@ header('Cache-Control: no-cache, must-revalidate');
                             <button class="btn btn-full" id="btn-save-auto-melt" style="margin-top: 1rem;">
                                 Save Settings
                             </button>
-                            </div>
+                            </div><!-- /#aw-store -->
+                            </div><!-- /#cashu-cashout-body -->
                         </div>
                     </div>
 
@@ -5739,12 +5678,10 @@ header('Cache-Control: no-cache, must-revalidate');
                             <div class="form-group">
                                 <label class="form-label">Offer on-chain to customers</label>
                                 <select class="form-input" id="onchain-offer-override" onchange="onchainOfferChanged()">
-                                    <option value="-1">Inherit site default</option>
                                     <option value="1">On for this store</option>
                                     <option value="0">Off &mdash; Lightning-only checkout</option>
                                 </select>
                                 <p class="form-help">
-                                    Site default: <strong id="onchain-offer-site-default">&mdash;</strong>.
                                     Currently effective: <strong id="onchain-offer-effective">&mdash;</strong>.
                                     Your xpub is still used for submarine-swap settlement even when
                                     on-chain checkout is off.
@@ -5869,8 +5806,8 @@ header('Cache-Control: no-cache, must-revalidate');
                         </div>
                     </div>
 
-                    <!-- Per-store submarine-swap override. Tri-state: inherit
-                         the site default, or force on/off for this store. -->
+                    <!-- Per-store submarine-swap settings (there is no
+                         site-wide layer; every knob lives on the store). -->
                     <div class="card collapsible" id="card-store-swaps">
                         <div class="card-header">
                             <div class="card-title">Submarine Swaps (LN&rarr;on-chain)</div>
@@ -5882,7 +5819,6 @@ header('Cache-Control: no-cache, must-revalidate');
                                 let them, but have them automatically pay the lightning -&gt; on-chain
                                 conversion fee (around 10c in low fee environments). Requires an
                                 on-chain xpub on the Bitcoin tab.
-                                Site default: <strong id="store-swaps-site-default">&mdash;</strong>.
                             </p>
                             <?php if ($gmpEnvError !== null): ?>
                                 <div style="margin-bottom:0.75rem; padding:0.75rem; border-radius:8px; background:rgba(245,158,11,0.12); border:1px solid rgba(245,158,11,0.35); font-size:0.85rem;">
@@ -5892,39 +5828,82 @@ header('Cache-Control: no-cache, must-revalidate');
                                 </div>
                             <?php endif; ?>
 
-                            <div class="form-group">
-                                <label class="form-label">Mode</label>
-                                <select class="form-input" id="store-swaps-override">
-                                    <option value="-1">Inherit site default</option>
-                                    <option value="1">Force on for this store</option>
-                                    <option value="0">Force off for this store</option>
-                                </select>
+                            <div class="toggle-container">
+                                <span><strong>Enable submarine swaps</strong> (this store)</span>
+                                <label class="toggle">
+                                    <input type="checkbox" id="store-swaps-enabled">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
+                            <p class="form-help">
+                                Currently effective: <strong id="store-swaps-effective">&mdash;</strong>
+                            </p>
+
+                            <div class="form-group" style="margin-top: 1rem;">
+                                <label class="form-label">Providers</label>
+                                <div id="store-swaps-provider-checkboxes" style="display: flex; flex-direction: column; gap: 0.4rem; padding: 0.5rem 0;">
+                                    <!-- populated by refreshStoreSwapsCard(); one checkbox per known provider -->
+                                </div>
                                 <p class="form-help">
-                                    Currently effective: <strong id="store-swaps-effective">&mdash;</strong>
+                                    Each enabled provider is tried in the order shown. At invoice creation
+                                    we use the first reachable one &mdash; unless the auto-select option below
+                                    finds a meaningfully cheaper alternative.
+                                </p>
+                            </div>
+
+                            <div class="toggle-container" style="margin-top: 0.75rem;">
+                                <span><strong>Automatically select the cheapest swap provider</strong></span>
+                                <label class="toggle">
+                                    <input type="checkbox" id="store-swaps-auto-select">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
+                            <p class="form-help" style="margin-top: -0.25rem;">
+                                Fetches a quote from every enabled provider in parallel and prefers a
+                                cheaper one when it beats the highest-priority provider by more than the
+                                threshold below. Falls back to the priority order whenever a quote can't
+                                be fetched, so it never adds a new failure mode.
+                            </p>
+
+                            <div class="form-group" style="margin-top: 0.5rem;">
+                                <label class="form-label" for="store-swaps-auto-threshold">Minimum savings to switch providers (%)</label>
+                                <input type="number" class="form-input" id="store-swaps-auto-threshold"
+                                       min="1" max="90" step="1" value="10" style="max-width: 8rem;">
+                                <p class="form-help">
+                                    How much cheaper a lower-priority provider must be before we
+                                    use it instead. Default 10%.
+                                </p>
+                            </div>
+
+                            <div class="form-group" style="margin-top: 1rem;">
+                                <label class="form-label" for="store-swaps-min-sats">Minimum target (sats)</label>
+                                <input type="number" class="form-input" id="store-swaps-min-sats"
+                                       placeholder="provider default" min="0" step="1" style="max-width: 9rem;">
+                                <p class="form-help">
+                                    Local floor in addition to the provider's own minimum. Leave blank
+                                    to use the provider's minimum (Boltz mainnet: 10,000 sats).
                                 </p>
                             </div>
 
                             <div class="form-group" style="margin-top: 0.75rem; padding-top: 0.75rem; border-top: 1px solid var(--border-color, rgba(255,255,255,0.08));">
                                 <label class="form-label">Cashu mint fallback (this store)</label>
                                 <select class="form-input" id="store-swaps-strict">
-                                    <option value="-1">Inherit site default</option>
                                     <option value="0">Allow falling back to a mint</option>
                                     <option value="1">Never fall back to a mint (strict)</option>
                                 </select>
                                 <p class="form-help">
                                     Strict means an invoice errors rather than being issued by a Cashu
                                     mint when Lightning and swaps both fail. Setup sets this to strict
-                                    when you decline mints. Currently effective:
-                                    <strong id="store-swaps-strict-effective">&mdash;</strong>
+                                    when you decline mints.
                                 </p>
                             </div>
 
                             <div class="form-group" style="margin-top: 0.75rem; padding-top: 0.75rem; border-top: 1px solid var(--border-color, rgba(255,255,255,0.08));">
                                 <label class="form-label">Fee-too-high mint fallback (this store)</label>
                                 <p class="form-help" style="margin-top: -0.25rem;">
-                                    Override the site thresholds for skipping an expensive swap in
-                                    favour of a mint Lightning invoice (requires a mint on this store).
-                                    Leave blank to inherit; 0 disables a check.
+                                    Skip an expensive swap in favour of a mint Lightning invoice
+                                    (requires a mint on this store). Leave blank for the config-file
+                                    default; 0 disables a check.
                                     Effective now: <strong id="store-swaps-fee-effective">&mdash;</strong>
                                 </p>
                                 <div style="display: flex; gap: 1rem; flex-wrap: wrap;">
@@ -5989,15 +5968,14 @@ header('Cache-Control: no-cache, must-revalidate');
                             <p style="font-size: 0.85rem; color: var(--text-secondary); margin: 0 0 0.75rem 0;">
                                 Let customers create and pay their own invoice (no login) from a public
                                 link, choosing the amount and an optional note. Requires a payment method
-                                on this store. Site default: <strong id="store-selfserve-site-default">&mdash;</strong>.
+                                on this store. Off by default.
                             </p>
 
                             <div class="form-group">
                                 <label class="form-label">Mode</label>
                                 <select class="form-input" id="store-selfserve-override">
-                                    <option value="-1">Inherit site default</option>
-                                    <option value="1">Force on for this store</option>
-                                    <option value="0">Force off for this store</option>
+                                    <option value="0">Off for this store</option>
+                                    <option value="1">On for this store</option>
                                 </select>
                                 <p class="form-help">
                                     Currently effective: <strong id="store-selfserve-effective">&mdash;</strong>
@@ -6007,9 +5985,10 @@ header('Cache-Control: no-cache, must-revalidate');
                             <div class="form-group">
                                 <label class="form-label" for="store-selfserve-max">Maximum invoice (sats)</label>
                                 <input type="number" class="form-input" id="store-selfserve-max"
-                                       min="1" step="1" placeholder="inherit site default">
+                                       min="1" step="1" placeholder="500000">
                                 <p class="form-help">
-                                    Leave blank to inherit the site-wide maximum. Effective now:
+                                    Caps how much a single self-serve invoice can lock up. Leave blank
+                                    for the default (500,000 sats). Effective now:
                                     <strong id="store-selfserve-max-effective">&mdash;</strong> sats.
                                 </p>
                             </div>
@@ -6379,40 +6358,6 @@ header('Cache-Control: no-cache, must-revalidate');
                         </button>
                     </div>
                 </div>
-                <div class="card collapsible" data-admin-only="true" id="card-onchain-site">
-                    <div class="card-header">
-                        <div class="card-title">On-chain payments (site-wide default)</div>
-                    </div>
-                    <div class="card-body">
-                        <p style="font-size: 0.85rem; color: var(--text-secondary); margin: 0 0 0.75rem 0;">
-                            The default for whether stores offer a direct on-chain (pay-to-address)
-                            option to customers, alongside Lightning. Individual stores can override
-                            this on their Bitcoin tab. Turning it off here makes new stores
-                            Lightning-only by default (useful when you want fast, Lightning-first
-                            checkout across the instance).
-                        </p>
-                        <div class="toggle-container">
-                            <span><strong>Offer on-chain payments by default</strong></span>
-                            <label class="toggle">
-                                <input type="checkbox" id="onchain-site-enabled">
-                                <span class="toggle-slider"></span>
-                            </label>
-                        </div>
-                        <div id="onchain-site-warning" style="display:none; margin-top:0.75rem; padding:0.75rem; border-radius:8px; background:rgba(245,158,11,0.12); border:1px solid rgba(245,158,11,0.35); font-size:0.85rem;">
-                            <strong>&#9888; Heads up.</strong>
-                            Not all wallets support Lightning. Disabling on-chain payments will
-                            mean some wallets can&rsquo;t make payment to you. Additionally, if your
-                            LNURL/noffer/mint is down, it may leave you with no way to accept payment.
-                        </div>
-                        <p class="form-help" style="margin-top: 0.5rem;">
-                            A store&rsquo;s xpub is still used for submarine-swap settlement even when
-                            on-chain checkout is off. Default on.
-                        </p>
-                        <button class="btn btn-full" id="btn-save-onchain-site" style="margin-top: 0.75rem;">
-                            Save on-chain default
-                        </button>
-                    </div>
-                </div>
                 <div class="card collapsible" data-admin-only="true" id="card-notifications">
                     <div class="card-header">
                         <div class="card-title">Email Notifications</div>
@@ -6715,216 +6660,6 @@ header('Cache-Control: no-cache, must-revalidate');
                     </div>
                 </div>
                 <?php endif; ?>
-
-                <!--
-                    Email notifications — site-wide master switch + per-type
-                    toggles + default "to" address. Per-store opt-in lives in
-                    the store-settings card; the master switch here gates
-                    everything.
-                -->
-                <!--
-                    Submarine swaps — site-wide master switch + provider
-                    preference order + strict fallback policy. Replaces the
-                    cashu mint in the LN invoice flow with a non-custodial
-                    LN→on-chain swap that settles directly to the merchant's
-                    xpub. Disabled by default. Per-store override lives in
-                    that store's settings card.
-                -->
-                <div class="card collapsible" data-admin-only="true" id="card-swaps">
-                    <div class="card-header">
-                        <div class="card-title">Submarine Swaps</div>
-                    </div>
-                    <div class="card-body">
-                        <p style="font-size: 0.85rem; color: var(--text-secondary); margin: 0 0 0.75rem 0;">
-                            Settle Lightning invoices on-chain directly to the merchant's xpub via
-                            a third-party swap provider (Zeus, Boltz). Eliminates the cashu mint as
-                            an intermediate custodian. Requires each store using swaps to have an
-                            on-chain xpub configured. See README for trade-offs.
-                        </p>
-                        <?php
-                        require_once __DIR__ . '/includes/onchain/wallet.php';
-                        $gmpEnvErrorSite = OnchainWallet::environmentError();
-                        ?>
-                        <?php if ($gmpEnvErrorSite !== null): ?>
-                            <div style="margin-bottom:0.75rem; padding:0.75rem; border-radius:8px; background:rgba(245,158,11,0.12); border:1px solid rgba(245,158,11,0.35); font-size:0.85rem;">
-                                <strong>&#9888; Swaps are unavailable on this server.</strong>
-                                <?= htmlspecialchars($gmpEnvErrorSite) ?>
-                                These settings are saved but won't take effect until it is enabled.
-                            </div>
-                        <?php endif; ?>
-
-                        <div class="toggle-container">
-                            <span><strong>Enable submarine swaps</strong> (site-wide default)</span>
-                            <label class="toggle">
-                                <input type="checkbox" id="swaps-enabled">
-                                <span class="toggle-slider"></span>
-                            </label>
-                        </div>
-
-                        <div class="form-group" style="margin-top: 1rem;">
-                            <label class="form-label">Providers</label>
-                            <div id="swaps-provider-checkboxes" style="display: flex; flex-direction: column; gap: 0.4rem; padding: 0.5rem 0;">
-                                <!-- populated by loadSwapSettings(); one checkbox per known provider -->
-                            </div>
-                            <p class="form-help">
-                                Each enabled provider is tried in the order shown. At invoice creation
-                                we use the first reachable one — unless the auto-select option below
-                                finds a meaningfully cheaper alternative.
-                            </p>
-                        </div>
-
-                        <div class="toggle-container" style="margin-top: 0.75rem;">
-                            <span><strong>Automatically select the cheapest swap provider</strong></span>
-                            <label class="toggle">
-                                <input type="checkbox" id="swaps-auto-select">
-                                <span class="toggle-slider"></span>
-                            </label>
-                        </div>
-                        <p class="form-help" style="margin-top: -0.25rem;">
-                            Fetches a quote from every enabled provider in parallel and prefers a
-                            cheaper one when it beats the highest-priority provider by more than the
-                            threshold below. Falls back to the priority order whenever a quote can't
-                            be fetched, so it never adds a new failure mode.
-                        </p>
-
-                        <div class="form-group" style="margin-top: 0.5rem;">
-                            <label class="form-label" for="swaps-auto-threshold">Minimum savings to switch providers (%)</label>
-                            <input type="number" class="form-input" id="swaps-auto-threshold"
-                                   min="1" max="90" step="1" value="10" style="max-width: 8rem;">
-                            <p class="form-help">
-                                How much cheaper a lower-priority provider must be before we
-                                use it instead. Default 10%.
-                            </p>
-                        </div>
-
-                        <div class="toggle-container" style="margin-top: 0.75rem;">
-                            <span>Strict mode (don't fall back to mint when no swap can be created)</span>
-                            <label class="toggle">
-                                <input type="checkbox" id="swaps-strict">
-                                <span class="toggle-slider"></span>
-                            </label>
-                        </div>
-
-                        <div class="form-group" style="margin-top: 1rem;">
-                            <label class="form-label">Minimum target (sats)</label>
-                            <input type="number" class="form-input" id="swaps-min-sats"
-                                   placeholder="provider default" min="0" step="1">
-                            <p class="form-help">
-                                Local floor in addition to the provider's own minimum. Leave blank
-                                to use the provider's minimum (Boltz mainnet: 10,000 sats).
-                            </p>
-                        </div>
-
-                        <div class="form-group" style="margin-top: 1rem; padding-top: 1rem; border-top: 1px solid var(--border-color, rgba(255,255,255,0.08));">
-                            <label class="form-label">Fall back to mint when swap fees are too high</label>
-                            <p class="form-help" style="margin-top: -0.25rem;">
-                                For small payments a swap can cost more than it's worth. When a store
-                                has a cashu mint enabled, a swap whose total cost (provider fee +
-                                miner fees) exceeds <em>either</em> threshold below is skipped and the
-                                customer is shown a mint Lightning invoice instead. Leave blank to
-                                inherit the config-file value; set 0 to disable a check. (No effect
-                                when strict mode above is on.)
-                            </p>
-                            <div style="display: flex; gap: 1rem; flex-wrap: wrap;">
-                                <div>
-                                    <label class="form-label" for="swaps-fee-max-pct">Max fee (% of amount)</label>
-                                    <input type="number" class="form-input" id="swaps-fee-max-pct"
-                                           min="0" max="100" step="0.1" style="max-width: 9rem;">
-                                </div>
-                                <div>
-                                    <label class="form-label" for="swaps-fee-max-sats">Max fee (sats)</label>
-                                    <input type="number" class="form-input" id="swaps-fee-max-sats"
-                                           min="0" step="1" style="max-width: 9rem;">
-                                </div>
-                            </div>
-                        </div>
-
-                        <div id="aw-site" data-aw data-aw-scope="site" style="margin-top: 1.5rem; padding-top: 1rem; border-top: 1px solid var(--border-color, rgba(255,255,255,0.08));">
-                            <p class="aw-title">auto-cashout settings (site-wide default for new stores)</p>
-                            <!-- Hidden boolean kept so the existing save_swaps flow keeps working:
-                                 Lightning column => unchecked, On-chain column => checked. -->
-                            <input type="checkbox" id="auto-melt-use-swap-default" style="display:none;">
-                            <div class="aw-cols">
-                                <div class="aw-col" data-aw-mode="0" tabindex="0" role="button" aria-pressed="false">
-                                    <span class="aw-col-check">&#10003;</span>
-                                    <div class="aw-col-head"><span class="aw-col-name">Lightning Withdrawal</span><span class="aw-col-badge">Suggested</span></div>
-                                    <div class="aw-col-desc">Withdraw to LNURL (lightning address) like myawesomestore@strike.me. Don&rsquo;t have a lightning address? Get one for free at <a class="aw-strike-link" href="http://strike.me" target="_blank" rel="noopener noreferrer">Strike</a> or <a href="https://coinos.io/" target="_blank" rel="noopener noreferrer">CoinOS</a> (all merchants).</div>
-                                    <ul>
-                                        <li>Get your funds the fastest</li>
-                                        <li>Automatic conversion to USD on Strike</li>
-                                        <li>Lowest fees</li>
-                                    </ul>
-                                </div>
-                                <div class="aw-col" data-aw-mode="1" tabindex="0" role="button" aria-pressed="false">
-                                    <span class="aw-col-check">&#10003;</span>
-                                    <div class="aw-col-head"><span class="aw-col-name">On-chain Withdrawal</span></div>
-                                    <div class="aw-col-desc">Withdraw to On-chain Address (via submarine swap to the store's on-chain xpub).</div>
-                                    <ul>
-                                        <li>Slower funds transfers</li>
-                                        <li>Works with all Bitcoin wallets</li>
-                                        <li>Funds may sit in the mint until sufficient for the on-chain transaction fee (custodial risk)</li>
-                                    </ul>
-                                </div>
-                            </div>
-                            <p class="form-help" style="margin-top: 0.6rem;">
-                                Default for new stores; each store can override on its dashboard. On-chain
-                                requires site-wide swaps enabled (above) and the store to have an on-chain xpub.
-                                During high-fee periods sweeps are deferred until the swap cost is
-                                ≤ <strong id="auto-melt-swap-max-fee-pct-display">1%</strong> of the sweep amount.
-                                Minimum sweep: <strong id="auto-melt-swap-min-sats-display">5,000</strong> sats
-                                (~$5).
-                            </p>
-                        </div>
-
-                        <button class="btn btn-full" id="btn-save-swaps" style="margin-top: 1rem;">
-                            Save swap settings
-                        </button>
-                    </div>
-                </div>
-
-                <!--
-                    Self-serve invoices — site-wide master switch + per-invoice
-                    maximum. Per-store override lives in that store's settings card.
-                -->
-                <div class="card collapsible" data-admin-only="true" id="card-selfserve">
-                    <div class="card-header">
-                        <div class="card-title">Self-Serve Invoices</div>
-                    </div>
-                    <div class="card-body">
-                        <p style="font-size: 0.85rem; color: var(--text-secondary); margin: 0 0 0.75rem 0;">
-                            Let customers create and pay their own invoice from a public link
-                            (/pay/&lt;store&gt;), without logging in. They choose the amount, currency
-                            and an optional note. Disabled by default. Each store can override this in
-                            its own settings card; the link is shown there once enabled.
-                        </p>
-
-                        <div class="toggle-container">
-                            <span><strong>Enable self-serve invoices</strong> (site-wide default)</span>
-                            <label class="toggle">
-                                <input type="checkbox" id="selfserve-enabled">
-                                <span class="toggle-slider"></span>
-                            </label>
-                        </div>
-
-                        <p class="form-help" style="margin-top: 0.5rem;">
-                            To get the self-serve invoice URL, go to settings for the individual store.
-                        </p>
-
-                        <div class="form-group" style="margin-top: 1rem;">
-                            <label class="form-label" for="selfserve-max-sats">Maximum invoice (sats)</label>
-                            <input type="number" class="form-input" id="selfserve-max-sats"
-                                   min="1" step="1" placeholder="500000">
-                            <p class="form-help">
-                                Caps how much a single self-serve invoice can lock up. Leave blank for
-                                the default (500,000 sats).
-                            </p>
-                        </div>
-
-                        <button class="btn btn-full" id="btn-save-selfserve" style="margin-top: 1rem;">
-                            Save self-serve settings
-                        </button>
-                    </div>
-                </div>
 
                 <!-- My Account card: own password + logout, available to every logged-in user -->
                 <?php if (!Urls::isWordPress()): ?>
@@ -8089,6 +7824,8 @@ header('Cache-Control: no-cache, must-revalidate');
 
             // Settings
             document.getElementById('btn-save-auto-melt').addEventListener('click', saveAutoMelt);
+            const btnSaveLightning = document.getElementById('btn-save-lightning-payments');
+            if (btnSaveLightning) btnSaveLightning.addEventListener('click', saveLightningPayments);
             const btnAddLnAddr = document.getElementById('btn-add-ln-address');
             if (btnAddLnAddr) btnAddLnAddr.addEventListener('click', addLnAddressRow);
             const btnAddNoffer = document.getElementById('btn-add-noffer');
@@ -8101,16 +7838,12 @@ header('Cache-Control: no-cache, must-revalidate');
             if (autoMeltModeSel) autoMeltModeSel.addEventListener('change', () => {
                 if (!dashboardData || !dashboardData.autoMelt) return;
                 const v = parseInt(autoMeltModeSel.value, 10);
-                // Recompute effective from override + site default for the live preview.
-                let mode;
-                if (v === 1) mode = 'swap';
-                else if (v === 0) mode = 'lightning';
-                else mode = dashboardData.autoMelt.siteSwapDefault ? 'swap' : 'lightning';
+                const mode = (v === 1) ? 'swap' : 'lightning';
                 dashboardData.autoMelt = { ...dashboardData.autoMelt, modeOverride: v, mode };
                 renderAutoMeltMode();
             });
             // Wire collapsible cards/subsections and the auto-cashout column
-            // selectors (both the store and site-wide instances).
+            // selector.
             wireCollapsibles();
             wireAwSelectors();
             const saveStoreNotifsBtn = document.getElementById('btn-save-store-notifications');
@@ -8129,20 +7862,12 @@ header('Cache-Control: no-cache, must-revalidate');
             if (saveNotifsBtn) saveNotifsBtn.addEventListener('click', saveNotificationSettings);
             const saveDevBtn = document.getElementById('btn-save-developer');
             if (saveDevBtn) saveDevBtn.addEventListener('click', saveDeveloperSettings);
-            const saveOnchainSiteBtn = document.getElementById('btn-save-onchain-site');
-            if (saveOnchainSiteBtn) saveOnchainSiteBtn.addEventListener('click', saveOnchainSiteSettings);
-            const onchainSiteCb = document.getElementById('onchain-site-enabled');
-            if (onchainSiteCb) onchainSiteCb.addEventListener('change', updateOnchainSiteWarning);
             const testNotifsBtn = document.getElementById('btn-send-test-notification');
             if (testNotifsBtn) testNotifsBtn.addEventListener('click', sendTestNotification);
-            const saveSwapsBtn = document.getElementById('btn-save-swaps');
-            if (saveSwapsBtn) saveSwapsBtn.addEventListener('click', saveSwapSettings);
             const saveStoreSwapsBtn = document.getElementById('btn-save-store-swaps');
             if (saveStoreSwapsBtn) saveStoreSwapsBtn.addEventListener('click', saveStoreSwaps);
             const revealSeedBtn = document.getElementById('btn-reveal-store-seed');
             if (revealSeedBtn) revealSeedBtn.addEventListener('click', revealStoreSeed);
-            const saveSelfServeBtn = document.getElementById('btn-save-selfserve');
-            if (saveSelfServeBtn) saveSelfServeBtn.addEventListener('click', saveSelfServeSettings);
             const saveStoreSelfServeBtn = document.getElementById('btn-save-store-selfserve');
             if (saveStoreSelfServeBtn) saveStoreSelfServeBtn.addEventListener('click', saveStoreSelfServe);
             const copySelfServeLinkBtn = document.getElementById('btn-copy-selfserve-link');
@@ -8381,9 +8106,6 @@ header('Cache-Control: no-cache, must-revalidate');
                     loadAutoUpdateCard();
                     loadNotificationSettings();
                     loadDeveloperSettings();
-                    loadOnchainSiteSettings();
-                    loadSwapSettings();
-                    loadSelfServeSettings();
                 }
             }
         }
@@ -10691,29 +10413,23 @@ header('Cache-Control: no-cache, must-revalidate');
                 staticMeta.textContent =
                     'Paste a single Bitcoin address you control. The server will reuse it for every invoice. Leave blank to disable on-chain payments.';
             }
-            // "Offer on-chain to customers" tri-state override.
+            // "Offer on-chain to customers" per-store flag.
             const offerSel = document.getElementById('onchain-offer-override');
-            const offerDef = document.getElementById('onchain-offer-site-default');
             const offerEff = document.getElementById('onchain-offer-effective');
-            if (offerSel) offerSel.value = String(oc.offerOverride ?? -1);
-            if (offerDef) offerDef.textContent = oc.offerSiteDefault ? 'on' : 'off';
-            if (offerEff) offerEff.textContent = oc.offerEffective ? 'on' : 'off';
+            if (offerSel) offerSel.value = oc.offerEnabled ? '1' : '0';
+            if (offerEff) offerEff.textContent = oc.offerEnabled ? 'on' : 'off';
             updateOnchainOfferWarning();
             applyOnchainModeVisibility();
         }
 
-        // Show the "some wallets can't pay you" warning whenever on-chain would
-        // be OFF for this store (either forced off, or inheriting an off site
-        // default). Computed from the current select value so it reacts before
-        // the save round-trips.
+        // Show the "some wallets can't pay you" warning whenever on-chain is
+        // OFF for this store. Computed from the current select value so it
+        // reacts before the save round-trips.
         function updateOnchainOfferWarning() {
-            const oc = dashboardData?.onchain;
             const sel = document.getElementById('onchain-offer-override');
             const warn = document.getElementById('onchain-offer-warning');
             if (!sel || !warn) return;
-            const v = sel.value;
-            const effectiveOff = v === '0' || (v === '-1' && oc && !oc.offerSiteDefault);
-            warn.style.display = effectiveOff ? 'block' : 'none';
+            warn.style.display = sel.value === '0' ? 'block' : 'none';
         }
 
         function onchainOfferChanged() {
@@ -10726,10 +10442,10 @@ header('Cache-Control: no-cache, must-revalidate');
                 showToast('No store selected', 'error');
                 return;
             }
-            const tri = document.getElementById('onchain-offer-override').value;
+            const enabled = document.getElementById('onchain-offer-override').value;
             try {
                 const response = await postWithCsrf(adminUrl,
-                    `action=save_onchain_offer&store_id=${encodeURIComponent(currentStoreId)}&offer_enabled=${encodeURIComponent(tri)}`);
+                    `action=save_onchain_offer&store_id=${encodeURIComponent(currentStoreId)}&offer_enabled=${encodeURIComponent(enabled)}`);
                 const result = await response.json();
                 if (response.ok && result.success) {
                     showToast('On-chain payment setting saved', 'success');
@@ -10946,15 +10662,15 @@ header('Cache-Control: no-cache, must-revalidate');
             }
         }
 
-        async function saveAutoMelt() {
+        // Save the "Lightning payments" card: the ordered destination chain
+        // (LNURL addresses, NWC connections, CLINK noffers). Used both for
+        // invoice receive routing and the Lightning auto-cashout rail.
+        async function saveLightningPayments() {
             if (!currentStoreId) {
                 showToast('No store selected', 'error');
                 return;
             }
-            clearAwError('aw-store-error');
-            const mintUnit = dashboardData?.mintUnit || 'sat';
-            const enabled = document.getElementById('auto-melt-enabled').checked ? '1' : '0';
-            const modeOverride = document.getElementById('auto-melt-mode-override').value;
+            clearAwError('lightning-payments-error');
 
             // Pull the ordered, non-blank addresses straight from the live rows
             // so what the operator sees is exactly what's saved.
@@ -10975,60 +10691,45 @@ header('Cache-Control: no-cache, must-revalidate');
 
             // Validate each section against its own type before saving so bad
             // data surfaces inline rather than failing silently on the server.
-            if (modeOverride === '0') {
-                if (enabled === '1' && lnAddresses.length === 0 && noffers.length === 0 && nwcEntries.length === 0) {
-                    return awError('aw-store-error', 'Add at least one lightning address, NWC connection, or noffer to withdraw to.');
+            for (const a of lnAddresses) {
+                if (isNofferValue(a)) {
+                    const nofferGated = !!document.getElementById('auto-melt-noffer-group')?.dataset.envError;
+                    return awError('lightning-payments-error', nofferGated
+                        ? `"${a}" is a CLINK noffer — those are unavailable on this server (see the CLINK noffers section).`
+                        : `"${a}" is a CLINK noffer — add it in the CLINK noffers section, not Lightning Addresses.`);
                 }
-                for (const a of lnAddresses) {
-                    if (isNofferValue(a)) {
-                        const nofferGated = !!document.getElementById('auto-melt-noffer-group')?.dataset.envError;
-                        return awError('aw-store-error', nofferGated
-                            ? `"${a}" is a CLINK noffer — those are unavailable on this server (see the CLINK noffers section).`
-                            : `"${a}" is a CLINK noffer — add it in the CLINK noffers section, not Lightning Addresses.`);
-                    }
-                    if (!isValidLightningAddress(a)) {
-                        return awError('aw-store-error', `"${a}" doesn't look like a valid lightning address (name@domain.tld).`);
-                    }
-                }
-                for (const n of noffers) {
-                    if (!isNofferValue(n)) {
-                        return awError('aw-store-error', `"${n}" doesn't look like a valid CLINK noffer (noffer1…).`);
-                    }
-                }
-                for (const w of nwcEntries) {
-                    if (w.startsWith('keep:')) continue; // saved row reference
-                    if (!isNwcValue(w)) {
-                        // Don't echo the paste back — a malformed NWC string may
-                        // still contain the wallet secret.
-                        return awError('aw-store-error', 'That NWC entry doesn\'t look like a valid connection string (nostr+walletconnect://…).');
-                    }
-                }
-                // Reject duplicates (case-insensitive) across the lists — the
-                // combined chain should never contain the same destination
-                // twice. (NWC duplicates are caught server-side, where the
-                // stored values behind keep: refs are known.)
-                const all = lnAddresses.concat(noffers).map(a => a.toLowerCase());
-                const dup = all.find((a, i) => all.indexOf(a) !== i);
-                if (dup) {
-                    return awError('aw-store-error', `Duplicate destination: ${dup}`);
-                }
-            } else if (modeOverride === '1') {
-                if (!storeHasOnchain()) {
-                    return awError('aw-store-error', 'On-chain withdrawal needs an on-chain xpub or address. Add one in the On-chain Bitcoin payments section first.');
+                if (!isValidLightningAddress(a)) {
+                    return awError('lightning-payments-error', `"${a}" doesn't look like a valid lightning address (name@domain.tld).`);
                 }
             }
-
-            // Convert threshold to smallest unit (cents for fiat)
-            const threshold = parseAmount(document.getElementById('auto-melt-threshold').value, mintUnit);
+            for (const n of noffers) {
+                if (!isNofferValue(n)) {
+                    return awError('lightning-payments-error', `"${n}" doesn't look like a valid CLINK noffer (noffer1…).`);
+                }
+            }
+            for (const w of nwcEntries) {
+                if (w.startsWith('keep:')) continue; // saved row reference
+                if (!isNwcValue(w)) {
+                    // Don't echo the paste back — a malformed NWC string may
+                    // still contain the wallet secret.
+                    return awError('lightning-payments-error', 'That NWC entry doesn\'t look like a valid connection string (nostr+walletconnect://…).');
+                }
+            }
+            // Reject duplicates (case-insensitive) across the lists — the
+            // combined chain should never contain the same destination
+            // twice. (NWC duplicates are caught server-side, where the
+            // stored values behind keep: refs are known.)
+            const all = lnAddresses.concat(noffers).map(a => a.toLowerCase());
+            const dup = all.find((a, i) => all.indexOf(a) !== i);
+            if (dup) {
+                return awError('lightning-payments-error', `Duplicate destination: ${dup}`);
+            }
 
             try {
-                let body = `action=save_auto_melt&store_id=${encodeURIComponent(currentStoreId)}`
-                    + `&enabled=${enabled}`
-                    + `&threshold=${threshold}`
-                    + `&mode_override=${encodeURIComponent(modeOverride)}`;
-                // Send the two ordered lists separately; the server appends
-                // noffers after the addresses (LN first, noffers as fallback).
-                // Empty lists clear the chain.
+                let body = `action=save_lightning_payments&store_id=${encodeURIComponent(currentStoreId)}`;
+                // Send the three ordered lists separately; the server chains
+                // them addresses-first, then NWC, noffers last. Empty lists
+                // clear the chain.
                 for (const a of lnAddresses) {
                     body += `&ln_addresses%5B%5D=${encodeURIComponent(a)}`;
                 }
@@ -11096,6 +10797,63 @@ header('Cache-Control: no-cache, must-revalidate');
             }
         }
 
+        // Save the "Cashu automatic cashout" card: withdrawal mode, enable
+        // toggle and threshold. The destination chain itself is saved by
+        // saveLightningPayments above.
+        async function saveAutoMelt() {
+            if (!currentStoreId) {
+                showToast('No store selected', 'error');
+                return;
+            }
+            clearAwError('aw-store-error');
+            const mintUnit = dashboardData?.mintUnit || 'sat';
+            const enabled = document.getElementById('auto-melt-enabled').checked ? '1' : '0';
+            const modeOverride = document.getElementById('auto-melt-mode-override').value;
+
+            if (modeOverride === '0') {
+                // Lightning cashout needs at least one destination in the
+                // Lightning payments section (saved rows or unsaved edits).
+                syncLnAddressesFromInputs();
+                syncNoffersFromInputs();
+                syncNwcFromInputs();
+                const haveDestinations =
+                    awLnAddresses.some(a => (a.address || '').trim().length > 0)
+                    || awNoffers.some(a => (a.address || '').trim().length > 0)
+                    || awNwc.some(a => a.ref || (a.uri || '').trim().length > 0);
+                if (enabled === '1' && !haveDestinations) {
+                    return awError('aw-store-error', 'Add at least one lightning address, NWC connection, or noffer in the Lightning payments section to withdraw to.');
+                }
+            } else if (modeOverride === '1') {
+                if (!storeHasOnchain()) {
+                    return awError('aw-store-error', 'On-chain withdrawal needs an on-chain xpub or address. Add one in the On-chain Bitcoin payments section first.');
+                }
+            }
+
+            // Convert threshold to smallest unit (cents for fiat)
+            const threshold = parseAmount(document.getElementById('auto-melt-threshold').value, mintUnit);
+
+            try {
+                const body = `action=save_auto_melt&store_id=${encodeURIComponent(currentStoreId)}`
+                    + `&enabled=${enabled}`
+                    + `&threshold=${threshold}`
+                    + `&mode_override=${encodeURIComponent(modeOverride)}`;
+
+                const response = await postWithCsrf(adminUrl, body);
+                const result = await response.json();
+
+                if (response.ok) {
+                    showToast('Settings saved!', 'success');
+                    // Reload dashboard so the effective-mode badge reflects the
+                    // save.
+                    if (typeof loadDashboard === 'function') loadDashboard();
+                } else {
+                    showToast(result.error || 'Failed to save', 'error');
+                }
+            } catch (e) {
+                showToast('Failed to save settings', 'error');
+            }
+        }
+
         // ---- Auto-cashout column selector + collapsible sections ----
 
         function isValidLightningAddress(addr) {
@@ -11134,8 +10892,8 @@ header('Cache-Control: no-cache, must-revalidate');
         }
 
         // User picked a column. Reflect it into the hidden control that the
-        // existing save flow reads, and (for the store) fire the live-preview
-        // 'change' listener so the effective-mode hint updates immediately.
+        // existing save flow reads, and fire the live-preview 'change'
+        // listener so the effective-mode hint updates immediately.
         function selectAwColumn(container, mode) {
             const scope = container.getAttribute('data-aw-scope');
             highlightAwColumn(container, mode);
@@ -11146,9 +10904,6 @@ header('Cache-Control: no-cache, must-revalidate');
                     hidden.value = String(mode);
                     hidden.dispatchEvent(new Event('change'));
                 }
-            } else if (scope === 'site') {
-                const cb = document.getElementById('auto-melt-use-swap-default');
-                if (cb) cb.checked = String(mode) === '1';
             }
         }
 
@@ -11608,32 +11363,32 @@ header('Cache-Control: no-cache, must-revalidate');
         }
 
         /**
-         * Populate the auto-melt card from dashboardData.autoMelt. Toggles
-         * the LN-address vs swap-mode hint pane based on the effective mode,
-         * and updates the inherit-default label so the dropdown reflects what
-         * the site default actually resolves to right now.
+         * Populate the cashout card from dashboardData.autoMelt: mode
+         * selection, effective-mode hint, swap-mode blurb, and the
+         * greyed-out state when the store has no Cashu mint wallet.
          */
         function renderAutoMeltMode() {
             const am = dashboardData && dashboardData.autoMelt;
             if (!am) return;
             const modeEl = document.getElementById('auto-melt-mode-override');
             if (modeEl) modeEl.value = String(am.modeOverride);
-            const defLabel = document.getElementById('auto-melt-mode-default-label');
-            if (defLabel) defLabel.textContent = am.siteSwapDefault ? 'On-chain via swap' : 'Lightning address';
             const effLabel = document.getElementById('auto-melt-mode-effective');
             if (effLabel) effLabel.textContent = (am.mode === 'swap') ? 'On-chain via submarine swap' : 'Lightning address';
-            const addrGroup = document.getElementById('auto-melt-address-group');
-            const nofferGroup = document.getElementById('auto-melt-noffer-group');
             const swapInfo = document.getElementById('auto-melt-swap-info');
-            if (am.mode === 'swap') {
-                if (addrGroup) addrGroup.style.display = 'none';
-                if (nofferGroup) nofferGroup.style.display = 'none';
-                if (swapInfo) swapInfo.style.display = 'block';
-            } else {
-                if (addrGroup) addrGroup.style.display = '';
-                if (nofferGroup) nofferGroup.style.display = '';
-                if (swapInfo) swapInfo.style.display = 'none';
+            if (swapInfo) swapInfo.style.display = (am.mode === 'swap') ? 'block' : 'none';
+
+            // Grey the whole card out when Cashu is disabled for this store
+            // (no mint wallet). The server-rendered env gate (no GMP/BCMath)
+            // wins — it already made the body inert, so don't fight it.
+            const cashuBody = document.getElementById('cashu-cashout-body');
+            const mintWarn = document.getElementById('cashu-cashout-mint-warning');
+            if (cashuBody && !cashuBody.dataset.envError) {
+                const hasMint = !!(dashboardData && dashboardData.storeConfigured);
+                cashuBody.style.opacity = hasMint ? '' : '0.5';
+                cashuBody.style.pointerEvents = hasMint ? '' : 'none';
+                if (mintWarn) mintWarn.classList.toggle('hidden', hasMint);
             }
+
             const minSatsEl = document.getElementById('auto-melt-mode-min-sats');
             if (minSatsEl && am.swapMinSats != null) minSatsEl.textContent = Number(am.swapMinSats).toLocaleString();
             const maxPctEl = document.getElementById('auto-melt-mode-max-fee-pct');
@@ -11884,194 +11639,77 @@ header('Cache-Control: no-cache, must-revalidate');
             }
         }
 
-        // -------- Site-wide on-chain payment default --------
-
-        function updateOnchainSiteWarning() {
-            const cb = document.getElementById('onchain-site-enabled');
-            const warn = document.getElementById('onchain-site-warning');
-            if (cb && warn) warn.style.display = cb.checked ? 'none' : 'block';
-        }
-
-        async function loadOnchainSiteSettings() {
-            try {
-                const response = await postWithCsrf(adminUrl, 'action=get_onchain_site_settings');
-                if (!response.ok) return;
-                const data = await response.json();
-                document.getElementById('onchain-site-enabled').checked = !!data.onchainPaymentsEnabled;
-                updateOnchainSiteWarning();
-            } catch (e) {
-                console.error('Failed to load on-chain site settings', e);
-            }
-        }
-
-        async function saveOnchainSiteSettings() {
-            const params = new URLSearchParams({
-                action: 'save_onchain_site_settings',
-                onchain_payments_enabled: document.getElementById('onchain-site-enabled').checked ? '1' : '0',
-            });
-            try {
-                const response = await postWithCsrf(adminUrl, params.toString());
-                const result = await response.json();
-                if (response.ok && result.success) {
-                    showToast('On-chain default saved!', 'success');
-                    loadOnchainSiteSettings();
-                } else {
-                    showToast(result.error || 'Failed to save', 'error');
-                }
-            } catch (e) {
-                showToast('Failed to save on-chain default', 'error');
-            }
-        }
-
         // -------- Submarine swap settings --------
-
-        async function loadSwapSettings() {
-            try {
-                // POST via postWithCsrf — get_swap_settings lives in the POST
-                // action dispatcher, and GET ?action=... is intercepted by the
-                // path-based admin router as a page nav.
-                const response = await postWithCsrf(adminUrl, 'action=get_swap_settings');
-                if (!response.ok) return;
-                const data = await response.json();
-                const enabledEl = document.getElementById('swaps-enabled');
-                const strictEl = document.getElementById('swaps-strict');
-                const minEl = document.getElementById('swaps-min-sats');
-                const autoEl = document.getElementById('swaps-auto-select');
-                const thresholdEl = document.getElementById('swaps-auto-threshold');
-                if (enabledEl) enabledEl.checked = !!data.enabled;
-                if (strictEl) strictEl.checked = !!data.strictNoMintFallback;
-                if (minEl) minEl.value = data.minimumTargetSats ?? '';
-                if (autoEl) autoEl.checked = data.autoSelectCheapest !== false; // default true
-                if (thresholdEl) thresholdEl.value = data.autoSelectThresholdPct ?? 10;
-                // Fee-too-high → mint fallback. Show the raw site value (blank
-                // when inheriting); reflect the config-file/built-in default in
-                // the placeholder so operators see what "blank" resolves to.
-                const feePctEl = document.getElementById('swaps-fee-max-pct');
-                const feeSatsEl = document.getElementById('swaps-fee-max-sats');
-                if (feePctEl) {
-                    feePctEl.value = (data.feeFallbackMaxPct ?? '') === '' ? '' : data.feeFallbackMaxPct;
-                    feePctEl.placeholder = data.feeFallbackMaxPctDefault > 0
-                        ? `inherit (${data.feeFallbackMaxPctDefault})` : 'off';
-                }
-                if (feeSatsEl) {
-                    feeSatsEl.value = (data.feeFallbackMaxSats ?? '') === '' ? '' : data.feeFallbackMaxSats;
-                    feeSatsEl.placeholder = data.feeFallbackMaxSatsDefault > 0
-                        ? `inherit (${data.feeFallbackMaxSatsDefault})` : 'off';
-                }
-                const autoMeltSwapEl = document.getElementById('auto-melt-use-swap-default');
-                if (autoMeltSwapEl) autoMeltSwapEl.checked = !!data.autoMeltUseSwapDefault;
-                // Reflect the site default into the auto-cashout column selector.
-                highlightAwColumn(awContainer('site'), data.autoMeltUseSwapDefault ? 1 : 0);
-                const minSatsDisp = document.getElementById('auto-melt-swap-min-sats-display');
-                if (minSatsDisp && data.autoMeltSwapMinSats != null) {
-                    minSatsDisp.textContent = Number(data.autoMeltSwapMinSats).toLocaleString();
-                }
-                const maxPctDisp = document.getElementById('auto-melt-swap-max-fee-pct-display');
-                if (maxPctDisp && data.autoMeltSwapMaxFeePct != null) {
-                    maxPctDisp.textContent = data.autoMeltSwapMaxFeePct + '%';
-                }
-                if (autoEl && thresholdEl) {
-                    const sync = () => { thresholdEl.disabled = !autoEl.checked; };
-                    sync();
-                    autoEl.onchange = sync;
-                }
-
-                // Render provider checkboxes. Order: providerOrder (enabled, in
-                // preference order) first, then the rest of knownProviders
-                // disabled-by-default.
-                const known = (data.knownProviders || []);
-                const order = (data.providerOrder || []);
-                const enabledSet = new Set(order);
-                const renderedOrder = [...order, ...known.filter(p => !enabledSet.has(p))];
-                const container = document.getElementById('swaps-provider-checkboxes');
-                if (container) {
-                    container.innerHTML = '';
-                    renderedOrder.forEach(name => {
-                        const label = document.createElement('label');
-                        label.style.display = 'flex';
-                        label.style.alignItems = 'center';
-                        label.style.gap = '0.5rem';
-                        label.style.cursor = 'pointer';
-                        const cb = document.createElement('input');
-                        cb.type = 'checkbox';
-                        cb.value = name;
-                        cb.checked = enabledSet.has(name);
-                        cb.dataset.providerName = name;
-                        label.appendChild(cb);
-                        label.appendChild(document.createTextNode(' ' + name));
-                        container.appendChild(label);
-                    });
-                }
-            } catch (e) {
-                console.error('Failed to load swap settings', e);
-            }
-        }
-
-        async function saveSwapSettings() {
-            const enabled = document.getElementById('swaps-enabled').checked ? '1' : '0';
-            const strict = document.getElementById('swaps-strict').checked ? '1' : '0';
-            const autoSelect = document.getElementById('swaps-auto-select').checked ? '1' : '0';
-            const threshold = document.getElementById('swaps-auto-threshold').value.trim();
-            // Build the provider list from checked checkboxes, preserving the
-            // DOM order (the checkboxes were rendered with the saved order first).
-            const checked = Array.from(document.querySelectorAll(
-                '#swaps-provider-checkboxes input[type=checkbox]:checked'))
-                .map(cb => cb.value);
-            const order = checked.join(',');
-            const minSats = document.getElementById('swaps-min-sats').value.trim();
-            const feeMaxPct = document.getElementById('swaps-fee-max-pct').value.trim();
-            const feeMaxSats = document.getElementById('swaps-fee-max-sats').value.trim();
-            const autoMeltSwapDefault = document.getElementById('auto-melt-use-swap-default').checked ? '1' : '0';
-            try {
-                const response = await postWithCsrf(adminUrl,
-                    `action=save_swap_settings`
-                    + `&enabled=${enabled}`
-                    + `&strict_no_mint_fallback=${strict}`
-                    + `&provider_order=${encodeURIComponent(order)}`
-                    + `&minimum_target_sats=${encodeURIComponent(minSats)}`
-                    + `&auto_select_cheapest=${autoSelect}`
-                    + `&auto_select_threshold_pct=${encodeURIComponent(threshold)}`
-                    + `&fee_fallback_max_pct=${encodeURIComponent(feeMaxPct)}`
-                    + `&fee_fallback_max_sats=${encodeURIComponent(feeMaxSats)}`
-                    + `&auto_melt_use_swap_default=${autoMeltSwapDefault}`
-                );
-                const result = await response.json();
-                if (response.ok) {
-                    showToast('Swap settings saved!', 'success');
-                } else {
-                    showToast(result.error || 'Failed to save', 'error');
-                }
-            } catch (e) {
-                showToast('Failed to save swap settings', 'error');
-            }
-        }
 
         function refreshStoreSwapsCard() {
             // Driven by dashboardData.swaps once loaded.
             if (!dashboardData || !dashboardData.swaps) return;
-            const sel = document.getElementById('store-swaps-override');
-            const eff = document.getElementById('store-swaps-effective');
-            const def = document.getElementById('store-swaps-site-default');
-            if (sel) sel.value = String(dashboardData.swaps.override);
-            if (eff) eff.textContent = dashboardData.swaps.effective ? 'on' : 'off';
-            if (def) def.textContent = dashboardData.swaps.siteDefault ? 'on' : 'off';
-            // Fee-too-high → mint fallback per-store overrides.
             const s = dashboardData.swaps;
+            const enabledEl = document.getElementById('store-swaps-enabled');
+            const eff = document.getElementById('store-swaps-effective');
+            if (enabledEl) enabledEl.checked = !!s.enabled;
+            if (eff) eff.textContent = s.effective ? 'on' : 'off';
+
+            // Provider checkboxes. Order: providerOrder (enabled, in
+            // preference order) first, then the rest of knownProviders
+            // disabled-by-default.
+            const known = (s.knownProviders || []);
+            const order = (s.providerOrder || []);
+            const enabledSet = new Set(order);
+            const renderedOrder = [...order, ...known.filter(p => !enabledSet.has(p))];
+            const container = document.getElementById('store-swaps-provider-checkboxes');
+            if (container) {
+                container.innerHTML = '';
+                renderedOrder.forEach(name => {
+                    const label = document.createElement('label');
+                    label.style.display = 'flex';
+                    label.style.alignItems = 'center';
+                    label.style.gap = '0.5rem';
+                    label.style.cursor = 'pointer';
+                    const cb = document.createElement('input');
+                    cb.type = 'checkbox';
+                    cb.value = name;
+                    cb.checked = enabledSet.has(name);
+                    cb.dataset.providerName = name;
+                    label.appendChild(cb);
+                    label.appendChild(document.createTextNode(' ' + name));
+                    container.appendChild(label);
+                });
+            }
+
+            const autoEl = document.getElementById('store-swaps-auto-select');
+            const thresholdEl = document.getElementById('store-swaps-auto-threshold');
+            if (autoEl) autoEl.checked = s.autoSelectCheapest !== false; // default true
+            if (thresholdEl) thresholdEl.value = s.autoSelectThresholdPct ?? 10;
+            if (autoEl && thresholdEl) {
+                const sync = () => { thresholdEl.disabled = !autoEl.checked; };
+                sync();
+                autoEl.onchange = sync;
+            }
+            const minEl = document.getElementById('store-swaps-min-sats');
+            if (minEl) minEl.value = s.minimumTargetSats ?? '';
+
+            // Fee-too-high → mint fallback per-store values. Blank inherits
+            // the config-file constant, reflected in the placeholder.
             const fpct = document.getElementById('store-swaps-fee-pct');
             const fsats = document.getElementById('store-swaps-fee-sats');
             const feff = document.getElementById('store-swaps-fee-effective');
-            if (fpct) fpct.value = (s.feeFallbackMaxPct ?? null) === null ? '' : s.feeFallbackMaxPct;
-            if (fsats) fsats.value = (s.feeFallbackMaxSats ?? null) === null ? '' : s.feeFallbackMaxSats;
+            if (fpct) {
+                fpct.value = (s.feeFallbackMaxPct ?? null) === null ? '' : s.feeFallbackMaxPct;
+                fpct.placeholder = s.feeFallbackDefaultPct > 0 ? `default (${s.feeFallbackDefaultPct})` : 'off';
+            }
+            if (fsats) {
+                fsats.value = (s.feeFallbackMaxSats ?? null) === null ? '' : s.feeFallbackMaxSats;
+                fsats.placeholder = s.feeFallbackDefaultSats > 0 ? `default (${s.feeFallbackDefaultSats})` : 'off';
+            }
             if (feff) {
                 const pctTxt = s.feeFallbackEffectivePct > 0 ? (s.feeFallbackEffectivePct + '%') : 'off';
                 const satsTxt = s.feeFallbackEffectiveSats > 0 ? (Number(s.feeFallbackEffectiveSats).toLocaleString() + ' sat') : 'off';
                 feff.textContent = `${pctTxt} / ${satsTxt}`;
             }
-            // Per-store strict-no-mint-fallback tri-state.
+            // Per-store strict-no-mint-fallback flag.
             const strictSel = document.getElementById('store-swaps-strict');
-            const strictEff = document.getElementById('store-swaps-strict-effective');
-            if (strictSel) strictSel.value = String(s.strictOverride);
-            if (strictEff) strictEff.textContent = s.strictEffective ? 'strict (no mint fallback)' : 'mint fallback allowed';
+            if (strictSel) strictSel.value = s.strict ? '1' : '0';
             // A revealed phrase belongs to the store it was revealed for, so
             // clear it whenever the settings panel re-binds to a store.
             resetStoreSeedCard();
@@ -12132,17 +11770,33 @@ header('Cache-Control: no-cache, must-revalidate');
                 return;
             }
             clearAwError('store-swaps-error');
-            const override = document.getElementById('store-swaps-override').value;
-            // Forcing swaps on requires an on-chain address; warn + don't save.
-            if (override === '1' && !storeHasOnchain()) {
+            const enabled = document.getElementById('store-swaps-enabled').checked ? '1' : '0';
+            // Turning swaps on requires an on-chain address; warn + don't save.
+            if (enabled === '1' && !storeHasOnchain()) {
                 return awError('store-swaps-error', 'Submarine swaps require an on-chain xpub or address on the Bitcoin tab.');
             }
+            // Provider list from checked checkboxes, preserving the DOM order
+            // (the checkboxes were rendered with the saved order first).
+            const order = Array.from(document.querySelectorAll(
+                '#store-swaps-provider-checkboxes input[type=checkbox]:checked'))
+                .map(cb => cb.value)
+                .join(',');
+            if (enabled === '1' && !order) {
+                return awError('store-swaps-error', 'Select at least one swap provider.');
+            }
+            const autoSelect = document.getElementById('store-swaps-auto-select').checked ? '1' : '0';
+            const threshold = document.getElementById('store-swaps-auto-threshold').value.trim();
+            const minSats = document.getElementById('store-swaps-min-sats').value.trim();
             const feePct = document.getElementById('store-swaps-fee-pct').value.trim();
             const feeSats = document.getElementById('store-swaps-fee-sats').value.trim();
             const strict = document.getElementById('store-swaps-strict').value;
             try {
                 const response = await postWithCsrf(adminUrl,
-                    `action=save_store_swaps&store_id=${encodeURIComponent(currentStoreId)}&override=${encodeURIComponent(override)}`
+                    `action=save_store_swaps&store_id=${encodeURIComponent(currentStoreId)}&enabled=${encodeURIComponent(enabled)}`
+                    + `&provider_order=${encodeURIComponent(order)}`
+                    + `&auto_select_cheapest=${autoSelect}`
+                    + `&auto_select_threshold_pct=${encodeURIComponent(threshold)}`
+                    + `&minimum_target_sats=${encodeURIComponent(minSats)}`
                     + `&fee_fallback_max_pct=${encodeURIComponent(feePct)}`
                     + `&fee_fallback_max_sats=${encodeURIComponent(feeSats)}`
                     + `&strict_no_mint_fallback=${encodeURIComponent(strict)}`
@@ -12163,63 +11817,20 @@ header('Cache-Control: no-cache, must-revalidate');
 
         // -------- Self-serve invoice settings --------
 
-        async function loadSelfServeSettings() {
-            try {
-                const response = await postWithCsrf(adminUrl, 'action=get_selfserve_settings');
-                if (!response.ok) return;
-                const data = await response.json();
-                const enabledEl = document.getElementById('selfserve-enabled');
-                const maxEl = document.getElementById('selfserve-max-sats');
-                if (enabledEl) enabledEl.checked = !!data.enabled;
-                if (maxEl) {
-                    // Blank when inheriting the built-in default; show the default
-                    // in the placeholder so operators see what "blank" resolves to.
-                    maxEl.value = (data.maxSats ?? '') === '' ? '' : data.maxSats;
-                    maxEl.placeholder = String(data.maxSatsDefault ?? 500000);
-                }
-            } catch (e) {
-                console.error('Failed to load self-serve settings', e);
-            }
-        }
-
-        async function saveSelfServeSettings() {
-            const enabled = document.getElementById('selfserve-enabled').checked ? '1' : '0';
-            const maxSats = document.getElementById('selfserve-max-sats').value.trim();
-            try {
-                const response = await postWithCsrf(adminUrl,
-                    `action=save_selfserve_settings`
-                    + `&enabled=${enabled}`
-                    + `&max_sats=${encodeURIComponent(maxSats)}`
-                );
-                const result = await response.json();
-                if (response.ok) {
-                    showToast('Self-serve settings saved!', 'success');
-                    // Refresh the per-store card's "site default" + effective text.
-                    if (currentStoreId) { await loadDashboard(); refreshStoreSelfServeCard(); }
-                } else {
-                    showToast(result.error || 'Failed to save', 'error');
-                }
-            } catch (e) {
-                showToast('Failed to save self-serve settings', 'error');
-            }
-        }
-
         function refreshStoreSelfServeCard() {
             // Driven by dashboardData.selfserve once loaded.
             if (!dashboardData || !dashboardData.selfserve) return;
             const s = dashboardData.selfserve;
             const sel = document.getElementById('store-selfserve-override');
             const eff = document.getElementById('store-selfserve-effective');
-            const def = document.getElementById('store-selfserve-site-default');
             const maxEl = document.getElementById('store-selfserve-max');
             const maxEff = document.getElementById('store-selfserve-max-effective');
             const linkRow = document.getElementById('store-selfserve-link-row');
             const linkEl = document.getElementById('store-selfserve-link');
-            if (sel) sel.value = String(s.override);
+            if (sel) sel.value = s.enabled ? '1' : '0';
             if (eff) eff.textContent = s.effective ? 'on' : 'off';
-            if (def) def.textContent = s.siteDefault ? 'on' : 'off';
             if (maxEl) maxEl.value = (s.maxSatsOverride ?? null) === null ? '' : s.maxSatsOverride;
-            if (maxEl) maxEl.placeholder = 'inherit (' + Number(s.siteMaxSats).toLocaleString() + ')';
+            if (maxEl) maxEl.placeholder = 'default (' + Number(s.maxSatsDefault ?? 500000).toLocaleString() + ')';
             if (maxEff) maxEff.textContent = Number(s.effectiveMaxSats).toLocaleString();
             // Show the shareable public link only when self-serve is effectively on.
             if (linkRow && linkEl) {
@@ -12278,15 +11889,15 @@ header('Cache-Control: no-cache, must-revalidate');
                 return;
             }
             clearAwError('store-selfserve-error');
-            const override = document.getElementById('store-selfserve-override').value;
+            const enabled = document.getElementById('store-selfserve-override').value;
             const maxSats = document.getElementById('store-selfserve-max').value.trim();
-            // Forcing self-serve on requires a payment method on the store.
-            if (override === '1' && dashboardData?.selfserve && !dashboardData.selfserve.paymentCapable) {
+            // Turning self-serve on requires a payment method on the store.
+            if (enabled === '1' && dashboardData?.selfserve && !dashboardData.selfserve.paymentCapable) {
                 return awError('store-selfserve-error', 'This store has no payment method configured (add a Cashu mint or on-chain address first).');
             }
             try {
                 const response = await postWithCsrf(adminUrl,
-                    `action=save_store_selfserve&store_id=${encodeURIComponent(currentStoreId)}&override=${encodeURIComponent(override)}`
+                    `action=save_store_selfserve&store_id=${encodeURIComponent(currentStoreId)}&enabled=${encodeURIComponent(enabled)}`
                     + `&max_sats=${encodeURIComponent(maxSats)}`
                 );
                 const result = await response.json();
