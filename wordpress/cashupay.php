@@ -24,6 +24,7 @@ require_once __DIR__ . '/admin-menu.php';
 // wordpress/*.php into the same directory as the top-level cron.php endpoint,
 // so a wordpress/cron.php would collide with it in the shipped plugin.
 require_once __DIR__ . '/cron-integration.php';
+require_once __DIR__ . '/gateway-guard.php';
 
 // Register activation/deactivation hooks
 register_activation_hook(__FILE__, 'cashupay_activate');

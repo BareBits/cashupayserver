@@ -105,6 +105,14 @@ def _place_order(wp: WordPressHandle, product_id: int) -> dict:
     """Drive a real guest checkout through the WooCommerce Store API, selecting
     the BTCPay gateway. Returns the checkout response JSON (order_id, status,
     payment_result)."""
+    r = _checkout_response(wp, product_id)
+    assert r.status_code in (200, 201), f"checkout failed: {r.status_code} {r.text}"
+    return r.json()
+
+
+def _checkout_response(wp: WordPressHandle, product_id: int) -> requests.Response:
+    """The raw Store API checkout exchange behind _place_order, for tests that
+    expect the payment step to fail."""
     s = requests.Session()
     base = wp.url + STORE_API
 
@@ -142,9 +150,7 @@ def _place_order(wp: WordPressHandle, product_id: int) -> dict:
         },
         "payment_method": GATEWAY_ID,
     }
-    r = s.post(f"{base}/checkout", json=payload, headers=headers(), timeout=60)
-    assert r.status_code in (200, 201), f"checkout failed: {r.status_code} {r.text}"
-    return r.json()
+    return s.post(f"{base}/checkout", json=payload, headers=headers(), timeout=60)
 
 
 def _cron_key(wp: WordPressHandle) -> str:
@@ -295,6 +301,44 @@ def test_woocommerce_order_settles_via_btcpay_gateway(
         ).fetchone()
     assert row is not None, "no InvoiceSettled delivery was recorded"
     assert row["status"] == "delivered" and 200 <= row["status_code"] < 300, dict(row)
+
+
+def test_failed_invoice_creation_returns_clean_error_not_500(woocommerce) -> None:
+    """When invoice creation on BareBits fails, the stock Greenfield gateway's
+    process_payment() implicitly returns null and WooCommerce's Store API
+    checkout fatals with an HTTP 500 (array_merge(..., null) in
+    StoreApi\\Legacy). The cashupay plugin swaps in a guarded gateway subclass
+    (wordpress/gateway-guard.php) that turns the null into a catchable
+    exception, so the shopper sees a clean payment error instead."""
+    wp, info = woocommerce
+    _flush_rewrites(wp)
+    store_id, api_key = _seed_store(wp, "https://mint.example")
+    _autowire_btcpay(wp, store_id, api_key)
+
+    # The guard subclass must be the gateway WooCommerce actually registered.
+    snippet = """
+foreach (WC()->payment_gateways()->payment_gateways() as $gw) {
+    if ($gw->id === 'btcpaygf_default') { echo get_class($gw); }
+}
+"""
+    cls = wp.wp_cli("eval", snippet).stdout.strip().splitlines()[-1].strip()
+    assert cls == "CashuPay_Guarded_BTCPay_Gateway", (
+        f"the guarded subclass must replace the stock gateway, got {cls!r}"
+    )
+
+    # Break the plugin's API key so the invoice-create call 401s. That is the
+    # same failure shape as any server-side reject (key mismatch after a
+    # re-setup, validation error, payserver 5xx): createInvoice() throws and
+    # the stock gateway would have returned null.
+    wp.wp_cli("eval", "update_option('btcpay_gf_api_key', 'broken-key');")
+
+    r = _checkout_response(wp, info["product_id"])
+    assert r.status_code == 400, (
+        f"expected a clean payment error, got {r.status_code}: {r.text[:300]}"
+    )
+    body = r.json()
+    assert body.get("code") == "woocommerce_rest_checkout_process_payment_error", body
+    assert "payment could not be started" in body.get("message", "").lower(), body
 
 
 def test_expired_invoice_fails_order_and_offers_retry(

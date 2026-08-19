@@ -438,6 +438,41 @@ def test_lightning_screen_collapses_nwc_and_noffer_sections(
     assert page.locator("#noffer").is_visible()
 
 
+def test_validation_error_scrolls_back_to_top(
+    payserver: PayserverHandle, mint: MintHandle, page
+) -> None:
+    """A failed validation re-renders the wizard via POST, and browsers restore
+    the pre-submit scroll position on that navigation — on the long lightning
+    screen the operator sits scrolled past the error banner and never sees why
+    the save failed. Rendering an error must pin the view back to the top."""
+    _walk_to_store(page, payserver)
+    page.fill("#store_name", "Scroll Store")
+    page.click("button[type=submit]")
+
+    page.wait_for_selector("#onchain-form")
+    page.click("button:has-text('Skip for now')")
+
+    page.wait_for_selector("#lightning_address")
+    page.click("#nwc-section > summary")
+    page.fill("#nwc", "not-a-wallet-connect-string")
+    # Submit from the bottom of the page, like an operator who scrolled down
+    # to reach the Continue button.
+    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+    page.click("button:has-text('Continue')")
+
+    page.wait_for_selector("#setup-error")
+    assert "nostr+walletconnect://" in page.locator("#setup-error").inner_text()
+    # The error render turns browser scroll restoration off and scrolls to the
+    # top, so the banner lands inside the viewport.
+    assert page.evaluate("history.scrollRestoration") == "manual"
+    page.wait_for_function("window.scrollY === 0")
+    box = page.locator("#setup-error").bounding_box()
+    assert box is not None, "the error banner must be rendered"
+    assert box["y"] + box["height"] <= page.viewport_size["height"], (
+        "the error banner must be inside the viewport after the auto-scroll"
+    )
+
+
 def test_noffer_section_reopens_when_a_rejected_value_is_echoed(
     payserver: PayserverHandle, mint: MintHandle, page
 ) -> None:
