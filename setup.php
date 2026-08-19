@@ -2222,7 +2222,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                     for your customers, cheap for you. 🚀
                 </p>
                 <p style="margin-bottom: 1.25rem;">
-                    We'd really suggest turning it on! BareBits supports several types of lightning wallet backends, you can use multiple at once. When invoices are generated for your customers, BareBits will try each option in sequence until it can sucessfully generate an invoice.
+                    We'd really suggest turning it on! BareBits supports several types of lightning wallet backends. When invoices are generated for your customers, BareBits will try each option in sequence until it can successfully generate an invoice. <strong>Only one method is needed for lightning payments to work</strong>, you can use multiple methods if you want.
                 </p>
 
                 <form method="POST" action="<?= htmlspecialchars(Urls::setup()) ?>">
@@ -2232,45 +2232,48 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                         <input type="hidden" name="mode" value="add_store">
                     <?php endif; ?>
 
-                    <div class="form-group">
-                        <label for="lightning_address">LNURL/lightning address eg myname@strike.me</label>
-                        <input type="text" id="lightning_address" name="lightning_address"
-                               style="font-family: monospace; font-size: 0.9rem;"
+                    <!-- Open on every render (unlike the NWC/noffer sections
+                         below): the address is the primary, no-wallet-software
+                         path, so it stays visible by default while remaining
+                         collapsible. -->
+                    <details class="form-group" id="lnurl-section" open>
+                        <summary style="cursor: pointer; font-weight: 500; margin-bottom: 0.5rem;">Method 1: LNURL/lightning address eg myname@strike.me</summary>
+                        <input type="text" id="lightning_address" name="lightning_address" aria-label="LNURL/lightning address"
+                               style="font-family: monospace; font-size: 0.9rem; margin-bottom: 0.5rem;"
                                value="<?= htmlspecialchars($_POST['lightning_address'] ?? $lnExistingAddress) ?>"
                                placeholder="myname@strike.me">
-                    </div>
-
-                    <div id="ln-help-box" style="background: rgba(0,0,0,0.2); padding: 1rem; border-radius: 8px; margin-bottom: 1.5rem; font-size: 0.9rem; color: #a0aec0;">
-                        <p style="margin-bottom: 0.75rem;">
-                            Don't have a lightning address? You can get one for free
-                            (and enable instant fiat/USD conversion) in 100+
-                            countries at
-                            <a href="https://strike.me" target="_blank" rel="noopener noreferrer" style="color: #63b3ed;">strike.me</a>.
-                        </p>
-                        <p style="margin-bottom: 0.75rem;">
-                            Don't want to use strike? Want full self-custody? You can
-                            use the
-                            <a href="https://github.com/BareBits/electrum_clink" target="_blank" rel="noopener noreferrer" style="color: #63b3ed;">clink plugin</a>
-                            or the built-in NWC (nostr wallet connect) plugin for the
-                            <a href="https://electrum.org" target="_blank" rel="noopener noreferrer" style="color: #63b3ed;">Electrum wallet</a>
-                            to have lightning payments delivered directly to your
-                            wallet (when online). We also suggest the
-                            <a href="https://github.com/BareBits/electrum_liquidity" target="_blank" rel="noopener noreferrer" style="color: #63b3ed;">Electrum Liquidity Management plugin</a>,
-                            just set to automatic mode and you'll always have
-                            inbound liquidity once you reach a balance of around
-                            $100 worth of BTC. BareBits provides graceful fallback
-                            options for if your wallet is offline or doesn't have
-                            inbound liquidity.
-                        </p>
-                        <p style="margin: 0;">
-                            Alternate option: use a cashu mint. A cashu mint holds
-                            onto your funds (no need to worry about managing
-                            liquidity or keeping wallet online) and funds are
-                            automatically withdrawn to your on-chain wallet when a
-                            sufficient amount has accumulated. Just skip this
-                            section if you prefer to use a cashu mint.
-                        </p>
-                    </div>
+                        <div id="ln-help-box" style="background: rgba(0,0,0,0.2); padding: 1rem; border-radius: 8px; font-size: 0.9rem; color: #a0aec0;">
+                            <p style="margin-bottom: 0.75rem;">
+                                Don't have a lightning address? You can get one for free
+                                (and enable instant fiat/USD conversion) in 100+
+                                countries at
+                                <a href="https://strike.me" target="_blank" rel="noopener noreferrer" style="color: #63b3ed;">strike.me</a>.
+                            </p>
+                            <p style="margin-bottom: 0.75rem;">
+                                Don't want to use strike? Want full self-custody? You can
+                                use the
+                                <a href="https://github.com/BareBits/electrum_clink" target="_blank" rel="noopener noreferrer" style="color: #63b3ed;">clink plugin</a>
+                                or the built-in NWC (nostr wallet connect) plugin for the
+                                <a href="https://electrum.org" target="_blank" rel="noopener noreferrer" style="color: #63b3ed;">Electrum wallet</a>
+                                to have lightning payments delivered directly to your
+                                wallet (when online). We also suggest the
+                                <a href="https://github.com/BareBits/electrum_liquidity" target="_blank" rel="noopener noreferrer" style="color: #63b3ed;">Electrum Liquidity Management plugin</a>,
+                                just set to automatic mode and you'll always have
+                                inbound liquidity once you reach a balance of around
+                                $100 worth of BTC. BareBits provides graceful fallback
+                                options for if your wallet is offline or doesn't have
+                                inbound liquidity.
+                            </p>
+                            <p style="margin: 0;">
+                                Alternate option: use a cashu mint. A cashu mint holds
+                                onto your funds (no need to worry about managing
+                                liquidity or keeping wallet online) and funds are
+                                automatically withdrawn to your on-chain wallet when a
+                                sufficient amount has accumulated. Just skip this
+                                section if you prefer to use a cashu mint.
+                            </p>
+                        </div>
+                    </details>
 
                     <!-- Collapsed by default; open only when the section already
                          shows stored content (the saved-connection label here, a
@@ -2279,7 +2282,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                          stays visible). An environment warning alone doesn't
                          force a section open. -->
                     <details class="form-group" id="nwc-section"<?= $lnNwcShowsSaved ? ' open' : '' ?>>
-                        <summary style="cursor: pointer; font-weight: 500; margin-bottom: 0.5rem;">Nostr Wallet Connect (NWC) (Electrum)</summary>
+                        <summary style="cursor: pointer; font-weight: 500; margin-bottom: 0.5rem;">Method 2: Nostr Wallet Connect (NWC) (Electrum)</summary>
                         <div class="warning" style="margin-bottom: 0.5rem;">
                             ⚠️ Your wallet must be ONLINE to receive lightning payments
                         </div>
@@ -2342,7 +2345,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                     }
                     ?>
                     <details class="form-group" id="noffer-section"<?= $lnNofferValues !== [] ? ' open' : '' ?>>
-                        <summary style="cursor: pointer; font-weight: 500; margin-bottom: 0.5rem;">noffer (CLINK) (Electrum)</summary>
+                        <summary style="cursor: pointer; font-weight: 500; margin-bottom: 0.5rem;">Method 3: noffer (CLINK) (Electrum)</summary>
                         <div class="warning" style="margin-bottom: 0.5rem;">
                             ⚠️ Your wallet must be ONLINE to receive lightning payments
                         </div>

@@ -374,9 +374,9 @@ def test_add_store_with_mints_shows_the_generated_seed_once(
 def test_lightning_screen_collapses_nwc_and_noffer_sections(
     payserver: PayserverHandle, mint: MintHandle, page
 ) -> None:
-    """The NWC and noffer inputs live in <details> sections that start
-    collapsed, and the "don't have a lightning address?" help box sits
-    between the LNURL field and the NWC section."""
+    """All three destinations live in <details> sections titled Method 1-3.
+    The LNURL section (with the "don't have a lightning address?" help box
+    inside it) starts open; NWC and noffer start collapsed."""
     _walk_to_store(page, payserver)
     page.fill("#store_name", "Collapsed Rails Store")
     page.click("button[type=submit]")
@@ -385,13 +385,28 @@ def test_lightning_screen_collapses_nwc_and_noffer_sections(
     page.click("button:has-text('Skip for now')")
 
     page.wait_for_selector("#lightning_address")
-    # Both sections render collapsed, so their inputs are hidden.
+    # The LNURL section renders open, so its input is visible; the NWC and
+    # noffer sections render collapsed, so their inputs are hidden.
+    assert page.locator("#lnurl-section[open]").count() == 1, "LNURL section must start open"
+    assert page.locator("#lightning_address").is_visible()
     assert page.locator("#nwc-section[open]").count() == 0, "NWC section must start collapsed"
     assert page.locator("#noffer-section[open]").count() == 0, "noffer section must start collapsed"
     assert not page.locator("#nwc").is_visible(), "collapsed NWC section must hide its input"
     assert not page.locator("#noffer").is_visible(), "collapsed noffer section must hide its input"
 
-    # The help box sits below the LNURL field and above the NWC section.
+    # The section titles number the methods in fallback order.
+    assert "Method 1: LNURL/lightning address" in page.locator("#lnurl-section > summary").inner_text()
+    assert "Method 2: Nostr Wallet Connect" in page.locator("#nwc-section > summary").inner_text()
+    assert "Method 3: noffer (CLINK)" in page.locator("#noffer-section > summary").inner_text()
+
+    # Only one method is required; the intro says so in bold.
+    assert (
+        "Only one method is needed for lightning payments to work"
+        in page.locator("strong", has_text="Only one method").inner_text()
+    )
+
+    # The help box sits inside the LNURL section, below its input and above
+    # the NWC section.
     order = page.evaluate(
         """() => {
             const before = (a, b) => !!(
@@ -402,13 +417,21 @@ def test_lightning_screen_collapses_nwc_and_noffer_sections(
                 before('#lightning_address', '#ln-help-box'),
                 before('#ln-help-box', '#nwc-section'),
                 before('#nwc-section', '#noffer-section'),
+                !!document.querySelector('#lnurl-section #ln-help-box'),
             ];
         }"""
     )
-    assert order == [True, True, True], f"screen order wrong: {order}"
+    assert order == [True, True, True, True], f"screen order wrong: {order}"
     assert "Don't have a lightning address?" in page.locator("#ln-help-box").inner_text()
 
-    # Expanding via the summary reveals the inputs.
+    # Collapsing the LNURL section via its summary hides the input; expanding
+    # the others via their summaries reveals theirs.
+    page.click("#lnurl-section > summary")
+    assert not page.locator("#lightning_address").is_visible(), (
+        "the LNURL section must be collapsible"
+    )
+    page.click("#lnurl-section > summary")
+    assert page.locator("#lightning_address").is_visible()
     page.click("#nwc-section > summary")
     assert page.locator("#nwc").is_visible()
     page.click("#noffer-section > summary")
