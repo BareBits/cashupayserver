@@ -2200,8 +2200,45 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                         </p>
                     </div>
 
-                    <div class="form-group">
-                        <label for="nwc">Nostr Wallet Connect (NWC)</label>
+                    <div id="ln-help-box" style="background: rgba(0,0,0,0.2); padding: 1rem; border-radius: 8px; margin-bottom: 1.5rem; font-size: 0.9rem; color: #a0aec0;">
+                        <p style="margin-bottom: 0.75rem;">
+                            Don't have a lightning address? You can get one for free
+                            (and enable instant fiat/USD conversion) in 100+
+                            countries at
+                            <a href="https://strike.me" target="_blank" rel="noopener noreferrer" style="color: #63b3ed;">strike.me</a>.
+                        </p>
+                        <p style="margin-bottom: 0.75rem;">
+                            Don't want to use strike? Want full self-custody? You can
+                            use the
+                            <a href="https://github.com/BareBits/electrum_clink" target="_blank" rel="noopener noreferrer" style="color: #63b3ed;">clink plugin for the Electrum wallet</a>
+                            to generate an noffer and have lightning payments
+                            delivered directly to your electrum wallet (when
+                            online). We also suggest the
+                            <a href="https://github.com/BareBits/electrum_liquidity" target="_blank" rel="noopener noreferrer" style="color: #63b3ed;">Electrum Liquidity Management plugin</a>,
+                            just set to automatic mode and you'll always have
+                            inbound liquidity once you reach a balance of around
+                            $100 worth of BTC. BareBits provides graceful fallback
+                            options for if your wallet is offline or doesn't have
+                            inbound liquidity.
+                        </p>
+                        <p style="margin: 0;">
+                            Alternate option: use a cashu mint. A cashu mint holds
+                            onto your funds (no need to worry about managing
+                            liquidity or keeping wallet online) and funds are
+                            automatically withdrawn to your on-chain wallet when a
+                            sufficient amount has accumulated. Just skip this
+                            section if you prefer to use a cashu mint.
+                        </p>
+                    </div>
+
+                    <!-- Collapsed by default; open only when the section already
+                         shows stored content (the saved-connection label here, a
+                         rendered noffer value below — including the POST echo
+                         after a failed validation, so the input the error names
+                         stays visible). An environment warning alone doesn't
+                         force a section open. -->
+                    <details class="form-group" id="nwc-section"<?= $lnNwcShowsSaved ? ' open' : '' ?>>
+                        <summary style="cursor: pointer; font-weight: 500; margin-bottom: 0.5rem;">Nostr Wallet Connect (NWC)</summary>
                         <?php if ($lnNwcEnvError !== null): ?>
                             <div class="warning" style="margin-bottom: 0.5rem;">
                                 <strong>NWC isn't available on this server yet:</strong>
@@ -2225,13 +2262,13 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                                 <input type="checkbox" name="nwc_clear" value="1">
                                 Remove this saved connection
                             </label>
-                            <input type="text" id="nwc" name="nwc"
+                            <input type="text" id="nwc" name="nwc" aria-label="Nostr Wallet Connect (NWC)"
                                    style="font-family: monospace; font-size: 0.9rem;<?= $lnNwcEnvError !== null ? ' opacity: 0.5;' : '' ?>"
                                    value=""
                                    placeholder="paste a new nostr+walletconnect://&hellip; to replace"
                                    <?= $lnNwcEnvError !== null ? 'disabled' : '' ?>>
                         <?php else: ?>
-                            <input type="text" id="nwc" name="nwc"
+                            <input type="text" id="nwc" name="nwc" aria-label="Nostr Wallet Connect (NWC)"
                                    style="font-family: monospace; font-size: 0.9rem;<?= $lnNwcEnvError !== null ? ' opacity: 0.5;' : '' ?>"
                                    value=""
                                    placeholder="nostr+walletconnect://&hellip;"
@@ -2244,10 +2281,11 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                             lookup_invoice). When you continue, the connection is
                             tested with a 1-sat test invoice (it's never paid).
                         </p>
-                    </div>
+                    </details>
 
-                    <div class="form-group">
-                        <label for="noffer">noffer</label>
+                    <?php $lnNofferValue = trim((string)($_POST['noffer'] ?? $lnExistingNoffer)); ?>
+                    <details class="form-group" id="noffer-section"<?= $lnNofferValue !== '' ? ' open' : '' ?>>
+                        <summary style="cursor: pointer; font-weight: 500; margin-bottom: 0.5rem;">noffer</summary>
                         <?php if ($lnNofferEnvError !== null): ?>
                             <div class="warning" style="margin-bottom: 0.5rem;">
                                 <strong>noffers aren't available on this server yet:</strong>
@@ -2258,12 +2296,12 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                                 <?= htmlspecialchars($lnNofferNotice) ?>
                             </div>
                         <?php endif; ?>
-                        <input type="text" id="noffer" name="noffer"
+                        <input type="text" id="noffer" name="noffer" aria-label="noffer"
                                style="font-family: monospace; font-size: 0.9rem;<?= $lnNofferEnvError !== null ? ' opacity: 0.5;' : '' ?>"
-                               value="<?= htmlspecialchars($_POST['noffer'] ?? $lnExistingNoffer) ?>"
+                               value="<?= htmlspecialchars($lnNofferValue) ?>"
                                placeholder="noffer1&hellip;"
                                <?= $lnNofferEnvError !== null ? 'disabled' : '' ?>>
-                    </div>
+                    </details>
 
                     <button type="submit" class="btn" style="width: 100%;">Continue</button>
                 </form>
@@ -2276,37 +2314,6 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                     <?php endif; ?>
                     <button type="submit" class="btn btn-secondary" style="width: 100%;">Skip for now</button>
                 </form>
-
-                <div style="background: rgba(0,0,0,0.2); padding: 1rem; border-radius: 8px; margin-top: 1.5rem; font-size: 0.9rem; color: #a0aec0;">
-                    <p style="margin-bottom: 0.75rem;">
-                        Don't have a lightning address? You can get one for free
-                        (and enable instant fiat/USD conversion) in 100+
-                        countries at
-                        <a href="https://strike.me" target="_blank" rel="noopener noreferrer" style="color: #63b3ed;">strike.me</a>.
-                    </p>
-                    <p style="margin-bottom: 0.75rem;">
-                        Don't want to use strike? Want full self-custody? You can
-                        use the
-                        <a href="https://github.com/BareBits/electrum_clink" target="_blank" rel="noopener noreferrer" style="color: #63b3ed;">clink plugin for the Electrum wallet</a>
-                        to generate an noffer and have lightning payments
-                        delivered directly to your electrum wallet (when
-                        online). We also suggest the
-                        <a href="https://github.com/BareBits/electrum_liquidity" target="_blank" rel="noopener noreferrer" style="color: #63b3ed;">Electrum Liquidity Management plugin</a>,
-                        just set to automatic mode and you'll always have
-                        inbound liquidity once you reach a balance of around
-                        $100 worth of BTC. BareBits provides graceful fallback
-                        options for if your wallet is offline or doesn't have
-                        inbound liquidity.
-                    </p>
-                    <p style="margin: 0;">
-                        Alternate option: use a cashu mint. A cashu mint holds
-                        onto your funds (no need to worry about managing
-                        liquidity or keeping wallet online) and funds are
-                        automatically withdrawn to your on-chain wallet when a
-                        sufficient amount has accumulated. Just skip this
-                        section if you prefer to use a cashu mint.
-                    </p>
-                </div>
 
             <?php elseif ($step === 'swaps'): ?>
                 <!-- Screen: submarine swaps -->
