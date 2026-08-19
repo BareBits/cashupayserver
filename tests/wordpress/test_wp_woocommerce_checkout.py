@@ -297,6 +297,105 @@ def test_woocommerce_order_settles_via_btcpay_gateway(
     assert row["status"] == "delivered" and 200 <= row["status_code"] < 300, dict(row)
 
 
+def test_expired_invoice_fails_order_and_offers_retry(
+    woocommerce,
+    mint: MintHandle,
+) -> None:
+    """Invoice expiry must reach WooCommerce and leave the customer a way to
+    pay again:
+
+      - the cron sweep fires the signed InvoiceExpired webhook, and — via the
+        Expired→wc-failed mapping BareBits configures — the order flips
+        pending→failed instead of silently rotting at pending;
+      - the payment page's expired screen links /cashupay/retry/{invoiceId},
+        which resolves the invoice back to its order and bounces to
+        WooCommerce's order-pay page, where clicking Pay mints a fresh
+        invoice. Failed orders keep that affordance; the gateway plugin's
+        stock wc-cancelled mapping would have removed it.
+    """
+    wp, info = woocommerce
+    _flush_rewrites(wp)
+    store_id, api_key = _seed_store(wp, mint.url)
+
+    # The full wizard path: configure + webhook + enable + order-state map.
+    data = _ensure_integration(wp, store_id, api_key)
+    assert data["res"]["status"] == "ready", data
+
+    states_out = wp.wp_cli(
+        "eval", "echo json_encode(get_option('btcpay_gf_order_states'));"
+    ).stdout.strip().splitlines()[-1]
+    assert json.loads(states_out)["Expired"] == "wc-failed", states_out
+
+    # --- customer places the order; the gateway creates a BareBits invoice ---
+    checkout = _place_order(wp, info["product_id"])
+    order_id = checkout["order_id"]
+    invoice_id = _order_field(wp, order_id, "get_meta('BTCPay_id')")
+    assert invoice_id and invoice_id != "NO_ORDER", checkout
+    assert _order_field(wp, order_id, "get_status()") == "pending"
+
+    # --- backdate so the cron sweep expires the invoice, then loop the real
+    #     cron endpoint: it sweeps (firing InvoiceExpired) and drains the
+    #     outbox to WooCommerce's wc-api endpoint ---
+    with wp.db() as db:
+        db.execute(
+            "UPDATE invoices SET expiration_time = ? WHERE id = ?",
+            (int(time.time()) - 60, invoice_id),
+        )
+
+    cron_key = _cron_key(wp)
+    deadline = time.monotonic() + 30
+    status = None
+    while time.monotonic() < deadline:
+        r = requests.get(f"{wp.url}/cashupay/cron", params={"key": cron_key}, timeout=15)
+        assert r.status_code == 200, f"cron refused: {r.status_code} {r.text[:200]}"
+        status = _order_field(wp, order_id, "get_status()")
+        if status == "failed":
+            break
+        time.sleep(1)
+    assert status == "failed", (
+        f"order never flipped to failed on InvoiceExpired (last status {status!r})"
+    )
+
+    # Delivery accepted with 2xx => the real plugin verified the HMAC before
+    # touching the order. partiallyPaid=false is what routes the plugin to the
+    # plain-Expired branch (not expired-paid-partial).
+    with wp.db() as db:
+        row = db.execute(
+            "SELECT status, status_code, payload FROM webhook_deliveries "
+            "WHERE invoice_id = ? AND event_type = 'InvoiceExpired'",
+            (invoice_id,),
+        ).fetchone()
+    assert row is not None, "no InvoiceExpired delivery was recorded"
+    assert row["status"] == "delivered" and 200 <= row["status_code"] < 300, dict(row)
+    assert json.loads(row["payload"]).get("partiallyPaid") is False
+
+    # --- the expired payment page offers the retry link ---
+    page = requests.get(f"{wp.url}/cashupay/payment/{invoice_id}", timeout=15)
+    page.raise_for_status()
+    assert f"/cashupay/retry/{invoice_id}" in page.text, (
+        "expired payment page should link the retry endpoint"
+    )
+
+    # --- the retry endpoint bounces to WooCommerce's order-pay page, carrying
+    #     the order key so a guest can pay without an account ---
+    r = requests.get(
+        f"{wp.url}/cashupay/retry/{invoice_id}", allow_redirects=False, timeout=15
+    )
+    assert r.status_code in (301, 302), (r.status_code, r.text[:200])
+    location = r.headers.get("Location", "")
+    assert "order-pay" in location, location
+    assert str(order_id) in location, location
+    assert "key=" in location, location
+
+    # An unresolvable invoice id falls back to the front page, never an error
+    # page or an order it doesn't own.
+    r = requests.get(
+        f"{wp.url}/cashupay/retry/inv_nonexistent", allow_redirects=False, timeout=15
+    )
+    assert r.status_code in (301, 302), (r.status_code, r.text[:200])
+    assert "order-pay" not in r.headers.get("Location", ""), r.headers.get("Location")
+
+
 def _await_settled(wp, api, store_id, invoice_id, auth) -> None:
     """Poll the invoice until BareBits marks it Settled (the GET drives
     Invoice::pollSingleQuote, which is what flips the state)."""

@@ -1110,15 +1110,37 @@ class Invoice {
     /**
      * Mark expired invoices without contacting the mint
      *
+     * Row-at-a-time with a status-guarded UPDATE instead of one bulk UPDATE:
+     * only the caller whose UPDATE actually flips a row (rowCount 1) fires
+     * that invoice's InvoiceExpired webhook, so concurrent sweeps from the
+     * cron pollers can't emit duplicates and a row paid between the SELECT
+     * and the UPDATE is left alone.
+     *
      * @return int Number of invoices marked as expired
      */
     public static function markExpiredInvoices(): int {
-        $stmt = Database::query(
-            "UPDATE invoices SET status = 'Expired'
-             WHERE status = 'New' AND expiration_time < ?",
+        $rows = Database::fetchAll(
+            "SELECT id FROM invoices WHERE status = 'New' AND expiration_time < ?",
             [time()]
         );
-        return $stmt->rowCount();
+        $count = 0;
+        foreach ($rows as $row) {
+            $changed = Database::update(
+                'invoices',
+                ['status' => 'Expired'],
+                "id = ? AND status = 'New'",
+                [$row['id']]
+            );
+            if ($changed !== 1) {
+                continue;
+            }
+            $count++;
+            $invoice = self::getById($row['id']);
+            if ($invoice) {
+                WebhookSender::fireEvent($invoice['store_id'], 'InvoiceExpired', $invoice);
+            }
+        }
+        return $count;
     }
 
     /**

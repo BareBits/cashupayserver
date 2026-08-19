@@ -166,6 +166,91 @@ function cashupay_apply_btcpay_gateway_branding(int $discountPercent = 0): void 
 }
 
 /**
+ * Map the BTCPay plugin's "Expired" webhook to wc-failed instead of its stock
+ * wc-cancelled. WooCommerce keeps failed orders payable (the order-pay
+ * endpoint plus the "Pay" button under My Account → Orders), so the customer
+ * can retry after an invoice lapses; a cancelled order loses that affordance
+ * and restocks the items.
+ *
+ * Same conservatism as the branding writer above: the mapping is flipped only
+ * while it is unset or still the stock default, so a merchant's deliberate
+ * choice under WooCommerce → Settings → Payments → BTCPay survives re-runs of
+ * the completion screen. The full mapping array is always written because the
+ * plugin's webhook handler indexes every state without isset() checks once
+ * the option exists.
+ */
+function cashupay_apply_btcpay_order_states(): void {
+    // Stock defaults from the plugin's OrderStates::getDefaultOrderStateMappings().
+    $defaults = [
+        'New'                => 'wc-pending',
+        'Processing'         => 'wc-on-hold',
+        'Settled'            => 'BTCPAY_IGNORE',
+        'SettledPaidOver'    => 'wc-processing',
+        'Invalid'            => 'wc-failed',
+        'Expired'            => 'wc-cancelled',
+        'ExpiredPaidPartial' => 'wc-failed',
+        'ExpiredPaidLate'    => 'wc-processing',
+    ];
+
+    $states = get_option('btcpay_gf_order_states');
+    if (!is_array($states)) {
+        $states = [];
+    }
+
+    $current = (string) ($states['Expired'] ?? '');
+    if ($current !== '' && $current !== 'wc-cancelled') {
+        return; // The merchant picked something else on purpose.
+    }
+
+    update_option(
+        'btcpay_gf_order_states',
+        array_merge($defaults, $states, ['Expired' => 'wc-failed'])
+    );
+}
+
+/**
+ * Redirect a payer whose invoice expired back to a page where they can pay.
+ *
+ * Linked from the payment page's expired screen as /cashupay/retry/{invoiceId}.
+ * Resolves the invoice back to its WooCommerce order via the BTCPay_id order
+ * meta (the same lookup the gateway's webhook handler uses), then sends the
+ * customer to WooCommerce's order-pay page — where clicking "Pay" makes the
+ * gateway notice the old invoice is Expired and mint a fresh one. Orders that
+ * no longer need payment (paid meanwhile, cancelled, refunded) go to the
+ * order-received page instead, which explains the order's actual state.
+ */
+function cashupay_handle_retry_redirect(string $invoiceId): void {
+    // Without WooCommerce (or if the invoice can't be resolved to exactly one
+    // order) the front page beats a dead end — the expired payment page is
+    // what linked here, so bouncing back to it would loop.
+    $fallback = home_url('/');
+
+    if (!function_exists('wc_get_orders')) {
+        wp_safe_redirect($fallback);
+        exit;
+    }
+
+    $orders = wc_get_orders([
+        'meta_key' => 'BTCPay_id',
+        'meta_value' => $invoiceId,
+    ]);
+
+    if (!is_array($orders) || count($orders) !== 1) {
+        wp_safe_redirect($fallback);
+        exit;
+    }
+
+    $order = $orders[0];
+    if ($order->needs_payment()) {
+        wp_safe_redirect($order->get_checkout_payment_url());
+        exit;
+    }
+
+    wp_safe_redirect($order->get_checkout_order_received_url());
+    exit;
+}
+
+/**
  * Whether this WordPress install can install plugins programmatically without
  * prompting for FTP/SSH credentials.
  *
@@ -327,6 +412,7 @@ function cashupay_ensure_woocommerce_integration(string $store_id, string $api_k
 
     cashupay_enable_btcpay_gateway();
     cashupay_apply_btcpay_gateway_branding($discountPercent);
+    cashupay_apply_btcpay_order_states();
 
     return [
         'status' => 'ready',

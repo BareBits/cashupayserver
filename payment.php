@@ -260,6 +260,17 @@ $redirectAuto = $checkoutConfig['redirectAutomatically'] ?? true;
 $invoiceMetadata = $invoice['metadata'] ? json_decode($invoice['metadata'], true) : null;
 $invoiceNote = is_array($invoiceMetadata) ? trim((string)($invoiceMetadata['itemDesc'] ?? '')) : '';
 
+// WooCommerce-backed invoices (created by the BTCPay gateway plugin) carry
+// metadata.orderId. For those, the expired screen offers a retry link that
+// bounces through /cashupay/retry/{invoiceId} to WooCommerce's order-pay
+// page, where clicking "Pay" makes the gateway mint a fresh invoice for the
+// same order. Standalone invoices (admin wizard, self-serve /pay) have no
+// order to re-pay, so they keep the plain Return-to-Shop exit.
+$wooRetryUrl = null;
+if (Urls::isWordPress() && is_array($invoiceMetadata) && !empty($invoiceMetadata['orderId'])) {
+    $wooRetryUrl = site_url('/cashupay/retry/' . rawurlencode((string)$invoice['id']));
+}
+
 // Decide whether to render the payer-receipt form. The check is composed of
 // site-wide master switch + per-type toggle + SMTP. When false, the success
 // modal shows a "screenshot this page" fallback instead. WordPress installs
@@ -1267,7 +1278,18 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                 <p style="color: var(--text-secondary); margin-top: 1rem;">
                     This invoice has expired. Please request a new one.
                 </p>
-                <?php if ($redirectUrl): ?>
+                <?php if ($wooRetryUrl): ?>
+                    <a href="<?= htmlspecialchars($wooRetryUrl) ?>" class="btn <?= $invoice['status'] === 'Invalid' ? 'hidden' : '' ?>" style="margin-top: 1.5rem;" id="retry-btn">
+                        Request a new invoice
+                    </a>
+                    <?php if ($redirectUrl): ?>
+                        <p style="margin-top: 1rem;">
+                            <a href="<?= htmlspecialchars($redirectUrl) ?>" style="color: var(--text-secondary);">
+                                Return to Shop
+                            </a>
+                        </p>
+                    <?php endif; ?>
+                <?php elseif ($redirectUrl): ?>
                     <a href="<?= htmlspecialchars($redirectUrl) ?>" class="btn" style="margin-top: 1.5rem;">
                         Return to Shop
                     </a>
@@ -1640,9 +1662,14 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                     onSettled();
                     break;
                 case 'Expired':
-                case 'Invalid':
+                case 'Invalid': {
                     document.getElementById('payment-expired').classList.remove('hidden');
+                    // Re-paying only makes sense for an invoice that lapsed on
+                    // its own (Expired), not one an operator voided (Invalid).
+                    const retryBtn = document.getElementById('retry-btn');
+                    if (retryBtn) retryBtn.classList.toggle('hidden', status !== 'Expired');
                     break;
+                }
             }
         }
 

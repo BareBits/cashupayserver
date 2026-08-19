@@ -115,6 +115,14 @@ class WebhookSender {
             'expirationTime' => $invoiceData['expiration_time'],
         ];
 
+        // The BTCPay WooCommerce plugin branches on partiallyPaid when it
+        // handles InvoiceExpired. BareBits rails are all-or-nothing (no
+        // partial-payment tracking), so a swept invoice is never partially
+        // paid — but the field must exist to match the BTCPay payload shape.
+        if ($eventType === 'InvoiceExpired') {
+            $payload['partiallyPaid'] = false;
+        }
+
         // Add invoice metadata for certain events
         if (in_array($eventType, ['InvoiceSettled', 'InvoiceReceivedPayment', 'InvoiceCreated', 'InvoiceProvisional'])) {
             if (isset($invoiceData['metadata'])) {

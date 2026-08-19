@@ -20,12 +20,6 @@ def _wait_status(configured: ConfiguredPayserver, invoice_id: str, expected: str
     raise AssertionError(f"invoice {invoice_id} did not reach {expected}; last={last}")
 
 
-@pytest.mark.xfail(
-    reason="Invoice::markExpiredInvoices() bulk-updates without firing "
-    "InvoiceExpired webhooks (see includes/invoice.php:188). The test asserts "
-    "the contract; flip to passing once the source is fixed.",
-    strict=False,
-)
 def test_unpaid_invoice_expires_via_cron(
     configured: ConfiguredPayserver,
     webhook_sink: WebhookSink,
@@ -52,8 +46,12 @@ def test_unpaid_invoice_expires_via_cron(
     assert expired["status"] == "Expired"
 
     captured = webhook_sink.wait_for("/hook/expire", count=1, timeout_s=15)
-    types = {r.json().get("type") for r in captured}
-    assert "InvoiceExpired" in types, f"missing InvoiceExpired; saw {types}"
+    payloads = [r.json() for r in captured]
+    expired = [p for p in payloads if p.get("type") == "InvoiceExpired"]
+    assert expired, f"missing InvoiceExpired; saw {[p.get('type') for p in payloads]}"
+    # BTCPay payload contract: consumers (the WooCommerce plugin among them)
+    # branch on partiallyPaid; BareBits rails are all-or-nothing.
+    assert expired[0].get("partiallyPaid") is False, expired[0]
 
 
 def test_admin_can_cancel_new_invoice(
