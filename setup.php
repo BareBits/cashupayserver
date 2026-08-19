@@ -2177,7 +2177,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                     for your customers, cheap for you. 🚀
                 </p>
                 <p style="margin-bottom: 1.25rem;">
-                    We'd really suggest turning it on!
+                    We'd really suggest turning it on! BareBits supports several types of lightning wallet backends, you can use multiple at once. When invoices are generated for your customers, BareBits will try each option in sequence until it can sucessfully generate an invoice.
                 </p>
 
                 <form method="POST" action="<?= htmlspecialchars(Urls::setup()) ?>">
