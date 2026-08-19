@@ -73,7 +73,7 @@ def bignumless_payserver(lnurlp_server) -> Iterator[PayserverHandle]:
 
 def _noffer_input_chunk(body: str) -> str:
     """The <input ...> tag of the wizard's noffer field."""
-    m = re.search(r'<input[^>]*name="noffer"[^>]*>', body)
+    m = re.search(r'<input[^>]*name="noffers\[\]"[^>]*>', body)
     assert m, "lightning screen should render the noffer input"
     return m.group(0)
 
@@ -128,7 +128,7 @@ def test_wizard_saves_noffer_on_bcmath_host(
     feature this port exists to unlock."""
     w = SetupWizard(gmpless_payserver.url)
     _to_lightning_screen(w, "Noffer Saves Store")
-    body = w.post(step="lightning", lightning_action="save", noffer=REFERENCE_NOFFER)
+    body = w.post(step="lightning", lightning_action="save", **{"noffers[]": REFERENCE_NOFFER})
     assert wizard_error(body) is None, wizard_error(body)
     assert wizard_heading(body) == "Submarine swaps"
     rows = _chain_rows(gmpless_payserver)
@@ -177,7 +177,7 @@ def test_wizard_rejects_new_noffer_without_bignum(
     with the actionable message and nothing is persisted."""
     w = SetupWizard(bignumless_payserver.url)
     _to_lightning_screen(w, "Noffer POST Store")
-    body = w.post(step="lightning", lightning_action="save", noffer=REFERENCE_NOFFER)
+    body = w.post(step="lightning", lightning_action="save", **{"noffers[]": REFERENCE_NOFFER})
     err = wizard_error(body)
     assert err is not None and "GMP" in err, f"error was: {err!r}"
     assert wizard_heading(body) == "Lightning payments"
@@ -306,7 +306,7 @@ def test_wizard_noffer_field_enabled_with_gmp(payserver: PayserverHandle) -> Non
     assert "BCMath" not in body
     assert "disabled" not in _noffer_input_chunk(body)
 
-    body = w.post(step="lightning", lightning_action="save", noffer=REFERENCE_NOFFER)
+    body = w.post(step="lightning", lightning_action="save", **{"noffers[]": REFERENCE_NOFFER})
     assert wizard_error(body) is None, wizard_error(body)
     rows = _chain_rows(payserver)
     assert [(r["address"], r["type"]) for r in rows] == [(REFERENCE_NOFFER, "noffer")]

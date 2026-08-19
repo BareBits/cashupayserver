@@ -44,6 +44,14 @@ REFERENCE_NOFFER = (
     "dp3x93xydf5xg6rzce4vv6xgdfh8quxgct9x5erxvspremhxue69uhhgetnwskhyetvv9ujumrfv"
     "a58gmnfdenjuur4vgqzpccxc30wpf78wf2q78wg3vq008fd8ygtl4qy06gstpye3h5unc47xmee6z"
 )
+# A second structurally valid noffer for multi-noffer flows (the wizard's
+# "+ Add another noffer" rows). Synthetic: ClinkNoffer::encode with pubkey
+# ab..ab, relay wss://relay2.example.com, offer 'second-test-offer'.
+# Persisted by tests, never dialled.
+SECOND_NOFFER = (
+    "noffer1qqs2h2at4w46h2at4w46h2at4w46h2at4w46h2at4w46h2at4w46h2cprpmhxue69uhhy"
+    "etvv9unytn90psk6urvv5hxxmmdqgghxetrdahxgtt5v4ehgtt0venx2us0var4k"
+)
 
 
 def wizard_error(body: str) -> str | None:

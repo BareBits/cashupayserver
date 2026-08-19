@@ -484,7 +484,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 }
 
                 $lnAddress = trim($_POST['lightning_address'] ?? '');
-                $noffer = trim($_POST['noffer'] ?? '');
+                // The noffer section renders one input per entry
+                // (name="noffers[]"), so the value arrives as an array; a
+                // scalar is accepted too for direct POSTs. Blank rows — the
+                // always-present empty input, or an added-then-abandoned row —
+                // are dropped, not errors.
+                $nofferInput = $_POST['noffers'] ?? [];
+                $nofferPosted = [];
+                foreach (is_array($nofferInput) ? $nofferInput : [$nofferInput] as $nofferRow) {
+                    $nofferRow = trim((string)$nofferRow);
+                    if ($nofferRow !== '') {
+                        $nofferPosted[] = $nofferRow;
+                    }
+                }
                 $nwc = trim($_POST['nwc'] ?? '');
                 // Saved-connection controls (see the render below): a pasted
                 // URI replaces, the clear checkbox removes, and otherwise the
@@ -495,7 +507,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
                 if ($lnAction === 'skip') {
                     $lnAddress = '';
-                    $noffer = '';
+                    $nofferPosted = [];
                     $nwc = '';
                 }
 
@@ -504,8 +516,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if ($lnAddress !== '' && !StoreLnAddresses::isValid($lnAddress)) {
                     throw new Exception('Lightning addresses look like myname@strike.me. Check the spelling and try again.');
                 }
-                if ($noffer !== '' && !ClinkNoffer::isValid($noffer)) {
-                    throw new Exception('That noffer doesn\'t look right. It should start with noffer1 — copy the whole string from your wallet.');
+                foreach ($nofferPosted as $nofferRow) {
+                    if (!ClinkNoffer::isValid($nofferRow)) {
+                        throw new Exception('That noffer doesn\'t look right. It should start with noffer1 — copy the whole string from your wallet.');
+                    }
                 }
                 // A previously stored connection round-trips as an opaque
                 // keep:<id> ref (the raw URI embeds the wallet secret and is
@@ -530,15 +544,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         $storedNoffers[] = $lnRow['address'];
                     }
                 }
-                if ($noffer !== '' && $nofferEnvError !== null
-                        && !in_array(strtolower($noffer), array_map('strtolower', $storedNoffers), true)) {
-                    throw new Exception('noffers can\'t be used on this server yet. ' . $nofferEnvError);
+                if ($nofferEnvError !== null) {
+                    $storedNofferKeys = array_map('strtolower', $storedNoffers);
+                    foreach ($nofferPosted as $nofferRow) {
+                        if (!in_array(strtolower($nofferRow), $storedNofferKeys, true)) {
+                            throw new Exception('noffers can\'t be used on this server yet. ' . $nofferEnvError);
+                        }
+                    }
                 }
                 // A disabled input doesn't submit, so on a gated host a save
-                // would silently delete a previously stored noffer. Keep it —
-                // it starts working the moment the host gains GMP, and the
-                // screen says why it's inert until then.
-                $noffers = $noffer !== '' ? [$noffer] : [];
+                // would silently delete previously stored noffers. Keep them —
+                // they start working the moment the host gains GMP, and the
+                // screen says why they're inert until then.
+                $noffers = $nofferPosted;
                 if ($lnAction === 'save' && $nofferEnvError !== null && $noffers === []) {
                     $noffers = $storedNoffers;
                 }
@@ -2135,7 +2153,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                 <!-- Screen: Lightning destinations (LNURL + NWC + CLINK noffer) -->
                 <?php
                 $lnExistingAddress = '';
-                $lnExistingNoffer = '';
+                $lnExistingNoffers = [];
                 // A stored NWC connection prefills as a masked label + keep:<id>
                 // ref — the raw URI embeds the wallet secret and never reaches
                 // the browser.
@@ -2143,7 +2161,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                 $lnExistingNwcLabel = '';
                 foreach ($renderStoreId ? StoreLnAddresses::listForStore($renderStoreId) : [] as $lnRow) {
                     if ($lnRow['type'] === StoreLnAddresses::TYPE_NOFFER) {
-                        if ($lnExistingNoffer === '') { $lnExistingNoffer = $lnRow['address']; }
+                        $lnExistingNoffers[] = $lnRow['address'];
                     } elseif ($lnRow['type'] === StoreLnAddresses::TYPE_NWC) {
                         if ($lnExistingNwcRef === '') {
                             $lnExistingNwcRef = StoreLnAddresses::KEEP_REF_PREFIX . $lnRow['id'];
@@ -2193,11 +2211,6 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                                style="font-family: monospace; font-size: 0.9rem;"
                                value="<?= htmlspecialchars($_POST['lightning_address'] ?? $lnExistingAddress) ?>"
                                placeholder="myname@strike.me">
-                        <p style="margin-top: 0.35rem; font-size: 0.85rem; opacity: 0.75;">
-                            When you continue we check that this wallet supports payment
-                            verification (LUD-21) &mdash; without it Lightning payments
-                            can't be confirmed, so the address can't be saved.
-                        </p>
                     </div>
 
                     <div id="ln-help-box" style="background: rgba(0,0,0,0.2); padding: 1rem; border-radius: 8px; margin-bottom: 1.5rem; font-size: 0.9rem; color: #a0aec0;">
@@ -2210,10 +2223,11 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                         <p style="margin-bottom: 0.75rem;">
                             Don't want to use strike? Want full self-custody? You can
                             use the
-                            <a href="https://github.com/BareBits/electrum_clink" target="_blank" rel="noopener noreferrer" style="color: #63b3ed;">clink plugin for the Electrum wallet</a>
-                            to generate an noffer and have lightning payments
-                            delivered directly to your electrum wallet (when
-                            online). We also suggest the
+                            <a href="https://github.com/BareBits/electrum_clink" target="_blank" rel="noopener noreferrer" style="color: #63b3ed;">clink plugin</a>
+                            or the built-in NWC (nostr wallet connect) plugin for the
+                            <a href="https://electrum.org" target="_blank" rel="noopener noreferrer" style="color: #63b3ed;">Electrum wallet</a>
+                            to have lightning payments delivered directly to your
+                            wallet (when online). We also suggest the
                             <a href="https://github.com/BareBits/electrum_liquidity" target="_blank" rel="noopener noreferrer" style="color: #63b3ed;">Electrum Liquidity Management plugin</a>,
                             just set to automatic mode and you'll always have
                             inbound liquidity once you reach a balance of around
@@ -2238,7 +2252,10 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                          stays visible). An environment warning alone doesn't
                          force a section open. -->
                     <details class="form-group" id="nwc-section"<?= $lnNwcShowsSaved ? ' open' : '' ?>>
-                        <summary style="cursor: pointer; font-weight: 500; margin-bottom: 0.5rem;">Nostr Wallet Connect (NWC)</summary>
+                        <summary style="cursor: pointer; font-weight: 500; margin-bottom: 0.5rem;">Nostr Wallet Connect (NWC) (Electrum)</summary>
+                        <div class="warning" style="margin-bottom: 0.5rem;">
+                            ⚠️ Your wallet must be ONLINE to receive lightning payments
+                        </div>
                         <?php if ($lnNwcEnvError !== null): ?>
                             <div class="warning" style="margin-bottom: 0.5rem;">
                                 <strong>NWC isn't available on this server yet:</strong>
@@ -2283,9 +2300,25 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                         </p>
                     </details>
 
-                    <?php $lnNofferValue = trim((string)($_POST['noffer'] ?? $lnExistingNoffer)); ?>
-                    <details class="form-group" id="noffer-section"<?= $lnNofferValue !== '' ? ' open' : '' ?>>
-                        <summary style="cursor: pointer; font-weight: 500; margin-bottom: 0.5rem;">noffer</summary>
+                    <?php
+                    // One input per noffer. A failed validation echoes the
+                    // POSTed rows back so the value the error names stays
+                    // visible; otherwise the stored entries prefill.
+                    $lnNofferPosted = $_POST['noffers'] ?? null;
+                    if ($lnNofferPosted !== null && !is_array($lnNofferPosted)) {
+                        $lnNofferPosted = [(string)$lnNofferPosted];
+                    }
+                    $lnNofferValues = [];
+                    foreach ($lnNofferPosted ?? $lnExistingNoffers as $lnNofferRow) {
+                        $lnNofferRow = trim((string)$lnNofferRow);
+                        if ($lnNofferRow !== '') { $lnNofferValues[] = $lnNofferRow; }
+                    }
+                    ?>
+                    <details class="form-group" id="noffer-section"<?= $lnNofferValues !== [] ? ' open' : '' ?>>
+                        <summary style="cursor: pointer; font-weight: 500; margin-bottom: 0.5rem;">noffer (CLINK) (Electrum)</summary>
+                        <div class="warning" style="margin-bottom: 0.5rem;">
+                            ⚠️ Your wallet must be ONLINE to receive lightning payments
+                        </div>
                         <?php if ($lnNofferEnvError !== null): ?>
                             <div class="warning" style="margin-bottom: 0.5rem;">
                                 <strong>noffers aren't available on this server yet:</strong>
@@ -2296,15 +2329,45 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                                 <?= htmlspecialchars($lnNofferNotice) ?>
                             </div>
                         <?php endif; ?>
-                        <input type="text" id="noffer" name="noffer" aria-label="noffer"
-                               style="font-family: monospace; font-size: 0.9rem;<?= $lnNofferEnvError !== null ? ' opacity: 0.5;' : '' ?>"
-                               value="<?= htmlspecialchars($lnNofferValue) ?>"
-                               placeholder="noffer1&hellip;"
-                               <?= $lnNofferEnvError !== null ? 'disabled' : '' ?>>
+                        <div id="noffer-list">
+                            <?php foreach (($lnNofferValues === [] ? [''] : $lnNofferValues) as $lnNofferIndex => $lnNofferRow): ?>
+                                <input type="text" name="noffers[]" aria-label="noffer"
+                                       <?= $lnNofferIndex === 0 ? 'id="noffer" ' : '' ?>style="font-family: monospace; font-size: 0.9rem; margin-bottom: 0.5rem;<?= $lnNofferEnvError !== null ? ' opacity: 0.5;' : '' ?>"
+                                       value="<?= htmlspecialchars($lnNofferRow) ?>"
+                                       placeholder="noffer1&hellip;"
+                                       <?= $lnNofferEnvError !== null ? 'disabled' : '' ?>>
+                            <?php endforeach; ?>
+                        </div>
+                        <button type="button" class="btn btn-secondary" id="add-noffer"
+                                style="<?= $lnNofferEnvError !== null ? 'opacity: 0.4;' : '' ?>"
+                                <?= $lnNofferEnvError !== null ? 'disabled' : '' ?>>
+                            + Add another noffer
+                        </button>
+                        <p style="margin-top: 0.35rem; font-size: 0.85rem; opacity: 0.75;">
+                            We suggest creating two noffers on separate relays to
+                            keep payments flowing smoothly if one of your relays
+                            experiences unexpected downtime
+                        </p>
                     </details>
 
                     <button type="submit" class="btn" style="width: 100%;">Continue</button>
                 </form>
+
+                <script>
+                (function () {
+                    var addBtn = document.getElementById('add-noffer');
+                    if (!addBtn) { return; }
+                    addBtn.addEventListener('click', function () {
+                        var list = document.getElementById('noffer-list');
+                        var row = list.lastElementChild.cloneNode(false);
+                        row.removeAttribute('id');
+                        row.removeAttribute('value');
+                        row.value = '';
+                        list.appendChild(row);
+                        row.focus();
+                    });
+                })();
+                </script>
 
                 <form method="POST" action="<?= htmlspecialchars(Urls::setup()) ?>" style="margin-top: 0.5rem;">
                     <input type="hidden" name="step" value="lightning">
@@ -2376,7 +2439,8 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                 </p>
                 <p style="margin-bottom: 0.75rem;">
                     Any funds that land in your mint get swept to your on-chain
-                    wallet automatically, as soon as the fees make sense.
+                    or lightning wallet automatically, as soon as the fees make
+                    sense.
                 </p>
                 <p style="margin-bottom: 1.5rem;">
                     ⚠️ One thing to know: mints are custodial &mdash; they could
