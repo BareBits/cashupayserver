@@ -124,7 +124,8 @@ def test_completion_screen_applies_the_wizard_discount(woocommerce) -> None:
 
     w = SetupWizard(wp.url, setup_path="/cashupay-setup/", session=session)
     w.post(step="terms", terms_legal="1", terms_warranty="1", terms_fee="1")
-    w.post(step="security", security_acknowledged="1")
+    # No security step: the fixture's data dir is outside the web root, so
+    # the wizard drops that screen from the WordPress flow.
     w.post(step="store", store_name="Discount Store")
     w.post(step="onchain", onchain_action="skip")
     w.post(step="lightning", lightning_action="skip")

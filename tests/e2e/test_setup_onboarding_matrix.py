@@ -146,7 +146,7 @@ def walk(
         if choices.lightning in ("address", "both"):
             fields["lightning_address"] = LN_ADDRESS
         if choices.lightning in ("noffer", "both"):
-            fields["noffer"] = REFERENCE_NOFFER
+            fields["noffers[]"] = REFERENCE_NOFFER
         body = w.post(step="lightning", lightning_action="save", **fields)
     assert wizard_error(body) is None, wizard_error(body)
 

@@ -17,6 +17,8 @@ from fixtures.payserver import PayserverHandle
 from fixtures.setup_helpers import (
     MAINNET_ADDRESS,
     MAINNET_XPUB,
+    REFERENCE_NOFFER,
+    SECOND_NOFFER,
     SetupWizard,
     TESTNET_TPUB,
     wizard_error as _error,
@@ -180,7 +182,7 @@ def test_invalid_inputs_are_rejected_with_readable_messages(payserver: Payserver
     body = w.post(step="lightning", lightning_action="save", lightning_address="not-an-address")
     assert "myname@strike.me" in (_error(body) or ""), _error(body)
 
-    body = w.post(step="lightning", lightning_action="save", noffer="noffer1garbage")
+    body = w.post(step="lightning", lightning_action="save", **{"noffers[]": "noffer1garbage"})
     assert "noffer1" in (_error(body) or ""), _error(body)
 
     # A well-formed address whose host can't be reached fails the LUD-21
@@ -200,6 +202,50 @@ def test_invalid_inputs_are_rejected_with_readable_messages(payserver: Payserver
         assert conn.execute("SELECT COUNT(*) FROM store_ln_addresses").fetchone()[0] == 0
     finally:
         conn.close()
+
+
+def test_multiple_noffers_persist_in_order(payserver: PayserverHandle) -> None:
+    """The noffer section accepts several entries (name="noffers[]"); all of
+    them persist as chain rows in the submitted order. Noffers carry no LUD-21
+    probe, so no lnurlp stack is needed. A duplicate row is rejected with the
+    same readable message the admin panel's chain uses, and revisiting the
+    screen prefills one input per stored noffer."""
+    w = Wizard(payserver)
+    w.through_store("Two Noffer Store")
+    w.post(step="onchain", onchain_action="skip")
+
+    body = w.post(
+        step="lightning",
+        lightning_action="save",
+        **{"noffers[]": [REFERENCE_NOFFER, SECOND_NOFFER, REFERENCE_NOFFER]},
+    )
+    assert "Duplicate destination" in (_error(body) or ""), _error(body)
+
+    body = w.post(
+        step="lightning",
+        lightning_action="save",
+        **{"noffers[]": [REFERENCE_NOFFER, SECOND_NOFFER]},
+    )
+    assert _error(body) is None, _error(body)
+    assert _heading(body) == "Submarine swaps"
+
+    conn = sqlite3.connect(payserver.data_dir / "cashupay.sqlite")
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            "SELECT address, type FROM store_ln_addresses ORDER BY position"
+        ).fetchall()
+    finally:
+        conn.close()
+    assert [(r["type"], r["address"]) for r in rows] == [
+        ("noffer", REFERENCE_NOFFER),
+        ("noffer", SECOND_NOFFER),
+    ], [dict(r) for r in rows]
+
+    # Revisiting the screen renders one prefilled input per stored noffer.
+    body = w.get("lightning")
+    assert body.count('name="noffers[]"') == 2, body.count('name="noffers[]"')
+    assert REFERENCE_NOFFER in body and SECOND_NOFFER in body
 
 
 def test_duplicate_store_name_is_rejected_but_a_rename_is_not(payserver: PayserverHandle) -> None:
@@ -338,3 +384,41 @@ def test_terms_gate_requires_all_three_checkboxes(payserver: PayserverHandle) ->
     body = w.post(step="terms", terms_legal="1", terms_warranty="1", terms_fee="1")
     assert _error(body) is None, _error(body)
     assert _heading(body) == "Quick safety check", _heading(body)
+
+
+def test_security_screen_skipped_when_data_dir_is_outside_the_webroot() -> None:
+    """The security screen exists to prove the database can't be fetched over
+    HTTP. With the data directory outside the web root that exposure is
+    impossible, so the wizard drops the screen — terms goes straight to the
+    password screen and the step counter shrinks accordingly. (The default
+    fixture keeps its data dir inside the repo/webroot, which is why every
+    other case here still sees the screen.)"""
+    import tempfile
+    import uuid
+
+    from conftest import SESSION_TMP
+    from fixtures.payserver import start_payserver, stop_payserver
+
+    workdir = SESSION_TMP / f"outside-webroot-{uuid.uuid4().hex[:8]}"
+    with tempfile.TemporaryDirectory(prefix="cashupay-data-") as outside:
+        handle = start_payserver(workdir, extra_env={"CASHUPAY_DATA_DIR": outside})
+        try:
+            w = SetupWizard(handle.url)
+            body = w.get("terms")
+            assert "of 9" in body, (
+                "skipping the security screen makes the standalone wizard 9 screens"
+            )
+
+            body = w.post(step="terms", terms_legal="1", terms_warranty="1", terms_fee="1")
+            assert _error(body) is None, _error(body)
+            assert _heading(body) == "Create your admin password", (
+                f"terms must land straight on the password screen, got {_heading(body)!r}"
+            )
+            # The terms screen carries the (normally security-screen-hosted)
+            # silent URL-mode probe so routing detection still happens.
+            terms = w.get("terms")
+            assert "save_url_mode" in terms, (
+                "the terms screen must host the URL-mode probe when the security screen is skipped"
+            )
+        finally:
+            stop_payserver(handle)

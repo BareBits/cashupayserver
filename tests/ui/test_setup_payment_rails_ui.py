@@ -148,6 +148,47 @@ def test_noffer_is_stored_after_the_lightning_address(
     assert chain[1]["address"] == REFERENCE_NOFFER
 
 
+def test_add_another_noffer_button_saves_multiple(
+    payserver: PayserverHandle, page
+) -> None:
+    """The noffer section starts with one input; "+ Add another noffer" adds a
+    second row, and both persist as ordered chain rows. Noffers carry no
+    save-time LUD-21 probe, so the plain payserver stack suffices. Also pins
+    the section's ONLINE warning and the separate-relays helper copy."""
+    from fixtures.setup_helpers import SECOND_NOFFER
+
+    _walk_to_store(page, payserver)
+    page.fill("#store_name", "Multi Noffer Store")
+    page.click("button[type=submit]")
+
+    page.wait_for_selector("#onchain-form")
+    page.click("button:has-text('Skip for now')")
+
+    page.wait_for_selector("#lightning_address")
+    page.click("#noffer-section > summary")
+    assert page.locator("#noffer-list input[name='noffers[]']").count() == 1
+    content = page.content()
+    assert "Your wallet must be ONLINE to receive lightning payments" in content
+    assert "two noffers on separate relays" in content
+
+    page.fill("#noffer", REFERENCE_NOFFER)
+    page.click("#add-noffer")
+    inputs = page.locator("#noffer-list input[name='noffers[]']")
+    assert inputs.count() == 2
+    assert inputs.nth(1).input_value() == "", "a fresh row must start empty"
+    inputs.nth(1).fill(SECOND_NOFFER)
+    page.click("button:has-text('Continue')")
+
+    page.wait_for_selector("button:has-text('No thanks')")
+    chain = _rows(
+        payserver, "SELECT address, type, position FROM store_ln_addresses ORDER BY position ASC"
+    )
+    assert [(r["type"], r["address"]) for r in chain] == [
+        ("noffer", REFERENCE_NOFFER),
+        ("noffer", SECOND_NOFFER),
+    ]
+
+
 def test_all_three_destination_types_store_in_chain_order(
     payserver_with_lnurlp: PayserverHandle, mint: MintHandle, backup_mint: MintHandle,
     lnd_mint, channels, page

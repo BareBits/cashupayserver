@@ -45,6 +45,48 @@ assert_eq(
     'WordPress swaps the password screen for the Bitcoin-discount screen'
 );
 
+// --- Security screen skip (data dir outside the web root) ------------------
+//
+// The screen proves the database can't be fetched over HTTP; with the data
+// directory outside the web root that exposure is impossible, so the screen
+// is dropped ($includeSecurity = false) and the counter stays honest. The
+// caller keeps it in the flow whenever a PHP requirement is missing, because
+// the screen is also where that blocking error renders.
+
+$noSecurity = SetupFlow::stepSequence('', false, false, false);
+assert_eq(
+    ['terms', 'password', 'store', 'onchain', 'lightning', 'swaps', 'mints', 'cron', 'done'],
+    $noSecurity,
+    'standalone with the data dir outside the web root drops the security screen'
+);
+assert_eq('password', SetupFlow::nextStep('terms', $noSecurity), 'terms then goes straight to the password screen');
+
+$wpNoSecurity = SetupFlow::stepSequence('', true, false, false);
+assert_eq(
+    ['terms', 'store', 'onchain', 'lightning', 'swaps', 'mints', 'discount', 'cron', 'done'],
+    $wpNoSecurity,
+    'WordPress with the data dir outside the web root drops both password and security'
+);
+assert_eq('store', SetupFlow::nextStep('terms', $wpNoSecurity), 'in WordPress terms then goes straight to the store screen');
+
+// Omitting the flag keeps the screen — every historical call site behaves
+// as before.
+assert_true(
+    in_array('security', SetupFlow::stepSequence('', false, false), true),
+    'the security screen stays by default'
+);
+
+// add_store never had the security screen; the flag must not disturb it.
+assert_eq(
+    SetupFlow::stepSequence('add_store', false, true),
+    SetupFlow::stepSequence('add_store', false, true, false),
+    'add_store is unaffected by the security flag'
+);
+
+// The bundled test PHP satisfies every requirement, so the skip decision is
+// purely the webroot test on this rig.
+assert_eq([], SetupFlow::missingRequirements(), 'the bundled test PHP passes all requirement checks');
+
 // --- The Bitcoin-discount screen is WordPress-only ------------------------
 //
 // It configures a WooCommerce checkout discount, so outside WordPress there
