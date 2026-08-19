@@ -134,6 +134,7 @@ def test_noffer_is_stored_after_the_lightning_address(
 
     page.wait_for_selector("#lightning_address")
     page.fill("#lightning_address", "merchant@strike.me")
+    page.click("#noffer-section > summary")
     page.fill("#noffer", REFERENCE_NOFFER)
     page.click("button:has-text('Continue')")
 
@@ -177,7 +178,9 @@ def test_all_three_destination_types_store_in_chain_order(
 
         page.wait_for_selector("#lightning_address")
         page.fill("#lightning_address", "merchant@strike.me")
+        page.click("#nwc-section > summary")
         page.fill("#nwc", nwc_uri)
+        page.click("#noffer-section > summary")
         page.fill("#noffer", REFERENCE_NOFFER)
         page.click("button:has-text('Continue')")
 
@@ -325,3 +328,75 @@ def test_add_store_with_mints_shows_the_generated_seed_once(
 
     page.click("a:has-text('Go to BareBits Admin')")
     page.wait_for_selector("#app", state="visible")
+
+
+def test_lightning_screen_collapses_nwc_and_noffer_sections(
+    payserver: PayserverHandle, mint: MintHandle, page
+) -> None:
+    """The NWC and noffer inputs live in <details> sections that start
+    collapsed, and the "don't have a lightning address?" help box sits
+    between the LNURL field and the NWC section."""
+    _walk_to_store(page, payserver)
+    page.fill("#store_name", "Collapsed Rails Store")
+    page.click("button[type=submit]")
+
+    page.wait_for_selector("#onchain-form")
+    page.click("button:has-text('Skip for now')")
+
+    page.wait_for_selector("#lightning_address")
+    # Both sections render collapsed, so their inputs are hidden.
+    assert page.locator("#nwc-section[open]").count() == 0, "NWC section must start collapsed"
+    assert page.locator("#noffer-section[open]").count() == 0, "noffer section must start collapsed"
+    assert not page.locator("#nwc").is_visible(), "collapsed NWC section must hide its input"
+    assert not page.locator("#noffer").is_visible(), "collapsed noffer section must hide its input"
+
+    # The help box sits below the LNURL field and above the NWC section.
+    order = page.evaluate(
+        """() => {
+            const before = (a, b) => !!(
+                document.querySelector(a).compareDocumentPosition(document.querySelector(b))
+                & Node.DOCUMENT_POSITION_FOLLOWING
+            );
+            return [
+                before('#lightning_address', '#ln-help-box'),
+                before('#ln-help-box', '#nwc-section'),
+                before('#nwc-section', '#noffer-section'),
+            ];
+        }"""
+    )
+    assert order == [True, True, True], f"screen order wrong: {order}"
+    assert "Don't have a lightning address?" in page.locator("#ln-help-box").inner_text()
+
+    # Expanding via the summary reveals the inputs.
+    page.click("#nwc-section > summary")
+    assert page.locator("#nwc").is_visible()
+    page.click("#noffer-section > summary")
+    assert page.locator("#noffer").is_visible()
+
+
+def test_noffer_section_reopens_when_a_rejected_value_is_echoed(
+    payserver: PayserverHandle, mint: MintHandle, page
+) -> None:
+    """A failed validation re-renders the screen with the operator's noffer
+    echoed back; the section must render open so the value the error names
+    isn't hidden behind a collapsed toggle."""
+    _walk_to_store(page, payserver)
+    page.fill("#store_name", "Reopen Store")
+    page.click("button[type=submit]")
+
+    page.wait_for_selector("#onchain-form")
+    page.click("button:has-text('Skip for now')")
+
+    page.wait_for_selector("#lightning_address")
+    page.click("#noffer-section > summary")
+    page.fill("#noffer", "noffer-not-valid")
+    page.click("button:has-text('Continue')")
+
+    page.wait_for_selector(".error")
+    assert "noffer1" in page.locator(".error").inner_text()
+    assert page.locator("#noffer-section[open]").count() == 1, (
+        "the echoed noffer must render its section open"
+    )
+    assert page.input_value("#noffer") == "noffer-not-valid"
+    # The untouched NWC section stays collapsed.
+    assert page.locator("#nwc-section[open]").count() == 0
