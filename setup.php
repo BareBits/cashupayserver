@@ -517,8 +517,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     throw new Exception('That NWC connection string doesn\'t look right. It should start with nostr+walletconnect:// — copy the whole string from your wallet.');
                 }
 
-                // Environment gate, same as the swaps screen's: the CLINK
-                // client can't sign Nostr requests without GMP, so a noffer
+                // Environment gate: the CLINK client can't sign Nostr
+                // requests without bignum math (GMP or BCMath), so a noffer
                 // saved here would silently drop Lightning from the checkout.
                 // The screen renders the field disabled; this catches a direct
                 // POST past that.
@@ -1034,6 +1034,15 @@ function getDataDirHttpPath(): ?string {
             margin-bottom: 1.5rem;
         }
 
+        .info {
+            background: rgba(59, 130, 246, 0.15);
+            border: 1px solid rgba(59, 130, 246, 0.4);
+            color: #bfdbfe;
+            padding: 1rem;
+            border-radius: 8px;
+            margin-bottom: 1.5rem;
+        }
+
         .checkbox-group {
             display: flex;
             align-items: flex-start;
@@ -1340,21 +1349,23 @@ function getDataDirHttpPath(): ?string {
                     </div>
                 <?php else: ?>
                     <?php if (!function_exists('gmp_init')): ?>
-                        <!-- BCMath satisfies the hard requirement (Cashu falls
-                             back to it), but xpub derivation and swap signing
-                             run through libraries that only speak GMP. Flagged
-                             here, on the first screen with a requirements list,
-                             so a shared-host operator learns before investing
-                             time in the wizard — the affected steps repeat it.
+                        <!-- BCMath satisfies the hard requirement (Cashu,
+                             noffers, and NWC all fall back to it), but xpub
+                             derivation and swap signing run through libraries
+                             that only speak GMP. Flagged here, on the first
+                             screen with a requirements list, so a shared-host
+                             operator learns before investing time in the
+                             wizard — the affected steps repeat it.
                              function_exists, not extension_loaded: hardened
                              hosts sometimes disable the functions while the
                              extension itself reports as loaded. -->
                         <div class="warning" style="margin-bottom: 1.5rem;">
                             <strong>Heads up: PHP's GMP extension is not enabled.</strong>
-                            Payments will work, but xpub-based on-chain wallets and
-                            submarine swaps need it (a single Bitcoin address works
-                            fine without it). Ask your hosting provider to enable
-                            <code>php-gmp</code> to unlock everything.
+                            Payments, Lightning (NWC/noffers), and Cashu still work on
+                            the slower BCMath fallback, but xpub-based on-chain wallets
+                            and submarine swaps need GMP &mdash; ask your hosting
+                            provider to enable <code>php-gmp</code> for the fastest,
+                            best-tested cryptography and to unlock everything.
                         </div>
                     <?php endif; ?>
                     <!-- Security Check Section -->
@@ -2142,8 +2153,8 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                         $lnExistingAddress = $lnRow['address'];
                     }
                 }
-                // Same environment gate as the swaps screen: the CLINK client
-                // needs GMP, so on a host without it the noffer field is
+                // Environment gate: the CLINK client needs bignum math (GMP
+                // or BCMath), so on a host with neither the noffer field is
                 // disabled with the reason instead of accepting a destination
                 // that would silently fail at checkout. NWC signs its Nostr
                 // requests through the same stack and gets the same gate.
@@ -2196,6 +2207,10 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                                 <strong>NWC isn't available on this server yet:</strong>
                                 <?= htmlspecialchars($lnNwcEnvError) ?>
                             </div>
+                        <?php elseif (($lnNwcNotice = NwcClient::environmentNotice()) !== null): ?>
+                            <div class="info" style="margin-bottom: 0.5rem;">
+                                <?= htmlspecialchars($lnNwcNotice) ?>
+                            </div>
                         <?php endif; ?>
                         <?php if ($lnNwcShowsSaved): ?>
                             <!-- A connection is stored. Its secret-bearing URI never
@@ -2237,6 +2252,10 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                             <div class="warning" style="margin-bottom: 0.5rem;">
                                 <strong>noffers aren't available on this server yet:</strong>
                                 <?= htmlspecialchars($lnNofferEnvError) ?>
+                            </div>
+                        <?php elseif (($lnNofferNotice = ClinkClient::environmentNotice()) !== null): ?>
+                            <div class="info" style="margin-bottom: 0.5rem;">
+                                <?= htmlspecialchars($lnNofferNotice) ?>
                             </div>
                         <?php endif; ?>
                         <input type="text" id="noffer" name="noffer"

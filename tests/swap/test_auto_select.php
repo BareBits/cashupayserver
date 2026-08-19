@@ -264,7 +264,7 @@ class LockupTreeMockProvider extends QuoteMockProvider {
     public function createReverseSwap(string $network, int $onchainAmountSats,
                                        string $claimPubkeyHex, string $preimageHashHex): SwapCreateResult {
         $refundPriv = hash('sha256', 'autoselect-test-refund:' . $this->getName(), true);
-        $refundPub = Secp256k1::pointToCompressed(Secp256k1::generatorMult(Secp256k1::bytesToGmp($refundPriv)));
+        $refundPub = Secp256k1::pointToCompressed(Secp256k1::generatorMult(Secp256k1::bytesToNum($refundPriv)));
         $claimPub = hex2bin($claimPubkeyHex);
         $preimageHash = hex2bin($preimageHashHex);
         $claimXOnly = substr($claimPub, 1);

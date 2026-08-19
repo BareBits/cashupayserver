@@ -1,11 +1,16 @@
 <?php
 /**
- * BIP340 test vectors.
+ * BIP340 test vectors, on every available BigNum backend.
  *
- * Subset from https://github.com/bitcoin/bips/blob/master/bip-0340/test-vectors.csv
+ * All 32-byte-message vectors from
+ * https://github.com/bitcoin/bips/blob/master/bip-0340/test-vectors.csv
+ * (vectors 15-18 use variable-length messages, which this implementation
+ * deliberately doesn't accept — every caller signs a 32-byte digest).
  *
  * Vectors with a secret key validate signing (deterministic, given aux_rand).
- * Vectors without a secret key validate verification only.
+ * Vectors without a secret key validate verification only. The whole set runs
+ * once per usable backend (GMP, BCMath) so the shared-hosting fallback is
+ * pinned to the exact same outputs.
  */
 
 require_once __DIR__ . '/../../includes/crypto/schnorr.php';
@@ -39,80 +44,148 @@ $VECTORS = [
      'FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF',
      'FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF',
      '7EB0509757E246F19449885651611CB965ECC1A187DD51B64FDA1EDC9637D5EC97582B9CB13DB3933705B32BA982AF5AF25FD78881EBB32771FC5922EFC66EA3',
+     true], // test fails if msg is reduced modulo p or n
+    [4,
+     null,
+     'D69C3509BB99E412E68B0FE8544E72837DFA30746D8BE2AA65975F29D22DC7B9',
+     null,
+     '4DF3C3F68FCC83B27E9D42C90431A72499F17875C81A599B566C9889B9696703',
+     '00000000000000000000003B78CE563F89A0ED9414F5AA28AD0D96D6795F9C6376AFB1548AF603B3EB45C9F8207DEE1060CB71C04E80F593060B07D28308D7F4',
      true],
-    // Vector 5: public key not on the curve → must verify FALSE
     [5,
      null,
      'EEFDEA4CDB677750A420FEE807EACF21EB9898AE79B9768766E4FAA04A2D4A34',
      null,
      '243F6A8885A308D313198A2E03707344A4093822299F31D0082EFA98EC4E6C89',
      '6CFF5C3BA86C69EA4B7376F31A9BCB4F74C1976089B2D9963DA2E5543E17776969E89B4C5564D00349106B8497785DD7D1D713A8AE82B32FA79D5F7FC407D39B',
-     false],
-    // Vector 6: has_even_y(R) is false → must verify FALSE
+     false], // public key not on the curve
     [6,
      null,
      'DFF1D77F2A671C5F36183726DB2341BE58FEAE1DA2DECED843240F7B502BA659',
      null,
      '243F6A8885A308D313198A2E03707344A4093822299F31D0082EFA98EC4E6C89',
      'FFF97BD5755EEEA420453A14355235D382F6472F8568A18B2F057A14602975563CC27944640AC607CD107AE10923D9EF7A73C643E166BE5EBEAFA34B1AC553E2',
-     false],
-    // Vector 7: negated message → must verify FALSE
+     false], // has_even_y(R) is false
     [7,
      null,
      'DFF1D77F2A671C5F36183726DB2341BE58FEAE1DA2DECED843240F7B502BA659',
      null,
      '243F6A8885A308D313198A2E03707344A4093822299F31D0082EFA98EC4E6C89',
      '1FA62E331EDBC21C394792D2AB1100A7B432B013DF3F6FF4F99FCB33E0E1515F28890B3EDB6E7189B630448B515CE4F8622A954CFE545735AAEA5134FCCDB2BD',
-     false],
-    // Vector 14: pubkey > field size → must verify FALSE
+     false], // negated message
+    [8,
+     null,
+     'DFF1D77F2A671C5F36183726DB2341BE58FEAE1DA2DECED843240F7B502BA659',
+     null,
+     '243F6A8885A308D313198A2E03707344A4093822299F31D0082EFA98EC4E6C89',
+     '6CFF5C3BA86C69EA4B7376F31A9BCB4F74C1976089B2D9963DA2E5543E177769961764B3AA9B2FFCB6EF947B6887A226E8D7C93E00C5ED0C1834FF0D0C2E6DA6',
+     false], // negated s value
+    [9,
+     null,
+     'DFF1D77F2A671C5F36183726DB2341BE58FEAE1DA2DECED843240F7B502BA659',
+     null,
+     '243F6A8885A308D313198A2E03707344A4093822299F31D0082EFA98EC4E6C89',
+     '0000000000000000000000000000000000000000000000000000000000000000123DDA8328AF9C23A94C1FEECFD123BA4FB73476F0D594DCB65C6425BD186051',
+     false], // sG - eP is infinite. Test fails in single verification if has_even_y(inf) is defined as true and x(inf) as 0
+    [10,
+     null,
+     'DFF1D77F2A671C5F36183726DB2341BE58FEAE1DA2DECED843240F7B502BA659',
+     null,
+     '243F6A8885A308D313198A2E03707344A4093822299F31D0082EFA98EC4E6C89',
+     '00000000000000000000000000000000000000000000000000000000000000017615FBAF5AE28864013C099742DEADB4DBA87F11AC6754F93780D5A1837CF197',
+     false], // sG - eP is infinite. Test fails in single verification if has_even_y(inf) is defined as true and x(inf) as 1
+    [11,
+     null,
+     'DFF1D77F2A671C5F36183726DB2341BE58FEAE1DA2DECED843240F7B502BA659',
+     null,
+     '243F6A8885A308D313198A2E03707344A4093822299F31D0082EFA98EC4E6C89',
+     '4A298DACAE57395A15D0795DDBFD1DCB564DA82B0F269BC70A74F8220429BA1D69E89B4C5564D00349106B8497785DD7D1D713A8AE82B32FA79D5F7FC407D39B',
+     false], // sig[0:32] is not an X coordinate on the curve
+    [12,
+     null,
+     'DFF1D77F2A671C5F36183726DB2341BE58FEAE1DA2DECED843240F7B502BA659',
+     null,
+     '243F6A8885A308D313198A2E03707344A4093822299F31D0082EFA98EC4E6C89',
+     'FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F69E89B4C5564D00349106B8497785DD7D1D713A8AE82B32FA79D5F7FC407D39B',
+     false], // sig[0:32] is equal to field size
+    [13,
+     null,
+     'DFF1D77F2A671C5F36183726DB2341BE58FEAE1DA2DECED843240F7B502BA659',
+     null,
+     '243F6A8885A308D313198A2E03707344A4093822299F31D0082EFA98EC4E6C89',
+     '6CFF5C3BA86C69EA4B7376F31A9BCB4F74C1976089B2D9963DA2E5543E177769FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141',
+     false], // sig[32:64] is equal to curve order
     [14,
      null,
      'FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC30',
      null,
      '243F6A8885A308D313198A2E03707344A4093822299F31D0082EFA98EC4E6C89',
      '6CFF5C3BA86C69EA4B7376F31A9BCB4F74C1976089B2D9963DA2E5543E17776969E89B4C5564D00349106B8497785DD7D1D713A8AE82B32FA79D5F7FC407D39B',
-     false],
+     false], // public key is not a valid X coordinate because it exceeds the field size
 ];
 
-$failures = 0;
-$total = 0;
-foreach ($VECTORS as $v) {
-    $total++;
-    [$index, $sk, $pk, $aux, $msg, $sig, $expectValid] = $v;
+function run_vectors(array $VECTORS, string $backend): array {
+    $failures = 0;
+    $total = 0;
+    foreach ($VECTORS as $v) {
+        $total++;
+        [$index, $sk, $pk, $aux, $msg, $sig, $expectValid] = $v;
 
-    $pkBytes = hex2bin($pk);
-    $msgBytes = hex2bin($msg);
-    $sigBytes = hex2bin($sig);
+        $pkBytes = hex2bin($pk);
+        $msgBytes = hex2bin($msg);
+        $sigBytes = hex2bin($sig);
 
-    // Verify
-    $ok = Schnorr::verify($pkBytes, $msgBytes, $sigBytes);
-    if ($ok !== $expectValid) {
-        echo "FAIL verify idx={$index} expected=" . ($expectValid ? 'true' : 'false') . " got=" . ($ok ? 'true' : 'false') . "\n";
-        $failures++;
-        continue;
-    }
-
-    // Sign if secret key provided
-    if ($sk !== null && $expectValid) {
-        $skBytes = hex2bin($sk);
-        $auxBytes = hex2bin($aux);
-        try {
-            $produced = Schnorr::sign($skBytes, $msgBytes, $auxBytes);
-            $producedHex = strtoupper(bin2hex($produced));
-            if ($producedHex !== strtoupper($sig)) {
-                echo "FAIL sign idx={$index}\n  expected={$sig}\n  got     ={$producedHex}\n";
-                $failures++;
-                continue;
-            }
-        } catch (Throwable $e) {
-            echo "FAIL sign idx={$index} threw: " . $e->getMessage() . "\n";
+        // Verify
+        $ok = Schnorr::verify($pkBytes, $msgBytes, $sigBytes);
+        if ($ok !== $expectValid) {
+            echo "FAIL [{$backend}] verify idx={$index} expected=" . ($expectValid ? 'true' : 'false') . " got=" . ($ok ? 'true' : 'false') . "\n";
             $failures++;
             continue;
         }
-    }
 
-    echo "PASS idx=" . ($index ?? 'verify-only') . "\n";
+        // Sign if secret key provided
+        if ($sk !== null && $expectValid) {
+            $skBytes = hex2bin($sk);
+            $auxBytes = hex2bin($aux);
+            try {
+                $produced = Schnorr::sign($skBytes, $msgBytes, $auxBytes);
+                $producedHex = strtoupper(bin2hex($produced));
+                if ($producedHex !== strtoupper($sig)) {
+                    echo "FAIL [{$backend}] sign idx={$index}\n  expected={$sig}\n  got     ={$producedHex}\n";
+                    $failures++;
+                    continue;
+                }
+            } catch (Throwable $e) {
+                echo "FAIL [{$backend}] sign idx={$index} threw: " . $e->getMessage() . "\n";
+                $failures++;
+                continue;
+            }
+        }
+
+        echo "PASS [{$backend}] idx={$index}\n";
+    }
+    return [$total, $failures];
 }
+
+$backends = [];
+if (function_exists('gmp_init')) $backends[] = 'gmp';
+if (function_exists('bcadd')) $backends[] = 'bcmath';
+if ($backends === []) {
+    fwrite(STDERR, "neither GMP nor BCMath available\n");
+    exit(1);
+}
+
+$total = 0;
+$failures = 0;
+foreach ($backends as $backend) {
+    BigNum::forceBackend($backend);
+    Secp256k1::resetCaches();
+    [$t, $f] = run_vectors($VECTORS, $backend);
+    $total += $t;
+    $failures += $f;
+}
+BigNum::forceBackend(null);
+Secp256k1::resetCaches();
 
 echo "\n{$total} tested, {$failures} failed\n";
 exit($failures === 0 ? 0 : 1);

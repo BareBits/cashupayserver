@@ -5,9 +5,12 @@
  * Speaks the *client* side of Nostr Wallet Connect against the merchant's
  * wallet service: given a connection URI we ask the wallet to mint a BOLT11
  * (`make_invoice`) and later confirm settlement (`lookup_invoice`). Pure PHP
- * (no exec, no ext-sodium) on top of swentel/nostr-php + the same websocket
- * client the CLINK payer uses, and the same shared-hosting constraint: every
- * call is one short open→request→reply→close round trip, no resident process.
+ * (no exec, no ext-sodium) on top of swentel/nostr-php's event/relay layer +
+ * the same websocket client the CLINK payer uses, with the crypto (BIP340
+ * signing/verification, NIP-04/NIP-44 keys) done by the in-repo NostrCrypto
+ * stack so it runs on ext-gmp or ext-bcmath. Same shared-hosting constraint:
+ * every call is one short open→request→reply→close round trip, no resident
+ * process.
  *
  * This client deliberately knows only three methods:
  *
@@ -30,12 +33,10 @@
 declare(strict_types=1);
 
 require_once __DIR__ . '/uri.php';
+require_once __DIR__ . '/../crypto/nostr_crypto.php';
 require_once __DIR__ . '/../../vendor/autoload.php';
 
-use swentel\nostr\Key\Key;
 use swentel\nostr\Event\Event;
-use swentel\nostr\Sign\Sign;
-use swentel\nostr\Encryption\Nip04;
 use swentel\nostr\Encryption\Nip44;
 
 /** Structured NWC failure carrying the NIP-47 error code where known. */
@@ -67,23 +68,43 @@ class NwcClient
     public const DEFAULT_TIMEOUT_SEC = 10;
 
     /**
-     * NWC signs kind-23194 events and derives NIP-04/NIP-44 keys through
-     * swentel/nostr-php, which hard-requires ext-gmp — the same constraint as
-     * the CLINK noffer stack. Checked up front by the onboarding wizard and
-     * admin settings so the operator gets one actionable sentence instead of
-     * a per-invoice error_log line. Returns null when NWC can run here.
+     * NWC signs kind-23194 events and derives NIP-04/NIP-44 keys, which
+     * needs bignum math — ext-gmp or ext-bcmath (the in-repo NostrCrypto
+     * stack runs on either), the same constraint as the CLINK noffer stack.
+     * Checked up front by the onboarding wizard and admin settings so the
+     * operator gets one actionable sentence instead of a per-invoice
+     * error_log line. Returns null when NWC can run here. See
+     * environmentNotice() for the non-blocking "BCMath fallback active"
+     * advisory.
      */
     public static function environmentError(): ?string
     {
         if (PHP_INT_SIZE < 8) {
             return 'This server runs 32-bit PHP; NWC connections require 64-bit PHP.';
         }
-        if (!function_exists('gmp_init')) {
-            return 'This server\'s PHP is missing the GMP extension, which is required to'
-                . ' sign the Nostr requests NWC (Nostr Wallet Connect) works over. Ask your'
-                . ' hosting provider to enable php-gmp, or use a Lightning address instead.';
+        if (!NostrCrypto::available()) {
+            return 'This server\'s PHP has neither the GMP nor the BCMath extension; one'
+                . ' of them is required to sign the Nostr requests NWC (Nostr Wallet'
+                . ' Connect) works over. Ask your hosting provider to enable php-gmp'
+                . ' (preferred) or php-bcmath, or use a Lightning address instead.';
         }
         return null;
+    }
+
+    /**
+     * Non-blocking advisory when NWC runs on the BCMath fallback: it works,
+     * but GMP is much faster and the better-audited bignum. Null when GMP is
+     * active or when the feature can't run at all.
+     */
+    public static function environmentNotice(): ?string
+    {
+        if (self::environmentError() !== null || !NostrCrypto::usingBcmathFallback()) {
+            return null;
+        }
+        return 'NWC is running on PHP\'s BCMath extension. This works, but enabling'
+            . ' the GMP extension (php-gmp) makes the cryptography roughly 100x faster'
+            . ' and uses the more battle-tested math library — worth asking your'
+            . ' hosting provider for.';
     }
 
     /**
@@ -268,7 +289,7 @@ class NwcClient
     ): array {
         $skHex = $parsed['secret'];
         $walletPubkey = $parsed['pubkey'];
-        $clientPubkey = (new Key())->getPublicKey($skHex);
+        $clientPubkey = NostrCrypto::derivePublicKeyHex($skHex);
 
         $client = null;
         $subId = bin2hex(random_bytes(8));
@@ -283,11 +304,11 @@ class NwcClient
             // Build + encrypt the request.
             $payload = json_encode(['method' => $method, 'params' => $params]);
             if ($useNip44) {
-                $convKey = Nip44::getConversationKey($skHex, $walletPubkey);
+                $convKey = NostrCrypto::nip44ConversationKey($skHex, $walletPubkey);
                 $content = Nip44::encrypt($payload, $convKey);
             } else {
                 $convKey = null;
-                $content = Nip04::encrypt($payload, $skHex, $walletPubkey);
+                $content = NostrCrypto::nip04Encrypt($payload, $skHex, $walletPubkey);
             }
 
             $event = new Event();
@@ -301,7 +322,7 @@ class NwcClient
             $tags[] = ['expiration', (string)(time() + $timeout + 30)];
             $event->setTags($tags);
             $event->setContent($content);
-            (new Sign())->signEvent($event, $skHex);
+            NostrCrypto::signEvent($event, $skHex);
             $signed = $event->toArray();
             $requestId = (string)$signed['id'];
             $createdAt = (int)$signed['created_at'];
@@ -332,6 +353,14 @@ class NwcClient
                     // Only the wallet may answer; the filter asks for this but
                     // the relay is untrusted.
                     if (!hash_equals($walletPubkey, (string)($ev['pubkey'] ?? ''))) {
+                        continue;
+                    }
+                    // Defense in depth: require a valid Schnorr signature by
+                    // the wallet key before trusting the content. Conversation
+                    // -key secrecy already authenticates the ciphertext, but a
+                    // signature check means an impostor needs to break BOTH
+                    // the ECDH layer and BIP340 to speak for the wallet.
+                    if (!NostrCrypto::verifyEventArray($ev)) {
                         continue;
                     }
                     $plain = self::decryptResponse((string)($ev['content'] ?? ''), $skHex, $walletPubkey, $convKey);
@@ -437,9 +466,9 @@ class NwcClient
         foreach ($schemes as $scheme) {
             try {
                 if ($scheme === 'nip04') {
-                    return Nip04::decrypt($content, $skHex, $walletPubkey);
+                    return NostrCrypto::nip04Decrypt($content, $skHex, $walletPubkey);
                 }
-                $convKey = $nip44ConvKey ?? Nip44::getConversationKey($skHex, $walletPubkey);
+                $convKey = $nip44ConvKey ?? NostrCrypto::nip44ConversationKey($skHex, $walletPubkey);
                 return Nip44::decrypt($content, $convKey);
             } catch (\Throwable $e) {
                 // try the other scheme

@@ -55,7 +55,7 @@ class FeeGateMockProvider implements SwapProvider {
     public function createReverseSwap(string $network, int $onchainAmountSats, string $claimPubkeyHex, string $preimageHashHex): SwapCreateResult {
         self::$createdCount++;
         $refundPriv = hash('sha256', 'mock-refund-key', true);
-        $refundPub = Secp256k1::pointToCompressed(Secp256k1::generatorMult(Secp256k1::bytesToGmp($refundPriv)));
+        $refundPub = Secp256k1::pointToCompressed(Secp256k1::generatorMult(Secp256k1::bytesToNum($refundPriv)));
         $claimPub = hex2bin($claimPubkeyHex);
         $preimageHash = hex2bin($preimageHashHex);
 

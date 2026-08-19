@@ -9,8 +9,9 @@
  * disable functions while the extension still reports loaded.
  *
  * Distinct from OnchainWallet::environmentError(): that one requires GMP
- * specifically (EC math), so "GMP missing but BCMath present" leaves Cashu
- * working while on-chain/swaps/noffer/NWC are dead.
+ * specifically (xpub parsing via bitwasp/bitcoin has no BCMath fallback), so
+ * "GMP missing but BCMath present" leaves Cashu, noffers, and NWC working
+ * while on-chain/swaps are dead.
  */
 final class CashuEnv {
     /** Null when Cashu can run; otherwise an operator-actionable message. */

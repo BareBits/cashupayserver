@@ -186,7 +186,10 @@ on the checkout page.
 ## Requirements
 
 - PHP 8.0 or higher
-- Extensions: `curl`, `json`, `sqlite3`, `gmp`, `mbstring`
+- Extensions: `curl`, `json`, `sqlite3`, `mbstring`, and `gmp` or `bcmath`
+  (`gmp` is strongly recommended — it is ~100x faster for the payment
+  cryptography and is required for xpub-based on-chain wallets and submarine
+  swaps; Cashu, Lightning addresses, NWC, and noffers also run on `bcmath`)
 - Apache with mod_rewrite, nginx, or any PHP-capable web server
 
 For on-chain Bitcoin payment support, the release zip ships with the required

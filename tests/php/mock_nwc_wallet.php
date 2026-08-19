@@ -30,6 +30,8 @@
  *                         introspect itself)
  *   MOCK_NWC_SILENT       if "1", swallow requests without replying (timeout
  *                         path)
+ *   MOCK_NWC_BAD_SIG      if "1", replies carry a mangled Schnorr signature
+ *                         (impostor simulation — the client must ignore them)
  *   MOCK_NWC_DUMP         if set, append each decrypted request payload as a
  *                         JSON line to this path (lets a test assert methods,
  *                         params, and encryption actually sent)
@@ -147,7 +149,14 @@ $server->onText(function (Server $srv, $conn, Text $message) use ($walletSk, $wa
             $reply->setContent(Nip44::encrypt(json_encode($body), $ck));
         }
         (new Sign())->signEvent($reply, $walletSk);
-        $conn->send(new Text(json_encode(['EVENT', $sub, $reply->toArray()])));
+        $replyArr = $reply->toArray();
+        if (getenv('MOCK_NWC_BAD_SIG') === '1') {
+            // Impostor mode: correctly encrypted content (the conversation key
+            // is real) but a mangled Schnorr signature — the client's reply
+            // verification must drop this event.
+            $replyArr['sig'] = str_repeat('0', 16) . substr($replyArr['sig'], 16);
+        }
+        $conn->send(new Text(json_encode(['EVENT', $sub, $replyArr])));
         return;
     }
 

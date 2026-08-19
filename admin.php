@@ -2382,8 +2382,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 }
 
                 // Environment gate: the CLINK client can't sign Nostr requests
-                // without GMP, so a noffer added on such a host would silently
-                // drop Lightning from the checkout. Refuse NEW noffers with the
+                // without bignum math (GMP or BCMath), so a noffer added on
+                // such a host would silently drop Lightning from the checkout.
+                // Refuse NEW noffers with the
                 // actionable message; ones already stored pass through so the
                 // operator can still keep (or remove) them while editing the
                 // rest of the card. The UI greys the section out — this catches
@@ -2404,7 +2405,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         }
                     }
                 }
-                // Same gate for NWC: signing NIP-47 requests needs GMP too.
+                // Same gate for NWC: signing NIP-47 requests needs the same math.
                 // NEW connections are refused with the actionable message;
                 // kept ones (resolved from keep: refs above) pass through so
                 // the operator can still edit the rest of the card.
@@ -5505,6 +5506,10 @@ header('Cache-Control: no-cache, must-revalidate');
                                         Existing entries stay saved (and can be removed) but are
                                         skipped at checkout until then.
                                     </div>
+                                <?php elseif (($nwcNotice = NwcClient::environmentNotice()) !== null): ?>
+                                    <div style="margin-bottom:0.75rem; padding:0.6rem 0.8rem; border-radius:8px; background:rgba(59,130,246,0.10); border:1px solid rgba(59,130,246,0.35); font-size:0.82rem;">
+                                        &#9432; <?= htmlspecialchars($nwcNotice) ?>
+                                    </div>
                                 <?php endif; ?>
                                 <p class="form-help">
                                     Nostr Wallet Connect (NIP-47) lets BareBits request Lightning
@@ -5534,6 +5539,10 @@ header('Cache-Control: no-cache, must-revalidate');
                                         <?= htmlspecialchars($nofferEnvError) ?>
                                         Existing entries stay saved (and can be removed) but are
                                         skipped at checkout until then.
+                                    </div>
+                                <?php elseif (($nofferNotice = ClinkClient::environmentNotice()) !== null): ?>
+                                    <div style="margin-bottom:0.75rem; padding:0.6rem 0.8rem; border-radius:8px; background:rgba(59,130,246,0.10); border:1px solid rgba(59,130,246,0.35); font-size:0.82rem;">
+                                        &#9432; <?= htmlspecialchars($nofferNotice) ?>
                                     </div>
                                 <?php endif; ?>
                                 <p class="form-help">

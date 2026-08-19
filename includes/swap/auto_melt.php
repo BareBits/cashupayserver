@@ -474,7 +474,7 @@ final class SwapAutoMelt {
         }
 
         $claimPriv = random_bytes(32);
-        $claimPubPoint = Secp256k1::generatorMult(Secp256k1::bytesToGmp($claimPriv));
+        $claimPubPoint = Secp256k1::generatorMult(Secp256k1::bytesToNum($claimPriv));
         if ($claimPubPoint === null) {
             error_log("SwapAutoMelt: claim key derivation failed for store {$store['id']}");
             return null;
