@@ -154,6 +154,28 @@ try {
     stop_wallet($proc);
 }
 
+// ---------- impostor reply (bad Schnorr signature) is ignored ----------
+// The mock encrypts correctly (it holds the real wallet key) but mangles the
+// signature; the client's reply verification must drop the event and time
+// out rather than accept the bolt11.
+[$proc, $port] = start_wallet([
+    'MOCK_NWC_WALLET_SK' => $walletSk,
+    'MOCK_NWC_BAD_SIG' => '1',
+]);
+try {
+    $uri = wallet_uri($walletPk, $port, $clientSk);
+    $threw = false;
+    try {
+        NwcClient::makeInvoice($uri, 21, null, null, 3);
+    } catch (NwcException $e) {
+        $threw = true;
+        assert_eq('', $e->nwcCode, 'unsigned reply is treated as no reply, not a wallet error');
+    }
+    assert_true($threw, 'reply with an invalid signature is not accepted');
+} finally {
+    stop_wallet($proc);
+}
+
 // ---------- lookup_invoice: settled ----------
 $hash = hash('sha256', 'some-invoice');
 [$proc, $port] = start_wallet([

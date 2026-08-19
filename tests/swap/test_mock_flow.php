@@ -66,7 +66,7 @@ class MockSwapProvider implements SwapProvider {
 
         // Generate a deterministic refund key for the test.
         $refundPriv = hash('sha256', 'mock-refund-key', true);
-        $refundPub = Secp256k1::pointToCompressed(Secp256k1::generatorMult(Secp256k1::bytesToGmp($refundPriv)));
+        $refundPub = Secp256k1::pointToCompressed(Secp256k1::generatorMult(Secp256k1::bytesToNum($refundPriv)));
         $claimPub = hex2bin($claimPubkeyHex);
         $preimageHash = hex2bin($preimageHashHex);
 

@@ -749,7 +749,7 @@ class Invoice {
 
                 // Per-swap fresh keypair + preimage.
                 $claimPriv = random_bytes(32);
-                $claimPubPoint = Secp256k1::generatorMult(Secp256k1::bytesToGmp($claimPriv));
+                $claimPubPoint = Secp256k1::generatorMult(Secp256k1::bytesToNum($claimPriv));
                 if ($claimPubPoint === null) {
                     $failureReasons[] = "{$name}: claim key derivation failed (retry)";
                     continue;

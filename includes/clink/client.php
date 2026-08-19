@@ -7,7 +7,10 @@
  * paid by reading the merchant's kind-21001 payment receipt.
  *
  * Two distinct jobs, both pure-PHP (no exec, no ext-sodium) on top of
- * swentel/nostr-php (NIP-44 + Schnorr signing + a pure-PHP websocket client):
+ * swentel/nostr-php's event/relay layer (a pure-PHP websocket client) with
+ * the crypto — BIP340 Schnorr, x-only ECDH, NIP-44 keys — done by the in-repo
+ * NostrCrypto/BigNum stack, which runs on ext-gmp or ext-bcmath (nostr-php's
+ * own crypto hard-requires GMP, which shared WordPress hosts often lack):
  *
  *   requestInvoice()  — used at invoice creation (receive) and at cashout
  *                       (withdraw). Generates a throwaway identity, sends an
@@ -32,11 +35,10 @@
 declare(strict_types=1);
 
 require_once __DIR__ . '/noffer.php';
+require_once __DIR__ . '/../crypto/nostr_crypto.php';
 require_once __DIR__ . '/../../vendor/autoload.php';
 
-use swentel\nostr\Key\Key;
 use swentel\nostr\Event\Event;
-use swentel\nostr\Sign\Sign;
 use swentel\nostr\Encryption\Nip44;
 
 /** Structured CLINK failure carrying a NIP-69 error code where known. */
@@ -58,27 +60,47 @@ class ClinkClient
 
     /**
      * Why this exists: the CLINK payer path Schnorr-signs Nostr events and
-     * derives NIP-44 conversation keys through swentel/nostr-php, which
-     * hard-requires ext-gmp with no fallback. Shared WordPress hosts
-     * frequently ship PHP without GMP, and before this check that surfaced
-     * only as a per-invoice error_log line while the checkout silently lost
-     * its Lightning option. The mirror of OnchainWallet::environmentError()
-     * for the noffer stack: checked up front by the onboarding wizard and the
-     * admin settings so the operator gets one actionable sentence instead.
+     * derives NIP-44 conversation keys, which needs bignum math — ext-gmp or
+     * ext-bcmath (the in-repo NostrCrypto stack runs on either). Shared
+     * WordPress hosts frequently ship PHP without GMP, and before this check
+     * that surfaced only as a per-invoice error_log line while the checkout
+     * silently lost its Lightning option. The mirror of
+     * OnchainWallet::environmentError() for the noffer stack: checked up
+     * front by the onboarding wizard and the admin settings so the operator
+     * gets one actionable sentence instead.
      *
-     * Returns null when the environment can run the CLINK client.
+     * Returns null when the environment can run the CLINK client. See
+     * environmentNotice() for the non-blocking "BCMath fallback active"
+     * advisory.
      */
     public static function environmentError(): ?string
     {
         if (PHP_INT_SIZE < 8) {
             return 'This server runs 32-bit PHP; CLINK noffers require 64-bit PHP.';
         }
-        if (!function_exists('gmp_init')) {
-            return 'This server\'s PHP is missing the GMP extension, which is required to'
-                . ' sign the Nostr payment requests CLINK noffers work over. Ask your'
-                . ' hosting provider to enable php-gmp, or use a Lightning address instead.';
+        if (!NostrCrypto::available()) {
+            return 'This server\'s PHP has neither the GMP nor the BCMath extension; one'
+                . ' of them is required to sign the Nostr payment requests CLINK noffers'
+                . ' work over. Ask your hosting provider to enable php-gmp (preferred)'
+                . ' or php-bcmath, or use a Lightning address instead.';
         }
         return null;
+    }
+
+    /**
+     * Non-blocking advisory when noffers run on the BCMath fallback: they
+     * work, but GMP is much faster and the better-audited bignum library.
+     * Null when GMP is active or when the feature can't run at all.
+     */
+    public static function environmentNotice(): ?string
+    {
+        if (self::environmentError() !== null || !NostrCrypto::usingBcmathFallback()) {
+            return null;
+        }
+        return 'CLINK noffers are running on PHP\'s BCMath extension. This works, but'
+            . ' enabling the GMP extension (php-gmp) makes the cryptography roughly'
+            . ' 100x faster and uses the more battle-tested math library — worth'
+            . ' asking your hosting provider for.';
     }
 
     // Total wall-clock budget for a request→reply round trip. Relays + the
@@ -121,9 +143,8 @@ class ClinkClient
             $description = mb_substr($description, 0, 100);
         }
 
-        $key = new Key();
-        $skHex = $key->generatePrivateKey();
-        $pkHex = $key->getPublicKey($skHex);
+        $skHex = NostrCrypto::generatePrivateKeyHex();
+        $pkHex = NostrCrypto::derivePublicKeyHex($skHex);
         $receiverPubkey = $decoded['pubkey'];
 
         // Encrypted request payload. amount is conditional: the spec carries it
@@ -140,14 +161,14 @@ class ClinkClient
             $payload['description'] = $description;
         }
 
-        $convKey = Nip44::getConversationKey($skHex, $receiverPubkey);
+        $convKey = NostrCrypto::nip44ConversationKey($skHex, $receiverPubkey);
         $content = Nip44::encrypt(json_encode($payload), $convKey);
 
         $event = new Event();
         $event->setKind(self::KIND);
         $event->setTags([['p', $receiverPubkey], ['clink_version', '1']]);
         $event->setContent($content);
-        (new Sign())->signEvent($event, $skHex);
+        NostrCrypto::signEvent($event, $skHex);
         $signed = $event->toArray();
         $requestId = (string)$signed['id'];
         $createdAt = (int)$signed['created_at'];
@@ -197,7 +218,7 @@ class ClinkClient
     public static function fetchReceipt(array $ctx, ?int $timeoutSec = null): array
     {
         $timeout = $timeoutSec ?? self::timeoutSec();
-        $convKey = Nip44::getConversationKey($ctx['ephemeral_sk'], $ctx['receiver_pubkey']);
+        $convKey = NostrCrypto::nip44ConversationKey($ctx['ephemeral_sk'], $ctx['receiver_pubkey']);
         $events = self::collectEvents(
             $ctx['relay'],
             $ctx['ephemeral_pubkey'],
@@ -225,7 +246,7 @@ class ClinkClient
      */
     public static function verifyReceiptEvent(array $rawEvent, array $ctx): array
     {
-        $convKey = Nip44::getConversationKey($ctx['ephemeral_sk'], $ctx['receiver_pubkey']);
+        $convKey = NostrCrypto::nip44ConversationKey($ctx['ephemeral_sk'], $ctx['receiver_pubkey']);
         return self::interpretReceipt($rawEvent, $ctx, $convKey);
     }
 
@@ -248,19 +269,11 @@ class ClinkClient
         if (!self::tagsReferenceEvent($ev['tags'] ?? [], (string)$ctx['request_event_id'])) {
             return ['paid' => false];
         }
-        // Verify the Schnorr signature over the canonical event id.
+        // Verify the Schnorr signature over the canonical event id (which
+        // NostrCrypto re-derives from the presented content — a receipt with
+        // a genuine (id,sig) pair but altered tags/content fails here).
         try {
-            $check = new Event();
-            $check->populate((object)[
-                'id' => $ev['id'] ?? '',
-                'pubkey' => $ev['pubkey'] ?? '',
-                'created_at' => $ev['created_at'] ?? 0,
-                'kind' => $ev['kind'] ?? 0,
-                'tags' => $ev['tags'] ?? [],
-                'content' => $ev['content'] ?? '',
-                'sig' => $ev['sig'] ?? '',
-            ]);
-            if (!$check->verify()) {
+            if (!NostrCrypto::verifyEventArray($ev)) {
                 return ['paid' => false];
             }
         } catch (\Throwable $e) {
