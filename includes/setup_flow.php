@@ -64,9 +64,18 @@ final class SetupFlow {
      * the sequence entirely, which also keeps the "Step X of Y" counter honest
      * rather than advertising a screen that will never render.
      *
+     * $includeSecurity is false when the data directory is outside the web
+     * root (and the PHP requirements all pass): the screen exists to prove
+     * the database can't be fetched over HTTP, and with the directory outside
+     * the web root that exposure is impossible — showing the warning anyway
+     * only confuses the operator. Callers keep it true whenever a requirement
+     * is missing, because the screen is also where that blocking error lives.
+     *
      * @return string[]
      */
-    public static function stepSequence(string $mode, bool $isWordPress, bool $includeZeroConf): array {
+    public static function stepSequence(
+        string $mode, bool $isWordPress, bool $includeZeroConf, bool $includeSecurity = true
+    ): array {
         if ($mode === 'add_store') {
             $steps = self::ADD_STORE_STEPS;
         } else {
@@ -80,11 +89,44 @@ final class SetupFlow {
                 // there is no WooCommerce to apply it to.
                 $steps = array_values(array_diff($steps, ['discount']));
             }
+            if (!$includeSecurity) {
+                $steps = array_values(array_diff($steps, ['security']));
+            }
         }
         if (!$includeZeroConf) {
             $steps = array_values(array_diff($steps, ['zeroconf']));
         }
         return array_values($steps);
+    }
+
+    /**
+     * PHP requirements the wizard's security screen reports, as
+     * name => passed. Lives here rather than inline in the render so the
+     * "can the security screen be skipped?" decision and the screen itself
+     * can never disagree about what was checked.
+     *
+     * GMP-or-BCMath deliberately uses extension_loaded (matching the screen's
+     * original check): a hardened host that disables the functions but keeps
+     * the extension loaded is handled by the softer per-feature gates later
+     * in the wizard, not blocked here.
+     *
+     * @return string[] Names of the requirements that FAILED (empty = all ok).
+     */
+    public static function missingRequirements(): array {
+        $checks = [
+            'PHP ' . PHP_VERSION => version_compare(PHP_VERSION, '8.0.0', '>='),
+            'cURL extension' => extension_loaded('curl'),
+            'JSON extension' => extension_loaded('json'),
+            'PDO SQLite' => extension_loaded('pdo_sqlite'),
+            'GMP or BCMath' => extension_loaded('gmp') || extension_loaded('bcmath'),
+        ];
+        $failed = [];
+        foreach ($checks as $name => $passed) {
+            if (!$passed) {
+                $failed[] = $name;
+            }
+        }
+        return $failed;
     }
 
     /**

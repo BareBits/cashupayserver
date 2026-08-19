@@ -115,6 +115,14 @@ if (!Database::isInitialized()) {
     Database::initialize();
 }
 
+// The security screen exists to prove the data directory can't be fetched
+// over the web. With the directory outside the web root that exposure is
+// impossible, so the screen is dropped from the flow entirely rather than
+// warning about a risk that doesn't apply — unless a PHP requirement is
+// missing, because the screen is also where that blocking error renders.
+$securityScreenNeeded = SetupFlow::missingRequirements() !== []
+    || !Database::isDataDirOutsideWebroot();
+
 // Current screen. Anything unrecognised (a stale bookmark, or a form saved
 // from the pre-slug wizard) restarts at the first screen for this mode rather
 // than rendering a blank card.
@@ -193,7 +201,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     // each handler runs so the advance lands on the right screen.
     $storeIdForFlow = $_SESSION['setup_store_id'] ?? null;
     $flowSteps = SetupFlow::stepSequence(
-        $mode, Urls::isWordPress(), SetupFlow::onchainState($storeIdForFlow)['configured']
+        $mode, Urls::isWordPress(), SetupFlow::onchainState($storeIdForFlow)['configured'],
+        $securityScreenNeeded
     );
     // Set by the mints handler when it mints a fresh wallet seed. add_store
     // has to stop and show it rather than redirecting past it.
@@ -327,7 +336,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 // reached by going Back may already have one, which decides
                 // whether the zero-conf screen is in the sequence.
                 $flowSteps = SetupFlow::stepSequence(
-                    $mode, Urls::isWordPress(), SetupFlow::onchainState($storeId)['configured']
+                    $mode, Urls::isWordPress(), SetupFlow::onchainState($storeId)['configured'],
+                    $securityScreenNeeded
                 );
                 $step = SetupFlow::nextStep('store', $flowSteps) ?? 'onchain';
                 break;
@@ -342,7 +352,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if ($onchainAction === 'skip') {
                     // Nothing saved; the zero-conf screen drops out of the
                     // sequence because there is no on-chain rail to time.
-                    $flowSteps = SetupFlow::stepSequence($mode, Urls::isWordPress(), false);
+                    $flowSteps = SetupFlow::stepSequence($mode, Urls::isWordPress(), false, $securityScreenNeeded);
                     $step = SetupFlow::nextStep('onchain', $flowSteps) ?? 'lightning';
                     break;
                 }
@@ -452,7 +462,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     ], 'id = ?', [$storeId]);
                 }
 
-                $flowSteps = SetupFlow::stepSequence($mode, Urls::isWordPress(), true);
+                $flowSteps = SetupFlow::stepSequence($mode, Urls::isWordPress(), true, $securityScreenNeeded);
                 $step = SetupFlow::nextStep('onchain', $flowSteps) ?? 'zeroconf';
                 break;
 
@@ -837,6 +847,107 @@ function getDataDirHttpPath(): ?string {
 
 // Security tests are done client-side via JavaScript for better compatibility
 // (PHP's built-in server can't make HTTP requests to itself)
+
+/**
+ * Emit the client-side URL-mode probe (standalone only): detect which routing
+ * style the host supports (clean > direct > router) and save it through the
+ * save_url_mode AJAX action. Client-side because PHP's built-in server can't
+ * make HTTP requests to itself.
+ *
+ * The security screen renders progress into its #url-mode-* elements; when
+ * that screen is skipped (data directory outside the web root) the same probe
+ * runs silently from the terms screen instead — so every UI touch below is
+ * guarded on the elements existing.
+ */
+function renderUrlModeDetectionScript(): void { ?>
+    <script>
+    (function() {
+        async function detectAndSaveUrlMode() {
+            const loadingEl = document.getElementById('url-mode-loading');
+            const resultEl = document.getElementById('url-mode-result');
+            const statusEl = document.getElementById('url-mode-status');
+            const messageEl = document.getElementById('url-mode-message');
+            const detailsEl = document.getElementById('url-mode-details');
+
+            const baseUrl = <?= json_encode(Urls::siteBase()) ?>;
+            const setupUrl = <?= json_encode(Urls::setup()) ?>;
+
+            // Probe each routing style. The /health probe tells
+            // "clean" (pretty URLs via the front-controller
+            // rewrite) apart from "direct": /health is cron-key
+            // gated, so it answers 403 when the extension-less
+            // path routes and 404 when it does not. 200/503 also
+            // count as "resolved". The /api/v1 probes accept
+            // 200/503 (503 = setup not complete yet).
+            const tests = {
+                clean:  { url: baseUrl + '/health', works: false, ok: [200, 403, 503] },
+                direct: { url: baseUrl + '/api/v1/server/info', works: false, ok: [200, 503] },
+                router: { url: baseUrl + '/router.php/api/v1/server/info', works: false, ok: [200, 503] }
+            };
+
+            for (const [mode, test] of Object.entries(tests)) {
+                try {
+                    const response = await fetch(test.url, { method: 'GET', mode: 'same-origin' });
+                    test.works = test.ok.includes(response.status);
+                } catch (e) {
+                    test.works = false;
+                }
+            }
+
+            // Prefer the nicest routing the host supports:
+            // clean > direct > router.
+            let selectedMode = null;
+            if (tests.clean.works) {
+                selectedMode = 'clean';
+            } else if (tests.direct.works) {
+                selectedMode = 'direct';
+            } else if (tests.router.works) {
+                selectedMode = 'router';
+            }
+
+            // Save the detected mode
+            if (selectedMode) {
+                try {
+                    const formData = new FormData();
+                    formData.append('action', 'save_url_mode');
+                    formData.append('mode', selectedMode);
+                    await fetch(setupUrl, { method: 'POST', body: formData });
+                } catch (e) {
+                    console.error('Failed to save URL mode:', e);
+                }
+            }
+
+            // Update UI (present on the security screen only)
+            if (!loadingEl || !resultEl || !statusEl || !messageEl || !detailsEl) {
+                return;
+            }
+            loadingEl.style.display = 'none';
+            resultEl.style.display = 'flex';
+
+            if (selectedMode === 'clean') {
+                statusEl.className = 'status OK';
+                messageEl.textContent = 'Clean URLs working';
+                detailsEl.textContent = 'Pretty URLs like /admin and /pay/... are supported.';
+            } else if (selectedMode === 'direct') {
+                statusEl.className = 'status OK';
+                messageEl.textContent = 'Direct URLs working';
+                detailsEl.textContent = 'API URLs like /api/v1/... are supported.';
+            } else if (selectedMode === 'router') {
+                statusEl.className = 'status OK';
+                messageEl.textContent = 'Router.php URLs working';
+                detailsEl.textContent = 'Using /router.php/api/v1/... for compatibility.';
+            } else {
+                statusEl.className = 'status WARN';
+                messageEl.textContent = 'Could not detect working URL mode';
+                detailsEl.textContent = 'You may need to configure your server. Check settings after setup.';
+            }
+        }
+
+        // Run URL detection after page load
+        detectAndSaveUrlMode();
+    })();
+    </script>
+<?php }
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -1251,7 +1362,9 @@ function getDataDirHttpPath(): ?string {
             // so the counter never promises a screen that won't appear.
             $renderStoreId = $_SESSION['setup_store_id'] ?? null;
             $renderOnchain = SetupFlow::onchainState($renderStoreId);
-            $renderSteps = SetupFlow::stepSequence($mode, Urls::isWordPress(), $renderOnchain['configured']);
+            $renderSteps = SetupFlow::stepSequence(
+                $mode, Urls::isWordPress(), $renderOnchain['configured'], $securityScreenNeeded
+            );
             $displayIndex = array_search($step, $renderSteps, true);
             $totalSteps = count($renderSteps);
             // The add_store hand-off panel sits outside the sequence; show it
@@ -1325,6 +1438,13 @@ function getDataDirHttpPath(): ?string {
                     <button type="submit" class="btn" style="width: 100%;">Continue →</button>
                 </form>
 
+                <?php if (!Urls::isWordPress() && !$securityScreenNeeded) {
+                    // The security screen normally hosts the URL-mode probe;
+                    // with that screen skipped (data directory outside the web
+                    // root) it runs silently from here instead.
+                    renderUrlModeDetectionScript();
+                } ?>
+
             <?php elseif ($step === 'security'): ?>
                 <!-- Screen: security check (requirements + DB exposure + URL mode) -->
                 <h2 style="margin-bottom: 1rem;">🔒 Quick safety check</h2>
@@ -1337,22 +1457,12 @@ function getDataDirHttpPath(): ?string {
                 </p>
 
                 <?php
-                // Check PHP requirements silently - only show if something fails
-                $checks = [
-                    ['PHP ' . PHP_VERSION, version_compare(PHP_VERSION, '8.0.0', '>=')],
-                    ['cURL extension', extension_loaded('curl')],
-                    ['JSON extension', extension_loaded('json')],
-                    ['PDO SQLite', extension_loaded('pdo_sqlite')],
-                    ['GMP or BCMath', extension_loaded('gmp') || extension_loaded('bcmath')],
-                ];
-                $allPassed = true;
-                $failedChecks = [];
-                foreach ($checks as [$name, $passed]) {
-                    if (!$passed) {
-                        $allPassed = false;
-                        $failedChecks[] = $name;
-                    }
-                }
+                // Check PHP requirements silently - only show if something
+                // fails. Shared with the "can this screen be skipped?"
+                // decision (SetupFlow::stepSequence) so the two never
+                // disagree about what was checked.
+                $failedChecks = SetupFlow::missingRequirements();
+                $allPassed = $failedChecks === [];
                 ?>
 
                 <?php if (!$allPassed): ?>
@@ -1637,92 +1747,9 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
 
                         // Run test on page load
                         runSecurityTest();
-
-                        // URL Mode Detection (standalone only)
-                        <?php if (!Urls::isWordPress()): ?>
-                        async function detectAndSaveUrlMode() {
-                            const loadingEl = document.getElementById('url-mode-loading');
-                            const resultEl = document.getElementById('url-mode-result');
-                            const statusEl = document.getElementById('url-mode-status');
-                            const messageEl = document.getElementById('url-mode-message');
-                            const detailsEl = document.getElementById('url-mode-details');
-
-                            const baseUrl = <?= json_encode(Urls::siteBase()) ?>;
-                            const setupUrl = <?= json_encode(Urls::setup()) ?>;
-
-                            // Probe each routing style. The /health probe tells
-                            // "clean" (pretty URLs via the front-controller
-                            // rewrite) apart from "direct": /health is cron-key
-                            // gated, so it answers 403 when the extension-less
-                            // path routes and 404 when it does not. 200/503 also
-                            // count as "resolved". The /api/v1 probes accept
-                            // 200/503 (503 = setup not complete yet).
-                            const tests = {
-                                clean:  { url: baseUrl + '/health', works: false, ok: [200, 403, 503] },
-                                direct: { url: baseUrl + '/api/v1/server/info', works: false, ok: [200, 503] },
-                                router: { url: baseUrl + '/router.php/api/v1/server/info', works: false, ok: [200, 503] }
-                            };
-
-                            for (const [mode, test] of Object.entries(tests)) {
-                                try {
-                                    const response = await fetch(test.url, { method: 'GET', mode: 'same-origin' });
-                                    test.works = test.ok.includes(response.status);
-                                } catch (e) {
-                                    test.works = false;
-                                }
-                            }
-
-                            // Prefer the nicest routing the host supports:
-                            // clean > direct > router.
-                            let selectedMode = null;
-                            if (tests.clean.works) {
-                                selectedMode = 'clean';
-                            } else if (tests.direct.works) {
-                                selectedMode = 'direct';
-                            } else if (tests.router.works) {
-                                selectedMode = 'router';
-                            }
-
-                            // Save the detected mode
-                            if (selectedMode) {
-                                try {
-                                    const formData = new FormData();
-                                    formData.append('action', 'save_url_mode');
-                                    formData.append('mode', selectedMode);
-                                    await fetch(setupUrl, { method: 'POST', body: formData });
-                                } catch (e) {
-                                    console.error('Failed to save URL mode:', e);
-                                }
-                            }
-
-                            // Update UI
-                            loadingEl.style.display = 'none';
-                            resultEl.style.display = 'flex';
-
-                            if (selectedMode === 'clean') {
-                                statusEl.className = 'status OK';
-                                messageEl.textContent = 'Clean URLs working';
-                                detailsEl.textContent = 'Pretty URLs like /admin and /pay/... are supported.';
-                            } else if (selectedMode === 'direct') {
-                                statusEl.className = 'status OK';
-                                messageEl.textContent = 'Direct URLs working';
-                                detailsEl.textContent = 'API URLs like /api/v1/... are supported.';
-                            } else if (selectedMode === 'router') {
-                                statusEl.className = 'status OK';
-                                messageEl.textContent = 'Router.php URLs working';
-                                detailsEl.textContent = 'Using /router.php/api/v1/... for compatibility.';
-                            } else {
-                                statusEl.className = 'status WARN';
-                                messageEl.textContent = 'Could not detect working URL mode';
-                                detailsEl.textContent = 'You may need to configure your server. Check settings after setup.';
-                            }
-                        }
-
-                        // Run URL detection after page load
-                        detectAndSaveUrlMode();
-                        <?php endif; ?>
                     })();
                     </script>
+                    <?php if (!Urls::isWordPress()) { renderUrlModeDetectionScript(); } ?>
                 <?php endif; ?>
 
             <?php elseif ($step === 'password'): ?>

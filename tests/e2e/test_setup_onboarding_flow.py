@@ -384,3 +384,41 @@ def test_terms_gate_requires_all_three_checkboxes(payserver: PayserverHandle) ->
     body = w.post(step="terms", terms_legal="1", terms_warranty="1", terms_fee="1")
     assert _error(body) is None, _error(body)
     assert _heading(body) == "Quick safety check", _heading(body)
+
+
+def test_security_screen_skipped_when_data_dir_is_outside_the_webroot() -> None:
+    """The security screen exists to prove the database can't be fetched over
+    HTTP. With the data directory outside the web root that exposure is
+    impossible, so the wizard drops the screen — terms goes straight to the
+    password screen and the step counter shrinks accordingly. (The default
+    fixture keeps its data dir inside the repo/webroot, which is why every
+    other case here still sees the screen.)"""
+    import tempfile
+    import uuid
+
+    from conftest import SESSION_TMP
+    from fixtures.payserver import start_payserver, stop_payserver
+
+    workdir = SESSION_TMP / f"outside-webroot-{uuid.uuid4().hex[:8]}"
+    with tempfile.TemporaryDirectory(prefix="cashupay-data-") as outside:
+        handle = start_payserver(workdir, extra_env={"CASHUPAY_DATA_DIR": outside})
+        try:
+            w = SetupWizard(handle.url)
+            body = w.get("terms")
+            assert "of 9" in body, (
+                "skipping the security screen makes the standalone wizard 9 screens"
+            )
+
+            body = w.post(step="terms", terms_legal="1", terms_warranty="1", terms_fee="1")
+            assert _error(body) is None, _error(body)
+            assert _heading(body) == "Create your admin password", (
+                f"terms must land straight on the password screen, got {_heading(body)!r}"
+            )
+            # The terms screen carries the (normally security-screen-hosted)
+            # silent URL-mode probe so routing detection still happens.
+            terms = w.get("terms")
+            assert "save_url_mode" in terms, (
+                "the terms screen must host the URL-mode probe when the security screen is skipped"
+            )
+        finally:
+            stop_payserver(handle)

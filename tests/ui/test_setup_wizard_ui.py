@@ -169,3 +169,58 @@ def test_setup_wizard_without_onchain_skips_zeroconf(
 
     # Straight to Lightning — no zero-conf screen in between.
     page.wait_for_selector("#lightning_address")
+
+
+def test_outside_webroot_skips_security_screen_but_still_detects_url_mode(
+    page,
+) -> None:
+    """With the data directory outside the web root the security screen is
+    dropped from the flow — terms lands straight on the password screen — but
+    the URL-mode probe that screen normally hosts must still run: it moves to
+    the terms screen (silently) and saves a working url_mode."""
+    import tempfile
+    import time
+    import uuid
+    from pathlib import Path
+
+    from conftest import SESSION_TMP
+    from fixtures.payserver import start_payserver, stop_payserver
+
+    workdir = SESSION_TMP / f"outside-webroot-ui-{uuid.uuid4().hex[:8]}"
+    with tempfile.TemporaryDirectory(prefix="cashupay-data-") as outside:
+        handle = start_payserver(workdir, extra_env={"CASHUPAY_DATA_DIR": outside})
+        try:
+            page.set_default_timeout(30000)
+            page.goto(f"{handle.url}/setup")
+
+            # The terms screen hosts the silent URL-mode probe now; give the
+            # fetch round-trips a moment and check the config row landed.
+            db = Path(outside) / "cashupay.sqlite"
+            deadline = time.time() + 20
+            mode = None
+            while time.time() < deadline:
+                conn = sqlite3.connect(db)
+                try:
+                    row = conn.execute(
+                        "SELECT value FROM config WHERE key = 'url_mode'"
+                    ).fetchone()
+                finally:
+                    conn.close()
+                if row:
+                    mode = row[0]
+                    break
+                time.sleep(0.5)
+            assert mode is not None, "the terms screen must save a detected url_mode"
+            assert mode in ('"clean"', '"direct"', '"router"', "clean", "direct", "router"), mode
+
+            # Terms → password directly; no security screen in the flow.
+            page.check("#terms_legal")
+            page.check("#terms_warranty")
+            page.check("#terms_fee")
+            page.click("button[type=submit]")
+            page.wait_for_selector("#password")
+            assert "of 9" in page.locator(".subtitle").inner_text(), (
+                "skipping the security screen should advertise 9 screens"
+            )
+        finally:
+            stop_payserver(handle)

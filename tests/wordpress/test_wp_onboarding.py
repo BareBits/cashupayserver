@@ -69,22 +69,26 @@ def _wp_login(wp: WordPressHandle) -> requests.Session:
 
 def test_wizard_skips_the_password_screen_and_completes(wp_ready) -> None:
     """The whole point of WordPress mode: no BareBits password is created,
-    because the WordPress admin already is the admin. The security ack must
-    therefore land straight on the store screen, and the flow must still
-    complete through the WordPress-only completion screen."""
+    because the WordPress admin already is the admin. This fixture also keeps
+    the data directory outside the web root (the WordPress default), so the
+    security screen is skipped as well — accepting the terms must land
+    straight on the store screen, and the flow must still complete through
+    the WordPress-only completion screen."""
     wp, session = wp_ready
     w = SetupWizard(wp.url, setup_path=SETUP_PATH, session=session)
 
-    body = w.get("security")
-    assert wizard_heading(body) == "Quick safety check", wizard_heading(body)
-    # 10 screens, not the standalone 10: WordPress drops the password screen
-    # but gains the Bitcoin-discount screen, and zero-conf has not joined yet
-    # because no on-chain rail exists.
-    assert "of 10" in body, "WordPress with no on-chain rail should be 10 screens"
+    body = w.get("terms")
+    assert wizard_heading(body) == "Let's agree on a few things", wizard_heading(body)
+    # 9 screens: WordPress drops the password screen and gains the
+    # Bitcoin-discount screen, the outside-webroot data dir drops the
+    # security screen, and zero-conf has not joined yet because no on-chain
+    # rail exists.
+    assert "of 9" in body, "WordPress with no on-chain rail should be 9 screens"
 
-    body = w.post(step="security", security_acknowledged="1")
+    body = w.post(step="terms", terms_legal="1", terms_warranty="1", terms_fee="1")
     assert wizard_heading(body) == "Let's name your store", (
-        f"WordPress mode must skip the password screen, landed on {wizard_heading(body)!r}"
+        "WordPress mode must skip the password screen and, with the data dir "
+        f"outside the web root, the security screen too; landed on {wizard_heading(body)!r}"
     )
 
     body = w.post(step="store", store_name="WP Wizard Store")
