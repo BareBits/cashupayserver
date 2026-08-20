@@ -148,9 +148,17 @@ class Invoice {
         $onchainConfigured = ($onchainMode === 'static')
             ? !empty($store['onchain_static_address'])
             : !empty($store['onchain_xpub']);
-        if (!$cashuConfigured && !$onchainConfigured) {
+        // Ordered direct-receive chain (Lightning address / NWC / noffer),
+        // loaded once here because it is a payment rail in its own right: a
+        // store whose only rails are Lightning destinations (the wizard's
+        // "skip on-chain, skip mints, add NWC/noffer" outcome) fetches its
+        // BOLT11 straight from the merchant's wallet, needing neither a mint
+        // nor an xpub.
+        $destinations = StoreLnAddresses::destinationsForStore($storeId);
+        if (!$cashuConfigured && !$onchainConfigured && $destinations === []) {
             throw new Exception(
-                'Store has no payment methods configured. Add a Cashu mint or an on-chain xpub.'
+                'Store has no payment methods configured. Add a Cashu mint, an '
+                . 'on-chain xpub, or a Lightning destination (address, NWC, or noffer).'
             );
         }
         // Whether to OFFER the on-chain rail to customers. A store can keep its
@@ -185,9 +193,8 @@ class Invoice {
         // invoice can fetch a bolt11 from a destination whether or not
         // threshold-based cashout is enabled. The toggle only governs the cron
         // threshold-melt of accumulated mint balance, not invoice creation.
-        $lnAddrsForRedirect = StoreLnAddresses::addressesForStore($storeId);
         $lightningCapable = $cashuConfigured
-            || !empty($lnAddrsForRedirect)
+            || $destinations !== []
             || (SwapsConfig::isEnabledForStore($storeId) && $onchainConfigured);
         $offeredRails = [];
         if ($lightningCapable)   { $offeredRails[] = 'lightning'; }
@@ -209,13 +216,13 @@ class Invoice {
         $nofferAttempt = null;         // CLINK noffer receive context on success
         $nwcAttempt = null;            // NWC (NIP-47) receive context on success
         $lnurlOverrideReason = null;   // set when override-gate fired; recorded on the fallback invoice
-        // Ordered fallback chain: try each destination (Lightning address via
-        // LNURL, or CLINK noffer via Nostr) in priority order until one yields a
-        // usable invoice. Loaded regardless of the auto-cashout (threshold-melt)
+        // Ordered fallback chain ($destinations, loaded with the rails gate
+        // above): try each destination (Lightning address via LNURL, NWC, or
+        // CLINK noffer via Nostr) in priority order until one yields a usable
+        // invoice. Walked regardless of the auto-cashout (threshold-melt)
         // toggle — configuring a destination is enough to direct-receive to it;
         // the toggle only governs the cron threshold-melt of mint balance. The
         // single auto_melt_address column was replaced by store_ln_addresses.
-        $destinations = StoreLnAddresses::destinationsForStore($storeId);
         // Skip the merchant lightning rail entirely when a fee owns it — the
         // single lightning option on this invoice is the fee LNURL's bolt11.
         if ($feeLightning === null && !empty($destinations)) {
@@ -232,10 +239,15 @@ class Invoice {
                 $decision['override'] ? '1' : '0',
                 $decision['reason']
             ));
-            if ($decision['override']) {
+            if ($decision['override'] && ($cashuConfigured || $onchainConfigured)) {
                 // Skip LNURL this invoice and remember why; the mint-rail
                 // path below will record this on the invoice so settlement
-                // can fire the immediate-settle-and-forward handler.
+                // can fire the immediate-settle-and-forward handler. Only
+                // honored when a mint/on-chain rail exists to land on: on a
+                // store whose sole rails are its Lightning destinations,
+                // firing would disable the only way to pay, so the
+                // destinations are used anyway and the fees stay owed for the
+                // cron to collect later.
                 $lnurlOverrideReason = $decision['reason'];
             } elseif ($lnurlTargetSats > 0) {
                 // Walk the priority chain. First destination to return a usable
@@ -592,7 +604,31 @@ class Invoice {
             $quoteIdFinal = null;
             $amountSatsFinal = $swapAttempt['swap']->invoiceAmountSats;
         } else {
-            $paymentRail = $quote ? 'mint' : ($onchainAddress ? 'onchain' : 'mint');
+            if ($quote === null && $onchainAddress === null) {
+                // No rail produced anything payable. Refuse rather than insert
+                // an invoice with a null bolt11 and no on-chain address — the
+                // customer would land on a payment page with no way to pay.
+                // Typical trigger: a Lightning-destination-only store whose
+                // wallet is offline, so every direct-receive attempt failed
+                // and there is no mint/xpub to fall back to.
+                $hints = [];
+                if ($destinations !== []) {
+                    $hints[] = 'none of the store\'s Lightning destinations '
+                        . '(address / NWC / noffer) returned an invoice — check '
+                        . 'that the receiving wallet is online';
+                }
+                if ($cashuConfigured) {
+                    $hints[] = 'no configured mint produced a quote';
+                }
+                if ($onchainConfigured && !$onchainOffered) {
+                    $hints[] = 'the on-chain rail is switched off for customers';
+                }
+                throw new Exception(
+                    'Could not create an invoice: no payment rail is available.'
+                    . ($hints !== [] ? ' ' . ucfirst(implode('; ', $hints)) . '.' : '')
+                );
+            }
+            $paymentRail = $quote ? 'mint' : 'onchain';
             $bolt11Final = $quote ? $quote->request : null;
             $mintUrlFinal = $usedMintUrl;
             $quoteIdFinal = $quote ? $quote->quote : null;
