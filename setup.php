@@ -1388,7 +1388,25 @@ function renderUrlModeDetectionScript(): void { ?>
             </div>
 
             <?php if ($error): ?>
-                <div class="error"><?= htmlspecialchars($error) ?></div>
+                <div class="error" id="setup-error"><?= htmlspecialchars($error) ?></div>
+                <script>
+                // A failed save re-renders this page via POST, and browsers
+                // restore the pre-submit scroll position on that navigation —
+                // on the longer screens (lightning, mints) the operator can be
+                // scrolled well past this banner and never see why the save
+                // failed. Pin the view to the top whenever an error rendered.
+                (function () {
+                    if ('scrollRestoration' in history) {
+                        history.scrollRestoration = 'manual';
+                    }
+                    window.scrollTo(0, 0);
+                    // Scroll restoration can also fire after the document
+                    // finishes loading; win that race too.
+                    window.addEventListener('load', function () {
+                        window.scrollTo(0, 0);
+                    });
+                })();
+                </script>
             <?php endif; ?>
 
             <?php if ($step === 'terms'): ?>
