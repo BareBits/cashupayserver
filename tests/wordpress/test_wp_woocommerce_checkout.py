@@ -23,7 +23,9 @@ the foreign plugin actually installed and talking to us.
 """
 from __future__ import annotations
 
+import html
 import json
+import re
 import time
 
 import pytest
@@ -492,6 +494,17 @@ def test_expired_invoice_fails_order_and_offers_retry(
     assert f"/cashupay/retry/{invoice_id}" in page.text, (
         "expired payment page should link the retry endpoint"
     )
+
+    # --- and a working Return to Shop link: the gateway stored WooCommerce's
+    #     order-received URL as redirectURL; it must render as stored (the
+    #     payer-safe rewrite only touches admin-surface targets) and resolve
+    #     for a guest ---
+    m = re.search(r'<a href="([^"]+)"[^>]*>\s*Return to Shop', page.text)
+    assert m, "expired payment page should offer Return to Shop"
+    shop_href = html.unescape(m.group(1))
+    assert "order-received" in shop_href, shop_href
+    r = requests.get(shop_href, timeout=15)
+    assert r.status_code == 200, f"Return to Shop gave {r.status_code}"
 
     # --- the retry endpoint bounces to WooCommerce's order-pay page, carrying
     #     the order key so a guest can pay without an account ---

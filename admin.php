@@ -7462,6 +7462,12 @@ header('Cache-Control: no-cache, must-revalidate');
         const adminBasePath = <?= json_encode($adminBasePath) ?>;
         const adminUrl = adminBasePath;
         const setupUrl = <?= json_encode(Urls::setup()) ?>;
+        // Public site root (WordPress mode) — where payer-facing redirect
+        // links (the payment page's "Continue to Store" / "Return to Shop"
+        // buttons) should land. The admin SPA's own URL is gated behind
+        // manage_options, so it must never be handed to a payer. Null in
+        // standalone mode, where there is no public shop to return to.
+        const shopHomeUrl = <?= json_encode(Urls::isWordPress() ? home_url('/') : null) ?>;
         // Where to point "get a free lightning address" links (Strike). Operator
         // override via CASHUPAY_STRIKE_URL in user_config.php; defaults to strike.me.
         const strikeUrl = <?= json_encode(defined('CASHUPAY_STRIKE_URL') ? CASHUPAY_STRIKE_URL : 'http://strike.me') ?>;
@@ -10304,7 +10310,11 @@ header('Cache-Control: no-cache, must-revalidate');
                     amount: amount,
                     currency: currency,
                     checkout: {
-                        redirectURL: window.location.href.split('?')[0], // Return to admin
+                        // WordPress mode: payers land on the shop's front
+                        // page — this admin's URL is manage_options-gated and
+                        // shows them an Access-denied page. Standalone keeps
+                        // the return-to-admin convenience (no shop exists).
+                        redirectURL: shopHomeUrl || window.location.href.split('?')[0],
                         redirectAutomatically: true
                     }
                 };
