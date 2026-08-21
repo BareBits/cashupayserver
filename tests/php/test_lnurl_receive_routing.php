@@ -13,10 +13,11 @@
  *      auto-cashout toggle (which only gates the cron threshold-melt).
  *
  *   3. When pre-existing settled invoices accumulate a fee owed >= the next
- *      invoice amount, the fee-redirect path engages and supersedes the old
- *      mint-override gate: the whole invoice is pointed at the fee (here the
- *      dev fee LNURL, resolved through the mock host) and the resulting
- *      invoice records fee_redirect_note + the LUD-21 verify URL.
+ *      invoice amount, the fee-redirect path engages: the whole invoice is
+ *      pointed at the fee (here the dev fee LNURL, resolved through the mock
+ *      host) and the resulting invoice records fee_redirect_note + the
+ *      LUD-21 verify URL. (This is the ONLY invoice-time fee mechanism; the
+ *      old fees-due mint-override gate was removed.)
  *
  *   4. When the mock host returns no verify URL, the LNURL probe fails
  *      and routing falls back transparently.
@@ -170,11 +171,11 @@ try {
 
     // ---------- Scenario 3: fee owed >= invoice → payment redirected to fee ----------
     // Inflate revenue so a dev fee is owed in an amount larger than the next
-    // invoice. The fee-redirect path supersedes the old mint-override gate:
-    // because a fee rail is reachable (the dev LNURL, resolved through the mock
-    // host), the whole 5_000-sat invoice is pointed straight at the dev fee
-    // instead of round-tripping through the mint. With 1_000_000 sats revenue
-    // the dev fee owes 20_000 sats (2%), comfortably above the invoice.
+    // invoice. Because a fee rail is reachable (the dev LNURL, resolved
+    // through the mock host), the whole 5_000-sat invoice is pointed straight
+    // at the dev fee instead of round-tripping through the mint. With
+    // 1_000_000 sats revenue the dev fee owes 20_000 sats (2%), comfortably
+    // above the invoice.
     $store3 = 'store_override_force';
     make_store($store3, $mintStub);
     Database::update('stores', [

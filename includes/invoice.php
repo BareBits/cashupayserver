@@ -215,7 +215,6 @@ class Invoice {
         $lnurlAttempt = null;          // ['bolt11','verify_url','amount_sats'] on success
         $nofferAttempt = null;         // CLINK noffer receive context on success
         $nwcAttempt = null;            // NWC (NIP-47) receive context on success
-        $lnurlOverrideReason = null;   // set when override-gate fired; recorded on the fallback invoice
         // Ordered fallback chain ($destinations, loaded with the rails gate
         // above): try each destination (Lightning address via LNURL, NWC, or
         // CLINK noffer via Nostr) in priority order until one yields a usable
@@ -225,31 +224,16 @@ class Invoice {
         // single auto_melt_address column was replaced by store_ln_addresses.
         // Skip the merchant lightning rail entirely when a fee owns it — the
         // single lightning option on this invoice is the fee LNURL's bolt11.
+        //
+        // Fee collection never reroutes this chain: owed fees are either taken
+        // by the fee-redirect path above (a fee large enough to cover the whole
+        // invoice claims the rail outright) or melted from mint balance by the
+        // cron's DevFee::settleStore pass. The old fees-due override — which
+        // parked payments on the mint rail for immediate collection — was
+        // removed in favor of those two paths.
         if ($feeLightning === null && !empty($destinations)) {
             $lnurlTargetSats = (int) ExchangeRates::convertToSats((string)$amount, $currency, 'sat');
-            $feesDueSats = LnUrlReceive::feesDueSats($storeId);
-            $decision = LnUrlReceive::shouldOverride($feesDueSats, $lnurlTargetSats);
-            // Log every routing decision so the override mechanism is
-            // auditable from production logs — both fired and skipped cases.
-            // The override gate is amount-vs-fees based, independent of which
-            // address is used, so it's decided once for the whole chain.
-            error_log(sprintf(
-                '[lnurl-override] store=%s invoice_sats=%d fees_due_sats=%d override=%s reason=%s',
-                $storeId, $lnurlTargetSats, $feesDueSats,
-                $decision['override'] ? '1' : '0',
-                $decision['reason']
-            ));
-            if ($decision['override'] && ($cashuConfigured || $onchainConfigured)) {
-                // Skip LNURL this invoice and remember why; the mint-rail
-                // path below will record this on the invoice so settlement
-                // can fire the immediate-settle-and-forward handler. Only
-                // honored when a mint/on-chain rail exists to land on: on a
-                // store whose sole rails are its Lightning destinations,
-                // firing would disable the only way to pay, so the
-                // destinations are used anyway and the fees stay owed for the
-                // cron to collect later.
-                $lnurlOverrideReason = $decision['reason'];
-            } elseif ($lnurlTargetSats > 0) {
+            if ($lnurlTargetSats > 0) {
                 // Walk the priority chain. First destination to return a usable
                 // invoice wins; the rest are only tried when earlier ones are
                 // down / out of range / can't produce a verifiable invoice.
@@ -662,7 +646,6 @@ class Invoice {
             'onchain_created_tip_height' => $onchainCreatedTipHeight,
             'payment_rail' => $paymentRail,
             'lnurl_verify_url' => $lnurlVerifyUrl,
-            'lnurl_override_reason' => $lnurlOverrideReason,
             'ln_destination' => $lnDestination,
             'noffer_relay' => $nofferRelay,
             'noffer_receiver_pubkey' => $nofferReceiverPubkey,
@@ -1280,7 +1263,6 @@ class Invoice {
 
             self::flushWebhookQueue();
             NotificationSender::queueInvoicePaid($updatedInvoice);
-            self::maybeFireOverrideSettled($updatedInvoice);
         } catch (\Throwable $e) {
             // Catch \Throwable, not Exception: a \TypeError/\Error thrown
             // mid-transaction (PDO is a process-wide singleton) would otherwise
@@ -1289,35 +1271,6 @@ class Invoice {
             Database::rollback();
             self::clearWebhookQueue();
             throw $e;
-        }
-    }
-
-    /**
-     * Mint-rail invoices that landed on the mint rail because the LNURL
-     * override gate fired (lnurl_override_reason IS NOT NULL) need to
-     * immediately settle owed fees + auto-melt the remainder to the
-     * merchant's LN address. See {@see LnUrlReceive::handleOverrideSettled}.
-     *
-     * Best-effort wrapper around the handler — any failure is logged but
-     * doesn't propagate, because the customer invoice is already paid and
-     * the cron's regular DevFee::settleStore + auto-melt loop will catch up
-     * on the next tick if this synchronous attempt fails.
-     */
-    private static function maybeFireOverrideSettled(?array $invoice): void {
-        if ($invoice === null) {
-            return;
-        }
-        if (empty($invoice['lnurl_override_reason'])) {
-            return;
-        }
-        if (($invoice['settled_rail'] ?? null) !== 'mint') {
-            return;
-        }
-        try {
-            LnUrlReceive::handleOverrideSettled((string)$invoice['id']);
-        } catch (Throwable $e) {
-            error_log('[lnurl-override] handler failed for invoice '
-                . ($invoice['id'] ?? '?') . ': ' . $e->getMessage());
         }
     }
 
@@ -2110,7 +2063,6 @@ class Invoice {
                     $updatedInvoice = self::getById($invoice['id']);
                     WebhookSender::fireEvent($invoice['store_id'], 'InvoiceSettled', $updatedInvoice);
                     NotificationSender::queueInvoicePaid($updatedInvoice);
-                    self::maybeFireOverrideSettled($updatedInvoice);
                     return;
                 } catch (\Throwable $e) {
                     // \Throwable (not Exception): a \TypeError/\Error must not
@@ -2162,7 +2114,6 @@ class Invoice {
                         $updatedInvoice = self::getById($invoice['id']);
                         WebhookSender::fireEvent($invoice['store_id'], 'InvoiceSettled', $updatedInvoice);
                         NotificationSender::queueInvoicePaid($updatedInvoice);
-                        self::maybeFireOverrideSettled($updatedInvoice);
 
                         error_log("CashuPayServer: Recovered orphaned invoice {$invoice['id']}");
                     }

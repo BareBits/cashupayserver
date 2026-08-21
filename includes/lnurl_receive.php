@@ -9,17 +9,19 @@
  * withdraw to that same address anyway.
  *
  * Decision flow at invoice creation:
- *   1. Probe the auto_melt LN address: resolve LNURL-pay metadata, request a
+ *   1. Probe the configured LN address: resolve LNURL-pay metadata, request a
  *      BOLT11 for the exact amount, require a `verify` URL in the response.
- *   2. If the probe succeeds and the fee-override gate does not fire, the
- *      LNURL-issued BOLT11 becomes the invoice (payment_rail='lnaddress').
- *   3. If the override gate fires (this invoice is smaller than the
- *      accumulated dev/hosting fees the operator owes), the LNURL
- *      path is skipped and we fall through to mint/swap. The resulting
- *      mint-rail invoice is flagged with lnurl_override_reason so settlement
- *      triggers an immediate DevFee::settleStore + auto-melt.
- *   4. If the probe fails (host down, no LUD-21, timeout), we silently fall
+ *   2. If the probe succeeds, the LNURL-issued BOLT11 becomes the invoice
+ *      (payment_rail='lnaddress').
+ *   3. If the probe fails (host down, no LUD-21, timeout), we silently fall
  *      through to the existing mint/swap decision.
+ *
+ * Fee collection never reroutes this path: owed dev/hosting fees are taken
+ * either by FeeRedirect (an owed fee covering the whole invoice claims the
+ * rail at creation time) or by the cron's DevFee::settleStore melt from mint
+ * balance. The historical fees-due override — which skipped this path to park
+ * payments on the mint for immediate collection — was removed; old invoices
+ * may still carry its lnurl_override_reason column value.
  *
  * Settlement detection uses the LUD-21 verify URL: GET returns
  * {"settled": true|false, "preimage": "..."}. The preimage matches
@@ -42,45 +44,6 @@ if (!defined('LNURL_RECEIVE_PROBE_TIMEOUT_SEC')) {
 }
 
 class LnUrlReceive {
-    /** Override decision reasons written to invoices.lnurl_override_reason. */
-    public const REASON_NONE = 'none';
-    public const REASON_FEES_DUE = 'fees_due';
-
-    /**
-     * Pure override-gate function: should the LNURL-receive path be skipped
-     * for an invoice of this size given the store's current fees-due?
-     *
-     * Single rule: when the invoice amount is smaller than the accumulated
-     * dev/hosting fees the operator owes, route via the mint so the
-     * resulting mint balance can clear the owed fees. Larger invoices take
-     * the LNURL direct path even if some fees are outstanding — the next
-     * small invoice (or the cron) will catch the debt up.
-     *
-     * Pure in/out for unit testing; caller fetches feesDue from
-     * {@see DevFee::computeOwed}.
-     */
-    public static function shouldOverride(
-        int $feesDueSats,
-        int $invoiceAmountSats
-    ): array {
-        if ($feesDueSats > 0 && $invoiceAmountSats < $feesDueSats) {
-            return ['override' => true, 'reason' => self::REASON_FEES_DUE];
-        }
-        return ['override' => false, 'reason' => self::REASON_NONE];
-    }
-
-    /**
-     * Sum of the owed fee buckets for a store, in sats. Used as the
-     * feesDue input to {@see shouldOverride}. Delegates to the existing
-     * {@see DevFee::computeOwed} so the override math stays consistent with
-     * what the cron will actually try to collect.
-     */
-    public static function feesDueSats(string $storeId): int {
-        $owed = DevFee::computeOwed($storeId);
-        return ((int)$owed['dev_owed'])
-             + ((int)$owed['hosting_owed']);
-    }
-
     /**
      * Resolve a Lightning address to its LNURL-pay metadata and request a
      * BOLT11 for the exact amount, requiring a LUD-21 verify URL in the
@@ -255,143 +218,6 @@ class LnUrlReceive {
             return ['state' => 'paid', 'preimage' => $preimage];
         }
         return ['state' => 'pending', 'preimage' => null];
-    }
-
-    /**
-     * Handler invoked when a mint-rail invoice with lnurl_override_reason
-     * IS NOT NULL settles. The override forced this payment through the mint
-     * so accumulated owed fees can be cleared before forwarding the net to
-     * the merchant's LN address.
-     *
-     * Steps:
-     *   1. Run DevFee::settleStore to pay out owed dev/hosting fees
-     *      from the just-received mint tokens.
-     *   2. Melt the remaining balance to the merchant's auto_melt_address.
-     *
-     * Best-effort: any failure logs + notifies but doesn't surface to the
-     * customer — the invoice is already paid from their perspective. Normal
-     * auto-melt cron will retry the merchant payout on the next tick.
-     */
-    public static function handleOverrideSettled(string $invoiceId): void {
-        require_once __DIR__ . '/lightning_address.php';
-        require_once __DIR__ . '/invoice.php';
-        require_once __DIR__ . '/rates.php';
-        require_once __DIR__ . '/notification_sender.php';
-        require_once __DIR__ . '/store_ln_addresses.php';
-
-        $invoice = Invoice::getById($invoiceId);
-        if ($invoice === null) {
-            error_log("[lnurl-override] settled-handler: invoice {$invoiceId} not found");
-            return;
-        }
-        $storeId = (string)$invoice['store_id'];
-        $store = Config::getStore($storeId);
-        if ($store === null) {
-            error_log("[lnurl-override] settled-handler: store {$storeId} not found");
-            return;
-        }
-
-        error_log(sprintf(
-            '[lnurl-override] settled-handler: invoice=%s store=%s reason=%s amount_sats=%s',
-            $invoiceId, $storeId,
-            $invoice['lnurl_override_reason'] ?? 'unknown',
-            (string)($invoice['amount_sats'] ?? '?')
-        ));
-
-        // Step 1: settle owed fees from this store's mint balance. settleStore
-        // is a no-op if nothing crosses the per-fee threshold. Failures here
-        // (mint unreachable, insufficient balance) are logged inside settleStore
-        // and don't block the auto-melt below — fees just stay owed.
-        try {
-            DevFee::settleStore($storeId);
-        } catch (Throwable $e) {
-            error_log("[lnurl-override] settleStore failed for store {$storeId}: " . $e->getMessage());
-        }
-
-        // Step 2: auto-melt the remaining balance to the operator's LN address,
-        // regardless of the auto_melt_enabled toggle. Direct-receive engages
-        // whenever a destination is configured (the toggle only gates cron
-        // threshold-melt), so a store reaching this forward path always has at
-        // least one destination. The address list is tried in priority order —
-        // the first that accepts the payment wins.
-        $destinations = StoreLnAddresses::destinationsForStore($storeId);
-        if (empty($destinations)) {
-            error_log("[lnurl-override] no payout destinations for store {$storeId}; skipping auto-melt");
-            return;
-        }
-
-        $balance = Invoice::getBalance($storeId);
-        $mintUnit = strtolower((string)($store['mint_unit'] ?? 'sat'));
-        $isFiat = !in_array($mintUnit, ['sat', 'sats', 'msat'], true);
-        if ($balance < 1) {
-            error_log("[lnurl-override] store {$storeId} has zero balance after fee settle; nothing to forward");
-            return;
-        }
-        if ($isFiat) {
-            $meltSats = (int) ExchangeRates::convertMintUnitToSats(
-                $balance, $mintUnit,
-                $store['price_provider_primary'] ?? null,
-                $store['price_provider_secondary'] ?? null
-            );
-        } else {
-            $meltSats = (int)$balance;
-        }
-        // Match the existing auto-melt fee-reserve buffer so the mint
-        // doesn't reject for fee shortfall.
-        $feeBuffer = max(2, min(100, (int)ceil($meltSats * 0.01)));
-        $meltSats -= $feeBuffer;
-        if ($meltSats < 1) {
-            error_log("[lnurl-override] store {$storeId} balance below fee buffer; deferring to cron");
-            return;
-        }
-
-        $lastError = null;
-        foreach ($destinations as $priority => $dest) {
-            // Log/notification-safe form (masks NWC connection secrets).
-            $address = StoreLnAddresses::displayValue($dest['type'], $dest['value']);
-            try {
-                $result = LightningAddress::meltToDestination(
-                    $storeId,
-                    $dest,
-                    $meltSats,
-                    'BareBits override-triggered auto-cashout'
-                );
-                $networkFeeSats = (int)($result['fee'] ?? 0);
-                if ($isFiat && $networkFeeSats > 0) {
-                    $networkFeeSats = (int) ExchangeRates::convertMintUnitToSats(
-                        $networkFeeSats, $mintUnit,
-                        $store['price_provider_primary'] ?? null,
-                        $store['price_provider_secondary'] ?? null
-                    );
-                }
-                MeltLog::record(
-                    $storeId, $meltSats, $networkFeeSats, $address,
-                    $result['preimage'] ?? null, null
-                );
-                NotificationSender::queueAutoCashoutSuccess($storeId, $meltSats, $address);
-                error_log(sprintf(
-                    '[lnurl-override] auto-melt ok store=%s amount_sats=%d to=%s priority=%d',
-                    $storeId, $meltSats, $address, $priority
-                ));
-                return;
-            } catch (Throwable $e) {
-                $lastError = $e;
-                error_log(sprintf(
-                    '[lnurl-override] auto-melt attempt failed store=%s priority=%d to=%s: %s',
-                    $storeId, $priority, $address, $e->getMessage()
-                ));
-            }
-        }
-
-        // Every address failed — notify against the primary so the operator
-        // sees the payout is wedged. Cron auto-melt will retry on the next tick.
-        error_log("[lnurl-override] all auto-melt destinations failed for store {$storeId}");
-        NotificationSender::queueAutoCashoutFailure(
-            $storeId,
-            StoreLnAddresses::displayValue($destinations[0]['type'], $destinations[0]['value']),
-            $lastError ? $lastError->getMessage() : 'unknown error',
-            null
-        );
     }
 
     /**

@@ -12,8 +12,9 @@ Exercises the full stack — cashupayserver, the LUD-21 mock LNURL host
 
 2. **Fee redirect**: when a fee is owed >= the next invoice amount (seeded
    by inserting a settled-revenue invoice directly), the fee-redirect path
-   supersedes the old mint-override gate — the whole invoice is pointed at
-   the dev fee LNURL (resolved through the mock host). The invoice rides the
+   points the whole invoice at the dev fee LNURL (resolved through the mock
+   host) — the only invoice-time fee mechanism now that the old fees-due
+   mint-override gate is removed. The invoice rides the
    lnaddress rail tagged with fee_redirect_note; paying it settles the
    invoice and records a melts credit (via='redirect') instead of moving
    funds to the merchant. The pure-PHP unit tests cover the decision truth
@@ -169,7 +170,8 @@ def _seed_fee_revenue(payserver: PayserverHandle, store_id: str, sats: int) -> N
     fee_tracking_start_at so the synthetic row falls inside the accounting
     window (computeOwed filters created_at >= start_at).
 
-    Used by the override-gate test to push feesDue above the FORCE threshold
+    Used by the fee-redirect test to push the owed fee above the invoice
+    amount
     in a single deterministic step.
     """
     db_path = payserver.data_dir / "cashupay.sqlite"
@@ -383,7 +385,7 @@ def _read_redirect_melt(payserver: PayserverHandle, invoice_id: str) -> dict | N
         return None if row is None else dict(row)
 
 
-def test_fee_redirect_lightning_supersedes_mint_override(
+def test_fee_redirect_lightning_claims_whole_invoice(
     configured_with_lnurlp: ConfiguredPayserver,
     lnd_mint: LndHandle,
     lnurlp_server: LnurlpServer,
@@ -425,7 +427,7 @@ def test_fee_redirect_lightning_supersedes_mint_override(
     )
     assert row["lnurl_verify_url"], "verify URL needed to detect settlement"
     assert row["lnurl_override_reason"] is None, (
-        "redirect path supersedes the override gate; no override reason expected"
+        "nothing writes the retired lnurl_override_reason column"
     )
 
     # The API surfaces the badge payload for the admin invoice list.
@@ -591,8 +593,8 @@ def test_lnurl_lud21_grandfathered_address_falls_back_to_mint(
     assert row["payment_rail"] == "mint", (
         f"LUD-21 missing → expected mint fallback; got {row['payment_rail']!r}"
     )
-    # No override reason — the gate didn't fire, we just couldn't use LNURL.
+    # Nothing writes the retired lnurl_override_reason column.
     assert row["lnurl_override_reason"] is None, (
-        f"no override expected; got {row['lnurl_override_reason']!r}"
+        f"no override reason expected; got {row['lnurl_override_reason']!r}"
     )
     assert row["lnurl_verify_url"] is None

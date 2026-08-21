@@ -11,10 +11,13 @@
  *      clear error INSTEAD of inserting an unpayable invoice (null bolt11, no
  *      on-chain address), and no invoice row is left behind.
  *   3. A store with no rails at all still gets the configuration error.
- *   4. The fees-due override (which parks a payment on the mint rail for
- *      immediate fee collection) must not fire when there is no mint/on-chain
- *      rail to park on — the sole Lightning rail keeps working and the fees
- *      stay owed for the cron to collect later.
+ *   4. Owed fees never disable the sole Lightning rail: when the fee-redirect
+ *      path can't claim the invoice (fee destination unreachable), the
+ *      merchant's destination still serves and the fees simply stay owed —
+ *      collected by fee-redirect on a later invoice it CAN claim. (The old
+ *      fees-due override, which parked such payments on the mint rail, was
+ *      removed outright — direct fee routing and the cron's mint-balance
+ *      settle are the only collection paths.)
  */
 declare(strict_types=1);
 require __DIR__ . '/harness.php';
@@ -124,11 +127,12 @@ assert_true(
     "rail-less store keeps the configuration error, got: {$threw}"
 );
 
-// ---------- 4: fees due must not disable the sole Lightning rail ----------
-// Enough settled revenue that the owed dev fee exceeds the next invoice, which
-// is exactly when LnUrlReceive::shouldOverride fires. Point the LNURL template
-// at a dead host so the fee-redirect path (which would otherwise claim the
-// rail outright) fails fast to build, exposing the override branch.
+// ---------- 4: owed fees never disable the sole Lightning rail ----------
+// Enough settled revenue that the owed dev fee exceeds the next invoice.
+// Point the LNURL template at a dead host so the fee-redirect path (which
+// would otherwise claim the rail outright, pointing the invoice at the fee
+// payee) fails fast to build — the merchant's own destination must then
+// serve, with the fees simply staying owed.
 Config::set('fee_tracking_start_at', 0);
 putenv('CASHU_LNURL_URL_TEMPLATE=http://127.0.0.1:1/.well-known/lnurlp/{user}');
 [$proc, $port] = start_mock('mock_nwc_wallet.php', 'MOCK_NWC_PORT', [
@@ -141,13 +145,13 @@ try {
     StoreLnAddresses::replaceForStore($store4, [['type' => 'nwc', 'address' => $uri4]]);
     paid_invoice($store4, 1_000_000);
 
-    require_once dirname(__DIR__, 2) . '/includes/lnurl_receive.php';
-    $feesDue = LnUrlReceive::feesDueSats($store4);
+    $owed = DevFee::computeOwed($store4);
+    $feesDue = (int)$owed['dev_owed'] + (int)$owed['hosting_owed'];
     assert_true($feesDue > 1000, "owed fees ({$feesDue}) must exceed the upcoming invoice");
 
     $inv4 = Invoice::create($store4, ['amount' => 1000, 'currency' => 'sat']);
-    assert_eq('nwc', $inv4['payment_rail'], 'override skipped: the sole rail still serves');
-    assert_null($inv4['lnurl_override_reason'], 'no override recorded on an LN-only store');
+    assert_eq('nwc', $inv4['payment_rail'], 'the sole rail still serves with fees owed');
+    assert_null($inv4['lnurl_override_reason'], 'nothing writes the retired override column');
     assert_true(str_starts_with((string)$inv4['bolt11'], 'lnbc'), 'wallet bolt11 stored');
 } finally {
     if (is_resource($proc)) { proc_terminate($proc); }
