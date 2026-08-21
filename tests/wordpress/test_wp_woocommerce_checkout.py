@@ -23,7 +23,9 @@ the foreign plugin actually installed and talking to us.
 """
 from __future__ import annotations
 
+import html
 import json
+import re
 import time
 
 import pytest
@@ -208,7 +210,8 @@ def test_completion_screen_autowires_and_enables_gateway(woocommerce) -> None:
 def test_completion_screen_never_clobbers_a_real_btcpay_server(woocommerce) -> None:
     """If a merchant already points the BTCPay plugin at a real BTCPay Server, the
     completion screen must refuse to overwrite it rather than silently hijack
-    their payments."""
+    their payments — and a consent recorded for a *different* server must not
+    unlock this one either."""
     wp, _info = woocommerce
     store_id, api_key = _seed_store(wp, "https://mint.example")
 
@@ -218,6 +221,78 @@ def test_completion_screen_never_clobbers_a_real_btcpay_server(woocommerce) -> N
     data = _ensure_integration(wp, store_id, api_key)
     assert data["res"]["status"] == "existing_btcpay", data
     assert data["url"] == real, "the real BTCPay URL must be left untouched"
+
+    wp.wp_cli(
+        "eval",
+        "update_option('cashupay_btcpay_override_consent', 'https://other.example.com');",
+    )
+    data = _ensure_integration(wp, store_id, api_key)
+    assert data["res"]["status"] == "existing_btcpay", data
+    assert data["url"] == real, "consent for another server must not authorize this takeover"
+
+
+def test_consented_override_replaces_existing_btcpay_config(woocommerce) -> None:
+    """The consented takeover the onboarding wizard promises: with consent
+    recorded for exactly the configured server, the wiring replaces the whole
+    BTCPay plugin configuration — connection, gateway settings, order states,
+    and unmanaged globals alike — with BareBits defaults, then consumes the
+    consent so a later reconnection to a real server warns again."""
+    wp, _info = woocommerce
+    store_id, api_key = _seed_store(wp, "https://mint.example")
+
+    real = "https://btcpay.example.com"
+    seed = f"""
+update_option('btcpay_gf_url', {real!r});
+update_option('btcpay_gf_api_key', 'old-server-key');
+update_option('btcpay_gf_store_id', 'old-store');
+update_option('btcpay_gf_transaction_speed', 'high');
+update_option('btcpay_gf_order_states', ['Expired' => 'wc-on-hold']);
+update_option('woocommerce_{GATEWAY_ID}_settings',
+    ['enabled' => 'no', 'title' => 'My custom BTCPay title']);
+update_option('cashupay_btcpay_override_consent', {real!r});
+"""
+    wp.wp_cli("eval", seed)
+
+    data = _ensure_integration(wp, store_id, api_key)
+    assert data["res"]["status"] == "ready", data
+    assert data["res"]["replaced_url"] == real, data
+    assert data["url"].endswith("/cashupay"), data["url"]
+    assert data["enabled"] == "yes", "the gateway must come out enabled at checkout"
+
+    # This eval is itself part of the test: it boots WordPress (and the BTCPay
+    # gateway plugin) again after the takeover. When the reset wiped the
+    # plugin's internal btcpay_gf_version marker, this boot re-ran the plugin's
+    # version migrations, whose webhook migration makes a blocking API call to
+    # the configured server — now this site itself — and the recursive
+    # self-requests deadlocked the whole install. So merely returning here
+    # proves the wipe spared the plugin's bookkeeping.
+    after_snippet = f"""
+echo json_encode([
+    'title' => get_option('woocommerce_{GATEWAY_ID}_settings')['title'] ?? null,
+    'expired' => get_option('btcpay_gf_order_states')['Expired'] ?? null,
+    'speed' => get_option('btcpay_gf_transaction_speed', 'GONE'),
+    'api_key' => get_option('btcpay_gf_api_key', ''),
+    'consent' => get_option('cashupay_btcpay_override_consent', 'GONE'),
+    'version' => get_option('btcpay_gf_version', 'GONE'),
+]);
+"""
+    after = json.loads(wp.wp_cli("eval", after_snippet).stdout.strip().splitlines()[-1])
+    assert after["version"] != "GONE", (
+        "the plugin's internal version marker must survive the wipe — deleting "
+        "it re-runs boot-time migrations that self-request this site until the "
+        "PHP workers deadlock"
+    )
+    assert after["title"].startswith("BareBits"), (
+        f"the custom gateway title must be reset to the BareBits default, got {after['title']!r}"
+    )
+    assert after["expired"] == "wc-failed", (
+        "the custom order-state mapping must be reset to the BareBits default"
+    )
+    assert after["speed"] == "GONE", (
+        "unmanaged btcpay_gf_* globals from the old server must be wiped"
+    )
+    assert after["api_key"] == api_key, "the API key must be ours, not the old server's"
+    assert after["consent"] == "GONE", "consent is single-use and must be consumed"
 
 
 def test_woocommerce_stack_installs(woocommerce) -> None:
@@ -419,6 +494,17 @@ def test_expired_invoice_fails_order_and_offers_retry(
     assert f"/cashupay/retry/{invoice_id}" in page.text, (
         "expired payment page should link the retry endpoint"
     )
+
+    # --- and a working Return to Shop link: the gateway stored WooCommerce's
+    #     order-received URL as redirectURL; it must render as stored (the
+    #     payer-safe rewrite only touches admin-surface targets) and resolve
+    #     for a guest ---
+    m = re.search(r'<a href="([^"]+)"[^>]*>\s*Return to Shop', page.text)
+    assert m, "expired payment page should offer Return to Shop"
+    shop_href = html.unescape(m.group(1))
+    assert "order-received" in shop_href, shop_href
+    r = requests.get(shop_href, timeout=15)
+    assert r.status_code == 200, f"Return to Shop gave {r.status_code}"
 
     # --- the retry endpoint bounces to WooCommerce's order-pay page, carrying
     #     the order key so a guest can pay without an account ---

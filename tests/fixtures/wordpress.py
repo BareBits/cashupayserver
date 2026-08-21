@@ -116,7 +116,11 @@ class WordPressHandle:
         ]
         env = os.environ.copy()
         env["CASHUPAY_DATA_DIR"] = str(self.data_dir)
-        result = subprocess.run(cmd, env=env, capture_output=True, text=True)
+        # Generous ceiling (plugin installs legitimately take a while) that
+        # still fails loudly instead of eating the whole CI job cap when a WP
+        # boot deadlocks — seen when a wiped btcpay_gf_version made the BTCPay
+        # plugin's boot migrations self-request this site recursively.
+        result = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=300)
         if check and result.returncode != 0:
             raise RuntimeError(
                 f"wp-cli failed ({result.returncode}) for {args}\n"

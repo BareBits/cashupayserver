@@ -76,6 +76,9 @@ foreach ($setupSrc as $i => $line) {
         $checked++;
     }
 }
-assert_true($checked >= 9, "expected at least 9 wp-admin links in setup.php, found $checked");
+// Floor so a refactor that breaks the scan (and matches nothing) fails loudly.
+// 8 as of the existing-BTCPay override panel, whose "Go to BTCPay Settings"
+// link was replaced by the override button.
+assert_true($checked >= 8, "expected at least 8 wp-admin links in setup.php, found $checked");
 
 echo "test_wp_admin_embed: ok\n";

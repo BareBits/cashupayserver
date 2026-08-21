@@ -252,6 +252,29 @@ $redirectUrl = $checkoutConfig['redirectURL'] ?? null;
 if ($redirectUrl !== null && $redirectUrl !== '') {
     $redirectUrl = Security::sanitizeUrl((string)$redirectUrl);
 }
+// Payer-safe redirect (WordPress mode): invoices created from the embedded
+// admin's "Request payment" modal used to store the admin SPA's own URL as
+// checkout.redirectURL (a return-to-admin convenience for the merchant). The
+// payment page is customer-facing, and /cashupay-admin, /cashupay-setup and
+// /wp-admin are all gated behind manage_options — a payer clicking "Return
+// to Shop" / "Continue to Store" on such an invoice landed on WordPress's
+// Access-denied error page. Rewrite admin-surface targets to the shop's
+// front page. Render-time (not create-time) so invoices already carrying an
+// admin URL are covered too.
+if ($redirectUrl !== null && Urls::isWordPress()) {
+    $adminSurfaces = [site_url('/cashupay-admin'), site_url('/cashupay-setup'), admin_url()];
+    foreach ($adminSurfaces as $surface) {
+        // Boundary-checked prefix match, so an unrelated page that merely
+        // starts with the same string (e.g. /cashupay-admin-guide) survives.
+        $surface = rtrim($surface, '/');
+        if ($redirectUrl === $surface
+                || (strpos($redirectUrl, $surface) === 0
+                    && in_array($redirectUrl[strlen($surface)], ['/', '?', '#'], true))) {
+            $redirectUrl = home_url('/');
+            break;
+        }
+    }
+}
 $redirectAuto = $checkoutConfig['redirectAutomatically'] ?? true;
 
 // Pull the payer-facing note out of the invoice's metadata. itemDesc is what

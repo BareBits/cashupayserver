@@ -62,8 +62,13 @@ def wizard_error(body: str) -> str | None:
     Entities are decoded: the messages are htmlspecialchars'd on the way out,
     so an apostrophe arrives as &#039; and a naive substring check against the
     human-readable text would never match.
+
+    The validation div carries id="setup-error" (the scroll-into-view anchor);
+    matching it optionally keeps this helper working across both markups while
+    still not matching the wizard's static error boxes (missing PHP
+    extensions), which style themselves inline instead.
     """
-    m = re.search(r'<div class="error">(.*?)</div>', body, re.S)
+    m = re.search(r'<div class="error"(?:\s+id="setup-error")?>(.*?)</div>', body, re.S)
     return html.unescape(m.group(1).strip()) if m else None
 
 
