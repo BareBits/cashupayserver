@@ -1540,10 +1540,31 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                 return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
             })();
 
+            // Warn once (not per 3s retry) when the relay socket can't be
+            // opened — e.g. a ws:// relay on an https page (mixed content) or
+            // a malformed relay URL. Without this the stuck "waiting for
+            // payment" screen is undiagnosable; the server-side receipt poll
+            // keeps covering settlement while we retry.
+            let connectWarned = false;
+            function warnConnectOnce(detail) {
+                if (connectWarned) return;
+                connectWarned = true;
+                console.warn('CLINK receipt watch: cannot reach relay', nofferSub.relay, detail || '');
+            }
+
             function connect() {
                 if (stopped) return;
                 try { ws = new WebSocket(nofferSub.relay); }
-                catch (e) { return; }
+                catch (e) {
+                    // The constructor throws synchronously (mixed content,
+                    // bad URL). Keep retrying while the invoice is open
+                    // instead of silently giving up for good.
+                    warnConnectOnce(e);
+                    if (currentStatus === 'New') {
+                        setTimeout(connect, 3000);
+                    }
+                    return;
+                }
 
                 ws.onopen = function () {
                     ws.send(JSON.stringify(['REQ', subId, {
@@ -1582,7 +1603,10 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                         setTimeout(connect, 3000);
                     }
                 };
-                ws.onerror = function () { try { ws.close(); } catch (e) {} };
+                ws.onerror = function () {
+                    warnConnectOnce('socket error');
+                    try { ws.close(); } catch (e) {}
+                };
             }
             connect();
 
