@@ -30,6 +30,10 @@ if ($timestamp) {
 // Remove rewrite-version marker so a reinstall flushes again.
 delete_option('cashupay_rewrite_version');
 
+// Remove any recorded consent to replace a BTCPay Server connection — a
+// future reinstall must re-warn, not inherit a stale approval.
+delete_option('cashupay_btcpay_override_consent');
+
 // Remove review-banner dismissal state and cron-loopback backoff marker.
 delete_option('cashupay_review_banner');
 delete_option('cashupay_cron_loopback_retry_at');

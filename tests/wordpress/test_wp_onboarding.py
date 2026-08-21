@@ -84,6 +84,11 @@ def test_wizard_skips_the_password_screen_and_completes(wp_ready) -> None:
     # security screen, and zero-conf has not joined yet because no on-chain
     # rail exists.
     assert "of 9" in body, "WordPress with no on-chain rail should be 9 screens"
+    # No BTCPay plugin config exists on this fresh install, so the terms
+    # screen must not demand the existing-BTCPay override consent.
+    assert "Existing BTCPay Server detected" not in body, (
+        "a clean install must not warn about an existing BTCPay Server"
+    )
 
     body = w.post(step="terms", terms_legal="1", terms_warranty="1", terms_fee="1")
     assert wizard_heading(body) == "Let's name your store", (
@@ -295,6 +300,126 @@ def wp_ready(wordpress: WordPressHandle):
     session — the two preconditions every test here shares."""
     _flush_rewrites(wordpress)
     return wordpress, _wp_login(wordpress)
+
+
+REAL_BTCPAY = "https://btcpay.example.com"
+
+
+def _wp_option(wp: WordPressHandle, name: str) -> str:
+    """Read a WordPress option as a plain string ('' when unset)."""
+    out = wp.wp_cli("option", "get", name, check=False).stdout.strip()
+    return out.splitlines()[-1].strip() if out else ""
+
+
+def test_terms_screen_gates_on_btcpay_override_consent(wp_ready) -> None:
+    """A WooCommerce checkout already paying through a real BTCPay Server must
+    not be silently rewired: the wizard's first screen has to surface the
+    existing connection and refuse to advance until the merchant explicitly
+    approves replacing it. The approval is recorded keyed to the exact URL it
+    was shown for, so it can never authorize clobbering a different server."""
+    wp, session = wp_ready
+    wp.wp_cli("eval", f"update_option('btcpay_gf_url', {REAL_BTCPAY!r});")
+    w = SetupWizard(wp.url, setup_path=SETUP_PATH, session=session)
+
+    body = w.get("terms")
+    assert "Existing BTCPay Server detected" in body, (
+        "the terms screen must warn about the configured BTCPay Server"
+    )
+    assert REAL_BTCPAY in body, "the warning must name the server being replaced"
+    assert 'name="btcpay_override_consent"' in body, (
+        "the terms screen must render the extra consent checkbox"
+    )
+
+    # The three stock terms alone are no longer enough.
+    body = w.post(step="terms", terms_legal="1", terms_warranty="1", terms_fee="1")
+    assert wizard_error(body) is not None, (
+        "posting the terms without the override consent must be rejected"
+    )
+    assert wizard_heading(body) == "Let's agree on a few things", (
+        f"a rejected consent must stay on the terms screen, landed on {wizard_heading(body)!r}"
+    )
+    assert _wp_option(wp, "cashupay_btcpay_override_consent") == "", (
+        "no consent may be recorded by a rejected submit"
+    )
+
+    body = w.post(
+        step="terms", terms_legal="1", terms_warranty="1", terms_fee="1",
+        btcpay_override_consent="1",
+    )
+    assert wizard_heading(body) == "Let's name your store", wizard_heading(body)
+    assert _wp_option(wp, "cashupay_btcpay_override_consent") == REAL_BTCPAY, (
+        "the consent must be recorded as the exact URL it was granted for"
+    )
+    # Nothing is replaced yet — the takeover itself belongs to the completion
+    # screen, once WooCommerce and the gateway plugin are actually in place.
+    assert _wp_option(wp, "btcpay_gf_url") == REAL_BTCPAY, (
+        "the terms screen only records consent; it must not touch the config"
+    )
+
+
+def test_completion_screen_offers_btcpay_override(wp_ready) -> None:
+    """An install whose wizard ran before a real BTCPay Server was connected
+    (or whose terms screen predates the consent checkbox) reaches the
+    completion screen with the existing_btcpay status. That panel must offer
+    an explicit override — not the old disconnect-by-hand dead end — and the
+    override must only record consent: with WooCommerce absent here, the old
+    configuration has to survive untouched until the wiring can actually
+    complete."""
+    wp, session = wp_ready
+    w = SetupWizard(wp.url, setup_path=SETUP_PATH, session=session)
+
+    # Walk the proven WP-mode path to the completion screen (same rails as
+    # test_wizard_skips_the_password_screen_and_completes, minus the detours).
+    w.post(step="terms", terms_legal="1", terms_warranty="1", terms_fee="1")
+    w.post(step="store", store_name="WP Takeover Store")
+    w.post(step="onchain", onchain_action="save",
+           onchain_address_mode="xpub", onchain_xpub=MAINNET_XPUB)
+    w.post(step="zeroconf", zero_conf="1")
+    with wp.db() as db:
+        store_id = db.execute(
+            "SELECT id FROM stores WHERE name = 'WP Takeover Store'"
+        ).fetchone()[0]
+        db.execute(
+            "INSERT INTO store_ln_addresses "
+            "(store_id, position, address, type, supports_verify) "
+            "VALUES (?, 0, 'wpmerchant@wp.invalid', 'lnaddress', NULL)",
+            (store_id,),
+        )
+    w.post(step="lightning", lightning_action="save",
+           lightning_address="wpmerchant@wp.invalid")
+    w.post(step="swaps", swaps_enabled="1")
+    body = w.post(step="mints", mints_enabled="0")
+    assert wizard_error(body) is None, wizard_error(body)
+    body = w.post(step="discount", btc_discount_percent="0")
+    assert wizard_heading(body).startswith("You"), (
+        f"expected the completion screen, landed on {wizard_heading(body)!r}"
+    )
+
+    # The merchant now connects a real BTCPay Server; the next completion
+    # render must stop and warn instead of clobbering it.
+    wp.wp_cli("eval", f"update_option('btcpay_gf_url', {REAL_BTCPAY!r});")
+    body = w.post(step="done")
+    assert "Existing BTCPay Server detected" in body, body[:500]
+    assert REAL_BTCPAY in body
+    assert "Replace it with BareBits" in body, (
+        "the panel must offer an explicit override button"
+    )
+    assert _wp_option(wp, "btcpay_gf_url") == REAL_BTCPAY, (
+        "rendering the warning must not touch the config"
+    )
+
+    # Clicking the button records consent and re-runs the wiring. WooCommerce
+    # is not installed in this fixture, so the flow proceeds past the takeover
+    # gate but must stop at needs_woocommerce with the old config intact —
+    # the consent stays recorded for the reload that completes the stack.
+    body = w.post(step="done", btcpay_override="1")
+    assert "WooCommerce isn't active yet" in body, body[:500]
+    assert _wp_option(wp, "btcpay_gf_url") == REAL_BTCPAY, (
+        "the config must survive until WooCommerce wiring can actually complete"
+    )
+    assert _wp_option(wp, "cashupay_btcpay_override_consent") == REAL_BTCPAY, (
+        "the consent must persist for the reload after WooCommerce is installed"
+    )
 
 
 def test_error_statuses_are_not_flattened_to_200(wp_ready) -> None:

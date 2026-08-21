@@ -39,6 +39,29 @@ require_once __DIR__ . '/includes/store_ln_addresses.php';
 require_once __DIR__ . '/includes/swap/config.php';
 require_once __DIR__ . '/includes/setup_flow.php';
 
+/**
+ * Load the WooCommerce/BTCPay auto-wiring helper (WordPress mode only). Its
+ * location depends on how the plugin was assembled: build-wordpress-plugin.sh
+ * keeps wordpress/ as a subdirectory, while docker/Dockerfile.wordpress
+ * flattens wordpress/*.php to the plugin root — a bare __DIR__ include only
+ * resolves under the second. Returns false rather than fataling when neither
+ * layout matches, so callers degrade to "no WooCommerce wiring offered"
+ * instead of killing the page. Used by the terms screen (existing-BTCPay
+ * consent), the done-step POST handler, and the completion screen.
+ */
+function setupLoadBtcpayIntegration(): bool {
+    foreach ([
+        __DIR__ . '/wordpress/btcpay-integration.php',
+        __DIR__ . '/btcpay-integration.php',
+    ] as $candidate) {
+        if (is_file($candidate)) {
+            require_once $candidate;
+            return true;
+        }
+    }
+    return false;
+}
+
 // Initialize session early - needed for storing temp data during setup
 Auth::initSession();
 
@@ -213,6 +236,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             case 'terms':
                 if (empty($_POST['terms_legal']) || empty($_POST['terms_warranty']) || empty($_POST['terms_fee'])) {
                     throw new Exception('Please accept all three terms to continue.');
+                }
+                // WordPress mode: a WooCommerce checkout already paying
+                // through a real BTCPay Server is about to be replaced by the
+                // completion screen. That is destructive (all BTCPay plugin
+                // settings are reset to BareBits defaults), so it needs the
+                // merchant's explicit consent — collected here, on the first
+                // screen, where the warning is impossible to miss. The state
+                // is re-checked server-side rather than trusting the render:
+                // the config can change between the GET and this POST.
+                if (Urls::isWordPress() && setupLoadBtcpayIntegration()
+                        && cashupay_btcpay_takeover_state() === 'needs_consent') {
+                    if (empty($_POST['btcpay_override_consent'])) {
+                        throw new Exception('Please confirm that your existing BTCPay Server settings may be replaced.');
+                    }
+                    cashupay_record_btcpay_override_consent();
                 }
                 $step = SetupFlow::nextStep('terms', $flowSteps) ?? 'security';
                 break;
@@ -796,6 +834,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
             case 'cron':
                 $step = 'done';
+                break;
+
+            case 'done':
+                // The completion screen's "Replace it with BareBits" button,
+                // for installs that reach the screen with a real BTCPay
+                // Server configured but no consent on record (e.g. the wizard
+                // ran before that server was connected, or the terms screen
+                // predates the consent checkbox). Recording consent here lets
+                // the render below re-run the WooCommerce wiring, which now
+                // proceeds with the takeover.
+                if (!empty($_POST['btcpay_override']) && Urls::isWordPress()
+                        && setupLoadBtcpayIntegration()) {
+                    cashupay_record_btcpay_override_consent();
+                }
                 break;
         }
 
@@ -1417,13 +1469,22 @@ function renderUrlModeDetectionScript(): void { ?>
                 // trailing zeros are trimmed so "1" renders as "1%" and a
                 // fractional rate like 1.5 renders as "1.5%".
                 $devFeeDisplay = rtrim(rtrim(number_format((float) CASHUPAY_DEV_FEE_PERCENT, 2), '0'), '.');
+                // WordPress mode: if the BTCPay WooCommerce plugin is already
+                // pointed at a real BTCPay Server, completing this wizard
+                // will replace that connection — warn up front and require an
+                // extra consent checkbox (validated by the POST handler).
+                $btcpayTakeoverUrl = null;
+                if (Urls::isWordPress() && setupLoadBtcpayIntegration()
+                        && cashupay_btcpay_takeover_state() === 'needs_consent') {
+                    $btcpayTakeoverUrl = (string) get_option('btcpay_gf_url', '');
+                }
                 ?>
                 <h2 style="margin-bottom: 1rem;">🤝 Let's agree on a few things</h2>
                 <p style="margin-bottom: 0.75rem;">
                     Almost ready to roll! First, a quick read-through. 👀
                 </p>
                 <p style="margin-bottom: 1.5rem;">
-                    Tick all three boxes and we'll get you set up.
+                    Tick all <?= $btcpayTakeoverUrl !== null ? 'four' : 'three' ?> boxes and we'll get you set up.
                 </p>
 
                 <form method="post">
@@ -1452,6 +1513,27 @@ function renderUrlModeDetectionScript(): void { ?>
                             I understand that a <?= htmlspecialchars($devFeeDisplay) ?>% fee is assessed on all incoming payments.
                         </label>
                     </div>
+
+                    <?php if ($btcpayTakeoverUrl !== null): ?>
+                    <div class="warning" style="margin: 1.5rem 0;">
+                        <strong>⚠️ Existing BTCPay Server detected</strong>
+                        <code style="display: block; margin: 0.5rem 0; word-break: break-all;"><?= htmlspecialchars($btcpayTakeoverUrl) ?></code>
+                        <p style="margin: 0.5rem 0 0; font-size: 0.9rem;">
+                            Your WooCommerce checkout currently pays through this
+                            BTCPay Server. Completing this setup will disconnect
+                            it and replace <strong>all</strong> BTCPay plugin
+                            settings with BareBits defaults. Your previous
+                            settings will not be saved.
+                        </p>
+                    </div>
+
+                    <div class="checkbox-group" style="margin: 1.5rem 0;">
+                        <input type="checkbox" id="btcpay_override_consent" name="btcpay_override_consent" required>
+                        <label for="btcpay_override_consent">
+                            I understand my existing BTCPay Server settings will be replaced.
+                        </label>
+                    </div>
+                    <?php endif; ?>
 
                     <button type="submit" class="btn" style="width: 100%;">Continue →</button>
                 </form>
@@ -2767,28 +2849,8 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                      "server URL / connect your e-commerce" sections below are
                      therefore hidden in WordPress mode. -->
                 <?php
-                // The helper's location depends on how the plugin was
-                // assembled: build-wordpress-plugin.sh keeps wordpress/ as a
-                // subdirectory, while docker/Dockerfile.wordpress flattens
-                // wordpress/*.php to the plugin root. A bare
-                // __DIR__ . '/btcpay-integration.php' only resolves under the
-                // second, so the zip the build script produces fataled here and
-                // never rendered the completion screen at all. Try both, and
-                // degrade to "no WooCommerce wiring offered" rather than
-                // killing the page if neither is present.
-                $btcpayHelper = null;
-                foreach ([
-                    __DIR__ . '/wordpress/btcpay-integration.php',
-                    __DIR__ . '/btcpay-integration.php',
-                ] as $candidate) {
-                    if (is_file($candidate)) {
-                        $btcpayHelper = $candidate;
-                        break;
-                    }
-                }
-                if ($btcpayHelper !== null) {
-                    require_once $btcpayHelper;
-                } else {
+                $btcpayHelperLoaded = setupLoadBtcpayIntegration();
+                if (!$btcpayHelperLoaded) {
                     error_log('CashuPayServer: btcpay-integration.php not found; '
                         . 'skipping the WooCommerce section of the setup completion screen.');
                 }
@@ -2801,7 +2863,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                 // follow-through below installs the matching discount rule.
                 $discountPercent = (int) Config::get('wp_btc_discount_percent', 0);
 
-                if ($btcpayHelper !== null && $storeId) {
+                if ($btcpayHelperLoaded && $storeId) {
                     $apiKey = Auth::getOrCreateInternalApiKey($storeId);
                     if ($apiKey) {
                         // Idempotent: installs/activates the gateway plugin if
@@ -2853,6 +2915,16 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                     <div class="success" style="margin-bottom: 1rem;">
                         ✅ WooCommerce is wired up — BareBits is set as a payment method and enabled at checkout.
                     </div>
+                    <?php if (!empty($wooStatus['replaced_url'])): ?>
+                    <div class="warning" style="margin-bottom: 1.5rem;">
+                        <strong>ℹ️ Previous BTCPay Server connection replaced</strong>
+                        <p style="margin: 0.5rem 0 0; font-size: 0.9rem;">
+                            As confirmed, WooCommerce now pays through BareBits instead of
+                            <code style="word-break: break-all;"><?= htmlspecialchars($wooStatus['replaced_url']) ?></code>,
+                            and all BTCPay plugin settings were reset to BareBits defaults.
+                        </p>
+                    </div>
+                    <?php endif; ?>
                     <?php if (!empty($wooStatus['auto_installed'])): ?>
                     <div class="warning" style="margin-bottom: 1.5rem;">
                         <strong>ℹ️ We installed a plugin for you</strong>
@@ -2869,18 +2941,26 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                     <div style="background: rgba(0,0,0,0.2); padding: 1.5rem; border-radius: 8px; margin-bottom: 1.5rem;">
                         <h3 style="margin-bottom: 0.75rem;">WooCommerce Integration</h3>
                         <div class="warning">
-                            <strong>Existing BTCPay Server detected:</strong>
+                            <strong>⚠️ Existing BTCPay Server detected:</strong>
                             <code style="display: block; margin-top: 0.5rem; word-break: break-all;"><?= htmlspecialchars($wooStatus['current_url'] ?? '') ?></code>
                         </div>
                         <p style="color: #a0aec0; font-size: 0.9rem; margin: 0.75rem 0;">
-                            A real BTCPay Server is already connected. To use BareBits instead, disconnect it first via WooCommerce settings, then reload this page.
+                            Your WooCommerce checkout currently pays through this BTCPay Server.
+                            Replacing it points WooCommerce at BareBits instead and resets
+                            <strong>all</strong> BTCPay plugin settings to BareBits defaults —
+                            your previous settings will not be saved. To keep the existing
+                            connection, skip this step.
                         </p>
-                        <div class="btn-group">
-                            <!-- target="_top": the wizard can run inside the wp-admin
-                                 iframe, and wp-admin links must not nest inside it. -->
-                            <a href="<?= admin_url('admin.php?page=wc-settings&tab=checkout&section=btcpay_greenfield') ?>" target="_top" class="btn btn-secondary" style="text-align: center;">Go to BTCPay Settings</a>
-                            <a href="<?= admin_url('admin.php?page=cashupay') ?>" target="_top" class="btn" style="text-align: center;">Skip</a>
-                        </div>
+                        <form method="post" style="margin: 0;">
+                            <input type="hidden" name="step" value="done">
+                            <input type="hidden" name="btcpay_override" value="1">
+                            <div class="btn-group">
+                                <button type="submit" class="btn" style="text-align: center;">Replace it with BareBits</button>
+                                <!-- target="_top": the wizard can run inside the wp-admin
+                                     iframe, and wp-admin links must not nest inside it. -->
+                                <a href="<?= admin_url('admin.php?page=cashupay') ?>" target="_top" class="btn btn-secondary" style="text-align: center;">Keep it &amp; Skip</a>
+                            </div>
+                        </form>
                     </div>
                 <?php elseif ($wooStatus !== null && $wooStatus['status'] === 'needs_woocommerce'): ?>
                     <div style="background: rgba(0,0,0,0.2); padding: 1.5rem; border-radius: 8px; margin-bottom: 1.5rem;">
