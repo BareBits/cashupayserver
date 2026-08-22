@@ -2364,6 +2364,19 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                                 options for if your wallet is offline or doesn't have
                                 inbound liquidity.
                             </p>
+                            <p style="margin-bottom: 0.75rem;">
+                                ⚠️ Using
+                                <a href="https://electrum.org" target="_blank" rel="noopener noreferrer" style="color: #63b3ed;">Electrum</a>
+                                with the
+                                <a href="https://github.com/BareBits/electrum_clink" target="_blank" rel="noopener noreferrer" style="color: #63b3ed;">CLINK plugin</a>
+                                is STRONGLY recommended as opposed to other wallets
+                                with CLINK support. CLINK payment receipts are
+                                temporary when issued, which means they can be lost
+                                during small network outages and report invoices as
+                                "unpaid". There is no risk to funds from this, but it
+                                does mean an order may show unpaid when it was, in
+                                fact, paid.
+                            </p>
                             <p style="margin: 0;">
                                 Alternate option: use a cashu mint. A cashu mint holds
                                 onto your funds (no need to worry about managing
@@ -2448,6 +2461,18 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                         <summary style="cursor: pointer; font-weight: 500; margin-bottom: 0.5rem;">Method 3: noffer (CLINK) (Electrum)</summary>
                         <div class="warning" style="margin-bottom: 0.5rem;">
                             ⚠️ Your wallet must be ONLINE to receive lightning payments
+                        </div>
+                        <div class="warning" style="margin-bottom: 0.5rem;">
+                            ⚠️ Using
+                            <a href="https://electrum.org" target="_blank" rel="noopener noreferrer" style="color: #63b3ed;">Electrum</a>
+                            with the
+                            <a href="https://github.com/BareBits/electrum_clink" target="_blank" rel="noopener noreferrer" style="color: #63b3ed;">CLINK plugin</a>
+                            is STRONGLY recommended as opposed to other wallets with
+                            CLINK support. CLINK payment receipts are temporary when
+                            issued, which means they can be lost during small network
+                            outages and report invoices as "unpaid". There is no risk
+                            to funds from this, but it does mean an order may show
+                            unpaid when it was, in fact, paid.
                         </div>
                         <?php if ($lnNofferEnvError !== null): ?>
                             <div class="warning" style="margin-bottom: 0.5rem;">
