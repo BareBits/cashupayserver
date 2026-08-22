@@ -5552,6 +5552,18 @@ header('Cache-Control: no-cache, must-revalidate');
                                     in order, if those can&rsquo;t produce an invoice. Paste a
                                     <code>noffer1&hellip;</code> string.
                                 </p>
+                                <div style="margin-bottom:0.75rem; padding:0.6rem 0.8rem; border-radius:8px; background:rgba(245,158,11,0.12); border:1px solid rgba(245,158,11,0.4); font-size:0.82rem;">
+                                    &#9888; Using
+                                    <a href="https://electrum.org" target="_blank" rel="noopener noreferrer" style="color: var(--accent);">Electrum</a>
+                                    with the
+                                    <a href="https://github.com/BareBits/electrum_clink" target="_blank" rel="noopener noreferrer" style="color: var(--accent);">CLINK plugin</a>
+                                    is STRONGLY recommended as opposed to other wallets with CLINK
+                                    support. CLINK payment receipts are temporary when issued, which
+                                    means they can be lost during small network outages and report
+                                    invoices as &ldquo;unpaid&rdquo;. There is no risk to funds from
+                                    this, but it does mean an order may show unpaid when it was, in
+                                    fact, paid.
+                                </div>
                                 <div id="auto-melt-noffer-list"></div>
                                 <button type="button" class="btn btn-secondary" id="btn-add-noffer" style="margin-top: 0.5rem;<?= $nofferEnvError !== null ? ' opacity: 0.4;' : '' ?>"
                                         <?= $nofferEnvError !== null ? 'disabled' : '' ?>>
@@ -11172,8 +11184,16 @@ header('Cache-Control: no-cache, must-revalidate');
                 hintEl.className = 'form-help ln-address-hint';
                 hintEl.style.cssText = 'margin:0 0 0.5rem 1.8rem;';
                 if (entry.type === 'noffer') {
-                    hintEl.textContent = 'CLINK noffer — payments are fetched over Nostr and '
-                        + 'confirmed by the merchant’s kind-21001 payment receipt.';
+                    // Static markup only — no user data goes through innerHTML here.
+                    hintEl.innerHTML = 'CLINK noffer — payments are fetched over Nostr and '
+                        + 'confirmed by the merchant’s kind-21001 payment receipt. '
+                        + '⚠️ Using <a href="https://electrum.org" target="_blank" rel="noopener noreferrer" style="color: var(--accent);">Electrum</a> '
+                        + 'with the <a href="https://github.com/BareBits/electrum_clink" target="_blank" rel="noopener noreferrer" style="color: var(--accent);">CLINK plugin</a> '
+                        + 'is STRONGLY recommended as opposed to other wallets with CLINK '
+                        + 'support. CLINK payment receipts are temporary when issued, which '
+                        + 'means they can be lost during small network outages and report '
+                        + 'invoices as “unpaid”. There is no risk to funds from this, but it '
+                        + 'does mean an order may show unpaid when it was, in fact, paid.';
                     hintEl.style.color = 'var(--success, #2d7a3a)';
                 } else {
                     const hint = lud21HintFor(entry.lud21Support);

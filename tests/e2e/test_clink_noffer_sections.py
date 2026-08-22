@@ -160,6 +160,15 @@ def test_noffer_section_renders_below_addresses(admin_page) -> None:
     )
     assert after, "noffer group should follow the address group"
 
+    # The dedicated noffer group carries the receipt-loss warning with the
+    # Electrum / CLINK-plugin links.
+    group_html = page.evaluate(
+        "document.getElementById('auto-melt-noffer-group').innerHTML"
+    )
+    assert "STRONGLY recommended" in group_html
+    assert 'href="https://electrum.org"' in group_html
+    assert 'href="https://github.com/BareBits/electrum_clink"' in group_html
+
 
 def test_add_noffer_via_ui_persists(admin_page, configured: ConfiguredPayserver) -> None:
     page, base = admin_page
