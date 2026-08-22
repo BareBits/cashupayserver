@@ -208,31 +208,44 @@ class ClinkClient
     }
 
     /**
-     * Best-effort cron path: re-subscribe to the relay and look for a payment
-     * receipt referencing our original request. Returns ['paid'=>bool] —
-     * paid=true only when a merchant-signed receipt with {res:'ok'} is found.
+     * Re-subscribe to the relay and look for a payment receipt referencing our
+     * original request. Returns ['paid'=>bool] — paid=true only when a
+     * merchant-signed receipt with {res:'ok'} is found.
+     *
+     * With $waitAfterEose=false (the cron batch poll) this reads only what the
+     * relay retained — nothing, on relays that treat kind 21001 as ephemeral
+     * per spec. With $waitAfterEose=true (the payment-page single poll) the
+     * subscription stays open until $timeoutSec, so a receipt broadcast live
+     * during the window is caught even when the relay retains nothing and the
+     * customer's browser subscription is broken.
      *
      * @param array{relay:string,receiver_pubkey:string,ephemeral_sk:string,
      *              ephemeral_pubkey:string,request_event_id:string,created_at:int} $ctx
      */
-    public static function fetchReceipt(array $ctx, ?int $timeoutSec = null): array
+    public static function fetchReceipt(array $ctx, ?int $timeoutSec = null, bool $waitAfterEose = false): array
     {
         $timeout = $timeoutSec ?? self::timeoutSec();
         $convKey = NostrCrypto::nip44ConversationKey($ctx['ephemeral_sk'], $ctx['receiver_pubkey']);
-        $events = self::collectEvents(
+        $found = null;
+        // Interpret events as they arrive so a live-window listen returns the
+        // moment the genuine receipt lands instead of idling out the window.
+        $stopWhen = function (array $ev) use ($ctx, $convKey, &$found): bool {
+            if (self::interpretReceipt($ev, $ctx, $convKey)['paid']) {
+                $found = $ev;
+                return true;
+            }
+            return false;
+        };
+        self::collectEvents(
             $ctx['relay'],
             $ctx['ephemeral_pubkey'],
             $ctx['request_event_id'],
             (int)$ctx['created_at'],
-            $timeout
+            $timeout,
+            $waitAfterEose,
+            $stopWhen
         );
-        foreach ($events as $ev) {
-            $verdict = self::interpretReceipt($ev, $ctx, $convKey);
-            if ($verdict['paid']) {
-                return ['paid' => true, 'event' => $ev];
-            }
-        }
-        return ['paid' => false];
+        return $found !== null ? ['paid' => true, 'event' => $found] : ['paid' => false];
     }
 
     /**
@@ -253,43 +266,45 @@ class ClinkClient
     // ---- internals ----
 
     /**
-     * Validate + decrypt a candidate receipt event. Returns ['paid'=>bool].
-     * A genuine receipt must: be kind 21001, be authored by the offer's
-     * receiver pubkey, reference our request id via an `e` tag, carry a valid
-     * Schnorr signature, and decrypt to a JSON object whose `res` is `ok`.
+     * Validate + decrypt a candidate receipt event. Returns ['paid'=>bool] plus
+     * a 'reason' on rejection so callers can log WHY a forwarded receipt was
+     * refused. A genuine receipt must: be kind 21001, be authored by the
+     * offer's receiver pubkey, reference our request id via an `e` tag, carry
+     * a valid Schnorr signature, and decrypt to a JSON object whose `res` is
+     * `ok`.
      */
     private static function interpretReceipt(array $ev, array $ctx, string $convKey): array
     {
         if ((int)($ev['kind'] ?? 0) !== self::KIND) {
-            return ['paid' => false];
+            return ['paid' => false, 'reason' => 'wrong kind'];
         }
         if (!hash_equals((string)$ctx['receiver_pubkey'], (string)($ev['pubkey'] ?? ''))) {
-            return ['paid' => false];
+            return ['paid' => false, 'reason' => 'author is not the offer receiver'];
         }
         if (!self::tagsReferenceEvent($ev['tags'] ?? [], (string)$ctx['request_event_id'])) {
-            return ['paid' => false];
+            return ['paid' => false, 'reason' => 'no e-tag referencing our request'];
         }
         // Verify the Schnorr signature over the canonical event id (which
         // NostrCrypto re-derives from the presented content — a receipt with
         // a genuine (id,sig) pair but altered tags/content fails here).
         try {
             if (!NostrCrypto::verifyEventArray($ev)) {
-                return ['paid' => false];
+                return ['paid' => false, 'reason' => 'invalid signature'];
             }
         } catch (\Throwable $e) {
-            return ['paid' => false];
+            return ['paid' => false, 'reason' => 'invalid signature'];
         }
         // Decrypt + inspect the receipt body.
         try {
             $plain = Nip44::decrypt((string)($ev['content'] ?? ''), $convKey);
             $data = json_decode($plain, true);
         } catch (\Throwable $e) {
-            return ['paid' => false];
+            return ['paid' => false, 'reason' => 'undecryptable content'];
         }
         if (is_array($data) && isset($data['res']) && $data['res'] === 'ok') {
             return ['paid' => true];
         }
-        return ['paid' => false];
+        return ['paid' => false, 'reason' => 'res is not ok'];
     }
 
     private static function tagsReferenceEvent(array $tags, string $eventId): bool
@@ -372,6 +387,11 @@ class ClinkClient
      * Collect events matching our reply filter until EOSE or timeout. Used by
      * the cron receipt poll, where we read whatever the relay still holds.
      *
+     * $waitAfterEose keeps the subscription open past EOSE until the timeout —
+     * a short live-listen window for ephemeral receipts spec-compliant relays
+     * never retain. $stopWhen, when given, is called with each event and ends
+     * the collection early by returning true (e.g. "that's the receipt").
+     *
      * @return array<int,array> raw event arrays
      */
     private static function collectEvents(
@@ -379,7 +399,9 @@ class ClinkClient
         string $ephemeralPubkey,
         string $requestId,
         int $createdAt,
-        int $timeout
+        int $timeout,
+        bool $waitAfterEose = false,
+        ?callable $stopWhen = null
     ): array {
         $client = null;
         $subId = bin2hex(random_bytes(8));
@@ -403,8 +425,16 @@ class ClinkClient
                 }
                 if ($data[0] === 'EVENT' && ($data[1] ?? null) === $subId && isset($data[2]) && is_array($data[2])) {
                     $out[] = $data[2];
+                    if ($stopWhen !== null && $stopWhen($data[2])) {
+                        break;
+                    }
                 } elseif ($data[0] === 'EOSE' && ($data[1] ?? null) === $subId) {
-                    break; // we have all stored events the relay will give us
+                    if (!$waitAfterEose) {
+                        break; // we have all stored events the relay will give us
+                    }
+                    // Live-listen mode: the relay retained nothing (or not the
+                    // receipt); keep the subscription open until the deadline
+                    // to catch a receipt broadcast while we're connected.
                 } elseif ($data[0] === 'CLOSED' && ($data[1] ?? null) === $subId) {
                     break;
                 }

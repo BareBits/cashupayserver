@@ -62,7 +62,7 @@ try {
     $inv = Invoice::create($store, [
         'amount' => 1000,
         'currency' => 'sat',
-        'metadata' => ['itemDesc' => '2x Latte'],
+        'metadata' => ['itemDesc' => '2x Latte', 'orderId' => '555'],
     ]);
     assert_eq('nwc', $inv['payment_rail'], 'invoice rides the nwc rail');
     assert_eq('lnbc10000n1mockinvoice0000000', $inv['bolt11'], 'wallet bolt11 stored (1000 sats)');
@@ -76,7 +76,8 @@ try {
     $sent = json_decode(end($lines), true)['payload'] ?? [];
     assert_eq('make_invoice', $sent['method'] ?? null, 'make_invoice sent');
     assert_eq(1000000, $sent['params']['amount'] ?? null, 'amount sent in msats');
-    assert_eq('Acme Coffee - 2x Latte', $sent['params']['description'] ?? null, 'store-name memo sent');
+    assert_eq('Acme Coffee - Order 555 - 2x Latte', $sent['params']['description'] ?? null,
+        'store-name + order-reference memo sent');
     assert_true(($sent['params']['expiry'] ?? 0) > 0, 'expiry sent');
 } finally {
     if (is_resource($proc)) { proc_terminate($proc); }

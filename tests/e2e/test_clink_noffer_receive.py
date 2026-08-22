@@ -442,3 +442,60 @@ def test_clink_noffer_receipt_via_cron(
 
     settled = _poll_invoice_status(configured, invoice_id, "Settled", timeout=45)
     assert settled["status"] == "Settled"
+
+
+def test_clink_noffer_receipt_via_checkout_poll(
+    configured: ConfiguredPayserver, clink_stack: ClinkStack
+) -> None:
+    """The payment page's 2s JSON poll settles a noffer invoice entirely
+    server-side: pollSingleQuote -> pollSingleNoffer re-subscribes to the
+    offer's relay (rate-limited, with a live-listen window) and recovers the
+    merchant receipt with no help from the browser's own relay subscription
+    and no cron. Regression guard for payments stuck at "waiting for payment"
+    after the browser missed the ephemeral kind-21001 receipt."""
+    admin = configured.admin
+    store_id = configured.store_id
+    payserver = configured.handle
+
+    _save_noffer_destination(admin, store_id, clink_stack.noffer)
+    invoice = configured.greenfield.create_invoice(
+        store_id, amount=str(INVOICE_AMOUNT_SAT), currency="sat"
+    )
+    invoice_id = invoice["id"]
+    bolt11 = (
+        invoice.get("checkout", {}).get("paymentMethods", {})
+        .get("BTC-LightningNetwork", {}).get("destination")
+    )
+    assert bolt11 and bolt11.lower().startswith("lnbcrt"), bolt11
+
+    E.electrum_lnpay(clink_stack.customer, bolt11, timeout=120)
+
+    # Make sure the receipt reached the relay before asserting the poll can
+    # recover it (the in-rig relay buffers, standing in for a
+    # retention-friendly relay; the live-listen window is covered by the
+    # mock-relay PHP suite).
+    row = _invoice_row(payserver, invoice_id)
+    _wait_for_receipt_buffered(
+        clink_stack.relay, row["noffer_request_event_id"],
+        int(row["noffer_created_at"] or 0),
+    )
+
+    # Hit the JSON status poll exactly like the checkout page does. The first
+    # tick past the CAS min-interval performs the server-side receipt fetch.
+    deadline = time.monotonic() + 45
+    status = None
+    while time.monotonic() < deadline:
+        r = requests.get(
+            f"{payserver.url}/payment.php",
+            params={"id": invoice_id, "json": "1"},
+            timeout=30,
+        )
+        assert r.status_code == 200, r.text
+        status = r.json().get("status")
+        if status == "Settled":
+            break
+        time.sleep(2)
+    assert status == "Settled", f"JSON poll never settled the invoice; last status={status}"
+
+    final_row = _invoice_row(payserver, invoice_id)
+    assert final_row["settled_rail"] == "noffer", final_row

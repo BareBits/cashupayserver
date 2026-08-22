@@ -75,30 +75,59 @@ class Invoice {
     }
 
     /**
-     * Build the payer-facing memo embedded in an invoice — the store name plus
-     * the invoice's note (metadata.itemDesc) joined with " - ", each included
-     * only when its privacy resolution (see showStoreNameOnInvoice /
-     * showNoteOnInvoice) says to show it. mb-safe so multibyte names/notes
-     * aren't cut mid-character. Returns '' when there's nothing to say, so
-     * callers can omit the memo entirely.
+     * Build the payer-facing memo embedded in an invoice — the store name, the
+     * order reference (metadata.orderId, set by the WooCommerce gateway), and
+     * the invoice's note (metadata.itemDesc) joined with " - ". Name and note
+     * are each included only when their privacy resolution (see
+     * showStoreNameOnInvoice / showNoteOnInvoice) says to show them; the order
+     * reference is deliberately NOT privacy-gated — letting the receiving
+     * wallet match a payment to its order is the memo's job. mb-safe so
+     * multibyte names/notes aren't cut mid-character. Returns '' when there's
+     * nothing to say, so callers can omit the memo entirely.
      *
-     * $maxLen caps the result (mb-safe); pass <= 0 to leave it uncapped.
+     * $maxLen caps the result (mb-safe); pass <= 0 to leave it uncapped. When
+     * capping, the order reference survives: the note is shortened first, then
+     * the store name, before the whole string is hard-capped.
      */
     public static function buildInvoiceMemo(array $store, ?array $metadata = null, int $maxLen = 100): string {
-        $parts = [];
+        $name = '';
         if (self::showStoreNameOnInvoice($store, $metadata)) {
             $name = trim((string)($store['name'] ?? ''));
-            if ($name !== '') { $parts[] = $name; }
         }
+        $order = '';
+        if (is_array($metadata) && isset($metadata['orderId'])
+            && is_scalar($metadata['orderId']) && !is_bool($metadata['orderId'])) {
+            $ref = trim((string)$metadata['orderId']);
+            if ($ref !== '') { $order = 'Order ' . $ref; }
+        }
+        $note = '';
         if (self::showNoteOnInvoice($store, $metadata)) {
             // itemDesc is the payer-facing note convention used across the app
             // (see payment.php / pay.php); reuse it so the memo matches.
             $note = is_array($metadata) ? trim((string)($metadata['itemDesc'] ?? '')) : '';
-            if ($note !== '') { $parts[] = $note; }
         }
-        $memo = implode(' - ', $parts);
+
+        $compose = static function (string $name, string $order, string $note): string {
+            $parts = [];
+            foreach ([$name, $order, $note] as $p) {
+                if ($p !== '') { $parts[] = $p; }
+            }
+            return implode(' - ', $parts);
+        };
+
+        $memo = $compose($name, $order, $note);
         if ($maxLen > 0 && mb_strlen($memo) > $maxLen) {
-            $memo = rtrim(mb_substr($memo, 0, $maxLen));
+            if ($order !== '' && $note !== '') {
+                $note = rtrim(mb_substr($note, 0, max(0, mb_strlen($note) - (mb_strlen($memo) - $maxLen))));
+                $memo = $compose($name, $order, $note);
+            }
+            if ($order !== '' && $name !== '' && mb_strlen($memo) > $maxLen) {
+                $name = rtrim(mb_substr($name, 0, max(0, mb_strlen($name) - (mb_strlen($memo) - $maxLen))));
+                $memo = $compose($name, $order, $note);
+            }
+            if (mb_strlen($memo) > $maxLen) {
+                $memo = rtrim(mb_substr($memo, 0, $maxLen));
+            }
         }
         return $memo;
     }
@@ -106,10 +135,11 @@ class Invoice {
     /**
      * Best-effort, spec-compliant memo for an externally-minted Lightning
      * invoice we request as the payer — currently the CLINK noffer rail's
-     * NIP-69 `description`. We surface the store name plus the invoice's
-     * payer-facing note (metadata.itemDesc) when present and not hidden by the
-     * store/invoice privacy settings, so the receiving wallet *can* label the
-     * payment in its history, mirroring the text the payment page shows.
+     * NIP-69 `description`. We surface the store name, the order reference
+     * (metadata.orderId) and the invoice's payer-facing note
+     * (metadata.itemDesc) when present and not hidden by the store/invoice
+     * privacy settings, so the receiving wallet *can* label the payment in its
+     * history, mirroring the text the payment page shows.
      *
      * This is only a request: per NIP-69 the receiving service may honor or
      * ignore the description and has the final say on the invoice's actual
@@ -1619,6 +1649,58 @@ class Invoice {
     }
 
     /**
+     * Single-invoice noffer receipt poll for the live payment-page tick. The
+     * browser's own relay subscription is the fast path, but it can miss the
+     * ephemeral kind-21001 receipt entirely — blocked WebSocket (ws:// relay
+     * on an https page), a reconnect gap, a suspended tab — and a missed
+     * ephemeral event is unrecoverable from a spec-compliant relay. So the
+     * checkout poll re-subscribes server-side and keeps the subscription open
+     * briefly past EOSE: that catches both receipts a retention-friendly relay
+     * replays AND receipts broadcast live during the window. Same CAS
+     * min-interval gate as pollSingleNwc — each check is a relay round trip,
+     * so only one 2s tick per window pays for it (and the fresh
+     * last_polled_at keeps cron's batch poll off invoices a page is watching).
+     */
+    public static function pollSingleNoffer(string $invoiceId): void {
+        $minInterval = 5;
+        $liveWindowSec = 4;
+        $invoice = self::getById($invoiceId);
+        if (!$invoice || ($invoice['payment_rail'] ?? null) !== 'noffer') {
+            return;
+        }
+        // noffer settles New -> Settled directly; anything else is done here.
+        if ($invoice['status'] !== 'New') {
+            return;
+        }
+        if ((int)$invoice['expiration_time'] < time()) {
+            self::updateStatus((string)$invoice['id'], 'Expired');
+            return;
+        }
+        $ctx = self::nofferCtxFromInvoice($invoice);
+        if ($ctx === null) {
+            return;
+        }
+        $now = time();
+        $claimed = Database::update(
+            'invoices',
+            ['last_polled_at' => $now],
+            'id = ? AND (last_polled_at IS NULL OR last_polled_at <= ?)',
+            [$invoice['id'], $now - $minInterval]
+        );
+        if ($claimed !== 1) {
+            return; // another poller checked within the window
+        }
+        try {
+            $res = ClinkClient::fetchReceipt($ctx, $liveWindowSec, true);
+            if (!empty($res['paid'])) {
+                self::markNofferPaid($invoice);
+            }
+        } catch (Throwable $e) {
+            error_log("[clink-receive] single poll failed for {$invoiceId}: " . $e->getMessage());
+        }
+    }
+
+    /**
      * Settle a noffer-rail invoice from a receipt event the payment page
      * forwarded off its live subscription. Returns true only when the event is
      * a valid, merchant-signed payment receipt for this invoice. All trust is
@@ -1638,6 +1720,12 @@ class Invoice {
         }
         $verdict = ClinkClient::verifyReceiptEvent($rawEvent, $ctx);
         if (empty($verdict['paid'])) {
+            // Say WHY: a screen stuck on "waiting for payment" while the
+            // wallet insists "receipt sent" is undiagnosable without this.
+            error_log(sprintf(
+                '[clink-receive] rejected forwarded receipt for invoice=%s: %s',
+                $invoiceId, (string)($verdict['reason'] ?? 'unspecified')
+            ));
             return false;
         }
         self::markNofferPaid($invoice);
@@ -1953,9 +2041,14 @@ class Invoice {
         //              checkout polls, and the min-interval keeps us off the
         //              provider API on every 2s tick. Cron's expireStale()
         //              remains the backstop that releases the held swap invoice.
-        //   noffer   — settlement arrives via the merchant's kind-21001 receipt
-        //              (page subscription + cron receipt poll), so there's
-        //              nothing to poll here; this is a no-op on the LN side.
+        //   noffer   — settlement arrives via the merchant's kind-21001
+        //              receipt. The page's own relay subscription is the fast
+        //              path, but the receipt is ephemeral — if the browser
+        //              misses it (blocked WebSocket, reconnect gap) it's gone
+        //              from spec-compliant relays. pollSingleNoffer
+        //              re-subscribes server-side with a short live-listen
+        //              window (rate-limited like NWC) so the checkout tick can
+        //              still recover the settlement.
         //   lnaddress— poll the LUD-21 verify URL.
         //   nwc      — run lookup_invoice against the merchant wallet over
         //              Nostr Wallet Connect. Each check is a full relay
@@ -1975,6 +2068,8 @@ class Invoice {
                 self::pollSingleLnAddress($invoiceId);
             } elseif ($rail === 'nwc') {
                 self::pollSingleNwc($invoiceId);
+            } elseif ($rail === 'noffer') {
+                self::pollSingleNoffer($invoiceId);
             }
             if (empty($invoice['onchain_address'])) {
                 return;
