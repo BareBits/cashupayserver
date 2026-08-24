@@ -37,6 +37,7 @@ jobs:
           submodules: recursive
 
       - name: Set up Python
+        id: setup-python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -50,23 +51,35 @@ jobs:
           restore-keys: |
             bins-${{ runner.os }}-
 
+      # Both venv cache keys must carry the FULL Python version
+      # (steps.setup-python.outputs.python-version), not just "3.11": a venv
+      # symlinks bin/python3 to the exact hostedtoolcache interpreter that
+      # created it, so when a runner image update bumps the 3.11 patch release,
+      # a venv cached under a patchless key restores with a dangling symlink
+      # and every pip/playwright/mint invocation dies with "bad interpreter".
       - name: Cache nutshell venv
         uses: actions/cache@v4
         with:
           path: tests/.venv-nutshell
-          key: nutshell-${{ runner.os }}-${{ hashFiles('tests/fixtures/nutshell.py') }}
+          key: nutshell-${{ runner.os }}-py${{ steps.setup-python.outputs.python-version }}-${{ hashFiles('tests/fixtures/nutshell.py') }}
 
       - name: Cache test runner venv
         uses: actions/cache@v4
         with:
           path: tests/.venv
-          key: venv-${{ runner.os }}-py3.11-${{ hashFiles('tests/requirements.txt') }}
+          key: venv-${{ runner.os }}-py${{ steps.setup-python.outputs.python-version }}-${{ hashFiles('tests/requirements.txt') }}
 
       - name: Install Playwright system dependencies
         # `playwright install-deps chromium` needs root to apt-install the libs
         # Chromium needs. The browser tarball itself is cached under tests/bin/.
+        # A restored venv whose interpreter no longer exists is rebuilt from
+        # scratch rather than reused (belt and suspenders on top of the cache
+        # key fix above).
         run: |
-          python3 -m venv tests/.venv || true
+          if ! tests/.venv/bin/python3 --version >/dev/null 2>&1; then
+            rm -rf tests/.venv
+          fi
+          python3 -m venv tests/.venv
           source tests/.venv/bin/activate
           pip install --quiet -r tests/requirements.txt
           sudo $(which playwright) install-deps chromium
@@ -145,13 +158,15 @@ jobs:
             bootstrap.php \
             rewrite-rules.php \
             admin-menu.php \
+            cron-integration.php \
             activation.php \
             btcpay-integration.php \
             setup.php \
             admin.php \
             api.php \
             pay.php \
-            includes/database.php
+            includes/database.php \
+            assets/img/barebits-gateway-logo.png
 
       - name: Build standalone zip
         env:

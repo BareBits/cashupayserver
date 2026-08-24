@@ -172,6 +172,9 @@ class Stats {
         );
         $swapFees = (int)$swapFeesRow['lockup'] + (int)$swapFeesRow['pct'];
 
+        // The retired upstream dev fee still counts toward the paid total on
+        // deployments that historically paid it (real cost, honest profit
+        // math) but is no longer broken out in the payload. 0 on fresh installs.
         $totalFeesPaid = $feesPaidByNote['upstream'] + $feesPaidByNote['dev'] + $feesPaidByNote['hosting'] + $networkFees + $swapFees;
         $profit = $revenue - $totalFeesPaid;
         $effectiveFeePct = $revenue > 0 ? ($totalFeesPaid / $revenue * 100.0) : 0.0;
@@ -195,7 +198,6 @@ class Stats {
             'onchain_revenue_sats' => $onchainRevenue,
             'onchain_count' => $onchainCount,
             'fees_paid' => [
-                'upstream' => $feesPaidByNote['upstream'],
                 'dev' => $feesPaidByNote['dev'],
                 'hosting' => $feesPaidByNote['hosting'],
                 'network' => $networkFees,
@@ -239,17 +241,16 @@ class Stats {
      * would settle on the next tick.
      */
     private static function lifetimeOwed(string $storeId): array {
-        $totals = ['upstream' => 0, 'dev' => 0, 'hosting' => 0, 'total' => 0];
+        $totals = ['dev' => 0, 'hosting' => 0, 'total' => 0];
         $storeIds = ($storeId === self::ALL_STORES || $storeId === '')
             ? array_column(Database::fetchAll("SELECT id FROM stores"), 'id')
             : [$storeId];
         foreach ($storeIds as $sid) {
             $o = DevFee::computeOwed($sid);
-            $totals['upstream'] += (int) $o['upstream_owed'];
             $totals['dev']      += (int) $o['dev_owed'];
             $totals['hosting']  += (int) $o['hosting_owed'];
         }
-        $totals['total'] = $totals['upstream'] + $totals['dev'] + $totals['hosting'];
+        $totals['total'] = $totals['dev'] + $totals['hosting'];
         return $totals;
     }
 
@@ -348,8 +349,8 @@ class Stats {
                 $whereMelt['params']
             )['s'];
             return [
-                'labels' => ['Upstream dev fee', 'Dev fee', 'Hosting fee', 'Network fees'],
-                'data'   => [$feesPaid['upstream'], $feesPaid['dev'], $feesPaid['hosting'], $network],
+                'labels' => ['Dev fee', 'Hosting fee', 'Network fees'],
+                'data'   => [$feesPaid['dev'], $feesPaid['hosting'], $network],
             ];
         }
 

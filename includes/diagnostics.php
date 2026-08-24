@@ -41,7 +41,6 @@ class Diagnostics {
      */
     private const SAFE_CONFIG_KEYS = [
         'allow_private_endpoints',
-        'auto_melt_use_swap_default',
         'cron_warning_dismissed_at',
         'deployment_id',
         'fee_tracking_start_at',
@@ -59,12 +58,6 @@ class Diagnostics {
         'notifications_auto_cashout_enabled',
         'notifications_payer_receipt_enabled',
         'setup_complete',
-        'swaps_enabled',
-        'swaps_auto_select_cheapest',
-        'swaps_auto_select_threshold_pct',
-        'swaps_minimum_target_sats',
-        'swaps_provider_order',
-        'swaps_strict_no_mint_fallback',
         'update_channel',
         'updater_auto_rollback_dismissed',
         'updater_banner_dismissed',

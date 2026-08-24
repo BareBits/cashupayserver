@@ -15,6 +15,9 @@
 require_once __DIR__ . '/database.php';
 require_once __DIR__ . '/config.php';
 require_once __DIR__ . '/email_sender.php';
+// Circular with invoice.php (which requires this file) — harmless under
+// require_once; Invoice is only referenced at call time, never at load time.
+require_once __DIR__ . '/invoice.php';
 
 class NotificationSender {
     public const EVENT_INVOICE_PAID = 'InvoicePaid';
@@ -158,6 +161,52 @@ class NotificationSender {
     }
 
     /**
+     * Queue payer receipts that were requested before settlement (the payer
+     * left their email on the on-chain "payment detected" screen while the tx
+     * was still confirming). Settlement happens on several rails with no
+     * shared choke-point, so this is a sweep: the payment page's status poll
+     * calls it for its own invoice (instant receipt while the tab is open)
+     * and cron calls it for everything (payer walked away). The CAS on
+     * payer_receipt_requested makes each request queue at most one receipt
+     * even when both callers race.
+     *
+     * Returns the number of receipts queued.
+     */
+    public static function flushRequestedPayerReceipts(?string $invoiceId = null): int {
+        $sql = "SELECT * FROM invoices
+                WHERE status = 'Settled' AND payer_receipt_requested = 1
+                  AND customer_email IS NOT NULL AND customer_email != ''";
+        $params = [];
+        if ($invoiceId !== null) {
+            $sql .= " AND id = ?";
+            $params[] = $invoiceId;
+        }
+
+        $queued = 0;
+        foreach (Database::fetchAll($sql, $params) as $invoice) {
+            $claimed = Database::update(
+                'invoices',
+                ['payer_receipt_requested' => 0],
+                'id = ? AND payer_receipt_requested = 1',
+                [$invoice['id']]
+            );
+            if ($claimed !== 1) {
+                continue; // another caller already claimed this request
+            }
+            // If receipts were switched off between the request and settlement,
+            // the claim still clears the flag — the email stays saved on the
+            // invoice, mirroring the settled-page behaviour when receipts are
+            // not offered.
+            if (self::isPayerReceiptOffered()) {
+                if (self::queuePayerReceipt($invoice, (string)$invoice['customer_email'])) {
+                    $queued++;
+                }
+            }
+        }
+        return $queued;
+    }
+
+    /**
      * Build the plain-text body of a payer-facing payment confirmation.
      * Format mirrors the operator-facing InvoicePaid template — same
      * label-aligned style, plus payment-method-specific lines (on-chain
@@ -182,11 +231,11 @@ class NotificationSender {
             ? trim($amount . ' ' . $currency)
             : null;
 
-        // settled_rail is the rail that actually moved funds; fall back to the
-        // rail chosen at create time so older rows (no settled_rail backfill)
-        // still get a sensible label.
-        $rail = (string)($invoice['settled_rail'] ?? $invoice['payment_rail'] ?? '');
-        $methodLine = self::paymentMethodLabel($rail);
+        // The rail that actually moved funds, with Invoice's fallback to the
+        // rail chosen at create time (older rows, legacy cashu-token rows
+        // that settled as 'mint') so every row gets a sensible label.
+        $rail = (string)(Invoice::effectiveRail($invoice) ?? '');
+        $methodLine = self::paymentMethodLabel($rail, (string)($invoice['mint_url'] ?? ''));
 
         $lines = ["Thank you for shopping at {$storeName}.", ""];
         $lines[] = "Your payment has been received.";
@@ -211,12 +260,21 @@ class NotificationSender {
         return implode("\n", $lines) . "\n";
     }
 
-    private static function paymentMethodLabel(string $rail): string {
+    private static function paymentMethodLabel(string $rail, string $mintUrl = ''): string {
+        // Mint-rail payments arrive over Lightning but land as Cashu ecash at
+        // the store's mint; direct token receipts never touch Lightning. Both
+        // name the mint by hostname, matching the admin invoices tab.
+        $mintSuffix = '';
+        if ($mintUrl !== '') {
+            $host = parse_url($mintUrl, PHP_URL_HOST);
+            $mintSuffix = '(' . (is_string($host) && $host !== '' ? $host : $mintUrl) . ')';
+        }
         switch ($rail) {
             case 'onchain':   return 'On-chain Bitcoin';
             case 'swap':      return 'Lightning → submarine swap to on-chain';
             case 'lnaddress': return 'Lightning (LNURL)';
-            case 'mint':      return 'Lightning';
+            case 'mint':      return 'Lightning (cashu)' . $mintSuffix;
+            case 'cashu':     return 'Cashu' . $mintSuffix;
             default:          return $rail !== '' ? $rail : '(unknown)';
         }
     }

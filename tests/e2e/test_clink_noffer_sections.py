@@ -1,10 +1,11 @@
 """CLINK noffer dedicated-section e2e.
 
-The admin "Auto-Cashout" card now keeps CLINK noffers in their own section
+The admin "Lightning payments" card keeps CLINK noffers in their own section
 below the Lightning Addresses section, and submits the two as separate ordered
-lists (ln_addresses[] + noffers[]). The server combines them LN-first (noffers
-as fallback) via StoreLnAddresses::chainFromLists and validates each list
-against its declared type.
+lists (ln_addresses[] + noffers[]) to the save_lightning_payments action. The
+server combines them LN-first (noffers as fallback) via
+StoreLnAddresses::chainFromLists and validates each list against its declared
+type.
 
 Covered here:
   - HTTP contract: the split lists persist LN-first then noffers, in order.
@@ -35,15 +36,12 @@ REFERENCE_NOFFER = (
 )
 
 
-def _post_split(admin: AdminClient, store_id: str, *, ln=(), noffers=(),
-                enabled="1", threshold="100", mode="0") -> "object":
-    """POST save_auto_melt with the split contract (ln_addresses[] + noffers[])."""
+def _post_split(admin: AdminClient, store_id: str, *, ln=(), noffers=()) -> "object":
+    """POST save_lightning_payments with the split contract
+    (ln_addresses[] + noffers[])."""
     data = [
-        ("action", "save_auto_melt"),
+        ("action", "save_lightning_payments"),
         ("store_id", store_id),
-        ("enabled", enabled),
-        ("threshold", threshold),
-        ("mode_override", mode),
     ]
     for a in ln:
         data.append(("ln_addresses[]", a))
@@ -71,7 +69,11 @@ def _chain_rows(payserver, store_id: str) -> list[sqlite3.Row]:
 # ---------------------------------------------------------------- HTTP contract
 
 
-def test_split_lists_persist_ln_first_then_noffers(configured: ConfiguredPayserver) -> None:
+def test_split_lists_persist_ln_first_then_noffers(
+    configured_with_lnurlp: ConfiguredPayserver,
+) -> None:
+    # lnaddresses in the chain must pass the save-time LUD-21 gate.
+    configured = configured_with_lnurlp
     admin, store_id = configured.admin, configured.store_id
     r = _post_split(
         admin, store_id,
@@ -158,17 +160,25 @@ def test_noffer_section_renders_below_addresses(admin_page) -> None:
     )
     assert after, "noffer group should follow the address group"
 
+    # The dedicated noffer group carries the receipt-loss warning with the
+    # Electrum / CLINK-plugin links.
+    group_html = page.evaluate(
+        "document.getElementById('auto-melt-noffer-group').innerHTML"
+    )
+    assert "STRONGLY recommended" in group_html
+    assert 'href="https://electrum.org"' in group_html
+    assert 'href="https://github.com/BareBits/electrum_clink"' in group_html
+
 
 def test_add_noffer_via_ui_persists(admin_page, configured: ConfiguredPayserver) -> None:
     page, base = admin_page
     _goto_stores(page, base)
 
-    # Lightning mode so the destination sections are active.
-    page.query_selector('#aw-store .aw-col[data-aw-mode="0"]').click()
-    # Add a noffer row and fill it through the dedicated section.
+    # The destination sections live in the always-active "Lightning payments"
+    # card now. Add a noffer row and fill it through the dedicated section.
     page.query_selector("#btn-add-noffer").click()
     page.fill("#auto-melt-noffer-list input.noffer-input", REFERENCE_NOFFER)
-    page.query_selector("#btn-save-auto-melt").click()
+    page.query_selector("#btn-save-lightning-payments").click()
     page.wait_for_timeout(1500)
 
     rows = _chain_rows(configured.handle, configured.store_id)

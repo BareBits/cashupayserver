@@ -58,6 +58,11 @@ class PaymentPathDebug
                 $label = self::withDest('CLINK noffer (NIP-69)', $dest);
                 return $relay !== '' ? $label . ' via relay ' . $relay : $label;
 
+            case 'nwc':
+                // ln_destination is the masked connection label (never the
+                // URI — it embeds the wallet secret).
+                return self::withDest('Nostr Wallet Connect (NIP-47)', $dest);
+
             case 'swap':
                 $provider = trim((string)$swapProvider);
                 return $provider !== ''

@@ -10,16 +10,8 @@ require_once __DIR__ . '/database.php';
 // Version
 define('CASHUPAY_VERSION', '1.2');
 
-// Upstream dev fee — paid to the original CashuPayServer author via the
-// existing cypherpunk.today donation sink. Triggered on the periodic fee
-// settlement cron tick (see includes/dev_fee.php) when ≥ 1000 sats are owed.
-// Counts as a network cost when computing the Zaphaus LLC development fee
-// base, so the upstream fee never "stacks" on top of the dev fee.
-define('CASHUPAY_UPSTREAM_DEV_FEE_PERCENT', 0.5);
-define('CASHUPAY_UPSTREAM_DEV_FEE_SINK_URL', 'https://cypherpunk.today/donation-sink/donation-sink.php');
-
 // Development fee — the mandatory BareBits fee assessed on incoming payments,
-// settled on the same cron tick as the upstream fee. Defined here (rather than
+// settled on the periodic fee settlement cron tick. Defined here (rather than
 // only in includes/dev_fee.php) so lightweight callers such as the setup
 // wizard's terms screen can display the rate without pulling in the full
 // settlement stack. dev_fee.php keeps a guarded fallback define for the same
@@ -230,6 +222,43 @@ class Config {
             "SELECT * FROM stores WHERE id = ?",
             [$storeId]
         );
+    }
+
+    /**
+     * Secret columns of the stores table that must never be serialized into a
+     * response payload. seed_phrase is the spendable wallet key (whoever holds
+     * it can move every sat of the store's ecash); smtp_password and the raw
+     * internal_api_key are credentials; the xpubs let an observer derive every
+     * receive address. These are read into memory by the many `SELECT *`
+     * dashboard/store reads, so redaction happens at the response boundary
+     * (see Config::redactStoreSecrets). Reading the seed for actual signing
+     * goes through Config::getStoreSeedPhrase, not these payloads.
+     */
+    public const STORE_SECRET_COLUMNS = [
+        'seed_phrase',
+        'internal_api_key',
+        'smtp_password',
+        'onchain_xpub',
+        'hosting_fee_onchain_xpub',
+    ];
+
+    /**
+     * Strip the store-table secret columns from a single store row before it
+     * is returned to a browser. The admin panel is reachable by the lower
+     * privilege ROLE_USER (not just admins), so these JSON reads must not leak
+     * wallet keys or credentials to a logged-in-but-not-admin user. Any
+     * derived non-secret fields already added to the row (e.g. the camelCase
+     * `internalApiKey` the dashboard needs for the Request Payment feature)
+     * are preserved — only the raw secret columns above are removed.
+     *
+     * @param array<string,mixed> $store
+     * @return array<string,mixed>
+     */
+    public static function redactStoreSecrets(array $store): array {
+        foreach (self::STORE_SECRET_COLUMNS as $col) {
+            unset($store[$col]);
+        }
+        return $store;
     }
 
     /**

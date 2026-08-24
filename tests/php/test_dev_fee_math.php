@@ -1,8 +1,9 @@
 <?php
 /**
- * DevFee::computeOwed math. Verifies the three formulas (upstream / dev /
- * hosting) work together with the network-cost decrement and the
- * "upstream paid counts toward network cost" rule.
+ * DevFee::computeOwed math. Verifies the dev / hosting formulas work together
+ * with the network-cost decrement, and that HISTORICAL upstream-fee payments
+ * (the retired 0.5% fee) still shrink the dev-fee base without any new
+ * upstream amount accruing.
  */
 declare(strict_types=1);
 require __DIR__ . '/harness.php';
@@ -33,25 +34,26 @@ function paid_invoice(string $storeId, int $sats, int $createdAt): void {
     ]);
 }
 
-// 1. Empty store: nothing owed.
+// 1. Empty store: nothing owed. The retired upstream fee never appears as an
+//    owed bucket.
 $o = DevFee::computeOwed($store);
 assert_eq(0, $o['revenue'], 'no revenue');
-assert_eq(0, $o['upstream_owed']);
+assert_true(!array_key_exists('upstream_owed', $o), 'upstream_owed bucket removed');
 assert_eq(0, $o['dev_owed']);
 assert_eq(0, $o['hosting_owed']);
 
 // 2. 100k sats revenue, no network costs, no hosting fee.
-//    upstream = 100000 * 0.005 = 500 sats
-//    dev      = (100000 - 0) * 0.01 = 1000 sats   (no upstream paid yet)
+//    dev      = 100000 * 0.01 = 1000 sats
 //    hosting  = 100000 * 0 / 100 = 0
 paid_invoice($store, 100000, time());
 $o = DevFee::computeOwed($store);
 assert_eq(100000, $o['revenue']);
-assert_eq(500, $o['upstream_owed'], 'upstream 0.5% of revenue');
-assert_eq(1000, $o['dev_owed'], 'dev 1% of revenue (upstream not yet paid)');
+assert_eq(1000, $o['dev_owed'], 'dev 1% of revenue');
 assert_eq(0, $o['hosting_owed']);
 
-// 3. After upstream is paid, dev fee base shrinks by upstream_paid.
+// 3. Historical upstream payments (rows written before the fee was retired)
+//    still shrink the dev-fee base — existing deployments must not see their
+//    dev fee retroactively increase.
 //    dev base = 100000 - 0 - 500 = 99500 → floor(99500 * 0.01) = 995
 Database::insert('melts', [
     'store_id' => $store,
@@ -63,16 +65,11 @@ Database::insert('melts', [
     'created_at' => time(),
 ]);
 $o = DevFee::computeOwed($store);
-assert_eq(500, $o['upstream_paid']);
-assert_eq(0, $o['upstream_owed'], 'upstream paid, nothing more owed');
-assert_eq(995, $o['dev_owed'], 'dev base shrunk by upstream paid');
+assert_eq(500, $o['upstream_paid'], 'historical upstream payment still reported');
+assert_eq(995, $o['dev_owed'], 'dev base shrunk by historical upstream paid');
 
-// 4. Network cost from a user withdraw further reduces both bases.
-//    User withdrew with 100 sats network fee.
-//    upstream base = 100000 - 100 = 99900 → floor(99900 * 0.005) = 499
-//      upstream_owed = 499 - 500 = -1 → clamped to 0 (already overpaid)
+// 4. Network cost from a user withdraw further reduces the dev base.
 //    dev base = 100000 - 100 - 500 = 99400 → floor(99400 * 0.01) = 994
-//      dev_owed = 994 - 0 = 994
 Database::insert('melts', [
     'store_id' => $store,
     'amount_sats' => 50000,
@@ -84,8 +81,7 @@ Database::insert('melts', [
 ]);
 $o = DevFee::computeOwed($store);
 assert_eq(100, $o['network_cost']);
-assert_eq(0, $o['upstream_owed'], 'upstream already overpaid');
-assert_eq(994, $o['dev_owed'], 'dev base reflects network cost + upstream paid');
+assert_eq(994, $o['dev_owed'], 'dev base reflects network cost + historical upstream paid');
 
 // 5. Hosting fee is flat over revenue (does NOT subtract network costs).
 //    With 2% hosting: 100000 * 0.02 = 2000

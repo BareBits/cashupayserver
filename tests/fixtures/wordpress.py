@@ -62,6 +62,17 @@ BTCPAY_WC_URL = (
 BTCPAY_WC_SHA256 = "b06a4da4835d984ddd870c3bfafb6fc4c524fe0ef988f22cd1575a8a7b77d236"
 BTCPAY_WC_CACHE = BIN_DIR / f"btcpay-greenfield-{BTCPAY_WC_VERSION}"
 
+# ELEX Discount Per Payment Method — the free plugin the onboarding wizard's
+# Bitcoin-discount step auto-installs. Tests stage it pre-installed (NOT
+# active) so cashupay_ensure_elex_discount exercises its activate+configure
+# path without a live wordpress.org download mid-test.
+ELEX_DPP_VERSION = "1.3.2"
+ELEX_DPP_URL = (
+    f"https://downloads.wordpress.org/plugin/elex-discount-per-payment-method.{ELEX_DPP_VERSION}.zip"
+)
+ELEX_DPP_SHA256 = "dbce21758f7bf76968880ed5e0750b73aa6621a8c944d2a13441fef47535dfd1"
+ELEX_DPP_CACHE = BIN_DIR / f"elex-discount-per-payment-method-{ELEX_DPP_VERSION}"
+
 
 @dataclass
 class WordPressHandle:
@@ -105,7 +116,11 @@ class WordPressHandle:
         ]
         env = os.environ.copy()
         env["CASHUPAY_DATA_DIR"] = str(self.data_dir)
-        result = subprocess.run(cmd, env=env, capture_output=True, text=True)
+        # Generous ceiling (plugin installs legitimately take a while) that
+        # still fails loudly instead of eating the whole CI job cap when a WP
+        # boot deadlocks — seen when a wiped btcpay_gf_version made the BTCPay
+        # plugin's boot migrations self-request this site recursively.
+        result = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=300)
         if check and result.returncode != 0:
             raise RuntimeError(
                 f"wp-cli failed ({result.returncode}) for {args}\n"
@@ -554,6 +569,22 @@ def install_woocommerce(handle: WordPressHandle) -> dict:
     )
     product_id = int(created.stdout.strip().splitlines()[-1])
     return {"product_id": product_id}
+
+
+def stage_elex_discount_plugin(handle: WordPressHandle) -> None:
+    """Place the ELEX Discount Per Payment Method plugin in wp-content/plugins
+    WITHOUT activating it.
+
+    This is the state cashupay_ensure_elex_discount finds on a host where the
+    plugin is present but dormant: it must take the activate+configure path,
+    and the test avoids depending on a live wordpress.org download (the
+    fresh-install path is byte-identical from activation onward)."""
+    src = _ensure_cached_plugin(
+        ELEX_DPP_CACHE, ELEX_DPP_URL, ELEX_DPP_SHA256, "elex-discount-per-payment-method"
+    )
+    dst = handle.wp_root / "wp-content" / "plugins" / src.name
+    if not dst.exists():
+        os.symlink(src, dst)
 
 
 def _wp_config_php(*, port: int, data_dir: Path) -> str:

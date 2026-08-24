@@ -50,6 +50,44 @@ assert_true(mb_strlen($memo) <= 100, 'memo capped at 100 chars');
 assert_eq(str_repeat('é', 100), $memo, 'multibyte truncation keeps whole characters');
 
 // ---------------------------------------------------------------------------
+// Unit: order reference (metadata.orderId) in the memo
+// ---------------------------------------------------------------------------
+assert_eq('Acme Coffee - Order 123 - 2x Latte',
+    Invoice::nofferMemo(['name' => 'Acme Coffee'], ['orderId' => '123', 'itemDesc' => '2x Latte']),
+    'order reference sits between store name and note');
+assert_eq('Acme Coffee - Order 123',
+    Invoice::nofferMemo(['name' => 'Acme Coffee'], ['orderId' => 123]),
+    'numeric orderId accepted, no note');
+assert_eq('Order 123',
+    Invoice::nofferMemo(['name' => ''], ['orderId' => '123']),
+    'order reference alone when nothing else to say');
+assert_eq('Acme Coffee - 2x Latte',
+    Invoice::nofferMemo(['name' => 'Acme Coffee'], ['orderId' => '  ', 'itemDesc' => '2x Latte']),
+    'blank orderId ignored');
+assert_eq('Acme Coffee - 2x Latte',
+    Invoice::nofferMemo(['name' => 'Acme Coffee'], ['orderId' => true, 'itemDesc' => '2x Latte']),
+    'non-string/number orderId ignored');
+
+// The order reference is NOT privacy-gated: hiding name and note still leaves
+// it, so the receiving wallet can match the payment to its order.
+assert_eq('Order 123',
+    Invoice::nofferMemo(['name' => 'Acme Coffee'],
+        ['orderId' => '123', 'itemDesc' => '2x Latte', 'hideStoreName' => true, 'hideNote' => true]),
+    'order reference survives hiding both name and note');
+
+// Truncation sheds the note first, then the name — the order reference must
+// survive the 100-char cap.
+$memo = Invoice::nofferMemo(['name' => 'Acme Coffee'],
+    ['orderId' => '123', 'itemDesc' => str_repeat('x', 150)]);
+assert_true(mb_strlen($memo) <= 100, 'order memo capped at 100 chars');
+assert_true(str_contains($memo, 'Order 123'), 'order reference survives note overflow');
+assert_true(str_starts_with($memo, 'Acme Coffee - Order 123 - '), 'name and order intact, note trimmed');
+
+$memo = Invoice::nofferMemo(['name' => str_repeat('n', 150)], ['orderId' => '123']);
+assert_true(mb_strlen($memo) <= 100, 'order memo capped when name overflows');
+assert_true(str_contains($memo, 'Order 123'), 'order reference survives name overflow');
+
+// ---------------------------------------------------------------------------
 // Integration: Invoice::create sends the memo as the NIP-69 description
 // ---------------------------------------------------------------------------
 
@@ -204,5 +242,17 @@ assert_eq('',
     noffer_description($mSk, $mPk, 'store_noffer_hide_both', $noop,
         ['itemDesc' => '2x Latte', 'hideStoreName' => true, 'hideNote' => true]),
     'hiding both leaves no NIP-69 description');
+
+// WooCommerce-style metadata.orderId reaches the wire as part of the memo.
+assert_eq('Acme Coffee - Order 1042 - 2x Latte',
+    noffer_description($mSk, $mPk, 'store_noffer_order', $noop,
+        ['orderId' => '1042', 'itemDesc' => '2x Latte']),
+    'order reference sent in the NIP-69 description');
+
+// …and is NOT silenced by the privacy toggles.
+assert_eq('Order 1042',
+    noffer_description($mSk, $mPk, 'store_noffer_order_priv', $noop,
+        ['orderId' => '1042', 'itemDesc' => '2x Latte', 'hideStoreName' => true, 'hideNote' => true]),
+    'order reference survives the privacy toggles on the wire');
 
 echo "test_clink_noffer_memo: OK\n";

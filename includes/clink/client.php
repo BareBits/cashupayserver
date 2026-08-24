@@ -7,7 +7,10 @@
  * paid by reading the merchant's kind-21001 payment receipt.
  *
  * Two distinct jobs, both pure-PHP (no exec, no ext-sodium) on top of
- * swentel/nostr-php (NIP-44 + Schnorr signing + a pure-PHP websocket client):
+ * swentel/nostr-php's event/relay layer (a pure-PHP websocket client) with
+ * the crypto — BIP340 Schnorr, x-only ECDH, NIP-44 keys — done by the in-repo
+ * NostrCrypto/BigNum stack, which runs on ext-gmp or ext-bcmath (nostr-php's
+ * own crypto hard-requires GMP, which shared WordPress hosts often lack):
  *
  *   requestInvoice()  — used at invoice creation (receive) and at cashout
  *                       (withdraw). Generates a throwaway identity, sends an
@@ -32,11 +35,10 @@
 declare(strict_types=1);
 
 require_once __DIR__ . '/noffer.php';
+require_once __DIR__ . '/../crypto/nostr_crypto.php';
 require_once __DIR__ . '/../../vendor/autoload.php';
 
-use swentel\nostr\Key\Key;
 use swentel\nostr\Event\Event;
-use swentel\nostr\Sign\Sign;
 use swentel\nostr\Encryption\Nip44;
 
 /** Structured CLINK failure carrying a NIP-69 error code where known. */
@@ -56,11 +58,62 @@ class ClinkClient
 {
     public const KIND = 21001;
 
+    /**
+     * Why this exists: the CLINK payer path Schnorr-signs Nostr events and
+     * derives NIP-44 conversation keys, which needs bignum math — ext-gmp or
+     * ext-bcmath (the in-repo NostrCrypto stack runs on either). Shared
+     * WordPress hosts frequently ship PHP without GMP, and before this check
+     * that surfaced only as a per-invoice error_log line while the checkout
+     * silently lost its Lightning option. The mirror of
+     * OnchainWallet::environmentError() for the noffer stack: checked up
+     * front by the onboarding wizard and the admin settings so the operator
+     * gets one actionable sentence instead.
+     *
+     * Returns null when the environment can run the CLINK client. See
+     * environmentNotice() for the non-blocking "BCMath fallback active"
+     * advisory.
+     */
+    public static function environmentError(): ?string
+    {
+        if (PHP_INT_SIZE < 8) {
+            return 'This server runs 32-bit PHP; CLINK noffers require 64-bit PHP.';
+        }
+        if (!NostrCrypto::available()) {
+            return 'This server\'s PHP has neither the GMP nor the BCMath extension; one'
+                . ' of them is required to sign the Nostr payment requests CLINK noffers'
+                . ' work over. Ask your hosting provider to enable php-gmp (preferred)'
+                . ' or php-bcmath, or use a Lightning address instead.';
+        }
+        return null;
+    }
+
+    /**
+     * Non-blocking advisory when noffers run on the BCMath fallback: they
+     * work, but GMP is much faster and the better-audited bignum library.
+     * Null when GMP is active or when the feature can't run at all.
+     */
+    public static function environmentNotice(): ?string
+    {
+        if (self::environmentError() !== null || !NostrCrypto::usingBcmathFallback()) {
+            return null;
+        }
+        return 'CLINK noffers are running on PHP\'s BCMath extension. This works, but'
+            . ' enabling the GMP extension (php-gmp) makes the cryptography roughly'
+            . ' 100x faster and uses the more battle-tested math library — worth'
+            . ' asking your hosting provider for.';
+    }
+
     // Total wall-clock budget for a request→reply round trip. Relays + the
     // merchant's invoice generation are the slow parts; keep it snappy enough
-    // not to wedge invoice creation but tolerant of a sluggish relay. Override
+    // not to wedge invoice creation but tolerant of a sluggish relay. The
+    // budget covers the whole offer: every relay in the noffer draws from the
+    // same deadline, so extra relays add reach, not checkout wait. Override
     // in user_config.php.
     public const DEFAULT_TIMEOUT_SEC = 10;
+
+    // Don't open yet another relay socket when less than this much of the
+    // budget is left — the round trip could never complete in time.
+    private const MIN_ATTEMPT_SEC = 0.5;
 
     /**
      * Ask a noffer's service for a BOLT11 invoice.
@@ -84,6 +137,11 @@ class ClinkClient
         ?string $description = null,
         ?int $timeoutSec = null
     ): array {
+        // Fail with the actionable environment message rather than the raw
+        // Error nostr-php raises from gmp_* two frames deeper.
+        if (($envError = self::environmentError()) !== null) {
+            throw new ClinkException($envError, 0);
+        }
         $decoded = ClinkNoffer::decode($noffer); // throws on malformed
         $timeout = $timeoutSec ?? self::timeoutSec();
 
@@ -91,9 +149,8 @@ class ClinkClient
             $description = mb_substr($description, 0, 100);
         }
 
-        $key = new Key();
-        $skHex = $key->generatePrivateKey();
-        $pkHex = $key->getPublicKey($skHex);
+        $skHex = NostrCrypto::generatePrivateKeyHex();
+        $pkHex = NostrCrypto::derivePublicKeyHex($skHex);
         $receiverPubkey = $decoded['pubkey'];
 
         // Encrypted request payload. amount is conditional: the spec carries it
@@ -110,24 +167,51 @@ class ClinkClient
             $payload['description'] = $description;
         }
 
-        $convKey = Nip44::getConversationKey($skHex, $receiverPubkey);
+        $convKey = NostrCrypto::nip44ConversationKey($skHex, $receiverPubkey);
         $content = Nip44::encrypt(json_encode($payload), $convKey);
 
         $event = new Event();
         $event->setKind(self::KIND);
         $event->setTags([['p', $receiverPubkey], ['clink_version', '1']]);
         $event->setContent($content);
-        (new Sign())->signEvent($event, $skHex);
+        NostrCrypto::signEvent($event, $skHex);
         $signed = $event->toArray();
         $requestId = (string)$signed['id'];
         $createdAt = (int)$signed['created_at'];
 
         // Subscribe-before-publish on one socket: the reply is an ephemeral
         // event the service emits *after* seeing our request, so the
-        // subscription must already be live or we'd miss it.
-        $reply = self::roundTrip($decoded['relay'], $signed, $pkHex, $requestId, $createdAt, $timeout, $convKey);
+        // subscription must already be live or we'd miss it. Walk every relay
+        // in the offer under ONE deadline (started before the first connect,
+        // so connect time spends budget too): a definitive reply from any
+        // relay is the answer; a silent or unreachable relay just hands the
+        // remaining budget to the next one.
+        $deadline = microtime(true) + $timeout;
+        $reply = null;
+        $relayUsed = null;
+        $lastTransportError = null;
+        $sawTimeout = false;
+        foreach ($decoded['relays'] as $i => $relayUrl) {
+            if ($i > 0 && self::remaining($deadline) < self::MIN_ATTEMPT_SEC) {
+                break; // budget spent; another connect could never finish
+            }
+            try {
+                $reply = self::roundTrip($relayUrl, $signed, $pkHex, $requestId, $createdAt, $deadline, $convKey);
+            } catch (ClinkException $e) {
+                $lastTransportError = $e; // connect/handshake failure — try the next relay
+                continue;
+            }
+            if ($reply !== null) {
+                $relayUsed = $relayUrl; // bolt11 or service error — either is definitive
+                break;
+            }
+            $sawTimeout = true; // reachable but silent — try the next relay with what's left
+        }
         if ($reply === null) {
-            throw new ClinkException('No response from noffer service within timeout', 2);
+            if ($sawTimeout || $lastTransportError === null) {
+                throw new ClinkException('No response from noffer service within timeout', 2);
+            }
+            throw $lastTransportError;
         }
 
         if (isset($reply['error']) || isset($reply['code'])) {
@@ -146,7 +230,10 @@ class ClinkClient
 
         return [
             'bolt11' => (string)$reply['bolt11'],
-            'relay' => $decoded['relay'],
+            // The relay that actually answered — the receipt subscription
+            // (payment page + cron) should listen where the service is known
+            // to be reachable, not blindly on the offer's first relay.
+            'relay' => $relayUsed,
             'receiver_pubkey' => $receiverPubkey,
             'offer' => $decoded['offer'],
             'ephemeral_sk' => $skHex,
@@ -157,31 +244,44 @@ class ClinkClient
     }
 
     /**
-     * Best-effort cron path: re-subscribe to the relay and look for a payment
-     * receipt referencing our original request. Returns ['paid'=>bool] —
-     * paid=true only when a merchant-signed receipt with {res:'ok'} is found.
+     * Re-subscribe to the relay and look for a payment receipt referencing our
+     * original request. Returns ['paid'=>bool] — paid=true only when a
+     * merchant-signed receipt with {res:'ok'} is found.
+     *
+     * With $waitAfterEose=false (the cron batch poll) this reads only what the
+     * relay retained — nothing, on relays that treat kind 21001 as ephemeral
+     * per spec. With $waitAfterEose=true (the payment-page single poll) the
+     * subscription stays open until $timeoutSec, so a receipt broadcast live
+     * during the window is caught even when the relay retains nothing and the
+     * customer's browser subscription is broken.
      *
      * @param array{relay:string,receiver_pubkey:string,ephemeral_sk:string,
      *              ephemeral_pubkey:string,request_event_id:string,created_at:int} $ctx
      */
-    public static function fetchReceipt(array $ctx, ?int $timeoutSec = null): array
+    public static function fetchReceipt(array $ctx, ?int $timeoutSec = null, bool $waitAfterEose = false): array
     {
         $timeout = $timeoutSec ?? self::timeoutSec();
-        $convKey = Nip44::getConversationKey($ctx['ephemeral_sk'], $ctx['receiver_pubkey']);
-        $events = self::collectEvents(
+        $convKey = NostrCrypto::nip44ConversationKey($ctx['ephemeral_sk'], $ctx['receiver_pubkey']);
+        $found = null;
+        // Interpret events as they arrive so a live-window listen returns the
+        // moment the genuine receipt lands instead of idling out the window.
+        $stopWhen = function (array $ev) use ($ctx, $convKey, &$found): bool {
+            if (self::interpretReceipt($ev, $ctx, $convKey)['paid']) {
+                $found = $ev;
+                return true;
+            }
+            return false;
+        };
+        self::collectEvents(
             $ctx['relay'],
             $ctx['ephemeral_pubkey'],
             $ctx['request_event_id'],
             (int)$ctx['created_at'],
-            $timeout
+            $timeout,
+            $waitAfterEose,
+            $stopWhen
         );
-        foreach ($events as $ev) {
-            $verdict = self::interpretReceipt($ev, $ctx, $convKey);
-            if ($verdict['paid']) {
-                return ['paid' => true, 'event' => $ev];
-            }
-        }
-        return ['paid' => false];
+        return $found !== null ? ['paid' => true, 'event' => $found] : ['paid' => false];
     }
 
     /**
@@ -195,58 +295,52 @@ class ClinkClient
      */
     public static function verifyReceiptEvent(array $rawEvent, array $ctx): array
     {
-        $convKey = Nip44::getConversationKey($ctx['ephemeral_sk'], $ctx['receiver_pubkey']);
+        $convKey = NostrCrypto::nip44ConversationKey($ctx['ephemeral_sk'], $ctx['receiver_pubkey']);
         return self::interpretReceipt($rawEvent, $ctx, $convKey);
     }
 
     // ---- internals ----
 
     /**
-     * Validate + decrypt a candidate receipt event. Returns ['paid'=>bool].
-     * A genuine receipt must: be kind 21001, be authored by the offer's
-     * receiver pubkey, reference our request id via an `e` tag, carry a valid
-     * Schnorr signature, and decrypt to a JSON object whose `res` is `ok`.
+     * Validate + decrypt a candidate receipt event. Returns ['paid'=>bool] plus
+     * a 'reason' on rejection so callers can log WHY a forwarded receipt was
+     * refused. A genuine receipt must: be kind 21001, be authored by the
+     * offer's receiver pubkey, reference our request id via an `e` tag, carry
+     * a valid Schnorr signature, and decrypt to a JSON object whose `res` is
+     * `ok`.
      */
     private static function interpretReceipt(array $ev, array $ctx, string $convKey): array
     {
         if ((int)($ev['kind'] ?? 0) !== self::KIND) {
-            return ['paid' => false];
+            return ['paid' => false, 'reason' => 'wrong kind'];
         }
         if (!hash_equals((string)$ctx['receiver_pubkey'], (string)($ev['pubkey'] ?? ''))) {
-            return ['paid' => false];
+            return ['paid' => false, 'reason' => 'author is not the offer receiver'];
         }
         if (!self::tagsReferenceEvent($ev['tags'] ?? [], (string)$ctx['request_event_id'])) {
-            return ['paid' => false];
+            return ['paid' => false, 'reason' => 'no e-tag referencing our request'];
         }
-        // Verify the Schnorr signature over the canonical event id.
+        // Verify the Schnorr signature over the canonical event id (which
+        // NostrCrypto re-derives from the presented content — a receipt with
+        // a genuine (id,sig) pair but altered tags/content fails here).
         try {
-            $check = new Event();
-            $check->populate((object)[
-                'id' => $ev['id'] ?? '',
-                'pubkey' => $ev['pubkey'] ?? '',
-                'created_at' => $ev['created_at'] ?? 0,
-                'kind' => $ev['kind'] ?? 0,
-                'tags' => $ev['tags'] ?? [],
-                'content' => $ev['content'] ?? '',
-                'sig' => $ev['sig'] ?? '',
-            ]);
-            if (!$check->verify()) {
-                return ['paid' => false];
+            if (!NostrCrypto::verifyEventArray($ev)) {
+                return ['paid' => false, 'reason' => 'invalid signature'];
             }
         } catch (\Throwable $e) {
-            return ['paid' => false];
+            return ['paid' => false, 'reason' => 'invalid signature'];
         }
         // Decrypt + inspect the receipt body.
         try {
             $plain = Nip44::decrypt((string)($ev['content'] ?? ''), $convKey);
             $data = json_decode($plain, true);
         } catch (\Throwable $e) {
-            return ['paid' => false];
+            return ['paid' => false, 'reason' => 'undecryptable content'];
         }
         if (is_array($data) && isset($data['res']) && $data['res'] === 'ok') {
             return ['paid' => true];
         }
-        return ['paid' => false];
+        return ['paid' => false, 'reason' => 'res is not ok'];
     }
 
     private static function tagsReferenceEvent(array $tags, string $eventId): bool
@@ -261,7 +355,8 @@ class ClinkClient
 
     /**
      * Open a socket, subscribe for the reply, publish the request, and return
-     * the first decrypted reply payload (bolt11 or error) — or null on timeout.
+     * the first decrypted reply payload (bolt11 or error) — or null when
+     * $deadline passes without one.
      */
     private static function roundTrip(
         string $relayUrl,
@@ -269,22 +364,27 @@ class ClinkClient
         string $ephemeralPubkey,
         string $requestId,
         int $createdAt,
-        int $timeout,
+        float $deadline,
         string $convKey
     ): ?array {
         $client = null;
         $subId = bin2hex(random_bytes(8));
         try {
             $client = new \WebSocket\Client($relayUrl);
-            $client->setTimeout($timeout);
+            // The connect (TCP + websocket upgrade) spends budget too — a
+            // black-holing relay host can't stretch the wait past the deadline.
+            $client->setTimeout(max(0.1, self::remaining($deadline)));
             $client->connect();
 
             $filter = self::replyFilter($ephemeralPubkey, $requestId, $createdAt);
             $client->text(json_encode(['REQ', $subId, $filter]));
             $client->text(json_encode(['EVENT', $signedEvent]));
 
-            $deadline = microtime(true) + $timeout;
-            while (microtime(true) < $deadline) {
+            while (($left = self::remaining($deadline)) > 0) {
+                // Shrink the socket timeout to what's left of the budget: the
+                // deadline check alone can't stop a blocking read entered just
+                // before it from overrunning by a further full socket timeout.
+                $client->setTimeout(max(0.05, $left));
                 $msg = self::receiveText($client);
                 if ($msg === null) {
                     break; // timeout / closed
@@ -329,6 +429,11 @@ class ClinkClient
      * Collect events matching our reply filter until EOSE or timeout. Used by
      * the cron receipt poll, where we read whatever the relay still holds.
      *
+     * $waitAfterEose keeps the subscription open past EOSE until the timeout —
+     * a short live-listen window for ephemeral receipts spec-compliant relays
+     * never retain. $stopWhen, when given, is called with each event and ends
+     * the collection early by returning true (e.g. "that's the receipt").
+     *
      * @return array<int,array> raw event arrays
      */
     private static function collectEvents(
@@ -336,20 +441,25 @@ class ClinkClient
         string $ephemeralPubkey,
         string $requestId,
         int $createdAt,
-        int $timeout
+        int $timeout,
+        bool $waitAfterEose = false,
+        ?callable $stopWhen = null
     ): array {
         $client = null;
         $subId = bin2hex(random_bytes(8));
         $out = [];
+        // One deadline covering connect and every read, socket timeout shrunk
+        // to what's left before each read — same enforcement as roundTrip().
+        $deadline = microtime(true) + $timeout;
         try {
             $client = new \WebSocket\Client($relayUrl);
-            $client->setTimeout($timeout);
+            $client->setTimeout(max(0.1, self::remaining($deadline)));
             $client->connect();
             $filter = self::replyFilter($ephemeralPubkey, $requestId, $createdAt);
             $client->text(json_encode(['REQ', $subId, $filter]));
 
-            $deadline = microtime(true) + $timeout;
-            while (microtime(true) < $deadline) {
+            while (($left = self::remaining($deadline)) > 0) {
+                $client->setTimeout(max(0.05, $left));
                 $msg = self::receiveText($client);
                 if ($msg === null) {
                     break;
@@ -360,8 +470,16 @@ class ClinkClient
                 }
                 if ($data[0] === 'EVENT' && ($data[1] ?? null) === $subId && isset($data[2]) && is_array($data[2])) {
                     $out[] = $data[2];
+                    if ($stopWhen !== null && $stopWhen($data[2])) {
+                        break;
+                    }
                 } elseif ($data[0] === 'EOSE' && ($data[1] ?? null) === $subId) {
-                    break; // we have all stored events the relay will give us
+                    if (!$waitAfterEose) {
+                        break; // we have all stored events the relay will give us
+                    }
+                    // Live-listen mode: the relay retained nothing (or not the
+                    // receipt); keep the subscription open until the deadline
+                    // to catch a receipt broadcast while we're connected.
                 } elseif ($data[0] === 'CLOSED' && ($data[1] ?? null) === $subId) {
                     break;
                 }
@@ -424,5 +542,11 @@ class ClinkClient
             return (int)CLINK_NOFFER_TIMEOUT_SEC;
         }
         return self::DEFAULT_TIMEOUT_SEC;
+    }
+
+    /** Seconds left before $deadline, floored at 0. */
+    private static function remaining(float $deadline): float
+    {
+        return max(0.0, $deadline - microtime(true));
     }
 }

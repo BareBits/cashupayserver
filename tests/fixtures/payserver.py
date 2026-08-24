@@ -114,7 +114,12 @@ def _ensure_php() -> str:
     return str(binaries.ensure(binaries.PHP)["php"])
 
 
-def start_payserver(workdir: Path, *, extra_env: dict[str, str] | None = None) -> PayserverHandle:
+def start_payserver(
+    workdir: Path,
+    *,
+    extra_env: dict[str, str] | None = None,
+    extra_php_args: list[str] | None = None,
+) -> PayserverHandle:
     php = _ensure_php()
     workdir.mkdir(parents=True, exist_ok=True)
     data_dir = workdir / "data"
@@ -159,6 +164,9 @@ def start_payserver(workdir: Path, *, extra_env: dict[str, str] | None = None) -
     proc = subprocess.Popen(
         [
             php,
+            # e.g. ["-d", "disable_functions=gmp_init,…"] to simulate a shared
+            # host whose PHP lacks an extension the bundled binary has.
+            *(extra_php_args or []),
             "-S", f"127.0.0.1:{port}",
             "-t", str(REPO_ROOT),
             str(router_wrapper),

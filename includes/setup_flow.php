@@ -15,7 +15,7 @@ final class SetupFlow {
     /** Every screen the wizard knows, in canonical order. */
     public const STEPS = [
         'terms', 'security', 'password', 'store', 'onchain', 'zeroconf',
-        'lightning', 'swaps', 'mints', 'cron', 'done',
+        'lightning', 'swaps', 'mints', 'discount', 'cron', 'done',
     ];
 
     /** The screens add_store mode walks before returning to admin. */
@@ -43,7 +43,7 @@ final class SetupFlow {
      * Screens that render after setup_complete has been set, and therefore
      * have to survive setup.php's redirect-if-set-up guard.
      */
-    public const POST_COMPLETION = ['cron', 'done'];
+    public const POST_COMPLETION = ['discount', 'cron', 'done'];
 
     public static function isKnownStep(string $step): bool {
         return in_array($step, self::STEPS, true) || $step === self::ADD_STORE_COMPLETE;
@@ -64,9 +64,18 @@ final class SetupFlow {
      * the sequence entirely, which also keeps the "Step X of Y" counter honest
      * rather than advertising a screen that will never render.
      *
+     * $includeSecurity is false when the data directory is outside the web
+     * root (and the PHP requirements all pass): the screen exists to prove
+     * the database can't be fetched over HTTP, and with the directory outside
+     * the web root that exposure is impossible — showing the warning anyway
+     * only confuses the operator. Callers keep it true whenever a requirement
+     * is missing, because the screen is also where that blocking error lives.
+     *
      * @return string[]
      */
-    public static function stepSequence(string $mode, bool $isWordPress, bool $includeZeroConf): array {
+    public static function stepSequence(
+        string $mode, bool $isWordPress, bool $includeZeroConf, bool $includeSecurity = true
+    ): array {
         if ($mode === 'add_store') {
             $steps = self::ADD_STORE_STEPS;
         } else {
@@ -74,12 +83,50 @@ final class SetupFlow {
             if ($isWordPress) {
                 // WordPress supplies its own authentication.
                 $steps = array_values(array_diff($steps, ['password']));
+            } else {
+                // The Bitcoin-discount screen configures a WooCommerce
+                // checkout discount (via the ELEX plugin); outside WordPress
+                // there is no WooCommerce to apply it to.
+                $steps = array_values(array_diff($steps, ['discount']));
+            }
+            if (!$includeSecurity) {
+                $steps = array_values(array_diff($steps, ['security']));
             }
         }
         if (!$includeZeroConf) {
             $steps = array_values(array_diff($steps, ['zeroconf']));
         }
         return array_values($steps);
+    }
+
+    /**
+     * PHP requirements the wizard's security screen reports, as
+     * name => passed. Lives here rather than inline in the render so the
+     * "can the security screen be skipped?" decision and the screen itself
+     * can never disagree about what was checked.
+     *
+     * GMP-or-BCMath deliberately uses extension_loaded (matching the screen's
+     * original check): a hardened host that disables the functions but keeps
+     * the extension loaded is handled by the softer per-feature gates later
+     * in the wizard, not blocked here.
+     *
+     * @return string[] Names of the requirements that FAILED (empty = all ok).
+     */
+    public static function missingRequirements(): array {
+        $checks = [
+            'PHP ' . PHP_VERSION => version_compare(PHP_VERSION, '8.0.0', '>='),
+            'cURL extension' => extension_loaded('curl'),
+            'JSON extension' => extension_loaded('json'),
+            'PDO SQLite' => extension_loaded('pdo_sqlite'),
+            'GMP or BCMath' => extension_loaded('gmp') || extension_loaded('bcmath'),
+        ];
+        $failed = [];
+        foreach ($checks as $name => $passed) {
+            if (!$passed) {
+                $failed[] = $name;
+            }
+        }
+        return $failed;
     }
 
     /**
@@ -127,14 +174,39 @@ final class SetupFlow {
     }
 
     /**
+     * Parse the Bitcoin-discount screen's answer: a whole number of percent,
+     * 0–100. Null means the value is unusable and the screen should re-render
+     * with an error rather than saving anything.
+     *
+     * Whole numbers only: the free ELEX plugin that applies the discount
+     * renders its own settings form with a step-1 number input, so a
+     * fractional value saved here would trap the merchant in browser
+     * validation if they ever edited the rule there.
+     */
+    public static function parseDiscountPercent(string $raw): ?int {
+        $raw = trim($raw);
+        // An empty submit means "no discount", not an error — the field
+        // defaults to 0 and clearing it reads as declining the offer.
+        if ($raw === '') {
+            return 0;
+        }
+        if (!preg_match('/^[0-9]{1,3}$/', $raw)) {
+            return null;
+        }
+        $value = (int)$raw;
+        return $value <= 100 ? $value : null;
+    }
+
+    /**
      * Settle the store's auto-cashout (threshold-melt) configuration once
      * every rail answer is in. This cannot be decided on the Lightning screen
      * alone: whether the mint balance is swept over Lightning or via a
      * submarine swap depends on the swaps and mints answers that come after.
      *
      * The rules, in priority order:
-     *   1. Any Lightning destination (LNURL address or CLINK noffer) → sweep
-     *      over Lightning. Cheapest and fastest, so it wins when available.
+     *   1. Any Lightning destination (LNURL address, NWC connection, or CLINK
+     *      noffer) → sweep over Lightning. Cheapest and fastest, so it wins
+     *      when available.
      *   2. Otherwise, a mint plus swaps plus an xpub → sweep via submarine
      *      swap to the on-chain wallet. This is the case the mints screen
      *      promises: "funds are automatically withdrawn to your on-chain

@@ -12,18 +12,19 @@ Exercises the full stack — cashupayserver, the LUD-21 mock LNURL host
 
 2. **Fee redirect**: when a fee is owed >= the next invoice amount (seeded
    by inserting a settled-revenue invoice directly), the fee-redirect path
-   supersedes the old mint-override gate — the whole invoice is pointed at
-   the dev fee LNURL (resolved through the mock host). The invoice rides the
+   points the whole invoice at the dev fee LNURL (resolved through the mock
+   host) — the only invoice-time fee mechanism now that the old fees-due
+   mint-override gate is removed. The invoice rides the
    lnaddress rail tagged with fee_redirect_note; paying it settles the
    invoice and records a melts credit (via='redirect') instead of moving
    funds to the merchant. The pure-PHP unit tests cover the decision truth
    table + accounting; this confirms the path is wired end-to-end.
 
-3. **LUD-21 fallback**: when the LN address host doesn't advertise a
-   verify URL, save_auto_melt records stores.lnurl_supports_verify=0 and
-   the runtime probe falls back transparently. New invoices land on the
-   mint rail with no override reason (the gate didn't fire — we just
-   couldn't use LNURL at all).
+3. **LUD-21 save gate**: when the LN address host doesn't advertise a
+   verify URL, save_lightning_payments refuses to add the address (400
+   naming LUD-21). An address already stored for the store is grandfathered:
+   re-saving it succeeds with lud21Support=0, and invoices for it fall
+   back transparently to the mint rail with no override reason.
 """
 from __future__ import annotations
 
@@ -67,18 +68,29 @@ def _enable_auto_melt(
     threshold_sat: int = 100,
     enabled: str = "1",
 ) -> dict:
-    """Hit the admin save_auto_melt endpoint, mimicking the dashboard UI.
-    Returns the response (includes an ordered `addresses` list, each carrying
-    the per-address lud21Support from the LUD-21 probe the handler runs
-    synchronously). Posts the legacy single `address` field, which the handler
-    still accepts and stores as a one-entry fallback chain."""
-    return configured.admin._post_action(
-        "save_auto_melt",
+    """Configure the destination + toggle, mimicking the dashboard UI: the
+    destination chain goes to save_lightning_payments (posted first, so its
+    LUD-21 gate fires before anything is toggled), then the enable/threshold
+    to save_auto_melt. Returns the save_lightning_payments response (includes
+    an ordered `addresses` list, each carrying the per-address lud21Support
+    from the LUD-21 probe the handler runs synchronously). Posts the legacy
+    single `address` field, which the handler still accepts and stores as a
+    one-entry fallback chain."""
+    result = configured.admin._post_action(
+        "save_lightning_payments",
         store_id=configured.store_id,
         address=address,
+    )
+    toggle = configured.admin._post_action(
+        "save_auto_melt",
+        store_id=configured.store_id,
         enabled=enabled,
         threshold=str(threshold_sat),
+        mode_override="0",
     )
+    assert toggle.get("success") is True, toggle
+    assert "addresses" not in toggle, toggle
+    return result
 
 
 def _poll_invoice_until(
@@ -129,9 +141,10 @@ def _read_store_row(payserver: PayserverHandle, store_id: str) -> dict:
 
 
 def _primary_lud21(save_result: dict):
-    """LUD-21 support for the highest-priority address in a save_auto_melt
-    response. The response now returns an ordered `addresses` list (each with
-    a per-address lud21Support) instead of a single lnurl_supports_verify."""
+    """LUD-21 support for the highest-priority address in a
+    save_lightning_payments response. The response returns an ordered
+    `addresses` list (each with a per-address lud21Support) instead of a
+    single lnurl_supports_verify."""
     addresses = save_result.get("addresses") or []
     if not addresses:
         return None
@@ -157,7 +170,8 @@ def _seed_fee_revenue(payserver: PayserverHandle, store_id: str, sats: int) -> N
     fee_tracking_start_at so the synthetic row falls inside the accounting
     window (computeOwed filters created_at >= start_at).
 
-    Used by the override-gate test to push feesDue above the FORCE threshold
+    Used by the fee-redirect test to push the owed fee above the invoice
+    amount
     in a single deterministic step.
     """
     db_path = payserver.data_dir / "cashupay.sqlite"
@@ -231,9 +245,9 @@ def test_lnurl_direct_receive_happy_path(
     the cashupayserver detects settlement via the verify URL."""
     configured = configured_with_lnurlp
 
-    # 1. Save the auto-melt LN address. The save_auto_melt handler probes the
-    #    mock LNURL host (which advertises a verify URL via lud21=True), so
-    #    lnurl_supports_verify on the response should be 1.
+    # 1. Save the auto-melt LN address. The save_lightning_payments handler
+    #    probes the mock LNURL host (which advertises a verify URL via
+    #    lud21=True), so lnurl_supports_verify on the response should be 1.
     save_result = _enable_auto_melt(configured)
     assert save_result.get("success") is True, save_result
     assert _primary_lud21(save_result) == 1, (
@@ -371,7 +385,7 @@ def _read_redirect_melt(payserver: PayserverHandle, invoice_id: str) -> dict | N
         return None if row is None else dict(row)
 
 
-def test_fee_redirect_lightning_supersedes_mint_override(
+def test_fee_redirect_lightning_claims_whole_invoice(
     configured_with_lnurlp: ConfiguredPayserver,
     lnd_mint: LndHandle,
     lnurlp_server: LnurlpServer,
@@ -413,7 +427,7 @@ def test_fee_redirect_lightning_supersedes_mint_override(
     )
     assert row["lnurl_verify_url"], "verify URL needed to detect settlement"
     assert row["lnurl_override_reason"] is None, (
-        "redirect path supersedes the override gate; no override reason expected"
+        "nothing writes the retired lnurl_override_reason column"
     )
 
     # The API surfaces the badge payload for the admin invoice list.
@@ -508,24 +522,69 @@ def configured_no_lud21(
     return _configure(payserver_no_lud21, mint, backup_mint)
 
 
-def test_lnurl_lud21_missing_falls_back_to_mint(
+def _seed_ln_address(
+    payserver: PayserverHandle, store_id: str, address: str, supports_verify=None
+) -> None:
+    """Insert a store_ln_addresses row directly, bypassing the save-time
+    LUD-21 gate — models an address stored before the gate existed (the
+    grandfathered case)."""
+    db_path = payserver.data_dir / "cashupay.sqlite"
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute(
+            "INSERT INTO store_ln_addresses "
+            "(store_id, position, address, type, supports_verify) "
+            "VALUES (?, 0, ?, 'lnaddress', ?)",
+            (store_id, address, supports_verify),
+        )
+        conn.commit()
+
+
+def test_lnurl_lud21_missing_blocks_save(
     configured_no_lud21: ConfiguredPayserver,
     lnurlp_server_no_lud21: LnurlpServer,
 ) -> None:
-    """Without LUD-21, the LNURL probe rejects and the invoice routes via
-    the mint. The save_auto_melt response should reflect lnurl_supports_verify=0,
-    and the stores table should match."""
+    """Without LUD-21, save_lightning_payments refuses a NEW address outright
+    — the broken direct-receive rail is caught at save time instead of
+    silently dropping Lightning from the checkout (and the toggle save that
+    would follow it is never posted)."""
     configured = configured_no_lud21
+
+    with pytest.raises(RuntimeError, match="LUD-21"):
+        _enable_auto_melt(configured)
+
+    # Nothing was persisted: neither the address chain nor the toggle.
+    assert _primary_ln_address_support(configured.handle, configured.store_id) is None
+    store = _read_store_row(configured.handle, configured.store_id)
+    assert store["auto_melt_enabled"] == 0, dict(store)
+
+
+def test_lnurl_lud21_grandfathered_address_falls_back_to_mint(
+    configured_no_lud21: ConfiguredPayserver,
+    lnurlp_server_no_lud21: LnurlpServer,
+) -> None:
+    """An address stored before the gate existed keeps working: re-saving it
+    succeeds (refreshing its probe result to 0) and invoices fall back to the
+    mint rail with no override reason — the pre-gate runtime behaviour."""
+    configured = configured_no_lud21
+    _seed_ln_address(configured.handle, configured.store_id, LNURL_ADDRESS)
 
     save_result = _enable_auto_melt(configured)
     assert save_result.get("success") is True, save_result
     assert _primary_lud21(save_result) == 0, (
-        "host without verify URL should report unsupported; "
+        "grandfathered address should re-probe to lud21Support=0; "
         f"got {save_result}"
     )
 
     # The per-address cache mirrors the response.
     assert _primary_ln_address_support(configured.handle, configured.store_id) == 0
+
+    # Adding a second, NEW address alongside the grandfathered one still fails.
+    with pytest.raises(RuntimeError, match="LUD-21"):
+        configured.admin._post_action(
+            "save_lightning_payments",
+            store_id=configured.store_id,
+            **{"ln_addresses[]": [LNURL_ADDRESS, "brandnew@example.test"]},
+        )
 
     invoice = configured.greenfield.create_invoice(
         configured.store_id, amount=str(INVOICE_AMOUNT_SAT), currency="sat"
@@ -534,8 +593,8 @@ def test_lnurl_lud21_missing_falls_back_to_mint(
     assert row["payment_rail"] == "mint", (
         f"LUD-21 missing → expected mint fallback; got {row['payment_rail']!r}"
     )
-    # No override reason — the gate didn't fire, we just couldn't use LNURL.
+    # Nothing writes the retired lnurl_override_reason column.
     assert row["lnurl_override_reason"] is None, (
-        f"no override expected; got {row['lnurl_override_reason']!r}"
+        f"no override reason expected; got {row['lnurl_override_reason']!r}"
     )
     assert row["lnurl_verify_url"] is None

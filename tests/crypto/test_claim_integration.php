@@ -27,8 +27,8 @@ $claimPriv = hex2bin('1111111111111111111111111111111111111111111111111111111111
 $refundPriv = hex2bin('2222222222222222222222222222222222222222222222222222222222222222');
 $preimage = hex2bin('3333333333333333333333333333333333333333333333333333333333333333');
 
-$claimPub33 = Secp256k1::pointToCompressed(Secp256k1::generatorMult(Secp256k1::bytesToGmp($claimPriv)));
-$refundPub33 = Secp256k1::pointToCompressed(Secp256k1::generatorMult(Secp256k1::bytesToGmp($refundPriv)));
+$claimPub33 = Secp256k1::pointToCompressed(Secp256k1::generatorMult(Secp256k1::bytesToNum($claimPriv)));
+$refundPub33 = Secp256k1::pointToCompressed(Secp256k1::generatorMult(Secp256k1::bytesToNum($refundPriv)));
 $claimXOnly = substr($claimPub33, 1); // x-only
 $refundXOnly = substr($refundPub33, 1);
 

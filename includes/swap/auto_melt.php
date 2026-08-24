@@ -25,7 +25,7 @@
  *   - If 5+ quotes in the rolling 30-day window all fail the percent gate
  *     when re-evaluated against the current balance, skip fetching.
  *
- * The actual swap creation reuses {@see SwapProviderFactory::rankedForSite}
+ * The actual swap creation reuses {@see SwapProviderFactory::rankedForStore}
  * (parallel quote fetch + auto-select-cheapest rules) and persists into a
  * dedicated `sweep_attempts` table so the existing {@see SwapPoller} +
  * {@see SwapClaimer} can drive lockup observation, claim broadcast, and
@@ -98,7 +98,7 @@ final class SwapAutoMelt {
     private const MELT_FEE_RESERVE_PCT = 2.0;
     private const MELT_FEE_RESERVE_MIN = 5;
 
-    // ----- Tri-state values (mirror SwapsConfig conventions) -----
+    // ----- Mode values (legacy -1 "inherit" rows resolve to lightning) -----
     public const INHERIT = -1;
     public const FORCE_LIGHTNING = 0;
     public const FORCE_SWAP = 1;
@@ -129,31 +129,18 @@ final class SwapAutoMelt {
     }
 
     /**
-     * Site-wide default for the per-store mode. Off by default.
-     */
-    public static function siteDefault(): bool {
-        return (bool)Config::get('auto_melt_use_swap_default', false);
-    }
-
-    public static function setSiteDefault(bool $enabled): void {
-        Config::set('auto_melt_use_swap_default', $enabled);
-    }
-
-    /**
      * Resolve the effective auto-melt mode for a store. Only meaningful when
      * the store has auto_melt_enabled = 1; otherwise auto-melt is off entirely.
      *
      * @return 'lightning'|'swap' Effective rail for this store's auto-melt.
      *   Stores that pick swap but lack an xpub (or have swaps force-disabled)
      *   fall back to 'lightning' so the operator is never silently stuck.
+     *   Legacy -1 "inherit" rows (from when a site-wide default existed)
+     *   resolve to lightning.
      */
     public static function modeForStore(array $store): string {
-        $tri = isset($store['auto_melt_use_swap']) ? (int)$store['auto_melt_use_swap'] : self::INHERIT;
-        $picksSwap = match ($tri) {
-            self::FORCE_SWAP      => true,
-            self::FORCE_LIGHTNING => false,
-            default               => self::siteDefault(),
-        };
+        $tri = isset($store['auto_melt_use_swap']) ? (int)$store['auto_melt_use_swap'] : self::FORCE_LIGHTNING;
+        $picksSwap = ($tri === self::FORCE_SWAP);
         if (!$picksSwap) return 'lightning';
         // Swap mode needs swaps enabled for the store (which requires an xpub
         // in xpub mode — static-address mode is incompatible with swap claims).
@@ -164,8 +151,8 @@ final class SwapAutoMelt {
     }
 
     public static function setStoreOverride(string $storeId, int $tri): void {
-        if (!in_array($tri, [self::INHERIT, self::FORCE_LIGHTNING, self::FORCE_SWAP], true)) {
-            throw new InvalidArgumentException("Invalid auto_melt_use_swap tri-state: {$tri}");
+        if (!in_array($tri, [self::FORCE_LIGHTNING, self::FORCE_SWAP], true)) {
+            throw new InvalidArgumentException("Invalid auto_melt_use_swap value: {$tri}");
         }
         Database::query(
             "UPDATE stores SET auto_melt_use_swap = ? WHERE id = ?",
@@ -182,6 +169,15 @@ final class SwapAutoMelt {
      * Returns one row per store touched, suitable for the cron summary JSON.
      */
     public static function checkAndExecute(): ?array {
+        // Sweep swaps sign Taproot claim transactions — EC math that needs
+        // GMP. Gate the whole rail up front on GMP-less hosts: this runs from
+        // cron every minute, and without the gate each eligible store would
+        // fail mid-pipeline with a cryptic "undefined function gmp_init".
+        require_once __DIR__ . '/../onchain/wallet.php';
+        if (($envError = OnchainWallet::environmentError()) !== null) {
+            error_log('SwapAutoMelt: skipping swap rail: ' . $envError);
+            return null;
+        }
         $stores = Database::fetchAll(
             "SELECT s.* FROM stores s
               WHERE auto_melt_enabled = 1
@@ -265,11 +261,11 @@ final class SwapAutoMelt {
         }
 
         // 3. Fetch quotes via the existing parallel fetcher / ranking helper.
-        // rankedForSite() also applies the auto-select-cheapest rule, so the
+        // rankedForStore() also applies the auto-select-cheapest rule, so the
         // first entry already reflects the operator's preferred provider with
         // the configured cheapness-undercut threshold honoured.
         $network = $store['onchain_network'] ?? 'mainnet';
-        $ranked = SwapProviderFactory::rankedForSite($network, $balanceSats);
+        $ranked = SwapProviderFactory::rankedForStore($storeId, $network, $balanceSats);
         if (empty($ranked)) {
             return [
                 'store_id'   => $storeId,
@@ -478,7 +474,7 @@ final class SwapAutoMelt {
         }
 
         $claimPriv = random_bytes(32);
-        $claimPubPoint = Secp256k1::generatorMult(Secp256k1::bytesToGmp($claimPriv));
+        $claimPubPoint = Secp256k1::generatorMult(Secp256k1::bytesToNum($claimPriv));
         if ($claimPubPoint === null) {
             error_log("SwapAutoMelt: claim key derivation failed for store {$store['id']}");
             return null;

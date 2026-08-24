@@ -101,11 +101,11 @@ final class Taproot {
             throw new InvalidArgumentException('merkle root must be empty or 32 bytes');
         }
         $t = Secp256k1::taggedHash('TapTweak', $internalXOnly . $merkleRoot);
-        $tInt = Secp256k1::bytesToGmp($t);
-        if (gmp_cmp($tInt, Secp256k1::n()) >= 0) {
+        $tInt = Secp256k1::bytesToNum($t);
+        if ($tInt->cmp(Secp256k1::n()) >= 0) {
             throw new RuntimeException('TapTweak overflow (negligible probability)');
         }
-        $P = Secp256k1::liftX(Secp256k1::bytesToGmp($internalXOnly));
+        $P = Secp256k1::liftX(Secp256k1::bytesToNum($internalXOnly));
         if ($P === null) {
             throw new RuntimeException('internal key has no curve lift');
         }
@@ -114,7 +114,7 @@ final class Taproot {
         if ($Q === null) {
             throw new RuntimeException('output key is point at infinity');
         }
-        return [Secp256k1::gmpTo32Bytes($Q[0]), Secp256k1::pointParity($Q)];
+        return [Secp256k1::numTo32Bytes($Q[0]), Secp256k1::pointParity($Q)];
     }
 
     /**
@@ -151,10 +151,10 @@ final class Taproot {
                 throw new RuntimeException('KeyAgg: invalid compressed pubkey');
             }
             if ($pk2nd !== null && $pk === $pk2nd) {
-                $coef = gmp_init(1);
+                $coef = BigNum::one();
             } else {
                 $h = Secp256k1::taggedHash('KeyAgg coefficient', $L . $pk);
-                $coef = gmp_mod(Secp256k1::bytesToGmp($h), $n);
+                $coef = Secp256k1::bytesToNum($h)->mod($n);
             }
             $term = Secp256k1::scalarMult($coef, $P);
             $sum = Secp256k1::pointAdd($sum, $term);
@@ -163,7 +163,7 @@ final class Taproot {
             throw new RuntimeException('KeyAgg sum is point at infinity');
         }
         // Return the x-coordinate (BIP341 internal-key convention).
-        return Secp256k1::gmpTo32Bytes($sum[0]);
+        return Secp256k1::numTo32Bytes($sum[0]);
     }
 
     /**

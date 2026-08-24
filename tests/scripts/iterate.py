@@ -284,16 +284,27 @@ def wait_for_status(gc: GreenfieldClient, store_id: str, invoice_id: str, expect
 def _enable_auto_melt(admin: AdminClient, store_id: str, address: str,
                       threshold_sat: int = 1) -> dict:
     """Configure a store's auto-cashout (auto-melt) LN address via the same
-    admin endpoint the dashboard uses. The handler probes the address for
-    LUD-21 support through the mock LNURL host. With it set, a lightning
-    invoice on this store routes to the lnaddress rail."""
-    return admin._post_action(
-        "save_auto_melt",
+    admin endpoints the dashboard uses. The destination chain moved to its own
+    action (save_lightning_payments — probes the address for LUD-21 support
+    through the mock LNURL host); save_auto_melt now carries only the
+    enabled/threshold/mode settings. With the address set, a lightning invoice
+    on this store routes to the lnaddress rail."""
+    chain_res = admin._post_action(
+        "save_lightning_payments",
         store_id=store_id,
         address=address,
+    )
+    melt_res = admin._post_action(
+        "save_auto_melt",
+        store_id=store_id,
         enabled="1",
         threshold=str(threshold_sat),
+        mode_override="0",
     )
+    return {
+        "success": bool(chain_res.get("success")) and bool(melt_res.get("success")),
+        "addresses": chain_res.get("addresses"),
+    }
 
 
 def _seed_fee_revenue(payserver: PayserverHandle, store_id: str, sats: int) -> None:
@@ -560,6 +571,20 @@ def main() -> int:
         clink_relay = start_clink_relay(workdir)
         handles.append(("clink-relay", stop_clink_relay, clink_relay))
         print(f"[iterate] CLINK relay: {clink_relay.ws_url}")
+
+        # Fake NWC wallet on the same relay, minting from lnd_payer (which
+        # lnd_mint can pay over the dual channels — so both direct-receive
+        # invoices, paid from lnd_mint, and auto-melt drains, paid BY the
+        # store's mint, settle in-rig). Paste the printed connection string
+        # into a store's NWC section or the wizard's NWC field.
+        print("[iterate] starting fake NWC wallet (NIP-47) on the in-rig relay ...")
+        from fixtures.nwc_wallet import start_nwc_wallet
+        nwc_wallet = start_nwc_wallet(
+            clink_relay.ws_url, lnd_payer,
+            info_methods=["make_invoice", "lookup_invoice", "get_info"],
+        )
+        handles.append(("nwc-wallet", lambda h: h.stop(), nwc_wallet))
+        nwc_demo_uri = nwc_wallet.connection_uri()
         # Redirect the plugin's opt-out dev-fee payout to the local LNURL host so
         # nothing ever leaves the rig (default is a real mainnet address).
         clink_devfee_dest = f"{lnurlp.base_url}/.well-known/lnurlp/{CLINK_FEES_LN_USER}"
@@ -956,6 +981,9 @@ def main() -> int:
             print(f"                  (pay it from {CLINK_SENDER_WALLET_NAME}, or add it to a store's")
             print(f"                   auto-cashout chain in admin to direct-receive over CLINK)")
         print(f"CLINK dev-fee:    redirected to {clink_devfee_dest} (local; never leaves the rig)")
+        print(f"NWC demo string:  {nwc_demo_uri}")
+        print(f"                  (fake NIP-47 wallet backed by lnd_payer; paste it into a store's")
+        print(f"                   NWC section — invoices it mints are payable from lnd_mint)")
         print(f"cashu.me:         {cashume_url}")
         print(f"                  opened in Chromium with {CASHUME_FUNDING_SAT} sat pre-loaded")
 

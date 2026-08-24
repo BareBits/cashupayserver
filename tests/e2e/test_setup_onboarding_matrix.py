@@ -146,7 +146,7 @@ def walk(
         if choices.lightning in ("address", "both"):
             fields["lightning_address"] = LN_ADDRESS
         if choices.lightning in ("noffer", "both"):
-            fields["noffer"] = REFERENCE_NOFFER
+            fields["noffers[]"] = REFERENCE_NOFFER
         body = w.post(step="lightning", lightning_action="save", **fields)
     assert wizard_error(body) is None, wizard_error(body)
 
@@ -257,8 +257,11 @@ MINTLESS_MATRIX = [
 
 @pytest.mark.parametrize("choices,expect", MINTLESS_MATRIX)
 def test_choice_matrix_without_mints(
-    payserver: PayserverHandle, choices: Choices, expect: Expect
+    payserver_with_lnurlp: PayserverHandle, choices: Choices, expect: Expect
 ) -> None:
+    # The lnurlp-backed stack routes LN_ADDRESS to the mock LUD-21 host, so
+    # the lightning step's save-time gate passes for the rows that type one.
+    payserver = payserver_with_lnurlp
     walk(payserver, choices)
     assert_state(payserver, expect)
 
@@ -321,12 +324,13 @@ MINTED_MATRIX = [
 
 @pytest.mark.parametrize("choices,expect", MINTED_MATRIX)
 def test_choice_matrix_with_mints(
-    payserver: PayserverHandle,
+    payserver_with_lnurlp: PayserverHandle,
     mint: MintHandle,
     backup_mint: MintHandle,
     choices: Choices,
     expect: Expect,
 ) -> None:
+    payserver = payserver_with_lnurlp
     walk(payserver, choices, mint, backup_mint)
     assert_state(payserver, expect)
 
@@ -424,20 +428,22 @@ def test_completion_screen_warns_when_no_rail_was_configured(
 
 
 def test_completion_screen_is_clean_when_a_rail_exists(
-    payserver: PayserverHandle,
+    payserver_with_lnurlp: PayserverHandle,
 ) -> None:
+    payserver = payserver_with_lnurlp
     w = walk(payserver, Choices(onchain="xpub", lightning="address", swaps=True, mints=False))
     body = w.post(step="cron")
     assert "No payment method is set up yet" not in body
 
 
 def test_completion_screen_does_not_cry_wolf_on_a_fresh_session(
-    payserver: PayserverHandle,
+    payserver_with_lnurlp: PayserverHandle,
 ) -> None:
     """Reaching the final screen without the wizard's session — browser
     restarted, cookie expired, link reopened in another tab — leaves no store
     id to inspect. An unknown store must not be reported as unpayable: that
     reads as "your setup failed" to an operator whose setup went fine."""
+    payserver = payserver_with_lnurlp
     walk(payserver, Choices(onchain="skip", lightning="address", swaps=False, mints=False))
 
     stranger = SetupWizard(payserver.url)  # brand new cookie jar
@@ -457,23 +463,91 @@ def _config(payserver: PayserverHandle, key: str) -> str | None:
         conn.close()
 
 
-def test_first_run_swaps_answer_sets_the_site_default(payserver: PayserverHandle) -> None:
-    """Saying yes to swaps on a first run also flips the site-wide default, so
-    stores added later inherit the operator's answer instead of the built-in
-    off. The per-store override is set either way."""
+def test_first_run_swaps_answer_sets_only_the_store_flag(payserver: PayserverHandle) -> None:
+    """Swaps are store-only now: saying yes on a first run writes the store
+    flag and must NOT create a site-wide swaps_enabled config row — that key
+    no longer exists as a setting, and a row here would just be a stale-looking
+    artifact (it is ignored by resolution either way)."""
     walk(payserver, Choices(onchain="xpub", lightning="skip", swaps=True, mints=False))
-    assert _config(payserver, "swaps_enabled") == "true"
+    assert _config(payserver, "swaps_enabled") is None, (
+        "the wizard must not write a site-wide swaps_enabled config row"
+    )
     assert _store(payserver)["swaps_enabled"] == ON
 
 
-def test_first_run_declining_swaps_leaves_the_site_default_alone(
+def test_first_run_declining_swaps_writes_no_config_row(
     payserver: PayserverHandle,
 ) -> None:
-    """Declining must not write a site default — the built-in off already
-    covers it, and writing 'false' would mask a later deliberate site change."""
+    """Declining writes only the store flag too — the site-wide layer is gone,
+    so no config row may appear in either direction."""
     walk(payserver, Choices(onchain="xpub", lightning="skip", swaps=False, mints=False))
     assert _config(payserver, "swaps_enabled") is None
     assert _store(payserver)["swaps_enabled"] == OFF
+
+
+# ---------------------------------------------------------------------------
+# Store-only swaps resolution. The old tri-state × site-key matrix is gone:
+# stores.swaps_enabled alone decides — 1 → on (given an xpub), 0 → off, and a
+# legacy -1 "inherit" row (from when a site-wide default existed) → off. A
+# stale site-wide config row must be ignored even when present.
+# ---------------------------------------------------------------------------
+
+
+def _set_store_swaps_flag(payserver: PayserverHandle, value: int) -> None:
+    conn = sqlite3.connect(payserver.data_dir / "cashupay.sqlite")
+    try:
+        conn.execute("UPDATE stores SET swaps_enabled = ?", (value,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _seed_stale_site_swaps_row(payserver: PayserverHandle) -> None:
+    """Plant a leftover site-wide swaps_enabled=true row, as an install that
+    upgraded from the site-default era would still carry."""
+    conn = sqlite3.connect(payserver.data_dir / "cashupay.sqlite")
+    try:
+        conn.execute(
+            "INSERT INTO config (key, value, created_at, updated_at) "
+            "VALUES ('swaps_enabled', 'true', strftime('%s','now'), strftime('%s','now')) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    "flag,expected",
+    [
+        pytest.param(ON, True, id="store-flag-1-resolves-on"),
+        pytest.param(OFF, False, id="store-flag-0-resolves-off"),
+        pytest.param(INHERIT, False, id="legacy-minus1-resolves-off"),
+    ],
+)
+def test_swaps_resolution_is_store_only(
+    payserver: PayserverHandle, flag: int, expected: bool
+) -> None:
+    """stores.swaps_enabled alone decides the effective swaps state (the store
+    has an xpub, so the on-chain requirement is met). The stale site-wide
+    config row is planted on purpose: if any site fallback survived the
+    refactor, the OFF and legacy-INHERIT rows would wrongly flip on."""
+    w = walk(payserver, Choices(onchain="xpub", lightning="skip", swaps=False, mints=False))
+    _seed_stale_site_swaps_row(payserver)
+    _set_store_swaps_flag(payserver, flag)
+
+    w.login(payserver.url)
+    store_id = _store(payserver)["id"]
+    r = w.s.get(
+        f"{payserver.url}/admin",
+        params={"api": "dashboard", "store_id": store_id},
+        timeout=15,
+    )
+    assert r.status_code == 200, r.text[:300]
+    swaps = r.json()["swaps"]
+    assert swaps["effective"] is expected, swaps
+    # The site-default era keys must not resurface in the payload.
+    assert "siteDefault" not in swaps and "override" not in swaps, swaps
 
 
 # ---------------------------------------------------------------------------
@@ -522,10 +596,10 @@ def test_add_store_applies_the_same_rail_resolution(
     assert added["auto_melt_enabled"] == 1
     assert added["auto_melt_use_swap"] == ON, "mint + swaps + xpub must sweep on-chain here too"
     assert len(added["seed_phrase"].split()) == 12
-    # add_store answers for one store, not for the install: the operator did
-    # not just re-decide the site-wide swaps default on everyone's behalf.
+    # Swaps are store-only: no wizard run — first-run or add_store — may write
+    # a site-wide swaps_enabled config row.
     assert _config(payserver, "swaps_enabled") is None, (
-        "add_store must not rewrite the site-wide swaps default"
+        "add_store must not write a site-wide swaps_enabled config row"
     )
 
     # The first store must be untouched — in particular still strict and mintless.

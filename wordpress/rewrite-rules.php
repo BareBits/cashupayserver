@@ -13,7 +13,7 @@ if (!defined('ABSPATH')) {
 // compares it to the cashupay_rewrite_version option and flushes once on
 // mismatch — so an in-place update doesn't require deactivate/reactivate or a
 // manual Settings → Permalinks → Save Changes to pick up new routes.
-const CASHUPAY_REWRITE_VERSION = '3';
+const CASHUPAY_REWRITE_VERSION = '4';
 
 // Register rewrite rules on init
 add_action('init', 'cashupay_add_rewrite_rules');
@@ -25,9 +25,12 @@ add_filter('redirect_canonical', 'cashupay_disable_trailing_slash_redirect', 10,
 /**
  * Disable WordPress canonical redirect (trailing slash) for CashuPay API paths.
  * BTCPay clients don't follow redirects, so 301 breaks API calls.
+ * The retry endpoint issues its own redirect (to WooCommerce's order-pay
+ * page); letting the canonical 301 run first just adds a pointless hop.
  */
 function cashupay_disable_trailing_slash_redirect($redirect_url, $requested_url) {
-    if (strpos($requested_url, '/cashupay/api/') !== false) {
+    if (strpos($requested_url, '/cashupay/api/') !== false
+        || strpos($requested_url, '/cashupay/retry/') !== false) {
         return false;
     }
     return $redirect_url;
@@ -38,6 +41,8 @@ function cashupay_add_rewrite_rules(): void {
     add_rewrite_rule('^cashupay/payment/(.*)$', 'index.php?cashupay_payment=$matches[1]', 'top');
     // Public self-serve invoice page: /cashupay/pay/{storeId}
     add_rewrite_rule('^cashupay/pay/([^/]+)/?$', 'index.php?cashupay_pay=$matches[1]', 'top');
+    // Expired-invoice retry: bounce the payer to the WooCommerce order-pay page.
+    add_rewrite_rule('^cashupay/retry/([^/]+)/?$', 'index.php?cashupay_retry=$matches[1]', 'top');
     // Admin SPA: capture optional view slug (e.g. /cashupay-admin/invoices) so
     // a refresh restores the operator's current page.
     add_rewrite_rule('^cashupay-admin(?:/([^/]+))?/?$', 'index.php?cashupay_admin=1&cashupay_admin_view=$matches[1]', 'top');
@@ -63,6 +68,7 @@ function cashupay_query_vars(array $vars): array {
     $vars[] = 'cashupay_path';
     $vars[] = 'cashupay_payment';
     $vars[] = 'cashupay_pay';
+    $vars[] = 'cashupay_retry';
     $vars[] = 'cashupay_admin';
     $vars[] = 'cashupay_admin_view';
     $vars[] = 'cashupay_setup';
@@ -99,6 +105,14 @@ function cashupay_handle_request(): void {
     if ($pay) {
         $_GET['store'] = $pay;
         require CASHUPAY_PLUGIN_DIR . '/pay.php';
+        exit;
+    }
+
+    $retry = get_query_var('cashupay_retry');
+    if ($retry) {
+        // btcpay-integration.php is loaded on demand (not at plugin boot).
+        require_once CASHUPAY_PLUGIN_DIR . '/btcpay-integration.php';
+        cashupay_handle_retry_redirect((string) $retry);
         exit;
     }
 

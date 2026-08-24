@@ -23,7 +23,9 @@ the foreign plugin actually installed and talking to us.
 """
 from __future__ import annotations
 
+import html
 import json
+import re
 import time
 
 import pytest
@@ -105,6 +107,14 @@ def _place_order(wp: WordPressHandle, product_id: int) -> dict:
     """Drive a real guest checkout through the WooCommerce Store API, selecting
     the BTCPay gateway. Returns the checkout response JSON (order_id, status,
     payment_result)."""
+    r = _checkout_response(wp, product_id)
+    assert r.status_code in (200, 201), f"checkout failed: {r.status_code} {r.text}"
+    return r.json()
+
+
+def _checkout_response(wp: WordPressHandle, product_id: int) -> requests.Response:
+    """The raw Store API checkout exchange behind _place_order, for tests that
+    expect the payment step to fail."""
     s = requests.Session()
     base = wp.url + STORE_API
 
@@ -142,9 +152,7 @@ def _place_order(wp: WordPressHandle, product_id: int) -> dict:
         },
         "payment_method": GATEWAY_ID,
     }
-    r = s.post(f"{base}/checkout", json=payload, headers=headers(), timeout=60)
-    assert r.status_code in (200, 201), f"checkout failed: {r.status_code} {r.text}"
-    return r.json()
+    return s.post(f"{base}/checkout", json=payload, headers=headers(), timeout=60)
 
 
 def _cron_key(wp: WordPressHandle) -> str:
@@ -202,7 +210,8 @@ def test_completion_screen_autowires_and_enables_gateway(woocommerce) -> None:
 def test_completion_screen_never_clobbers_a_real_btcpay_server(woocommerce) -> None:
     """If a merchant already points the BTCPay plugin at a real BTCPay Server, the
     completion screen must refuse to overwrite it rather than silently hijack
-    their payments."""
+    their payments — and a consent recorded for a *different* server must not
+    unlock this one either."""
     wp, _info = woocommerce
     store_id, api_key = _seed_store(wp, "https://mint.example")
 
@@ -212,6 +221,78 @@ def test_completion_screen_never_clobbers_a_real_btcpay_server(woocommerce) -> N
     data = _ensure_integration(wp, store_id, api_key)
     assert data["res"]["status"] == "existing_btcpay", data
     assert data["url"] == real, "the real BTCPay URL must be left untouched"
+
+    wp.wp_cli(
+        "eval",
+        "update_option('cashupay_btcpay_override_consent', 'https://other.example.com');",
+    )
+    data = _ensure_integration(wp, store_id, api_key)
+    assert data["res"]["status"] == "existing_btcpay", data
+    assert data["url"] == real, "consent for another server must not authorize this takeover"
+
+
+def test_consented_override_replaces_existing_btcpay_config(woocommerce) -> None:
+    """The consented takeover the onboarding wizard promises: with consent
+    recorded for exactly the configured server, the wiring replaces the whole
+    BTCPay plugin configuration — connection, gateway settings, order states,
+    and unmanaged globals alike — with BareBits defaults, then consumes the
+    consent so a later reconnection to a real server warns again."""
+    wp, _info = woocommerce
+    store_id, api_key = _seed_store(wp, "https://mint.example")
+
+    real = "https://btcpay.example.com"
+    seed = f"""
+update_option('btcpay_gf_url', {real!r});
+update_option('btcpay_gf_api_key', 'old-server-key');
+update_option('btcpay_gf_store_id', 'old-store');
+update_option('btcpay_gf_transaction_speed', 'high');
+update_option('btcpay_gf_order_states', ['Expired' => 'wc-on-hold']);
+update_option('woocommerce_{GATEWAY_ID}_settings',
+    ['enabled' => 'no', 'title' => 'My custom BTCPay title']);
+update_option('cashupay_btcpay_override_consent', {real!r});
+"""
+    wp.wp_cli("eval", seed)
+
+    data = _ensure_integration(wp, store_id, api_key)
+    assert data["res"]["status"] == "ready", data
+    assert data["res"]["replaced_url"] == real, data
+    assert data["url"].endswith("/cashupay"), data["url"]
+    assert data["enabled"] == "yes", "the gateway must come out enabled at checkout"
+
+    # This eval is itself part of the test: it boots WordPress (and the BTCPay
+    # gateway plugin) again after the takeover. When the reset wiped the
+    # plugin's internal btcpay_gf_version marker, this boot re-ran the plugin's
+    # version migrations, whose webhook migration makes a blocking API call to
+    # the configured server — now this site itself — and the recursive
+    # self-requests deadlocked the whole install. So merely returning here
+    # proves the wipe spared the plugin's bookkeeping.
+    after_snippet = f"""
+echo json_encode([
+    'title' => get_option('woocommerce_{GATEWAY_ID}_settings')['title'] ?? null,
+    'expired' => get_option('btcpay_gf_order_states')['Expired'] ?? null,
+    'speed' => get_option('btcpay_gf_transaction_speed', 'GONE'),
+    'api_key' => get_option('btcpay_gf_api_key', ''),
+    'consent' => get_option('cashupay_btcpay_override_consent', 'GONE'),
+    'version' => get_option('btcpay_gf_version', 'GONE'),
+]);
+"""
+    after = json.loads(wp.wp_cli("eval", after_snippet).stdout.strip().splitlines()[-1])
+    assert after["version"] != "GONE", (
+        "the plugin's internal version marker must survive the wipe — deleting "
+        "it re-runs boot-time migrations that self-request this site until the "
+        "PHP workers deadlock"
+    )
+    assert after["title"].startswith("BareBits"), (
+        f"the custom gateway title must be reset to the BareBits default, got {after['title']!r}"
+    )
+    assert after["expired"] == "wc-failed", (
+        "the custom order-state mapping must be reset to the BareBits default"
+    )
+    assert after["speed"] == "GONE", (
+        "unmanaged btcpay_gf_* globals from the old server must be wiped"
+    )
+    assert after["api_key"] == api_key, "the API key must be ours, not the old server's"
+    assert after["consent"] == "GONE", "consent is single-use and must be consumed"
 
 
 def test_woocommerce_stack_installs(woocommerce) -> None:
@@ -295,6 +376,154 @@ def test_woocommerce_order_settles_via_btcpay_gateway(
         ).fetchone()
     assert row is not None, "no InvoiceSettled delivery was recorded"
     assert row["status"] == "delivered" and 200 <= row["status_code"] < 300, dict(row)
+
+
+def test_failed_invoice_creation_returns_clean_error_not_500(woocommerce) -> None:
+    """When invoice creation on BareBits fails, the stock Greenfield gateway's
+    process_payment() implicitly returns null and WooCommerce's Store API
+    checkout fatals with an HTTP 500 (array_merge(..., null) in
+    StoreApi\\Legacy). The cashupay plugin swaps in a guarded gateway subclass
+    (wordpress/gateway-guard.php) that turns the null into a catchable
+    exception, so the shopper sees a clean payment error instead."""
+    wp, info = woocommerce
+    _flush_rewrites(wp)
+    store_id, api_key = _seed_store(wp, "https://mint.example")
+    _autowire_btcpay(wp, store_id, api_key)
+
+    # The guard subclass must be the gateway WooCommerce actually registered.
+    snippet = """
+foreach (WC()->payment_gateways()->payment_gateways() as $gw) {
+    if ($gw->id === 'btcpaygf_default') { echo get_class($gw); }
+}
+"""
+    cls = wp.wp_cli("eval", snippet).stdout.strip().splitlines()[-1].strip()
+    assert cls == "CashuPay_Guarded_BTCPay_Gateway", (
+        f"the guarded subclass must replace the stock gateway, got {cls!r}"
+    )
+
+    # Break the plugin's API key so the invoice-create call 401s. That is the
+    # same failure shape as any server-side reject (key mismatch after a
+    # re-setup, validation error, payserver 5xx): createInvoice() throws and
+    # the stock gateway would have returned null.
+    wp.wp_cli("eval", "update_option('btcpay_gf_api_key', 'broken-key');")
+
+    r = _checkout_response(wp, info["product_id"])
+    assert r.status_code == 400, (
+        f"expected a clean payment error, got {r.status_code}: {r.text[:300]}"
+    )
+    body = r.json()
+    assert body.get("code") == "woocommerce_rest_checkout_process_payment_error", body
+    assert "payment could not be started" in body.get("message", "").lower(), body
+
+
+def test_expired_invoice_fails_order_and_offers_retry(
+    woocommerce,
+    mint: MintHandle,
+) -> None:
+    """Invoice expiry must reach WooCommerce and leave the customer a way to
+    pay again:
+
+      - the cron sweep fires the signed InvoiceExpired webhook, and — via the
+        Expired→wc-failed mapping BareBits configures — the order flips
+        pending→failed instead of silently rotting at pending;
+      - the payment page's expired screen links /cashupay/retry/{invoiceId},
+        which resolves the invoice back to its order and bounces to
+        WooCommerce's order-pay page, where clicking Pay mints a fresh
+        invoice. Failed orders keep that affordance; the gateway plugin's
+        stock wc-cancelled mapping would have removed it.
+    """
+    wp, info = woocommerce
+    _flush_rewrites(wp)
+    store_id, api_key = _seed_store(wp, mint.url)
+
+    # The full wizard path: configure + webhook + enable + order-state map.
+    data = _ensure_integration(wp, store_id, api_key)
+    assert data["res"]["status"] == "ready", data
+
+    states_out = wp.wp_cli(
+        "eval", "echo json_encode(get_option('btcpay_gf_order_states'));"
+    ).stdout.strip().splitlines()[-1]
+    assert json.loads(states_out)["Expired"] == "wc-failed", states_out
+
+    # --- customer places the order; the gateway creates a BareBits invoice ---
+    checkout = _place_order(wp, info["product_id"])
+    order_id = checkout["order_id"]
+    invoice_id = _order_field(wp, order_id, "get_meta('BTCPay_id')")
+    assert invoice_id and invoice_id != "NO_ORDER", checkout
+    assert _order_field(wp, order_id, "get_status()") == "pending"
+
+    # --- backdate so the cron sweep expires the invoice, then loop the real
+    #     cron endpoint: it sweeps (firing InvoiceExpired) and drains the
+    #     outbox to WooCommerce's wc-api endpoint ---
+    with wp.db() as db:
+        db.execute(
+            "UPDATE invoices SET expiration_time = ? WHERE id = ?",
+            (int(time.time()) - 60, invoice_id),
+        )
+
+    cron_key = _cron_key(wp)
+    deadline = time.monotonic() + 30
+    status = None
+    while time.monotonic() < deadline:
+        r = requests.get(f"{wp.url}/cashupay/cron", params={"key": cron_key}, timeout=15)
+        assert r.status_code == 200, f"cron refused: {r.status_code} {r.text[:200]}"
+        status = _order_field(wp, order_id, "get_status()")
+        if status == "failed":
+            break
+        time.sleep(1)
+    assert status == "failed", (
+        f"order never flipped to failed on InvoiceExpired (last status {status!r})"
+    )
+
+    # Delivery accepted with 2xx => the real plugin verified the HMAC before
+    # touching the order. partiallyPaid=false is what routes the plugin to the
+    # plain-Expired branch (not expired-paid-partial).
+    with wp.db() as db:
+        row = db.execute(
+            "SELECT status, status_code, payload FROM webhook_deliveries "
+            "WHERE invoice_id = ? AND event_type = 'InvoiceExpired'",
+            (invoice_id,),
+        ).fetchone()
+    assert row is not None, "no InvoiceExpired delivery was recorded"
+    assert row["status"] == "delivered" and 200 <= row["status_code"] < 300, dict(row)
+    assert json.loads(row["payload"]).get("partiallyPaid") is False
+
+    # --- the expired payment page offers the retry link ---
+    page = requests.get(f"{wp.url}/cashupay/payment/{invoice_id}", timeout=15)
+    page.raise_for_status()
+    assert f"/cashupay/retry/{invoice_id}" in page.text, (
+        "expired payment page should link the retry endpoint"
+    )
+
+    # --- and a working Return to Shop link: the gateway stored WooCommerce's
+    #     order-received URL as redirectURL; it must render as stored (the
+    #     payer-safe rewrite only touches admin-surface targets) and resolve
+    #     for a guest ---
+    m = re.search(r'<a href="([^"]+)"[^>]*>\s*Return to Shop', page.text)
+    assert m, "expired payment page should offer Return to Shop"
+    shop_href = html.unescape(m.group(1))
+    assert "order-received" in shop_href, shop_href
+    r = requests.get(shop_href, timeout=15)
+    assert r.status_code == 200, f"Return to Shop gave {r.status_code}"
+
+    # --- the retry endpoint bounces to WooCommerce's order-pay page, carrying
+    #     the order key so a guest can pay without an account ---
+    r = requests.get(
+        f"{wp.url}/cashupay/retry/{invoice_id}", allow_redirects=False, timeout=15
+    )
+    assert r.status_code in (301, 302), (r.status_code, r.text[:200])
+    location = r.headers.get("Location", "")
+    assert "order-pay" in location, location
+    assert str(order_id) in location, location
+    assert "key=" in location, location
+
+    # An unresolvable invoice id falls back to the front page, never an error
+    # page or an order it doesn't own.
+    r = requests.get(
+        f"{wp.url}/cashupay/retry/inv_nonexistent", allow_redirects=False, timeout=15
+    )
+    assert r.status_code in (301, 302), (r.status_code, r.text[:200])
+    assert "order-pay" not in r.headers.get("Location", ""), r.headers.get("Location")
 
 
 def _await_settled(wp, api, store_id, invoice_id, auth) -> None:

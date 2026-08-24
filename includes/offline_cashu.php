@@ -493,7 +493,7 @@ class OfflineCashu {
             WebhookSender::fireEvent($storeId, 'InvoiceCreated', Invoice::getById($invoiceId));
         }
 
-        Invoice::updateStatus($invoiceId, 'Settled', null, 'mint');
+        Invoice::updateStatus($invoiceId, 'Settled', null, 'cashu');
         return Invoice::getById($invoiceId);
     }
 
@@ -530,7 +530,7 @@ class OfflineCashu {
                 // in the wallet balance (existing auto-melt handles payout).
                 $wallet->receive($invoice['cashu_offline_token']);
 
-                Invoice::updateStatus($invoiceId, 'Settled', null, 'mint');
+                Invoice::updateStatus($invoiceId, 'Settled', null, 'cashu');
                 self::clearLocks($invoiceId);
                 $summary['settled']++;
             } catch (CashuNetworkException $e) {

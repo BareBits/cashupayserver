@@ -44,6 +44,14 @@ REFERENCE_NOFFER = (
     "dp3x93xydf5xg6rzce4vv6xgdfh8quxgct9x5erxvspremhxue69uhhgetnwskhyetvv9ujumrfv"
     "a58gmnfdenjuur4vgqzpccxc30wpf78wf2q78wg3vq008fd8ygtl4qy06gstpye3h5unc47xmee6z"
 )
+# A second structurally valid noffer for multi-noffer flows (the wizard's
+# "+ Add another noffer" rows). Synthetic: ClinkNoffer::encode with pubkey
+# ab..ab, relay wss://relay2.example.com, offer 'second-test-offer'.
+# Persisted by tests, never dialled.
+SECOND_NOFFER = (
+    "noffer1qqs2h2at4w46h2at4w46h2at4w46h2at4w46h2at4w46h2at4w46h2cprpmhxue69uhhy"
+    "etvv9unytn90psk6urvv5hxxmmdqgghxetrdahxgtt5v4ehgtt0venx2us0var4k"
+)
 
 
 def wizard_error(body: str) -> str | None:
@@ -54,8 +62,13 @@ def wizard_error(body: str) -> str | None:
     Entities are decoded: the messages are htmlspecialchars'd on the way out,
     so an apostrophe arrives as &#039; and a naive substring check against the
     human-readable text would never match.
+
+    The validation div carries id="setup-error" (the scroll-into-view anchor);
+    matching it optionally keeps this helper working across both markups while
+    still not matching the wizard's static error boxes (missing PHP
+    extensions), which style themselves inline instead.
     """
-    m = re.search(r'<div class="error">(.*?)</div>', body, re.S)
+    m = re.search(r'<div class="error"(?:\s+id="setup-error")?>(.*?)</div>', body, re.S)
     return html.unescape(m.group(1).strip()) if m else None
 
 
@@ -144,7 +157,7 @@ class SetupWizard:
         acknowledgement."""
         return self.post(step="terms", terms_legal="1", terms_warranty="1", terms_fee="1")
 
-    def through_store(self, name: str = "Wizard Store") -> str:
+    def through_store(self, name: str = "Wizard Store", default_currency: str = "sat") -> str:
         """terms → security ack → password → store name, landing on the on-chain screen."""
         self.accept_terms()
         self.post(step="security", security_acknowledged="1")
@@ -153,7 +166,7 @@ class SetupWizard:
             password=self.DEFAULT_PASSWORD,
             confirm_password=self.DEFAULT_PASSWORD,
         )
-        return self.post(step="store", store_name=name)
+        return self.post(step="store", store_name=name, default_currency=default_currency)
 
 
 @dataclass
@@ -174,6 +187,7 @@ def run_setup_wizard(
     mint_url: str,
     mint_unit: str = "sat",
     backup_mint_url: str,
+    default_currency: str = "sat",
 ) -> SetupResult:
     """Walk the standalone onboarding wizard end-to-end."""
     s = requests.Session()
@@ -205,8 +219,13 @@ def run_setup_wizard(
     )
     _assert_step_ok(r, "password")
 
-    # store: name only
-    r = s.post(setup, data={"step": "store", "store_name": store_name}, timeout=10, allow_redirects=False)
+    # store: name + default display/quote currency
+    r = s.post(
+        setup,
+        data={"step": "store", "store_name": store_name, "default_currency": default_currency},
+        timeout=10,
+        allow_redirects=False,
+    )
     _assert_step_ok(r, "store")
 
     # onchain: skip, so callers needn't supply an xpub. This also drops the

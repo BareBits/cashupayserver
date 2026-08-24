@@ -36,6 +36,7 @@ $invoice = [
     'paid_at' => 1700000000,
     'settled_rail' => 'mint',
     'payment_rail' => 'mint',
+    'mint_url' => 'https://m.example.com',
 ];
 
 // ---- Gate: all three required ----------------------------------------------
@@ -72,7 +73,8 @@ assert_true(str_contains($row['body'], 'Thank you for shopping at'), 'thank-you 
 assert_true(str_contains($row['body'], 'test ' . $store), 'store name swapped in');
 assert_true(str_contains($row['body'], '25,000 sats'), 'sats with thousands separator');
 assert_true(str_contains($row['body'], '12.50 USD'), 'fiat equivalent');
-assert_true(str_contains($row['body'], 'Lightning'), 'mint rail labelled as Lightning');
+assert_true(str_contains($row['body'], 'Lightning (cashu)(m.example.com)'),
+    'mint rail labelled Lightning (cashu)(mint host)');
 
 // ---- Per-invoice cap: 3 sends, then the 4th is rejected --------------------
 
@@ -124,5 +126,20 @@ $row = Database::fetchOne(
 assert_true(str_contains($row['body'], 'bc1qexampleaddress'), 'on-chain address in body');
 assert_true(str_contains($row['body'], 'deadbeef'), 'on-chain txid in body');
 assert_true(str_contains($row['body'], 'On-chain Bitcoin'), 'on-chain rail label');
+
+// ---- Cashu-token rail: labelled Cashu, never Lightning ---------------------
+// Legacy rows settled as 'mint' with payment_rail 'cashu' (token receipts
+// before the settled_rail fix) must resolve to the Cashu label too.
+$cashuInvoice = $invoice;
+$cashuInvoice['id'] = 'inv_cashu_token';
+$cashuInvoice['payment_rail'] = 'cashu';
+$cashuInvoice['settled_rail'] = 'mint'; // legacy fingerprint
+NotificationSender::queuePayerReceipt($cashuInvoice, 'token@example.com');
+$row = Database::fetchOne(
+    "SELECT body FROM notification_queue WHERE invoice_id = ?",
+    ['inv_cashu_token']
+);
+assert_true(str_contains($row['body'], 'Cashu(m.example.com)'), 'cashu rail label with mint host');
+assert_true(!str_contains($row['body'], 'Lightning'), 'cashu token receipt not labelled Lightning');
 
 echo "test_notification_payer_receipt: ok\n";

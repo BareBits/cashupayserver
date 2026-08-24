@@ -32,6 +32,43 @@ if (empty($invoiceId)) {
     exit;
 }
 
+/**
+ * Public mempool.space URL for the invoice's first-seen on-chain tx, or null
+ * when none has been observed. First-seen matches the admin invoices view
+ * when several txs pay the same address. The store's network picks the
+ * explorer path; regtest has no public explorer so it falls back to the
+ * mainnet URL (same behavior as the admin UI's mempoolUrl helper). Always
+ * links the public explorer even when detection runs against a custom
+ * Esplora backend — the configured URL is an API base, not a browsable site.
+ */
+function cashupay_onchain_tx_url(array $invoice): ?string {
+    // Rows exist only once a tx is seen; skip the lookup for states that
+    // cannot have one (New/Expired) to keep the 2 s poll cheap.
+    if ($invoice['status'] !== 'Settled'
+            && !($invoice['status'] === 'Processing' && !empty($invoice['onchain_first_seen_at']))) {
+        return null;
+    }
+    $oc = Database::fetchOne(
+        "SELECT txid FROM onchain_payments
+          WHERE invoice_id = ?
+          ORDER BY first_seen_at ASC, id ASC
+          LIMIT 1",
+        [$invoice['id']]
+    );
+    if (!$oc || empty($oc['txid'])) {
+        return null;
+    }
+    $store = Database::fetchOne(
+        "SELECT onchain_network FROM stores WHERE id = ?",
+        [$invoice['store_id']]
+    );
+    $network = $store['onchain_network'] ?? 'mainnet';
+    $base = $network === 'testnet' ? 'https://mempool.space/testnet'
+          : ($network === 'signet' ? 'https://mempool.space/signet'
+          : 'https://mempool.space');
+    return $base . '/tx/' . rawurlencode($oc['txid']);
+}
+
 // CLINK noffer receipt endpoint: the payment page holds a live Nostr
 // subscription (native WebSocket) for the merchant's kind-21001 payment
 // receipt and forwards the raw signed event here. We verify the merchant's
@@ -69,9 +106,25 @@ if (isset($_GET['json'])) {
         echo json_encode(['error' => 'Invoice not found']);
         exit;
     }
+    // If the payer left their email while the on-chain tx was confirming and
+    // the invoice just settled, queue the receipt now — this poll is the
+    // fastest observer of the settlement while the tab is still open (cron's
+    // sweep covers payers who closed it).
+    if ($invoice['status'] === 'Settled' && !empty($invoice['payer_receipt_requested'])) {
+        require_once __DIR__ . '/includes/notification_sender.php';
+        NotificationSender::flushRequestedPayerReceipts($invoiceId);
+    }
     echo json_encode([
         'status' => $invoice['status'],
         'additionalStatus' => $invoice['additional_status'],
+        // True while an on-chain payment is detected in the mempool but not
+        // yet confirmed — drives the "waiting for on-chain confirmation" copy.
+        'onchainPending' => $invoice['status'] === 'Processing'
+            && !empty($invoice['onchain_first_seen_at']),
+        // Explorer link for the detected on-chain tx; null for non-on-chain
+        // payments. Sent while confirming AND after settlement so the link
+        // survives the pending -> settled transition.
+        'onchainTxUrl' => cashupay_onchain_tx_url($invoice),
     ]);
     exit;
 }
@@ -109,7 +162,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'send_
     require_once __DIR__ . '/includes/notification_sender.php';
     header('Content-Type: application/json');
 
-    if ($invoice['status'] !== 'Settled') {
+    // WordPress installs don't render the email/newsletter form (WooCommerce
+    // owns customer emails there), so reject the endpoint outright rather
+    // than trusting the client not to POST.
+    if (Urls::isWordPress()) {
+        cashupay_status(404);
+        echo json_encode(['error' => 'Not available.']);
+        exit;
+    }
+
+    // Accepted for a settled invoice (receipt queued immediately) or while a
+    // detected on-chain payment is still confirming (email saved now, receipt
+    // queued at settlement — see NotificationSender::flushRequestedPayerReceipts).
+    $onchainConfirming = $invoice['status'] === 'Processing'
+        && !empty($invoice['onchain_first_seen_at']);
+    if ($invoice['status'] !== 'Settled' && !$onchainConfirming) {
         cashupay_status(400);
         echo json_encode(['error' => 'Invoice is not paid yet.']);
         exit;
@@ -132,6 +199,25 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'send_
         'id = ?',
         [$invoice['id']]
     );
+
+    // Still confirming: don't queue anything yet — a receipt sent before
+    // confirmation would confirm a payment that could still time out. Flag the
+    // request so the settlement sweep queues exactly one receipt (to the
+    // latest saved email) once the invoice settles.
+    if ($onchainConfirming) {
+        $receiptPending = false;
+        if (NotificationSender::isPayerReceiptOffered()) {
+            Database::update(
+                'invoices',
+                ['payer_receipt_requested' => 1],
+                'id = ?',
+                [$invoice['id']]
+            );
+            $receiptPending = true;
+        }
+        echo json_encode(['success' => true, 'receiptQueued' => false, 'receiptPending' => $receiptPending]);
+        exit;
+    }
 
     // Queue a payment-confirmation email only when receipts are offered. The
     // per-invoice cap still bounds how many receipts can be sent.
@@ -166,6 +252,29 @@ $redirectUrl = $checkoutConfig['redirectURL'] ?? null;
 if ($redirectUrl !== null && $redirectUrl !== '') {
     $redirectUrl = Security::sanitizeUrl((string)$redirectUrl);
 }
+// Payer-safe redirect (WordPress mode): invoices created from the embedded
+// admin's "Request payment" modal used to store the admin SPA's own URL as
+// checkout.redirectURL (a return-to-admin convenience for the merchant). The
+// payment page is customer-facing, and /cashupay-admin, /cashupay-setup and
+// /wp-admin are all gated behind manage_options — a payer clicking "Return
+// to Shop" / "Continue to Store" on such an invoice landed on WordPress's
+// Access-denied error page. Rewrite admin-surface targets to the shop's
+// front page. Render-time (not create-time) so invoices already carrying an
+// admin URL are covered too.
+if ($redirectUrl !== null && Urls::isWordPress()) {
+    $adminSurfaces = [site_url('/cashupay-admin'), site_url('/cashupay-setup'), admin_url()];
+    foreach ($adminSurfaces as $surface) {
+        // Boundary-checked prefix match, so an unrelated page that merely
+        // starts with the same string (e.g. /cashupay-admin-guide) survives.
+        $surface = rtrim($surface, '/');
+        if ($redirectUrl === $surface
+                || (strpos($redirectUrl, $surface) === 0
+                    && in_array($redirectUrl[strlen($surface)], ['/', '?', '#'], true))) {
+            $redirectUrl = home_url('/');
+            break;
+        }
+    }
+}
 $redirectAuto = $checkoutConfig['redirectAutomatically'] ?? true;
 
 // Pull the payer-facing note out of the invoice's metadata. itemDesc is what
@@ -174,16 +283,47 @@ $redirectAuto = $checkoutConfig['redirectAutomatically'] ?? true;
 $invoiceMetadata = $invoice['metadata'] ? json_decode($invoice['metadata'], true) : null;
 $invoiceNote = is_array($invoiceMetadata) ? trim((string)($invoiceMetadata['itemDesc'] ?? '')) : '';
 
+// WooCommerce-backed invoices (created by the BTCPay gateway plugin) carry
+// metadata.orderId. For those, the expired screen offers a retry link that
+// bounces through /cashupay/retry/{invoiceId} to WooCommerce's order-pay
+// page, where clicking "Pay" makes the gateway mint a fresh invoice for the
+// same order. Standalone invoices (admin wizard, self-serve /pay) have no
+// order to re-pay, so they keep the plain Return-to-Shop exit.
+$wooRetryUrl = null;
+if (Urls::isWordPress() && is_array($invoiceMetadata) && !empty($invoiceMetadata['orderId'])) {
+    $wooRetryUrl = site_url('/cashupay/retry/' . rawurlencode((string)$invoice['id']));
+}
+
 // Decide whether to render the payer-receipt form. The check is composed of
 // site-wide master switch + per-type toggle + SMTP. When false, the success
-// modal shows a "screenshot this page" fallback instead.
+// modal shows a "screenshot this page" fallback instead. WordPress installs
+// never render the email/newsletter form at all — WooCommerce owns customer
+// emails and order confirmations there — so they always get the fallback.
 require_once __DIR__ . '/includes/notification_sender.php';
-$payerReceiptOffered = NotificationSender::isPayerReceiptOffered();
+$emailFormOffered = !Urls::isWordPress();
+$payerReceiptOffered = $emailFormOffered && NotificationSender::isPayerReceiptOffered();
 
 // Resolve the newsletter checkbox's initial state for this store (per-store
 // override → site-wide default). The email/newsletter capture form is shown
 // regardless of whether receipts are offered.
-$newsletterDefaultChecked = Config::getNewsletterDefaultChecked($invoice['store_id']);
+$newsletterDefaultChecked = $emailFormOffered && Config::getNewsletterDefaultChecked($invoice['store_id']);
+
+// An on-chain payment was seen in the mempool but hasn't confirmed yet. This
+// drives the unified detected/complete screen: same layout as the settled
+// state (amount, invoice details, email form) with a "waiting for on-chain
+// confirmation" badge + copy instead of the checkmark, and without the
+// Continue-to-Store link (the WooCommerce order isn't marked paid until the
+// Settled webhook). The generic #payment-processing block remains for the
+// transient non-on-chain Processing state (Cashu minting after a Lightning
+// payment).
+$onchainPendingInitial = $invoice['status'] === 'Processing'
+    && !empty($invoice['onchain_first_seen_at']);
+
+// Explorer link for the detected on-chain tx (null for non-on-chain
+// payments). Rendered on the unified screen in both pending and settled
+// modes; the poll also carries it so JS can inject the link when the tx is
+// detected while the page is open.
+$onchainTxUrl = cashupay_onchain_tx_url($invoice);
 
 // Format amount for display - use store's mint unit
 $mintUnit = Config::getStoreMintUnit($invoice['store_id']);
@@ -309,15 +449,23 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
             max-width: 480px;
         }
 
+        /* Logo + store name share one compact line above the amount. */
+        .merchant-header {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.5rem;
+            margin-bottom: 1rem;
+        }
+
         .logo {
-            font-size: 2.5rem;
-            margin-bottom: 0.5rem;
+            font-size: 1.5rem;
+            line-height: 1;
         }
 
         .merchant-name {
             font-size: 0.875rem;
             color: var(--text-secondary);
-            margin-bottom: 1.5rem;
         }
 
         .amount {
@@ -337,22 +485,17 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
             border-radius: 16px;
             padding: 1rem;
             margin: 0 auto 1.5rem;
-            display: inline-block;
+            width: 100%;
+            /* 380px of QR plus the white quiet-zone padding. */
+            max-width: calc(380px + 2rem);
         }
 
         .qr-container svg,
         .qr-container canvas {
             display: block;
-            width: 220px;
-            height: 220px;
-        }
-
-        @media (max-width: 360px) {
-            .qr-container svg,
-            .qr-container canvas {
-                width: 180px;
-                height: 180px;
-            }
+            width: 100%;
+            height: auto;
+            aspect-ratio: 1;
         }
 
         .status-badge {
@@ -416,7 +559,9 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
             text-align: center;
             cursor: pointer;
             transition: border-color 0.2s;
-            word-break: break-all;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
         }
 
         /* Lightning <-> on-chain method tabs (shown only when both methods are
@@ -486,6 +631,33 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
         .btn-secondary {
             background: rgba(255, 255, 255, 0.1);
             margin-top: 0.5rem;
+        }
+
+        /* Open-in-wallet + copy side by side under the QR. */
+        .btn-row {
+            display: flex;
+            gap: 0.5rem;
+            margin-top: 1rem;
+        }
+
+        .btn-row .btn {
+            flex: 1;
+            min-width: 0;
+            margin-top: 0;
+            padding: 1rem 0.75rem;
+            white-space: nowrap;
+        }
+
+        @media (max-width: 380px) {
+            .btn-row .btn {
+                font-size: 0.875rem;
+                gap: 0.35rem;
+                padding: 0.9rem 0.5rem;
+            }
+            .btn-row .btn svg {
+                width: 16px;
+                height: 16px;
+            }
         }
 
         .btn-secondary:hover {
@@ -651,6 +823,39 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
             color: white;
         }
 
+        /* Large spinner shown in place of the checkmark while a detected
+           on-chain payment waits for confirmation. */
+        .confirming-icon {
+            width: 80px;
+            height: 80px;
+            border-radius: 50%;
+            border: 6px solid rgba(66, 153, 225, 0.25);
+            border-top-color: #63b3ed;
+            animation: spin 1.2s linear infinite;
+            margin-bottom: 1.5rem;
+        }
+
+        .onchain-pending-copy {
+            color: var(--text-secondary);
+            font-size: 0.9rem;
+            line-height: 1.5;
+            margin: 0 0 0.5rem;
+            text-align: center;
+        }
+
+        /* Explorer link for the detected on-chain tx. Visible in both the
+           pending and settled modes of the unified screen. */
+        .onchain-tx-link {
+            display: inline-block;
+            color: #63b3ed;
+            font-size: 0.85rem;
+            margin: 0 0 0.5rem;
+            text-decoration: underline;
+        }
+        .onchain-tx-link.hidden {
+            display: none;
+        }
+
         .hidden {
             display: none;
         }
@@ -795,8 +1000,10 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
 <body>
     <div class="container">
         <div class="payment-card">
-            <div class="logo">&#9889;</div>
-            <div class="merchant-name"><?= htmlspecialchars($storeName) ?></div>
+            <div class="merchant-header">
+                <span class="logo">&#9889;</span>
+                <span class="merchant-name"><?= htmlspecialchars($storeName) ?></span>
+            </div>
 
             <?php
             $hasLightning = !empty($invoice['bolt11']);
@@ -894,22 +1101,18 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                     Waiting for payment
                 </div>
 
-                <div class="invoice-details">
-                    <div><span class="label">Invoice:</span><span class="invoice-id-value"><?= htmlspecialchars($invoice['id']) ?></span></div>
-                    <?php if ($invoiceNote !== ''): ?>
-                    <div><span class="label">Note:</span><span class="invoice-note-value"><?= htmlspecialchars($invoiceNote) ?></span></div>
-                    <?php endif; ?>
-                </div>
-
                 <?php
-                $firstMethod = $hasLightning ? 'lightning' : ($hasOnchain ? 'onchain' : 'cashu');
+                // On-chain is the preferred default when the invoice offers it;
+                // Lightning and Cashu remain selectable via the tabs. Tab order
+                // mirrors the priority so the default tab sits first.
+                $firstMethod = $hasOnchain ? 'onchain' : ($hasLightning ? 'lightning' : 'cashu');
                 if ($methodCount >= 2): ?>
                 <div class="method-tabs" role="tablist">
-                    <?php if ($hasLightning): ?>
-                    <button type="button" class="method-tab <?= $firstMethod === 'lightning' ? 'active' : '' ?>" data-method="lightning" role="tab">Lightning</button>
-                    <?php endif; ?>
                     <?php if ($hasOnchain): ?>
                     <button type="button" class="method-tab <?= $firstMethod === 'onchain' ? 'active' : '' ?>" data-method="onchain" role="tab">On-chain</button>
+                    <?php endif; ?>
+                    <?php if ($hasLightning): ?>
+                    <button type="button" class="method-tab <?= $firstMethod === 'lightning' ? 'active' : '' ?>" data-method="lightning" role="tab">Lightning</button>
                     <?php endif; ?>
                     <?php if ($hasCashu): ?>
                     <button type="button" class="method-tab <?= $firstMethod === 'cashu' ? 'active' : '' ?>" data-method="cashu" role="tab">Cashu</button>
@@ -918,24 +1121,26 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                 <?php endif; ?>
 
                 <?php if ($hasLightning): ?>
-                <div class="method-block" data-method-block="lightning">
+                <div class="method-block <?= $firstMethod === 'lightning' ? '' : 'hidden' ?>" data-method-block="lightning">
                     <div class="qr-container" id="qr-lightning"></div>
                     <div class="invoice-input" data-copy="<?= htmlspecialchars($invoice['bolt11']) ?>">
                         <?= htmlspecialchars(substr($invoice['bolt11'], 0, 40) . '...' . substr($invoice['bolt11'], -10)) ?>
                     </div>
-                    <a href="lightning:<?= htmlspecialchars($invoice['bolt11']) ?>" class="btn">
-                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                            <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon>
-                        </svg>
-                        Open in Wallet
-                    </a>
-                    <button type="button" class="btn btn-secondary" data-copy="<?= htmlspecialchars($invoice['bolt11']) ?>">
-                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                            <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
-                            <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
-                        </svg>
-                        Copy Invoice
-                    </button>
+                    <div class="btn-row">
+                        <a href="lightning:<?= htmlspecialchars($invoice['bolt11']) ?>" class="btn">
+                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon>
+                            </svg>
+                            Open in Wallet
+                        </a>
+                        <button type="button" class="btn btn-secondary" data-copy="<?= htmlspecialchars($invoice['bolt11']) ?>">
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+                                <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+                            </svg>
+                            Copy Invoice
+                        </button>
+                    </div>
                     <?php if ($pathDebug): ?>
                     <div class="debug-path" title="Admin debug: how this Lightning invoice was sourced">
                         <span class="debug-path-tag">path</span>
@@ -946,7 +1151,7 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                 <?php endif; ?>
 
                 <?php if ($hasOnchain): ?>
-                <div class="method-block <?= $hasLightning ? 'hidden' : '' ?>" data-method-block="onchain">
+                <div class="method-block <?= $firstMethod === 'onchain' ? '' : 'hidden' ?>" data-method-block="onchain">
                     <div class="qr-container" id="qr-onchain"></div>
                     <div class="invoice-input" data-copy="<?= htmlspecialchars($bip21) ?>">
                         <?= $shortOnchainAddr ?>
@@ -954,20 +1159,22 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                             <?= number_format($onchainSat) ?> sat
                         </div>
                     </div>
-                    <a href="<?= htmlspecialchars($bip21) ?>" class="btn">
-                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                            <circle cx="12" cy="12" r="10"></circle>
-                            <path d="M9.5 8h4a2.5 2.5 0 0 1 0 5h-4v-5zm0 5h4.5a2.5 2.5 0 0 1 0 5h-4.5v-5z"></path>
-                        </svg>
-                        Open in Wallet
-                    </a>
-                    <button type="button" class="btn btn-secondary" data-copy="<?= htmlspecialchars($bip21) ?>">
-                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                            <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
-                            <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
-                        </svg>
-                        Copy Address
-                    </button>
+                    <div class="btn-row">
+                        <a href="<?= htmlspecialchars($bip21) ?>" class="btn">
+                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <circle cx="12" cy="12" r="10"></circle>
+                                <path d="M9.5 8h4a2.5 2.5 0 0 1 0 5h-4v-5zm0 5h4.5a2.5 2.5 0 0 1 0 5h-4.5v-5z"></path>
+                            </svg>
+                            Open in Wallet
+                        </a>
+                        <button type="button" class="btn btn-secondary" data-copy="<?= htmlspecialchars($bip21) ?>">
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+                                <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+                            </svg>
+                            Copy Address
+                        </button>
+                    </div>
                     <?php if ($pathDebug): ?>
                     <div class="debug-path" title="Admin debug: on-chain address derivation mode">
                         <span class="debug-path-tag">path</span>
@@ -1001,6 +1208,13 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                     </div>
                 </div>
                 <?php endif; ?>
+
+                <div class="invoice-details">
+                    <div><span class="label">Invoice:</span><span class="invoice-id-value"><?= htmlspecialchars($invoice['id']) ?></span></div>
+                    <?php if ($invoiceNote !== ''): ?>
+                    <div><span class="label">Note:</span><span class="invoice-note-value"><?= htmlspecialchars($invoiceNote) ?></span></div>
+                    <?php endif; ?>
+                </div>
 
                 <div class="timer" id="timer"></div>
 
@@ -1042,7 +1256,7 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                 </div>
             </div>
 
-            <div id="payment-processing" class="<?= $invoice['status'] !== 'Processing' ? 'hidden' : '' ?>">
+            <div id="payment-processing" class="<?= ($invoice['status'] !== 'Processing' || $onchainPendingInitial) ? 'hidden' : '' ?>">
                 <div class="status-badge processing">
                     <div class="spinner"></div>
                     Processing payment...
@@ -1052,22 +1266,47 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                 </p>
             </div>
 
-            <div id="payment-success" class="success-animation <?= $invoice['status'] === 'Settled' ? 'show' : '' ?>">
-                <div class="success-icon">
+            <!-- Unified detected/complete screen. Shown from the moment an
+                 on-chain payment is detected (pending mode: spinner badge +
+                 confirmation copy) and stays up through settlement (settled
+                 mode: checkmark + Continue-to-Store). Only the mode-specific
+                 elements toggle, so anything the payer typed into the email
+                 form survives the transition. -->
+            <div id="payment-success" class="success-animation <?= ($invoice['status'] === 'Settled' || $onchainPendingInitial) ? 'show' : '' ?>">
+                <div class="success-icon <?= $onchainPendingInitial ? 'hidden' : '' ?>" id="success-icon">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3">
                         <polyline points="20 6 9 17 4 12"></polyline>
                     </svg>
                 </div>
+                <div class="confirming-icon <?= $onchainPendingInitial ? '' : 'hidden' ?>" id="confirming-icon"></div>
                 <div class="amount"><?= htmlspecialchars($displayAmount) ?></div>
-                <div class="status-badge settled">
+                <div class="status-badge settled <?= $onchainPendingInitial ? 'hidden' : '' ?>" id="success-badge-settled">
                     Payment Complete
                 </div>
+                <div class="status-badge processing <?= $onchainPendingInitial ? '' : 'hidden' ?>" id="success-badge-pending">
+                    <div class="spinner"></div>
+                    Waiting for on-chain confirmation
+                </div>
+                <p class="onchain-pending-copy <?= $onchainPendingInitial ? '' : 'hidden' ?>" id="onchain-pending-copy">
+                    Payment detected, waiting for on-chain confirmation. Please do not
+                    close this window. Confirmation usually takes up to 10 minutes, but
+                    may take longer if you elected to pay a low network fee.
+                </p>
+                <!-- Explorer link for the detected tx. Always in the DOM so the
+                     poll can populate it when the tx is detected mid-session;
+                     shown in both pending and settled modes once a txid is
+                     known (setSuccessMode deliberately doesn't toggle it). -->
+                <a class="onchain-tx-link <?= $onchainTxUrl ? '' : 'hidden' ?>" id="onchain-tx-link"
+                   href="<?= htmlspecialchars($onchainTxUrl ?? '') ?>" target="_blank" rel="noopener">
+                    View transaction on mempool.space
+                </a>
                 <div class="invoice-details">
                     <div><span class="label">Invoice:</span><span class="invoice-id-value"><?= htmlspecialchars($invoice['id']) ?></span></div>
                     <?php if ($invoiceNote !== ''): ?>
                     <div><span class="label">Note:</span><span class="invoice-note-value"><?= htmlspecialchars($invoiceNote) ?></span></div>
                     <?php endif; ?>
                 </div>
+                <?php if ($emailFormOffered): ?>
                 <form class="receipt-form" id="receipt-form" data-receipt-offered="<?= $payerReceiptOffered ? '1' : '0' ?>" novalidate>
                     <div class="receipt-prompt">
                         <?= $payerReceiptOffered ? 'Email me a payment confirmation' : 'Leave your email' ?>
@@ -1083,13 +1322,14 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                     <button type="button" class="receipt-skip" id="receipt-skip">No thanks</button>
                     <div class="receipt-status hidden" id="receipt-status"></div>
                 </form>
+                <?php endif; ?>
                 <?php if (!$payerReceiptOffered): ?>
-                <div class="receipt-fallback">
+                <div class="receipt-fallback <?= $onchainPendingInitial ? 'hidden' : '' ?>" id="receipt-fallback">
                     Screenshot this page or save your invoice ID for your records.
                 </div>
                 <?php endif; ?>
                 <?php if ($redirectUrl): ?>
-                    <a href="<?= htmlspecialchars($redirectUrl) ?>" class="btn" id="redirect-btn">
+                    <a href="<?= htmlspecialchars($redirectUrl) ?>" class="btn <?= $onchainPendingInitial ? 'hidden' : '' ?>" id="redirect-btn">
                         Continue to Store
                     </a>
                 <?php endif; ?>
@@ -1102,7 +1342,18 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                 <p style="color: var(--text-secondary); margin-top: 1rem;">
                     This invoice has expired. Please request a new one.
                 </p>
-                <?php if ($redirectUrl): ?>
+                <?php if ($wooRetryUrl): ?>
+                    <a href="<?= htmlspecialchars($wooRetryUrl) ?>" class="btn <?= $invoice['status'] === 'Invalid' ? 'hidden' : '' ?>" style="margin-top: 1.5rem;" id="retry-btn">
+                        Request a new invoice
+                    </a>
+                    <?php if ($redirectUrl): ?>
+                        <p style="margin-top: 1rem;">
+                            <a href="<?= htmlspecialchars($redirectUrl) ?>" style="color: var(--text-secondary);">
+                                Return to Shop
+                            </a>
+                        </p>
+                    <?php endif; ?>
+                <?php elseif ($redirectUrl): ?>
                     <a href="<?= htmlspecialchars($redirectUrl) ?>" class="btn" style="margin-top: 1.5rem;">
                         Return to Shop
                     </a>
@@ -1151,6 +1402,10 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                 : null
         ) ?>;
         let currentStatus = <?= json_encode($invoice['status']) ?>;
+        // Whether a detected on-chain payment is still waiting for
+        // confirmation — selects the unified screen's pending mode while
+        // status is Processing.
+        let currentOnchainPending = <?= json_encode($onchainPendingInitial) ?>;
 
         function renderQR(targetId, data) {
             const target = document.getElementById(targetId);
@@ -1162,8 +1417,10 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
             }
             const canvas = document.createElement('canvas');
             target.appendChild(canvas);
+            // Rendered at 760px internally (2x the 380px display cap) so the
+            // CSS-scaled canvas stays crisp on hidpi screens.
             new QRious({
-                element: canvas, value: data, size: 220,
+                element: canvas, value: data, size: 760,
                 backgroundAlpha: 1, foreground: '#000000', background: '#ffffff', level: 'M',
             });
         }
@@ -1326,10 +1583,31 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                 return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
             })();
 
+            // Warn once (not per 3s retry) when the relay socket can't be
+            // opened — e.g. a ws:// relay on an https page (mixed content) or
+            // a malformed relay URL. Without this the stuck "waiting for
+            // payment" screen is undiagnosable; the server-side receipt poll
+            // keeps covering settlement while we retry.
+            let connectWarned = false;
+            function warnConnectOnce(detail) {
+                if (connectWarned) return;
+                connectWarned = true;
+                console.warn('CLINK receipt watch: cannot reach relay', nofferSub.relay, detail || '');
+            }
+
             function connect() {
                 if (stopped) return;
                 try { ws = new WebSocket(nofferSub.relay); }
-                catch (e) { return; }
+                catch (e) {
+                    // The constructor throws synchronously (mixed content,
+                    // bad URL). Keep retrying while the invoice is open
+                    // instead of silently giving up for good.
+                    warnConnectOnce(e);
+                    if (currentStatus === 'New') {
+                        setTimeout(connect, 3000);
+                    }
+                    return;
+                }
 
                 ws.onopen = function () {
                     ws.send(JSON.stringify(['REQ', subId, {
@@ -1368,7 +1646,10 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                         setTimeout(connect, 3000);
                     }
                 };
-                ws.onerror = function () { try { ws.close(); } catch (e) {} };
+                ws.onerror = function () {
+                    warnConnectOnce('socket error');
+                    try { ws.close(); } catch (e) {}
+                };
             }
             connect();
 
@@ -1395,8 +1676,21 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                 const response = await fetch(pollUrl.toString());
                 const data = await response.json();
 
-                if (data.status !== currentStatus) {
+                // Populate the explorer link as soon as the poll knows the
+                // txid; independent of the status transition below so a page
+                // that already shows the pending screen still picks it up.
+                if (data.onchainTxUrl) {
+                    const txLink = document.getElementById('onchain-tx-link');
+                    if (txLink) {
+                        txLink.href = data.onchainTxUrl;
+                        txLink.classList.remove('hidden');
+                    }
+                }
+
+                const onchainPending = !!data.onchainPending;
+                if (data.status !== currentStatus || onchainPending !== currentOnchainPending) {
                     currentStatus = data.status;
+                    currentOnchainPending = onchainPending;
                     updateUI(data.status);
                 }
             } catch (e) {
@@ -1404,6 +1698,24 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
             }
 
             setTimeout(pollStatus, 2000);
+        }
+
+        // Toggle the unified detected/complete screen between its two modes.
+        // Only mode-specific elements flip; the email form and invoice details
+        // are shared DOM nodes, so anything the payer typed survives the
+        // pending -> settled transition.
+        function setSuccessMode(pending) {
+            const toggle = (id, show) => {
+                const el = document.getElementById(id);
+                if (el) el.classList.toggle('hidden', !show);
+            };
+            toggle('success-icon', !pending);
+            toggle('confirming-icon', pending);
+            toggle('success-badge-settled', !pending);
+            toggle('success-badge-pending', pending);
+            toggle('onchain-pending-copy', pending);
+            toggle('receipt-fallback', !pending);
+            toggle('redirect-btn', !pending);
         }
 
         // Update UI based on status
@@ -1420,19 +1732,34 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                     document.getElementById('payment-pending').classList.remove('hidden');
                     break;
                 case 'Processing':
-                    document.getElementById('payment-processing').classList.remove('hidden');
+                    if (currentOnchainPending) {
+                        // On-chain payment detected, awaiting confirmation:
+                        // show the unified screen in pending mode so the payer
+                        // can already leave their email.
+                        setSuccessMode(true);
+                        document.getElementById('payment-success').classList.add('show');
+                        wireReceiptForm();
+                    } else {
+                        document.getElementById('payment-processing').classList.remove('hidden');
+                    }
                     break;
                 case 'Provisional':
                     if (provisionalEl) provisionalEl.classList.remove('hidden');
                     break;
                 case 'Settled':
+                    setSuccessMode(false);
                     document.getElementById('payment-success').classList.add('show');
                     onSettled();
                     break;
                 case 'Expired':
-                case 'Invalid':
+                case 'Invalid': {
                     document.getElementById('payment-expired').classList.remove('hidden');
+                    // Re-paying only makes sense for an invoice that lapsed on
+                    // its own (Expired), not one an operator voided (Invalid).
+                    const retryBtn = document.getElementById('retry-btn');
+                    if (retryBtn) retryBtn.classList.toggle('hidden', status !== 'Expired');
                     break;
+                }
             }
         }
 
@@ -1446,16 +1773,14 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
             }
         }
 
-        // Settled-state entry point. Wires up the receipt form (if offered)
+        // Settled-state entry point. Wires up the receipt form (if rendered)
         // so the payer can opt into a receipt. We deliberately do NOT auto-
         // redirect: the success modal stays visible until the payer clicks
         // the "Continue to Store" link (when the merchant configured one) or
         // navigates away themselves. Auto-redirect used to flash the modal
         // for ~2 seconds, which made the invoice ID + note unreadable.
         function onSettled() {
-            if (payerReceiptOffered) {
-                wireReceiptForm();
-            }
+            wireReceiptForm();
         }
 
         // Wire up the receipt form: submit POSTs to this same URL with
@@ -1506,9 +1831,11 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                     });
                     const data = await response.json().catch(() => ({}));
                     if (response.ok && data.success) {
-                        setStatus(data.receiptQueued
-                            ? 'Receipt queued — check your inbox.'
-                            : 'Thanks — your email has been saved.', 'success');
+                        setStatus(data.receiptPending
+                            ? 'Saved — your receipt will be emailed once the payment confirms.'
+                            : (data.receiptQueued
+                                ? 'Receipt queued — check your inbox.'
+                                : 'Thanks — your email has been saved.'), 'success');
                         emailInput.disabled = true;
                         if (newsletterInput) newsletterInput.disabled = true;
                         submitBtn.style.display = 'none';
@@ -1527,6 +1854,12 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
         // Handle settled state on initial page load.
         if (currentStatus === 'Settled') {
             onSettled();
+        }
+        // Page loaded while an on-chain payment awaits confirmation: the
+        // unified screen is already rendered in pending mode server-side;
+        // just wire the email form.
+        if (currentStatus === 'Processing' && currentOnchainPending) {
+            wireReceiptForm();
         }
     </script>
 </body>

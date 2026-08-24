@@ -53,7 +53,7 @@ class MockSwapProvider implements SwapProvider {
 
     public function createReverseSwap(string $network, int $onchainAmountSats, string $claimPubkeyHex, string $preimageHashHex): SwapCreateResult {
         $refundPriv = hash('sha256', 'mock-refund-key', true);
-        $refundPub = Secp256k1::pointToCompressed(Secp256k1::generatorMult(Secp256k1::bytesToGmp($refundPriv)));
+        $refundPub = Secp256k1::pointToCompressed(Secp256k1::generatorMult(Secp256k1::bytesToNum($refundPriv)));
         $claimPub = hex2bin($claimPubkeyHex);
         $preimageHash = hex2bin($preimageHashHex);
 
@@ -122,9 +122,6 @@ class MockSwapProvider implements SwapProvider {
 // ------------- Wire up DB + config + store -------------
 
 Database::initialize();
-SwapsConfig::setSiteEnabled(true);
-SwapsConfig::setProviderOrder(['mock']);
-SwapsConfig::setStrictNoMintFallback(true);
 SwapProviderFactory::setRegistry(['mock' => new MockSwapProvider()]);
 
 $storeId = Database::generateId('store');
@@ -138,7 +135,10 @@ Database::insert('stores', [
     'onchain_xpub' => 'tpubD6NzVbkrYhZ4WaWSyoBvQwbpLkojyoTZPRsgXELWz3Popb3qkjcJyJUGLnL4qHHoQvao8ESaAstxYSnhyswJ76uZPStJRJCTKvosUCJZL5B',
     'onchain_address_type' => 'P2WPKH',
     'onchain_network' => 'regtest',
+    'swaps_enabled' => SwapsConfig::FORCE_ON,
 ]);
+SwapsConfig::setStoreProviderOrder($storeId, ['mock']);
+SwapsConfig::setStoreStrictOverride($storeId, SwapsConfig::FORCE_ON);
 
 // ------------- Create a swap invoice -------------
 

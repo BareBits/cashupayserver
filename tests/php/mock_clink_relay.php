@@ -11,6 +11,12 @@
  *   MOCK_CLINK_BOLT11     bolt11 to return on success
  *   MOCK_CLINK_ERROR_CODE if set, reply with this NIP-69 error code instead
  *   MOCK_CLINK_SEND_RECEIPT if "1", also send a {res:'ok'} receipt after the reply
+ *   MOCK_CLINK_RECEIPT_AFTER_EOSE if "1", send the receipt AFTER the EOSE —
+ *                        simulating a spec-compliant relay that retains no
+ *                        ephemeral events, where the receipt only ever arrives
+ *                        live on an open subscription (needs MOCK_CLINK_SEND_RECEIPT=1)
+ *   MOCK_CLINK_SILENT    if "1", accept the request (relay OK) but never send
+ *                        the merchant reply — the client must time out
  *   MOCK_CLINK_DUMP      if set, decrypt the payer's request and write the
  *                        plaintext JSON payload to this path (lets a test assert
  *                        what the payer actually sent, e.g. the description memo)
@@ -35,6 +41,7 @@ $merchantSk = (string)getenv('MOCK_CLINK_MERCHANT_SK');
 $bolt11 = (string)(getenv('MOCK_CLINK_BOLT11') ?: 'lnbc10n1mockinvoice');
 $errorCode = getenv('MOCK_CLINK_ERROR_CODE');
 $sendReceipt = getenv('MOCK_CLINK_SEND_RECEIPT') === '1';
+$receiptAfterEose = getenv('MOCK_CLINK_RECEIPT_AFTER_EOSE') === '1';
 
 if ($port <= 0 || $merchantSk === '') {
     fwrite(STDERR, "mock_clink_relay: MOCK_CLINK_PORT and MOCK_CLINK_MERCHANT_SK required\n");
@@ -48,7 +55,7 @@ $server = new Server($port, false);
 
 // Per-connection subscription id, captured from the REQ.
 $server->onText(function (Server $srv, $conn, Text $message) use (
-    $merchantSk, $merchantPk, $bolt11, $errorCode, $sendReceipt
+    $merchantSk, $merchantPk, $bolt11, $errorCode, $sendReceipt, $receiptAfterEose
 ) {
     $data = json_decode($message->getContent(), true);
     if (!is_array($data) || !isset($data[0])) {
@@ -64,11 +71,18 @@ $server->onText(function (Server $srv, $conn, Text $message) use (
         $filter = $data[2] ?? [];
         $payerPk = $filter['#p'][0] ?? null;
         $reqId = $filter['#e'][0] ?? null;
-        if ($sendReceipt && $errorCode === false && $payerPk && $reqId) {
+        if ($sendReceipt && $errorCode === false && $payerPk && $reqId && !$receiptAfterEose) {
             $receipt = makeMerchantEvent($merchantSk, (string)$payerPk, (string)$reqId, ['res' => 'ok']);
             $conn->send(new Text(json_encode(['EVENT', $sub, $receipt])));
         }
         $conn->send(new Text(json_encode(['EOSE', $sub])));
+        // Spec-compliant-relay mode: nothing retained, so the receipt shows up
+        // only live, after EOSE — exactly what a subscriber that hangs up at
+        // EOSE would miss and a live-listen window catches.
+        if ($sendReceipt && $errorCode === false && $payerPk && $reqId && $receiptAfterEose) {
+            $receipt = makeMerchantEvent($merchantSk, (string)$payerPk, (string)$reqId, ['res' => 'ok']);
+            $conn->send(new Text(json_encode(['EVENT', $sub, $receipt])));
+        }
         return;
     }
     if ($data[0] === 'EVENT' && isset($data[1]) && is_array($data[1])) {
@@ -92,6 +106,10 @@ $server->onText(function (Server $srv, $conn, Text $message) use (
 
         // Acknowledge the publish (relay OK).
         $conn->send(new Text(json_encode(['OK', $reqId, true, ''])));
+
+        if (getenv('MOCK_CLINK_SILENT') === '1') {
+            return; // accept but never answer — client must time out
+        }
 
         // Build the encrypted reply addressed back to the payer.
         if ($errorCode !== false && $errorCode !== '') {

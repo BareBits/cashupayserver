@@ -219,6 +219,63 @@ def test_underpayment_stays_processing(
     assert got["status"] == "Processing", got
 
 
+def test_pending_page_links_mempool_tx(
+    configured: ConfiguredPayserver,
+    onchain: OnchainContext,
+) -> None:
+    """min_confs=1: while the detected tx awaits confirmation, the customer
+    payment page (JSON poll + HTML) links the tx on mempool.space, and the
+    link survives settlement. Regtest stores fall back to the mainnet URL."""
+    _wire_onchain(configured, onchain, min_confs=1)
+    inv = configured.greenfield.create_invoice(
+        configured.store_id, amount=str(INVOICE_AMOUNT_SAT), currency="sat"
+    )
+    addr = inv["checkout"]["paymentMethods"]["BTC-OnChain"]["destination"]
+    txid = onchain.fund_address(addr, INVOICE_AMOUNT_SAT)
+    expected_url = f"https://mempool.space/tx/{txid}"
+
+    # Drive detection via cron and the customer poll until the pending state
+    # (Processing + mempool sighting) is reported.
+    deadline = time.monotonic() + 20
+    data: dict = {}
+    while time.monotonic() < deadline:
+        configured.handle.trigger_cron()
+        r = requests.get(
+            f"{configured.handle.url}/payment.php",
+            params={"id": inv["id"], "json": "1"},
+            timeout=15,
+        )
+        r.raise_for_status()
+        data = r.json()
+        if data.get("onchainPending"):
+            break
+        time.sleep(0.5)
+    assert data.get("onchainPending") is True, data
+    assert data.get("onchainTxUrl") == expected_url, data
+
+    html = requests.get(
+        f"{configured.handle.url}/payment.php", params={"id": inv["id"]}, timeout=15
+    ).text
+    assert expected_url in html
+    assert "onchain-tx-link hidden" not in html
+
+    # Confirmation settles the invoice; the explorer link must survive.
+    onchain.confirm(1)
+    _poll_until(configured, inv["id"], "Settled", timeout_s=20)
+    r = requests.get(
+        f"{configured.handle.url}/payment.php",
+        params={"id": inv["id"], "json": "1"},
+        timeout=15,
+    )
+    r.raise_for_status()
+    assert r.json().get("onchainTxUrl") == expected_url
+    html = requests.get(
+        f"{configured.handle.url}/payment.php", params={"id": inv["id"]}, timeout=15
+    ).text
+    assert expected_url in html
+    assert "onchain-tx-link hidden" not in html
+
+
 def test_address_uniqueness_across_invoices(
     configured: ConfiguredPayserver,
     onchain: OnchainContext,

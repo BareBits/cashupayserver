@@ -43,11 +43,15 @@ def _config_value(payserver: PayserverHandle, key: str) -> str | None:
 
 
 def test_setup_wizard_completes_in_browser(
-    payserver: PayserverHandle,
+    payserver_with_lnurlp: PayserverHandle,
     mint: MintHandle,
     backup_mint: MintHandle,
     page,
 ) -> None:
+    # The lnurlp-backed stack routes the typed Lightning address to the mock
+    # LNURL host (which serves a LUD-21 verify URL), so the setup step's
+    # save-time gate passes.
+    payserver = payserver_with_lnurlp
     page.set_default_timeout(30000)
     page.goto(f"{payserver.url}/setup")
 
@@ -114,6 +118,11 @@ def test_setup_wizard_completes_in_browser(
     assert len(seed_words) == 12, f"expected a 12-word phrase, got {len(seed_words)}"
 
     assert _config_value(payserver, "setup_complete") == "true"
+    # The swaps step is store-only now: enabling it must write the store flag
+    # (asserted below) without flipping any site-wide config key.
+    assert _config_value(payserver, "swaps_enabled") is None, (
+        "the wizard must not write the retired site-wide swaps_enabled key"
+    )
 
     row = _store_row(payserver)
     assert row["name"] == "Browser Store"
@@ -125,7 +134,9 @@ def test_setup_wizard_completes_in_browser(
     assert row["mint_url"].rstrip("/") == mint.url.rstrip("/")
     assert row["mint_unit"] == "sat"
     assert row["seed_phrase"], "a seed should have been generated for the mint wallet"
-    # Declining mints is what pins strict mode; enabling them leaves it inherit.
+    # Declining mints is what pins strict mode; enabling them leaves the
+    # column at its schema default (-1, a legacy value that resolves to
+    # "allow mint fallback").
     assert row["strict_no_mint_fallback"] == -1
 
 
@@ -158,3 +169,58 @@ def test_setup_wizard_without_onchain_skips_zeroconf(
 
     # Straight to Lightning — no zero-conf screen in between.
     page.wait_for_selector("#lightning_address")
+
+
+def test_outside_webroot_skips_security_screen_but_still_detects_url_mode(
+    page,
+) -> None:
+    """With the data directory outside the web root the security screen is
+    dropped from the flow — terms lands straight on the password screen — but
+    the URL-mode probe that screen normally hosts must still run: it moves to
+    the terms screen (silently) and saves a working url_mode."""
+    import tempfile
+    import time
+    import uuid
+    from pathlib import Path
+
+    from conftest import SESSION_TMP
+    from fixtures.payserver import start_payserver, stop_payserver
+
+    workdir = SESSION_TMP / f"outside-webroot-ui-{uuid.uuid4().hex[:8]}"
+    with tempfile.TemporaryDirectory(prefix="cashupay-data-") as outside:
+        handle = start_payserver(workdir, extra_env={"CASHUPAY_DATA_DIR": outside})
+        try:
+            page.set_default_timeout(30000)
+            page.goto(f"{handle.url}/setup")
+
+            # The terms screen hosts the silent URL-mode probe now; give the
+            # fetch round-trips a moment and check the config row landed.
+            db = Path(outside) / "cashupay.sqlite"
+            deadline = time.time() + 20
+            mode = None
+            while time.time() < deadline:
+                conn = sqlite3.connect(db)
+                try:
+                    row = conn.execute(
+                        "SELECT value FROM config WHERE key = 'url_mode'"
+                    ).fetchone()
+                finally:
+                    conn.close()
+                if row:
+                    mode = row[0]
+                    break
+                time.sleep(0.5)
+            assert mode is not None, "the terms screen must save a detected url_mode"
+            assert mode in ('"clean"', '"direct"', '"router"', "clean", "direct", "router"), mode
+
+            # Terms → password directly; no security screen in the flow.
+            page.check("#terms_legal")
+            page.check("#terms_warranty")
+            page.check("#terms_fee")
+            page.click("button[type=submit]")
+            page.wait_for_selector("#password")
+            assert "of 9" in page.locator(".subtitle").inner_text(), (
+                "skipping the security screen should advertise 9 screens"
+            )
+        finally:
+            stop_payserver(handle)

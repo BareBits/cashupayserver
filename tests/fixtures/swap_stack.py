@@ -358,9 +358,10 @@ def _php_eval(data_dir: Path, snippet: str) -> str:
 def setup_payserver(workdir: Path, vpub: str, boltz_api_url: str,
                     strict_no_mint_fallback: bool = True,
                     admin_password: str = "password") -> PayserverProc:
-    """Initialize DB, seed setup-complete + swap config + one store using the
-    given vpub, create an admin user (admin/<admin_password>) + a public API
-    token + the store's internal-API-key (used by the admin UI). Start php -S.
+    """Initialize DB, seed setup-complete + one store using the given vpub
+    (swaps enabled per-store: swaps live entirely on the stores table now),
+    create an admin user (admin/<admin_password>) + a public API token + the
+    store's internal-API-key (used by the admin UI). Start php -S.
     Returns a handle."""
     data_dir = workdir / "payserver-data"
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -399,9 +400,8 @@ def setup_payserver(workdir: Path, vpub: str, boltz_api_url: str,
             # everything through the wrapper. The setup wizard normally
             # detects this; we skip the wizard, so set it explicitly.
             ("url_mode", json.dumps("direct")),
-            ("swaps_enabled", json.dumps(True)),
-            ("swaps_provider_order", json.dumps(["boltz"])),
-            ("swaps_strict_no_mint_fallback", json.dumps(bool(strict_no_mint_fallback))),
+            # swaps_boltz_regtest_url is still a live config key (dev/test
+            # knob); the other swap settings moved to stores columns below.
             ("swaps_boltz_regtest_url", json.dumps(boltz_api_url)),
             ("cron_key", json.dumps("dev-cron-key")),
         ]
@@ -417,12 +417,15 @@ def setup_payserver(workdir: Path, vpub: str, boltz_api_url: str,
             "VALUES (?, 'admin', ?, 'admin', ?)",
             ("user_" + uuid.uuid4().hex[:12], admin_pw_hash, now),
         )
-        # Store + store.internal_api_key
+        # Store + store.internal_api_key. Swap settings are per-store now:
+        # swaps on, boltz-only provider order, strict flag from the arg.
         cur.execute(
             "INSERT INTO stores (id, name, mint_unit, default_currency, created_at, "
-            "onchain_xpub, onchain_address_type, onchain_network, internal_api_key) VALUES "
-            "(?, 'Swap Dev Store', 'sat', 'sat', ?, ?, 'P2WPKH', 'regtest', ?)",
-            (store_id, now, vpub, internal_api_token),
+            "onchain_xpub, onchain_address_type, onchain_network, internal_api_key, "
+            "swaps_enabled, swaps_provider_order, strict_no_mint_fallback) VALUES "
+            "(?, 'Swap Dev Store', 'sat', 'sat', ?, ?, 'P2WPKH', 'regtest', ?, 1, ?, ?)",
+            (store_id, now, vpub, internal_api_token,
+             json.dumps(["boltz"]), 1 if strict_no_mint_fallback else 0),
         )
         # API keys: external dev token + the internal one referenced by the UI
         cur.execute(
@@ -812,7 +815,8 @@ def setup_payserver_for_sweep(workdir: Path, vpub: str, mint_url: str,
         via {@see enable_sweep_mode_for_store} so the funding-side invoice
         creation goes through the cashu mint path, not swap.
       - auto_melt_enabled = 1, auto_melt_use_swap = 1 (force swap).
-      - Site-wide swap config: enabled, boltz provider, no mint fallback.
+      - Per-store swap columns: boltz-only provider order, mint fallback
+        allowed (swap settings are store-only; no site keys any more).
 
     Returns a handle including the seed phrase + store id + API token.
     """
@@ -845,14 +849,10 @@ def setup_payserver_for_sweep(workdir: Path, vpub: str, mint_url: str,
         kvs = [
             ("setup_complete", json.dumps(True)),
             ("url_mode", json.dumps("direct")),
-            ("swaps_enabled", json.dumps(True)),
-            ("swaps_provider_order", json.dumps(["boltz"])),
-            ("swaps_strict_no_mint_fallback", json.dumps(False)),
+            # swaps_boltz_regtest_url is still a live config key (dev/test
+            # knob); every other swap / cashout-mode setting is per-store now.
             ("swaps_boltz_regtest_url", json.dumps(boltz_api_url)),
             ("cron_key", json.dumps("dev-cron-key")),
-            # Site default off for sweep mode — the per-store override below
-            # flips it on for this one store.
-            ("auto_melt_use_swap_default", json.dumps(False)),
         ]
         for k, v in kvs:
             cur.execute(
@@ -866,20 +866,24 @@ def setup_payserver_for_sweep(workdir: Path, vpub: str, mint_url: str,
             ("user_" + uuid.uuid4().hex[:12], admin_pw_hash, now),
         )
         # Store: swaps initially FORCE_OFF so funding works via cashu mint
-        # rail. auto_melt_use_swap initially -1 (inherit) so the funding
+        # rail. auto_melt_use_swap initially 0 (lightning) so the funding
         # invoice's checkAutoMelt run won't try to sweep before we tell it to.
-        # auto_melt_enabled left at 0 — flipped on after funding.
+        # auto_melt_enabled left at 0 — flipped on after funding. Provider
+        # order + strict live on the store row now (boltz only, mint fallback
+        # allowed).
         cur.execute(
             "INSERT INTO stores ("
             " id, name, mint_url, mint_unit, default_currency, seed_phrase,"
             " created_at, onchain_xpub, onchain_address_type, onchain_network,"
-            " onchain_min_confs, swaps_enabled,"
+            " onchain_min_confs, swaps_enabled, swaps_provider_order,"
+            " strict_no_mint_fallback,"
             " auto_melt_enabled, auto_melt_threshold, auto_melt_use_swap,"
             " internal_api_key"
             ") VALUES "
             "(?, 'Sweep Test Store', ?, 'sat', 'sat', ?, ?, ?, 'P2WPKH',"
-            " 'regtest', 1, 0, 0, 1000, -1, ?)",
-            (store_id, mint_url, seed_phrase, now, vpub, internal_token),
+            " 'regtest', 1, 0, ?, 0, 0, 1000, 0, ?)",
+            (store_id, mint_url, seed_phrase, now, vpub,
+             json.dumps(["boltz"]), internal_token),
         )
         cur.execute(
             "INSERT INTO api_keys (id, key_hash, store_id, label, permissions, created_at) "

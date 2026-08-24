@@ -21,6 +21,18 @@ on:
   push:
     tags:
       - "v*"
+  # Reusable entry point. testing-release.yml calls this on every push to the
+  # `testing` branch, passing a v<version>-testing.<run#> prerelease tag so a
+  # testing-channel release is cut without duplicating the build/publish steps
+  # and without needing a PAT to re-trigger a tag-push workflow.
+  workflow_call:
+    inputs:
+      tag:
+        description: >-
+          Release tag to cut (e.g. v1.2-testing.5). Defaults to the pushed tag
+          when this workflow is triggered by a tag push.
+        required: false
+        type: string
 
 permissions:
   contents: write
@@ -33,6 +45,11 @@ jobs:
   build-and-release:
     runs-on: ubuntu-22.04
     timeout-minutes: 20
+    # Effective tag: the workflow_call input (testing-release.yml passes a
+    # v<version>-testing.<run#> prerelease tag) or, for a direct tag push, the
+    # pushed ref. Every step below uses $TAG / env.TAG, never github.ref_name.
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
 
     steps:
       - name: Use HTTPS for SSH-form submodule URLs
@@ -57,7 +74,7 @@ jobs:
           node-version: "20"
 
       - name: Verify in-tree version matches the tag
-        run: ./scripts/verify-release-version.sh "${{ github.ref_name }}"
+        run: ./scripts/verify-release-version.sh "$TAG"
 
       - name: Classify release (stable vs prerelease)
         id: classify
@@ -67,7 +84,7 @@ jobs:
         # advances; prereleases must NOT be latest, or 'main' would jump to a
         # prerelease.
         run: |
-          tag="${{ github.ref_name }}"
+          tag="$TAG"
           if [[ "$tag" =~ ^v[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
             echo "prerelease=false" >> "$GITHUB_OUTPUT"
             echo "make_latest=true"  >> "$GITHUB_OUTPUT"
@@ -110,13 +127,15 @@ jobs:
             bootstrap.php \
             rewrite-rules.php \
             admin-menu.php \
+            cron-integration.php \
             activation.php \
             btcpay-integration.php \
             setup.php \
             admin.php \
             api.php \
             pay.php \
-            includes/database.php
+            includes/database.php \
+            assets/img/barebits-gateway-logo.png
 
       - name: Version-stamp the release assets
         # Rename the fixed build outputs to version-stamped asset names. The
@@ -124,25 +143,31 @@ jobs:
         # cashupayserver/ (the updater hardcodes that), and wordpress_plugin.zip
         # still contains cashupay/ (the WP plugin slug).
         run: |
-          tag="${{ github.ref_name }}"
+          tag="$TAG"
           cp build/cashupayserver.zip "build/cashupayserver-${tag}.zip"
           cp build/wordpress_plugin.zip "build/wordpress_plugin-${tag}.zip"
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name }}
-          name: "CashuPayServer ${{ github.ref_name }}"
+          tag_name: ${{ env.TAG }}
+          # When the tag doesn't exist yet (the workflow_call path), GitHub
+          # creates it while publishing — and without an explicit target it
+          # points the tag at the default branch's head, not the commit that
+          # was built. Pin it to the built commit. Ignored when the tag
+          # already exists (the tag-push path).
+          target_commitish: ${{ github.sha }}
+          name: "CashuPayServer ${{ env.TAG }}"
           body: |
-            CashuPayServer ${{ github.ref_name }}, built from ${{ github.sha }}.
+            CashuPayServer ${{ env.TAG }}, built from ${{ github.sha }}.
 
             Assets:
-            - `cashupayserver-${{ github.ref_name }}.zip` — standalone server (the auto-updater pulls this)
-            - `wordpress_plugin-${{ github.ref_name }}.zip` — WordPress plugin
+            - `cashupayserver-${{ env.TAG }}.zip` — standalone server (the auto-updater pulls this)
+            - `wordpress_plugin-${{ env.TAG }}.zip` — WordPress plugin
             - `BUILD_INFO` — build metadata
           prerelease: ${{ steps.classify.outputs.prerelease }}
           make_latest: ${{ steps.classify.outputs.make_latest }}
           files: |
-            build/cashupayserver-${{ github.ref_name }}.zip
-            build/wordpress_plugin-${{ github.ref_name }}.zip
+            build/cashupayserver-${{ env.TAG }}.zip
+            build/wordpress_plugin-${{ env.TAG }}.zip
             build/cashupayserver/BUILD_INFO

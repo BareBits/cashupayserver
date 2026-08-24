@@ -17,6 +17,7 @@ require_once __DIR__ . '/safe_http.php';
 require_once __DIR__ . '/swap/auto_melt.php';
 require_once __DIR__ . '/store_ln_addresses.php';
 require_once __DIR__ . '/clink/client.php';
+require_once __DIR__ . '/nwc/client.php';
 require_once __DIR__ . '/../cashu-wallet-php/CashuWallet.php';
 
 use Cashu\Wallet;
@@ -246,7 +247,11 @@ class LightningAddress {
             if (empty($destinations)) {
                 continue;
             }
-            $primaryAddress = $destinations[0]['value'];
+            // Display-safe form (masks NWC connection URIs) — this string ends
+            // up in notifications and logs, never used to actually melt.
+            $primaryAddress = StoreLnAddresses::displayValue(
+                $destinations[0]['type'], $destinations[0]['value']
+            );
             try {
                 // Check store balance from local storage (offline-first, no mint contact)
                 // This prevents crashes when mint is unreachable
@@ -303,7 +308,8 @@ class LightningAddress {
                     $usedAddress = null;
                     $lastMeltError = null;
                     foreach ($destinations as $priority => $dest) {
-                        $destValue = $dest['value'];
+                        // Log/notification-safe form (masks NWC secrets).
+                        $destShown = StoreLnAddresses::displayValue($dest['type'], $dest['value']);
                         try {
                             $meltResult = self::meltToDestination(
                                 $store['id'],
@@ -311,14 +317,14 @@ class LightningAddress {
                                 $meltAmountSats,
                                 'BareBits auto-cashout'
                             );
-                            $usedAddress = $destValue;
+                            $usedAddress = $destShown;
                             if ($priority > 0) {
-                                error_log("Auto-melt: used fallback destination (priority {$priority}, {$dest['type']}) {$destValue} for store {$store['id']}");
+                                error_log("Auto-melt: used fallback destination (priority {$priority}, {$dest['type']}) {$destShown} for store {$store['id']}");
                             }
                             break;
                         } catch (Exception $meltError) {
                             $lastMeltError = $meltError;
-                            error_log("Auto-melt attempt to {$destValue} ({$dest['type']}, priority {$priority}) failed for store {$store['id']}: " . $meltError->getMessage());
+                            error_log("Auto-melt attempt to {$destShown} ({$dest['type']}, priority {$priority}) failed for store {$store['id']}: " . $meltError->getMessage());
                         }
                     }
 
@@ -640,10 +646,15 @@ class LightningAddress {
 
     /**
      * Withdraw to a typed destination from the ordered chain, dispatching on
-     * type so callers can walk a mixed list of Lightning addresses and CLINK
-     * noffers uniformly.
+     * type so callers can walk a mixed list of Lightning addresses, NWC
+     * connections, and CLINK noffers uniformly.
      *
      *   lnaddress → meltToAddress (LNURL-pay resolution).
+     *   nwc       → ask the merchant's own wallet for a BOLT11 over Nostr
+     *               Wallet Connect (make_invoice), then melt to that one-shot
+     *               invoice. Only invoice creation is requested of the wallet;
+     *               the mint pays it, and the cashu melt preimage is the proof
+     *               of payment — no lookup_invoice needed on this side.
      *   noffer    → ask the noffer's Nostr service for a BOLT11 (acting as the
      *               payer), then melt to that one-shot invoice. The cashu melt
      *               preimage is the proof of payment, so noffer withdrawal needs
@@ -662,140 +673,13 @@ class LightningAddress {
             $resolved = ClinkClient::requestInvoice($value, $amountSats, $comment);
             return self::meltToBolt11($storeId, $resolved['bolt11'], $amountSats);
         }
+        if ($type === StoreLnAddresses::TYPE_NWC) {
+            // makeInvoice verifies the returned bolt11 encodes exactly
+            // $amountSats; meltToBolt11's expectedAmount bound re-checks
+            // against the mint's melt quote before proofs are spent.
+            $made = NwcClient::makeInvoice($value, $amountSats, $comment);
+            return self::meltToBolt11($storeId, $made['bolt11'], $amountSats);
+        }
         return self::meltToAddress($storeId, $value, $amountSats, $comment);
-    }
-}
-
-/**
- * UpstreamDevFee — pay the original CashuPayServer author via the existing
- * cypherpunk.today donation sink (Cashu-token POST mechanism).
- *
- * Previously this fee was charged on every withdrawal as an opt-out
- * "donation". It is now charged on the periodic fee-settlement cron tick
- * (see DevFee::settleStore) once ≥ 1000 sats are owed, and the sats paid
- * count as a network cost when computing the Modified MIT dev fee base.
- */
-class UpstreamDevFee {
-    /**
-     * Send tokens to the upstream dev fee sink
-     *
-     * @param string $storeId Store ID for wallet access
-     * @param int $amount Amount in mint units (NOT sats — caller should convert
-     *                    if the store mint is fiat-denominated)
-     */
-    public static function sendToSink(string $storeId, int $amount): array {
-        if ($amount < 1) {
-            return ['success' => false, 'token' => null, 'error' => 'Amount too small'];
-        }
-
-        try {
-            $wallet = Invoice::getWalletInstance($storeId);
-            $proofs = Invoice::getUnspentProofs($storeId);
-
-            // Check proof states at mint - filter out PENDING/SPENT proofs
-            if (!empty($proofs)) {
-                try {
-                    $states = $wallet->checkProofState($proofs);
-                    $validProofs = [];
-                    $spentSecrets = [];
-
-                    foreach ($states as $i => $state) {
-                        $mintState = $state['state'] ?? ProofState::UNSPENT;
-                        if ($mintState === ProofState::UNSPENT) {
-                            $validProofs[] = $proofs[$i];
-                        } elseif ($mintState === ProofState::SPENT) {
-                            $spentSecrets[] = $proofs[$i]->secret;
-                        }
-                        // Skip PENDING proofs - they can't be used for split
-                    }
-
-                    if (!empty($spentSecrets)) {
-                        Invoice::markProofsSpent($storeId, $spentSecrets);
-                    }
-
-                    $proofs = $validProofs;
-                } catch (\Cashu\CashuException $e) {
-                    error_log("UpstreamDevFee checkProofState failed: " . $e->getMessage());
-                }
-            }
-
-            $balance = Wallet::sumProofs($proofs);
-
-            $fee = $wallet->calculateFee($proofs);
-            $totalNeeded = $amount + $fee;
-
-            if ($balance < $totalNeeded) {
-                return ['success' => false, 'token' => null, 'error' => 'Insufficient balance for upstream dev fee'];
-            }
-
-            if ($fee > $amount) {
-                return ['success' => false, 'token' => null, 'error' => 'Fee exceeds upstream dev fee amount'];
-            }
-
-            $result = $wallet->split($proofs, $amount);
-            $feeProofs = $result['send'];
-
-            // Mark proofs as SPENT immediately - they're sent to the sink and gone from our wallet
-            // Using PENDING causes race conditions: the mint may report different states depending on
-            // when the sink processes the token, causing "proofs are pending" errors on exports
-            $feeSecrets = array_map(fn($p) => $p->secret, $feeProofs);
-            $wallet->getStorage()->updateProofsState($feeSecrets, ProofState::SPENT);
-
-            $token = $wallet->serializeToken($feeProofs);
-
-            self::postTokenToSink($token);
-
-            return ['success' => true, 'token' => $token, 'error' => null];
-
-        } catch (Exception $e) {
-            error_log("UpstreamDevFee error: " . $e->getMessage());
-            return ['success' => false, 'token' => null, 'error' => $e->getMessage()];
-        }
-    }
-
-    /**
-     * POST token to upstream dev fee sink (fire and forget)
-     */
-    public static function postTokenToSink(string $token): void {
-        if (!defined('CASHUPAY_UPSTREAM_DEV_FEE_SINK_URL')) {
-            error_log("Upstream dev fee sink URL not configured");
-            return;
-        }
-
-        try {
-            $result = \SafeHttp::request(CASHUPAY_UPSTREAM_DEV_FEE_SINK_URL, [
-                'method' => 'POST',
-                'body' => json_encode(['token' => $token]),
-                'headers' => ['Content-Type: application/json'],
-                'timeout' => 5,
-                'connectTimeout' => 3,
-                'allowPrivate' => false,
-            ]);
-
-            if ($result['error'] !== '') {
-                error_log("Upstream dev fee sink POST failed: " . $result['error']);
-            } elseif ($result['status'] >= 400) {
-                error_log("Upstream dev fee sink returned HTTP {$result['status']}: {$result['body']}");
-            } else {
-                error_log("Upstream dev fee sent successfully to sink");
-            }
-
-        } catch (Exception $e) {
-            error_log("Upstream dev fee sink error: " . $e->getMessage());
-        }
-    }
-
-    /**
-     * Calculate upstream dev fee amount from a given base amount (in sats).
-     * Floor-rounded; minimum 1 sat when the base is > 0.
-     */
-    public static function calculateAmount(int $baseSats): int {
-        if (!defined('CASHUPAY_UPSTREAM_DEV_FEE_PERCENT')) {
-            return 0;
-        }
-        if ($baseSats < 1) {
-            return 0;
-        }
-        return (int)floor($baseSats * CASHUPAY_UPSTREAM_DEV_FEE_PERCENT / 100);
     }
 }

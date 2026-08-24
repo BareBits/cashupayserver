@@ -10,26 +10,19 @@
  * optional note, we validate it (untrusted input), then hand off to
  * Invoice::create and the regular /payment/{id} display page.
  *
- * Config keys (stored in the `config` table via Config::*):
- *   selfserve_enabled   — bool, site default (off)
- *   selfserve_max_sats  — int, site default maximum invoice size in sats.
- *                         Caps how much liquidity a single self-serve invoice
- *                         can lock up. Defaults to DEFAULT_MAX_SATS.
- *
- * Per-store overrides live on the stores table:
- *   stores.selfserve_enabled   — tri-state: -1 inherit site / 0 force off /
- *                                1 force on (mirrors stores.swaps_enabled).
- *   stores.selfserve_max_sats  — INTEGER, NULL = inherit the site value.
- *
- * The toggle resolution + max resolution mirror the submarine-swaps pattern in
- * includes/swap/config.php so the admin UI and operator mental model stay
- * consistent.
+ * The settings are per-store only:
+ *   stores.selfserve_enabled   — 0 off / 1 on. Default off (NULL and legacy
+ *                                -1 "inherit" rows — from when a site-wide
+ *                                default existed — resolve to off).
+ *   stores.selfserve_max_sats  — INTEGER, NULL = the built-in default
+ *                                (DEFAULT_MAX_SATS).
  */
 
 require_once __DIR__ . '/config.php';
 require_once __DIR__ . '/database.php';
 
 final class SelfServe {
+    /** Legacy sentinel still present in pre-store-only rows; resolves to off. */
     public const INHERIT   = -1;
     public const FORCE_OFF = 0;
     public const FORCE_ON  = 1;
@@ -44,51 +37,13 @@ final class SelfServe {
     public const NOTES_MAX_LEN = 200;
 
     // ------------------------------------------------------------------
-    // Site-wide toggle
-    // ------------------------------------------------------------------
-
-    public static function siteEnabled(): bool {
-        return (bool)Config::get('selfserve_enabled', false);
-    }
-
-    public static function setSiteEnabled(bool $enabled): void {
-        Config::set('selfserve_enabled', $enabled);
-    }
-
-    // ------------------------------------------------------------------
-    // Site-wide maximum invoice size (sats)
-    // ------------------------------------------------------------------
-
-    public static function siteMaxSats(): int {
-        $raw = Config::get('selfserve_max_sats', null);
-        if ($raw === null || (int)$raw <= 0) {
-            return self::DEFAULT_MAX_SATS;
-        }
-        return (int)$raw;
-    }
-
-    /**
-     * Persist the site-wide max. Pass null to clear it back to the built-in
-     * default (DEFAULT_MAX_SATS).
-     */
-    public static function setSiteMaxSats(?int $sats): void {
-        if ($sats === null) {
-            Config::delete('selfserve_max_sats');
-            return;
-        }
-        if ($sats <= 0) {
-            throw new InvalidArgumentException('Self-serve max must be a positive number of sats');
-        }
-        Config::set('selfserve_max_sats', $sats);
-    }
-
-    // ------------------------------------------------------------------
-    // Per-store override (tri-state) + resolution
+    // Per-store toggle + resolution
     // ------------------------------------------------------------------
 
     /**
-     * Raw per-store tri-state override (-1 inherit / 0 off / 1 on). Defaults
-     * to INHERIT when the column is NULL (older rows) or the store is missing.
+     * Raw per-store value (0 off / 1 on / legacy -1, which resolves to off).
+     * Defaults to INHERIT when the column is NULL (older rows) or the store
+     * is missing.
      */
     public static function storeOverride(string $storeId): int {
         $row = Database::fetchOne(
@@ -101,21 +56,21 @@ final class SelfServe {
         return (int)$row['selfserve_enabled'];
     }
 
-    public static function setStoreOverride(string $storeId, int $tri): void {
-        if (!in_array($tri, [self::INHERIT, self::FORCE_OFF, self::FORCE_ON], true)) {
-            throw new InvalidArgumentException("Invalid selfserve_enabled tri-state: {$tri}");
+    public static function setStoreOverride(string $storeId, int $enabled): void {
+        if (!in_array($enabled, [self::FORCE_OFF, self::FORCE_ON], true)) {
+            throw new InvalidArgumentException("Invalid selfserve_enabled value: {$enabled}");
         }
         Database::query(
             "UPDATE stores SET selfserve_enabled = ? WHERE id = ?",
-            [$tri, $storeId]
+            [$enabled, $storeId]
         );
     }
 
     /**
-     * Is self-serve effectively enabled for this store? Combines the per-store
-     * tri-state with the site default, and additionally requires the store to
-     * actually be able to take a payment — otherwise the public page would
-     * render a form that always errors on submit.
+     * Is self-serve effectively enabled for this store? Requires the per-store
+     * flag to be ON (NULL / legacy -1 rows resolve to off), and additionally
+     * requires the store to actually be able to take a payment — otherwise the
+     * public page would render a form that always errors on submit.
      */
     public static function isEnabledForStore(string $storeId): bool {
         $store = Config::getStore($storeId);
@@ -125,14 +80,8 @@ final class SelfServe {
         if (!self::storeIsPaymentCapable($store)) {
             return false;
         }
-        $tri = $store['selfserve_enabled'] === null
-            ? self::INHERIT
-            : (int)$store['selfserve_enabled'];
-        return match ($tri) {
-            self::FORCE_ON  => true,
-            self::FORCE_OFF => false,
-            default         => self::siteEnabled(),
-        };
+        return $store['selfserve_enabled'] !== null
+            && (int)$store['selfserve_enabled'] === self::FORCE_ON;
     }
 
     /**
@@ -154,8 +103,8 @@ final class SelfServe {
     // ------------------------------------------------------------------
 
     /**
-     * Raw per-store override (sats), or null when the store inherits the site
-     * value. Returned value is always > 0 when non-null.
+     * Raw per-store override (sats), or null when the store uses the built-in
+     * default. Returned value is always > 0 when non-null.
      */
     public static function storeMaxSats(string $storeId): ?int {
         $row = Database::fetchOne(
@@ -180,15 +129,11 @@ final class SelfServe {
     }
 
     /**
-     * Resolved maximum invoice size in sats for a store: per-store override
-     * wins, else the site value, else the built-in default.
+     * Resolved maximum invoice size in sats for a store: per-store value
+     * wins, else the built-in default.
      */
     public static function effectiveMaxSats(string $storeId): int {
-        $store = self::storeMaxSats($storeId);
-        if ($store !== null) {
-            return $store;
-        }
-        return self::siteMaxSats();
+        return self::storeMaxSats($storeId) ?? self::DEFAULT_MAX_SATS;
     }
 
     // ------------------------------------------------------------------

@@ -66,7 +66,7 @@ class MockSwapProvider implements SwapProvider {
 
         // Generate a deterministic refund key for the test.
         $refundPriv = hash('sha256', 'mock-refund-key', true);
-        $refundPub = Secp256k1::pointToCompressed(Secp256k1::generatorMult(Secp256k1::bytesToGmp($refundPriv)));
+        $refundPub = Secp256k1::pointToCompressed(Secp256k1::generatorMult(Secp256k1::bytesToNum($refundPriv)));
         $claimPub = hex2bin($claimPubkeyHex);
         $preimageHash = hex2bin($preimageHashHex);
 
@@ -146,10 +146,8 @@ class MockSwapProvider implements SwapProvider {
 
 Database::initialize();
 
-// Site config: enable swaps with mock provider only
-SwapsConfig::setSiteEnabled(true);
-SwapsConfig::setProviderOrder(['mock']);
-SwapsConfig::setStrictNoMintFallback(true);
+// Swaps are store-only now; the store row below carries the flag and the
+// provider prefs are written right after it exists.
 SwapProviderFactory::setRegistry(['mock' => new MockSwapProvider()]);
 
 // Create a store with xpub configured (regtest tpub for sanity).
@@ -164,7 +162,10 @@ Database::insert('stores', [
     'onchain_xpub' => 'tpubD6NzVbkrYhZ4WaWSyoBvQwbpLkojyoTZPRsgXELWz3Popb3qkjcJyJUGLnL4qHHoQvao8ESaAstxYSnhyswJ76uZPStJRJCTKvosUCJZL5B',
     'onchain_address_type' => 'P2WPKH',
     'onchain_network' => 'regtest',
+    'swaps_enabled' => SwapsConfig::FORCE_ON,
 ]);
+SwapsConfig::setStoreProviderOrder($storeId, ['mock']);
+SwapsConfig::setStoreStrictOverride($storeId, SwapsConfig::FORCE_ON);
 
 // ------------- Create an invoice (target 50,000 sats) -------------
 
@@ -231,7 +232,7 @@ tassert($invoiceAfter['status'] === 'Settled', 'invoice settled', $failures);
 // turn OFF the customer-facing on-chain rail for a Lightning-only checkout. The
 // swap is still created and still allocates its xpub claim address; the invoice
 // just carries no pay-to-address.
-tassert(OnchainConfig::isEnabledForStore($storeId) === true, 'offering default: enabled (inherits site default)', $failures);
+tassert(OnchainConfig::isEnabledForStore($storeId) === true, 'offering default: enabled', $failures);
 OnchainConfig::setStoreOverride($storeId, OnchainConfig::FORCE_OFF);
 tassert(OnchainConfig::isEnabledForStore($storeId) === false, 'offering-off: resolver reports disabled', $failures);
 $lnOnly = Invoice::create($storeId, ['amount' => 50000, 'currency' => 'sat']);
@@ -241,7 +242,11 @@ tassert(empty($lnOnly['onchain_address']), 'offering-off: no customer-facing on-
 $lnOnlySwap = Database::fetchOne("SELECT merchant_address FROM swap_attempts WHERE invoice_id = ?", [$lnOnly['id']]);
 tassert($lnOnlySwap && !empty($lnOnlySwap['merchant_address']),
     'offering-off: swap still allocates its xpub claim address (settles on-chain internally)', $failures);
-OnchainConfig::setStoreOverride($storeId, OnchainConfig::INHERIT);
+OnchainConfig::setStoreOverride($storeId, OnchainConfig::FORCE_ON);
+tassert(OnchainConfig::isEnabledForStore($storeId) === true, 'offering back on', $failures);
+// A legacy -1 row (pre-store-only installs) resolves to on.
+Database::query("UPDATE stores SET onchain_offer_enabled = -1 WHERE id = ?", [$storeId]);
+tassert(OnchainConfig::isEnabledForStore($storeId) === true, 'legacy -1 offer row resolves to on', $failures);
 
 // ------------- Lockup mismatch defense -------------
 
@@ -265,8 +270,8 @@ final class BadLockupProvider extends MockSwapProvider {
 }
 
 SwapProviderFactory::setRegistry(['badmock' => new BadLockupProvider()]);
-SwapsConfig::setProviderOrder(['badmock']);
-SwapsConfig::setStrictNoMintFallback(true);
+SwapsConfig::setStoreProviderOrder($storeId, ['badmock']);
+SwapsConfig::setStoreStrictOverride($storeId, SwapsConfig::FORCE_ON);
 
 $threw = false;
 try {

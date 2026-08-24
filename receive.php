@@ -17,6 +17,7 @@ require_once __DIR__ . '/includes/urls.php';
 require_once __DIR__ . '/includes/rates.php';
 require_once __DIR__ . '/includes/invoice.php';
 require_once __DIR__ . '/includes/offline_cashu.php';
+require_once __DIR__ . '/includes/security.php';
 require_once __DIR__ . '/cashu-wallet-php/CashuWallet.php';
 
 use Cashu\Wallet;
@@ -46,6 +47,18 @@ if (!Config::isSetupComplete()) {
  */
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     header('Content-Type: application/json');
+
+    // Rate-limit this unauthenticated endpoint per client IP: every accepted
+    // POST triggers a full mint swap (or offline DLEQ verification) plus DB
+    // writes, so unthrottled it lets anyone holding a (semi-public) store_id
+    // burn the mint's API budget and pin FPM workers. Same posture as the
+    // public self-serve create path in pay.php.
+    $rlIp = Security::getClientIp();
+    if (!Security::checkRateLimit('receive_token', $rlIp, 30)) {
+        cashupay_status(429);
+        echo json_encode(['error' => 'Too many requests. Please wait a minute and try again.']);
+        exit;
+    }
 
     // Get JSON body
     $input = file_get_contents('php://input');
@@ -659,8 +672,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
             background: white;
             padding: 1rem;
             border-radius: 16px;
-            display: inline-block;
+            width: 100%;
             margin-bottom: 1.5rem;
+        }
+        .qr-container canvas {
+            display: block;
+            width: 100%;
+            height: auto;
+            aspect-ratio: 1;
         }
         .request-string {
             background: rgba(0,0,0,0.2);
@@ -733,10 +752,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
         if (typeof QRious !== 'undefined') {
             const canvas = document.createElement('canvas');
             document.getElementById('qr-container').appendChild(canvas);
+            // Rendered oversized; CSS scales it down to fill the card, which
+            // keeps the canvas crisp on hidpi screens.
             new QRious({
                 element: canvas,
                 value: prString,
-                size: 200,
+                size: 640,
                 backgroundAlpha: 1,
                 foreground: '#000000',
                 background: '#ffffff',

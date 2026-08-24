@@ -1,9 +1,19 @@
 """Admin UI: ordered Lightning-address fallback chain.
 
-Drives the per-store Auto-Cashout card: add several Lightning addresses,
-reorder them with the up/down arrows, save, and verify the store_ln_addresses
-table reflects the on-screen priority order. Also checks that the save button
-enforces client-side validation (duplicate + malformed address).
+Drives the per-store "Lightning payments" card (the destination lists moved
+there from the old Auto-Cashout card and are always visible): add several
+Lightning addresses, reorder them with the up/down arrows, save via
+#btn-save-lightning-payments, and verify the store_ln_addresses table reflects
+the on-screen priority order. Also checks that the save button enforces
+client-side validation (duplicate + malformed address). The enable/threshold
+half of auto-cashout is saved separately via #btn-save-auto-melt and is
+exercised alongside the list saves.
+
+Saving the lists runs the server-side LUD-21 gate, so the persistence tests use
+the `configured_with_lnurlp` stack — its CASHU_LNURL_URL_TEMPLATE routes every
+address to the mock LNURL host, which advertises a verify URL. The last test
+runs against the plain `configured` stack (no LNURL host reachable) and
+asserts the gate blocks the save with a visible error.
 
 Run with: pytest tests/ui/test_admin_ln_addresses_ui.py -v -s
 """
@@ -32,19 +42,62 @@ def _ln_addresses(handle, store_id: str) -> list[str]:
     return [r[0] for r in rows]
 
 
-def _open_auto_cashout(page, configured: ConfiguredPayserver) -> None:
+def _open_lightning_payments(page, configured: ConfiguredPayserver) -> None:
     page.set_default_timeout(15000)
     page.goto(f"{configured.handle.url}/admin")
     page.fill("#password-input", configured.admin_password)
     page.click("#password-submit")
     page.wait_for_selector("#app", state="visible")
     page.locator('.nav-item[data-view="stores"]').click()
-    page.wait_for_selector("#aw-store", state="visible")
-    # Select Lightning-address mode so the address group is shown. The list div
-    # (#auto-melt-address-list) starts empty and thus has zero size, which
-    # Playwright treats as hidden — so wait on the always-present Add button.
-    page.locator('#aw-store .aw-col[data-aw-mode="0"]').click()
+    # The "Lightning payments" card is always visible — no cashout-mode click
+    # needed. The list div (#auto-melt-address-list) starts empty and thus has
+    # zero size, which Playwright treats as hidden — so wait on the
+    # always-present Add button.
+    page.wait_for_selector("#card-lightning-payments", state="visible")
     page.wait_for_selector("#btn-add-ln-address", state="visible")
+    # Wait for the dashboard payload to land (it re-renders the saved lists);
+    # rows added before that render would be wiped by it.
+    page.wait_for_function(
+        "() => { const el = document.getElementById('onchain-offer-effective');"
+        " return el && el.textContent.trim() && el.textContent.trim() !== '\\u2014'; }"
+    )
+
+
+def _reset_toast(page) -> None:
+    """The #toast div keeps its old text after hiding; reset it so a wait for
+    the next toast can't match a stale one."""
+    page.evaluate(
+        "() => { const t = document.getElementById('toast'); t.textContent = ''; t.className = 'toast'; }"
+    )
+
+
+def _save_lists_and_wait(page) -> None:
+    """Save the Lightning payments lists and wait for the success toast."""
+    _reset_toast(page)
+    page.click("#btn-save-lightning-payments")
+    page.wait_for_selector("#toast.show:has-text('Settings saved!')", timeout=30000)
+
+
+def _save_cashout_and_wait(page) -> None:
+    """Save the Cashu automatic cashout card (enabled/threshold/mode) and wait
+    for the success toast."""
+    _reset_toast(page)
+    page.click("#btn-save-auto-melt")
+    page.wait_for_selector("#toast.show:has-text('Settings saved!')", timeout=30000)
+
+
+def _enable_cashout_and_save(page, threshold: str = "100") -> None:
+    """Turn auto-cashout on with a threshold and save the cashout card.
+
+    Run AFTER the list save: that save reloads the dashboard, which resets
+    #auto-melt-enabled / #auto-melt-threshold to their persisted values and
+    would clobber values set before it. The toggle is a CSS-hidden checkbox
+    positioned off the viewport, so it is set directly rather than clicked;
+    its value is only read on save (no change handler)."""
+    page.wait_for_timeout(1500)  # let the post-save dashboard reload land
+    page.evaluate("() => { document.getElementById('auto-melt-enabled').checked = true; }")
+    page.fill("#auto-melt-threshold", threshold)
+    _save_cashout_and_wait(page)
 
 
 def _fill_rows(page, addresses: list[str]) -> None:
@@ -56,26 +109,22 @@ def _fill_rows(page, addresses: list[str]) -> None:
         inputs.nth(i).fill(addr)
 
 
-def test_add_reorder_and_save_chain(configured: ConfiguredPayserver, page) -> None:
-    _open_auto_cashout(page, configured)
+def test_add_reorder_and_save_chain(configured_with_lnurlp: ConfiguredPayserver, page) -> None:
+    configured = configured_with_lnurlp
+    _open_lightning_payments(page, configured)
 
     # Add three addresses in order A, B, C.
     _fill_rows(page, [ADDR_A, ADDR_B, ADDR_C])
-
-    # Enable auto-melt + a threshold so the save validation passes.
-    # Enable auto-melt. The toggle is a CSS-hidden checkbox positioned off the
-    # viewport, so set it directly rather than clicking; its value is only read
-    # on save (no change handler).
-    page.evaluate("() => { document.getElementById('auto-melt-enabled').checked = true; }")
-    page.fill("#auto-melt-threshold", "100")
 
     # Move the third row (C) up one → order becomes A, C, B.
     rows = page.locator("#auto-melt-address-list .ln-address-row")
     rows.nth(2).locator('button[title="Move up"]').click()
 
-    page.click("#btn-save-auto-melt")
-    # Wait for the save to land + dashboard reload.
-    page.wait_for_timeout(2500)
+    # The lists and the enable/threshold pair now save through separate
+    # buttons — lists first, then the cashout settings (the store has a mint
+    # wallet, so the cashout card is interactive).
+    _save_lists_and_wait(page)
+    _enable_cashout_and_save(page)
 
     assert _ln_addresses(configured.handle, configured.store_id) == [
         ADDR_A,
@@ -84,39 +133,47 @@ def test_add_reorder_and_save_chain(configured: ConfiguredPayserver, page) -> No
     ], "saved chain should match on-screen priority order after reorder"
 
 
-def test_remove_row(configured: ConfiguredPayserver, page) -> None:
-    _open_auto_cashout(page, configured)
+def test_remove_row(configured_with_lnurlp: ConfiguredPayserver, page) -> None:
+    configured = configured_with_lnurlp
+    _open_lightning_payments(page, configured)
     _fill_rows(page, [ADDR_A, ADDR_B])
-    # Enable auto-melt. The toggle is a CSS-hidden checkbox positioned off the
-    # viewport, so set it directly rather than clicking; its value is only read
-    # on save (no change handler).
-    page.evaluate("() => { document.getElementById('auto-melt-enabled').checked = true; }")
-    page.fill("#auto-melt-threshold", "100")
 
     # Remove the first row (A) → only B remains.
     rows = page.locator("#auto-melt-address-list .ln-address-row")
     rows.nth(0).locator('button[title="Remove"]').click()
 
-    page.click("#btn-save-auto-melt")
-    page.wait_for_timeout(2500)
+    _save_lists_and_wait(page)
+    _enable_cashout_and_save(page)
 
     assert _ln_addresses(configured.handle, configured.store_id) == [ADDR_B]
 
 
 def test_duplicate_rejected_client_side(configured: ConfiguredPayserver, page) -> None:
-    _open_auto_cashout(page, configured)
+    _open_lightning_payments(page, configured)
     _fill_rows(page, [ADDR_A, ADDR_A])
-    # Enable auto-melt. The toggle is a CSS-hidden checkbox positioned off the
-    # viewport, so set it directly rather than clicking; its value is only read
-    # on save (no change handler).
-    page.evaluate("() => { document.getElementById('auto-melt-enabled').checked = true; }")
-    page.fill("#auto-melt-threshold", "100")
 
-    page.click("#btn-save-auto-melt")
+    page.click("#btn-save-lightning-payments")
     page.wait_for_timeout(1000)
 
-    # The inline error surfaces and nothing is persisted.
-    err = page.locator("#aw-store-error")
+    # The inline error surfaces (in the Lightning payments card's own error
+    # div) and nothing is persisted.
+    err = page.locator("#lightning-payments-error")
     assert err.is_visible(), "expected inline duplicate-address error"
     assert "Duplicate" in err.text_content()
+    assert _ln_addresses(configured.handle, configured.store_id) == []
+
+
+def test_unverifiable_address_blocked_server_side(
+    configured: ConfiguredPayserver, page
+) -> None:
+    """On the plain stack no LNURL host is reachable, so the server-side
+    LUD-21 gate rejects the save: the error toast shows and nothing lands in
+    store_ln_addresses."""
+    _open_lightning_payments(page, configured)
+    _fill_rows(page, [ADDR_A])
+
+    page.click("#btn-save-lightning-payments")
+    # The probe times out server-side before the 400 comes back — allow for it.
+    page.wait_for_selector("#toast.show.error", timeout=20000)
+    assert "didn't respond" in page.locator("#toast").text_content()
     assert _ln_addresses(configured.handle, configured.store_id) == []

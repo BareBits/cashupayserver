@@ -29,6 +29,102 @@ function cashupay_is_real_btcpay_configured(): bool {
 }
 
 /**
+ * Pure decision for the existing-BTCPay takeover flow. Given the BTCPay
+ * plugin's configured server URL, our own Greenfield URL, and the URL the
+ * merchant last consented to replace, decide what the wiring may do:
+ *
+ *   'none'          no real BTCPay Server is configured (URL empty or already
+ *                   ours) — normal wiring may proceed.
+ *   'needs_consent' a real server is configured and no matching consent
+ *                   exists — hands off entirely until the merchant approves.
+ *   'consented'     a real server is configured and the merchant approved
+ *                   replacing exactly this one.
+ *
+ * Consent is compared against the exact configured URL: approval given for
+ * one server must never silently authorize clobbering a different one the
+ * merchant connected later.
+ *
+ * Pure (no WordPress calls) so tests/php can pin the matrix without a
+ * WordPress install; cashupay_btcpay_takeover_state() is the live wrapper.
+ */
+function cashupay_btcpay_takeover_decision(string $configuredUrl, string $ourUrl, string $consentUrl): string {
+    $configuredUrl = trim($configuredUrl);
+    // Mirrors cashupay_is_real_btcpay_configured(): empty or prefixed by our
+    // own URL means the config is ours (or absent), not a real server's.
+    if ($configuredUrl === '' || strpos($configuredUrl, $ourUrl) === 0) {
+        return 'none';
+    }
+    return trim($consentUrl) === $configuredUrl ? 'consented' : 'needs_consent';
+}
+
+/**
+ * The takeover decision for this site's live options. Consent is persisted in
+ * an option (not the PHP session) because it can be granted on the wizard's
+ * terms screen and consumed on a completion-screen render in a later request.
+ */
+function cashupay_btcpay_takeover_state(): string {
+    return cashupay_btcpay_takeover_decision(
+        (string) get_option('btcpay_gf_url', ''),
+        site_url('/cashupay'),
+        (string) get_option('cashupay_btcpay_override_consent', '')
+    );
+}
+
+/**
+ * Record the merchant's approval to replace the currently configured BTCPay
+ * Server connection. Stores the exact URL being replaced, so the consent is
+ * scoped to that server and a later reconnection to a different one re-warns.
+ */
+function cashupay_record_btcpay_override_consent(): void {
+    $url = trim((string) get_option('btcpay_gf_url', ''));
+    if ($url !== '') {
+        update_option('cashupay_btcpay_override_consent', $url);
+    }
+}
+
+/**
+ * Delete every option the BTCPay Greenfield plugin holds — the btcpay_gf_*
+ * globals (server URL, API key, store id, webhook, order states, transaction
+ * speed, separate-gateways mode, …) and all woocommerce_btcpaygf_* gateway
+ * settings (the default gateway plus any separate per-payment-method ones).
+ *
+ * Only called on a consented takeover: the merchant approved replacing "all
+ * existing settings", and the writers that run next then find every field
+ * empty and fill in BareBits defaults. Deleting by prefix rather than by a
+ * hardcoded list keeps this correct across gateway-plugin versions; each name
+ * goes through delete_option() so the options cache stays coherent.
+ */
+function cashupay_reset_btcpay_plugin_settings(): void {
+    global $wpdb;
+    // Internal bookkeeping the gateway plugin keeps alongside its settings —
+    // not configuration of the old server, so it survives the wipe.
+    // btcpay_gf_version is load-bearing: it gates UpdateManager::processUpdates()
+    // at every plugin boot, and with it deleted each boot re-runs the version
+    // migrations — update-1.0.3's webhook migration performs a BLOCKING API
+    // call against the configured server URL, which after the takeover is this
+    // site itself, so every request spawns a loopback request that boots the
+    // plugin again until the PHP workers are exhausted and the site deadlocks.
+    // The dismissal flags are merely the merchant's notice/review UI state.
+    $keep = [
+        'btcpay_gf_version',
+        'btcpay_gf_review_dismissed',
+        'btcpay_gf_review_dismissed_forever',
+        'btcpay_gf_order_states_warning',
+    ];
+    $names = $wpdb->get_col(
+        "SELECT option_name FROM {$wpdb->options}
+          WHERE option_name LIKE 'btcpay\\_gf\\_%'
+             OR option_name LIKE 'woocommerce\\_btcpaygf\\_%'"
+    );
+    foreach ((array) $names as $name) {
+        if (in_array((string) $name, $keep, true)) {
+            continue;
+        }
+        delete_option((string) $name);
+    }
+}
+
+/**
  * Fully qualified plugin file for the BTCPay Greenfield WooCommerce gateway,
  * as WordPress identifies it (folder/entry-file).
  */
@@ -64,6 +160,190 @@ function cashupay_enable_btcpay_gateway(): void {
     }
     $settings['enabled'] = 'yes';
     update_option($optionKey, $settings);
+}
+
+/**
+ * Ensure the bundled BareBits gateway logo exists as a media-library
+ * attachment and return its id (0 on failure).
+ *
+ * The attachment id is cached in an option so repeated completion-screen
+ * renders reuse the same attachment instead of re-uploading the file. The
+ * attachment metadata is written WITHOUT intermediate sizes on purpose: the
+ * BTCPay gateway resolves its icon via wp_get_attachment_image_src() at the
+ * default 'thumbnail' size, and a generated 150x150 crop would truncate the
+ * ~154px-wide wordmark. With no registered sizes WordPress falls back to the
+ * original file.
+ */
+function cashupay_ensure_gateway_icon_attachment(): int {
+    $existing = (int) get_option('cashupay_gateway_icon_attachment_id', 0);
+    if ($existing > 0 && wp_get_attachment_url($existing) !== false) {
+        return $existing;
+    }
+
+    $src = CASHUPAY_PLUGIN_DIR . '/assets/img/barebits-gateway-logo.png';
+    if (!is_file($src)) {
+        return 0;
+    }
+    $contents = file_get_contents($src);
+    if ($contents === false) {
+        return 0;
+    }
+
+    $bits = wp_upload_bits('barebits-gateway-logo.png', null, $contents);
+    if (!empty($bits['error'])) {
+        return 0;
+    }
+
+    $attachmentId = wp_insert_attachment([
+        'post_mime_type' => 'image/png',
+        'post_title'     => 'BareBits payment gateway logo',
+        'post_status'    => 'inherit',
+    ], $bits['file']);
+    if (is_wp_error($attachmentId) || !$attachmentId) {
+        return 0;
+    }
+
+    $size = @getimagesize($bits['file']);
+    wp_update_attachment_metadata((int) $attachmentId, [
+        'width'  => (int) ($size[0] ?? 0),
+        'height' => (int) ($size[1] ?? 0),
+        'file'   => _wp_relative_upload_path($bits['file']),
+    ]);
+
+    update_option('cashupay_gateway_icon_attachment_id', (int) $attachmentId);
+    return (int) $attachmentId;
+}
+
+/**
+ * Apply BareBits branding (checkout title, customer message, gateway logo) to
+ * the BTCPay gateway's WooCommerce settings.
+ *
+ * Deliberately conservative: each field is written only when it is empty or
+ * still carries the stock BTCPay default, so a merchant's manual edits under
+ * WooCommerce -> Settings -> Payments -> BTCPay survive every re-run of the
+ * setup completion screen.
+ *
+ * $discountPercent (the wizard's site-wide wp_btc_discount_percent, validated
+ * 0-100) is advertised in the checkout title so customers see the incentive
+ * before picking a payment method.
+ */
+function cashupay_apply_btcpay_gateway_branding(int $discountPercent = 0): void {
+    $optionKey = 'woocommerce_btcpaygf_default_settings';
+    $settings = get_option($optionKey, []);
+    if (!is_array($settings)) {
+        $settings = [];
+    }
+
+    // Stock defaults from the BTCPay plugin's DefaultGateway::getTitle() /
+    // getDescription(). Anything else means the merchant customized it.
+    $stockTitle = 'BTCPay (Bitcoin, Lightning Network, ...)';
+    $stockDescription = 'You will be redirected to BTCPay to complete your purchase.';
+
+    $title = trim((string) ($settings['title'] ?? ''));
+    if ($title === '' || $title === $stockTitle) {
+        $settings['title'] = 'BareBits (Bitcoin + Lightning)'
+            . ($discountPercent > 0 ? sprintf(' %d%% discount', $discountPercent) : '');
+    }
+
+    $description = trim((string) ($settings['description'] ?? ''));
+    if ($description === '' || $description === $stockDescription) {
+        $settings['description'] = 'CashApp, PayPal, and Venmo are all Bitcoin wallets. '
+            . 'You will be redirected to BareBits to complete this payment.';
+    }
+
+    if (empty($settings['icon_media_id'])) {
+        $iconId = cashupay_ensure_gateway_icon_attachment();
+        if ($iconId > 0) {
+            $settings['icon_media_id'] = (string) $iconId;
+        }
+    }
+
+    update_option($optionKey, $settings);
+}
+
+/**
+ * Map the BTCPay plugin's "Expired" webhook to wc-failed instead of its stock
+ * wc-cancelled. WooCommerce keeps failed orders payable (the order-pay
+ * endpoint plus the "Pay" button under My Account → Orders), so the customer
+ * can retry after an invoice lapses; a cancelled order loses that affordance
+ * and restocks the items.
+ *
+ * Same conservatism as the branding writer above: the mapping is flipped only
+ * while it is unset or still the stock default, so a merchant's deliberate
+ * choice under WooCommerce → Settings → Payments → BTCPay survives re-runs of
+ * the completion screen. The full mapping array is always written because the
+ * plugin's webhook handler indexes every state without isset() checks once
+ * the option exists.
+ */
+function cashupay_apply_btcpay_order_states(): void {
+    // Stock defaults from the plugin's OrderStates::getDefaultOrderStateMappings().
+    $defaults = [
+        'New'                => 'wc-pending',
+        'Processing'         => 'wc-on-hold',
+        'Settled'            => 'BTCPAY_IGNORE',
+        'SettledPaidOver'    => 'wc-processing',
+        'Invalid'            => 'wc-failed',
+        'Expired'            => 'wc-cancelled',
+        'ExpiredPaidPartial' => 'wc-failed',
+        'ExpiredPaidLate'    => 'wc-processing',
+    ];
+
+    $states = get_option('btcpay_gf_order_states');
+    if (!is_array($states)) {
+        $states = [];
+    }
+
+    $current = (string) ($states['Expired'] ?? '');
+    if ($current !== '' && $current !== 'wc-cancelled') {
+        return; // The merchant picked something else on purpose.
+    }
+
+    update_option(
+        'btcpay_gf_order_states',
+        array_merge($defaults, $states, ['Expired' => 'wc-failed'])
+    );
+}
+
+/**
+ * Redirect a payer whose invoice expired back to a page where they can pay.
+ *
+ * Linked from the payment page's expired screen as /cashupay/retry/{invoiceId}.
+ * Resolves the invoice back to its WooCommerce order via the BTCPay_id order
+ * meta (the same lookup the gateway's webhook handler uses), then sends the
+ * customer to WooCommerce's order-pay page — where clicking "Pay" makes the
+ * gateway notice the old invoice is Expired and mint a fresh one. Orders that
+ * no longer need payment (paid meanwhile, cancelled, refunded) go to the
+ * order-received page instead, which explains the order's actual state.
+ */
+function cashupay_handle_retry_redirect(string $invoiceId): void {
+    // Without WooCommerce (or if the invoice can't be resolved to exactly one
+    // order) the front page beats a dead end — the expired payment page is
+    // what linked here, so bouncing back to it would loop.
+    $fallback = home_url('/');
+
+    if (!function_exists('wc_get_orders')) {
+        wp_safe_redirect($fallback);
+        exit;
+    }
+
+    $orders = wc_get_orders([
+        'meta_key' => 'BTCPay_id',
+        'meta_value' => $invoiceId,
+    ]);
+
+    if (!is_array($orders) || count($orders) !== 1) {
+        wp_safe_redirect($fallback);
+        exit;
+    }
+
+    $order = $orders[0];
+    if ($order->needs_payment()) {
+        wp_safe_redirect($order->get_checkout_payment_url());
+        exit;
+    }
+
+    wp_safe_redirect($order->get_checkout_order_received_url());
+    exit;
 }
 
 /**
@@ -179,18 +459,24 @@ function cashupay_install_btcpay_plugin(): array {
  *
  * Returns a status the completion screen renders from:
  *   - 'ready'            everything wired; 'auto_installed' says whether we had
- *                        to fetch the gateway plugin ourselves.
- *   - 'existing_btcpay'  a real BTCPay Server is configured; we never clobber it.
+ *                        to fetch the gateway plugin ourselves, and a non-empty
+ *                        'replaced_url' names the real BTCPay Server connection
+ *                        this call (with consent) just replaced.
+ *   - 'existing_btcpay'  a real BTCPay Server is configured and the merchant
+ *                        has not consented to replacing it; nothing is touched.
  *   - 'needs_woocommerce' WooCommerce itself isn't active.
  *   - 'needs_plugin'     the gateway plugin is missing and we couldn't install
  *                        it unattended (merchant must add it by hand).
  *   - 'error'            configuration failed after the plugin was available.
  *
- * @return array{status:string, auto_installed:bool, message?:string, current_url?:string, webhook?:mixed}
+ * @return array{status:string, auto_installed:bool, message?:string, current_url?:string, replaced_url?:string, webhook?:mixed}
  */
-function cashupay_ensure_woocommerce_integration(string $store_id, string $api_key): array {
-    // Never overwrite a merchant's real BTCPay Server connection.
-    if (cashupay_is_real_btcpay_configured()) {
+function cashupay_ensure_woocommerce_integration(string $store_id, string $api_key, int $discountPercent = 0): array {
+    // A real BTCPay Server connection is only replaced after the merchant
+    // explicitly consented (the wizard's terms screen, or the completion
+    // screen's override button). Without that consent: hands off entirely.
+    $takeover = cashupay_btcpay_takeover_state();
+    if ($takeover === 'needs_consent') {
         return [
             'status' => 'existing_btcpay',
             'auto_installed' => false,
@@ -217,6 +503,19 @@ function cashupay_ensure_woocommerce_integration(string $store_id, string $api_k
         $autoInstalled = !empty($install['installed']);
     }
 
+    // Consented takeover. Deliberately sequenced after the WooCommerce and
+    // gateway-plugin checks: if either is missing, the merchant's old config
+    // survives untouched and the consent stays recorded, so a reload after
+    // they fix the stack completes the replacement — never a half-torn-down
+    // checkout. The wipe makes every writer below (configure, enable,
+    // branding, order states) see a blank slate and install BareBits
+    // defaults, which is exactly what the consent screen promised.
+    $replacedUrl = '';
+    if ($takeover === 'consented') {
+        $replacedUrl = (string) get_option('btcpay_gf_url', '');
+        cashupay_reset_btcpay_plugin_settings();
+    }
+
     $config = cashupay_configure_btcpay_plugin($store_id, $api_key);
     if (empty($config['success'])) {
         return [
@@ -227,10 +526,20 @@ function cashupay_ensure_woocommerce_integration(string $store_id, string $api_k
     }
 
     cashupay_enable_btcpay_gateway();
+    cashupay_apply_btcpay_gateway_branding($discountPercent);
+    cashupay_apply_btcpay_order_states();
+
+    // Consent is single-use: it covered the server that was just replaced.
+    // Deleted on every successful wiring (not only a consented takeover) so
+    // no stale approval lingers — if the merchant ever reconnects a real
+    // BTCPay Server, even the same one, the wizard must warn again rather
+    // than silently re-clobber it.
+    delete_option('cashupay_btcpay_override_consent');
 
     return [
         'status' => 'ready',
         'auto_installed' => $autoInstalled,
+        'replaced_url' => $replacedUrl,
         'webhook' => $config['webhook'] ?? null,
     ];
 }

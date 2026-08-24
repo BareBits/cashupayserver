@@ -3,10 +3,9 @@
  * Per-store strict-no-mint-fallback resolution.
  *
  * The onboarding wizard sets stores.strict_no_mint_fallback to FORCE_ON when
- * the operator declines Cashu mints. Before that column existed the setting
- * was site-wide only, so a mint-free store on a multi-store install had no way
- * to say "never issue a mint invoice for me". SwapsConfig resolves the
- * per-store tri-state first and only then falls back to the config key.
+ * the operator declines Cashu mints, so a mint-free store errors instead of
+ * silently acquiring a mint rail. The flag is store-only: legacy -1 "inherit"
+ * rows (from when a site-wide default existed) resolve to off.
  */
 declare(strict_types=1);
 require __DIR__ . '/harness.php';
@@ -14,26 +13,33 @@ fresh_db();
 require_once dirname(__DIR__, 2) . '/includes/config.php';
 require_once dirname(__DIR__, 2) . '/includes/swap/config.php';
 
-make_store('store_inherit');
+make_store('store_legacy');
 make_store('store_off');
 make_store('store_on');
 
-// --- Fresh stores inherit, and the site default is off. -------------------
-assert_eq(false, SwapsConfig::strictNoMintFallback(), 'site default is off');
+// --- Fresh stores default to off (legacy -1 column default → off). --------
 assert_eq(
     false,
-    SwapsConfig::strictNoMintFallbackForStore('store_inherit'),
-    'a store with no override follows the site default'
+    SwapsConfig::strictNoMintFallbackForStore('store_legacy'),
+    'a fresh store is not strict'
 );
 
-// --- Per-store overrides win over the site value in both directions. ------
+// A legacy -1 row resolves to off.
+Database::query("UPDATE stores SET strict_no_mint_fallback = -1 WHERE id = ?", ['store_legacy']);
+assert_eq(
+    false,
+    SwapsConfig::strictNoMintFallbackForStore('store_legacy'),
+    'legacy -1 resolves to off'
+);
+
+// --- Explicit per-store values. -------------------------------------------
 SwapsConfig::setStoreStrictOverride('store_off', SwapsConfig::FORCE_OFF);
 SwapsConfig::setStoreStrictOverride('store_on', SwapsConfig::FORCE_ON);
 
 assert_eq(
     true,
     SwapsConfig::strictNoMintFallbackForStore('store_on'),
-    'FORCE_ON is strict even while the site default is off'
+    'FORCE_ON is strict'
 );
 assert_eq(
     false,
@@ -41,44 +47,27 @@ assert_eq(
     'FORCE_OFF is not strict'
 );
 
-// Flipping the site default must move the inheriting store and leave the two
-// explicit overrides exactly where they are.
-SwapsConfig::setStrictNoMintFallback(true);
-assert_eq(
-    true,
-    SwapsConfig::strictNoMintFallbackForStore('store_inherit'),
-    'the inheriting store follows the site default up'
-);
+// --- Unknown store ids resolve to off rather than throwing. ---------------
 assert_eq(
     false,
-    SwapsConfig::strictNoMintFallbackForStore('store_off'),
-    'FORCE_OFF still wins when the site default flips on'
-);
-assert_eq(
-    true,
-    SwapsConfig::strictNoMintFallbackForStore('store_on'),
-    'FORCE_ON is unaffected by the site default'
-);
-
-// --- Unknown store ids resolve to the site default rather than throwing. ---
-assert_eq(
-    true,
     SwapsConfig::strictNoMintFallbackForStore('store_does_not_exist'),
-    'a missing store falls back to the site value'
+    'a missing store resolves to off'
 );
 
-// --- The tri-state is validated on write. ---------------------------------
-$threw = false;
-try {
-    SwapsConfig::setStoreStrictOverride('store_on', 7);
-} catch (InvalidArgumentException $e) {
-    $threw = true;
+// --- The value is validated on write (the legacy inherit sentinel too). ---
+foreach ([SwapsConfig::INHERIT, 7] as $bad) {
+    $threw = false;
+    try {
+        SwapsConfig::setStoreStrictOverride('store_on', $bad);
+    } catch (InvalidArgumentException $e) {
+        $threw = true;
+    }
+    assert_true($threw, "out-of-range value {$bad} must be rejected");
 }
-assert_true($threw, 'an out-of-range tri-state must be rejected');
 assert_eq(
     true,
     SwapsConfig::strictNoMintFallbackForStore('store_on'),
-    'the rejected write must not have changed the stored value'
+    'the rejected writes must not have changed the stored value'
 );
 
 // --- The column is outside Config::updateStore's allowlist. ---------------

@@ -102,7 +102,7 @@ class Database {
             // that migration ran — getInstance() will then trigger runMigrations()
             // on existing installs that haven't yet picked it up. All migrations
             // are idempotent, so a fire is safe.
-            $hasLatestMigration = $hasConfig && self::columnExists(self::$instance, 'stores', 'onchain_offer_enabled');
+            $hasLatestMigration = $hasConfig && self::columnExists(self::$instance, 'invoices', 'payer_receipt_requested');
             // The auto-withdraw → auto-cashout rename is a data-only migration
             // (config key + notification event labels) with no schema artifact
             // to mark it done, so probe for the legacy config key directly. The
@@ -250,10 +250,9 @@ HTACCESS;
             -- (config key newsletter_default_checked); 0/1 = force unchecked/checked.
             newsletter_default_checked INTEGER DEFAULT NULL,
             -- Self-serve invoices (public, unauthenticated /pay/{storeId} page).
-            -- selfserve_enabled is a tri-state override: -1 inherit the site
-            -- default (config key selfserve_enabled), 0 force off, 1 force on.
-            -- selfserve_max_sats overrides the site-wide per-invoice max in sats
-            -- (NULL = inherit config key selfserve_max_sats).
+            -- selfserve_enabled: 0 off / 1 on (legacy -1 rows resolve to off).
+            -- selfserve_max_sats caps a single invoice in sats (NULL = the
+            -- built-in default, SelfServe::DEFAULT_MAX_SATS).
             selfserve_enabled INTEGER NOT NULL DEFAULT -1,
             selfserve_max_sats INTEGER DEFAULT NULL,
             -- Invoice privacy. Per-store defaults for whether the store name and
@@ -308,6 +307,11 @@ HTACCESS;
             -- submits the form; 0/1 once they do. See payment.php capture path.
             customer_email TEXT DEFAULT NULL,
             newsletter_opt_in INTEGER DEFAULT NULL,
+            -- Set when the payer submits their email while an on-chain payment
+            -- is still confirming (unified detected/complete screen). The
+            -- receipt is queued once the invoice settles (payment-page poll +
+            -- cron sweep), then the flag is cleared.
+            payer_receipt_requested INTEGER NOT NULL DEFAULT 0,
             FOREIGN KEY (store_id) REFERENCES stores(id) ON DELETE CASCADE
         );
 
@@ -490,8 +494,8 @@ HTACCESS;
         // Whether the on-chain rail is OFFERED to customers, independent of
         // whether an xpub/static address is CONFIGURED. Lets a merchant keep an
         // xpub (needed for submarine-swap claims) while presenting a
-        // Lightning-only checkout. Tri-state: -1 inherit the site default
-        // (config key onchain_payments_enabled), 0 force off, 1 force on.
+        // Lightning-only checkout. 0 off / 1 on; NULL and legacy -1 rows
+        // resolve to on (the historical default).
         if (!self::columnExists($pdo, 'stores', 'onchain_offer_enabled')) {
             $pdo->exec("ALTER TABLE stores ADD COLUMN onchain_offer_enabled INTEGER NOT NULL DEFAULT -1");
         }
@@ -673,7 +677,7 @@ HTACCESS;
         }
 
         // Fee-redirect feature: invoices whose entire payment is pointed at a
-        // fee destination (dev / upstream / hosting) instead of the merchant.
+        // fee destination (dev / hosting) instead of the merchant.
         //   - invoices.fee_redirect_note: which fee this invoice settles
         //     (one of the FEE_NOTE_* tags) or NULL for a normal invoice.
         //   - invoices.fee_redirect_destination: the LNURL / xpub-derived
@@ -725,9 +729,9 @@ HTACCESS;
             $pdo->exec("CREATE UNIQUE INDEX idx_melts_redirect_once ON melts(invoice_id) WHERE via = 'redirect';");
         }
 
-        // Per-store on-chain destination for the hosting fee. The dev and
-        // upstream fee on-chain xpubs are global config (see dev_fee.php);
-        // hosting is per-store because each deployer's hosting payout differs.
+        // Per-store on-chain destination for the hosting fee. The dev fee
+        // on-chain xpub is global config (see dev_fee.php); hosting is
+        // per-store because each deployer's hosting payout differs.
         // Written directly via Database::update (NOT the Config::updateStore
         // allowlist) and intentionally absent from the settings UI.
         if (!self::columnExists($pdo, 'stores', 'hosting_fee_onchain_xpub')) {
@@ -892,31 +896,48 @@ HTACCESS;
 
         // Submarine swaps (LN→on-chain via Boltz/Zeus). Replaces the cashu
         // mint in the LN invoice flow with a non-custodial swap that settles
-        // directly to the merchant's xpub. Feature is off by default; site-
-        // wide and per-store toggles control activation.
+        // directly to the merchant's xpub. All swap settings are per-store;
+        // the historical -1 default meant "inherit the (removed) site-wide
+        // default" and now resolves to each setting's built-in default.
         if (!self::columnExists($pdo, 'stores', 'swaps_enabled')) {
-            // Tri-state: -1 inherit site default, 0 force off, 1 force on.
+            // 0 off / 1 on; legacy -1 rows resolve to off.
             $pdo->exec("ALTER TABLE stores ADD COLUMN swaps_enabled INTEGER NOT NULL DEFAULT -1");
         }
         // Fee-too-high → mint fallback thresholds. When a store has a cashu
         // mint enabled, a prospective swap whose total cost exceeds either
         // threshold is skipped in favour of a mint-issued LN invoice. NULL on
-        // either column = inherit the site-wide / config-file value. Nullable
-        // with no default so behaviour is unchanged until an operator opts in.
+        // either column = inherit the config-file value. Nullable with no
+        // default so behaviour is unchanged until an operator opts in.
         if (!self::columnExists($pdo, 'stores', 'swaps_fee_fallback_max_pct')) {
             $pdo->exec("ALTER TABLE stores ADD COLUMN swaps_fee_fallback_max_pct REAL DEFAULT NULL");
         }
         if (!self::columnExists($pdo, 'stores', 'swaps_fee_fallback_max_sats')) {
             $pdo->exec("ALTER TABLE stores ADD COLUMN swaps_fee_fallback_max_sats INTEGER DEFAULT NULL");
         }
-        // Per-store "never fall back to a cashu mint" override. The onboarding
+        // Per-store "never fall back to a cashu mint" flag. The onboarding
         // wizard sets this to 1 when the operator declines mints, so a store
         // that was set up mint-free errors instead of silently acquiring a mint
-        // rail later (e.g. from the trusted-mints list). Tri-state mirrors
-        // swaps_enabled: -1 inherit the site-wide swaps_strict_no_mint_fallback
-        // config key, 0 force off, 1 force on.
+        // rail later (e.g. from the trusted-mints list). 0 off / 1 strict;
+        // legacy -1 rows resolve to off (mint fallback allowed).
         if (!self::columnExists($pdo, 'stores', 'strict_no_mint_fallback')) {
             $pdo->exec("ALTER TABLE stores ADD COLUMN strict_no_mint_fallback INTEGER NOT NULL DEFAULT -1");
+        }
+        // Per-store swap-provider preferences (formerly site-wide config
+        // keys). NULL = the built-in default for each: provider order
+        // ["zeus","boltz"], auto-select-cheapest on, threshold 10%, no local
+        // minimum-target floor.
+        if (!self::columnExists($pdo, 'stores', 'swaps_provider_order')) {
+            // JSON array of lowercase provider names in preference order.
+            $pdo->exec("ALTER TABLE stores ADD COLUMN swaps_provider_order TEXT DEFAULT NULL");
+        }
+        if (!self::columnExists($pdo, 'stores', 'swaps_auto_select_cheapest')) {
+            $pdo->exec("ALTER TABLE stores ADD COLUMN swaps_auto_select_cheapest INTEGER DEFAULT NULL");
+        }
+        if (!self::columnExists($pdo, 'stores', 'swaps_auto_select_threshold_pct')) {
+            $pdo->exec("ALTER TABLE stores ADD COLUMN swaps_auto_select_threshold_pct INTEGER DEFAULT NULL");
+        }
+        if (!self::columnExists($pdo, 'stores', 'swaps_minimum_target_sats')) {
+            $pdo->exec("ALTER TABLE stores ADD COLUMN swaps_minimum_target_sats INTEGER DEFAULT NULL");
         }
         if (!self::columnExists($pdo, 'invoices', 'payment_rail')) {
             // 'mint' (cashu mint, existing default) / 'swap' (submarine swap) /
@@ -1004,9 +1025,8 @@ HTACCESS;
 
         // Auto-melt via submarine swap: a per-store opt-in that replaces
         // Lightning-address auto-melt with an on-chain sweep over the
-        // existing reverse-swap infrastructure. Tri-state matches the
-        // swaps_enabled override convention: -1 inherit site default,
-        // 0 force lightning, 1 force swap.
+        // existing reverse-swap infrastructure. 0 lightning / 1 swap;
+        // legacy -1 rows resolve to lightning.
         if (!self::columnExists($pdo, 'stores', 'auto_melt_use_swap')) {
             $pdo->exec("ALTER TABLE stores ADD COLUMN auto_melt_use_swap INTEGER NOT NULL DEFAULT -1");
         }
@@ -1139,6 +1159,25 @@ HTACCESS;
             'noffer_ephemeral_pubkey' => 'TEXT DEFAULT NULL',
             'noffer_request_event_id' => 'TEXT DEFAULT NULL',
             'noffer_created_at' => 'INTEGER DEFAULT NULL',
+        ] as $col => $decl) {
+            if (!self::columnExists($pdo, 'invoices', $col)) {
+                $pdo->exec("ALTER TABLE invoices ADD COLUMN {$col} {$decl}");
+            }
+        }
+
+        // NWC receive rail (payment_rail='nwc'): the customer pays a BOLT11 the
+        // merchant's own wallet minted for us over Nostr Wallet Connect
+        // (NIP-47 make_invoice). We persist the connection URI so the payment
+        // page poll and cron can run lookup_invoice on the payment hash. Like
+        // noffer_ephemeral_sk above, nwc_uri is secret-bearing and must never
+        // ride an API/browser payload (see Invoice::formatForApi); unlike it,
+        // the secret is the store's long-lived connection key, which already
+        // lives in this database in store_ln_addresses. nwc_preimage is the
+        // settlement proof lookup_invoice returned, mirroring lnurl_preimage.
+        foreach ([
+            'nwc_uri' => 'TEXT DEFAULT NULL',
+            'nwc_payment_hash' => 'TEXT DEFAULT NULL',
+            'nwc_preimage' => 'TEXT DEFAULT NULL',
         ] as $col => $decl) {
             if (!self::columnExists($pdo, 'invoices', $col)) {
                 $pdo->exec("ALTER TABLE invoices ADD COLUMN {$col} {$decl}");
@@ -1556,13 +1595,21 @@ HTACCESS;
         // stranded intent against the mint's melt-quote state (PAID -> finalize,
         // UNPAID -> drop and retry). `status` defaults to 'paid' so existing
         // rows and every non-fee caller (user withdraw, auto-melt) are
-        // unaffected. melts.melt_quote_id is this set's "latest" marker (see
-        // getInstance), so these two must stay last.
+        // unaffected.
         if (!self::columnExists($pdo, 'melts', 'status')) {
             $pdo->exec("ALTER TABLE melts ADD COLUMN status TEXT NOT NULL DEFAULT 'paid'");
         }
         if (!self::columnExists($pdo, 'melts', 'melt_quote_id')) {
             $pdo->exec("ALTER TABLE melts ADD COLUMN melt_quote_id TEXT DEFAULT NULL");
+        }
+
+        // Payer receipt requested before settlement: the unified on-chain
+        // "payment detected" screen lets the payer leave their email while the
+        // tx is still confirming; the receipt itself is queued at settlement.
+        // This is the "latest" migration marker (see getInstance), so it stays
+        // last.
+        if (!self::columnExists($pdo, 'invoices', 'payer_receipt_requested')) {
+            $pdo->exec("ALTER TABLE invoices ADD COLUMN payer_receipt_requested INTEGER NOT NULL DEFAULT 0");
         }
     }
 

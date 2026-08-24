@@ -64,6 +64,29 @@ class OnchainWallet {
     public const SUPPORTED_NETWORKS = ['mainnet', 'testnet', 'signet', 'regtest'];
 
     /**
+     * Why this exists: xpub derivation runs elliptic-curve math through
+     * paragonie/ecc, which hard-requires ext-gmp with no fallback — and our
+     * own base58/taproot code calls gmp_* directly. Shared WordPress hosts
+     * frequently ship PHP without GMP, and before this check that surfaced as
+     * a fatal error mid-request (which the setup wizard's JS then misreported
+     * as "could not reach the server"). Checked up front so the operator gets
+     * one actionable sentence instead.
+     *
+     * Returns null when the environment can run the on-chain stack.
+     */
+    public static function environmentError(): ?string {
+        if (PHP_INT_SIZE < 8) {
+            return 'This server runs 32-bit PHP; on-chain wallet features require 64-bit PHP.';
+        }
+        if (!function_exists('gmp_init')) {
+            return 'This server\'s PHP is missing the GMP extension, which is required for'
+                . ' xpub-based wallets and submarine swaps. Ask your hosting provider to'
+                . ' enable php-gmp, or use a single Bitcoin address instead.';
+        }
+        return null;
+    }
+
+    /**
      * Validate an xpub and return inferred metadata.
      *
      * @return array{valid:bool, error:?string, warnings:array, inferredType:?string, inferredNetwork:?string}
@@ -88,6 +111,10 @@ class OnchainWallet {
         }
         if ($expectedType !== null && !in_array($expectedType, self::SUPPORTED_TYPES, true)) {
             $result['error'] = "Unsupported address type: {$expectedType}";
+            return $result;
+        }
+        if (($envError = self::environmentError()) !== null) {
+            $result['error'] = $envError;
             return $result;
         }
 
@@ -155,6 +182,9 @@ class OnchainWallet {
         if ($index < 0) {
             throw new InvalidArgumentException('Negative derivation index');
         }
+        if (($envError = self::environmentError()) !== null) {
+            throw new RuntimeException($envError);
+        }
 
         $canonicalXpub = self::normalizeToCanonicalXpub(trim($xpub), $network);
         $net = self::bitwaspNetwork($network);
@@ -198,21 +228,38 @@ class OnchainWallet {
         if (!in_array($network, self::SUPPORTED_NETWORKS, true)) {
             return ['valid' => false, 'error' => "Unsupported network: {$network}"];
         }
-        $net = self::bitwaspNetwork($network);
-        $prev = error_reporting();
-        error_reporting($prev & ~E_DEPRECATED);
-        try {
-            (new AddressCreator())->fromString($address, $net);
-            return ['valid' => true, 'error' => null];
-        } catch (Throwable $e) {
-            $isTestnetFamily = in_array($network, ['testnet', 'signet', 'regtest'], true);
-            $hint = $isTestnetFamily
-                ? 'Expected a testnet/signet/regtest address (starts with m/n/2 or tb1/bcrt1).'
-                : 'Expected a mainnet address (starts with 1/3 or bc1).';
-            return ['valid' => false, 'error' => "Invalid address for {$network}. {$hint}"];
-        } finally {
-            error_reporting($prev);
+
+        // bitwasp first when the environment can run it (keeps behaviour
+        // identical on healthy hosts), but two cases fall through to the
+        // pure-PHP checker: bitwasp predates bech32m so it rejects valid v1
+        // Taproot addresses (bc1p… — the receive default in modern wallets),
+        // and on GMP-less hosts its base58 math throws an Error, which a bare
+        // catch used to mislabel as "not a valid address". Static-address mode
+        // only ever watches the string, so the checksum verification in
+        // AddressCheck is the full requirement — no key math needed.
+        if (self::environmentError() === null) {
+            $net = self::bitwaspNetwork($network);
+            $prev = error_reporting();
+            error_reporting($prev & ~E_DEPRECATED);
+            try {
+                (new AddressCreator())->fromString($address, $net);
+                return ['valid' => true, 'error' => null];
+            } catch (Throwable $e) {
+                // Fall through to the pure-PHP checker.
+            } finally {
+                error_reporting($prev);
+            }
         }
+
+        require_once __DIR__ . '/address_check.php';
+        if (AddressCheck::validate($address, $network)['valid']) {
+            return ['valid' => true, 'error' => null];
+        }
+        $isTestnetFamily = in_array($network, ['testnet', 'signet', 'regtest'], true);
+        $hint = $isTestnetFamily
+            ? 'Expected a testnet/signet/regtest address (starts with m/n/2 or tb1/tb1p/bcrt1).'
+            : 'Expected a mainnet address (starts with 1/3 or bc1/bc1p).';
+        return ['valid' => false, 'error' => "Invalid address for {$network}. {$hint}"];
     }
 
     /**

@@ -43,7 +43,7 @@ BareBits supports a number of payment types, risk/trust levels, and capabilities
 - **Product management** - Add commonly-used products to your store to make invoicing fast and clear
 - **Receipts** E-mail receipts to your customers (optional)
  - **On-chain payments** to an off-server wallet using xpub addresses
- - **Lightning payments** to an LNURL lightning address and/or a cashu mint (no need to manage liquidity). No LNURL? Don't want to rely on a cashu mint? You can use submarine swaps so your customer's can pay in lightning but you receive the funds on-chain. Your customer pays the swap fee. Noffers/CLINK are also supported, so you can direct lightning payments to an off-server wallet ([Electrum](https://electrum.org/) is suggested)
+ - **Lightning payments** to an LNURL lightning address and/or a cashu mint (no need to manage liquidity). No LNURL? Don't want to rely on a cashu mint? You can use submarine swaps so your customer's can pay in lightning but you receive the funds on-chain. Your customer pays the swap fee. Noffers/CLINK are also supported, so you can direct lightning payments to an off-server wallet ([Electrum](https://electrum.org/) is suggested). Nostr Wallet Connect (NWC/NIP-47) is supported too: BareBits requests invoices straight from your own wallet and confirms payment automatically
  - **Offline** payments powered by Cashu tokens (optional), melded to lightning when back online.
 - **Open source** - Read every line of code. Fork it, audit it yourself. Dual-licensed MIT (pre-2026-05-30) and Modified MIT (post-2026-05-30). See [LICENSE.md](LICENSE.md) and [USE_POLICY.md](USE_POLICY.md).
 
@@ -122,7 +122,7 @@ detected in over 24 hours.
 
 Generally speaking, BareBits tries to offer both on-chain and lightning as payment options to all customers. On-chain payments are always enabled, lightning payments are enabled depending on configuration. Here's what that decision tree looks like:
 - Is the customer paying on-chain? Send directly to merchant xpub wallet
-- Does the merchant have a working LNURL or CLINK Noffer? Present a lightning invoice
+- Does the merchant have a working LNURL, NWC connection, or CLINK Noffer? Present a lightning invoice
 - If submarine swaps are NOT enabled and a cashu mint is NOT enabled, do not present a lightning invoice.
 - If submarine swaps ARE enabled AND the invoice amount falls within the swap provider's min/max limits, present a lightning invoice that settles directly to the merchant's on-chain wallet. When several providers are configured, the preferred (first reachable) provider is used unless another is cheaper by more than the auto-select threshold (`swaps_auto_select_threshold_pct`, default 10%).
 - If submarine swaps are NOT enabled, or no provider can serve the amount, display a lightning invoice that sends payment to the cashu mint — unless strict mode is on, in which case the invoice is rejected instead. Funds are later emptied from the mint to the merchant's on-chain wallet by auto-cashout once it's worth it (auto-cashout caps the swap fee at 1% of the amount by default).
@@ -186,16 +186,19 @@ on the checkout page.
 ## Requirements
 
 - PHP 8.0 or higher
-- Extensions: `curl`, `json`, `sqlite3`, `gmp`, `mbstring`
+- Extensions: `curl`, `json`, `sqlite3`, `mbstring`, and `gmp` or `bcmath`
+  (`gmp` is strongly recommended — it is ~100x faster for the payment
+  cryptography and is required for xpub-based on-chain wallets and submarine
+  swaps; Cashu, Lightning addresses, NWC, and noffers also run on `bcmath`)
 - Apache with mod_rewrite, nginx, or any PHP-capable web server
 
 For on-chain Bitcoin payment support, the release zip ships with the required
 PHP libraries (bitwasp/bitcoin et al.) under `vendor/`. Composer is only needed
 if you're building from source (see Development below).
 
-## How to get an LNURL or CLINK Noffer
+## How to get an LNURL, NWC connection, or CLINK Noffer
 
-If you want your customers to be able to pay natively via lightning (lowest fees, fastest payments), you will need to generate a lightning invoice for each customer. There are two ways to automate this: LNURLs (lightning address) and CLINK Noffers. Alternatively, you can use cashu mints and submarine swaps (accept customer payments in LN, automatically send to you on-chain).
+If you want your customers to be able to pay natively via lightning (lowest fees, fastest payments), you will need to generate a lightning invoice for each customer. There are three ways to automate this: LNURLs (lightning address), Nostr Wallet Connect (NWC), and CLINK Noffers. Alternatively, you can use cashu mints and submarine swaps (accept customer payments in LN, automatically send to you on-chain).
 
 ### CLINK Noffers (suggested) (self-custody)
 CLINK Noffers enable you to generate lightning invoices on the fly from a desktop wallet that is left running online. This means you maintain full self-custody over your funds! You will need to manage your liquidity (make sure you have room for incoming payments), but this can be automated fairly easily. BareBits will automatically fall back to submarine swaps, cashu mints, etc if there is no liquidity available or the wallet is offline, so it's not a big deal.
@@ -203,6 +206,11 @@ CLINK Noffers enable you to generate lightning invoices on the fly from a deskto
 Suggested setup: [Electrum wallet](https://electrum.org/) with the [CLINK plugin](https://github.com/BareBits/electrum_clink) and [Liquidity management plugin](https://github.com/BareBits/electrum_clink). Once the CLINK plugin is installed, go to the settings and generate an noffer to add to your store settings page. You only need to generate a single noffer.
 
 The default settings on these plugins should work, just be sure to set the liquidity management plugin to run in automatic mode.
+
+### Nostr Wallet Connect (self-custody, works with many wallets)
+[NWC (NIP-47)](https://nwc.dev/) lets BareBits ask your own lightning wallet to create invoices and check whether they were paid — nothing more. Many wallets can issue a connection string (Alby Hub, Coinos, lnbits, and others): create a connection, then paste the `nostr+walletconnect://...` string into your store's NWC section (or the setup wizard). The connection is tested with a 1-sat test invoice when you save (the test invoice is never paid and simply expires).
+
+**Use a receive-only connection.** BareBits only ever calls `make_invoice` and `lookup_invoice`, but if your wallet lets you scope permissions, grant only those two — a connection that can also *pay* would let anyone who compromises your server spend from your wallet. BareBits warns you at save time if it can detect that the connection has spend permissions. The connection secret is stored server-side and never shown again in the admin UI.
 
 ### LNURL Providers (simplest, instant USD conversion)
 Many centralized exchanges like [Strike](https://strike.me) offer LNURLs out of the box and can offer instant USD conversion. Note that these exchanges are custodial: they hold onto funds for you. This introduces risk of theft, exchange collapse, etc so we do not suggest storing significant funds on them.

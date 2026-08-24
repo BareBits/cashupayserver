@@ -119,10 +119,12 @@ def test_swaps_cannot_be_enabled_without_an_xpub(
 
 
 def test_noffer_is_stored_after_the_lightning_address(
-    payserver: PayserverHandle, mint: MintHandle, backup_mint: MintHandle, page
+    payserver_with_lnurlp: PayserverHandle, mint: MintHandle, backup_mint: MintHandle, page
 ) -> None:
     """Both destination types are accepted on one screen and saved as an
-    ordered chain: LNURL address first, noffer as the fallback."""
+    ordered chain: LNURL address first, noffer as the fallback. Uses the
+    lnurlp-backed stack so the setup step's LUD-21 gate passes."""
+    payserver = payserver_with_lnurlp
     _walk_to_store(page, payserver)
     page.fill("#store_name", "Noffer Store")
     page.click("button[type=submit]")
@@ -132,6 +134,7 @@ def test_noffer_is_stored_after_the_lightning_address(
 
     page.wait_for_selector("#lightning_address")
     page.fill("#lightning_address", "merchant@strike.me")
+    page.click("#noffer-section > summary")
     page.fill("#noffer", REFERENCE_NOFFER)
     page.click("button:has-text('Continue')")
 
@@ -143,6 +146,100 @@ def test_noffer_is_stored_after_the_lightning_address(
     assert [(r["type"], r["position"]) for r in chain] == [("lnaddress", 0), ("noffer", 1)]
     assert chain[0]["address"] == "merchant@strike.me"
     assert chain[1]["address"] == REFERENCE_NOFFER
+
+
+def test_add_another_noffer_button_saves_multiple(
+    payserver: PayserverHandle, page
+) -> None:
+    """The noffer section starts with one input; "+ Add another noffer" adds a
+    second row, and both persist as ordered chain rows. Noffers carry no
+    save-time LUD-21 probe, so the plain payserver stack suffices. Also pins
+    the section's ONLINE warning and the separate-relays helper copy."""
+    from fixtures.setup_helpers import SECOND_NOFFER
+
+    _walk_to_store(page, payserver)
+    page.fill("#store_name", "Multi Noffer Store")
+    page.click("button[type=submit]")
+
+    page.wait_for_selector("#onchain-form")
+    page.click("button:has-text('Skip for now')")
+
+    page.wait_for_selector("#lightning_address")
+    page.click("#noffer-section > summary")
+    assert page.locator("#noffer-list input[name='noffers[]']").count() == 1
+    content = page.content()
+    assert "Your wallet must be ONLINE to receive lightning payments" in content
+    assert "two noffers on separate relays" in content
+
+    page.fill("#noffer", REFERENCE_NOFFER)
+    page.click("#add-noffer")
+    inputs = page.locator("#noffer-list input[name='noffers[]']")
+    assert inputs.count() == 2
+    assert inputs.nth(1).input_value() == "", "a fresh row must start empty"
+    inputs.nth(1).fill(SECOND_NOFFER)
+    page.click("button:has-text('Continue')")
+
+    page.wait_for_selector("button:has-text('No thanks')")
+    chain = _rows(
+        payserver, "SELECT address, type, position FROM store_ln_addresses ORDER BY position ASC"
+    )
+    assert [(r["type"], r["address"]) for r in chain] == [
+        ("noffer", REFERENCE_NOFFER),
+        ("noffer", SECOND_NOFFER),
+    ]
+
+
+def test_all_three_destination_types_store_in_chain_order(
+    payserver_with_lnurlp: PayserverHandle, mint: MintHandle, backup_mint: MintHandle,
+    lnd_mint, channels, page
+) -> None:
+    """The lightning screen accepts all three destination types at once and
+    persists the chain in the order Invoice::create walks it: LNURL address,
+    then the NWC connection, then the noffer. Uses the lnurlp-backed stack for
+    the LUD-21 gate and a live fake NWC wallet for the save-time probe."""
+    import time as _time
+
+    from conftest import SESSION_TMP
+    from fixtures.nwc_wallet import start_nwc_stack, stop_nwc_stack
+
+    workdir = SESSION_TMP / f"nwc-wizard-ui-{int(_time.time())}"
+    workdir.mkdir(parents=True, exist_ok=True)
+    stack = start_nwc_stack(
+        workdir, lnd_mint, info_methods=["make_invoice", "lookup_invoice", "get_info"]
+    )
+    try:
+        nwc_uri = stack.wallet.connection_uri()
+        payserver = payserver_with_lnurlp
+        _walk_to_store(page, payserver)
+        page.fill("#store_name", "Three Rails Store")
+        page.click("button[type=submit]")
+
+        page.wait_for_selector("#onchain-form")
+        page.click("button:has-text('Skip for now')")
+
+        page.wait_for_selector("#lightning_address")
+        page.fill("#lightning_address", "merchant@strike.me")
+        page.click("#nwc-section > summary")
+        page.fill("#nwc", nwc_uri)
+        page.click("#noffer-section > summary")
+        page.fill("#noffer", REFERENCE_NOFFER)
+        page.click("button:has-text('Continue')")
+
+        page.wait_for_selector("button:has-text('No thanks')")
+
+        chain = _rows(
+            payserver,
+            "SELECT address, type, position FROM store_ln_addresses ORDER BY position ASC",
+        )
+        assert [(r["type"], r["position"]) for r in chain] == [
+            ("lnaddress", 0), ("nwc", 1), ("noffer", 2),
+        ]
+        assert chain[1]["address"] == nwc_uri
+        # The wizard page itself must never re-render the secret.
+        secret = nwc_uri.split("secret=", 1)[1].split("&", 1)[0]
+        assert secret not in page.content()
+    finally:
+        stop_nwc_stack(stack)
 
 
 def test_back_to_store_screen_renames_instead_of_duplicating(
@@ -272,3 +369,133 @@ def test_add_store_with_mints_shows_the_generated_seed_once(
 
     page.click("a:has-text('Go to BareBits Admin')")
     page.wait_for_selector("#app", state="visible")
+
+
+def test_lightning_screen_collapses_nwc_and_noffer_sections(
+    payserver: PayserverHandle, mint: MintHandle, page
+) -> None:
+    """All three destinations live in <details> sections titled Method 1-3.
+    The LNURL section (with the "don't have a lightning address?" help box
+    inside it) starts open; NWC and noffer start collapsed."""
+    _walk_to_store(page, payserver)
+    page.fill("#store_name", "Collapsed Rails Store")
+    page.click("button[type=submit]")
+
+    page.wait_for_selector("#onchain-form")
+    page.click("button:has-text('Skip for now')")
+
+    page.wait_for_selector("#lightning_address")
+    # The LNURL section renders open, so its input is visible; the NWC and
+    # noffer sections render collapsed, so their inputs are hidden.
+    assert page.locator("#lnurl-section[open]").count() == 1, "LNURL section must start open"
+    assert page.locator("#lightning_address").is_visible()
+    assert page.locator("#nwc-section[open]").count() == 0, "NWC section must start collapsed"
+    assert page.locator("#noffer-section[open]").count() == 0, "noffer section must start collapsed"
+    assert not page.locator("#nwc").is_visible(), "collapsed NWC section must hide its input"
+    assert not page.locator("#noffer").is_visible(), "collapsed noffer section must hide its input"
+
+    # The section titles number the methods in fallback order.
+    assert "Method 1: LNURL/lightning address" in page.locator("#lnurl-section > summary").inner_text()
+    assert "Method 2: Nostr Wallet Connect" in page.locator("#nwc-section > summary").inner_text()
+    assert "Method 3: noffer (CLINK)" in page.locator("#noffer-section > summary").inner_text()
+
+    # Only one method is required; the intro says so in bold.
+    assert (
+        "Only one method is needed for lightning payments to work"
+        in page.locator("strong", has_text="Only one method").inner_text()
+    )
+
+    # The help box sits inside the LNURL section, below its input and above
+    # the NWC section.
+    order = page.evaluate(
+        """() => {
+            const before = (a, b) => !!(
+                document.querySelector(a).compareDocumentPosition(document.querySelector(b))
+                & Node.DOCUMENT_POSITION_FOLLOWING
+            );
+            return [
+                before('#lightning_address', '#ln-help-box'),
+                before('#ln-help-box', '#nwc-section'),
+                before('#nwc-section', '#noffer-section'),
+                !!document.querySelector('#lnurl-section #ln-help-box'),
+            ];
+        }"""
+    )
+    assert order == [True, True, True, True], f"screen order wrong: {order}"
+    assert "Don't have a lightning address?" in page.locator("#ln-help-box").inner_text()
+
+    # Collapsing the LNURL section via its summary hides the input; expanding
+    # the others via their summaries reveals theirs.
+    page.click("#lnurl-section > summary")
+    assert not page.locator("#lightning_address").is_visible(), (
+        "the LNURL section must be collapsible"
+    )
+    page.click("#lnurl-section > summary")
+    assert page.locator("#lightning_address").is_visible()
+    page.click("#nwc-section > summary")
+    assert page.locator("#nwc").is_visible()
+    page.click("#noffer-section > summary")
+    assert page.locator("#noffer").is_visible()
+
+
+def test_validation_error_scrolls_back_to_top(
+    payserver: PayserverHandle, mint: MintHandle, page
+) -> None:
+    """A failed validation re-renders the wizard via POST, and browsers restore
+    the pre-submit scroll position on that navigation — on the long lightning
+    screen the operator sits scrolled past the error banner and never sees why
+    the save failed. Rendering an error must pin the view back to the top."""
+    _walk_to_store(page, payserver)
+    page.fill("#store_name", "Scroll Store")
+    page.click("button[type=submit]")
+
+    page.wait_for_selector("#onchain-form")
+    page.click("button:has-text('Skip for now')")
+
+    page.wait_for_selector("#lightning_address")
+    page.click("#nwc-section > summary")
+    page.fill("#nwc", "not-a-wallet-connect-string")
+    # Submit from the bottom of the page, like an operator who scrolled down
+    # to reach the Continue button.
+    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+    page.click("button:has-text('Continue')")
+
+    page.wait_for_selector("#setup-error")
+    assert "nostr+walletconnect://" in page.locator("#setup-error").inner_text()
+    # The error render turns browser scroll restoration off and scrolls to the
+    # top, so the banner lands inside the viewport.
+    assert page.evaluate("history.scrollRestoration") == "manual"
+    page.wait_for_function("window.scrollY === 0")
+    box = page.locator("#setup-error").bounding_box()
+    assert box is not None, "the error banner must be rendered"
+    assert box["y"] + box["height"] <= page.viewport_size["height"], (
+        "the error banner must be inside the viewport after the auto-scroll"
+    )
+
+
+def test_noffer_section_reopens_when_a_rejected_value_is_echoed(
+    payserver: PayserverHandle, mint: MintHandle, page
+) -> None:
+    """A failed validation re-renders the screen with the operator's noffer
+    echoed back; the section must render open so the value the error names
+    isn't hidden behind a collapsed toggle."""
+    _walk_to_store(page, payserver)
+    page.fill("#store_name", "Reopen Store")
+    page.click("button[type=submit]")
+
+    page.wait_for_selector("#onchain-form")
+    page.click("button:has-text('Skip for now')")
+
+    page.wait_for_selector("#lightning_address")
+    page.click("#noffer-section > summary")
+    page.fill("#noffer", "noffer-not-valid")
+    page.click("button:has-text('Continue')")
+
+    page.wait_for_selector(".error")
+    assert "noffer1" in page.locator(".error").inner_text()
+    assert page.locator("#noffer-section[open]").count() == 1, (
+        "the echoed noffer must render its section open"
+    )
+    assert page.input_value("#noffer") == "noffer-not-valid"
+    # The untouched NWC section stays collapsed.
+    assert page.locator("#nwc-section[open]").count() == 0
