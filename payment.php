@@ -1102,14 +1102,17 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                 </div>
 
                 <?php
-                $firstMethod = $hasLightning ? 'lightning' : ($hasOnchain ? 'onchain' : 'cashu');
+                // On-chain is the preferred default when the invoice offers it;
+                // Lightning and Cashu remain selectable via the tabs. Tab order
+                // mirrors the priority so the default tab sits first.
+                $firstMethod = $hasOnchain ? 'onchain' : ($hasLightning ? 'lightning' : 'cashu');
                 if ($methodCount >= 2): ?>
                 <div class="method-tabs" role="tablist">
-                    <?php if ($hasLightning): ?>
-                    <button type="button" class="method-tab <?= $firstMethod === 'lightning' ? 'active' : '' ?>" data-method="lightning" role="tab">Lightning</button>
-                    <?php endif; ?>
                     <?php if ($hasOnchain): ?>
                     <button type="button" class="method-tab <?= $firstMethod === 'onchain' ? 'active' : '' ?>" data-method="onchain" role="tab">On-chain</button>
+                    <?php endif; ?>
+                    <?php if ($hasLightning): ?>
+                    <button type="button" class="method-tab <?= $firstMethod === 'lightning' ? 'active' : '' ?>" data-method="lightning" role="tab">Lightning</button>
                     <?php endif; ?>
                     <?php if ($hasCashu): ?>
                     <button type="button" class="method-tab <?= $firstMethod === 'cashu' ? 'active' : '' ?>" data-method="cashu" role="tab">Cashu</button>
@@ -1118,7 +1121,7 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                 <?php endif; ?>
 
                 <?php if ($hasLightning): ?>
-                <div class="method-block" data-method-block="lightning">
+                <div class="method-block <?= $firstMethod === 'lightning' ? '' : 'hidden' ?>" data-method-block="lightning">
                     <div class="qr-container" id="qr-lightning"></div>
                     <div class="invoice-input" data-copy="<?= htmlspecialchars($invoice['bolt11']) ?>">
                         <?= htmlspecialchars(substr($invoice['bolt11'], 0, 40) . '...' . substr($invoice['bolt11'], -10)) ?>
@@ -1148,7 +1151,7 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                 <?php endif; ?>
 
                 <?php if ($hasOnchain): ?>
-                <div class="method-block <?= $hasLightning ? 'hidden' : '' ?>" data-method-block="onchain">
+                <div class="method-block <?= $firstMethod === 'onchain' ? '' : 'hidden' ?>" data-method-block="onchain">
                     <div class="qr-container" id="qr-onchain"></div>
                     <div class="invoice-input" data-copy="<?= htmlspecialchars($bip21) ?>">
                         <?= $shortOnchainAddr ?>

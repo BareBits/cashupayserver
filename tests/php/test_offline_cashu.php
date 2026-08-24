@@ -151,6 +151,6 @@ assert_eq('Provisional', $still['status'], 'invoice still Provisional after fail
 $settled = OfflineCashu::recordOnlineReceipt($store, 250, $MINT);
 assert_eq('Settled', $settled['status'], 'online receipt settled');
 assert_eq('cashu', $settled['payment_rail'], 'online receipt rail cashu');
-assert_eq('mint', $settled['settled_rail'], 'settled_rail mint');
+assert_eq('cashu', $settled['settled_rail'], 'settled_rail cashu (token receipt, no Lightning)');
 
 echo "test_offline_cashu: ok\n";

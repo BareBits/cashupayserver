@@ -1791,6 +1791,24 @@ class Invoice {
     }
 
     /**
+     * The rail that actually moved funds, corrected for a historical quirk:
+     * direct ecash-token receipts used to settle with settled_rail='mint'
+     * even though no Lightning was involved. For those rows the created
+     * rail ('cashu') is the truth; new token settlements record 'cashu'
+     * directly. A creation rail of 'cashu' is only ever set by the token
+     * receive path, so the pair (settled='mint', created='cashu') uniquely
+     * fingerprints the legacy rows.
+     */
+    public static function effectiveRail(array $invoice): ?string {
+        $settled = $invoice['settled_rail'] ?? null;
+        $created = $invoice['payment_rail'] ?? null;
+        if ($settled === 'mint' && $created === 'cashu') {
+            return 'cashu';
+        }
+        return $settled ?: $created;
+    }
+
+    /**
      * Format invoice for API response
      */
     public static function formatForApi(array $invoice): array {
@@ -1811,7 +1829,11 @@ class Invoice {
             // payment_rail (the rail chosen at create time) for rows that
             // settled before the column existed, or for the Greenfield API
             // path that marks Settled without knowing the rail.
-            'paymentRail' => $invoice['settled_rail'] ?: ($invoice['payment_rail'] ?? null),
+            'paymentRail' => self::effectiveRail($invoice),
+            // Mint the funds landed at (mint-quote Lightning receives and
+            // direct ecash-token receives); null for every other rail. The
+            // admin UI shows the mint host next to the payment method.
+            'mintUrl' => $invoice['mint_url'] ?? null,
             'checkoutLink' => Urls::payment($invoice['id']),
             // Customer-supplied email + newsletter opt-in (entered on the
             // payment-complete screen). null until the payer submits the form.

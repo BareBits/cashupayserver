@@ -15,6 +15,9 @@
 require_once __DIR__ . '/database.php';
 require_once __DIR__ . '/config.php';
 require_once __DIR__ . '/email_sender.php';
+// Circular with invoice.php (which requires this file) — harmless under
+// require_once; Invoice is only referenced at call time, never at load time.
+require_once __DIR__ . '/invoice.php';
 
 class NotificationSender {
     public const EVENT_INVOICE_PAID = 'InvoicePaid';
@@ -228,11 +231,11 @@ class NotificationSender {
             ? trim($amount . ' ' . $currency)
             : null;
 
-        // settled_rail is the rail that actually moved funds; fall back to the
-        // rail chosen at create time so older rows (no settled_rail backfill)
-        // still get a sensible label.
-        $rail = (string)($invoice['settled_rail'] ?? $invoice['payment_rail'] ?? '');
-        $methodLine = self::paymentMethodLabel($rail);
+        // The rail that actually moved funds, with Invoice's fallback to the
+        // rail chosen at create time (older rows, legacy cashu-token rows
+        // that settled as 'mint') so every row gets a sensible label.
+        $rail = (string)(Invoice::effectiveRail($invoice) ?? '');
+        $methodLine = self::paymentMethodLabel($rail, (string)($invoice['mint_url'] ?? ''));
 
         $lines = ["Thank you for shopping at {$storeName}.", ""];
         $lines[] = "Your payment has been received.";
@@ -257,12 +260,21 @@ class NotificationSender {
         return implode("\n", $lines) . "\n";
     }
 
-    private static function paymentMethodLabel(string $rail): string {
+    private static function paymentMethodLabel(string $rail, string $mintUrl = ''): string {
+        // Mint-rail payments arrive over Lightning but land as Cashu ecash at
+        // the store's mint; direct token receipts never touch Lightning. Both
+        // name the mint by hostname, matching the admin invoices tab.
+        $mintSuffix = '';
+        if ($mintUrl !== '') {
+            $host = parse_url($mintUrl, PHP_URL_HOST);
+            $mintSuffix = '(' . (is_string($host) && $host !== '' ? $host : $mintUrl) . ')';
+        }
         switch ($rail) {
             case 'onchain':   return 'On-chain Bitcoin';
             case 'swap':      return 'Lightning → submarine swap to on-chain';
             case 'lnaddress': return 'Lightning (LNURL)';
-            case 'mint':      return 'Lightning';
+            case 'mint':      return 'Lightning (cashu)' . $mintSuffix;
+            case 'cashu':     return 'Cashu' . $mintSuffix;
             default:          return $rail !== '' ? $rail : '(unknown)';
         }
     }
