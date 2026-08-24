@@ -672,8 +672,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
             background: white;
             padding: 1rem;
             border-radius: 16px;
-            display: inline-block;
+            width: 100%;
             margin-bottom: 1.5rem;
+        }
+        .qr-container canvas {
+            display: block;
+            width: 100%;
+            height: auto;
+            aspect-ratio: 1;
         }
         .request-string {
             background: rgba(0,0,0,0.2);
@@ -746,10 +752,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
         if (typeof QRious !== 'undefined') {
             const canvas = document.createElement('canvas');
             document.getElementById('qr-container').appendChild(canvas);
+            // Rendered oversized; CSS scales it down to fill the card, which
+            // keeps the canvas crisp on hidpi screens.
             new QRious({
                 element: canvas,
                 value: prString,
-                size: 200,
+                size: 640,
                 backgroundAlpha: 1,
                 foreground: '#000000',
                 background: '#ffffff',

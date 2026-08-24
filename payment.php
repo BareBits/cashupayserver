@@ -449,15 +449,23 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
             max-width: 480px;
         }
 
+        /* Logo + store name share one compact line above the amount. */
+        .merchant-header {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.5rem;
+            margin-bottom: 1rem;
+        }
+
         .logo {
-            font-size: 2.5rem;
-            margin-bottom: 0.5rem;
+            font-size: 1.5rem;
+            line-height: 1;
         }
 
         .merchant-name {
             font-size: 0.875rem;
             color: var(--text-secondary);
-            margin-bottom: 1.5rem;
         }
 
         .amount {
@@ -477,22 +485,17 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
             border-radius: 16px;
             padding: 1rem;
             margin: 0 auto 1.5rem;
-            display: inline-block;
+            width: 100%;
+            /* 380px of QR plus the white quiet-zone padding. */
+            max-width: calc(380px + 2rem);
         }
 
         .qr-container svg,
         .qr-container canvas {
             display: block;
-            width: 220px;
-            height: 220px;
-        }
-
-        @media (max-width: 360px) {
-            .qr-container svg,
-            .qr-container canvas {
-                width: 180px;
-                height: 180px;
-            }
+            width: 100%;
+            height: auto;
+            aspect-ratio: 1;
         }
 
         .status-badge {
@@ -556,7 +559,9 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
             text-align: center;
             cursor: pointer;
             transition: border-color 0.2s;
-            word-break: break-all;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
         }
 
         /* Lightning <-> on-chain method tabs (shown only when both methods are
@@ -626,6 +631,33 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
         .btn-secondary {
             background: rgba(255, 255, 255, 0.1);
             margin-top: 0.5rem;
+        }
+
+        /* Open-in-wallet + copy side by side under the QR. */
+        .btn-row {
+            display: flex;
+            gap: 0.5rem;
+            margin-top: 1rem;
+        }
+
+        .btn-row .btn {
+            flex: 1;
+            min-width: 0;
+            margin-top: 0;
+            padding: 1rem 0.75rem;
+            white-space: nowrap;
+        }
+
+        @media (max-width: 380px) {
+            .btn-row .btn {
+                font-size: 0.875rem;
+                gap: 0.35rem;
+                padding: 0.9rem 0.5rem;
+            }
+            .btn-row .btn svg {
+                width: 16px;
+                height: 16px;
+            }
         }
 
         .btn-secondary:hover {
@@ -968,8 +1000,10 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
 <body>
     <div class="container">
         <div class="payment-card">
-            <div class="logo">&#9889;</div>
-            <div class="merchant-name"><?= htmlspecialchars($storeName) ?></div>
+            <div class="merchant-header">
+                <span class="logo">&#9889;</span>
+                <span class="merchant-name"><?= htmlspecialchars($storeName) ?></span>
+            </div>
 
             <?php
             $hasLightning = !empty($invoice['bolt11']);
@@ -1067,13 +1101,6 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                     Waiting for payment
                 </div>
 
-                <div class="invoice-details">
-                    <div><span class="label">Invoice:</span><span class="invoice-id-value"><?= htmlspecialchars($invoice['id']) ?></span></div>
-                    <?php if ($invoiceNote !== ''): ?>
-                    <div><span class="label">Note:</span><span class="invoice-note-value"><?= htmlspecialchars($invoiceNote) ?></span></div>
-                    <?php endif; ?>
-                </div>
-
                 <?php
                 $firstMethod = $hasLightning ? 'lightning' : ($hasOnchain ? 'onchain' : 'cashu');
                 if ($methodCount >= 2): ?>
@@ -1096,19 +1123,21 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                     <div class="invoice-input" data-copy="<?= htmlspecialchars($invoice['bolt11']) ?>">
                         <?= htmlspecialchars(substr($invoice['bolt11'], 0, 40) . '...' . substr($invoice['bolt11'], -10)) ?>
                     </div>
-                    <a href="lightning:<?= htmlspecialchars($invoice['bolt11']) ?>" class="btn">
-                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                            <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon>
-                        </svg>
-                        Open in Wallet
-                    </a>
-                    <button type="button" class="btn btn-secondary" data-copy="<?= htmlspecialchars($invoice['bolt11']) ?>">
-                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                            <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
-                            <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
-                        </svg>
-                        Copy Invoice
-                    </button>
+                    <div class="btn-row">
+                        <a href="lightning:<?= htmlspecialchars($invoice['bolt11']) ?>" class="btn">
+                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon>
+                            </svg>
+                            Open in Wallet
+                        </a>
+                        <button type="button" class="btn btn-secondary" data-copy="<?= htmlspecialchars($invoice['bolt11']) ?>">
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+                                <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+                            </svg>
+                            Copy Invoice
+                        </button>
+                    </div>
                     <?php if ($pathDebug): ?>
                     <div class="debug-path" title="Admin debug: how this Lightning invoice was sourced">
                         <span class="debug-path-tag">path</span>
@@ -1127,20 +1156,22 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                             <?= number_format($onchainSat) ?> sat
                         </div>
                     </div>
-                    <a href="<?= htmlspecialchars($bip21) ?>" class="btn">
-                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                            <circle cx="12" cy="12" r="10"></circle>
-                            <path d="M9.5 8h4a2.5 2.5 0 0 1 0 5h-4v-5zm0 5h4.5a2.5 2.5 0 0 1 0 5h-4.5v-5z"></path>
-                        </svg>
-                        Open in Wallet
-                    </a>
-                    <button type="button" class="btn btn-secondary" data-copy="<?= htmlspecialchars($bip21) ?>">
-                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                            <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
-                            <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
-                        </svg>
-                        Copy Address
-                    </button>
+                    <div class="btn-row">
+                        <a href="<?= htmlspecialchars($bip21) ?>" class="btn">
+                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <circle cx="12" cy="12" r="10"></circle>
+                                <path d="M9.5 8h4a2.5 2.5 0 0 1 0 5h-4v-5zm0 5h4.5a2.5 2.5 0 0 1 0 5h-4.5v-5z"></path>
+                            </svg>
+                            Open in Wallet
+                        </a>
+                        <button type="button" class="btn btn-secondary" data-copy="<?= htmlspecialchars($bip21) ?>">
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+                                <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+                            </svg>
+                            Copy Address
+                        </button>
+                    </div>
                     <?php if ($pathDebug): ?>
                     <div class="debug-path" title="Admin debug: on-chain address derivation mode">
                         <span class="debug-path-tag">path</span>
@@ -1174,6 +1205,13 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                     </div>
                 </div>
                 <?php endif; ?>
+
+                <div class="invoice-details">
+                    <div><span class="label">Invoice:</span><span class="invoice-id-value"><?= htmlspecialchars($invoice['id']) ?></span></div>
+                    <?php if ($invoiceNote !== ''): ?>
+                    <div><span class="label">Note:</span><span class="invoice-note-value"><?= htmlspecialchars($invoiceNote) ?></span></div>
+                    <?php endif; ?>
+                </div>
 
                 <div class="timer" id="timer"></div>
 
@@ -1376,8 +1414,10 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
             }
             const canvas = document.createElement('canvas');
             target.appendChild(canvas);
+            // Rendered at 760px internally (2x the 380px display cap) so the
+            // CSS-scaled canvas stays crisp on hidpi screens.
             new QRious({
-                element: canvas, value: data, size: 220,
+                element: canvas, value: data, size: 760,
                 backgroundAlpha: 1, foreground: '#000000', background: '#ffffff', level: 'M',
             });
         }
