@@ -9599,17 +9599,30 @@ header('Cache-Control: no-cache, must-revalidate');
             }).catch(() => showToast('Copy failed', 'error'));
         };
 
+        // Hostname of the mint an invoice's funds landed at, for the method
+        // chip. Falls back to the raw value for unparseable URLs.
+        function mintHost(mintUrl) {
+            try { return new URL(mintUrl).host || mintUrl; } catch (e) { return mintUrl; }
+        }
+
         // Map paymentRail → emoji+text chip cell. Lightning shows a bolt,
-        // on-chain a chain, swap the recycle arrows.
-        function renderPaymentMethod(rail) {
+        // on-chain a chain, swap the recycle arrows. Mint-rail payments
+        // arrive over Lightning but land as Cashu ecash at the store's mint,
+        // so they carry the mint host; direct ecash-token receipts (rail
+        // 'cashu') show the host of the mint the token came from.
+        function renderPaymentMethod(rail, mintUrl) {
             const map = {
-                mint:    { icon: '⚡', label: 'Lightning' },
+                mint:    { icon: '⚡', label: 'Lightning (cashu)' },
                 onchain: { icon: '🔗', label: 'On-chain' },
                 swap:    { icon: '🔄', label: 'Swap' },
                 cashu:   { icon: '🥜', label: 'Cashu' },
             };
             const m = map[rail] || { icon: '', label: rail || '—' };
-            return `<span class="inv-chip">${m.icon} ${escapeHtml(m.label)}</span>`;
+            let label = m.label;
+            if ((rail === 'mint' || rail === 'cashu') && mintUrl) {
+                label += `(${mintHost(mintUrl)})`;
+            }
+            return `<span class="inv-chip">${m.icon} ${escapeHtml(label)}</span>`;
         }
 
         // Swap status badge. invoice.settled is suppressed because the row's
@@ -9701,7 +9714,7 @@ header('Cache-Control: no-cache, must-revalidate');
                 return `
                     <tr>
                         <td><span class="inv-chip status-${escapeHtml(inv.status)}">${escapeHtml(statusLabel)}</span></td>
-                        <td>${renderPaymentMethod(inv.paymentRail)}</td>
+                        <td>${renderPaymentMethod(inv.paymentRail, inv.mintUrl)}</td>
                         <td>${idCell}</td>
                         <td>${noteCell}</td>
                         <td>${emailCell}</td>
