@@ -43,6 +43,54 @@ def test_payment_page_renders_qr_and_polls_to_settled(
     )
 
 
+def test_payment_page_qr_size_and_button_row(
+    configured: ConfiguredPayserver,
+    page,
+) -> None:
+    """The QR fills the checkout column (not the old fixed 220px), the
+    open-in-wallet / copy buttons share one row, and the invoice-details box
+    sits below the payment method blocks."""
+    invoice = configured.greenfield.create_invoice(
+        configured.store_id, amount="1000", currency="sat"
+    )
+    page.set_default_timeout(15000)
+    page.goto(f"{configured.handle.url}/payment?id={invoice['id']}")
+    page.wait_for_function(
+        "() => document.querySelector('#qr-lightning canvas') !== null"
+    )
+
+    # Desktop viewport: the QR should render well above the old 220px.
+    canvas = page.locator("#qr-lightning canvas")
+    box = canvas.bounding_box()
+    assert box["width"] >= 300, f"QR too small on desktop: {box['width']}px"
+    assert abs(box["width"] - box["height"]) < 2, "QR should stay square"
+    # Internal canvas resolution is oversized so CSS upscaling stays crisp.
+    assert canvas.evaluate("c => c.width") >= 380
+
+    # Open in Wallet + Copy Invoice share a single row.
+    block = page.locator('[data-method-block="lightning"]')
+    open_box = block.locator("a.btn", has_text="Open in Wallet").bounding_box()
+    copy_box = block.locator("button.btn", has_text="Copy Invoice").bounding_box()
+    assert abs(open_box["y"] - copy_box["y"]) < 2, "buttons should share a row"
+    assert open_box["x"] + open_box["width"] <= copy_box["x"] + 1
+
+    # Invoice details were moved below the method blocks to lift the QR.
+    assert page.evaluate(
+        """() => {
+            const details = document.querySelector('#payment-pending .invoice-details');
+            const block = document.querySelector('[data-method-block="lightning"]');
+            return !!(details && block
+                && (block.compareDocumentPosition(details) & Node.DOCUMENT_POSITION_FOLLOWING));
+        }"""
+    )
+
+    # Logo + store name merged into one compact header line.
+    header = page.locator(".merchant-header")
+    assert header.count() == 1
+    assert header.locator(".logo").count() == 1
+    assert header.locator(".merchant-name").count() == 1
+
+
 def test_payment_page_displays_invoice_amount(
     configured: ConfiguredPayserver,
     page,
