@@ -64,8 +64,15 @@ class NwcClient
     ];
 
     // Total wall-clock budget for one request→reply round trip (relay connect,
-    // info-event fetch, wallet's invoice work). Override in user_config.php.
+    // info-event fetch, wallet's invoice work). The budget covers the whole
+    // connection URI: every relay in it draws from the same deadline, so a
+    // multi-relay URI can't multiply the wait when the wallet is offline.
+    // Override in user_config.php.
     public const DEFAULT_TIMEOUT_SEC = 10;
+
+    // Don't open yet another relay socket when less than this much of the
+    // budget is left — the round trip could never complete in time.
+    private const MIN_ATTEMPT_SEC = 0.5;
 
     /**
      * NWC signs kind-23194 events and derives NIP-04/NIP-44 keys, which
@@ -261,11 +268,18 @@ class NwcClient
         }
         $parsed = NwcUri::parse($uri); // throws on malformed
         $timeout = $timeoutSec ?? self::timeoutSec();
+        // One deadline for the whole destination, started before the first
+        // connect: connect time and every relay in the URI spend the same
+        // budget, so the caller's timeout bounds real wall clock.
+        $deadline = microtime(true) + $timeout;
 
         $lastError = null;
         foreach ($parsed['relays'] as $relayUrl) {
+            if ($lastError !== null && self::remaining($deadline) < self::MIN_ATTEMPT_SEC) {
+                break; // budget spent; another connect could never finish
+            }
             try {
-                return self::requestViaRelay($relayUrl, $parsed, $method, $params, $timeout);
+                return self::requestViaRelay($relayUrl, $parsed, $method, $params, $timeout, $deadline);
             } catch (NwcException $e) {
                 // A definitive wallet-side error is the answer regardless of
                 // which relay carried it; only transport-ish failures ("no
@@ -285,7 +299,8 @@ class NwcClient
         array $parsed,
         string $method,
         $params,
-        int $timeout
+        int $timeout,
+        float $deadline
     ): array {
         $skHex = $parsed['secret'];
         $walletPubkey = $parsed['pubkey'];
@@ -295,9 +310,10 @@ class NwcClient
         $subId = bin2hex(random_bytes(8));
         try {
             $client = new \WebSocket\Client($relayUrl);
-            $client->setTimeout($timeout);
+            // The connect (TCP + websocket upgrade) spends budget too — a
+            // black-holing relay host can't stretch the wait past the deadline.
+            $client->setTimeout(max(0.1, self::remaining($deadline)));
             $client->connect();
-            $deadline = microtime(true) + $timeout;
 
             $useNip44 = self::walletSupportsNip44($client, $walletPubkey, $deadline);
 
@@ -336,10 +352,17 @@ class NwcClient
                 '#e' => [$requestId],
                 'since' => max(0, $createdAt - 1),
             ];
+            // The info probe may have shrunk the socket timeout to its last
+            // sliver; give the publish writes the full remaining budget.
+            $client->setTimeout(max(0.1, self::remaining($deadline)));
             $client->text(json_encode(['REQ', $subId, $filter]));
             $client->text(json_encode(['EVENT', $signed]));
 
-            while (microtime(true) < $deadline) {
+            while (($left = self::remaining($deadline)) > 0) {
+                // Shrink the socket timeout to what's left of the budget: the
+                // deadline check alone can't stop a blocking read entered just
+                // before it from overrunning by a further full socket timeout.
+                $client->setTimeout(max(0.05, $left));
                 $msg = self::receiveText($client);
                 if ($msg === null) {
                     break; // timeout / closed
@@ -416,7 +439,10 @@ class NwcClient
                 'authors' => [$walletPubkey],
                 'limit' => 1,
             ]]));
-            while (microtime(true) < $infoDeadline) {
+            while (($left = $infoDeadline - microtime(true)) > 0) {
+                // Same shrink as the response loop: keep a silent relay from
+                // blocking a read past the probe's slice of the budget.
+                $client->setTimeout(max(0.05, $left));
                 $msg = self::receiveText($client);
                 if ($msg === null) {
                     break;
@@ -546,5 +572,11 @@ class NwcClient
             return (int)NWC_TIMEOUT_SEC;
         }
         return self::DEFAULT_TIMEOUT_SEC;
+    }
+
+    /** Seconds left before $deadline, floored at 0. */
+    private static function remaining(float $deadline): float
+    {
+        return max(0.0, $deadline - microtime(true));
     }
 }

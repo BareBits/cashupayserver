@@ -105,9 +105,15 @@ class ClinkClient
 
     // Total wall-clock budget for a request→reply round trip. Relays + the
     // merchant's invoice generation are the slow parts; keep it snappy enough
-    // not to wedge invoice creation but tolerant of a sluggish relay. Override
+    // not to wedge invoice creation but tolerant of a sluggish relay. The
+    // budget covers the whole offer: every relay in the noffer draws from the
+    // same deadline, so extra relays add reach, not checkout wait. Override
     // in user_config.php.
     public const DEFAULT_TIMEOUT_SEC = 10;
+
+    // Don't open yet another relay socket when less than this much of the
+    // budget is left — the round trip could never complete in time.
+    private const MIN_ATTEMPT_SEC = 0.5;
 
     /**
      * Ask a noffer's service for a BOLT11 invoice.
@@ -175,10 +181,37 @@ class ClinkClient
 
         // Subscribe-before-publish on one socket: the reply is an ephemeral
         // event the service emits *after* seeing our request, so the
-        // subscription must already be live or we'd miss it.
-        $reply = self::roundTrip($decoded['relay'], $signed, $pkHex, $requestId, $createdAt, $timeout, $convKey);
+        // subscription must already be live or we'd miss it. Walk every relay
+        // in the offer under ONE deadline (started before the first connect,
+        // so connect time spends budget too): a definitive reply from any
+        // relay is the answer; a silent or unreachable relay just hands the
+        // remaining budget to the next one.
+        $deadline = microtime(true) + $timeout;
+        $reply = null;
+        $relayUsed = null;
+        $lastTransportError = null;
+        $sawTimeout = false;
+        foreach ($decoded['relays'] as $i => $relayUrl) {
+            if ($i > 0 && self::remaining($deadline) < self::MIN_ATTEMPT_SEC) {
+                break; // budget spent; another connect could never finish
+            }
+            try {
+                $reply = self::roundTrip($relayUrl, $signed, $pkHex, $requestId, $createdAt, $deadline, $convKey);
+            } catch (ClinkException $e) {
+                $lastTransportError = $e; // connect/handshake failure — try the next relay
+                continue;
+            }
+            if ($reply !== null) {
+                $relayUsed = $relayUrl; // bolt11 or service error — either is definitive
+                break;
+            }
+            $sawTimeout = true; // reachable but silent — try the next relay with what's left
+        }
         if ($reply === null) {
-            throw new ClinkException('No response from noffer service within timeout', 2);
+            if ($sawTimeout || $lastTransportError === null) {
+                throw new ClinkException('No response from noffer service within timeout', 2);
+            }
+            throw $lastTransportError;
         }
 
         if (isset($reply['error']) || isset($reply['code'])) {
@@ -197,7 +230,10 @@ class ClinkClient
 
         return [
             'bolt11' => (string)$reply['bolt11'],
-            'relay' => $decoded['relay'],
+            // The relay that actually answered — the receipt subscription
+            // (payment page + cron) should listen where the service is known
+            // to be reachable, not blindly on the offer's first relay.
+            'relay' => $relayUsed,
             'receiver_pubkey' => $receiverPubkey,
             'offer' => $decoded['offer'],
             'ephemeral_sk' => $skHex,
@@ -319,7 +355,8 @@ class ClinkClient
 
     /**
      * Open a socket, subscribe for the reply, publish the request, and return
-     * the first decrypted reply payload (bolt11 or error) — or null on timeout.
+     * the first decrypted reply payload (bolt11 or error) — or null when
+     * $deadline passes without one.
      */
     private static function roundTrip(
         string $relayUrl,
@@ -327,22 +364,27 @@ class ClinkClient
         string $ephemeralPubkey,
         string $requestId,
         int $createdAt,
-        int $timeout,
+        float $deadline,
         string $convKey
     ): ?array {
         $client = null;
         $subId = bin2hex(random_bytes(8));
         try {
             $client = new \WebSocket\Client($relayUrl);
-            $client->setTimeout($timeout);
+            // The connect (TCP + websocket upgrade) spends budget too — a
+            // black-holing relay host can't stretch the wait past the deadline.
+            $client->setTimeout(max(0.1, self::remaining($deadline)));
             $client->connect();
 
             $filter = self::replyFilter($ephemeralPubkey, $requestId, $createdAt);
             $client->text(json_encode(['REQ', $subId, $filter]));
             $client->text(json_encode(['EVENT', $signedEvent]));
 
-            $deadline = microtime(true) + $timeout;
-            while (microtime(true) < $deadline) {
+            while (($left = self::remaining($deadline)) > 0) {
+                // Shrink the socket timeout to what's left of the budget: the
+                // deadline check alone can't stop a blocking read entered just
+                // before it from overrunning by a further full socket timeout.
+                $client->setTimeout(max(0.05, $left));
                 $msg = self::receiveText($client);
                 if ($msg === null) {
                     break; // timeout / closed
@@ -406,15 +448,18 @@ class ClinkClient
         $client = null;
         $subId = bin2hex(random_bytes(8));
         $out = [];
+        // One deadline covering connect and every read, socket timeout shrunk
+        // to what's left before each read — same enforcement as roundTrip().
+        $deadline = microtime(true) + $timeout;
         try {
             $client = new \WebSocket\Client($relayUrl);
-            $client->setTimeout($timeout);
+            $client->setTimeout(max(0.1, self::remaining($deadline)));
             $client->connect();
             $filter = self::replyFilter($ephemeralPubkey, $requestId, $createdAt);
             $client->text(json_encode(['REQ', $subId, $filter]));
 
-            $deadline = microtime(true) + $timeout;
-            while (microtime(true) < $deadline) {
+            while (($left = self::remaining($deadline)) > 0) {
+                $client->setTimeout(max(0.05, $left));
                 $msg = self::receiveText($client);
                 if ($msg === null) {
                     break;
@@ -497,5 +542,11 @@ class ClinkClient
             return (int)CLINK_NOFFER_TIMEOUT_SEC;
         }
         return self::DEFAULT_TIMEOUT_SEC;
+    }
+
+    /** Seconds left before $deadline, floored at 0. */
+    private static function remaining(float $deadline): float
+    {
+        return max(0.0, $deadline - microtime(true));
     }
 }
