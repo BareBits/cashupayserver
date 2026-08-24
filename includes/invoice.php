@@ -33,6 +33,22 @@ use Cashu\Proof;
 use Cashu\ProofState;
 
 class Invoice {
+    // Per-destination wall-clock budget (seconds) for fetching a bolt11 from
+    // an NWC wallet or CLINK noffer service during invoice creation. Tighter
+    // than the clients' 10s default because the customer is staring at the
+    // checkout spinner while the destination chain walks; settlement polls,
+    // the admin save-time probe, and the cron cash-out keep the default. A
+    // NWC_TIMEOUT_SEC / CLINK_NOFFER_TIMEOUT_SEC define in user_config.php
+    // still overrides this, same as everywhere else those constants apply.
+    private const DIRECT_RECEIVE_TIMEOUT_SEC = 5;
+
+    /** Checkout-path budget for one NWC/noffer destination (see above). */
+    private static function directReceiveTimeoutSec(string $overrideConst): int {
+        return defined($overrideConst)
+            ? (int)constant($overrideConst)
+            : self::DIRECT_RECEIVE_TIMEOUT_SEC;
+    }
+
     // ---- Invoice-memo privacy resolution ------------------------------------
     // The store name and the payer-facing note can each be embedded in the memo
     // a payer's wallet records (noffer NIP-69 description + cashu NUT-18 memo).
@@ -280,7 +296,8 @@ class Invoice {
                             $resolved = ClinkClient::requestInvoice(
                                 $dest['value'],
                                 $lnurlTargetSats,
-                                $nofferMemo !== '' ? $nofferMemo : null
+                                $nofferMemo !== '' ? $nofferMemo : null,
+                                self::directReceiveTimeoutSec('CLINK_NOFFER_TIMEOUT_SEC')
                             );
                         } catch (Throwable $e) {
                             error_log(sprintf(
@@ -323,7 +340,8 @@ class Invoice {
                                 $dest['value'],
                                 $lnurlTargetSats,
                                 $nwcMemo !== '' ? $nwcMemo : null,
-                                Config::getInvoiceExpiration()
+                                Config::getInvoiceExpiration(),
+                                self::directReceiveTimeoutSec('NWC_TIMEOUT_SEC')
                             );
                         } catch (Throwable $e) {
                             error_log(sprintf(

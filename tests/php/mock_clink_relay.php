@@ -15,6 +15,8 @@
  *                        simulating a spec-compliant relay that retains no
  *                        ephemeral events, where the receipt only ever arrives
  *                        live on an open subscription (needs MOCK_CLINK_SEND_RECEIPT=1)
+ *   MOCK_CLINK_SILENT    if "1", accept the request (relay OK) but never send
+ *                        the merchant reply — the client must time out
  *   MOCK_CLINK_DUMP      if set, decrypt the payer's request and write the
  *                        plaintext JSON payload to this path (lets a test assert
  *                        what the payer actually sent, e.g. the description memo)
@@ -104,6 +106,10 @@ $server->onText(function (Server $srv, $conn, Text $message) use (
 
         // Acknowledge the publish (relay OK).
         $conn->send(new Text(json_encode(['OK', $reqId, true, ''])));
+
+        if (getenv('MOCK_CLINK_SILENT') === '1') {
+            return; // accept but never answer — client must time out
+        }
 
         // Build the encrypted reply addressed back to the payer.
         if ($errorCode !== false && $errorCode !== '') {
