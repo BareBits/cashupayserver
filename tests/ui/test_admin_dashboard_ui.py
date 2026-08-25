@@ -55,3 +55,45 @@ def test_dashboard_shows_balance_after_settle(
         "() => document.body.innerText.includes('2500')",
         timeout=15000,
     )
+
+
+def test_dashboard_balance_and_invoice_button_labels(
+    configured: ConfiguredPayserver, page,
+) -> None:
+    """The balance card reads "Balance stored in Cashu Mint" and the request
+    buttons are named "Create invoice" / "Create invoice (simple)". The balance
+    label is asserted after the dashboard fetch because loadDashboard() rewrites
+    it from JS (mint-online path) and would clobber a rename done only in HTML."""
+    page.set_default_timeout(15000)
+    page.goto(f"{configured.handle.url}/admin")
+    page.fill("#password-input", configured.admin_password)
+    page.click("#password-submit")
+    page.wait_for_selector("#app", state="visible")
+
+    # Wait until the dashboard fetch has run and re-set the label from JS.
+    page.wait_for_function(
+        "() => document.querySelector('.balance-label').textContent.trim()"
+        " === 'Balance stored in Cashu Mint'"
+    )
+
+    assert page.locator("#btn-request").inner_text().strip() == "Create invoice"
+    assert (
+        page.locator("#btn-request-simple").inner_text().strip()
+        == "Create invoice (simple)"
+    )
+
+    # Modal titles follow the buttons that open them.
+    page.click("#btn-request-simple")
+    page.wait_for_selector("#modal-request.visible")
+    assert (
+        page.locator("#modal-request .modal-title").inner_text().strip()
+        == "Create invoice (simple)"
+    )
+    page.evaluate("() => closeModal('modal-request')")
+
+    page.click("#btn-request")
+    page.wait_for_selector("#modal-cart.visible")
+    assert (
+        page.locator("#modal-cart .modal-title").inner_text().strip()
+        == "Create invoice"
+    )

@@ -5326,7 +5326,7 @@ header('Cache-Control: no-cache, must-revalidate');
                     <button id="btn-dismiss-cron-stale" aria-label="Dismiss" style="background: transparent; border: 0; color: var(--text-secondary); cursor: pointer; font-size: 1.2rem; line-height: 1; padding: 0 0.25rem; flex-shrink: 0;">×</button>
                 </div>
                 <div class="balance-card">
-                    <div class="balance-label">Total Balance</div>
+                    <div class="balance-label">Balance stored in Cashu Mint</div>
                     <div class="balance-amount" id="balance-amount">---</div>
                     <div class="balance-unit" id="balance-unit">sats</div>
                     <div class="balance-fiat" id="balance-fiat" style="display:none; margin-top:0.5rem; color:#000; font-size:1rem;"></div>
@@ -5342,13 +5342,13 @@ header('Cache-Control: no-cache, must-revalidate');
                                 <circle cx="9" cy="21" r="1"></circle><circle cx="20" cy="21" r="1"></circle>
                                 <path d="M1 1h4l2.68 13.39a2 2 0 0 0 2 1.61h9.72a2 2 0 0 0 2-1.61L23 6H6"></path>
                             </svg>
-                            Request
+                            Create invoice
                         </button>
                         <button class="balance-btn" id="btn-request-simple">
                             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                                 <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"></path>
                             </svg>
-                            Request (simple)
+                            Create invoice (simple)
                         </button>
                     </div>
                 </div>
@@ -6249,7 +6249,7 @@ header('Cache-Control: no-cache, must-revalidate');
                                 embedded in the invoice memo a customer's wallet records (the
                                 Lightning noffer description and Cashu payment-request memo). The
                                 payment page itself still shows them. Each invoice can override
-                                these defaults from the Request Payment screen.
+                                these defaults from the Create invoice screen.
                             </p>
 
                             <div class="toggle-container">
@@ -6286,7 +6286,7 @@ header('Cache-Control: no-cache, must-revalidate');
                                         <option value="<?= htmlspecialchars($cur) ?>"><?= htmlspecialchars(strtoupper($cur)) ?></option>
                                     <?php endforeach; ?>
                                 </select>
-                                <p class="form-help">Default unit for the Request page and dashboard balance. The mint still settles in its native unit (<span class="unit-label">SAT</span>); fiat amounts are converted at quote time.</p>
+                                <p class="form-help">Default unit for the Create invoice page and dashboard balance. The mint still settles in its native unit (<span class="unit-label">SAT</span>); fiat amounts are converted at quote time.</p>
                             </div>
                             <div class="form-group">
                                 <label class="form-label">Primary Rate Provider</label>
@@ -6398,11 +6398,11 @@ header('Cache-Control: no-cache, must-revalidate');
                     <div class="card-body">
                         <p style="font-size:0.85rem; color:var(--text-secondary); margin:0 0 0.75rem 0;">
                             Products for the selected store. They appear in the cart-based
-                            <strong>Request</strong> flow on the dashboard. Prices are in the store's
+                            <strong>Create invoice</strong> flow on the dashboard. Prices are in the store's
                             display currency (<span id="products-currency-label">sat</span>).
                         </p>
                         <div class="form-group" style="max-width:260px;">
-                            <label class="form-label" for="products-default-sort">Default sort in request modal</label>
+                            <label class="form-label" for="products-default-sort">Default sort in Create invoice modal</label>
                             <select class="form-input" id="products-default-sort">
                                 <option value="most_purchased">Most purchased</option>
                                 <option value="newest">Newest first</option>
@@ -7213,7 +7213,7 @@ header('Cache-Control: no-cache, must-revalidate');
     <div class="modal-overlay" id="modal-request">
         <div class="modal">
             <div class="modal-handle"></div>
-            <div class="modal-title">Request Payment</div>
+            <div class="modal-title">Create invoice (simple)</div>
 
             <div id="request-form">
                 <div class="form-group">
@@ -7268,7 +7268,7 @@ header('Cache-Control: no-cache, must-revalidate');
     <div class="modal-overlay" id="modal-cart">
         <div class="modal" style="max-width: 600px;">
             <div class="modal-handle"></div>
-            <div class="modal-title">Request payment</div>
+            <div class="modal-title">Create invoice</div>
 
             <div style="display:flex; gap:0.5rem; margin-bottom:0.5rem;">
                 <input type="text" class="form-input" id="cart-search" placeholder="Search products…" style="flex:1;">
@@ -8693,14 +8693,14 @@ header('Cache-Control: no-cache, must-revalidate');
                 // Show mint status warning if unreachable
                 const balanceLabel = document.querySelector('.balance-label');
                 if (dashboardData.mintUnreachable) {
-                    balanceLabel.innerHTML = 'Total Balance <span style="color: #f59e0b; font-size: 0.75rem;">(mint offline - cached)</span>';
+                    balanceLabel.innerHTML = 'Balance stored in Cashu Mint <span style="color: #f59e0b; font-size: 0.75rem;">(mint offline - cached)</span>';
                     // Disable withdraw/export buttons when mint is unreachable
                     document.querySelectorAll('.withdraw-btn, .export-btn').forEach(btn => {
                         btn.disabled = true;
                         btn.title = 'Mint is currently unreachable';
                     });
                 } else {
-                    balanceLabel.textContent = 'Total Balance';
+                    balanceLabel.textContent = 'Balance stored in Cashu Mint';
                     document.querySelectorAll('.withdraw-btn, .export-btn').forEach(btn => {
                         btn.disabled = false;
                         btn.title = '';
