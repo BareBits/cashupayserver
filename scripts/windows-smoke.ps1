@@ -43,15 +43,77 @@ $env:CASHUPAY_UPDATER_DISABLED = '1'
 # Fast helper ticks so the 3-missed-ticks self-shutdown is observable.
 $env:CASHUPAY_HELPER_TICK = '2'
 
+# Poll until the app answers 200 (following redirects). -SkipHttpErrorCheck so
+# an error response is evidence in the failure message, not a swallowed throw.
 function Wait-Http([string]$Url) {
+    $last = 'no response at all'
     for ($i = 0; $i -lt 120; $i++) {
         try {
-            return Invoke-WebRequest $Url -MaximumRedirection 5
+            $resp = Invoke-WebRequest $Url -MaximumRedirection 5 -SkipHttpErrorCheck
+            if ($resp.StatusCode -eq 200) { return $resp }
+            $body = [string]$resp.Content
+            $last = "HTTP $($resp.StatusCode): " + $body.Substring(0, [Math]::Min(500, $body.Length))
         } catch {
-            Start-Sleep -Milliseconds 500
+            $last = $_.Exception.Message
         }
+        Start-Sleep -Milliseconds 500
     }
-    throw "no HTTP response from $Url"
+    throw "no HTTP 200 from $Url within 60s; last: $last"
+}
+
+# Launch the .bat with its console output captured, and remember where — on
+# any failure the trap below dumps it (php -S startup errors land on stderr).
+$script:DiagRoot = $null
+$script:DiagOut = $null
+$script:DiagErr = $null
+function Start-Launcher([string]$Root, [string[]]$BatArgs = @(), [switch]$Wait) {
+    $tag = [IO.Path]::GetRandomFileName().Substring(0, 8)
+    $script:DiagRoot = $Root
+    $script:DiagOut = Join-Path (Get-Location).Path "launcher-$tag.out.log"
+    $script:DiagErr = Join-Path (Get-Location).Path "launcher-$tag.err.log"
+    $params = @{
+        FilePath = (Join-Path $Root 'CashuPayServer.bat')
+        WindowStyle = 'Hidden'
+        RedirectStandardOutput = $script:DiagOut
+        RedirectStandardError = $script:DiagErr
+        PassThru = $true
+    }
+    if ($BatArgs.Count -gt 0) { $params.ArgumentList = $BatArgs }
+    if ($Wait) { $params.Wait = $true }
+    Start-Process @params
+}
+
+function Show-Diagnostics {
+    # Every read is best-effort: the launcher may still hold its log files
+    # open, and a broken state must not mask the original error.
+    foreach ($pair in @(@('launcher stdout', $script:DiagOut), @('launcher stderr', $script:DiagErr))) {
+        Write-Host "---- $($pair[0]) ----"
+        try {
+            if ($pair[1] -and (Test-Path $pair[1])) { Get-Content $pair[1] | Write-Host }
+        } catch { Write-Host "(unreadable: $_)" }
+    }
+    Write-Host "---- php processes ----"
+    try {
+        Get-CimInstance Win32_Process -Filter "Name='php.exe'" |
+            ForEach-Object { Write-Host $_.CommandLine }
+    } catch { Write-Host "(unreadable: $_)" }
+    if ($script:DiagRoot) {
+        $ini = Join-Path $script:DiagRoot 'php/php.ini'
+        Write-Host "---- php.ini rendered: $(Test-Path $ini) ----"
+        $errLog = Join-Path $script:DiagRoot 'app/data/php-error.log'
+        try {
+            if (Test-Path $errLog) {
+                Write-Host "---- app php-error.log (tail) ----"
+                Get-Content $errLog -Tail 40 | Write-Host
+            }
+        } catch { Write-Host "(unreadable: $_)" }
+    }
+}
+
+trap {
+    Write-Host "SMOKE FAILED: $_"
+    Show-Diagnostics
+    break
 }
 
 function Wait-File([string]$Path, [string]$What) {
@@ -90,7 +152,6 @@ function Stop-ServerAndAwaitHelperExit([string]$Root) {
 Expand-Archive $Zip -DestinationPath smoke
 $root = (Resolve-Path 'smoke/CashuPayServer').Path
 $php = Join-Path $root 'php/php.exe'
-$bat = Join-Path $root 'CashuPayServer.bat'
 if (-not (Test-Path $php)) { throw "package layout wrong: php/php.exe missing" }
 
 # --- 1. Runtime smoke (ini render, extensions, gmp, cron-runner) -------------
@@ -113,10 +174,9 @@ Write-Host "runtime smoke: OK"
 
 # --- 2. Launcher boot on the default port ------------------------------------
 $env:CASHUPAY_BROWSER_CMD = "cmd /c echo {url} > `"$root\browser-opened.txt`""
-Start-Process -FilePath $bat -WindowStyle Hidden
+Start-Launcher $root | Out-Null
 
-$resp = Wait-Http 'http://127.0.0.1:8737/'
-if ($resp.StatusCode -ne 200) { throw "unexpected HTTP status $($resp.StatusCode)" }
+Wait-Http 'http://127.0.0.1:8737/' | Out-Null
 Wait-File "$root\browser-opened.txt" "helper never opened the browser"
 Write-Host "launcher boot: OK"
 
@@ -135,7 +195,7 @@ Write-Host "functional smoke + configured cron pass: OK (stamp: $stamp)"
 
 # --- 4. Double-launch: reopen, don't respawn ---------------------------------
 $env:CASHUPAY_BROWSER_CMD = "cmd /c echo {url} > `"$root\browser-reopened.txt`""
-$second = Start-Process -FilePath $bat -Wait -PassThru -WindowStyle Hidden
+$second = Start-Launcher $root -Wait
 if ($second.ExitCode -ne 0) { throw "double-launch exited $($second.ExitCode), expected 0" }
 if (-not (Test-Path "$root\browser-reopened.txt")) {
     throw "double-launch did not reopen the browser via the hook"
@@ -152,9 +212,8 @@ Write-Host "self-shutdown (default port): OK"
 
 # --- 5. Custom port via the .bat's port argument ------------------------------
 $env:CASHUPAY_BROWSER_CMD = "cmd /c echo {url} > `"$root\browser-customport.txt`""
-Start-Process -FilePath $bat -ArgumentList '9251' -WindowStyle Hidden
-$resp = Wait-Http 'http://127.0.0.1:9251/'
-if ($resp.StatusCode -ne 200) { throw "custom port: unexpected HTTP status $($resp.StatusCode)" }
+Start-Launcher $root @('9251') | Out-Null
+Wait-Http 'http://127.0.0.1:9251/' | Out-Null
 Wait-File "$root\browser-customport.txt" "custom port: helper never opened the browser"
 if ((Get-Content "$root\browser-customport.txt" -Raw) -notmatch '127\.0\.0\.1:9251') {
     throw "custom port: browser URL does not carry the requested port"
@@ -171,10 +230,9 @@ $hroot = Join-Path $hostileBase 'CashuPayServer'
 # location, not where cmd's redirection writes.
 $hostileMarker = Join-Path (Get-Location).Path 'hostile-browser-opened.txt'
 $env:CASHUPAY_BROWSER_CMD = "cmd /c echo {url} > `"$hostileMarker`""
-Start-Process -FilePath (Join-Path $hroot 'CashuPayServer.bat') -ArgumentList '9253' -WindowStyle Hidden
+Start-Launcher $hroot @('9253') | Out-Null
 
-$resp = Wait-Http 'http://127.0.0.1:9253/'
-if ($resp.StatusCode -ne 200) { throw "hostile path: unexpected HTTP status $($resp.StatusCode)" }
+Wait-Http 'http://127.0.0.1:9253/' | Out-Null
 Wait-File $hostileMarker "hostile path: helper never opened the browser"
 # The rendered ini must carry the absolute (spaces-and-parens) install path.
 if (-not (Select-String -Path (Join-Path $hroot 'php/php.ini') -Pattern 'New folder (2)' -SimpleMatch -Quiet)) {
