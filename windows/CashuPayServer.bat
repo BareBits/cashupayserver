@@ -62,13 +62,27 @@ if errorlevel 1 (
     exit /b 1
 )
 
-REM Already running (double-clicked twice)? Just reopen the browser.
+REM Preflight: PHP must be able to load its bundled extensions from this
+REM folder. PHP's Windows extension loader resolves extension_dir through the
+REM ANSI codepage, so a folder path with special (non-ASCII) characters makes
+REM every DLL fail to load and the app would serve nothing but errors. Refuse
+REM with advice instead of starting a broken server.
+"%PHPEXE%" -c "%PHPDIR%\php.ini" -r "exit(extension_loaded('pdo_sqlite') ? 0 : 1);" >nul 2>&1
+if errorlevel 1 goto badpath
+
+REM Already running (double-clicked twice)? Just reopen the browser. The
+REM CASHUPAY_BROWSER_CMD hook (documented in desktop-helper.php) is honored
+REM here too, so the CI smoke can observe this branch without a real browser.
 "%PHPEXE%" -n -r "exit(@fsockopen('127.0.0.1',(int)$argv[1]) ? 0 : 1);" %PORT% >nul 2>&1
-if not errorlevel 1 (
-    echo CashuPayServer is already running on port %PORT% - opening it.
-    start "" "http://127.0.0.1:%PORT%/"
-    exit /b 0
-)
+if errorlevel 1 goto notrunning
+echo CashuPayServer is already running on port %PORT% - opening it.
+if defined CASHUPAY_BROWSER_CMD goto reopen_hook
+start "" "http://127.0.0.1:%PORT%/"
+exit /b 0
+:reopen_hook
+"%PHPEXE%" -n -r "system(str_replace('{url}', $argv[1], (string) getenv('CASHUPAY_BROWSER_CMD')));" "http://127.0.0.1:%PORT%/"
+exit /b 0
+:notrunning
 
 REM Background helper: waits for the server, opens the browser, then keeps
 REM background tasks ticking (invoice polling, webhooks, auto-melt). It exits
@@ -83,3 +97,18 @@ echo   Close this window to stop it.
 echo.
 cd /d "%ROOT%app"
 "%PHPEXE%" -c "%PHPDIR%\php.ini" -S 127.0.0.1:%PORT% router.php
+exit /b 0
+
+:badpath
+echo.
+echo   CashuPayServer cannot start from this folder:
+echo.
+echo     %ROOT%
+echo.
+echo   PHP could not load its bundled extensions here. This usually means
+echo   the folder path contains special characters (accents, symbols).
+echo   Please move the whole CashuPayServer folder to a simpler location,
+echo   for example C:\CashuPayServer, and start it again.
+echo   If the path looks plain, re-extract the downloaded zip and retry.
+pause
+exit /b 1
