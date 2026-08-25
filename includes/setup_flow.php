@@ -71,10 +71,18 @@ final class SetupFlow {
      * only confuses the operator. Callers keep it true whenever a requirement
      * is missing, because the screen is also where that blocking error lives.
      *
+     * $isDesktop drops the cron screen: the Windows desktop package's
+     * launcher already ticks cron-runner.php on a timer (see windows/), so
+     * there is nothing for the operator to set up — and the crontab line the
+     * screen shows is meaningless on a system without cron. The same skip
+     * pattern WordPress uses after its cron self-test, decided statically
+     * because the desktop wiring ships with the package.
+     *
      * @return string[]
      */
     public static function stepSequence(
-        string $mode, bool $isWordPress, bool $includeZeroConf, bool $includeSecurity = true
+        string $mode, bool $isWordPress, bool $includeZeroConf,
+        bool $includeSecurity = true, bool $isDesktop = false
     ): array {
         if ($mode === 'add_store') {
             $steps = self::ADD_STORE_STEPS;
@@ -91,6 +99,9 @@ final class SetupFlow {
             }
             if (!$includeSecurity) {
                 $steps = array_values(array_diff($steps, ['security']));
+            }
+            if ($isDesktop) {
+                $steps = array_values(array_diff($steps, ['cron']));
             }
         }
         if (!$includeZeroConf) {
@@ -127,6 +138,36 @@ final class SetupFlow {
             }
         }
         return $failed;
+    }
+
+    /**
+     * The instruction the cron screen shows for wiring up the scheduler,
+     * keyed on the host OS. Unix hosts get the classic crontab line; a
+     * Windows server (IIS, XAMPP — not the desktop package, which never
+     * shows the screen) has no cron, so it gets the Task Scheduler
+     * equivalent instead. curl.exe ships with Windows 10 1803+; the inner
+     * quotes are backslash-escaped per schtasks' /TR quoting rules, and
+     * there is no > /dev/null because /TR runs the command directly, not
+     * through a shell.
+     *
+     * @return array{intro: string, line: string}
+     */
+    public static function cronScheduleLine(
+        string $osFamily, string $cronKey, string $cronUrl
+    ): array {
+        if ($osFamily === 'Windows') {
+            return [
+                'intro' => 'This server runs on Windows, which has no cron — '
+                    . 'create a Task Scheduler entry instead (run in a Command Prompt):',
+                'line' => 'schtasks /Create /F /SC MINUTE /MO 1 /TN "CashuPayServer cron" '
+                    . '/TR "curl.exe -fsS -H \"X-CRON-KEY: ' . $cronKey . '\" ' . $cronUrl . '"',
+            ];
+        }
+        return [
+            'intro' => "Add this line to your crontab (or your host's cron panel):",
+            'line' => '* * * * * curl -fsS -H \'X-CRON-KEY: ' . $cronKey . '\' '
+                . $cronUrl . ' > /dev/null',
+        ];
     }
 
     /**
