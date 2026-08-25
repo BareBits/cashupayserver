@@ -85,7 +85,7 @@ Don't want to mess around with LNURLs or CLINK noffers? Just want everything to 
 
 ### Standalone (Any PHP Hosting)
 
-1. **Download** the latest `cashupayserver.zip` from [GitHub Releases](https://github.com/BareBits/cashupayserver/releases)
+1. **Download** the latest `cashupayserver.zip` from the [latest GitHub release](https://github.com/BareBits/cashupayserver/releases/latest)
 2. **Extract** the zip file
 3. **Upload** to your web hosting via FTP or file manager
 4. **Open** the URL in your browser (e.g., `https://yourdomain.com/barebits/`)
@@ -97,7 +97,7 @@ Don't want to mess around with LNURLs or CLINK noffers? Just want everything to 
 Run BareBits as a local point-of-sale app on a Windows 10/11 PC or tablet —
 no web server, no hosting account.
 
-1. **Download** the latest `cashupayserver-windows-*.zip` from [GitHub Releases](https://github.com/BareBits/cashupayserver/releases)
+1. **Download** the latest `cashupayserver-windows-*.zip` from the [latest GitHub release](https://github.com/BareBits/cashupayserver/releases/latest)
 2. **Extract** it anywhere you have write access (Desktop, Documents — not `Program Files`)
 3. **Double-click** `CashuPayServer.bat` — your browser opens the setup wizard
 
