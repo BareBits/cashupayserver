@@ -1,0 +1,107 @@
+name: Windows desktop smoke
+
+# PR-time safety net for the Windows desktop package. The release workflow
+# runs the same smoke (scripts/windows-smoke.ps1), but only when a release is
+# being cut — which used to mean a break in the launcher, the package build,
+# or the setup flow was first discovered while trying to ship. This workflow
+# builds the package and boots it on a real Windows runner for every PR that
+# touches something the package depends on.
+#
+# Path-filtered: the two-job build+smoke pipeline costs real minutes, so it
+# runs only when the Windows package could actually be affected.
+
+on:
+  pull_request:
+    paths:
+      - "windows/**"
+      - "scripts/build-windows-desktop.sh"
+      - "scripts/build-standalone.sh"
+      - "scripts/windows-smoke.ps1"
+      - "scripts/desktop-smoke.php"
+      - "setup.php"
+      - "includes/setup_flow.php"
+      - "includes/desktop.php"
+      - "router.php"
+      - "index.php"
+      - ".github/workflows/windows-desktop-smoke.yml"
+  # Manual escape hatch for changes the path filter can't anticipate.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-desktop-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 25
+    steps:
+      - name: Use HTTPS for SSH-form submodule URLs
+        run: |
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
+
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.1"
+          extensions: curl, json, gmp, mbstring, sqlite3, zip
+          coverage: none
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Build Windows desktop zip
+        run: ./scripts/build-windows-desktop.sh
+
+      - name: Verify Windows desktop layout
+        run: |
+          php scripts/verify-plugin-build.php build/CashuPayServer \
+            CashuPayServer.bat \
+            desktop-helper.php \
+            cron-runner.php \
+            README.txt \
+            vc_redist.x64.exe \
+            php/php.exe \
+            php/ext/php_gmp.dll \
+            php/cacert.pem \
+            php/php.ini.template \
+            php/render-ini.php \
+            app/router.php \
+            app/cron.php \
+            app/includes/database.php
+
+      - name: Upload package for the smoke job
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-desktop-zip
+          if-no-files-found: error
+          retention-days: 3
+          path: build/cashupayserver-windows.zip
+
+  smoke:
+    needs: build
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout (smoke scripts)
+        uses: actions/checkout@v4
+
+      - name: Download package
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-desktop-zip
+          path: build
+
+      - name: Run Windows desktop smoke
+        shell: pwsh
+        run: ./scripts/windows-smoke.ps1 -Zip build/cashupayserver-windows.zip

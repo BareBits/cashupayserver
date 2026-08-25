@@ -113,6 +113,15 @@ for pair in "windows/CashuPayServer.bat:CashuPayServer.bat" \
     sed -e 's/\r$//' -e 's/$/\r/' "$src" > "$STAGE/$dst"
 done
 
+# Verify the normalization actually held: an LF-only line in a .bat makes
+# cmd.exe mis-parse labels silently, so fail the build rather than ship it.
+for f in "$STAGE/CashuPayServer.bat" "$STAGE/README.txt"; do
+    if ! awk '!/\r$/ { exit 1 }' "$f"; then
+        echo "ERROR: $f contains a line without a CRLF ending" >&2
+        exit 1
+    fi
+done
+
 # --- 5. Zip -----------------------------------------------------------------
 (cd build && zip -q -r cashupayserver-windows.zip CashuPayServer/)
 

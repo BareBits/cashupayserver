@@ -191,103 +191,33 @@ jobs:
             build/cashupayserver-windows-${{ env.TAG }}.zip
             build/cashupayserver/BUILD_INFO
 
-  # Boot the Windows desktop package on real Windows before publishing:
-  # extensions load (gmp does arithmetic), the launcher .bat brings the
-  # server up, the helper opens the "browser" (test hook), the POS answers
-  # over HTTP, and the helper shuts itself down after the server stops.
+  # Boot the Windows desktop package on real Windows before publishing. The
+  # scenarios live in scripts/windows-smoke.ps1 (shared with the PR-time
+  # windows-desktop-smoke.yml workflow): runtime checks (extensions, gmp,
+  # cron-runner), launcher boot + browser hook, a functional pass that walks
+  # the onboarding wizard and API end to end (scripts/desktop-smoke.php),
+  # a configured cron pass, double-launch, custom port, a hostile install
+  # path (spaces + non-ASCII), and helper self-shutdown.
   windows-smoke:
     needs: build
     runs-on: windows-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     env:
       TAG: ${{ inputs.tag || github.ref_name }}
 
     steps:
+      - name: Checkout (smoke scripts)
+        uses: actions/checkout@v4
+
       - name: Download release assets
         uses: actions/download-artifact@v4
         with:
           name: release-assets
           path: build
 
-      - name: Extract Windows package
+      - name: Run Windows desktop smoke
         shell: pwsh
-        run: |
-          Expand-Archive "build/cashupayserver-windows-$env:TAG.zip" -DestinationPath smoke
-          if (-not (Test-Path "smoke/CashuPayServer/php/php.exe")) {
-            throw "package layout wrong: php/php.exe missing"
-          }
-
-      - name: Runtime smoke (ini render, extensions, gmp, cron-runner)
-        shell: pwsh
-        run: |
-          $root = Resolve-Path "smoke/CashuPayServer"
-          $php = "$root/php/php.exe"
-
-          & $php -n "$root/php/render-ini.php"
-          if ($LASTEXITCODE -ne 0) { throw "render-ini.php failed" }
-
-          $mods = & $php -c "$root/php/php.ini" -m
-          foreach ($ext in 'gmp','curl','mbstring','openssl','pdo_sqlite','sqlite3','zip','fileinfo') {
-            if ($mods -notcontains $ext) { throw "extension not loaded: $ext" }
-          }
-
-          $pow = & $php -c "$root/php/php.ini" -r "echo gmp_strval(gmp_pow(2, 64));"
-          if ($pow -ne '18446744073709551616') { throw "gmp arithmetic broken: got '$pow'" }
-
-          # Fresh (unconfigured) install: the cron runner must bail politely.
-          & $php -c "$root/php/php.ini" "$root/cron-runner.php"
-          if ($LASTEXITCODE -ne 0) { throw "cron-runner.php failed on fresh install" }
-
-      - name: Launcher smoke (boot, HTTP, browser hook, self-shutdown)
-        shell: pwsh
-        run: |
-          $root = Resolve-Path "smoke/CashuPayServer"
-
-          # Test hooks: don't open a real browser, tick fast so the helper's
-          # 3-missed-ticks self-shutdown is observable within the test.
-          $env:CASHUPAY_BROWSER_CMD = "cmd /c echo {url} > `"$root\browser-opened.txt`""
-          $env:CASHUPAY_HELPER_TICK = '2'
-
-          Start-Process -FilePath "$root\CashuPayServer.bat" -WindowStyle Hidden
-
-          # Wait for the server to answer.
-          $up = $false
-          for ($i = 0; $i -lt 120 -and -not $up; $i++) {
-            try {
-              Invoke-WebRequest 'http://127.0.0.1:8737/' -MaximumRedirection 5 | Out-Null
-              $up = $true
-            } catch {
-              Start-Sleep -Milliseconds 500
-            }
-          }
-          if (-not $up) { throw "server did not come up on 127.0.0.1:8737" }
-
-          # A fresh install must serve the setup flow with a 200 somewhere
-          # down the redirect chain.
-          $resp = Invoke-WebRequest 'http://127.0.0.1:8737/' -MaximumRedirection 5
-          if ($resp.StatusCode -ne 200) { throw "unexpected HTTP status $($resp.StatusCode)" }
-
-          # The helper must have fired the browser hook.
-          for ($i = 0; $i -lt 40 -and -not (Test-Path "$root\browser-opened.txt"); $i++) {
-            Start-Sleep -Milliseconds 500
-          }
-          if (-not (Test-Path "$root\browser-opened.txt")) { throw "helper never opened the browser" }
-
-          # Stop only the web server (php -S ...); the helper must then exit
-          # on its own within 3 ticks.
-          $server = Get-CimInstance Win32_Process -Filter "Name='php.exe'" |
-            Where-Object { $_.CommandLine -match '-S 127\.0\.0\.1' }
-          if (-not $server) { throw "server process not found" }
-          $server | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
-
-          $helperGone = $false
-          for ($i = 0; $i -lt 30 -and -not $helperGone; $i++) {
-            Start-Sleep -Seconds 1
-            $helper = Get-CimInstance Win32_Process -Filter "Name='php.exe'" |
-              Where-Object { $_.CommandLine -match 'desktop-helper\.php' }
-            if (-not $helper) { $helperGone = $true }
-          }
-          if (-not $helperGone) { throw "helper did not shut itself down after server stop" }
+        run: ./scripts/windows-smoke.ps1 -Zip "build/cashupayserver-windows-$env:TAG.zip"
 
   publish:
     needs: [build, windows-smoke]
