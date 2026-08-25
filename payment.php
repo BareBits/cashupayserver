@@ -125,6 +125,12 @@ if (isset($_GET['json'])) {
         // payments. Sent while confirming AND after settlement so the link
         // survives the pending -> settled transition.
         'onchainTxUrl' => cashupay_onchain_tx_url($invoice),
+        // Sanitized create-time direct-receive failures ([{type, reason}]);
+        // static for the invoice's lifetime — the page renders them
+        // server-side, this mirrors them for JSON consumers.
+        'receiveErrors' => !empty($invoice['receive_errors'])
+            ? (json_decode((string)$invoice['receive_errors'], true) ?: [])
+            : [],
     ]);
     exit;
 }
@@ -773,6 +779,30 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
             display: none;
         }
 
+        /* Sanitized direct-receive failure banner (invoices.receive_errors):
+           tells the payer a store wallet (NWC / noffer / Lightning address)
+           couldn't be reached at invoice creation. Informational — the page
+           always still shows a payable method. */
+        .receive-errors {
+            margin: 0 0 1rem 0;
+            padding: 0.6rem 0.8rem;
+            text-align: left;
+            font-size: 0.8rem;
+            line-height: 1.45;
+            color: var(--text-secondary);
+            border: 1px solid var(--warning);
+            border-radius: 10px;
+        }
+        .receive-errors .re-title {
+            color: var(--warning);
+            font-weight: 600;
+            margin-bottom: 0.25rem;
+        }
+        .receive-errors ul {
+            margin: 0;
+            padding-left: 1.1rem;
+        }
+
         .barebits-notice {
             margin-top: 0.65rem;
             font-size: 1.05rem;
@@ -1100,6 +1130,41 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                     <div class="spinner"></div>
                     Waiting for payment
                 </div>
+
+                <?php
+                // Direct-receive failures recorded at create time (see
+                // Invoice::create): tell the payer which wallet *type* had a
+                // problem and why, in the fixed sanitized phrasing persisted in
+                // receive_errors. No addresses, URIs, or wallet-provided text
+                // ever land here, but escape everything anyway — this page is
+                // public.
+                $receiveErrors = [];
+                if (!empty($invoice['receive_errors'])) {
+                    $decoded = json_decode((string)$invoice['receive_errors'], true);
+                    if (is_array($decoded)) {
+                        $receiveErrors = $decoded;
+                    }
+                }
+                $receiveErrorLabels = [
+                    'nwc' => 'NWC wallet',
+                    'noffer' => 'Noffer (Nostr offer)',
+                    'lnurl' => 'Lightning address',
+                ];
+                if ($receiveErrors !== []): ?>
+                <div class="receive-errors">
+                    <div class="re-title">Some of this store&#39;s wallet connections had a problem</div>
+                    <ul>
+                        <?php foreach ($receiveErrors as $re):
+                            $reType = is_array($re) ? (string)($re['type'] ?? '') : '';
+                            $reReason = is_array($re) ? (string)($re['reason'] ?? '') : '';
+                            if ($reReason === '') { continue; }
+                        ?>
+                        <li><strong><?= htmlspecialchars($receiveErrorLabels[$reType] ?? $reType) ?></strong>: <?= htmlspecialchars($reReason) ?></li>
+                        <?php endforeach; ?>
+                    </ul>
+                    You can still pay using the option<?= $methodCount >= 2 ? 's' : '' ?> below.
+                </div>
+                <?php endif; ?>
 
                 <?php
                 // On-chain is the preferred default when the invoice offers it;

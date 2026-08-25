@@ -54,16 +54,23 @@ class LnUrlReceive {
      * have an invoice in hand that will be paid through to the merchant and
      * a verify URL we can poll for settlement.
      *
+     * On failure $failReason receives a short fixed phrase describing what
+     * went wrong. It is payer-facing (payment page), so it must never contain
+     * the LN address, URLs, or any host-provided text.
+     *
      * @return array{bolt11:string,verify_url:string,min_sendable_msats:int,max_sendable_msats:int}|null
      */
     public static function probeAndFetchInvoice(
         string $lnAddress,
         int $amountSats,
-        ?int $timeoutSec = null
+        ?int $timeoutSec = null,
+        ?string &$failReason = null
     ): ?array {
+        $failReason = null;
         $timeout = $timeoutSec ?? (int)LNURL_RECEIVE_PROBE_TIMEOUT_SEC;
 
         if (!preg_match('/^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$/', $lnAddress)) {
+            $failReason = 'the configured Lightning address is malformed';
             return null;
         }
         [$user, $domain] = explode('@', $lnAddress, 2);
@@ -80,12 +87,14 @@ class LnUrlReceive {
 
         $metaResp = self::httpGet($url, $timeout);
         if ($metaResp === null) {
+            $failReason = 'the Lightning address service could not be reached';
             return null;
         }
         $meta = json_decode($metaResp, true);
         if (!is_array($meta)
             || !isset($meta['callback'], $meta['minSendable'], $meta['maxSendable'])
         ) {
+            $failReason = 'the Lightning address service returned an invalid response';
             return null;
         }
 
@@ -93,6 +102,7 @@ class LnUrlReceive {
         if ($amountMsats < (int)$meta['minSendable']
             || $amountMsats > (int)$meta['maxSendable']
         ) {
+            $failReason = 'the amount is outside the range the Lightning address accepts';
             return null;
         }
 
@@ -102,16 +112,19 @@ class LnUrlReceive {
 
         $invResp = self::httpGet($callbackUrl, $timeout);
         if ($invResp === null) {
+            $failReason = 'the Lightning address service could not be reached';
             return null;
         }
         $inv = json_decode($invResp, true);
         if (!is_array($inv) || !isset($inv['pr'])) {
+            $failReason = 'the Lightning address service returned no invoice';
             return null;
         }
         // LUD-21: the callback response must include a `verify` URL. Without
         // it we cannot detect settlement (we don't run the LN node), so we
         // refuse to use this LNURL for receive and fall back to mint/swap.
         if (!isset($inv['verify']) || !is_string($inv['verify']) || $inv['verify'] === '') {
+            $failReason = 'the Lightning address service does not support payment verification (LUD-21)';
             return null;
         }
 
