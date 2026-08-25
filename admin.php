@@ -6952,7 +6952,7 @@ header('Cache-Control: no-cache, must-revalidate');
                 <div class="view-footer" style="text-align: center; padding: 1.5rem 0; color: var(--text-muted); font-size: 0.8rem;">
                     BareBits v<?= CASHUPAY_VERSION ?> &middot;
                     Deployment ID: <code style="background: rgba(0,0,0,0.2); padding: 0.1rem 0.4rem; border-radius: 4px;"><?= htmlspecialchars((string) Config::get('deployment_id', 'ANONYMOUS')) ?></code> &middot;
-                    <a href="https://github.com/BareBits/cashupayserver/releases" target="_blank" rel="noopener"
+                    <a href="<?= htmlspecialchars(Updater::releasesUrl()) ?>" target="_blank" rel="noopener"
                        style="color: var(--text-secondary); text-decoration: none;">Check for updates</a>
                 </div>
             </div>

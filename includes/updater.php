@@ -160,6 +160,17 @@ class Updater {
         return $channel === 'testing' ? 'testing' : 'main';
     }
 
+    /**
+     * Human-facing releases page for the current channel. Stable installs get
+     * /releases/latest (always the newest stable release — prereleases are
+     * skipped, so operators can't grab a testing build by mistake); testing
+     * installs get the full listing, the only page their prereleases show on.
+     */
+    public static function releasesUrl(): string {
+        $url = sprintf('https://github.com/%s/%s/releases', self::GH_OWNER, self::GH_REPO);
+        return self::getChannel() === 'main' ? $url . '/latest' : $url;
+    }
+
     public static function installRoot(): string {
         return self::$installRootOverride ?? dirname(__DIR__);
     }
