@@ -1,0 +1,45 @@
+; CashuPayServer Windows desktop php.ini TEMPLATE.
+;
+; Do not edit php.ini directly — it is re-rendered from this template on
+; every launch (see render-ini.php), with {{ROOT}} replaced by the absolute
+; path of the php/ directory. Absolute paths are required because the
+; package can be extracted (and later moved) anywhere: a relative
+; extension_dir would resolve against the *current working directory*,
+; which is app/ while the server runs.
+
+; --- Extensions -------------------------------------------------------------
+; bcmath / ctype / json / session / etc. are compiled into the official
+; Windows PHP builds; only these ship as DLLs. gmp is required for the
+; on-chain xpub, submarine-swap and sweep features (bitwasp/bitcoin).
+extension_dir = "{{ROOT}}/ext"
+extension=curl
+extension=fileinfo
+extension=gmp
+extension=mbstring
+extension=openssl
+extension=pdo_sqlite
+extension=sqlite3
+extension=zip
+
+; Bytecode cache: the app re-includes ~40 files per request and the checkout
+; page polls every second; this is the difference between snappy and sluggish.
+zend_extension=opcache
+opcache.enable=1
+opcache.enable_cli=0
+
+; --- Outbound TLS -----------------------------------------------------------
+; Official Windows PHP builds ship with NO CA store configured, so every
+; verified HTTPS request (mints, LNURL, relays — the app verifies peers)
+; would fail without this bundle.
+curl.cainfo = "{{ROOT}}/cacert.pem"
+openssl.cafile = "{{ROOT}}/cacert.pem"
+
+; --- Runtime ----------------------------------------------------------------
+memory_limit = 256M
+max_execution_time = 120
+date.timezone = UTC
+
+; Errors: never to the merchant's screen, always to a log we can ask for.
+display_errors = Off
+log_errors = On
+error_log = "{{ROOT}}/../app/data/php-error.log"
