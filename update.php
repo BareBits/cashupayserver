@@ -203,7 +203,8 @@ function upd_base_url(): string {
     }
     $protocol = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
     $host = $_SERVER['HTTP_HOST'] ?? 'localhost';
-    $path = dirname($_SERVER['SCRIPT_NAME'] ?? '');
+    // dirname() uses '\' separators on Windows; normalize like Config::getBaseUrl().
+    $path = str_replace('\\', '/', dirname($_SERVER['SCRIPT_NAME'] ?? ''));
     return rtrim($protocol . '://' . $host . $path, '/');
 }
 

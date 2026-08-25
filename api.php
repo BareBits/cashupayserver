@@ -55,8 +55,9 @@ if (!empty($_SERVER['PATH_INFO'])) {
 } else {
     $path = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH);
 
-    // Remove base path to get API path
-    $scriptPath = dirname($_SERVER['SCRIPT_NAME']);
+    // Remove base path to get API path. dirname() uses '\' separators on
+    // Windows, which would never prefix-match the '/'-separated request path.
+    $scriptPath = str_replace('\\', '/', dirname($_SERVER['SCRIPT_NAME']));
     if ($scriptPath !== '/' && str_starts_with($path, $scriptPath)) {
         $path = substr($path, strlen($scriptPath));
     }

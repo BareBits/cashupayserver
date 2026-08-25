@@ -198,7 +198,11 @@ class Config {
         // Auto-detect
         $protocol = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
         $host = $_SERVER['HTTP_HOST'] ?? 'localhost';
-        $path = dirname($_SERVER['SCRIPT_NAME'] ?? '');
+        // dirname() uses '\' separators on Windows ('/router.php' -> '\').
+        // A backslash leaking into a Location header breaks strict HTTP
+        // clients (.NET/PowerShell refuse to follow the redirect), so
+        // normalize before building the URL. Mirrored in upd_base_url().
+        $path = str_replace('\\', '/', dirname($_SERVER['SCRIPT_NAME'] ?? ''));
 
         return rtrim($protocol . '://' . $host . $path, '/');
     }
