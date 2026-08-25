@@ -54,7 +54,9 @@ foreach ($it as $file) {
     }
     $path = $file->getPathname();
     // vendor/ is third-party and huge; trust composer's own validation.
-    if (strpos($path, $root . '/vendor/') === 0) {
+    // Matched at any depth, not just the tree root: the Windows desktop
+    // package nests the whole app (vendor/ included) under app/.
+    if (strpos($path, '/vendor/') !== false) {
         continue;
     }
     $checkedFiles++;
