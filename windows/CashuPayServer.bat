@@ -25,6 +25,12 @@ REM single-threaded built-in server, so every update would "fail" and roll
 REM back. Inherited by every process started below.
 set "CASHUPAY_UPDATER_DISABLED=1"
 
+REM Tell the app it is running as the desktop package: the onboarding wizard
+REM skips its cron and database-exposure screens (background jobs are handled
+REM by desktop-helper.php below, and the server only listens on localhost).
+REM Inherited by every process started below.
+set "CASHUPAY_DESKTOP=1"
+
 REM php.exe needs the Microsoft Visual C++ runtime (VS16 builds). If PHP
 REM cannot start, install the bundled redistributable and retry once.
 "%PHPEXE%" -n -v >nul 2>&1

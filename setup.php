@@ -38,6 +38,7 @@ require_once __DIR__ . '/includes/urls.php';
 require_once __DIR__ . '/includes/store_ln_addresses.php';
 require_once __DIR__ . '/includes/swap/config.php';
 require_once __DIR__ . '/includes/setup_flow.php';
+require_once __DIR__ . '/includes/desktop.php';
 
 /**
  * Load the WooCommerce/BTCPay auto-wiring helper (WordPress mode only). Its
@@ -138,13 +139,20 @@ if (!Database::isInitialized()) {
     Database::initialize();
 }
 
+// One resolve per request: the answer can't change mid-request, and the
+// wizard's shape must not either.
+$isDesktop = Desktop::isWindowsDesktop();
+
 // The security screen exists to prove the data directory can't be fetched
 // over the web. With the directory outside the web root that exposure is
 // impossible, so the screen is dropped from the flow entirely rather than
 // warning about a risk that doesn't apply — unless a PHP requirement is
 // missing, because the screen is also where that blocking error renders.
+// The Windows desktop package drops it too: its server only listens on
+// 127.0.0.1 and router.php refuses /data requests, so the screen's manual
+// Apache/nginx hardening walkthrough has nothing to protect against.
 $securityScreenNeeded = SetupFlow::missingRequirements() !== []
-    || !Database::isDataDirOutsideWebroot();
+    || (!Database::isDataDirOutsideWebroot() && !$isDesktop);
 
 // Current screen. Anything unrecognised (a stale bookmark, or a form saved
 // from the pre-slug wizard) restarts at the first screen for this mode rather
@@ -225,7 +233,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $storeIdForFlow = $_SESSION['setup_store_id'] ?? null;
     $flowSteps = SetupFlow::stepSequence(
         $mode, Urls::isWordPress(), SetupFlow::onchainState($storeIdForFlow)['configured'],
-        $securityScreenNeeded
+        $securityScreenNeeded, $isDesktop
     );
     // Set by the mints handler when it mints a fresh wallet seed. add_store
     // has to stop and show it rather than redirecting past it.
@@ -375,7 +383,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 // whether the zero-conf screen is in the sequence.
                 $flowSteps = SetupFlow::stepSequence(
                     $mode, Urls::isWordPress(), SetupFlow::onchainState($storeId)['configured'],
-                    $securityScreenNeeded
+                    $securityScreenNeeded, $isDesktop
                 );
                 $step = SetupFlow::nextStep('store', $flowSteps) ?? 'onchain';
                 break;
@@ -390,7 +398,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if ($onchainAction === 'skip') {
                     // Nothing saved; the zero-conf screen drops out of the
                     // sequence because there is no on-chain rail to time.
-                    $flowSteps = SetupFlow::stepSequence($mode, Urls::isWordPress(), false, $securityScreenNeeded);
+                    $flowSteps = SetupFlow::stepSequence($mode, Urls::isWordPress(), false, $securityScreenNeeded, $isDesktop);
                     $step = SetupFlow::nextStep('onchain', $flowSteps) ?? 'lightning';
                     break;
                 }
@@ -500,7 +508,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     ], 'id = ?', [$storeId]);
                 }
 
-                $flowSteps = SetupFlow::stepSequence($mode, Urls::isWordPress(), true, $securityScreenNeeded);
+                $flowSteps = SetupFlow::stepSequence($mode, Urls::isWordPress(), true, $securityScreenNeeded, $isDesktop);
                 $step = SetupFlow::nextStep('onchain', $flowSteps) ?? 'zeroconf';
                 break;
 
@@ -1415,7 +1423,7 @@ function renderUrlModeDetectionScript(): void { ?>
             $renderStoreId = $_SESSION['setup_store_id'] ?? null;
             $renderOnchain = SetupFlow::onchainState($renderStoreId);
             $renderSteps = SetupFlow::stepSequence(
-                $mode, Urls::isWordPress(), $renderOnchain['configured'], $securityScreenNeeded
+                $mode, Urls::isWordPress(), $renderOnchain['configured'], $securityScreenNeeded, $isDesktop
             );
             $displayIndex = array_search($step, $renderSteps, true);
             $totalSteps = count($renderSteps);
@@ -2776,9 +2784,10 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                 // Same shape the admin Settings page renders, so operators see
                 // one canonical line in both places. The key travels in a
                 // header rather than the query string so it stays out of
-                // access logs.
-                $cronLine = '* * * * * curl -fsS -H \'X-CRON-KEY: ' . $cronKey . '\' '
-                    . Urls::cron() . ' > /dev/null';
+                // access logs. A Windows server host (the desktop package
+                // never reaches this screen) gets the Task Scheduler
+                // equivalent — a crontab line is unusable there.
+                $cronSchedule = SetupFlow::cronScheduleLine(PHP_OS_FAMILY, $cronKey, Urls::cron());
                 ?>
                 <h2 style="margin-bottom: 1rem;">⏰ Enable cron</h2>
                 <p style="margin-bottom: 1.25rem;">
@@ -2789,9 +2798,9 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                 </p>
 
                 <p style="margin-bottom: 0.5rem; font-size: 0.9rem; color: #a0aec0;">
-                    Add this line to your crontab (or your host's cron panel):
+                    <?= htmlspecialchars($cronSchedule['intro']) ?>
                 </p>
-                <pre style="background: rgba(0,0,0,0.3); padding: 0.75rem; border-radius: 6px; font-size: 0.8rem; user-select: all;"><?= htmlspecialchars($cronLine) ?></pre>
+                <pre style="background: rgba(0,0,0,0.3); padding: 0.75rem; border-radius: 6px; font-size: 0.8rem; user-select: all;"><?= htmlspecialchars($cronSchedule['line']) ?></pre>
 
                 <form method="POST" action="<?= htmlspecialchars(Urls::setup()) ?>" style="margin-top: 1.5rem;">
                     <input type="hidden" name="step" value="cron">
@@ -2810,6 +2819,11 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                 <p style="margin-bottom: 1.25rem; font-size: 0.9rem; color: #a0aec0;">
                     ⏰ Background jobs are handled automatically through
                     WordPress &mdash; no crontab entry needed.
+                </p>
+                <?php elseif ($isDesktop): ?>
+                <p style="margin-bottom: 1.25rem; font-size: 0.9rem; color: #a0aec0;">
+                    ⏰ Background jobs run automatically while the desktop
+                    launcher is open &mdash; nothing to set up.
                 </p>
                 <?php endif; ?>
 
