@@ -18,9 +18,15 @@
 #   5. Custom port: the .bat's port argument is honored end to end (server,
 #      helper, browser URL).
 #   6. Hostile install path: the package extracted under a directory with
-#      spaces, parentheses and non-ASCII characters ("José María/New folder
-#      (2)") still renders its ini and boots — the classic merchant-desktop
-#      failure class.
+#      spaces and parentheses ("Coffee Shop 2/New folder (2)") still renders
+#      its ini and boots — the classic merchant-desktop failure class.
+#      KNOWN LIMITATION, deliberately not tested: non-ASCII directories
+#      (e.g. "José María") break the package today — PHP's Windows extension
+#      loader resolves extension_dir through the ANSI codepage, so no DLL
+#      loads from a path whose UTF-8 ini bytes aren't ACP-representable and
+#      the app 500s ("could not find driver"). Needs a product-side fix
+#      (e.g. a launcher preflight with a clear "move the folder" message)
+#      before this scenario can assert accents.
 #   7. Shutdown: after the server is stopped, the helper exits on its own
 #      within three ticks.
 #
@@ -222,7 +228,7 @@ Stop-ServerAndAwaitHelperExit $root
 Write-Host "custom port: OK"
 
 # --- 6. Hostile install path --------------------------------------------------
-$hostileBase = Join-Path (Get-Location).Path 'smoke-hostile/José María/New folder (2)'
+$hostileBase = Join-Path (Get-Location).Path 'smoke-hostile/Coffee Shop 2/New folder (2)'
 New-Item -ItemType Directory -Path $hostileBase -Force | Out-Null
 Expand-Archive $Zip -DestinationPath $hostileBase
 $hroot = Join-Path $hostileBase 'CashuPayServer'
