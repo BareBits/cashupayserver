@@ -20,13 +20,11 @@
 #   6. Hostile install path: the package extracted under a directory with
 #      spaces and parentheses ("Coffee Shop 2/New folder (2)") still renders
 #      its ini and boots — the classic merchant-desktop failure class.
-#      KNOWN LIMITATION, deliberately not tested: non-ASCII directories
-#      (e.g. "José María") break the package today — PHP's Windows extension
+#      6b. Non-ASCII install path ("José María"): PHP's Windows extension
 #      loader resolves extension_dir through the ANSI codepage, so no DLL
-#      loads from a path whose UTF-8 ini bytes aren't ACP-representable and
-#      the app 500s ("could not find driver"). Needs a product-side fix
-#      (e.g. a launcher preflight with a clear "move the folder" message)
-#      before this scenario can assert accents.
+#      loads from such a path and the app could only serve errors. The
+#      launcher's preflight must catch that and refuse with a clear
+#      "move the folder" message instead of starting a broken server.
 #   7. Shutdown: after the server is stopped, the helper exits on its own
 #      within three ticks.
 #
@@ -72,7 +70,7 @@ function Wait-Http([string]$Url) {
 $script:DiagRoot = $null
 $script:DiagOut = $null
 $script:DiagErr = $null
-function Start-Launcher([string]$Root, [string[]]$BatArgs = @(), [switch]$Wait) {
+function Start-Launcher([string]$Root, [string[]]$BatArgs = @(), [switch]$Wait, [string]$StdIn = '') {
     $tag = [IO.Path]::GetRandomFileName().Substring(0, 8)
     $script:DiagRoot = $Root
     $script:DiagOut = Join-Path (Get-Location).Path "launcher-$tag.out.log"
@@ -86,6 +84,7 @@ function Start-Launcher([string]$Root, [string[]]$BatArgs = @(), [switch]$Wait) 
     }
     if ($BatArgs.Count -gt 0) { $params.ArgumentList = $BatArgs }
     if ($Wait) { $params.Wait = $true }
+    if ($StdIn) { $params.RedirectStandardInput = $StdIn }
     Start-Process @params
 }
 
@@ -246,5 +245,24 @@ if (-not (Select-String -Path (Join-Path $hroot 'php/php.ini') -Pattern 'New fol
 }
 Stop-ServerAndAwaitHelperExit $hroot
 Write-Host "hostile install path: OK"
+
+# --- 6b. Non-ASCII install path: the preflight refuses gracefully -------------
+$accentBase = Join-Path (Get-Location).Path 'smoke-hostile/José María'
+New-Item -ItemType Directory -Path $accentBase -Force | Out-Null
+Expand-Archive $Zip -DestinationPath $accentBase
+$aroot = Join-Path $accentBase 'CashuPayServer'
+# The refusal path ends in `pause`; feed stdin a newline so the .bat can exit.
+$stdinFile = Join-Path (Get-Location).Path 'preflight-stdin.txt'
+Set-Content -Path $stdinFile -Value "`r`n`r`n"
+$refused = Start-Launcher $aroot @('9255') -Wait -StdIn $stdinFile
+if ($refused.ExitCode -ne 1) {
+    throw "non-ASCII path: launcher exited $($refused.ExitCode), expected the preflight refusal (1)"
+}
+if (-not (Select-String -Path $script:DiagOut -Pattern 'move the whole CashuPayServer folder' -SimpleMatch -Quiet)) {
+    throw "non-ASCII path: refusal message missing from launcher output"
+}
+if (@(Get-ServerProcs $aroot).Count -ne 0) { throw "non-ASCII path: a server was started despite the refusal" }
+if (@(Get-HelperProcs $aroot).Count -ne 0) { throw "non-ASCII path: a helper was started despite the refusal" }
+Write-Host "non-ASCII path refusal: OK"
 
 Write-Host "windows-smoke: all scenarios passed"
