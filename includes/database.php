@@ -102,7 +102,7 @@ class Database {
             // that migration ran — getInstance() will then trigger runMigrations()
             // on existing installs that haven't yet picked it up. All migrations
             // are idempotent, so a fire is safe.
-            $hasLatestMigration = $hasConfig && self::columnExists(self::$instance, 'invoices', 'payer_receipt_requested');
+            $hasLatestMigration = $hasConfig && self::tableExists(self::$instance, 'admin_event_log');
             // The auto-withdraw → auto-cashout rename is a data-only migration
             // (config key + notification event labels) with no schema artifact
             // to mark it done, so probe for the legacy config key directly. The
@@ -312,6 +312,12 @@ HTACCESS;
             -- receipt is queued once the invoice settles (payment-page poll +
             -- cron sweep), then the flag is cleared.
             payer_receipt_requested INTEGER NOT NULL DEFAULT 0,
+            -- JSON array of sanitized direct-receive failures collected while
+            -- walking the destination chain at create time: [{type, reason}].
+            -- type is nwc|noffer|lnurl; reason is a fixed server-side phrase
+            -- (never wallet-provided text, URIs or addresses). Shown to the
+            -- payer on the payment page.
+            receive_errors TEXT DEFAULT NULL,
             FOREIGN KEY (store_id) REFERENCES stores(id) ON DELETE CASCADE
         );
 
@@ -405,6 +411,21 @@ HTACCESS;
             details TEXT
         );
 
+        -- Admin event log: direct-receive endpoint failures (NWC / noffer /
+        -- LNURL) recorded at checkout and by the settlement pollers. Read by
+        -- the admin Log tab (AdminLog::recent merges it with the other
+        -- error/event tables). Capped at AdminLog::ROW_CAP total rows.
+        CREATE TABLE IF NOT EXISTS admin_event_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp INTEGER NOT NULL,
+            category TEXT NOT NULL,           -- nwc | noffer | lnurl
+            context TEXT NOT NULL,            -- checkout | poll
+            store_id TEXT,
+            invoice_id TEXT,
+            label TEXT,                       -- safe destination identity (never a raw NWC URI)
+            message TEXT NOT NULL
+        );
+
         -- Open suspect rows for LIGHTNING_WALLET_ERROR pending verification.
         -- Resolved by another mint succeeding/failing at the same address (#1)
         -- or by protocol introspection (#2). Repeated same-pair failures bump
@@ -427,6 +448,7 @@ HTACCESS;
         CREATE INDEX IF NOT EXISTS idx_store_mints_store ON store_mints(store_id);
         CREATE INDEX IF NOT EXISTS idx_store_mints_priority ON store_mints(store_id, priority);
         CREATE INDEX IF NOT EXISTS idx_mint_event_log_mint ON mint_event_log(mint_url, timestamp DESC);
+        CREATE INDEX IF NOT EXISTS idx_admin_event_log_ts ON admin_event_log(timestamp DESC);
         CREATE INDEX IF NOT EXISTS idx_mint_event_log_address ON mint_event_log(address) WHERE address IS NOT NULL;
         CREATE INDEX IF NOT EXISTS idx_mint_suspect_address ON mint_suspect(address);
         ";
@@ -1606,10 +1628,32 @@ HTACCESS;
         // Payer receipt requested before settlement: the unified on-chain
         // "payment detected" screen lets the payer leave their email while the
         // tx is still confirming; the receipt itself is queued at settlement.
-        // This is the "latest" migration marker (see getInstance), so it stays
-        // last.
         if (!self::columnExists($pdo, 'invoices', 'payer_receipt_requested')) {
             $pdo->exec("ALTER TABLE invoices ADD COLUMN payer_receipt_requested INTEGER NOT NULL DEFAULT 0");
+        }
+
+        // Sanitized direct-receive failures (NWC / noffer / LNURL) collected at
+        // invoice-create time, surfaced to the payer on the payment page.
+        if (!self::columnExists($pdo, 'invoices', 'receive_errors')) {
+            $pdo->exec("ALTER TABLE invoices ADD COLUMN receive_errors TEXT DEFAULT NULL");
+        }
+
+        // Admin event log for endpoint failures (see AdminLog). This is the
+        // "latest" migration marker (see getInstance), so it stays last.
+        if (!self::tableExists($pdo, 'admin_event_log')) {
+            $pdo->exec("
+                CREATE TABLE admin_event_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp INTEGER NOT NULL,
+                    category TEXT NOT NULL,
+                    context TEXT NOT NULL,
+                    store_id TEXT,
+                    invoice_id TEXT,
+                    label TEXT,
+                    message TEXT NOT NULL
+                );
+            ");
+            $pdo->exec("CREATE INDEX idx_admin_event_log_ts ON admin_event_log(timestamp DESC);");
         }
     }
 

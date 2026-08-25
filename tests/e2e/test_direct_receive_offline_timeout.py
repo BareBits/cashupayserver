@@ -22,6 +22,7 @@ tests/php/test_invoice_direct_receive_timeout.php.
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 import subprocess
 import time
@@ -29,6 +30,7 @@ from pathlib import Path
 from typing import Iterator
 
 import pytest
+import requests
 
 from conftest import ConfiguredPayserver, SESSION_TMP
 from fixtures import binaries
@@ -108,9 +110,30 @@ def test_offline_destinations_fall_back_to_mint_within_budget(
         with sqlite3.connect(str(db)) as conn:
             conn.row_factory = sqlite3.Row
             row = conn.execute(
-                "SELECT payment_rail FROM invoices WHERE id = ?", (invoice["id"],)
+                "SELECT payment_rail, receive_errors FROM invoices WHERE id = ?",
+                (invoice["id"],),
             ).fetchone()
         assert row is not None and row["payment_rail"] == "mint", dict(row or {})
+
+        # Both dead destinations were recorded as sanitized receive errors:
+        # wallet type + fixed reason, never the noffer/NWC material itself.
+        errors = json.loads(row["receive_errors"])
+        assert {e["type"] for e in errors} == {"noffer", "nwc"}, errors
+        raw = row["receive_errors"]
+        for secret in (noffer, nwc_uri, dead_relay.ws_url):
+            assert secret not in raw, f"receive_errors leaked destination material: {raw}"
+
+        # ...and the payer sees them on the payment page, with the same
+        # sanitization: wallet types named, no relay URL / URI / noffer string.
+        page = requests.get(
+            f"{payserver.url}/payment.php", params={"id": invoice["id"]}, timeout=15
+        )
+        assert page.status_code == 200
+        assert "wallet connections had a problem" in page.text
+        assert "NWC wallet" in page.text
+        assert "Noffer (Nostr offer)" in page.text
+        for secret in (noffer, nwc_uri, dead_relay.ws_url):
+            assert secret not in page.text, "payment page leaked destination material"
         bolt11 = (
             invoice.get("checkout", {}).get("paymentMethods", {})
             .get("BTC-LightningNetwork", {}).get("destination")
