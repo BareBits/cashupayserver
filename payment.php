@@ -127,8 +127,9 @@ if (isset($_GET['json'])) {
         'onchainTxUrl' => cashupay_onchain_tx_url($invoice),
         // Sanitized create-time direct-receive failures ([{type, reason}]);
         // static for the invoice's lifetime — the page renders them
-        // server-side, this mirrors them for JSON consumers.
-        'receiveErrors' => !empty($invoice['receive_errors'])
+        // server-side, this mirrors them for JSON consumers. Empty when the
+        // operator suppresses payer-facing errors site-wide.
+        'receiveErrors' => (!AdminLog::suppressOnInvoice() && !empty($invoice['receive_errors']))
             ? (json_decode((string)$invoice['receive_errors'], true) ?: [])
             : [],
     ]);
@@ -1138,8 +1139,11 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                 // receive_errors. No addresses, URIs, or wallet-provided text
                 // ever land here, but escape everything anyway — this page is
                 // public.
+                // The site-wide suppress switch (admin Settings) hides the
+                // banner without touching what gets recorded — failures still
+                // land in receive_errors and the admin Log tab.
                 $receiveErrors = [];
-                if (!empty($invoice['receive_errors'])) {
+                if (!empty($invoice['receive_errors']) && !AdminLog::suppressOnInvoice()) {
                     $decoded = json_decode((string)$invoice['receive_errors'], true);
                     if (is_array($decoded)) {
                         $receiveErrors = $decoded;

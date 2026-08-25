@@ -100,4 +100,15 @@ $html = run_payment_page('inv_re_xss');
 assert_false(str_contains($html, '<script>alert(1)</script>'), 'reason text is HTML-escaped');
 assert_true(str_contains($html, '&lt;script&gt;'), 'escaped entities rendered instead');
 
+// --- site-wide suppress switch hides the banner and the JSON mirror -----------
+require_once dirname(__DIR__, 2) . '/includes/admin_log.php';
+Config::set(AdminLog::SUPPRESS_CONFIG_KEY, true);
+$html = run_payment_page('inv_re_banner');
+assert_false(str_contains($html, 'class="receive-errors"'), 'suppressed: no banner');
+$json = json_decode(run_payment_page('inv_re_banner', true), true);
+assert_eq([], $json['receiveErrors'], 'suppressed: json mirror empty');
+Config::set(AdminLog::SUPPRESS_CONFIG_KEY, false);
+$html = run_payment_page('inv_re_banner');
+assert_true(str_contains($html, 'class="receive-errors"'), 'switch off: banner returns');
+
 echo "test_payment_page_receive_errors: ok\n";

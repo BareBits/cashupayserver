@@ -151,6 +151,22 @@ try {
         assert_false(strpos($row['receive_errors'], $needle) !== false,
             "receive_errors must not contain '{$needle}'");
     }
+
+    // Both failures also land in the admin event log (checkout context, one
+    // row per destination — no payer-side dedupe there), carrying the masked
+    // NWC label but never the connection secret or full URI.
+    $logRows = Database::fetchAll(
+        "SELECT * FROM admin_event_log WHERE category = 'nwc' AND context = 'checkout' AND store_id = ?",
+        [$store]
+    );
+    assert_eq(2, count($logRows), 'one admin log row per failed NWC destination');
+    foreach ($logRows as $lr) {
+        assert_true(strpos((string)$lr['label'], 'NWC wallet') === 0, 'label is the masked display label');
+        foreach ([$clientSk, $clientSk2, 'nostr+walletconnect'] as $needle) {
+            assert_false(strpos($lr['label'] . ' ' . $lr['message'], $needle) !== false,
+                "admin log must not contain '{$needle}'");
+        }
+    }
 } finally {
     stop_mock($nwcProc);
     stop_mock($clinkProc);
@@ -187,6 +203,13 @@ try {
         'unreachable host maps to the fixed phrase');
     assert_false(strpos($row['receive_errors'], 'dead-host.test') !== false,
         'the LN address never reaches receive_errors');
+
+    // The admin log DOES name the failing address — it's admin-only.
+    $lr = Database::fetchOne(
+        "SELECT * FROM admin_event_log WHERE category = 'lnurl' AND store_id = ? ORDER BY id DESC LIMIT 1",
+        [$store]
+    );
+    assert_eq('merchant@dead-host.test', $lr['label'], 'admin log row names the LN address');
 } finally {
     putenv('CASHU_LNURL_URL_TEMPLATE');
     stop_mock($clinkProc);

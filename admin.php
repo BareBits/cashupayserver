@@ -2659,6 +2659,47 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             ]);
             break;
 
+        // Unified recent-issues feed for the Log view: admin_event_log
+        // (NWC/noffer/LNURL endpoint failures) merged with mint reliability
+        // events, failed webhook deliveries, failed notification emails, and
+        // swap/sweep errors. POST (not ?api=) — see the path-routing note in
+        // loadDeveloperSettings.
+        case 'get_admin_log':
+            Auth::requireAdmin();
+            require_once __DIR__ . '/includes/admin_log.php';
+            $limit = min(200, max(1, (int)($_POST['limit'] ?? 50)));
+            $offset = max(0, (int)($_POST['offset'] ?? 0));
+            $category = trim((string)($_POST['category'] ?? ''));
+            $storeId = trim((string)($_POST['store_id'] ?? ''));
+            echo json_encode(AdminLog::recent(
+                $limit,
+                $offset,
+                $category !== '' ? $category : null,
+                ($storeId !== '' && $storeId !== '__all__') ? $storeId : null
+            ));
+            break;
+
+        case 'get_invoice_error_settings':
+            Auth::requireAdmin();
+            require_once __DIR__ . '/includes/admin_log.php';
+            echo json_encode([
+                'suppressErrors' => AdminLog::suppressOnInvoice(),
+            ]);
+            break;
+
+        case 'save_invoice_error_settings':
+            Auth::requireAdmin();
+            require_once __DIR__ . '/includes/admin_log.php';
+            try {
+                $suppress = ($_POST['suppress_errors'] ?? '0') === '1';
+                Config::set(AdminLog::SUPPRESS_CONFIG_KEY, $suppress);
+                echo json_encode(['success' => true]);
+            } catch (Exception $e) {
+                cashupay_status(400);
+                echo json_encode(['error' => $e->getMessage()]);
+            }
+            break;
+
         case 'save_developer_settings':
             Auth::requireAdmin();
             require_once __DIR__ . '/includes/payment_path_debug.php';
@@ -3739,7 +3780,7 @@ $fileResetRequested = !$isLoggedIn && !$isWp && Auth::fileResetRequested();
 // Unknown or empty view → 302 to <base>/dashboard so /admin canonicalizes to
 // /admin/dashboard and bookmarks of removed views still resolve sensibly.
 // -----------------------------------------------------------------------------
-const ADMIN_VIEWS = ['dashboard', 'invoices', 'customers', 'stores', 'products', 'settings', 'stats'];
+const ADMIN_VIEWS = ['dashboard', 'invoices', 'customers', 'stores', 'products', 'settings', 'stats', 'log'];
 
 if ($isWp) {
     $rawAdminView = (string)get_query_var('cashupay_admin_view');
@@ -5390,6 +5431,41 @@ header('Cache-Control: no-cache, must-revalidate');
                 </div>
             </div>
 
+            <!-- Log View: unified recent-issues feed (admin-only). Endpoint
+                 failures (NWC / noffer / LNURL) from admin_event_log merged
+                 with mint reliability events, failed webhook deliveries,
+                 failed notification emails, and swap/sweep errors. -->
+            <div class="view" id="view-log">
+                <div class="card view-fill">
+                    <div class="card-header">
+                        <div class="card-title">Recent Issues</div>
+                        <button class="btn btn-secondary" id="btn-refresh-log">Refresh</button>
+                    </div>
+                    <div class="inv-filter-row">
+                        <label for="log-category-filter">Category:</label>
+                        <select id="log-category-filter">
+                            <option value="">All</option>
+                            <option value="nwc">NWC wallet</option>
+                            <option value="noffer">Noffer</option>
+                            <option value="lnurl">Lightning address</option>
+                            <option value="mint">Mint</option>
+                            <option value="webhook">Webhook</option>
+                            <option value="email">Email</option>
+                            <option value="swap">Swap</option>
+                            <option value="sweep">Sweep</option>
+                        </select>
+                        <label for="log-store-filter">Store:</label>
+                        <select id="log-store-filter">
+                            <option value="__all__">All stores</option>
+                        </select>
+                    </div>
+                    <div id="admin-log-list">
+                        <div class="loading"><div class="spinner"></div></div>
+                    </div>
+                    <div id="admin-log-pagination" class="list-pagination"></div>
+                </div>
+            </div>
+
             <!-- Customers View: aggregated list of customer emails captured on
                  the payment screen. Admin-only (same gate as the API). -->
             <div class="view" id="view-customers">
@@ -6389,6 +6465,31 @@ header('Cache-Control: no-cache, must-revalidate');
                         </button>
                     </div>
                 </div>
+                <div class="card collapsible" data-admin-only="true" id="card-invoice-errors">
+                    <div class="card-header">
+                        <div class="card-title">Invoice Page Errors</div>
+                    </div>
+                    <div class="card-body">
+                        <div class="toggle-container">
+                            <span><strong>Suppress errors on the invoice screen</strong></span>
+                            <label class="toggle">
+                                <input type="checkbox" id="suppress-invoice-errors">
+                                <span class="toggle-slider"></span>
+                            </label>
+                        </div>
+                        <p class="form-help" style="margin-top: 0.5rem;">
+                            When a store&rsquo;s wallet (NWC, noffer, Lightning address)
+                            can&rsquo;t be reached while an invoice is created, the payment
+                            page shows the customer a short sanitized notice. Enable this
+                            to hide those notices site-wide. Failures are still recorded
+                            and stay visible on the admin <strong>Log</strong> tab either
+                            way. Default off (notices shown).
+                        </p>
+                        <button class="btn btn-full" id="btn-save-invoice-errors" style="margin-top: 0.75rem;">
+                            Save invoice error settings
+                        </button>
+                    </div>
+                </div>
                 <div class="card collapsible" data-admin-only="true" id="card-notifications">
                     <div class="card-header">
                         <div class="card-title">Email Notifications</div>
@@ -7055,6 +7156,13 @@ header('Cache-Control: no-cache, must-revalidate');
                 </svg>
                 Customers
             </button>
+            <button class="nav-item hidden" data-view="log" data-admin-only="true" id="nav-log">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <polyline points="4 17 10 11 4 5"></polyline>
+                    <line x1="12" y1="19" x2="20" y2="19"></line>
+                </svg>
+                Log
+            </button>
             <button class="nav-item" data-view="settings">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                     <circle cx="12" cy="12" r="3"></circle>
@@ -7606,6 +7714,8 @@ header('Cache-Control: no-cache, must-revalidate');
                 if (navProducts) navProducts.classList.remove('hidden');
                 const navCustomers = document.getElementById('nav-customers');
                 if (navCustomers) navCustomers.classList.remove('hidden');
+                const navLog = document.getElementById('nav-log');
+                if (navLog) navLog.classList.remove('hidden');
             }
 
             // Check for store_created parameter from setup.php redirect
@@ -7852,6 +7962,26 @@ header('Cache-Control: no-cache, must-revalidate');
                 });
             }
 
+            // Log view: filters, refresh, and the settings-card save button.
+            const logCatSel = document.getElementById('log-category-filter');
+            if (logCatSel) {
+                logCatSel.addEventListener('change', () => {
+                    adminLogState.offset = 0;
+                    loadAdminLog();
+                });
+            }
+            const logStoreSel = document.getElementById('log-store-filter');
+            if (logStoreSel) {
+                logStoreSel.addEventListener('change', () => {
+                    adminLogState.offset = 0;
+                    loadAdminLog();
+                });
+            }
+            const logRefreshBtn = document.getElementById('btn-refresh-log');
+            if (logRefreshBtn) logRefreshBtn.addEventListener('click', () => loadAdminLog());
+            const btnSaveInvoiceErrors = document.getElementById('btn-save-invoice-errors');
+            if (btnSaveInvoiceErrors) btnSaveInvoiceErrors.addEventListener('click', saveInvoiceErrorSettings);
+
             // Withdraw modal
             document.getElementById('btn-confirm-withdraw').addEventListener('click', handleWithdraw);
             document.getElementById('withdraw-amount').addEventListener('input', updateWithdrawInfo);
@@ -8082,7 +8212,7 @@ header('Cache-Control: no-cache, must-revalidate');
         // grow a duplicate history entry.
         function switchView(view, opts) {
             if (!ADMIN_VIEWS.includes(view)) view = 'dashboard';
-            if ((view === 'stats' || view === 'products' || view === 'customers') && phpUser.role !== 'admin') {
+            if ((view === 'stats' || view === 'products' || view === 'customers' || view === 'log') && phpUser.role !== 'admin') {
                 showToast('Admin role required', 'error');
                 return;
             }
@@ -8099,14 +8229,15 @@ header('Cache-Control: no-cache, must-revalidate');
                 stores: 'Store Settings',
                 products: 'Products',
                 settings: 'Settings',
-                stats: 'Stats Dashboard'
+                stats: 'Stats Dashboard',
+                log: 'Log'
             };
             document.getElementById('header-text').textContent = titles[view];
 
             // Show/hide store selector based on view (hide on global settings
             // and on the stats page, which has its own per-page selector).
             const storeSelector = document.getElementById('header-store-selector');
-            if (view === 'settings' || view === 'stats' || view === 'customers') {
+            if (view === 'settings' || view === 'stats' || view === 'customers' || view === 'log') {
                 storeSelector.style.display = 'none';
             } else {
                 storeSelector.style.display = 'flex';
@@ -8132,6 +8263,10 @@ header('Cache-Control: no-cache, must-revalidate');
             if (view === 'stores') loadStoreSettings();
             if (view === 'products') loadProductsView();
             if (view === 'stats') loadStats();
+            if (view === 'log') {
+                adminLogState.offset = 0;
+                populateLogStoreFilter().then(loadAdminLog);
+            }
             if (view === 'settings') {
                 renderAccountCard();
                 if (phpUser.role === 'admin') {
@@ -8143,6 +8278,7 @@ header('Cache-Control: no-cache, must-revalidate');
                     loadAutoUpdateCard();
                     loadNotificationSettings();
                     loadDeveloperSettings();
+                    loadInvoiceErrorSettings();
                 }
             }
         }
@@ -11699,6 +11835,137 @@ header('Cache-Control: no-cache, must-revalidate');
             } catch (e) {
                 showToast('Failed to save developer settings', 'error');
             }
+        }
+
+        // -------- Invoice page error settings (site-wide suppress switch) --------
+
+        async function loadInvoiceErrorSettings() {
+            try {
+                const response = await postWithCsrf(adminUrl, 'action=get_invoice_error_settings');
+                if (!response.ok) return;
+                const data = await response.json();
+                document.getElementById('suppress-invoice-errors').checked = !!data.suppressErrors;
+            } catch (e) {
+                console.error('Failed to load invoice error settings', e);
+            }
+        }
+
+        async function saveInvoiceErrorSettings() {
+            const params = new URLSearchParams({
+                action: 'save_invoice_error_settings',
+                suppress_errors: document.getElementById('suppress-invoice-errors').checked ? '1' : '0',
+            });
+            try {
+                const response = await postWithCsrf(adminUrl, params.toString());
+                const result = await response.json();
+                if (response.ok) {
+                    showToast('Invoice error settings saved!', 'success');
+                    loadInvoiceErrorSettings();
+                } else {
+                    showToast(result.error || 'Failed to save', 'error');
+                }
+            } catch (e) {
+                showToast('Failed to save invoice error settings', 'error');
+            }
+        }
+
+        // -------- Log view (unified recent-issues feed) --------
+
+        const adminLogState = { offset: 0, total: 0 };
+        // store_id -> display name, filled by populateLogStoreFilter so the
+        // table can show names instead of opaque ids.
+        let logStoreNames = {};
+
+        const LOG_CATEGORY_LABELS = {
+            nwc: 'NWC wallet',
+            noffer: 'Noffer',
+            lnurl: 'Lightning address',
+            mint: 'Mint',
+            webhook: 'Webhook',
+            email: 'Email',
+            swap: 'Swap',
+            sweep: 'Sweep',
+        };
+
+        async function populateLogStoreFilter() {
+            const sel = document.getElementById('log-store-filter');
+            if (!sel) return;
+            try {
+                const r = await fetch(adminUrl + '?api=stores');
+                const stores = await r.json();
+                logStoreNames = {};
+                stores.forEach(s => { logStoreNames[s.id] = s.name || s.id; });
+                const prev = sel.value;
+                sel.innerHTML = '<option value="__all__">All stores</option>'
+                    + stores.map(s => `<option value="${s.id}">${escapeHtml(s.name || s.id)}</option>`).join('');
+                sel.value = [...sel.options].some(o => o.value === prev) ? prev : '__all__';
+            } catch (e) {
+                // Leave the existing "All stores" option in place on failure.
+            }
+        }
+
+        async function loadAdminLog() {
+            const listEl = document.getElementById('admin-log-list');
+            if (!listEl) return;
+            try {
+                const params = new URLSearchParams({
+                    action: 'get_admin_log',
+                    limit: String(LIST_PAGE_SIZE),
+                    offset: String(adminLogState.offset),
+                });
+                const cat = document.getElementById('log-category-filter').value;
+                if (cat) params.set('category', cat);
+                const store = document.getElementById('log-store-filter').value;
+                if (store && store !== '__all__') params.set('store_id', store);
+                const response = await postWithCsrf(adminUrl, params.toString());
+                const data = await response.json();
+                if (!response.ok) {
+                    showToast(data.error || 'Failed to load log', 'error');
+                    return;
+                }
+                adminLogState.total = data.total || 0;
+                renderAdminLog(data.entries || []);
+                renderListPagination('admin-log-pagination', adminLogState, (off) => {
+                    adminLogState.offset = off;
+                    loadAdminLog();
+                });
+            } catch (e) {
+                showToast('Failed to load log', 'error');
+            }
+        }
+
+        function renderAdminLog(entries) {
+            const listEl = document.getElementById('admin-log-list');
+            if (!listEl) return;
+            const rows = entries.map(e => {
+                const cat = LOG_CATEGORY_LABELS[e.category] || e.category;
+                const store = e.storeId ? (logStoreNames[e.storeId] || e.storeId) : '';
+                // Deep-link the invoice id into the invoices view is overkill
+                // here; show a short prefix so the operator can find it.
+                const inv = e.invoiceId ? e.invoiceId.substring(0, 12) : '';
+                return `<tr>
+                    <td style="white-space: nowrap; vertical-align: top;">${escapeHtml(fmtTimestamp(e.timestamp))}</td>
+                    <td style="vertical-align: top;"><code style="font-size: 0.75rem;">${escapeHtml(cat)}</code></td>
+                    <td style="vertical-align: top;">${escapeHtml(store)}</td>
+                    <td style="vertical-align: top; word-break: break-all; font-size: 0.75rem;">${escapeHtml(e.ref || '')}${inv ? '<br><span style="color: var(--text-secondary);">inv ' + escapeHtml(inv) + '&hellip;</span>' : ''}</td>
+                    <td style="vertical-align: top; word-break: break-word; font-size: 0.75rem;">${escapeHtml(e.message)}</td>
+                </tr>`;
+            }).join('');
+            listEl.innerHTML = `
+                <div style="overflow: auto; border: 1px solid var(--border); border-radius: 6px;">
+                    <table style="width: 100%; border-collapse: collapse; font-size: 0.85rem;">
+                        <thead>
+                            <tr style="background: rgba(0,0,0,0.3); position: sticky; top: 0;">
+                                <th style="text-align: left; padding: 0.4rem 0.6rem;">Time</th>
+                                <th style="text-align: left; padding: 0.4rem 0.6rem;">Category</th>
+                                <th style="text-align: left; padding: 0.4rem 0.6rem;">Store</th>
+                                <th style="text-align: left; padding: 0.4rem 0.6rem;">Destination</th>
+                                <th style="text-align: left; padding: 0.4rem 0.6rem;">Details</th>
+                            </tr>
+                        </thead>
+                        <tbody>${rows || '<tr><td colspan="5" style="padding: 1rem; text-align: center; color: var(--text-secondary);">No issues recorded.</td></tr>'}</tbody>
+                    </table>
+                </div>`;
         }
 
         // -------- Submarine swap settings --------

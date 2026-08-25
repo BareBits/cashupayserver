@@ -26,6 +26,7 @@ require_once __DIR__ . '/store_ln_addresses.php';
 require_once __DIR__ . '/clink/client.php';
 require_once __DIR__ . '/nwc/client.php';
 require_once __DIR__ . '/fee_redirect.php';
+require_once __DIR__ . '/admin_log.php';
 
 use Cashu\Wallet;
 use Cashu\WalletStorage;
@@ -381,6 +382,7 @@ class Invoice {
                                 $storeId, $priority, $e->getMessage()
                             ));
                             $receiveErrors[] = ['type' => 'noffer', 'reason' => self::describeNofferFailure($e)];
+                            AdminLog::log('noffer', 'checkout', $storeId, null, $dest['value'], $e->getMessage());
                             continue;
                         }
                         $nofferAttempt = [
@@ -426,6 +428,7 @@ class Invoice {
                                 $storeId, $priority, NwcUri::displayLabel($dest['value']), $e->getMessage()
                             ));
                             $receiveErrors[] = ['type' => 'nwc', 'reason' => self::describeNwcFailure($e)];
+                            AdminLog::log('nwc', 'checkout', $storeId, null, NwcUri::displayLabel($dest['value']), $e->getMessage());
                             continue;
                         }
                         $nwcAttempt = [
@@ -447,6 +450,7 @@ class Invoice {
                             $storeId, $priority, $dest['value']
                         ));
                         $receiveErrors[] = ['type' => 'lnurl', 'reason' => 'the configured Lightning address is malformed'];
+                        AdminLog::log('lnurl', 'checkout', $storeId, null, $dest['value'], 'malformed Lightning address configured');
                         continue;
                     }
                     $lnurlFailReason = null;
@@ -486,6 +490,8 @@ class Invoice {
                         'type' => 'lnurl',
                         'reason' => $lnurlFailReason ?? 'the Lightning address could not produce an invoice',
                     ];
+                    AdminLog::log('lnurl', 'checkout', $storeId, null, $dest['value'],
+                        $lnurlFailReason ?? 'probe failed');
                 }
                 if ($lnurlAttempt === null && $nofferAttempt === null && $nwcAttempt === null) {
                     error_log(sprintf(
@@ -1450,6 +1456,8 @@ class Invoice {
                 }
             } catch (Throwable $e) {
                 error_log("[lnurl-receive] poll failed for invoice {$invoice['id']}: " . $e->getMessage());
+                AdminLog::log('lnurl', 'poll', $invoice['store_id'], $invoice['id'],
+                    $invoice['ln_destination'] ?? null, $e->getMessage());
             }
         }
     }
@@ -1485,6 +1493,8 @@ class Invoice {
             }
         } catch (Throwable $e) {
             error_log("[lnurl-receive] single poll failed for {$invoiceId}: " . $e->getMessage());
+            AdminLog::log('lnurl', 'poll', $invoice['store_id'], $invoiceId,
+                $invoice['ln_destination'] ?? null, $e->getMessage());
         }
     }
 
@@ -1577,6 +1587,8 @@ class Invoice {
                 self::checkNwcSettlement($invoice);
             } catch (Throwable $e) {
                 error_log("[nwc-receive] cron poll failed for invoice {$invoice['id']}: " . $e->getMessage());
+                AdminLog::log('nwc', 'poll', $invoice['store_id'], $invoice['id'],
+                    $invoice['ln_destination'] ?? null, $e->getMessage());
             }
         }
     }
@@ -1622,6 +1634,8 @@ class Invoice {
             self::checkNwcSettlement($invoice);
         } catch (Throwable $e) {
             error_log("[nwc-receive] single poll failed for {$invoiceId}: " . $e->getMessage());
+            AdminLog::log('nwc', 'poll', $invoice['store_id'], $invoiceId,
+                $invoice['ln_destination'] ?? null, $e->getMessage());
         }
     }
 
@@ -1749,6 +1763,8 @@ class Invoice {
                 }
             } catch (Throwable $e) {
                 error_log("[clink-receive] cron poll failed for invoice {$invoice['id']}: " . $e->getMessage());
+                AdminLog::log('noffer', 'poll', $invoice['store_id'], $invoice['id'],
+                    $invoice['ln_destination'] ?? null, $e->getMessage());
             }
         }
     }
@@ -1802,6 +1818,8 @@ class Invoice {
             }
         } catch (Throwable $e) {
             error_log("[clink-receive] single poll failed for {$invoiceId}: " . $e->getMessage());
+            AdminLog::log('noffer', 'poll', $invoice['store_id'], $invoiceId,
+                $invoice['ln_destination'] ?? null, $e->getMessage());
         }
     }
 

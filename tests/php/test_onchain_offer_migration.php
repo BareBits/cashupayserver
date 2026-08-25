@@ -36,26 +36,34 @@ function has_col(string $table, string $col): bool {
     return (int)($r['n'] ?? 0) > 0;
 }
 
-// A fresh install has the newest marker column (invoices.receive_errors)
+function has_table(string $table): bool {
+    $r = Database::fetchOne(
+        "SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = ?",
+        [$table]
+    );
+    return (int)($r['n'] ?? 0) > 0;
+}
+
+// A fresh install has the newest marker artifact (the admin_event_log table)
 // AND the older migration artifacts.
-assert_true(has_col('invoices', 'receive_errors'), 'fresh install has the current marker column');
+assert_true(has_table('admin_event_log'), 'fresh install has the current marker table');
 assert_true(has_col('stores', 'onchain_offer_enabled'), 'fresh install has onchain_offer_enabled');
-assert_true(has_col('invoices', 'payer_receipt_requested'), 'fresh install has the previous marker column');
+assert_true(has_col('invoices', 'receive_errors'), 'fresh install has the previous marker column');
 assert_true(has_col('melts', 'melt_quote_id'), 'fresh install has older migration artifacts');
 
-// Simulate a pre-merge install: the newest columns are missing, but older
-// artifacts are still present — exactly the state of a running instance when
-// it pulls code that adds a new migration.
-Database::getInstance()->exec("ALTER TABLE invoices DROP COLUMN receive_errors");
+// Simulate a pre-merge install: the newest artifacts are missing, but older
+// ones are still present — exactly the state of a running instance when it
+// pulls code that adds a new migration.
+Database::getInstance()->exec("DROP TABLE admin_event_log");
 Database::getInstance()->exec("ALTER TABLE stores DROP COLUMN onchain_offer_enabled");
-assert_false(has_col('invoices', 'receive_errors'), 'pre-merge: marker column dropped');
+assert_false(has_table('admin_event_log'), 'pre-merge: marker table dropped');
 assert_false(has_col('stores', 'onchain_offer_enabled'), 'pre-merge: column dropped');
 assert_true(has_col('melts', 'melt_quote_id'), 'pre-merge: old marker still present');
 
 // First DB access after the "deploy" must re-run migrations and re-add them.
 reset_db_singleton();
 Database::getInstance();
-assert_true(has_col('invoices', 'receive_errors'), 'getInstance() self-heals the marker column');
+assert_true(has_table('admin_event_log'), 'getInstance() self-heals the marker table');
 assert_true(has_col('stores', 'onchain_offer_enabled'), 'getInstance() self-heals the missing column');
 
 // And the resolver that Invoice::create() calls now works instead of throwing.
@@ -71,6 +79,6 @@ assert_true(OnchainConfig::isEnabledForStore('store_offer_mig'), 'OnchainConfig 
 reset_db_singleton();
 Database::getInstance();
 assert_true(has_col('stores', 'onchain_offer_enabled'), 're-run leaves the column in place');
-assert_true(has_col('invoices', 'receive_errors'), 're-run leaves the marker column in place');
+assert_true(has_table('admin_event_log'), 're-run leaves the marker table in place');
 
 echo "test_onchain_offer_migration: ok\n";
