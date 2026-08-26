@@ -1,8 +1,10 @@
 <?php
 /**
- * CashuPay WordPress Admin Menu
+ * BareBits plugin — wp-admin menu, status page, and notices.
  *
- * Adds BareBits as a top-level section in the WordPress admin sidebar.
+ * Adds the top-level "BareBits" page: it renders the onboarding flow until
+ * the shop is wired, then a status panel linking out to the BareBits server's
+ * own admin. License: GPLv2 or later.
  */
 
 if (!defined('ABSPATH')) {
@@ -34,38 +36,52 @@ function cashupay_admin_menu(): void {
 }
 
 /**
- * Render the BareBits admin (or the setup wizard while setup is incomplete)
- * embedded in a full-height iframe, so clicking "BareBits" in the sidebar
- * keeps the operator inside wp-admin instead of navigating away. The SPA is
- * served same-origin at /cashupay-admin/ by the template_redirect handler,
- * which also still works when visited directly.
+ * The BareBits page: onboarding until wired, then the status panel.
  */
 function cashupay_admin_page(): void {
-    require_once CASHUPAY_PLUGIN_DIR . '/includes/database.php';
-    require_once CASHUPAY_PLUGIN_DIR . '/includes/config.php';
-
-    if (!Database::isInitialized() || !Config::isSetupComplete()) {
-        $url = Urls::setup();
-    } else {
-        $url = Urls::admin();
+    if (!cashupay_is_configured()) {
+        cashupay_render_onboarding();
+        return;
     }
+
+    $mode = cashupay_mode();
+    $server = cashupay_server_url();
+    $flash = cashupay_take_flash();
     ?>
-    <style>
-        /* Hand the whole content area to the iframe; wp-admin's own padding
-           and footer would otherwise add a page scrollbar under the SPA. */
-        #wpcontent, #wpbody-content { padding: 0; }
-        #wpfooter { display: none; }
-        #cashupay-admin-frame {
-            display: block;
-            width: 100%;
-            /* WP 5.9+ exposes the admin-bar height (32px, 46px on small
-               screens) as a custom property; older cores get the 32px
-               fallback. */
-            height: calc(100vh - var(--wp-admin--admin-bar--height, 32px));
-            border: 0;
-        }
-    </style>
-    <iframe id="cashupay-admin-frame" src="<?= esc_url($url) ?>" title="BareBits"></iframe>
+    <div class="wrap" style="max-width: 720px;">
+        <h1>BareBits</h1>
+        <?php if ($flash): ?>
+            <div class="notice notice-<?= esc_attr($flash['kind'] === 'error' ? 'error' : ($flash['kind'] === 'warning' ? 'warning' : 'success')) ?>"><p><?= esc_html($flash['message']) ?></p></div>
+        <?php endif; ?>
+        <p>✅ WooCommerce is connected to your BareBits server.</p>
+        <table class="widefat striped" style="max-width: 680px;">
+            <tbody>
+                <tr><td>Server</td><td><a href="<?= esc_url($server) ?>" target="_blank" rel="noopener"><?= esc_html($server) ?></a></td></tr>
+                <tr><td>Store ID</td><td><code><?= esc_html((string) get_option('cashupay_store_id', '')) ?></code></td></tr>
+                <tr><td>Mode</td><td><?= $mode === 'install' ? 'Installed alongside WordPress' : 'Existing server (connected by URL)' ?></td></tr>
+                <?php if ($mode === 'install'): ?>
+                    <tr><td>Install directory</td><td><code><?= esc_html((string) get_option('cashupay_install_dir', '')) ?></code></td></tr>
+                    <tr>
+                        <td>Data directory</td>
+                        <td>
+                            <code><?= esc_html((string) get_option('cashupay_install_data_dir', '')) ?></code>
+                            <p class="description">Holds the wallet database — real money. It is never deleted by this plugin; back up your recovery phrase.</p>
+                        </td>
+                    </tr>
+                    <tr><td>Background jobs</td><td>Driven by WP-cron (this plugin pings the server every minute).</td></tr>
+                <?php endif; ?>
+            </tbody>
+        </table>
+        <p style="margin-top: 1em;">
+            <a href="<?= esc_url($server . '/admin.php') ?>" target="_blank" rel="noopener" class="button button-primary">Open the BareBits admin</a>
+        </p>
+        <form method="post" action="<?= esc_url(admin_url('admin-post.php')) ?>" style="margin-top: 1em;">
+            <?php wp_nonce_field('cashupay_finish'); ?>
+            <input type="hidden" name="action" value="cashupay_finish">
+            <p class="description">If the WooCommerce gateway or webhook got misconfigured, re-run the wiring:</p>
+            <?php submit_button('Re-run WooCommerce wiring', 'secondary'); ?>
+        </form>
+    </div>
     <?php
 }
 
@@ -74,14 +90,13 @@ function cashupay_admin_notice(): void {
         return;
     }
 
-    require_once CASHUPAY_PLUGIN_DIR . '/includes/database.php';
-    require_once CASHUPAY_PLUGIN_DIR . '/includes/config.php';
-
-    if (!Database::isInitialized() || !Config::isSetupComplete()) {
+    if (!cashupay_is_configured()) {
+        // Not on the plugin's own page — it already renders the flow.
+        if (($_GET['page'] ?? '') === 'cashupay') {
+            return;
+        }
         echo '<div class="notice notice-info"><p>';
         echo '<strong>BareBits</strong> is almost ready — finish setup to start accepting Lightning payments via Bitcoin. ';
-        // The menu page embeds the wizard while setup is incomplete, so the
-        // banner routes there rather than to the full-screen /cashupay-setup/.
         echo '<a class="button button-primary" href="' . esc_url(admin_url('admin.php?page=cashupay')) . '">Configure BareBits</a>';
         echo '</p></div>';
         return;

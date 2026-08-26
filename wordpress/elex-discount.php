@@ -1,16 +1,39 @@
 <?php
 /**
- * CashuPay Bitcoin-discount auto-configuration.
+ * BareBits plugin — Bitcoin-discount auto-configuration.
  *
- * Follow-through for the onboarding wizard's discount screen: install the free
+ * Follow-through for the onboarding flow's discount question: install the free
  * ELEX Discount Per Payment Method plugin from wordpress.org and create a
  * percentage discount rule for the BTCPay WooCommerce gateway, so customers
  * who pick the Bitcoin payment method at checkout get the merchant's chosen
  * discount. Mirrors the guarded install pattern of btcpay-integration.php.
+ * License: GPLv2 or later.
  */
 
 if (!defined('ABSPATH')) {
     exit;
+}
+
+/**
+ * Parse the merchant's discount answer: a whole number of percent, 0-100.
+ * Null means the value is unusable and the form should re-render with an
+ * error rather than saving anything.
+ *
+ * Whole numbers only: the free ELEX plugin that applies the discount renders
+ * its own settings form with a step-1 number input, so a fractional value
+ * saved here would trap the merchant in browser validation if they ever
+ * edited the rule there. An empty submit means "no discount", not an error.
+ */
+function cashupay_parse_discount_percent(string $raw): ?int {
+    $raw = trim($raw);
+    if ($raw === '') {
+        return 0;
+    }
+    if (!preg_match('/^[0-9]{1,3}$/', $raw)) {
+        return null;
+    }
+    $value = (int)$raw;
+    return $value <= 100 ? $value : null;
 }
 
 /**
@@ -32,7 +55,7 @@ function cashupay_elex_plugin_file(): string {
  * `checkbox_value` is the enable toggle.
  *
  * Never overwrites: an existing rule for the gateway — whatever its value —
- * is a merchant decision, and re-renders of the completion screen must not
+ * is a merchant decision, and re-runs of the onboarding flow must not
  * undo it. Rows that are not arrays (a corrupt option) are dropped rather
  * than fataling the completion screen.
  *
@@ -74,7 +97,7 @@ function cashupay_elex_upsert_discount_rule(
  *
  * Idempotent: already present → only (re)activated; already active → no-op.
  * 'installed' is true only when this call freshly downloaded the plugin, so
- * the completion screen knows whether to show the "we installed a plugin for
+ * the onboarding screen knows whether to show the "we installed a plugin for
  * you" notice.
  *
  * @return array{success:bool, installed:bool, error?:string, message?:string}
@@ -156,7 +179,7 @@ function cashupay_install_elex_plugin(): array {
 /**
  * One call that makes the merchant's chosen Bitcoin discount live at checkout:
  * ensure the ELEX plugin is installed + active, then create the percentage
- * rule for the BTCPay gateway. Safe to call on every completion-screen render.
+ * rule for the BTCPay gateway. Safe to call repeatedly.
  *
  * Returns a status the completion screen renders from:
  *   - 'skipped'           the merchant chose 0% — nothing installed or written.
@@ -184,8 +207,7 @@ function cashupay_ensure_elex_discount(int $percent): array {
     }
 
     // cashupay_can_install_plugins lives in btcpay-integration.php, which the
-    // completion screen loads first — but don't depend on that ordering. Both
-    // helpers sit in the same directory in every plugin layout.
+    // plugin's entry point loads first — but don't depend on that ordering.
     if (!function_exists('cashupay_can_install_plugins')) {
         require_once __DIR__ . '/btcpay-integration.php';
     }
