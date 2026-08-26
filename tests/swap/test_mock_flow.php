@@ -273,13 +273,19 @@ SwapProviderFactory::setRegistry(['badmock' => new BadLockupProvider()]);
 SwapsConfig::setStoreProviderOrder($storeId, ['badmock']);
 SwapsConfig::setStoreStrictOverride($storeId, SwapsConfig::FORCE_ON);
 
-$threw = false;
-try {
-    Invoice::create($storeId, ['amount' => 50000, 'currency' => 'sat']);
-} catch (Throwable $e) {
-    $threw = true;
-}
-tassert($threw, 'lockup mismatch rejected (strict mode → invoice creation throws)', $failures);
+// The mismatched swap must be rejected — but a Lightning-path failure never
+// aborts creation while another rail can serve: with the store's xpub the
+// invoice degrades to on-chain-only (strict mode only forbids the MINT
+// fallback), and no swap_attempts row is persisted for the bad swap.
+$badInvoice = Invoice::create($storeId, ['amount' => 50000, 'currency' => 'sat']);
+tassert($badInvoice['payment_rail'] === 'onchain',
+    'lockup mismatch rejected (invoice degrades to the on-chain rail, not the bad swap)', $failures);
+tassert(empty($badInvoice['bolt11']), 'no bolt11 from the rejected swap', $failures);
+tassert(!empty($badInvoice['onchain_address']), 'on-chain address still allocated', $failures);
+$badSwapRows = Database::fetchOne(
+    "SELECT COUNT(*) AS c FROM swap_attempts WHERE invoice_id = ?", [$badInvoice['id']]
+);
+tassert((int)$badSwapRows['c'] === 0, 'no swap_attempts row for the rejected swap', $failures);
 
 // ------------- Cleanup -------------
 
