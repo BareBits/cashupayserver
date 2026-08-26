@@ -26,6 +26,7 @@ require_once __DIR__ . '/store_ln_addresses.php';
 require_once __DIR__ . '/clink/client.php';
 require_once __DIR__ . '/nwc/client.php';
 require_once __DIR__ . '/fee_redirect.php';
+require_once __DIR__ . '/admin_log.php';
 
 use Cashu\Wallet;
 use Cashu\WalletStorage;
@@ -168,6 +169,76 @@ class Invoice {
     }
 
     /**
+     * Payer-facing reason for a failed NWC make_invoice attempt. Maps the
+     * structured NIP-47 code (or the known local failure shapes) onto a fixed
+     * vocabulary — never echoes wallet- or relay-provided text, since the
+     * result lands on the public payment page and raw NWC errors can leak
+     * relay URLs from the (secret-bearing) connection string.
+     */
+    private static function describeNwcFailure(Throwable $e): string {
+        if ($e instanceof NwcException && $e->nwcCode !== '') {
+            switch ($e->nwcCode) {
+                case 'UNAUTHORIZED':
+                case 'RESTRICTED':
+                    return 'the wallet rejected the request (check the connection\'s permissions)';
+                case 'RATE_LIMITED':
+                    return 'the wallet is rate-limiting requests';
+                case 'INSUFFICIENT_BALANCE':
+                case 'QUOTA_EXCEEDED':
+                    return 'the wallet refused to issue an invoice';
+                default:
+                    return 'the wallet reported an error';
+            }
+        }
+        // '' code = local/transport failure; the timeout throw is the one
+        // local shape worth distinguishing for the payer.
+        if ($e instanceof NwcException && strpos($e->getMessage(), 'No response from NWC wallet') === 0) {
+            return 'no response from the wallet (timed out)';
+        }
+        return 'the wallet could not be reached';
+    }
+
+    /**
+     * Payer-facing reason for a failed CLINK noffer invoice request, keyed on
+     * the structured NIP-69 error code. Same sanitization contract as
+     * describeNwcFailure: fixed phrases only.
+     */
+    private static function describeNofferFailure(Throwable $e): string {
+        if ($e instanceof ClinkException) {
+            switch ($e->clinkCode) {
+                case 1: return 'the configured offer is invalid';
+                case 3: return 'the configured offer has expired';
+                case 4: return 'the service does not support this request';
+                case 5: return 'the amount is not accepted for this offer';
+                case 2: return 'no response or a temporary failure from the service';
+            }
+        }
+        return 'the service could not be reached';
+    }
+
+    /**
+     * Collapse repeated {type, reason} pairs (e.g. two NWC connections both
+     * timing out) and cap the list so the payment-page banner and the JSON
+     * column stay bounded no matter how many destinations are configured.
+     */
+    private static function dedupeReceiveErrors(array $errors): array {
+        $seen = [];
+        $out = [];
+        foreach ($errors as $err) {
+            $key = $err['type'] . '|' . $err['reason'];
+            if (isset($seen[$key])) {
+                continue;
+            }
+            $seen[$key] = true;
+            $out[] = $err;
+            if (count($out) >= 10) {
+                break;
+            }
+        }
+        return $out;
+    }
+
+    /**
      * Create a new invoice
      *
      * Uses per-store mint configuration and supports multi-mint fallback.
@@ -261,6 +332,12 @@ class Invoice {
         $lnurlAttempt = null;          // ['bolt11','verify_url','amount_sats'] on success
         $nofferAttempt = null;         // CLINK noffer receive context on success
         $nwcAttempt = null;            // NWC (NIP-47) receive context on success
+        // Sanitized [{type, reason}] records of destinations that failed while
+        // walking the chain, persisted as invoices.receive_errors and shown to
+        // the payer on the payment page. Reasons are fixed server-side phrases
+        // — never wallet/host-provided text, URIs, or addresses (the page is
+        // public and NWC URIs embed the wallet secret).
+        $receiveErrors = [];
         // Ordered fallback chain ($destinations, loaded with the rails gate
         // above): try each destination (Lightning address via LNURL, NWC, or
         // CLINK noffer via Nostr) in priority order until one yields a usable
@@ -304,6 +381,8 @@ class Invoice {
                                 '[clink-receive] noffer fetch failed store=%s priority=%d: %s; trying next',
                                 $storeId, $priority, $e->getMessage()
                             ));
+                            $receiveErrors[] = ['type' => 'noffer', 'reason' => self::describeNofferFailure($e)];
+                            AdminLog::log('noffer', 'checkout', $storeId, null, $dest['value'], $e->getMessage());
                             continue;
                         }
                         $nofferAttempt = [
@@ -348,6 +427,8 @@ class Invoice {
                                 '[nwc-receive] make_invoice failed store=%s priority=%d dest=%s: %s; trying next',
                                 $storeId, $priority, NwcUri::displayLabel($dest['value']), $e->getMessage()
                             ));
+                            $receiveErrors[] = ['type' => 'nwc', 'reason' => self::describeNwcFailure($e)];
+                            AdminLog::log('nwc', 'checkout', $storeId, null, NwcUri::displayLabel($dest['value']), $e->getMessage());
                             continue;
                         }
                         $nwcAttempt = [
@@ -368,15 +449,19 @@ class Invoice {
                             '[lnurl-receive] skipping malformed address store=%s priority=%d address=%s',
                             $storeId, $priority, $dest['value']
                         ));
+                        $receiveErrors[] = ['type' => 'lnurl', 'reason' => 'the configured Lightning address is malformed'];
+                        AdminLog::log('lnurl', 'checkout', $storeId, null, $dest['value'], 'malformed Lightning address configured');
                         continue;
                     }
+                    $lnurlFailReason = null;
                     try {
                         $probed = LnUrlReceive::probeAndFetchInvoice(
-                            $dest['value'], $lnurlTargetSats
+                            $dest['value'], $lnurlTargetSats, null, $lnurlFailReason
                         );
                     } catch (Throwable $e) {
                         error_log("[lnurl-receive] probe threw for store {$storeId} address {$dest['value']}: " . $e->getMessage());
                         $probed = null;
+                        $lnurlFailReason = 'the Lightning address service could not be reached';
                     }
                     if ($probed !== null) {
                         $lnurlAttempt = [
@@ -397,9 +482,16 @@ class Invoice {
                         break;
                     }
                     error_log(sprintf(
-                        '[lnurl-receive] probe failed for store=%s priority=%d address=%s amount_sats=%d; trying next',
-                        $storeId, $priority, $dest['value'], $lnurlTargetSats
+                        '[lnurl-receive] probe failed for store=%s priority=%d address=%s amount_sats=%d reason=%s; trying next',
+                        $storeId, $priority, $dest['value'], $lnurlTargetSats,
+                        $lnurlFailReason ?? 'unknown'
                     ));
+                    $receiveErrors[] = [
+                        'type' => 'lnurl',
+                        'reason' => $lnurlFailReason ?? 'the Lightning address could not produce an invoice',
+                    ];
+                    AdminLog::log('lnurl', 'checkout', $storeId, null, $dest['value'],
+                        $lnurlFailReason ?? 'probe failed');
                 }
                 if ($lnurlAttempt === null && $nofferAttempt === null && $nwcAttempt === null) {
                     error_log(sprintf(
@@ -706,6 +798,7 @@ class Invoice {
             'fee_redirect_note' => $feeNote,
             'fee_redirect_destination' => $feeDestination,
             'fee_redirect_rails' => $feeRails ? implode(',', $feeRails) : null,
+            'receive_errors' => $receiveErrors !== [] ? json_encode(self::dedupeReceiveErrors($receiveErrors)) : null,
             'metadata' => $metadata ? json_encode($metadata) : null,
             'checkout_config' => $checkout ? json_encode($checkout) : null,
             'created_at' => $now,
@@ -1363,6 +1456,8 @@ class Invoice {
                 }
             } catch (Throwable $e) {
                 error_log("[lnurl-receive] poll failed for invoice {$invoice['id']}: " . $e->getMessage());
+                AdminLog::log('lnurl', 'poll', $invoice['store_id'], $invoice['id'],
+                    $invoice['ln_destination'] ?? null, $e->getMessage());
             }
         }
     }
@@ -1398,6 +1493,8 @@ class Invoice {
             }
         } catch (Throwable $e) {
             error_log("[lnurl-receive] single poll failed for {$invoiceId}: " . $e->getMessage());
+            AdminLog::log('lnurl', 'poll', $invoice['store_id'], $invoiceId,
+                $invoice['ln_destination'] ?? null, $e->getMessage());
         }
     }
 
@@ -1490,6 +1587,8 @@ class Invoice {
                 self::checkNwcSettlement($invoice);
             } catch (Throwable $e) {
                 error_log("[nwc-receive] cron poll failed for invoice {$invoice['id']}: " . $e->getMessage());
+                AdminLog::log('nwc', 'poll', $invoice['store_id'], $invoice['id'],
+                    $invoice['ln_destination'] ?? null, $e->getMessage());
             }
         }
     }
@@ -1535,6 +1634,8 @@ class Invoice {
             self::checkNwcSettlement($invoice);
         } catch (Throwable $e) {
             error_log("[nwc-receive] single poll failed for {$invoiceId}: " . $e->getMessage());
+            AdminLog::log('nwc', 'poll', $invoice['store_id'], $invoiceId,
+                $invoice['ln_destination'] ?? null, $e->getMessage());
         }
     }
 
@@ -1662,6 +1763,8 @@ class Invoice {
                 }
             } catch (Throwable $e) {
                 error_log("[clink-receive] cron poll failed for invoice {$invoice['id']}: " . $e->getMessage());
+                AdminLog::log('noffer', 'poll', $invoice['store_id'], $invoice['id'],
+                    $invoice['ln_destination'] ?? null, $e->getMessage());
             }
         }
     }
@@ -1715,6 +1818,8 @@ class Invoice {
             }
         } catch (Throwable $e) {
             error_log("[clink-receive] single poll failed for {$invoiceId}: " . $e->getMessage());
+            AdminLog::log('noffer', 'poll', $invoice['store_id'], $invoiceId,
+                $invoice['ln_destination'] ?? null, $e->getMessage());
         }
     }
 

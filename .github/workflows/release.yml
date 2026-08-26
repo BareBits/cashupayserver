@@ -3,10 +3,11 @@ name: Release
 # Cuts an immutable, versioned GitHub release when a v* tag is pushed.
 #
 # Replaces the old moving-tag "channel" release model. Each release carries
-# three assets:
-#   - cashupayserver-<tag>.zip   the standalone app (auto-updater downloads this)
-#   - wordpress_plugin-<tag>.zip  the WordPress plugin (humans / WP install this)
-#   - BUILD_INFO                  stable-named metadata the updater reads first
+# four assets:
+#   - cashupayserver-<tag>.zip          the standalone app (auto-updater downloads this)
+#   - cashupayserver-windows-<tag>.zip  the Windows desktop package (portable POS)
+#   - wordpress_plugin-<tag>.zip        the WordPress plugin (humans / WP install this)
+#   - BUILD_INFO                        stable-named metadata the updater reads first
 #
 # The release version comes from the tag; scripts/verify-release-version.sh
 # fails the build if the in-tree version strings disagree, so a tag can never
@@ -16,6 +17,12 @@ name: Release
 # updater's 'main' channel via GitHub's /releases/latest). A tag with a
 # prerelease suffix (v0.4-alpha, v1.0.0-rc1, ...) is published as a GitHub
 # prerelease and feeds the 'testing' channel (newest release of any kind).
+#
+# Structure: build (ubuntu) -> windows-smoke (windows) -> publish (ubuntu).
+# The Windows desktop zip is assembled on Linux (it's just file plumbing:
+# official windows.php.net runtime + the app + launcher assets), then booted
+# for real on a Windows runner before anything is published — a broken
+# desktop package must never gate-crash a release.
 
 on:
   push:
@@ -42,14 +49,17 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build-and-release:
+  build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 20
+    timeout-minutes: 25
     # Effective tag: the workflow_call input (testing-release.yml passes a
     # v<version>-testing.<run#> prerelease tag) or, for a direct tag push, the
     # pushed ref. Every step below uses $TAG / env.TAG, never github.ref_name.
     env:
       TAG: ${{ inputs.tag || github.ref_name }}
+    outputs:
+      prerelease: ${{ steps.classify.outputs.prerelease }}
+      make_latest: ${{ steps.classify.outputs.make_latest }}
 
     steps:
       - name: Use HTTPS for SSH-form submodule URLs
@@ -137,15 +147,91 @@ jobs:
             includes/database.php \
             assets/img/barebits-gateway-logo.png
 
+      - name: Build Windows desktop zip
+        run: ./scripts/build-windows-desktop.sh
+
+      - name: Verify Windows desktop layout
+        run: |
+          php scripts/verify-plugin-build.php build/CashuPayServer \
+            CashuPayServer.bat \
+            desktop-helper.php \
+            cron-runner.php \
+            README.txt \
+            vc_redist.x64.exe \
+            php/php.exe \
+            php/ext/php_gmp.dll \
+            php/cacert.pem \
+            php/php.ini.template \
+            php/render-ini.php \
+            app/router.php \
+            app/cron.php \
+            app/includes/database.php
+
       - name: Version-stamp the release assets
         # Rename the fixed build outputs to version-stamped asset names. The
         # ZIP internals are untouched: cashupayserver.zip still extracts to
-        # cashupayserver/ (the updater hardcodes that), and wordpress_plugin.zip
-        # still contains cashupay/ (the WP plugin slug).
+        # cashupayserver/ (the updater hardcodes that), wordpress_plugin.zip
+        # still contains cashupay/ (the WP plugin slug), and the Windows zip
+        # still extracts to CashuPayServer/.
         run: |
           tag="$TAG"
           cp build/cashupayserver.zip "build/cashupayserver-${tag}.zip"
           cp build/wordpress_plugin.zip "build/wordpress_plugin-${tag}.zip"
+          cp build/cashupayserver-windows.zip "build/cashupayserver-windows-${tag}.zip"
+
+      - name: Upload release assets for later jobs
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          if-no-files-found: error
+          retention-days: 3
+          path: |
+            build/cashupayserver-${{ env.TAG }}.zip
+            build/wordpress_plugin-${{ env.TAG }}.zip
+            build/cashupayserver-windows-${{ env.TAG }}.zip
+            build/cashupayserver/BUILD_INFO
+
+  # Boot the Windows desktop package on real Windows before publishing. The
+  # scenarios live in scripts/windows-smoke.ps1 (shared with the PR-time
+  # windows-desktop-smoke.yml workflow): runtime checks (extensions, gmp,
+  # cron-runner), launcher boot + browser hook, a functional pass that walks
+  # the onboarding wizard and API end to end (scripts/desktop-smoke.php),
+  # a configured cron pass, double-launch, custom port, a hostile install
+  # path (spaces + non-ASCII), and helper self-shutdown.
+  windows-smoke:
+    needs: build
+    runs-on: windows-latest
+    timeout-minutes: 25
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+
+    steps:
+      - name: Checkout (smoke scripts)
+        uses: actions/checkout@v4
+
+      - name: Download release assets
+        uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: build
+
+      - name: Run Windows desktop smoke
+        shell: pwsh
+        run: ./scripts/windows-smoke.ps1 -Zip "build/cashupayserver-windows-$env:TAG.zip"
+
+  publish:
+    needs: [build, windows-smoke]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: build
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
@@ -163,11 +249,13 @@ jobs:
 
             Assets:
             - `cashupayserver-${{ env.TAG }}.zip` — standalone server (the auto-updater pulls this)
+            - `cashupayserver-windows-${{ env.TAG }}.zip` — Windows desktop package (portable point-of-sale; see README.txt inside)
             - `wordpress_plugin-${{ env.TAG }}.zip` — WordPress plugin
             - `BUILD_INFO` — build metadata
-          prerelease: ${{ steps.classify.outputs.prerelease }}
-          make_latest: ${{ steps.classify.outputs.make_latest }}
+          prerelease: ${{ needs.build.outputs.prerelease }}
+          make_latest: ${{ needs.build.outputs.make_latest }}
           files: |
             build/cashupayserver-${{ env.TAG }}.zip
             build/wordpress_plugin-${{ env.TAG }}.zip
+            build/cashupayserver-windows-${{ env.TAG }}.zip
             build/cashupayserver/BUILD_INFO

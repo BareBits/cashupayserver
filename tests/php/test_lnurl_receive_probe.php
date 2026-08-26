@@ -91,8 +91,10 @@ try {
 
     // Out-of-range amount → probe returns null (the host rejects amounts <
     // minSendable). Probe declines BEFORE the callback when bounds fail.
-    $res = LnUrlReceive::probeAndFetchInvoice('alice@example.test', 0);
+    $res = LnUrlReceive::probeAndFetchInvoice('alice@example.test', 0, null, $reason);
     assert_null($res, 'amount=0 outside range: null');
+    assert_eq('the amount is outside the range the Lightning address accepts', $reason,
+        'out-of-range failure reason set');
 
     // Above max:
     $res = LnUrlReceive::probeAndFetchInvoice('alice@example.test', 200000);
@@ -108,8 +110,10 @@ $p2 = $port + 1;
 $pid = start_mock_lnurl($p2, $serverDir, 'no_verify');
 set_template($p2);
 try {
-    $res = LnUrlReceive::probeAndFetchInvoice('alice@example.test', 5000);
+    $res = LnUrlReceive::probeAndFetchInvoice('alice@example.test', 5000, null, $reason);
     assert_null($res, 'no verify URL: probe returns null');
+    assert_eq('the Lightning address service does not support payment verification (LUD-21)',
+        $reason, 'missing LUD-21 failure reason set');
     // Save-time LUD-21 probe explicitly reports 0 (vs. null for unreachable),
     // so the admin can surface a warning instead of silent fallback.
     assert_eq(0, LnUrlReceive::probeLud21Support('alice@example.test'),
@@ -120,13 +124,17 @@ try {
 // Pick a port that's almost certainly not in use; don't start a server.
 $p3 = $port + 2;
 set_template($p3);
-$res = LnUrlReceive::probeAndFetchInvoice('alice@example.test', 5000, 1);
+$res = LnUrlReceive::probeAndFetchInvoice('alice@example.test', 5000, 1, $reason);
 assert_null($res, 'host down: probe returns null');
+assert_eq('the Lightning address service could not be reached', $reason,
+    'unreachable host failure reason set');
 $supp = LnUrlReceive::probeLud21Support('alice@example.test', 1);
 assert_null($supp, 'host down: support probe returns null (unreachable)');
 
 // --- Scenario 4: Malformed LN address (bad format) ---------------------------
-$res = LnUrlReceive::probeAndFetchInvoice('not-an-address', 5000);
+$res = LnUrlReceive::probeAndFetchInvoice('not-an-address', 5000, null, $reason);
 assert_null($res, 'bad address format: null without network call');
+assert_eq('the configured Lightning address is malformed', $reason,
+    'malformed address failure reason set');
 
 echo "test_lnurl_receive_probe: ok\n";

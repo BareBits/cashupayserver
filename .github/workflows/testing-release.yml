@@ -13,6 +13,10 @@ name: Testing release
 # steps) and invoke it via workflow_call instead of pushing a git tag — a tag
 # pushed with the default GITHUB_TOKEN would NOT re-trigger release.yml, so the
 # tag-push route would need a PAT. workflow_call needs neither.
+#
+# After a successful publish, superseded testing prereleases (and their tags)
+# are pruned so the releases page isn't dominated by testing builds — only the
+# newest testing prerelease is kept. Stable releases are never touched.
 
 on:
   push:
@@ -62,3 +66,20 @@ jobs:
     with:
       tag: ${{ needs.compute-tag.outputs.tag }}
     secrets: inherit
+
+  prune:
+    # Keep only the newest testing prerelease (the one just published). The
+    # default GITHUB_TOKEN is enough here: unlike tag pushes, deletions don't
+    # need to re-trigger any workflow.
+    needs: [compute-tag, release]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prune superseded testing prereleases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: ./scripts/prune-testing-releases.sh "$GITHUB_REPOSITORY" "${{ needs.compute-tag.outputs.tag }}"
