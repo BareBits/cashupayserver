@@ -13,19 +13,6 @@ Accept Bitcoin payments (lightning and on-chain) without running a full BTCPay S
 
 ---
 
-## ⚠️ AS-IS SOFTWARE ⚠️
-
-**This software is produced AS-IS without any warranty**
-
-- Do NOT use with amounts you cannot afford to lose
-- Use the suggested default pattern of having funds go to a cold wallet to limit risk. You wouldn't want your funds sitting on a web server anyway.
-
-**You are responsible for your own funds. The developers are not liable for any losses.**
-
-**Important:** A Cashu mint (if enabled) takes custody of smaller lightning payments until automatic withdrawal thresholds are reached. For maximum sovereignty, choose settings that enable lightning payments to an off-server wallet.
-
----
-
 ## What is BareBits?
 
 BareBits is a PHP-based Bitcoin Lightning payment gateway that implements BTCPay Server's Greenfield API. Any e-commerce software that works with BTCPay Server can work with BareBits. This include WooCommerce, Shopify, Magneto, Drupal, and more! It can also send invoices, manage products, and create self-serve invoices for your customers.
@@ -46,6 +33,11 @@ BareBits supports a number of payment types, risk/trust levels, and capabilities
 - **Receipts** E-mail receipts to your customers (optional) and collect their e-mail addresses for your newsletter
  - **Offline** payments powered by Cashu tokens (optional), melded to lightning when back online.
 - **Open source** - Read every line of code. Fork it, audit it yourself. Dual-licensed MIT (pre-2026-05-30) and Modified MIT (post-2026-05-30). See [LICENSE.md](LICENSE.md) and [USE_POLICY.md](USE_POLICY.md).
+
+
+## ⚠️ AS-IS SOFTWARE ⚠️
+
+Do NOT use with amounts you cannot afford to lose. Use the suggested default pattern of having funds go to a cold wallet to limit risk. You wouldn't want your funds sitting on a web server anyway. For maximum sovereignty, choose settings that enable lightning payments to an off-server wallet. If you do not have a lightning wallet configured, a Cashu mint (if explicitly enabled) takes custody of smaller lightning payments until automatic withdrawal thresholds are reached. **You are responsible for your own funds. The developers are not liable for any losses.** **This software is produced AS-IS without any warranty**
 
 ### Screenshots
 
@@ -123,22 +115,6 @@ BareBits integrates with most ecommerce platforms including woocommerce, magneto
 
 #### WooCommerce
 Have WooCommerce? Download our plugin zip from the [latest GitHub release](https://github.com/BareBits/cashupayserver/releases/latest) and upload it to your WordPress installation, no need to install BareBits separately. Easy peasy!
-
-
-### Recommended: Configure system cron
-
-BareBits's background tasks — invoice polling, auto-cashout, and
-fee settlement — run on a tight schedule when your hosting environment
-invokes `cron.php` once a minute. Without it, the same tasks still fire
-opportunistically when an admin or customer loads a page, but with
-multi-minute latency. 
-
-**This is particularly critical for submarine swaps: without cron, payments may not be claimed in time and may be refunded to the customer!**
-
-Open **Settings** in the admin UI to copy the suggested entry, then add it
-to your system crontab (or your host's cron panel). The admin dashboard
-will show a one-time dismissable banner if external cron hasn't been
-detected in over 24 hours.
 
 ## Payment Flow
 
