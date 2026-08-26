@@ -37,7 +37,9 @@ BareBits supports a number of payment types, risk/trust levels, and capabilities
 
 ## ⚠️ AS-IS SOFTWARE ⚠️
 
-Do NOT use with amounts you cannot afford to lose. Use the suggested default pattern of having funds go to a cold wallet to limit risk. You wouldn't want your funds sitting on a web server anyway. For maximum sovereignty, choose settings that enable lightning payments to an off-server wallet. If you do not have a lightning wallet configured, a Cashu mint (if explicitly enabled) takes custody of smaller lightning payments until automatic withdrawal thresholds are reached. **You are responsible for your own funds. The developers are not liable for any losses.** **This software is produced AS-IS without any warranty**
+Do NOT use with amounts you cannot afford to lose. Use the suggested default pattern of having funds go to a cold wallet to limit risk. You wouldn't want your funds sitting on a web server anyway. For maximum sovereignty, choose settings that enable lightning payments to an off-server wallet. If you do not have a lightning wallet configured, a Cashu mint (if explicitly enabled) takes custody of smaller lightning payments until automatic withdrawal thresholds are reached. 
+
+**You are responsible for your own funds. The developers are not liable for any losses.** **This software is produced AS-IS without any warranty**
 
 ### Screenshots
 
