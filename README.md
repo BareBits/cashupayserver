@@ -47,6 +47,18 @@ BareBits supports a number of payment types, risk/trust levels, and capabilities
  - **Offline** payments powered by Cashu tokens (optional), melded to lightning when back online.
 - **Open source** - Read every line of code. Fork it, audit it yourself. Dual-licensed MIT (pre-2026-05-30) and Modified MIT (post-2026-05-30). See [LICENSE.md](LICENSE.md) and [USE_POLICY.md](USE_POLICY.md).
 
+### Screenshots
+
+The invoice creation and payment flow: create an invoice from your product catalog or with a quick amount, the customer pays on-chain or over Lightning, and the paid invoice lands in your dashboard.
+
+<p align="center">
+  <img src="docs/screenshots/create-invoice.png" alt="Create an invoice from the product catalog" width="180">
+  <img src="docs/screenshots/create-invoice-simple.png" alt="Create a simple invoice with just an amount" width="180">
+  <img src="docs/screenshots/payment-pending.png" alt="Customer checkout offering both on-chain and Lightning" width="180">
+  <img src="docs/screenshots/payment-success.png" alt="Payment complete" width="180">
+  <img src="docs/screenshots/admin-invoices.png" alt="The paid invoice in the admin invoice list" width="180">
+</p>
+
 ### Trade-offs
 
 BareBits sits between custodial payment gateways and full self-hosting:
