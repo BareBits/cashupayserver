@@ -37,7 +37,7 @@ cp -r api-keys/ "$BUILD_DIR/api-keys/"
 # itself) were previously omitted — a from-zip install had no working updater.
 # scripts/verify-plugin-build.php enforces this against router.php's requires.
 cp admin.php setup.php api.php payment.php receive.php cron.php router.php index.php \
-   recover.php health.php pay.php product-image.php update.php "$BUILD_DIR/"
+   recover.php health.php pay.php product-image.php update.php provision.php "$BUILD_DIR/"
 # Operator config template (the real user_config.php is gitignored dev-local and
 # is preserved across updates by includes/updater.php's keep-list).
 cp user_config.example.php "$BUILD_DIR/"
