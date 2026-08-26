@@ -508,6 +508,10 @@ class Invoice {
         // bolt11) or the on-chain rail (a swap invoice must stay lightning-only,
         // so we don't pair it with a fee-owned on-chain address).
         $swapAttempt = null; // populated by self::trySwapCreate on success
+        // Set when strict-no-mint-fallback suppressed the mint path after a
+        // failed swap (invoice proceeds on-chain only); keeps the mint block
+        // below from quoting in violation of strict mode.
+        $strictMintFallbackBlocked = false;
         if ($lnurlAttempt === null && $nofferAttempt === null && $nwcAttempt === null
             && $feeLightning === null && $feeOnchain === null
             && SwapsConfig::isEnabledForStore($storeId) && $onchainConfigured) {
@@ -538,10 +542,29 @@ class Invoice {
                 $detail = $swapFailures
                     ? ' Provider attempts: ' . implode('; ', $swapFailures) . '.'
                     : '';
-                throw new Exception(
-                    'Submarine swap could not be created for ' . $targetSats . ' sat target.'
-                    . ' Strict mode is on (no mint fallback).' . $detail
-                );
+                if (!$onchainOffered) {
+                    throw new Exception(
+                        'Submarine swap could not be created for ' . $targetSats . ' sat target.'
+                        . ' Strict mode is on (no mint fallback).' . $detail
+                    );
+                }
+                // Strict mode forbids the MINT fallback, not the on-chain rail.
+                // With an on-chain address on offer the invoice must still come
+                // out payable (on-chain only): a Lightning-path failure never
+                // aborts creation while another rail can serve. The payer sees
+                // a fixed phrase; provider detail stays in the logs.
+                error_log(sprintf(
+                    '[swap] strict mode: swap failed for store=%s target=%d sat; serving on-chain only.%s',
+                    $storeId, $targetSats, $detail
+                ));
+                $receiveErrors[] = [
+                    'type' => 'swap',
+                    'reason' => 'a Lightning invoice could not be created for this amount',
+                ];
+                AdminLog::log('swap', 'checkout', $storeId, null, null,
+                    'strict mode: no swap provider accepted the ' . $targetSats
+                    . ' sat target; invoice created on-chain only.' . $detail);
+                $strictMintFallbackBlocked = true;
             }
         }
 
@@ -551,28 +574,47 @@ class Invoice {
         $quote = null;
         $usedMintUrl = null;
         $amountInMintUnit = null;
-        if ($cashuConfigured && $swapAttempt === null && $lnurlAttempt === null
+        if ($cashuConfigured && !$strictMintFallbackBlocked && $swapAttempt === null
+            && $lnurlAttempt === null
             && $nofferAttempt === null && $nwcAttempt === null && $feeLightning === null) {
             $mintUnit = $store['mint_unit'];
-            $amountInMintUnit = ExchangeRates::convertToMintUnit(
-                $amount, $currency, $mintUnit, $exchangeFee, $primaryProvider, $secondaryProvider
-            );
-            require_once __DIR__ . '/mint_reliability.php';
-            $allMints = Config::getStoreAllMintUrls($storeId);
             $lastError = null;
-            foreach ($allMints as $tryMintUrl) {
-                try {
-                    $wallet = self::getWalletForStore($storeId, $tryMintUrl);
-                    $quote = $wallet->requestMintQuote($amountInMintUnit);
-                    $usedMintUrl = $tryMintUrl;
-                    MintReliability::recordQuoteSuccess($tryMintUrl, $storeId);
-                    break;
-                } catch (Exception $e) {
-                    $lastError = $e;
-                    error_log("Mint quote failed for $tryMintUrl: " . $e->getMessage());
-                    $kind = MintReliability::classifyException($e, 'requestMintQuote');
-                    MintReliability::recordQuoteFailure($tryMintUrl, $storeId, $kind, $e->getMessage());
-                    continue;
+            try {
+                $amountInMintUnit = ExchangeRates::convertToMintUnit(
+                    $amount, $currency, $mintUnit, $exchangeFee, $primaryProvider, $secondaryProvider
+                );
+            } catch (Throwable $e) {
+                // A rate failure (fiat-unit mint, providers down) is a failure
+                // of the MINT path, not of the invoice: with an on-chain rail
+                // configured the invoice still comes out payable. Only abort
+                // when nothing else could serve it (same contract as the
+                // all-mints-failed throw below).
+                if (!$onchainConfigured) {
+                    throw $e;
+                }
+                error_log(sprintf(
+                    '[mint] unit conversion failed for store=%s (%s -> %s): %s; skipping mint path',
+                    $storeId, $currency, (string)$mintUnit, $e->getMessage()
+                ));
+                $amountInMintUnit = null;
+            }
+            if ($amountInMintUnit !== null) {
+                require_once __DIR__ . '/mint_reliability.php';
+                $allMints = Config::getStoreAllMintUrls($storeId);
+                foreach ($allMints as $tryMintUrl) {
+                    try {
+                        $wallet = self::getWalletForStore($storeId, $tryMintUrl);
+                        $quote = $wallet->requestMintQuote($amountInMintUnit);
+                        $usedMintUrl = $tryMintUrl;
+                        MintReliability::recordQuoteSuccess($tryMintUrl, $storeId);
+                        break;
+                    } catch (Exception $e) {
+                        $lastError = $e;
+                        error_log("Mint quote failed for $tryMintUrl: " . $e->getMessage());
+                        $kind = MintReliability::classifyException($e, 'requestMintQuote');
+                        MintReliability::recordQuoteFailure($tryMintUrl, $storeId, $kind, $e->getMessage());
+                        continue;
+                    }
                 }
             }
             if ($quote === null && !$onchainConfigured) {
