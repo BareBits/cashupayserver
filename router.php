@@ -161,6 +161,15 @@ if (preg_match('#^/health$#', $uri)) {
 }
 
 // -----------------------------------------------------------------------------
+// Provision: /provision — one-time credential handshake for orchestrated
+// installs (see provision.php). Routable so it works in every URL mode.
+// -----------------------------------------------------------------------------
+if (preg_match('#^/provision$#', $uri)) {
+    require __DIR__ . '/provision.php';
+    exit;
+}
+
+// -----------------------------------------------------------------------------
 // Product image: /product-image — serves uploaded product images (public).
 // -----------------------------------------------------------------------------
 if (preg_match('#^/product-image$#', $uri)) {
@@ -214,7 +223,7 @@ if ($uri === '/' || $uri === '') {
 // Direct .php file access (for backwards compatibility)
 // Only allow specific public files
 // -----------------------------------------------------------------------------
-$allowedFiles = ['index.php', 'admin.php', 'setup.php', 'payment.php', 'pay.php', 'api.php', 'cron.php', 'receive.php', 'recover.php', 'update.php', 'health.php', 'product-image.php'];
+$allowedFiles = ['index.php', 'admin.php', 'setup.php', 'payment.php', 'pay.php', 'api.php', 'cron.php', 'receive.php', 'recover.php', 'update.php', 'health.php', 'product-image.php', 'provision.php'];
 $requestedFile = basename($uri);
 
 if (in_array($requestedFile, $allowedFiles)) {

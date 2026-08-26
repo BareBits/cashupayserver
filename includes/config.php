@@ -195,6 +195,15 @@ class Config {
             return rtrim($baseUrl, '/');
         }
 
+        // Deployment-time pin (user_config.php), written by installers that
+        // know the served URL up front — e.g. the WordPress companion
+        // plugin's "install BareBits alongside" flow. Beats auto-detection:
+        // it never trusts the Host header and stays correct behind routing
+        // setups where SCRIPT_NAME doesn't reflect the public path.
+        if (defined('CASHUPAY_BASE_URL') && CASHUPAY_BASE_URL !== '') {
+            return rtrim((string)CASHUPAY_BASE_URL, '/');
+        }
+
         // Auto-detect
         $protocol = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
         $host = $_SERVER['HTTP_HOST'] ?? 'localhost';

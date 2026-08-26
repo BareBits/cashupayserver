@@ -93,8 +93,7 @@
 // the same name to a non-empty, non-"0" string). The updater respects the
 // CASHUPAY_UPDATE_CHANNEL setting above when fetching.
 //
-// Operators who don't want auto-update can leave this alone, or run the
-// WordPress plugin build (auto-update is skipped in WP mode regardless).
+// Operators who don't want auto-update can leave this alone.
 //
 // define('CASHUPAY_AUTO_UPDATE_ENABLED', true);
 
@@ -126,6 +125,39 @@
 // (also bundled). If the new build fails to boot, update.php restores the most
 // recent backup, blocks the broken build's commit so it is never re-applied,
 // and emails the address in the notification settings (Settings → Email).
+
+// =============================================================================
+// PROVISIONED INSTALLS (external orchestrators, e.g. the WordPress plugin)
+// =============================================================================
+// These settings are written by an installer that deploys BareBits on the
+// operator's behalf — the GPL WordPress companion plugin's "install BareBits
+// alongside WordPress" flow is the canonical example. A hand-managed install
+// never needs them.
+
+// CASHUPAY_BASE_URL — pin the public base URL of this install. Normally the
+// base URL is auto-detected per request (or set in the database); installers
+// that know the served URL up front write it here so it is correct from the
+// first request and never trusts the Host header.
+//
+// define('CASHUPAY_BASE_URL', 'https://example.com/barebits');
+
+// CASHUPAY_EXTERNAL_CRON — declare that something outside this install
+// already requests cron.php every minute (the WordPress plugin pings it from
+// WP-cron). The setup wizard then skips the crontab screen, since there is
+// nothing for the operator to wire up. Constant wins over the env var of the
+// same name; "0" means off.
+//
+// define('CASHUPAY_EXTERNAL_CRON', true);
+
+// CASHUPAY_PROVISION_TOKEN_HASH — SHA-256 hex hash of a one-time provisioning
+// token. When set, provision.php lets the holder of the matching plaintext
+// token collect this install's integration credentials (store id, a freshly
+// minted BTCPay-compatible API key, and the cron key) exactly once after the
+// setup wizard completes. The installer generates the token, writes only its
+// hash here, and keeps the plaintext on its own side. The exchange
+// self-invalidates after first use; remove the line to revoke an unused token.
+//
+// define('CASHUPAY_PROVISION_TOKEN_HASH', 'hex-sha256-of-token');
 
 // =============================================================================
 // EMAIL NOTIFICATIONS — SMTP (optional)
