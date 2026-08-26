@@ -41,15 +41,6 @@ Do NOT use with amounts you cannot afford to lose. Use the suggested default pat
 
 **You are responsible for your own funds. The developers are not liable for any losses.** **This software is produced AS-IS without any warranty**
 
-### Screenshots
-
-<p align="center">
-  <img src="docs/screenshots/create-invoice.png" alt="Create an invoice from the product catalog" width="180">
-  <img src="docs/screenshots/create-invoice-simple.png" alt="Create a simple invoice with just an amount" width="180">
-  <img src="docs/screenshots/payment-pending.png" alt="Customer checkout offering both on-chain and Lightning" width="180">
-  <img src="docs/screenshots/payment-success.png" alt="Payment complete" width="180">
-</p>
-
 ### Trade-offs
 
 BareBits sits between custodial payment gateways and full self-hosting:
@@ -61,6 +52,14 @@ BareBits sits between custodial payment gateways and full self-hosting:
 | [Bitcart](https://bitcart.ai/) | Full sovereignty, limited lightning support with no liquidity management | Needs smaller VPS ($10+/mo), Docker, ongoing maintenance |
 | **BareBits** | Simple, cheap hosting | No KYC, trust mint with funds until withdrawal, or go full self-custody |
 
+### Screenshots
+
+<p align="center">
+  <img src="docs/screenshots/create-invoice.png" alt="Create an invoice from the product catalog" width="180">
+  <img src="docs/screenshots/create-invoice-simple.png" alt="Create a simple invoice with just an amount" width="180">
+  <img src="docs/screenshots/payment-pending.png" alt="Customer checkout offering both on-chain and Lightning" width="180">
+  <img src="docs/screenshots/payment-success.png" alt="Payment complete" width="180">
+</p>
 
 ## Suggested Configurations
 BareBits is robust payment software that can direct payments to you via many methods depending on your security and speed needs. Below are several suggested setups. No matter which setup you choose, on-chain payments will ALWAYS go to your on-chain wallet. Lightning payments can take several paths depending on your needs.
