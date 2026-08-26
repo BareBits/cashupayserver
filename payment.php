@@ -169,15 +169,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'send_
     require_once __DIR__ . '/includes/notification_sender.php';
     header('Content-Type: application/json');
 
-    // WordPress installs don't render the email/newsletter form (WooCommerce
-    // owns customer emails there), so reject the endpoint outright rather
-    // than trusting the client not to POST.
-    if (Urls::isWordPress()) {
-        cashupay_status(404);
-        echo json_encode(['error' => 'Not available.']);
-        exit;
-    }
-
     // Accepted for a settled invoice (receipt queued immediately) or while a
     // detected on-chain payment is still confirming (email saved now, receipt
     // queued at settlement — see NotificationSender::flushRequestedPayerReceipts).
@@ -259,29 +250,6 @@ $redirectUrl = $checkoutConfig['redirectURL'] ?? null;
 if ($redirectUrl !== null && $redirectUrl !== '') {
     $redirectUrl = Security::sanitizeUrl((string)$redirectUrl);
 }
-// Payer-safe redirect (WordPress mode): invoices created from the embedded
-// admin's "Request payment" modal used to store the admin SPA's own URL as
-// checkout.redirectURL (a return-to-admin convenience for the merchant). The
-// payment page is customer-facing, and /cashupay-admin, /cashupay-setup and
-// /wp-admin are all gated behind manage_options — a payer clicking "Return
-// to Shop" / "Continue to Store" on such an invoice landed on WordPress's
-// Access-denied error page. Rewrite admin-surface targets to the shop's
-// front page. Render-time (not create-time) so invoices already carrying an
-// admin URL are covered too.
-if ($redirectUrl !== null && Urls::isWordPress()) {
-    $adminSurfaces = [site_url('/cashupay-admin'), site_url('/cashupay-setup'), admin_url()];
-    foreach ($adminSurfaces as $surface) {
-        // Boundary-checked prefix match, so an unrelated page that merely
-        // starts with the same string (e.g. /cashupay-admin-guide) survives.
-        $surface = rtrim($surface, '/');
-        if ($redirectUrl === $surface
-                || (strpos($redirectUrl, $surface) === 0
-                    && in_array($redirectUrl[strlen($surface)], ['/', '?', '#'], true))) {
-            $redirectUrl = home_url('/');
-            break;
-        }
-    }
-}
 $redirectAuto = $checkoutConfig['redirectAutomatically'] ?? true;
 
 // Pull the payer-facing note out of the invoice's metadata. itemDesc is what
@@ -290,30 +258,16 @@ $redirectAuto = $checkoutConfig['redirectAutomatically'] ?? true;
 $invoiceMetadata = $invoice['metadata'] ? json_decode($invoice['metadata'], true) : null;
 $invoiceNote = is_array($invoiceMetadata) ? trim((string)($invoiceMetadata['itemDesc'] ?? '')) : '';
 
-// WooCommerce-backed invoices (created by the BTCPay gateway plugin) carry
-// metadata.orderId. For those, the expired screen offers a retry link that
-// bounces through /cashupay/retry/{invoiceId} to WooCommerce's order-pay
-// page, where clicking "Pay" makes the gateway mint a fresh invoice for the
-// same order. Standalone invoices (admin wizard, self-serve /pay) have no
-// order to re-pay, so they keep the plain Return-to-Shop exit.
-$wooRetryUrl = null;
-if (Urls::isWordPress() && is_array($invoiceMetadata) && !empty($invoiceMetadata['orderId'])) {
-    $wooRetryUrl = site_url('/cashupay/retry/' . rawurlencode((string)$invoice['id']));
-}
-
 // Decide whether to render the payer-receipt form. The check is composed of
 // site-wide master switch + per-type toggle + SMTP. When false, the success
-// modal shows a "screenshot this page" fallback instead. WordPress installs
-// never render the email/newsletter form at all — WooCommerce owns customer
-// emails and order confirmations there — so they always get the fallback.
+// modal shows a "screenshot this page" fallback instead.
 require_once __DIR__ . '/includes/notification_sender.php';
-$emailFormOffered = !Urls::isWordPress();
-$payerReceiptOffered = $emailFormOffered && NotificationSender::isPayerReceiptOffered();
+$payerReceiptOffered = NotificationSender::isPayerReceiptOffered();
 
 // Resolve the newsletter checkbox's initial state for this store (per-store
 // override → site-wide default). The email/newsletter capture form is shown
 // regardless of whether receipts are offered.
-$newsletterDefaultChecked = $emailFormOffered && Config::getNewsletterDefaultChecked($invoice['store_id']);
+$newsletterDefaultChecked = Config::getNewsletterDefaultChecked($invoice['store_id']);
 
 // An on-chain payment was seen in the mempool but hasn't confirmed yet. This
 // drives the unified detected/complete screen: same layout as the settled
@@ -356,18 +310,16 @@ if ($invoice['amount_sats'] && $requestCurrency !== 'SAT' && $requestCurrency !=
 $baseUrl = Config::getBaseUrl();
 
 // Admin-only payment-path debug labels. Double-gated: the site-wide toggle
-// (default OFF) AND a logged-in admin session. In standalone mode we only probe
-// the session when the admin session cookie is already present, so anonymous
-// payers never receive a Set-Cookie from this public page; WordPress mode keys
-// off current_user_can() and needs no PHP session. When on, gather the extra
+// (default OFF) AND a logged-in admin session. We only probe the session when
+// the admin session cookie is already present, so anonymous payers never
+// receive a Set-Cookie from this public page. When on, gather the extra
 // context the labels need (store on-chain mode + swap provider) so the helper
 // stays a pure string builder. $pathDebug stays false for everyone else.
 $pathDebug = false;
 $pathDebugOnchainMode = null;
 $pathDebugSwapProvider = null;
 $pathDebugCashuMintUrl = null;
-$pathDebugMayBeAdmin = (defined('CASHUPAY_WORDPRESS') && CASHUPAY_WORDPRESS)
-    || isset($_COOKIE['cashupay_session']);
+$pathDebugMayBeAdmin = isset($_COOKIE['cashupay_session']);
 if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
     if (Auth::isAdmin()) {
         $pathDebug = true;
@@ -1376,7 +1328,6 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                     <div><span class="label">Note:</span><span class="invoice-note-value"><?= htmlspecialchars($invoiceNote) ?></span></div>
                     <?php endif; ?>
                 </div>
-                <?php if ($emailFormOffered): ?>
                 <form class="receipt-form" id="receipt-form" data-receipt-offered="<?= $payerReceiptOffered ? '1' : '0' ?>" novalidate>
                     <div class="receipt-prompt">
                         <?= $payerReceiptOffered ? 'Email me a payment confirmation' : 'Leave your email' ?>
@@ -1392,7 +1343,6 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                     <button type="button" class="receipt-skip" id="receipt-skip">No thanks</button>
                     <div class="receipt-status hidden" id="receipt-status"></div>
                 </form>
-                <?php endif; ?>
                 <?php if (!$payerReceiptOffered): ?>
                 <div class="receipt-fallback <?= $onchainPendingInitial ? 'hidden' : '' ?>" id="receipt-fallback">
                     Screenshot this page or save your invoice ID for your records.
@@ -1412,18 +1362,7 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                 <p style="color: var(--text-secondary); margin-top: 1rem;">
                     This invoice has expired. Please request a new one.
                 </p>
-                <?php if ($wooRetryUrl): ?>
-                    <a href="<?= htmlspecialchars($wooRetryUrl) ?>" class="btn <?= $invoice['status'] === 'Invalid' ? 'hidden' : '' ?>" style="margin-top: 1.5rem;" id="retry-btn">
-                        Request a new invoice
-                    </a>
-                    <?php if ($redirectUrl): ?>
-                        <p style="margin-top: 1rem;">
-                            <a href="<?= htmlspecialchars($redirectUrl) ?>" style="color: var(--text-secondary);">
-                                Return to Shop
-                            </a>
-                        </p>
-                    <?php endif; ?>
-                <?php elseif ($redirectUrl): ?>
+                <?php if ($redirectUrl): ?>
                     <a href="<?= htmlspecialchars($redirectUrl) ?>" class="btn" style="margin-top: 1.5rem;">
                         Return to Shop
                     </a>

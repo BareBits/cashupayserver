@@ -565,8 +565,8 @@ if (isset($_GET['api'])) {
                 'available' => Updater::getAvailableUpdate(),
                 // In-flight / last manual ("Update now") run, polled by the UI.
                 'manual_run' => Config::get('updater_manual_run'),
-                // Why a manual update can't run here (WordPress / dev kill
-                // switch), or null if it can. Drives the button's enabled state.
+                // Why a manual update can't run here (dev kill switch), or
+                // null if it can. Drives the button's enabled state.
                 'manual_blocked' => Updater::manualUpdateBlockedReason(),
             ]);
             break;
@@ -1863,10 +1863,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $storeId = $_POST['store_id'] ?? '';
                 $secretsRaw = $_POST['secrets'] ?? '[]';
                 $secrets = json_decode($secretsRaw, true);
-                if ($secrets === null && json_last_error() !== JSON_ERROR_NONE) {
-                    // JSON parse failed - likely WordPress magic quotes escaping
-                    $secrets = json_decode(stripslashes($secretsRaw), true);
-                }
 
                 if (empty($storeId)) {
                     throw new Exception('Store ID required');
@@ -2530,10 +2526,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
                 // Per-store newsletter checkbox default. Tri-state: '' = inherit
                 // the site-wide default (stored NULL); '1'/'0' = force checked/
-                // unchecked. See Config::getNewsletterDefaultChecked(). WordPress
-                // installs hide the selector (the payment page never shows the
-                // newsletter checkbox there), so the stored value must survive a
-                // save that carries no newsletter field.
+                // unchecked. See Config::getNewsletterDefaultChecked().
                 $newsletterDefault = (string)($_POST['newsletter_default_checked'] ?? '');
                 $newsletterDefaultVal = ($newsletterDefault === '1' || $newsletterDefault === '0')
                     ? (int)$newsletterDefault
@@ -2549,10 +2542,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'smtp_encryption' => $smtp['encryption'] !== '' ? $smtp['encryption'] : null,
                     'smtp_from_address' => $smtp['from_address'] !== '' ? $smtp['from_address'] : null,
                     'smtp_from_name' => $smtp['from_name'] !== '' ? $smtp['from_name'] : null,
+                    'newsletter_default_checked' => $newsletterDefaultVal,
                 ];
-                if (!Urls::isWordPress()) {
-                    $update['newsletter_default_checked'] = $newsletterDefaultVal;
-                }
                 // Password: preserve on blank, overwrite on new value, wipe on clear.
                 if ($smtp['password_clear']) {
                     $update['smtp_password'] = null;
@@ -2619,13 +2610,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 Config::set('notifications_enabled', $enabled);
                 Config::set('notifications_invoice_paid_enabled', $invoicePaidEnabled);
                 Config::set('notifications_auto_cashout_enabled', $autoCashoutEnabled);
-                // WordPress installs hide the payer-receipt and newsletter
-                // toggles (the payment page never renders the email form there),
-                // so a save must not clobber their stored values with defaults.
-                if (!Urls::isWordPress()) {
-                    Config::set('notifications_payer_receipt_enabled', $payerReceiptEnabled);
-                    Config::set('newsletter_default_checked', $newsletterDefaultChecked);
-                }
+                Config::set('notifications_payer_receipt_enabled', $payerReceiptEnabled);
+                Config::set('newsletter_default_checked', $newsletterDefaultChecked);
                 Config::set('notifications_to_email', $toEmail);
 
                 Config::set('smtp_host', $smtp['host']);
@@ -3689,10 +3675,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if (!$storeId) {
                     throw new Exception('Store ID required');
                 }
-                // Auth::verifyCurrentUserPassword handles both deployments:
-                // the BareBits users row standalone, the WordPress user's own
-                // password under WordPress (where there is no BareBits row and
-                // Auth::currentUser() is null by design).
                 if (!Auth::verifyCurrentUserPassword((string)($_POST['password'] ?? ''))) {
                     cashupay_status(401);
                     echo json_encode(['error' => 'Password is incorrect']);
@@ -3756,15 +3738,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
 // Serve the SPA HTML
 $baseUrl = Config::getBaseUrl();
-$isWp = Urls::isWordPress();
 $isLoggedIn = Auth::isLoggedIn();
-$currentUser = Auth::currentUser();   // null when WordPress mode or not logged in
+$currentUser = Auth::currentUser();   // null when not logged in
 $currentRole = $currentUser['role'] ?? ($isLoggedIn ? Auth::ROLE_ADMIN : null);
 $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
 // Mechanism 2: surface the file-based reset on the lock screen when the trigger
-// file is present and nobody is signed in. Standalone mode only (WordPress
-// manages its own accounts).
-$fileResetRequested = !$isLoggedIn && !$isWp && Auth::fileResetRequested();
+// file is present and nobody is signed in.
+$fileResetRequested = !$isLoggedIn && Auth::fileResetRequested();
 
 // -----------------------------------------------------------------------------
 // SPA view routing
@@ -3773,38 +3753,28 @@ $fileResetRequested = !$isLoggedIn && !$isWp && Auth::fileResetRequested();
 // parsed here so a refresh restores the operator's current page instead of
 // always dropping them back on the dashboard.
 //
-// Sources for the view slug:
-//   - Standalone (direct, router, or PATH_INFO mode): $_SERVER['PATH_INFO']
-//   - WordPress: a query var captured by the cashupay-admin rewrite rule
+// The view slug comes from $_SERVER['PATH_INFO'] (direct, router, or
+// PATH_INFO mode).
 //
 // Unknown or empty view → 302 to <base>/dashboard so /admin canonicalizes to
 // /admin/dashboard and bookmarks of removed views still resolve sensibly.
 // -----------------------------------------------------------------------------
 const ADMIN_VIEWS = ['dashboard', 'invoices', 'customers', 'stores', 'products', 'settings', 'stats', 'log'];
 
-if ($isWp) {
-    $rawAdminView = (string)get_query_var('cashupay_admin_view');
-} else {
-    $rawAdminView = trim((string)($_SERVER['PATH_INFO'] ?? ''), '/');
-}
+$rawAdminView = trim((string)($_SERVER['PATH_INFO'] ?? ''), '/');
 
 // Compute the base path the JS uses to build view URLs and to call back into
-// admin.php for ?api=... requests. In standalone mode it's REQUEST_URI minus
-// the PATH_INFO tail and any query string; in WordPress mode the rewrite
-// owns the URL shape, so we use the canonical admin URL.
-if ($isWp) {
+// admin.php for ?api=... requests: REQUEST_URI minus the PATH_INFO tail and
+// any query string.
+$reqPath = parse_url((string)($_SERVER['REQUEST_URI'] ?? ''), PHP_URL_PATH) ?: '';
+$pi = (string)($_SERVER['PATH_INFO'] ?? '');
+if ($pi !== '' && $pi !== '/' && substr($reqPath, -strlen($pi)) === $pi) {
+    $reqPath = substr($reqPath, 0, -strlen($pi));
+}
+$adminBasePath = rtrim($reqPath, '/');
+if ($adminBasePath === '') {
+    // Fallback if REQUEST_URI was unexpectedly empty.
     $adminBasePath = rtrim(Urls::admin(), '/');
-} else {
-    $reqPath = parse_url((string)($_SERVER['REQUEST_URI'] ?? ''), PHP_URL_PATH) ?: '';
-    $pi = (string)($_SERVER['PATH_INFO'] ?? '');
-    if ($pi !== '' && $pi !== '/' && substr($reqPath, -strlen($pi)) === $pi) {
-        $reqPath = substr($reqPath, 0, -strlen($pi));
-    }
-    $adminBasePath = rtrim($reqPath, '/');
-    if ($adminBasePath === '') {
-        // Fallback if REQUEST_URI was unexpectedly empty.
-        $adminBasePath = rtrim(Urls::admin(), '/');
-    }
 }
 
 // Canonicalize: unknown or empty view → /admin/dashboard, preserving query.
@@ -3833,7 +3803,7 @@ header('Cache-Control: no-cache, must-revalidate');
     <meta name="apple-mobile-web-app-title" content="BareBits">
     <meta name="csrf-token" content="<?= htmlspecialchars(Auth::generateCsrfToken()) ?>">
     <title>BareBits Admin</title>
-    <?php if (!$isWp): ?><link rel="manifest" href="<?= htmlspecialchars(Config::getBaseUrl()) ?>/manifest.json"><?php endif; ?>
+    <link rel="manifest" href="<?= htmlspecialchars(Config::getBaseUrl()) ?>/manifest.json">
     <link rel="apple-touch-icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect fill='%230f0f23' width='100' height='100' rx='20'/><text x='50' y='70' font-size='60' text-anchor='middle'>⚡</text></svg>">
     <style>
         * {
@@ -4249,16 +4219,6 @@ header('Cache-Control: no-cache, must-revalidate');
            can toggle whole cards/buttons by classList. Lock-screen has its
            own .lock-screen.hidden rule above; this is the catch-all. */
         .hidden {
-            display: none !important;
-        }
-
-        /* WordPress plugin mode: hides elements WordPress makes redundant
-           (Products/Customers tabs — the shop plugin owns that data; the
-           store selector — plugin installs run a single store). Kept in the
-           DOM so the JS that references them needs no null guards, with
-           !important so the role-based un-hide and the per-view
-           style.display toggles can't bring them back. */
-        .wp-hidden {
             display: none !important;
         }
 
@@ -5209,12 +5169,10 @@ header('Cache-Control: no-cache, must-revalidate');
             <input type="password" id="password-input" placeholder="Password"
                    autocomplete="current-password">
             <button class="btn btn-full" id="password-submit">Unlock</button>
-            <?php if (!$isWp): ?>
             <button class="btn-link" id="forgot-password-link" type="button"
                     style="background:none;border:0;color:var(--text-secondary);text-decoration:underline;cursor:pointer;margin-top:0.75rem;font-size:0.85rem;">
                 Forgot password?
             </button>
-            <?php endif; ?>
         </div>
 
         <?php if ($fileResetRequested): ?>
@@ -5242,7 +5200,7 @@ header('Cache-Control: no-cache, must-revalidate');
                     <img class="header-logo" src="<?= htmlspecialchars(Urls::assets('img/barebits-logo.svg')) ?>" alt="BareBits">
                     <span id="header-text">Dashboard</span>
                 </div>
-                <div class="header-store-selector<?= $isWp ? ' wp-hidden' : '' ?>" id="header-store-selector">
+                <div class="header-store-selector" id="header-store-selector">
                     <span class="store-selector-label">Selected Store:</span>
                     <select id="store-select">
                         <option value="">Loading stores...</option>
@@ -5256,7 +5214,6 @@ header('Cache-Control: no-cache, must-revalidate');
                         <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path>
                     </svg>
                 </button>
-                <?php if (!Urls::isWordPress()): ?>
                 <div class="user-menu" id="user-menu">
                     <button class="icon-btn" id="user-btn" title="Account">
                         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -5269,7 +5226,6 @@ header('Cache-Control: no-cache, must-revalidate');
                         <button class="user-menu-item" id="user-menu-logout" role="menuitem">Log out</button>
                     </div>
                 </div>
-                <?php endif; ?>
             </div>
         </header>
 
@@ -6047,15 +6003,11 @@ header('Cache-Control: no-cache, must-revalidate');
                             </p>
                             <div class="form-group">
                                 <label class="form-label" for="store-seed-password">
-                                    <?= Urls::isWordPress()
-                                        ? 'Confirm your WordPress password'
-                                        : 'Confirm your password' ?>
+                                    Confirm your password
                                 </label>
                                 <input type="password" class="form-input" id="store-seed-password"
                                        autocomplete="current-password"
-                                       placeholder="<?= Urls::isWordPress()
-                                           ? 'Your WordPress password'
-                                           : 'Your admin password' ?>">
+                                       placeholder="Your admin password">
                             </div>
                             <div id="store-seed-error" class="hidden" style="margin-bottom:0.5rem; color: var(--error); font-size: 0.85rem;"></div>
                             <div id="store-seed-output" class="hidden" style="margin-bottom: 0.75rem;">
@@ -6144,9 +6096,6 @@ header('Cache-Control: no-cache, must-revalidate');
                                 <p class="form-help">If blank, the site-wide notification address from Settings is used.</p>
                             </div>
 
-                            <?php if (!$isWp): ?>
-                            <!-- Hidden in WordPress installs: the payment page never
-                                 shows the newsletter checkbox there. -->
                             <div class="form-group" style="margin-top: 1rem;">
                                 <label class="form-label">Newsletter checkbox default</label>
                                 <select class="form-input" id="store-newsletter-default">
@@ -6159,14 +6108,8 @@ header('Cache-Control: no-cache, must-revalidate');
                                     payment page.
                                 </p>
                             </div>
-                            <?php endif; ?>
 
-                            <?php if ($isWp): ?>
-                            <div style="margin-top: 1rem; background: rgba(247,147,26,0.15); border: 1px solid rgba(247,147,26,0.4); padding: 0.6rem; border-radius: 6px; font-size: 0.85rem;">
-                                Installed in plugin mode &mdash; configure your e-mail settings in WordPress directly.
-                            </div>
-                            <?php endif; ?>
-                            <div class="toggle-container" style="margin-top: 1rem;<?= $isWp ? ' opacity: 0.5; pointer-events: none;' : '' ?>">
+                            <div class="toggle-container" style="margin-top: 1rem;">
                                 <span>Use a custom SMTP server for this store</span>
                                 <label class="toggle">
                                     <input type="checkbox" id="store-smtp-override-enabled">
@@ -6174,7 +6117,7 @@ header('Cache-Control: no-cache, must-revalidate');
                                 </label>
                             </div>
 
-                            <div id="store-smtp-fields" class="hidden" style="margin-top: 0.75rem; padding: 0.75rem; background: rgba(0,0,0,0.2); border-radius: 8px;<?= $isWp ? ' opacity: 0.5; pointer-events: none;' : '' ?>">
+                            <div id="store-smtp-fields" class="hidden" style="margin-top: 0.75rem; padding: 0.75rem; background: rgba(0,0,0,0.2); border-radius: 8px;">
                                 <p class="form-help" style="margin-top: 0;">
                                     Any field left blank falls back to the global SMTP settings, then to
                                     <code>user_config.php</code>.
@@ -6530,10 +6473,6 @@ header('Cache-Control: no-cache, must-revalidate');
                                     <span class="toggle-slider"></span>
                                 </label>
                             </div>
-                            <?php if (!$isWp): ?>
-                            <!-- WordPress installs never render the payment-page
-                                 email/newsletter form (WooCommerce owns customer
-                                 emails), so both toggles below would be dead there. -->
                             <div class="toggle-container" style="margin-top: 0.5rem;">
                                 <span>Offer payer receipt on payment page</span>
                                 <label class="toggle">
@@ -6559,15 +6498,9 @@ header('Cache-Control: no-cache, must-revalidate');
                                 shown regardless of whether receipts are enabled. Individual
                                 stores can override this default in their store settings.
                             </p>
-                            <?php endif; ?>
                         </div>
 
-                        <?php if ($isWp): ?>
-                        <div style="margin-top: 1rem; background: rgba(247,147,26,0.15); border: 1px solid rgba(247,147,26,0.4); padding: 0.6rem; border-radius: 6px; font-size: 0.85rem;">
-                            Installed in plugin mode &mdash; configure your e-mail settings in WordPress directly.
-                        </div>
-                        <?php endif; ?>
-                        <div style="margin-top: 1rem; padding: 0.75rem; background: rgba(0,0,0,0.2); border-radius: 8px;<?= $isWp ? ' opacity: 0.5; pointer-events: none;' : '' ?>">
+                        <div style="margin-top: 1rem; padding: 0.75rem; background: rgba(0,0,0,0.2); border-radius: 8px;">
                             <div style="font-weight: 500; margin-bottom: 0.5rem;">SMTP server</div>
                             <p class="form-help" style="margin-top: 0;">
                                 Outgoing mail server. Any field left blank falls back to
@@ -6641,7 +6574,6 @@ header('Cache-Control: no-cache, must-revalidate');
                         <p class="form-help" id="notifications-pending" style="margin-top: 0.5rem;"></p>
                     </div>
                 </div>
-                <?php if (!Urls::isWordPress()): ?>
                 <div class="card collapsible" data-admin-only="true">
                     <div class="card-header">
                         <div class="card-title">Server URL</div>
@@ -6731,8 +6663,7 @@ header('Cache-Control: no-cache, must-revalidate');
                     channel and overlays it on the install. data/ and
                     user_config.php are preserved. .htaccess is only overwritten
                     if untouched. After applying, it probes health.php and
-                    auto-rolls-back any build that fails to boot. Skipped
-                    entirely in WordPress mode.
+                    auto-rolls-back any build that fails to boot.
                 -->
                 <div class="card collapsible" data-admin-only="true" id="card-auto-update">
                     <div class="card-header">
@@ -6791,10 +6722,8 @@ header('Cache-Control: no-cache, must-revalidate');
                         </div>
                     </div>
                 </div>
-                <?php endif; ?>
 
                 <!-- My Account card: own password + logout, available to every logged-in user -->
-                <?php if (!Urls::isWordPress()): ?>
                 <div class="card collapsible" id="card-my-account">
                     <div class="card-header">
                         <div class="card-title">My Account</div>
@@ -6837,18 +6766,6 @@ header('Cache-Control: no-cache, must-revalidate');
                         <div id="users-list"></div>
                     </div>
                 </div>
-                <?php else: ?>
-                <div class="card collapsible">
-                    <div class="card-header">
-                        <div class="card-title">Account</div>
-                    </div>
-                    <div class="card-body">
-                        <button class="btn btn-danger btn-full" id="btn-logout">
-                            Logout
-                        </button>
-                    </div>
-                </div>
-                <?php endif; ?>
 
                 <!-- Stuck Funds card: admin-only.
                      Hidden when no store has any sats stranded in a mint with
@@ -7133,7 +7050,7 @@ header('Cache-Control: no-cache, must-revalidate');
                 </svg>
                 Store
             </button>
-            <button class="nav-item hidden<?= $isWp ? ' wp-hidden' : '' ?>" data-view="products" data-admin-only="true" id="nav-products">
+            <button class="nav-item hidden" data-view="products" data-admin-only="true" id="nav-products">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                     <path d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4"></path>
                 </svg>
@@ -7147,7 +7064,7 @@ header('Cache-Control: no-cache, must-revalidate');
                 </svg>
                 Stats
             </button>
-            <button class="nav-item hidden<?= $isWp ? ' wp-hidden' : '' ?>" data-view="customers" data-admin-only="true" id="nav-customers">
+            <button class="nav-item hidden" data-view="customers" data-admin-only="true" id="nav-customers">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                     <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path>
                     <circle cx="9" cy="7" r="4"></circle>
@@ -7562,8 +7479,6 @@ header('Cache-Control: no-cache, must-revalidate');
     <script src="<?= htmlspecialchars(Urls::assets('js/')) ?>animated-qr.js?v=4"></script>
     <script src="<?= htmlspecialchars(Urls::assets('js/')) ?>chart.min.js"></script>
     <script>
-        // WordPress mode - skip lock screen
-        const isWordPressMode = <?= Urls::isWordPress() ? 'true' : 'false' ?>;
         // PHP session state, used to skip the password prompt on reload when
         // the server still considers us logged in.
         const phpLoggedIn = <?= $isLoggedIn ? 'true' : 'false' ?>;
@@ -7577,17 +7492,11 @@ header('Cache-Control: no-cache, must-revalidate');
         // Path-based SPA routing: adminBasePath is the URL prefix the user
         // reached the admin under (no trailing slash, no view tail). All view
         // URLs and ?api=... fetches build off this so the same code works
-        // under direct, router, and WordPress modes — and under PATH_INFO
+        // under direct and router modes — and under PATH_INFO
         // where relative URLs would otherwise resolve incorrectly.
         const adminBasePath = <?= json_encode($adminBasePath) ?>;
         const adminUrl = adminBasePath;
         const setupUrl = <?= json_encode(Urls::setup()) ?>;
-        // Public site root (WordPress mode) — where payer-facing redirect
-        // links (the payment page's "Continue to Store" / "Return to Shop"
-        // buttons) should land. The admin SPA's own URL is gated behind
-        // manage_options, so it must never be handed to a payer. Null in
-        // standalone mode, where there is no public shop to return to.
-        const shopHomeUrl = <?= json_encode(Urls::isWordPress() ? home_url('/') : null) ?>;
         // Where to point "get a free lightning address" links (Strike). Operator
         // override via CASHUPAY_STRIKE_URL in user_config.php; defaults to strike.me.
         const strikeUrl = <?= json_encode(defined('CASHUPAY_STRIKE_URL') ? CASHUPAY_STRIKE_URL : 'http://strike.me') ?>;
@@ -7598,7 +7507,6 @@ header('Cache-Control: no-cache, must-revalidate');
 
         // URL mode config (embedded from PHP)
         const urlModeConfig = {
-            isWordPress: <?= json_encode(Urls::isWordPress()) ?>,
             currentMode: <?= json_encode(Config::getUrlMode()) ?>,
             baseUrl: <?= json_encode(Urls::siteBase()) ?>
         };
@@ -7682,11 +7590,6 @@ header('Cache-Control: no-cache, must-revalidate');
 
         // Check authentication state
         function checkAuth() {
-            if (isWordPressMode) {
-                showApp();
-                return;
-            }
-
             if (phpLoggedIn) {
                 showApp();
             } else {
@@ -8073,7 +7976,7 @@ header('Cache-Control: no-cache, must-revalidate');
             if (dismissCronBtn) dismissCronBtn.addEventListener('click', dismissCronStaleBanner);
             document.getElementById('btn-logout').addEventListener('click', logout);
 
-            // My Account + Users (standalone only — WordPress uses WP for user management)
+            // My Account + Users
             const btnChangePass = document.getElementById('btn-change-own-password');
             if (btnChangePass) {
                 btnChangePass.addEventListener('click', () => openModal('modal-change-password'));
@@ -8327,7 +8230,7 @@ header('Cache-Control: no-cache, must-revalidate');
 
         // Header user dropdown: shows the current username, opens/closes on
         // user-btn click, closes on outside click or Escape, hosts the
-        // Logout entry. No-op in WordPress mode (the markup is omitted).
+        // Logout entry.
         function setupUserMenu() {
             const btn = document.getElementById('user-btn');
             if (!btn) return;
@@ -10471,11 +10374,9 @@ header('Cache-Control: no-cache, must-revalidate');
                     amount: amount,
                     currency: currency,
                     checkout: {
-                        // WordPress mode: payers land on the shop's front
-                        // page — this admin's URL is manage_options-gated and
-                        // shows them an Access-denied page. Standalone keeps
-                        // the return-to-admin convenience (no shop exists).
-                        redirectURL: shopHomeUrl || window.location.href.split('?')[0],
+                        // Payers land back on this admin page after paying
+                        // (there is no separate shop to return to).
+                        redirectURL: window.location.href.split('?')[0],
                         redirectAutomatically: true
                     }
                 };
@@ -11614,8 +11515,6 @@ header('Cache-Control: no-cache, must-revalidate');
             const email = document.getElementById('store-notification-email').value.trim();
             const passwordCleared = document.getElementById('store-smtp-password-clear').checked;
             const passwordTyped = document.getElementById('store-smtp-password').value !== '';
-            // Absent in WordPress installs (the payment page never shows the
-            // newsletter checkbox there); the backend keeps the stored value.
             const storeNewsletterEl = document.getElementById('store-newsletter-default');
             const params = new URLSearchParams({
                 action: 'save_store_notifications',
@@ -11731,8 +11630,6 @@ header('Cache-Control: no-cache, must-revalidate');
                 document.getElementById('notifications-enabled').checked = !!data.enabled;
                 document.getElementById('notifications-invoice-paid').checked = !!data.invoicePaidEnabled;
                 document.getElementById('notifications-auto-cashout').checked = !!data.autoCashoutEnabled;
-                // Both are absent in WordPress installs, where the payment page
-                // never renders the email/newsletter form.
                 const payerReceiptEl = document.getElementById('notifications-payer-receipt');
                 if (payerReceiptEl) payerReceiptEl.checked = !!data.payerReceiptEnabled;
                 const newsletterDefaultEl = document.getElementById('notifications-newsletter-default');
@@ -11767,8 +11664,6 @@ header('Cache-Control: no-cache, must-revalidate');
             const enabled = document.getElementById('notifications-enabled').checked ? '1' : '0';
             const invoicePaid = document.getElementById('notifications-invoice-paid').checked ? '1' : '0';
             const autoCashout = document.getElementById('notifications-auto-cashout').checked ? '1' : '0';
-            // Absent in WordPress installs; the backend ignores these fields
-            // there, so the sent value is only a placeholder.
             const payerReceiptEl = document.getElementById('notifications-payer-receipt');
             const payerReceipt = payerReceiptEl && payerReceiptEl.checked ? '1' : '0';
             const newsletterDefaultEl = document.getElementById('notifications-newsletter-default');
@@ -12352,8 +12247,6 @@ header('Cache-Control: no-cache, must-revalidate');
         }
 
         async function detectAndSaveUrlMode() {
-            if (urlModeConfig.isWordPress) return;
-
             const statusEl = document.getElementById('url-mode-detect-status');
             const labelEl = document.getElementById('url-mode-current-label');
             if (statusEl) {
@@ -13579,9 +13472,7 @@ header('Cache-Control: no-cache, must-revalidate');
                 case 'error':
                     return { busy: false, done: 'failed', text: 'The update could not be applied' + (run.message ? (': ' + run.message) : '.'), color: '#ef4444' };
                 case 'blocked':
-                    return { busy: false, done: 'blocked', text: run.reason === 'wordpress'
-                        ? 'Updates here are managed by WordPress.'
-                        : 'Updates are disabled in this environment.', color: 'var(--text-secondary)' };
+                    return { busy: false, done: 'blocked', text: 'Updates are disabled in this environment.', color: 'var(--text-secondary)' };
                 default:
                     return null;
             }
@@ -13660,9 +13551,7 @@ header('Cache-Control: no-cache, must-revalidate');
                 if (data && data.manual_blocked && !view) {
                     if (cardProg) {
                         cardProg.classList.remove('hidden');
-                        cardProg.textContent = data.manual_blocked === 'wordpress'
-                            ? 'Updates here are managed by WordPress.'
-                            : 'Updates are disabled in this environment (dev/test).';
+                        cardProg.textContent = 'Updates are disabled in this environment (dev/test).';
                         cardProg.style.color = 'var(--text-secondary)';
                     }
                 }
@@ -13694,8 +13583,7 @@ header('Cache-Control: no-cache, must-revalidate');
                 const data = await r.json();
                 if (!data || !data.success) {
                     const reason = data && data.error;
-                    const msg = reason === 'wordpress' ? 'Updates here are managed by WordPress.'
-                        : reason === 'disabled' ? 'Updates are disabled in this environment (dev/test).'
+                    const msg = reason === 'disabled' ? 'Updates are disabled in this environment (dev/test).'
                         : reason === 'no_cron_key' ? 'Set up the cron job first — the updater needs the cron key.'
                         : 'Could not start the update.';
                     showToast(msg, 'error');

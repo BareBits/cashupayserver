@@ -9,15 +9,16 @@
  *
  * Sequence (standalone first run):
  *   security   Requirements + database-exposure check + URL-mode detection
- *   password   Admin password (skipped in WordPress mode)
+ *   password   Admin password
  *   store      Store name
  *   onchain    On-chain destination — xpub (preferred) or single address
  *   zeroconf   Zero-conf vs 1-confirmation (skipped when onchain was skipped)
  *   lightning  LNURL/Lightning address + CLINK noffer
  *   swaps      Submarine swaps on/off
  *   mints      Cashu mints on/off; auto-picks a main + backup when on
- *   discount   Bitcoin checkout discount %, WordPress mode only
- *   cron       Reminder to install the cron entry
+ *   cron       Reminder to install the cron entry (skipped on the desktop
+ *              package, and on provisioned installs that declare
+ *              CASHUPAY_EXTERNAL_CRON — see SetupFlow::externalCronConfigured)
  *   done       Completion, seed phrase, e-commerce pairing
  *
  * `?mode=add_store` (from the admin panel) runs store → mints only and then
@@ -39,29 +40,6 @@ require_once __DIR__ . '/includes/store_ln_addresses.php';
 require_once __DIR__ . '/includes/swap/config.php';
 require_once __DIR__ . '/includes/setup_flow.php';
 require_once __DIR__ . '/includes/desktop.php';
-
-/**
- * Load the WooCommerce/BTCPay auto-wiring helper (WordPress mode only). Its
- * location depends on how the plugin was assembled: build-wordpress-plugin.sh
- * keeps wordpress/ as a subdirectory, while docker/Dockerfile.wordpress
- * flattens wordpress/*.php to the plugin root — a bare __DIR__ include only
- * resolves under the second. Returns false rather than fataling when neither
- * layout matches, so callers degrade to "no WooCommerce wiring offered"
- * instead of killing the page. Used by the terms screen (existing-BTCPay
- * consent), the done-step POST handler, and the completion screen.
- */
-function setupLoadBtcpayIntegration(): bool {
-    foreach ([
-        __DIR__ . '/wordpress/btcpay-integration.php',
-        __DIR__ . '/btcpay-integration.php',
-    ] as $candidate) {
-        if (is_file($candidate)) {
-            require_once $candidate;
-            return true;
-        }
-    }
-    return false;
-}
 
 // Initialize session early - needed for storing temp data during setup
 Auth::initSession();
@@ -142,6 +120,7 @@ if (!Database::isInitialized()) {
 // One resolve per request: the answer can't change mid-request, and the
 // wizard's shape must not either.
 $isDesktop = Desktop::isWindowsDesktop();
+$externalCron = SetupFlow::externalCronConfigured();
 
 // The security screen exists to prove the data directory can't be fetched
 // over the web. With the directory outside the web root that exposure is
@@ -232,8 +211,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     // each handler runs so the advance lands on the right screen.
     $storeIdForFlow = $_SESSION['setup_store_id'] ?? null;
     $flowSteps = SetupFlow::stepSequence(
-        $mode, Urls::isWordPress(), SetupFlow::onchainState($storeIdForFlow)['configured'],
-        $securityScreenNeeded, $isDesktop
+        $mode, SetupFlow::onchainState($storeIdForFlow)['configured'],
+        $securityScreenNeeded, $isDesktop, $externalCron
     );
     // Set by the mints handler when it mints a fresh wallet seed. add_store
     // has to stop and show it rather than redirecting past it.
@@ -244,21 +223,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             case 'terms':
                 if (empty($_POST['terms_legal']) || empty($_POST['terms_warranty']) || empty($_POST['terms_fee'])) {
                     throw new Exception('Please accept all three terms to continue.');
-                }
-                // WordPress mode: a WooCommerce checkout already paying
-                // through a real BTCPay Server is about to be replaced by the
-                // completion screen. That is destructive (all BTCPay plugin
-                // settings are reset to BareBits defaults), so it needs the
-                // merchant's explicit consent — collected here, on the first
-                // screen, where the warning is impossible to miss. The state
-                // is re-checked server-side rather than trusting the render:
-                // the config can change between the GET and this POST.
-                if (Urls::isWordPress() && setupLoadBtcpayIntegration()
-                        && cashupay_btcpay_takeover_state() === 'needs_consent') {
-                    if (empty($_POST['btcpay_override_consent'])) {
-                        throw new Exception('Please confirm that your existing BTCPay Server settings may be replaced.');
-                    }
-                    cashupay_record_btcpay_override_consent();
                 }
                 $step = SetupFlow::nextStep('terms', $flowSteps) ?? 'security';
                 break;
@@ -382,8 +346,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 // reached by going Back may already have one, which decides
                 // whether the zero-conf screen is in the sequence.
                 $flowSteps = SetupFlow::stepSequence(
-                    $mode, Urls::isWordPress(), SetupFlow::onchainState($storeId)['configured'],
-                    $securityScreenNeeded, $isDesktop
+                    $mode, SetupFlow::onchainState($storeId)['configured'],
+                    $securityScreenNeeded, $isDesktop, $externalCron
                 );
                 $step = SetupFlow::nextStep('store', $flowSteps) ?? 'onchain';
                 break;
@@ -398,7 +362,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if ($onchainAction === 'skip') {
                     // Nothing saved; the zero-conf screen drops out of the
                     // sequence because there is no on-chain rail to time.
-                    $flowSteps = SetupFlow::stepSequence($mode, Urls::isWordPress(), false, $securityScreenNeeded, $isDesktop);
+                    $flowSteps = SetupFlow::stepSequence($mode, false, $securityScreenNeeded, $isDesktop, $externalCron);
                     $step = SetupFlow::nextStep('onchain', $flowSteps) ?? 'lightning';
                     break;
                 }
@@ -508,7 +472,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     ], 'id = ?', [$storeId]);
                 }
 
-                $flowSteps = SetupFlow::stepSequence($mode, Urls::isWordPress(), true, $securityScreenNeeded, $isDesktop);
+                $flowSteps = SetupFlow::stepSequence($mode, true, $securityScreenNeeded, $isDesktop, $externalCron);
                 $step = SetupFlow::nextStep('onchain', $flowSteps) ?? 'zeroconf';
                 break;
 
@@ -812,64 +776,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $step = SetupFlow::nextStep('mints', $flowSteps) ?? 'cron';
                 break;
 
-            case 'discount':
-                // WordPress-only screen (there is no WooCommerce checkout to
-                // discount anywhere else). The tail-post guard lets any
-                // completed install POST this step, so re-check the mode
-                // server-side instead of trusting the sequence alone.
-                if (!Urls::isWordPress()) {
-                    $step = SetupFlow::nextStep('discount', $flowSteps) ?? 'cron';
-                    break;
-                }
-                if (!isset($_POST['btc_discount_percent'])) {
-                    // Landing without the field — fall through to render.
-                    break;
-                }
-                $discountPercent = SetupFlow::parseDiscountPercent(
-                    (string)$_POST['btc_discount_percent']
-                );
-                if ($discountPercent === null) {
-                    throw new Exception('The discount needs to be a whole number between 0 and 100.');
-                }
-                // Site-wide, not per-store: the discount attaches to the
-                // WooCommerce checkout (one per WordPress site), which is also
-                // why the add_store flow never shows this screen. The ELEX
-                // plugin install + rule happen on the completion screen, where
-                // WooCommerce's presence is already being checked.
-                Config::set('wp_btc_discount_percent', $discountPercent);
-                $step = SetupFlow::nextStep('discount', $flowSteps) ?? 'cron';
-                break;
-
             case 'cron':
                 $step = 'done';
                 break;
-
-            case 'done':
-                // The completion screen's "Replace it with BareBits" button,
-                // for installs that reach the screen with a real BTCPay
-                // Server configured but no consent on record (e.g. the wizard
-                // ran before that server was connected, or the terms screen
-                // predates the consent checkbox). Recording consent here lets
-                // the render below re-run the WooCommerce wiring, which now
-                // proceeds with the takeover.
-                if (!empty($_POST['btcpay_override']) && Urls::isWordPress()
-                        && setupLoadBtcpayIntegration()) {
-                    cashupay_record_btcpay_override_consent();
-                }
-                break;
-        }
-
-        // WordPress runs the full cron.php task set through WP-cron (see
-        // wordpress/cron.php), so the manual-crontab screen is only needed on
-        // hosts where that mechanism can't work. A live self-test proves the
-        // loopback path (rewrite rule → cron.php → key auth) right now; on
-        // success the screen is skipped. Any failure — blocked self-requests,
-        // timeout — keeps the screen with the manual instructions, and the
-        // dashboard's cron staleness warning remains the runtime safety net.
-        if ($step === 'cron' && Urls::isWordPress()
-                && function_exists('cashupay_wp_cron_selftest')
-                && cashupay_wp_cron_selftest()) {
-            $step = SetupFlow::nextStep('cron', $flowSteps) ?? 'done';
         }
     } catch (Exception $e) {
         $error = $e->getMessage();
@@ -1423,7 +1332,7 @@ function renderUrlModeDetectionScript(): void { ?>
             $renderStoreId = $_SESSION['setup_store_id'] ?? null;
             $renderOnchain = SetupFlow::onchainState($renderStoreId);
             $renderSteps = SetupFlow::stepSequence(
-                $mode, Urls::isWordPress(), $renderOnchain['configured'], $securityScreenNeeded, $isDesktop
+                $mode, $renderOnchain['configured'], $securityScreenNeeded, $isDesktop, $externalCron
             );
             $displayIndex = array_search($step, $renderSteps, true);
             $totalSteps = count($renderSteps);
@@ -1477,22 +1386,13 @@ function renderUrlModeDetectionScript(): void { ?>
                 // trailing zeros are trimmed so "1" renders as "1%" and a
                 // fractional rate like 1.5 renders as "1.5%".
                 $devFeeDisplay = rtrim(rtrim(number_format((float) CASHUPAY_DEV_FEE_PERCENT, 2), '0'), '.');
-                // WordPress mode: if the BTCPay WooCommerce plugin is already
-                // pointed at a real BTCPay Server, completing this wizard
-                // will replace that connection — warn up front and require an
-                // extra consent checkbox (validated by the POST handler).
-                $btcpayTakeoverUrl = null;
-                if (Urls::isWordPress() && setupLoadBtcpayIntegration()
-                        && cashupay_btcpay_takeover_state() === 'needs_consent') {
-                    $btcpayTakeoverUrl = (string) get_option('btcpay_gf_url', '');
-                }
                 ?>
                 <h2 style="margin-bottom: 1rem;">🤝 Let's agree on a few things</h2>
                 <p style="margin-bottom: 0.75rem;">
                     Almost ready to roll! First, a quick read-through. 👀
                 </p>
                 <p style="margin-bottom: 1.5rem;">
-                    Tick all <?= $btcpayTakeoverUrl !== null ? 'four' : 'three' ?> boxes and we'll get you set up.
+                    Tick all three boxes and we'll get you set up.
                 </p>
 
                 <form method="post">
@@ -1522,31 +1422,10 @@ function renderUrlModeDetectionScript(): void { ?>
                         </label>
                     </div>
 
-                    <?php if ($btcpayTakeoverUrl !== null): ?>
-                    <div class="warning" style="margin: 1.5rem 0;">
-                        <strong>⚠️ Existing BTCPay Server detected</strong>
-                        <code style="display: block; margin: 0.5rem 0; word-break: break-all;"><?= htmlspecialchars($btcpayTakeoverUrl) ?></code>
-                        <p style="margin: 0.5rem 0 0; font-size: 0.9rem;">
-                            Your WooCommerce checkout currently pays through this
-                            BTCPay Server. Completing this setup will disconnect
-                            it and replace <strong>all</strong> BTCPay plugin
-                            settings with BareBits defaults. Your previous
-                            settings will not be saved.
-                        </p>
-                    </div>
-
-                    <div class="checkbox-group" style="margin: 1.5rem 0;">
-                        <input type="checkbox" id="btcpay_override_consent" name="btcpay_override_consent" required>
-                        <label for="btcpay_override_consent">
-                            I understand my existing BTCPay Server settings will be replaced.
-                        </label>
-                    </div>
-                    <?php endif; ?>
-
                     <button type="submit" class="btn" style="width: 100%;">Continue →</button>
                 </form>
 
-                <?php if (!Urls::isWordPress() && !$securityScreenNeeded) {
+                <?php if (!$securityScreenNeeded) {
                     // The security screen normally hosts the URL-mode probe;
                     // with that screen skipped (data directory outside the web
                     // root) it runs silently from here instead.
@@ -1734,8 +1613,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                         Note: These automated checks are supplemental. You should verify manually that the database file cannot be downloaded.
                     </p>
 
-                    <!-- URL Mode Detection (standalone only) -->
-                    <?php if (!Urls::isWordPress()): ?>
+                    <!-- URL Mode Detection -->
                     <h4 style="margin-top: 1.5rem; margin-bottom: 0.5rem;">Server URL Detection</h4>
                     <div id="url-mode-detection">
                         <div id="url-mode-loading" class="security-check">
@@ -1750,7 +1628,6 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                             </div>
                         </div>
                     </div>
-                    <?php endif; ?>
 
                     <form method="post">
                         <input type="hidden" name="step" value="security">
@@ -1857,7 +1734,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                         runSecurityTest();
                     })();
                     </script>
-                    <?php if (!Urls::isWordPress()) { renderUrlModeDetectionScript(); } ?>
+                    <?php renderUrlModeDetectionScript(); ?>
                 <?php endif; ?>
 
             <?php elseif ($step === 'password'): ?>
@@ -2738,41 +2615,6 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                     Go to BareBits Admin
                 </a>
 
-            <?php elseif ($step === 'discount'): ?>
-                <!-- Screen: Bitcoin checkout discount (WordPress mode only).
-                     Saves a site-wide percentage; the completion screen
-                     installs the ELEX Discount Per Payment Method plugin and
-                     creates the rule once WooCommerce wiring is confirmed. -->
-                <?php $discountSaved = (int) Config::get('wp_btc_discount_percent', 0); ?>
-                <h2 style="margin-bottom: 1rem;">🏷️ Offer a discount to customers paying in Bitcoin?</h2>
-                <p style="margin-bottom: 1.5rem;">
-                    Many merchants offer discounts to Bitcoin customers as BTC
-                    payments save them significantly on fees charged by
-                    traditional payment processors. BareBits only charges 1%,
-                    we suggest splitting the difference to incentivize your
-                    customers to pay with BTC. This is completely optional and
-                    you can change your mind at any time
-                </p>
-
-                <form method="POST" action="<?= htmlspecialchars(Urls::setup()) ?>">
-                    <input type="hidden" name="step" value="discount">
-                    <div class="form-group">
-                        <label for="btc_discount_percent">Discount for Bitcoin payments (%)</label>
-                        <input type="number" id="btc_discount_percent" name="btc_discount_percent"
-                               min="0" max="100" step="1" inputmode="numeric"
-                               value="<?= $discountSaved ?>">
-                    </div>
-
-                    <p style="color: #a0aec0; font-size: 0.85rem; margin-bottom: 1.5rem;">
-                        If you choose a discount, the free
-                        <a href="https://wordpress.org/plugins/elex-discount-per-payment-method/"
-                           target="_blank" rel="noopener" style="color: #63b3ed;">Elex Discount Per Payment Method</a>
-                        will automatically be installed
-                    </p>
-
-                    <button type="submit" class="btn" style="width: 100%;">Continue →</button>
-                </form>
-
             <?php elseif ($step === 'cron'): ?>
                 <!-- Screen: cron reminder -->
                 <?php
@@ -2815,12 +2657,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                     BareBits is ready to accept payments. ✅
                 </div>
 
-                <?php if (Urls::isWordPress() && (int)Config::get('wp_cron_selftest_ok_at', 0) > 0): ?>
-                <p style="margin-bottom: 1.25rem; font-size: 0.9rem; color: #a0aec0;">
-                    ⏰ Background jobs are handled automatically through
-                    WordPress &mdash; no crontab entry needed.
-                </p>
-                <?php elseif ($isDesktop): ?>
+                <?php if ($isDesktop): ?>
                 <p style="margin-bottom: 1.25rem; font-size: 0.9rem; color: #a0aec0;">
                     ⏰ Background jobs run automatically while the desktop
                     launcher is open &mdash; nothing to set up.
@@ -2879,227 +2716,6 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                 $baseUrl = Urls::siteBase();
                 ?>
 
-                <?php if (Urls::isWordPress()): ?>
-                <!-- WooCommerce integration (WordPress mode).
-                     Run from the plugin, BareBits owns the whole WooCommerce
-                     hookup: we install the BTCPay gateway plugin if needed,
-                     point it at our Greenfield API, register the webhook and
-                     enable the gateway at checkout — no manual steps. The
-                     "server URL / connect your e-commerce" sections below are
-                     therefore hidden in WordPress mode. -->
-                <?php
-                $btcpayHelperLoaded = setupLoadBtcpayIntegration();
-                if (!$btcpayHelperLoaded) {
-                    error_log('CashuPayServer: btcpay-integration.php not found; '
-                        . 'skipping the WooCommerce section of the setup completion screen.');
-                }
-
-                $storeId = $_SESSION['setup_store_id'] ?? null;
-                $wooStatus = null;
-                $wooReady = false;
-                // Read the wizard's saved discount up front: the gateway
-                // wiring advertises it in the checkout title, and the ELEX
-                // follow-through below installs the matching discount rule.
-                $discountPercent = (int) Config::get('wp_btc_discount_percent', 0);
-
-                if ($btcpayHelperLoaded && $storeId) {
-                    $apiKey = Auth::getOrCreateInternalApiKey($storeId);
-                    if ($apiKey) {
-                        // Idempotent: installs/activates the gateway plugin if
-                        // needed, then configures + enables it. Safe to re-run
-                        // on refresh.
-                        $wooStatus = cashupay_ensure_woocommerce_integration($storeId, $apiKey, $discountPercent);
-                        $wooReady = ($wooStatus['status'] ?? '') === 'ready';
-                    }
-                }
-
-                // Bitcoin-discount follow-through (the wizard's discount
-                // screen only saved a percentage). Gated on the gateway wiring
-                // being ready so a discount plugin is never installed on a
-                // site whose checkout we couldn't configure — including the
-                // existing-real-BTCPay case, which stays entirely untouched.
-                // Same dual-layout lookup as the BTCPay helper above.
-                $elexStatus = null;
-                if ($wooReady && $discountPercent > 0) {
-                    $elexHelper = null;
-                    foreach ([
-                        __DIR__ . '/wordpress/elex-discount.php',
-                        __DIR__ . '/elex-discount.php',
-                    ] as $candidate) {
-                        if (is_file($candidate)) {
-                            $elexHelper = $candidate;
-                            break;
-                        }
-                    }
-                    if ($elexHelper !== null) {
-                        require_once $elexHelper;
-                        // Idempotent: activates/installs only when missing and
-                        // never overwrites an existing rule for the gateway.
-                        $elexStatus = cashupay_ensure_elex_discount($discountPercent);
-                    } else {
-                        error_log('CashuPayServer: elex-discount.php not found; '
-                            . 'skipping the Bitcoin-discount section of the setup completion screen.');
-                    }
-                }
-                // Still pending while a reload could complete it (WooCommerce
-                // or the ELEX plugin missing); settled once the rule is live,
-                // the merchant declined a discount, or the session no longer
-                // knows the store (nothing left to retry with).
-                $elexPending = $discountPercent > 0 && $storeId
-                    && ($elexStatus === null
-                        || !in_array($elexStatus['status'], ['ready', 'skipped'], true));
-                ?>
-
-                <?php if ($wooReady): ?>
-                    <div class="success" style="margin-bottom: 1rem;">
-                        ✅ WooCommerce is wired up — BareBits is set as a payment method and enabled at checkout.
-                    </div>
-                    <?php if (!empty($wooStatus['replaced_url'])): ?>
-                    <div class="warning" style="margin-bottom: 1.5rem;">
-                        <strong>ℹ️ Previous BTCPay Server connection replaced</strong>
-                        <p style="margin: 0.5rem 0 0; font-size: 0.9rem;">
-                            As confirmed, WooCommerce now pays through BareBits instead of
-                            <code style="word-break: break-all;"><?= htmlspecialchars($wooStatus['replaced_url']) ?></code>,
-                            and all BTCPay plugin settings were reset to BareBits defaults.
-                        </p>
-                    </div>
-                    <?php endif; ?>
-                    <?php if (!empty($wooStatus['auto_installed'])): ?>
-                    <div class="warning" style="margin-bottom: 1.5rem;">
-                        <strong>ℹ️ We installed a plugin for you</strong>
-                        <p style="margin: 0.5rem 0 0; font-size: 0.9rem;">
-                            The <strong>BTCPay Server</strong> plugin has been
-                            automatically installed &mdash; this is what lets
-                            WooCommerce talk to the BareBits plugin. So if you see
-                            a new plugin in your plugin list, that's why. Keep it
-                            enabled! 🙏
-                        </p>
-                    </div>
-                    <?php endif; ?>
-                <?php elseif ($wooStatus !== null && $wooStatus['status'] === 'existing_btcpay'): ?>
-                    <div style="background: rgba(0,0,0,0.2); padding: 1.5rem; border-radius: 8px; margin-bottom: 1.5rem;">
-                        <h3 style="margin-bottom: 0.75rem;">WooCommerce Integration</h3>
-                        <div class="warning">
-                            <strong>⚠️ Existing BTCPay Server detected:</strong>
-                            <code style="display: block; margin-top: 0.5rem; word-break: break-all;"><?= htmlspecialchars($wooStatus['current_url'] ?? '') ?></code>
-                        </div>
-                        <p style="color: #a0aec0; font-size: 0.9rem; margin: 0.75rem 0;">
-                            Your WooCommerce checkout currently pays through this BTCPay Server.
-                            Replacing it points WooCommerce at BareBits instead and resets
-                            <strong>all</strong> BTCPay plugin settings to BareBits defaults —
-                            your previous settings will not be saved. To keep the existing
-                            connection, skip this step.
-                        </p>
-                        <form method="post" style="margin: 0;">
-                            <input type="hidden" name="step" value="done">
-                            <input type="hidden" name="btcpay_override" value="1">
-                            <div class="btn-group">
-                                <button type="submit" class="btn" style="text-align: center;">Replace it with BareBits</button>
-                                <!-- target="_top": the wizard can run inside the wp-admin
-                                     iframe, and wp-admin links must not nest inside it. -->
-                                <a href="<?= admin_url('admin.php?page=cashupay') ?>" target="_top" class="btn btn-secondary" style="text-align: center;">Keep it &amp; Skip</a>
-                            </div>
-                        </form>
-                    </div>
-                <?php elseif ($wooStatus !== null && $wooStatus['status'] === 'needs_woocommerce'): ?>
-                    <div style="background: rgba(0,0,0,0.2); padding: 1.5rem; border-radius: 8px; margin-bottom: 1.5rem;">
-                        <h3 style="margin-bottom: 0.75rem;">WooCommerce Integration</h3>
-                        <p style="color: #a0aec0; font-size: 0.9rem; margin-bottom: 1rem;">
-                            WooCommerce isn't active yet. Install and activate WooCommerce, then reload this page and BareBits will finish wiring up payments for you.
-                        </p>
-                        <a href="<?= admin_url('plugin-install.php?s=woocommerce&tab=search&type=term') ?>" target="_top" class="btn btn-secondary" style="display: inline-block;">
-                            Install WooCommerce
-                        </a>
-                    </div>
-                <?php elseif ($wooStatus !== null && $wooStatus['status'] === 'needs_plugin'): ?>
-                    <div style="background: rgba(0,0,0,0.2); padding: 1.5rem; border-radius: 8px; margin-bottom: 1.5rem;">
-                        <h3 style="margin-bottom: 0.75rem;">WooCommerce Integration</h3>
-                        <p style="color: #a0aec0; font-size: 0.9rem; margin-bottom: 0.75rem;">
-                            BareBits needs the <strong>"BTCPay Server for WooCommerce"</strong> plugin to take payments in WooCommerce. We couldn't install it automatically on this host, so please add it by hand:
-                        </p>
-                        <ol style="color: #a0aec0; font-size: 0.9rem; margin: 0 0 1rem 1.25rem; padding: 0;">
-                            <li>Go to Plugins &rarr; Add New in WordPress</li>
-                            <li>Search for "BTCPay Server for WooCommerce"</li>
-                            <li>Install and activate the plugin</li>
-                            <li>Reload this page &mdash; BareBits will finish the setup automatically</li>
-                        </ol>
-                        <a href="<?= admin_url('plugin-install.php?s=btcpay+greenfield+woocommerce&tab=search&type=term') ?>" target="_top" class="btn btn-secondary" style="display: inline-block;">
-                            Install BTCPay Plugin
-                        </a>
-                    </div>
-                <?php elseif ($wooStatus !== null && $wooStatus['status'] === 'error'): ?>
-                    <div style="background: rgba(0,0,0,0.2); padding: 1.5rem; border-radius: 8px; margin-bottom: 1.5rem;">
-                        <h3 style="margin-bottom: 0.75rem;">WooCommerce Integration</h3>
-                        <div class="warning">
-                            <strong>Couldn't finish automatic setup:</strong>
-                            <?= htmlspecialchars($wooStatus['message'] ?? '') ?>
-                        </div>
-                        <a href="<?= admin_url('admin.php?page=wc-settings&tab=checkout&section=btcpay_greenfield') ?>" target="_top" class="btn btn-secondary" style="display: inline-block; margin-top: 0.75rem;">
-                            Go to BTCPay Settings
-                        </a>
-                    </div>
-                <?php endif; ?>
-
-                <?php if ($discountPercent > 0 && $elexStatus !== null): ?>
-                    <?php if ($elexStatus['status'] === 'ready' && ($elexStatus['rule'] ?? '') === 'added'): ?>
-                        <div class="success" style="margin-bottom: 1rem;">
-                            ✅ Your <?= (int)$discountPercent ?>% Bitcoin discount is live at checkout.
-                            You can change or remove it any time under
-                            WooCommerce &rarr; Settings &rarr; ELEX Discount Per Payment Method.
-                        </div>
-                        <?php if (!empty($elexStatus['auto_installed'])): ?>
-                        <div class="warning" style="margin-bottom: 1.5rem;">
-                            <strong>ℹ️ We installed a plugin for you</strong>
-                            <p style="margin: 0.5rem 0 0; font-size: 0.9rem;">
-                                The <strong>ELEX Discount Per Payment Method</strong>
-                                plugin has been automatically installed &mdash; it's
-                                what applies your Bitcoin discount at checkout. Keep
-                                it enabled! 🙏
-                            </p>
-                        </div>
-                        <?php endif; ?>
-                    <?php elseif ($elexStatus['status'] === 'ready'): ?>
-                        <div class="warning" style="margin-bottom: 1.5rem;">
-                            <strong>⚠️ Existing Bitcoin discount rule found</strong>
-                            <p style="margin: 0.5rem 0 0; font-size: 0.9rem;">
-                                The ELEX Discount Per Payment Method plugin already
-                                has a discount rule for the BareBits payment method,
-                                so we left it as it was instead of applying your
-                                <?= (int)$discountPercent ?>% choice.
-                            </p>
-                            <a href="<?= admin_url('admin.php?page=wc-settings&tab=elex-discount-per-payment-method') ?>" target="_top" class="btn btn-secondary" style="display: inline-block; margin-top: 0.75rem;">
-                                Review Discount Rules
-                            </a>
-                        </div>
-                    <?php elseif ($elexStatus['status'] === 'needs_plugin'): ?>
-                        <div style="background: rgba(0,0,0,0.2); padding: 1.5rem; border-radius: 8px; margin-bottom: 1.5rem;">
-                            <h3 style="margin-bottom: 0.75rem;">Bitcoin Discount</h3>
-                            <p style="color: #a0aec0; font-size: 0.9rem; margin-bottom: 0.75rem;">
-                                You chose a <?= (int)$discountPercent ?>% discount for Bitcoin payments, but we couldn't install the <strong>ELEX Discount Per Payment Method</strong> plugin automatically on this host, so please add it by hand:
-                            </p>
-                            <ol style="color: #a0aec0; font-size: 0.9rem; margin: 0 0 1rem 1.25rem; padding: 0;">
-                                <li>Go to Plugins &rarr; Add New in WordPress</li>
-                                <li>Search for "ELEX Discount Per Payment Method"</li>
-                                <li>Install and activate the plugin</li>
-                                <li>Reload this page &mdash; BareBits will create the discount rule automatically</li>
-                            </ol>
-                            <a href="<?= admin_url('plugin-install.php?s=elex+discount+per+payment+method&tab=search&type=term') ?>" target="_top" class="btn btn-secondary" style="display: inline-block;">
-                                Install ELEX Plugin
-                            </a>
-                        </div>
-                    <?php else: ?>
-                        <div style="background: rgba(0,0,0,0.2); padding: 1.5rem; border-radius: 8px; margin-bottom: 1.5rem;">
-                            <h3 style="margin-bottom: 0.75rem;">Bitcoin Discount</h3>
-                            <div class="warning">
-                                <strong>Couldn't finish setting up your Bitcoin discount:</strong>
-                                <?= htmlspecialchars($elexStatus['message'] ?? '') ?>
-                            </div>
-                        </div>
-                    <?php endif; ?>
-                <?php endif; ?>
-                <?php endif; ?>
-
-                <?php if (!Urls::isWordPress()): ?>
                 <!-- Server URL (already detected in Step 1) -->
                 <?php
                 $serverUrl = Urls::server();
@@ -3164,28 +2780,14 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                         </div>
                     </div>
                 </details>
-                <?php endif; ?>
 
-                <a href="<?= Urls::isWordPress() ? admin_url('admin.php?page=cashupay') : Urls::admin() ?>"<?= Urls::isWordPress() ? ' target="_top"' : '' ?> class="btn" style="width: 100%; text-align: center; display: block;">
+                <a href="<?= Urls::admin() ?>" class="btn" style="width: 100%; text-align: center; display: block;">
                     Go to BareBits Admin
                 </a>
-                <?php if (Urls::isWordPress()): ?>
-                <a href="<?= admin_url() ?>" target="_top" class="btn btn-secondary" style="width: 100%; text-align: center; display: block; margin-top: 0.5rem;">
-                    Back to WordPress Dashboard
-                </a>
-                <?php endif; ?>
 
                 <?php
-                // Clear temporary session data. In WordPress mode, keep the
-                // session around if the WooCommerce hookup or the Bitcoin
-                // discount didn't complete (the merchant may need to install
-                // WooCommerce / the gateway plugin / the ELEX plugin and
-                // reload to let the auto-wiring finish — which needs the store
-                // id still in session).
-                if (!Urls::isWordPress()
-                    || ((isset($wooReady) && $wooReady) && empty($elexPending))) {
-                    unset($_SESSION['setup_store_id'], $_SESSION['setup_store_mode'], $_SESSION['setup_generated_seed']);
-                }
+                // Clear temporary session data.
+                unset($_SESSION['setup_store_id'], $_SESSION['setup_store_mode'], $_SESSION['setup_generated_seed']);
                 ?>
             <?php endif; ?>
 
