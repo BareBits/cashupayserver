@@ -18,13 +18,16 @@ were exactly that kind of blind spot:
 Two scenarios, both driven with Playwright:
 
   1. The full journey on a friendly (Apache-like) host: upload + activate
-     the BUILT plugin zip through wp-admin, choose install-alongside, walk
-     the embedded wizard (no password screen — the admin is pre-seeded),
-     collect credentials, wire WooCommerce.
-  2. The wizard on a rewrite-hostile host (nginx-style: real *.php files
-     execute, everything else falls into WordPress): the install must warn
-     that the /api/v1 routes don't answer, and the wizard — "Skip for now"
-     included — must still run start to finish.
+     the BUILT plugin zip through wp-admin, choose install-alongside, expand
+     the wizard to full screen, walk it (no password screen — the admin is
+     pre-seeded), return through the wizard's own finish button (which
+     collects the credentials with no manual step), wire WooCommerce.
+  2. The SAME full journey on a rewrite-hostile host (nginx-style: real
+     *.php files execute, everything else falls into WordPress — Local WP's
+     layout): the plugin's API bridge must keep the /api/v1 routes answering
+     (no warning, and the WooCommerce wiring's webhook registration works),
+     with the manual "I finished the wizard" fallback button standing in for
+     the wizard's return link.
 """
 from __future__ import annotations
 
@@ -130,7 +133,34 @@ def _walk_wizard_in_iframe(page) -> None:
 
 
 def _collect_credentials(page) -> None:
-    page.click("#submit")  # "I finished the wizard — continue"
+    page.click("#submit")  # "I finished the wizard — continue" (manual fallback)
+    page.wait_for_selector(".notice p:has-text('Connected!')")
+
+
+def _expand_wizard(page) -> None:
+    """The provision step's "Continue" button must switch the embedded wizard
+    into the full-viewport view (everything except the admin menu + bar), and
+    the exit control must switch it back."""
+    page.click("#cashupay-wizard-expand")
+    shell = page.locator("#cashupay-wizard-shell")
+    assert "cashupay-expanded" in (shell.get_attribute("class") or "")
+    # position:fixed makes it viewport-sized; sanity-check it actually grew
+    # past the 720px column the step normally renders in.
+    box = shell.bounding_box()
+    assert box is not None and box["width"] > 800, box
+    page.click("#cashupay-wizard-exit")
+    assert "cashupay-expanded" not in (shell.get_attribute("class") or "")
+    # Leave it expanded for the walk — the way a merchant would use it.
+    page.click("#cashupay-wizard-expand")
+
+
+def _finish_wizard_via_return(page) -> None:
+    """The wizard's completion screen carries the managed-install return
+    button (CASHUPAY_MANAGED_RETURN_URL): one click breaks out of the iframe
+    (target=_top), the plugin collects the credentials itself, and the
+    onboarding page lands on the wire step — no manual collect."""
+    frame = page.frame_locator(WIZARD_IFRAME)
+    frame.locator("#managed-return-link").click()
     page.wait_for_selector(".notice p:has-text('Connected!')")
 
 
@@ -157,8 +187,9 @@ def test_full_merchant_journey_in_browser(wordpress_bare_install, wp_plugin_zip,
     assert "routes are not answering" not in flash, flash
 
     page.wait_for_selector(WIZARD_IFRAME)
+    _expand_wizard(page)
     _walk_wizard_in_iframe(page)
-    _collect_credentials(page)
+    _finish_wizard_via_return(page)
 
     # Wire WooCommerce (no discount) and land fully configured.
     page.wait_for_selector("h2:has-text('connect WooCommerce')")
@@ -173,29 +204,43 @@ def test_full_merchant_journey_in_browser(wordpress_bare_install, wp_plugin_zip,
     assert wp_option(wp, "cashupay_provision_token") == ""
 
 
-def test_wizard_survives_rewrite_hostile_host(wordpress_hostile_host, page) -> None:
-    """nginx-style host: /barebits/*.php executes, every other /barebits URL
-    (extension-less, PATH_INFO) falls into WordPress. The install must warn
-    about the dead /api/v1 routes, and the embedded wizard must still walk
-    start to finish — including the on-chain "Skip for now" that used to
-    land on a WordPress 404 here."""
+def test_full_journey_on_rewrite_hostile_host(wordpress_hostile_host, page) -> None:
+    """nginx-style host (Local WP's layout): /barebits/*.php executes, every
+    other /barebits URL (extension-less, PATH_INFO) falls into WordPress.
+    The plugin's API bridge catches those fallen-through /api/v1 requests and
+    replays them against the install's api.php — so the routing probe must
+    stay quiet, the wizard must walk start to finish, and the WooCommerce
+    wiring (whose webhook registration is a real Greenfield API call) must
+    complete end to end THROUGH the bridge."""
     wp = wordpress_hostile_host
     page.set_default_timeout(60_000)
+
+    install_woocommerce(wp)
 
     _login(page, wp, f"{wp.url}/wp-admin/admin.php?page=cashupay")
     page.wait_for_selector("h1:has-text('BareBits')")
     flash = _choose_install_and_run(page, wp)
-    # The probe must catch this host's dead rewrites right away, while the
-    # merchant is still looking, instead of letting the final WooCommerce
-    # wiring step fail cryptically.
-    assert "routes are not answering" in flash, flash
+    # The install-time probe goes through the freshly recorded install's
+    # /api/v1 URL — on this host that means through the bridge. It answering
+    # is the whole fix: no warning, no dead end at the wiring step.
+    assert "routes are not answering" not in flash, flash
 
     page.wait_for_selector(WIZARD_IFRAME)
     _walk_wizard_in_iframe(page)
 
-    # Credential collection talks to provision.php — a real file, so it works
-    # even here. (WooCommerce wiring would need the /api/v1 routes the flash
-    # already warned about, so the journey ends at the wire screen.)
+    # Credential collection via the manual fallback button — the path a
+    # merchant takes if they never click the wizard's own return link (the
+    # friendly-host journey drives that link).
     _collect_credentials(page)
     assert wp_option(wp, "cashupay_store_id") != ""
     assert wp_option(wp, "cashupay_cron_key") != ""
+
+    # Wire WooCommerce: registering the invoice webhook is a live
+    # /api/v1/stores/{id}/webhooks call that only succeeds if the bridge
+    # really carries the Greenfield API on this host.
+    page.wait_for_selector("h2:has-text('connect WooCommerce')")
+    page.fill("#cashupay-discount", "0")
+    page.click("#submit")
+    page.wait_for_selector(".notice p:has-text('WooCommerce now takes Bitcoin')")
+    assert wp_option(wp, "btcpay_gf_url") == wp.barebits_url
+    assert wp_option(wp, "cashupay_wired_at") != ""

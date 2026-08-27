@@ -163,6 +163,7 @@ jobs:
             elex-discount.php \
             gateway-guard.php \
             readme.txt \
+            license.txt \
             assets/img/barebits-gateway-logo.png
           for leaked in includes vendor setup.php admin.php api.php cron.php payment.php; do
             if [ -e "build/cashupay/$leaked" ]; then
@@ -196,7 +197,9 @@ jobs:
             provision.php \
             sso.php \
             recover.php \
-            includes/database.php
+            includes/database.php \
+            LICENSE.md \
+            USE_POLICY.md
 
       - name: Upload built artifacts
         uses: actions/upload-artifact@v4

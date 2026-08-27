@@ -26,7 +26,7 @@ require_once dirname(__DIR__, 2) . '/includes/managed.php';
 // Make sure nothing leaks in from the invoking shell.
 foreach (['CASHUPAY_MANAGED_INSTALL', 'CASHUPAY_SHOP_URL',
           'CASHUPAY_ADMIN_PASSWORD_HASH', 'CASHUPAY_SSO_KEY_HASH',
-          'CASHUPAY_RETRY_URL_TEMPLATE'] as $var) {
+          'CASHUPAY_RETRY_URL_TEMPLATE', 'CASHUPAY_MANAGED_RETURN_URL'] as $var) {
     putenv($var);
 }
 
@@ -120,6 +120,26 @@ assert_eq('', ManagedInstall::retryUrlTemplate(), 'a relative template collapses
 putenv('CASHUPAY_RETRY_URL_TEMPLATE=javascript:alert(1)');
 assert_eq('', ManagedInstall::retryUrlTemplate(), 'a javascript: template collapses to empty');
 putenv('CASHUPAY_RETRY_URL_TEMPLATE');
+
+// --- returnUrl(): http(s) only, preserved verbatim ---------------------------
+//
+// The wizard's completion screen renders this into an href (target="_top"),
+// so anything that is not http(s) must collapse to '' — and the query string
+// (the orchestrator's admin-post action) must survive untrimmed.
+
+assert_eq('', ManagedInstall::returnUrl(), 'unset return URL is empty');
+$return = 'https://wp.test/wp-admin/admin-post.php?action=cashupay_provision_return';
+putenv('CASHUPAY_MANAGED_RETURN_URL=' . $return);
+assert_eq($return, ManagedInstall::returnUrl(), 'an https URL passes through, query string intact');
+putenv('CASHUPAY_MANAGED_RETURN_URL=http://wp.test/wp-admin/admin-post.php?action=x');
+assert_eq('http://wp.test/wp-admin/admin-post.php?action=x', ManagedInstall::returnUrl(), 'http is accepted');
+putenv('CASHUPAY_MANAGED_RETURN_URL=  ' . $return . '  ');
+assert_eq($return, ManagedInstall::returnUrl(), 'surrounding whitespace is trimmed');
+putenv('CASHUPAY_MANAGED_RETURN_URL=/wp-admin/admin-post.php');
+assert_eq('', ManagedInstall::returnUrl(), 'a relative URL collapses to empty');
+putenv('CASHUPAY_MANAGED_RETURN_URL=javascript:alert(1)');
+assert_eq('', ManagedInstall::returnUrl(), 'a javascript: URL collapses to empty');
+putenv('CASHUPAY_MANAGED_RETURN_URL');
 
 // --- seedAdminIfProvisioned() ----------------------------------------------
 

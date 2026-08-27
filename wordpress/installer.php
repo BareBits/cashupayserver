@@ -341,7 +341,9 @@ function cashupay_unpack_release(string $zipPath, string $installDir): array {
  *   - an SSO key (hash only) so opening BareBits from wp-admin signs the
  *     operator in via single-use login tokens,
  *   - a one-time provisioning token (hash only) for the credentials
- *     handshake after setup.
+ *     handshake after setup,
+ *   - the return URL the wizard's completion screen sends the operator to,
+ *     where the plugin collects credentials and resumes onboarding.
  *
  * The plaintexts are returned and kept in WordPress options; only hashes
  * ever touch the BareBits side.
@@ -371,7 +373,11 @@ function cashupay_write_install_config(string $installDir, string $dataDir, stri
         . "// SSO login-token handoff (see sso.php in the install).\n"
         . "define('CASHUPAY_SSO_KEY_HASH', '" . hash('sha256', $ssoKey) . "');\n"
         . "// One-time provisioning handshake (see provision.php in the install).\n"
-        . "define('CASHUPAY_PROVISION_TOKEN_HASH', '" . hash('sha256', $token) . "');\n";
+        . "define('CASHUPAY_PROVISION_TOKEN_HASH', '" . hash('sha256', $token) . "');\n"
+        . "// Where the wizard's completion screen sends the operator: the\n"
+        . "// plugin's return endpoint, which collects the credentials through\n"
+        . "// the handshake above and finishes the WooCommerce wiring flow.\n"
+        . "define('CASHUPAY_MANAGED_RETURN_URL', " . var_export(admin_url('admin-post.php') . '?action=cashupay_provision_return', true) . ");\n";
     if (file_put_contents(rtrim($installDir, '/') . '/user_config.php', $config) === false) {
         return ['ok' => false, 'message' => 'Could not write user_config.php into the install.'];
     }

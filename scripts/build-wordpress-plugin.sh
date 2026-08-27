@@ -15,7 +15,7 @@ rm -rf build/cashupay build/wordpress_plugin.zip
 
 mkdir -p "$BUILD_DIR"
 
-cp wordpress/*.php wordpress/readme.txt "$BUILD_DIR/"
+cp wordpress/*.php wordpress/readme.txt wordpress/license.txt "$BUILD_DIR/"
 cp -r wordpress/assets "$BUILD_DIR/assets"
 
 # Channel stamp: a testing-channel plugin build must install a testing-channel
