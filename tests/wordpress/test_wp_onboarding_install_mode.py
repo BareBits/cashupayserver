@@ -132,6 +132,12 @@ def test_install_mode_end_to_end(wordpress_install_mode, mint, backup_mint) -> N
     assert store_id
     assert wp_option(wp, "cashupay_cron_key")
     assert wp_option(wp, "cashupay_provision_token") == "", "one-time token must be deleted after use"
+    # Collecting fires one synchronous heartbeat ping to prove the cron loop
+    # works while the merchant is still watching; success seeds the stamp the
+    # wp-admin stale-heartbeat warning measures from.
+    assert wp_option(wp, "cashupay_cron_last_ok") != "", (
+        "the collect-time cron ping should have stamped cashupay_cron_last_ok"
+    )
 
     # The handshake is single-use on the server side too.
     with wp.db() as db:

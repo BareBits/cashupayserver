@@ -125,12 +125,16 @@ ManagedInstall::seedAdminIfProvisioned();
 
 // One resolve per request: the answer can't change mid-request, and the
 // wizard's shape must not either. A managed install implies the external
-// cron declaration (its orchestrator pings cron.php); the password skip is
-// keyed on the static deployment config, not the users table, so the step
-// counter can never change mid-run.
+// cron declaration (its orchestrator pings cron.php). The password skip
+// requires the seeded account to actually EXIST, not just the hash constant:
+// if a merchant-created account predated the hash, the seed above no-oped,
+// and the wizard must still collect a password rather than strand the
+// operator with credentials nobody knows. Stable mid-run — only the
+// password screen itself writes users, and it is exactly the screen that is
+// absent when this is true.
 $isDesktop = Desktop::isWindowsDesktop();
 $externalCron = SetupFlow::externalCronConfigured() || ManagedInstall::isManaged();
-$passwordPreseeded = ManagedInstall::adminPasswordHash() !== '';
+$passwordPreseeded = ManagedInstall::adminSeededFromProvisionedHash();
 
 // The security screen exists to prove the data directory can't be fetched
 // over the web. With the directory outside the web root that exposure is

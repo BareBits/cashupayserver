@@ -92,10 +92,13 @@ $req = $GLOBALS['http_requests'][0];
 assert_eq('http://wp.test/barebits/cron.php', $req['url'], 'targets the install\'s cron.php');
 assert_eq('k', $req['args']['headers']['X-CRON-KEY'] ?? null, 'key travels in the X-CRON-KEY header');
 assert_false(str_contains($req['url'], 'k='), 'key must not appear in the URL');
-// Same-host self-request: TLS peer verification is skipped, like WP core's
+// Same-origin self-request: TLS peer verification is skipped, like WP core's
 // own loopbacks (site_url() is wp.test, same as the install).
-assert_eq(false, $req['args']['sslverify'] ?? null, 'same-host loopback skips peer verification');
+assert_eq(false, $req['args']['sslverify'] ?? null, 'same-origin loopback skips peer verification');
 assert_false(isset($GLOBALS['wp_options']['cashupay_cron_backoff_until']), 'success leaves no backoff');
+// Every success stamps the heartbeat — the wp-admin stale warning reads this.
+$lastOk = (int)($GLOBALS['wp_options']['cashupay_cron_last_ok'] ?? 0);
+assert_true($lastOk > 0 && $lastOk <= time(), 'success stamps cashupay_cron_last_ok');
 
 // --- cron-shaped 200 succeeds and clears a standing backoff ------------------
 reset_http();
@@ -131,8 +134,12 @@ assert_false(cashupay_fire_cron_endpoint(15), 'WP_Error is a failure');
 // --- failure backs off; ticks stop until it expires, then retry --------------
 reset_http();
 $GLOBALS['http_response'] = 'error';
+$staleStamp = time() - 1234;
+$GLOBALS['wp_options']['cashupay_cron_last_ok'] = $staleStamp;
 cashupay_cron_tick();
 assert_eq(1, count($GLOBALS['http_requests']), 'the failed tick attempted the ping');
+assert_eq($staleStamp, $GLOBALS['wp_options']['cashupay_cron_last_ok'] ?? null,
+    'a failed ping never advances the heartbeat stamp');
 $backoff = (int)($GLOBALS['wp_options']['cashupay_cron_backoff_until'] ?? 0);
 assert_true($backoff > time(), 'failure sets a future backoff');
 assert_true($backoff <= time() + 600, 'the backoff is the documented ten minutes, not forever');
@@ -176,5 +183,6 @@ $GLOBALS['wp_options']['cashupay_cron_backoff_until'] = time() + 300;
 cashupay_cron_unschedule();
 assert_eq([[12345, 'cashupay_cron_tick']], $GLOBALS['unscheduled'], 'the scheduled event is removed');
 assert_false(isset($GLOBALS['wp_options']['cashupay_cron_backoff_until']), 'unschedule drops the backoff state');
+assert_false(isset($GLOBALS['wp_options']['cashupay_cron_last_ok']), 'unschedule drops the heartbeat stamp');
 
 echo "test_wp_cron_integration: ok\n";

@@ -33,13 +33,14 @@ if ($timestamp) {
 }
 
 // The plugin's own state.
-foreach ([
+$cashupay_options = [
     'cashupay_mode',
     'cashupay_server_url',
     'cashupay_store_id',
     'cashupay_api_key',
     'cashupay_cron_key',
     'cashupay_cron_backoff_until',
+    'cashupay_cron_last_ok',
     'cashupay_wired_at',
     'cashupay_discount_percent',
     'cashupay_pairing_expected',
@@ -54,6 +55,26 @@ foreach ([
     // not inherit a stale approval.
     'cashupay_btcpay_override_consent',
     'cashupay_review_banner',
-] as $cashupay_option) {
+];
+
+// When this plugin installed a BareBits server alongside WordPress, that
+// server keeps running after the uninstall — with real money behind a
+// generated admin password the merchant never chose. These few rows are the
+// ONLY copy of that password (and of where the install lives): deleting them
+// would lock the merchant out of their own wallet UI. They survive the
+// uninstall deliberately, and a reinstall of this plugin offers to reconnect
+// from them. A site with no alongside install keeps nothing.
+if ((string) get_option('cashupay_install_dir', '') !== '') {
+    $cashupay_options = array_values(array_diff($cashupay_options, [
+        'cashupay_server_url',
+        'cashupay_install_dir',
+        'cashupay_install_data_dir',
+        'cashupay_install_dirname',
+        'cashupay_admin_password',
+        'cashupay_sso_key',
+    ]));
+}
+
+foreach ($cashupay_options as $cashupay_option) {
     delete_option($cashupay_option);
 }

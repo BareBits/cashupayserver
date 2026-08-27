@@ -65,13 +65,16 @@ function cashupay_cron_unschedule(): void {
         wp_unschedule_event($timestamp, 'cashupay_cron_tick');
     }
     delete_option('cashupay_cron_backoff_until');
+    delete_option('cashupay_cron_last_ok');
 }
 
 /**
  * Fire one authenticated request at the install's cron endpoint. Returns
  * true when cron.php itself answered — it always returns JSON with a 'mode'
  * field (full / essentials / lock-bounce alike); a 200 carrying anything
- * else means some other page answered and must read as failure.
+ * else means some other page answered and must read as failure. Every
+ * success stamps cashupay_cron_last_ok, which the wp-admin stale-heartbeat
+ * warning (admin-menu.php) reads.
  */
 function cashupay_fire_cron_endpoint(int $timeoutSeconds): bool {
     $server = cashupay_server_url();
@@ -82,7 +85,7 @@ function cashupay_fire_cron_endpoint(int $timeoutSeconds): bool {
     $response = wp_remote_get($server . '/cron.php', [
         'timeout' => $timeoutSeconds,
         'redirection' => 2,
-        // Same-host self-request; mirrors WordPress core's own loopbacks,
+        // Same-origin self-request; mirrors WordPress core's own loopbacks,
         // which skip peer verification for local/self-signed HTTPS.
         'sslverify' => !cashupay_is_same_host_url($server),
         'headers' => ['X-CRON-KEY' => $cronKey],
@@ -94,7 +97,11 @@ function cashupay_fire_cron_endpoint(int $timeoutSeconds): bool {
         return false;
     }
     $body = json_decode((string) wp_remote_retrieve_body($response), true);
-    return is_array($body) && array_key_exists('mode', $body);
+    if (!is_array($body) || !array_key_exists('mode', $body)) {
+        return false;
+    }
+    update_option('cashupay_cron_last_ok', time(), false);
+    return true;
 }
 
 /** The every-minute WP-cron callback. */

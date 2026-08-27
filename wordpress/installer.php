@@ -70,9 +70,22 @@ function cashupay_resolve_install_target(string $dirname = ''): array {
  * over HTTP), else inside the install's own data/ directory — which the
  * release ships pre-protected with a deny-all .htaccess, and the BareBits
  * setup wizard's security screen verifies protection on such layouts.
+ *
+ * The outside directory is namespaced per site (a hash of ABSPATH): two
+ * WordPress sites whose docroots share a parent — the standard shared-
+ * hosting layout — must never resolve to the same data directory, or the
+ * second install would silently reuse the first one's wallet database. A
+ * previously recorded directory (this site's own earlier install, including
+ * pre-namespacing 'barebits-data' layouts) is reused; an UNRECORDED existing
+ * directory is never adopted — whatever lives there is not ours.
  */
 function cashupay_resolve_data_dir(string $installDir): string {
-    $outside = dirname(rtrim(ABSPATH, '/\\')) . '/barebits-data';
+    $recorded = (string) get_option('cashupay_install_data_dir', '');
+    if ($recorded !== '' && is_dir($recorded) && wp_is_writable($recorded)) {
+        return $recorded;
+    }
+    $outside = dirname(rtrim(ABSPATH, '/\\'))
+        . '/barebits-data-' . substr(hash('sha256', ABSPATH), 0, 12);
     if (is_dir($outside) && wp_is_writable($outside)) {
         return $outside;
     }
@@ -224,7 +237,13 @@ function cashupay_unpack_release(string $zipPath, string $installDir): array {
         return ['ok' => false, 'message' => 'Could not initialize the WordPress filesystem API.'];
     }
 
-    $staging = dirname($installDir) . '/.barebits-staging-' . wp_generate_password(8, false, false);
+    // Stage under wp-content/upgrade — WordPress's own staging area for
+    // plugin/core unpacks — never next to the install target: the target's
+    // parent is usually the web root, and even a dot-prefixed half-extracted
+    // tree should not sit in a served directory while it exists. The
+    // cross-directory rename below may cross filesystems in exotic setups;
+    // the copy_dir fallback covers that.
+    $staging = WP_CONTENT_DIR . '/upgrade/barebits-staging-' . wp_generate_password(8, false, false);
     if (!wp_mkdir_p($staging)) {
         return ['ok' => false, 'message' => 'Could not create the staging directory.'];
     }
@@ -325,7 +344,13 @@ function cashupay_run_install(string $dirname = ''): array {
     if (is_dir($installDir)) {
         $ours = (string) get_option('cashupay_install_dir', '');
         if ($ours === $installDir && is_file($installDir . '/user_config.php') && is_file($installDir . '/BUILD_INFO')) {
-            // Resuming after a partial onboarding run; the install is in place.
+            // Resuming after a partial onboarding run (or after "Start over"
+            // kept the install record): the install is in place. Restore the
+            // connection options a reset may have cleared — but never the
+            // credentials, whose hashes are baked into the install's own
+            // user_config.php and must not be regenerated out from under it.
+            update_option('cashupay_mode', 'install');
+            update_option('cashupay_server_url', $target['url']);
             return ['ok' => true, 'url' => $target['url'], 'verified' => true];
         }
         if (count(array_diff((array) scandir($installDir), ['.', '..'])) > 0) {

@@ -124,4 +124,19 @@ assert_null(iframe_src($html), 'a remote server is not embedded');
 assert_true(str_contains($html, 'WooCommerce is connected'), 'the connection panel renders instead');
 assert_true(str_contains($html, 'Existing server (connected by URL)'), 'labelled as a URL-mode connection');
 
+// --- cashupay_is_same_host_url: full origin, not hostname --------------------
+//
+// The check decides which requests may skip TLS peer verification (and so
+// where the plaintext SSO/cron/provision keys travel unverified). Only this
+// site's own origin — scheme AND host AND port (the stubbed site_url is
+// http://wp.test, so port 80) — qualifies; a different service on another
+// port of the same host is a different server.
+assert_true(cashupay_is_same_host_url('http://wp.test/barebits'), 'the site\'s own origin matches');
+assert_true(cashupay_is_same_host_url('http://WP.TEST:80/x'), 'host case and an explicit default port are normalized');
+assert_false(cashupay_is_same_host_url('http://wp.test:8080/x'), 'another port on the same host is NOT this site');
+assert_false(cashupay_is_same_host_url('https://wp.test/x'), 'another scheme is NOT this site');
+assert_false(cashupay_is_same_host_url('http://evil.test/x'), 'another host is NOT this site');
+assert_false(cashupay_is_same_host_url('not a url'), 'garbage never matches');
+assert_false(cashupay_is_same_host_url(''), 'nor does an empty URL');
+
 echo "test_wp_admin_page_sso_fallback: ok\n";

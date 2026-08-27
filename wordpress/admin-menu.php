@@ -24,6 +24,14 @@ const CASHUPAY_REVIEW_OPTION = 'cashupay_review_banner';
 const CASHUPAY_REVIEW_HIDE_SECONDS = 30 * DAY_IN_SECONDS;
 const CASHUPAY_REVIEW_MAX_DISMISSALS = 3;
 
+// How stale the WP-cron pinger's last successful tick (cashupay_cron_last_ok,
+// stamped by cron-integration.php) may grow before wp-admin warns. The pinger
+// runs every minute and backs off ten on failure, so anything past this is a
+// real outage — WP-cron not firing (quiet site, DISABLE_WP_CRON without a
+// system cron) or the install unreachable — during which payment
+// confirmations and webhooks stall.
+const CASHUPAY_CRON_STALE_WARN_SECONDS = 600;
+
 function cashupay_admin_menu(): void {
     add_menu_page(
         'BareBits',
@@ -188,7 +196,40 @@ function cashupay_admin_notice(): void {
         return;
     }
 
+    cashupay_cron_stale_notice();
     cashupay_review_notice();
+}
+
+/**
+ * Warn when the alongside install's background heartbeat has gone quiet.
+ *
+ * Install mode delegates the server's cron to the WP-cron pinger, and
+ * WP-cron only fires on site traffic — a quiet shop, a DISABLE_WP_CRON
+ * without a system cron, or a host that blocks self-requests silently
+ * stalls payment confirmations. cashupay_cron_last_ok is stamped on every
+ * successful ping (seeded synchronously when onboarding collects the
+ * credentials); staleness is measured from the LATER of that stamp and the
+ * wiring time, so installs wired before the stamp existed don't warn until
+ * they have actually been quiet. State-only on purpose: this reads options
+ * and never fires HTTP from an admin pageview.
+ */
+function cashupay_cron_stale_notice(): void {
+    if (cashupay_mode() !== 'install' || (string) get_option('cashupay_cron_key', '') === '') {
+        return;
+    }
+    $baseline = max((int) get_option('cashupay_cron_last_ok', 0), (int) get_option('cashupay_wired_at', 0));
+    if ($baseline <= 0 || (time() - $baseline) <= CASHUPAY_CRON_STALE_WARN_SECONDS) {
+        return;
+    }
+    $minutes = (int) floor((time() - $baseline) / 60);
+    echo '<div class="notice notice-warning"><p>';
+    echo '<strong>BareBits</strong>: the background heartbeat to your BareBits server has not succeeded for ';
+    echo esc_html((string) $minutes) . ' minutes. Payments still arrive, but confirmations and order updates ';
+    echo 'will lag until it recovers. Common causes: WP-cron is disabled (<code>DISABLE_WP_CRON</code>) without ';
+    echo 'a system cron calling <code>wp-cron.php</code>, the site gets too little traffic to fire WP-cron, or ';
+    echo 'the host blocks this site from requesting its own URLs. ';
+    echo '<a href="' . esc_url(admin_url('admin.php?page=cashupay-connection')) . '">Connection details</a>';
+    echo '</p></div>';
 }
 
 /**

@@ -132,11 +132,13 @@ assert_true(str_contains($t['error'], 'cannot be installed automatically'), 'wit
 $GLOBALS['unwritable'] = [];
 
 // =============================================================================
-// cashupay_resolve_data_dir — outside the web root when possible
+// cashupay_resolve_data_dir — outside the web root when possible, and
+// namespaced per site so co-hosted WordPress installs never share a wallet DB
 // =============================================================================
 
 $installDir = rtrim(ABSPATH, '/') . '/barebits';
-$outside = dirname(rtrim(ABSPATH, '/')) . '/barebits-data';
+$outside = dirname(rtrim(ABSPATH, '/'))
+    . '/barebits-data-' . substr(hash('sha256', ABSPATH), 0, 12);
 
 // Parent of the web root not writable, no existing dir → inside the install.
 $GLOBALS['unwritable'] = [rtrim(dirname($outside), '/')];
@@ -144,12 +146,33 @@ assert_eq($installDir . '/data', cashupay_resolve_data_dir($installDir),
     'no writable parent falls back to the install\'s own data/');
 $GLOBALS['unwritable'] = [];
 
-// Parent writable → the sibling dir is created outside the docroot.
+// Parent writable → the site-hashed sibling dir is created outside the
+// docroot. The suffix is a hash of ABSPATH: a second site whose docroot
+// shares this parent hashes to a different name and can never collide.
 assert_eq($outside, cashupay_resolve_data_dir($installDir), 'writable parent places data outside the web root');
 assert_true(is_dir($outside), 'and actually creates it');
 
 // Already existing (a resumed install) → reused, not recreated.
 assert_eq($outside, cashupay_resolve_data_dir($installDir), 'an existing outside dir is reused');
+
+// A RECORDED directory always wins — this is how pre-namespacing installs
+// (plain barebits-data) keep their wallet across plugin updates.
+$legacy = dirname(rtrim(ABSPATH, '/')) . '/barebits-data';
+mkdir($legacy, 0750, true);
+update_option('cashupay_install_data_dir', $legacy);
+assert_eq($legacy, cashupay_resolve_data_dir($installDir),
+    'a recorded legacy data dir is reused, never abandoned for the new name');
+// A recorded dir that no longer exists is ignored, not resurrected blindly.
+delete_option('cashupay_install_data_dir');
+cleanup_db($legacy);
+
+// An UNRECORDED foreign dir at the legacy shared name is never adopted:
+// nothing points the resolver at it any more.
+mkdir($legacy, 0750, true);
+file_put_contents($legacy . '/cashupay.sqlite', 'another site\'s wallet');
+assert_eq($outside, cashupay_resolve_data_dir($installDir),
+    'an unrecorded barebits-data dir (another site\'s) is never adopted');
+cleanup_db($legacy);
 
 // =============================================================================
 // cashupay_download_release — every SHA256SUMS posture
@@ -221,7 +244,11 @@ $u = cashupay_unpack_release($zipFile, $installDir);
 assert_eq(false, $u['ok'], 'a zip without cashupayserver/BUILD_INFO is refused');
 assert_true(str_contains($u['message'], 'does not look like a BareBits release'), 'with the refusal wording');
 assert_false(is_dir($installDir), 'nothing is left at the install target');
-$staging = glob(dirname($installDir) . '/.barebits-staging-*') ?: [];
+// Staging lives under wp-content/upgrade (WordPress's own staging area),
+// never in the served web root next to the install target.
+assert_eq([], glob(dirname($installDir) . '/*barebits-staging-*') ?: [],
+    'nothing is ever staged in the web root');
+$staging = glob(WP_CONTENT_DIR . '/upgrade/barebits-staging-*') ?: [];
 assert_eq([], $staging, 'the staging directory is cleaned up');
 
 $GLOBALS['unzip_layout'] = 'error';
@@ -233,7 +260,7 @@ $GLOBALS['unzip_layout'] = 'release';
 $u = cashupay_unpack_release($zipFile, $installDir);
 assert_eq(true, $u['ok'], 'a real release layout unpacks');
 assert_true(is_file($installDir . '/BUILD_INFO'), 'and lands at the install target');
-assert_eq([], glob(dirname($installDir) . '/.barebits-staging-*') ?: [], 'staging cleaned after success too');
+assert_eq([], glob(WP_CONTENT_DIR . '/upgrade/barebits-staging-*') ?: [], 'staging cleaned after success too');
 @unlink($zipFile);
 cleanup_db($installDir);
 
@@ -295,10 +322,20 @@ assert_eq('install', get_option('cashupay_mode'), 'mode recorded');
 assert_eq($installDir, get_option('cashupay_install_dir'), 'install dir recorded');
 assert_eq($outside, get_option('cashupay_install_data_dir'), 'data dir recorded (outside the web root)');
 
-// Resuming with our own completed install in place: reused, nothing re-fetched.
+// Resuming with our own completed install in place: reused, nothing
+// re-fetched — and the connection options a "Start over" reset cleared are
+// restored, while the credentials (whose hashes live in the install's own
+// user_config.php) are left untouched.
+delete_option('cashupay_mode');
+delete_option('cashupay_server_url');
+$tokenBefore = get_option('cashupay_provision_token');
 $GLOBALS['http_log'] = [];
 $r = cashupay_run_install('barebits');
 assert_eq(true, $r['ok'], 'our own completed install resumes');
 assert_eq([], $GLOBALS['http_log'], 'a resume never re-downloads');
+assert_eq('install', get_option('cashupay_mode'), 'a resume restores the mode');
+assert_eq('http://wp.test/barebits', get_option('cashupay_server_url'), 'and the server URL');
+assert_eq($tokenBefore, get_option('cashupay_provision_token'),
+    'a resume never regenerates the credentials behind the install\'s hashes');
 
 echo "test_wp_installer_paths: ok\n";

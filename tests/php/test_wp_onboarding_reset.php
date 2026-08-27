@@ -2,13 +2,16 @@
 /**
  * Onboarding "Start over" (cashupay_handle_reset_onboarding).
  *
- * The reset promises to forget only the PLUGIN's connection state: every
- * cashupay_* option is deleted, the WP-cron pinger is unscheduled, a flash
- * notice is queued, and the merchant lands back on the onboarding page —
- * while nothing here may ever touch the BareBits server or its data (the
- * handler has no filesystem or HTTP surface at all, which the stub set below
- * enforces by simply not providing any). Also pinned: the capability +
- * nonce gate runs before any state is destroyed.
+ * The reset forgets the plugin's CONNECTION state — wiring, credentials for
+ * the shop side, pairing/provision leftovers — and never touches the
+ * BareBits server or its data (the handler has no filesystem or HTTP
+ * surface at all, which the stub set below enforces by simply not providing
+ * any). When an alongside install exists, the install RECORD survives:
+ * its location, address, admin password, and SSO key — that server keeps
+ * running with real money behind a password the merchant never chose, so
+ * the plugin's copy is the only one. A URL-mode reset (no install) wipes
+ * everything. Also pinned: the capability + nonce gate runs before any
+ * state is destroyed, and the WP-cron pinger is unscheduled.
  *
  * The handler ends in exit, so each scenario runs in a subprocess whose
  * shutdown hook dumps the surviving state as JSON for the parent to assert.
@@ -29,7 +32,7 @@ define('ABSPATH', '/tmp/');
 
 // --- minimal WordPress stubs -------------------------------------------------
 $GLOBALS['wp_options'] = [
-    'cashupay_mode' => 'install',
+    'cashupay_mode' => getenv('T_MODE') ?: 'install',
     'cashupay_server_url' => 'http://wp.test/barebits',
     'cashupay_store_id' => 'store_x',
     'cashupay_api_key' => str_repeat('a', 64),
@@ -40,14 +43,18 @@ $GLOBALS['wp_options'] = [
     'cashupay_provision_token' => str_repeat('c', 64),
     'cashupay_admin_password' => 'super-secret',
     'cashupay_sso_key' => str_repeat('d', 64),
-    'cashupay_install_dir' => '/var/www/barebits',
-    'cashupay_install_data_dir' => '/var/www/barebits-data',
-    'cashupay_install_dirname' => 'barebits',
     'cashupay_btcpay_override_consent' => 'https://old.example',
     // NOT a connection option: the reset must leave it alone (review-banner
     // dismissals are UI state, not onboarding state).
     'cashupay_review_banner' => ['count' => 2, 'dismissed_at' => 1700000000],
 ];
+if ((getenv('T_MODE') ?: 'install') === 'install') {
+    $GLOBALS['wp_options'] += [
+        'cashupay_install_dir' => '/var/www/barebits',
+        'cashupay_install_data_dir' => '/var/www/barebits-data-abc123def456',
+        'cashupay_install_dirname' => 'barebits',
+    ];
+}
 $GLOBALS['transients'] = [];
 $GLOBALS['unscheduled'] = [];
 $GLOBALS['redirects'] = [];
@@ -116,33 +123,50 @@ function run_reset(array $env = []): array {
     return ['raw' => $raw, 'state' => $state];
 }
 
-// --- The reset wipes exactly the connection state ----------------------------
+// The connection state every reset must destroy, whatever the mode.
+const WIPED_ALWAYS = [
+    'cashupay_mode', 'cashupay_store_id', 'cashupay_api_key',
+    'cashupay_cron_key', 'cashupay_wired_at', 'cashupay_discount_percent',
+    'cashupay_pairing_expected', 'cashupay_provision_token',
+    'cashupay_btcpay_override_consent',
+];
+
+// --- Install mode: connection wiped, the install record survives -------------
 
 $res = run_reset();
 assert_not_null($res['state'], 'driver produced state: ' . substr($res['raw'], 0, 400));
 $options = $res['state']['options'];
 
-$connectionOptions = [
-    'cashupay_mode', 'cashupay_server_url', 'cashupay_store_id',
-    'cashupay_api_key', 'cashupay_cron_key', 'cashupay_wired_at',
-    'cashupay_discount_percent', 'cashupay_pairing_expected',
-    'cashupay_provision_token', 'cashupay_admin_password',
-    'cashupay_sso_key', 'cashupay_install_dir',
-    'cashupay_install_data_dir', 'cashupay_install_dirname',
-    'cashupay_btcpay_override_consent',
-];
-foreach ($connectionOptions as $option) {
+foreach (WIPED_ALWAYS as $option) {
     assert_false(array_key_exists($option, $options), "{$option} is deleted by the reset");
 }
+// The install record — location, address, and the ONLY copy of the admin
+// credentials for a server that keeps running with real money — survives.
+foreach (['cashupay_server_url', 'cashupay_install_dir', 'cashupay_install_data_dir',
+          'cashupay_install_dirname', 'cashupay_admin_password', 'cashupay_sso_key'] as $option) {
+    assert_true(array_key_exists($option, $options), "{$option} survives an install-mode reset");
+}
+assert_eq('super-secret', $options['cashupay_admin_password'], 'the admin password is intact');
 assert_true(array_key_exists('cashupay_review_banner', $options),
     'review-banner UI state survives — the reset only forgets the connection');
 
 assert_eq(['cashupay_cron_tick'], $res['state']['unscheduled'], 'the WP-cron pinger is unscheduled');
 assert_eq('success', $res['state']['flash']['kind'] ?? null, 'a success notice is queued');
-assert_true(str_contains((string)($res['state']['flash']['message'] ?? ''), 'Nothing on the BareBits side was removed'),
-    'and it repeats the nothing-server-side promise');
+assert_true(str_contains((string)($res['state']['flash']['message'] ?? ''), 'admin password stay saved'),
+    'and it tells the merchant the credentials were kept');
 assert_eq(['http://wp.test/wp-admin/admin.php?page=cashupay'], $res['state']['redirects'],
     'the merchant lands back on the onboarding page');
+
+// --- URL mode (no install): everything goes ----------------------------------
+
+$res = run_reset(['T_MODE' => 'url']);
+$options = $res['state']['options'];
+foreach (array_merge(WIPED_ALWAYS, ['cashupay_server_url', 'cashupay_admin_password', 'cashupay_sso_key']) as $option) {
+    assert_false(array_key_exists($option, $options), "{$option} is deleted by a URL-mode reset");
+}
+assert_true(array_key_exists('cashupay_review_banner', $options), 'UI state still survives');
+assert_true(str_contains((string)($res['state']['flash']['message'] ?? ''), 'Nothing on the BareBits side was removed'),
+    'the URL-mode flash keeps the nothing-server-side promise');
 
 // --- The gate runs before anything is destroyed ------------------------------
 

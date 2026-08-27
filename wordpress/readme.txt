@@ -35,7 +35,7 @@ To wallets you control: your own Lightning address, your own on-chain wallet (xp
 
 = What happens if I uninstall this plugin? =
 
-Only the WordPress-side wiring is removed. A BareBits server installed alongside WordPress keeps running, and its data directory (which holds wallet keys) is never deleted by this plugin.
+Only the WordPress-side wiring is removed. A BareBits server installed alongside WordPress keeps running, and its data directory (which holds wallet keys) is never deleted by this plugin. The record of where that server lives — including its saved admin password, which is your only way into its dashboard — also survives, so reinstalling the plugin later offers to reconnect it.
 
 == Changelog ==
 

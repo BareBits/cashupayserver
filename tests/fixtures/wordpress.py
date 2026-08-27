@@ -10,6 +10,7 @@ directly.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import signal
@@ -103,8 +104,11 @@ class WordPressHandle:
     @property
     def barebits_data_dir(self) -> Path:
         """The data dir the installer prefers: outside the docroot, a sibling
-        of ABSPATH (dirname(wp_root)/barebits-data = workdir/barebits-data)."""
-        return self.workdir / "barebits-data"
+        of ABSPATH, namespaced per site so co-hosted WordPress installs can
+        never share one wallet database (dirname(wp_root)/barebits-data-<12
+        hex of sha256(ABSPATH)>; ABSPATH carries WP's trailing slash)."""
+        digest = hashlib.sha256(f"{self.wp_root}/".encode()).hexdigest()[:12]
+        return self.workdir / f"barebits-data-{digest}"
 
     @property
     def db_path(self) -> Path:
@@ -379,9 +383,12 @@ def start_wordpress(
     workdir.mkdir(parents=True, exist_ok=True)
     wp_root = workdir / "wp"
     # The dir the plugin's installer prefers for the BareBits data dir is a
-    # sibling of the docroot (dirname(ABSPATH)/barebits-data) — that's inside
-    # this per-test workdir, so it needs no pre-creation and stays isolated.
-    data_dir = workdir / "barebits-data"
+    # sibling of the docroot, namespaced per site (dirname(ABSPATH)/
+    # barebits-data-<12 hex of sha256(ABSPATH)>) — that's inside this
+    # per-test workdir, so it needs no pre-creation and stays isolated.
+    data_dir = workdir / (
+        "barebits-data-" + hashlib.sha256(f"{wp_root}/".encode()).hexdigest()[:12]
+    )
 
     # 1. Copy WP core into wp_root (fresh per test; isolated).
     core = _ensure_wp_core()

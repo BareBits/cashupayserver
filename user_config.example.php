@@ -137,7 +137,9 @@
 // CASHUPAY_BASE_URL — pin the public base URL of this install. Normally the
 // base URL is auto-detected per request (or set in the database); installers
 // that know the served URL up front write it here so it is correct from the
-// first request and never trusts the Host header.
+// first request and never trusts the Host header. The pin wins over any
+// database-stored base_url — remove this line to hand control back to the
+// admin UI / auto-detection.
 //
 // define('CASHUPAY_BASE_URL', 'https://example.com/barebits');
 

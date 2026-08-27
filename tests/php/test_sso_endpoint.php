@@ -6,9 +6,10 @@
  * provisioned an SSO key hash, minting requires the plaintext key (constant
  * time, wrong key 403), nothing is minted before the DB and the admin account
  * exist ({"status":"pending"} lets the orchestrator poll), a mint stores only
- * the token's sha256 with a ~60 s expiry, and the GET leg is consume-first —
- * even a FAILED attempt burns the outstanding token, so a leaked URL can
- * never be retried and a used one can never be replayed.
+ * the token's sha256 with a ~60 s expiry, and the GET leg consumes on match
+ * (before the session starts, so a redeemed URL can never be replayed) and
+ * on expiry — while a MISMATCHED guess burns nothing, so outsiders hammering
+ * the public endpoint cannot deny the operator SSO.
  *
  * sso.php echoes and exits, so each scenario runs in a subprocess through a
  * generated driver that defines the constants, fakes the request
@@ -148,19 +149,29 @@ assert_true(
     'the expiry is ~60 s out (got ' . var_export($stored['expires'], true) . ')'
 );
 
-// --- (e) GET with the WRONG token: 403 AND the outstanding token burns -------
+// --- (e) GET with the WRONG token: 403, and the real token SURVIVES ----------
 //
-// Consume-first is the property under test: the stored hash is cleared
-// before validation, so a failed guess destroys the real token too.
+// A mismatch must not burn the outstanding token: the token is 256-bit
+// random (a guess proves nothing about the real one), while burning on
+// mismatch would let anyone who can reach this public endpoint deny the
+// operator SSO by hammering it with garbage. Single use is enforced at
+// redemption instead — the match consumes the token before the session
+// starts.
+$outstanding = stored_token()['hash'];
 $res = run_sso($ssoKeyHash, 'GET', null, null, bin2hex(random_bytes(32)));
 assert_eq(403, $res['status'], 'a wrong token is refused');
 assert_true(str_contains($res['body'], 'expired'), 'with the payer-facing expired copy');
-assert_eq('', stored_token()['hash'], 'the failed attempt burned the outstanding token');
-assert_eq(0, stored_token()['expires'], 'and cleared the expiry');
+assert_eq($outstanding, stored_token()['hash'], 'the failed guess did NOT burn the outstanding token');
 
-// The burned token is now worthless even though it was never used.
+// A malformed guess (not even token-shaped) changes nothing either.
+$res = run_sso($ssoKeyHash, 'GET', null, null, 'garbage');
+assert_eq(403, $res['status'], 'a malformed token is refused');
+assert_eq($outstanding, stored_token()['hash'], 'and still burns nothing');
+
+// The real token remains redeemable after any number of failed guesses.
 $res = run_sso($ssoKeyHash, 'GET', null, null, $token);
-assert_eq(403, $res['status'], 'the real token is dead after the failed guess');
+assert_eq(302, $res['status'], 'the real token still redeems after the failed guesses');
+assert_eq('', stored_token()['hash'], 'redemption consumed it (single use)');
 
 // --- (f) Mint again, redeem, replay ------------------------------------------
 //

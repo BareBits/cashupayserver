@@ -70,13 +70,22 @@ if ($method === 'GET') {
     $storedHash = (string)Config::get('sso_token_hash', '');
     $expires = (int)Config::get('sso_token_expires', 0);
 
-    // Consume-first: even a failed attempt burns the outstanding token, so
-    // a leaked-then-guessed URL can never be retried.
-    Config::set('sso_token_hash', '');
-    Config::set('sso_token_expires', 0);
+    $matches = $token !== '' && $storedHash !== ''
+        && hash_equals($storedHash, hash('sha256', $token));
+    $expired = time() > $expires;
 
-    if ($token === '' || $storedHash === '' || time() > $expires
-            || !hash_equals($storedHash, hash('sha256', $token))) {
+    // Consume on match (single use — consumed BEFORE the session starts, so
+    // a redeemed URL can never be replayed) and on expiry. A MISMATCH does
+    // not burn the outstanding token: the token is 256-bit random, so a
+    // wrong guess proves nothing about the real one — while burning on
+    // mismatch would let anyone who can reach this public endpoint deny the
+    // operator SSO by hammering it with garbage.
+    if ($matches || ($expired && $storedHash !== '')) {
+        Config::set('sso_token_hash', '');
+        Config::set('sso_token_expires', 0);
+    }
+
+    if (!$matches || $expired) {
         cashupay_status(403);
         header('Content-Type: text/plain');
         echo 'This sign-in link has expired. Go back and open BareBits again.';

@@ -158,7 +158,18 @@ function cashupay_handle_collect_provision(): void {
         update_option('cashupay_api_key', $result['apiKey'], false);
         update_option('cashupay_cron_key', $result['cronKey'], false);
         cashupay_cron_reschedule();
-        cashupay_flash('success', 'Connected! One more step below.');
+        // Prove the heartbeat loop RIGHT NOW, with the merchant watching:
+        // one synchronous ping with the freshly collected key. Success seeds
+        // cashupay_cron_last_ok so the stale-heartbeat warning starts from a
+        // known-good point; failure is worth a warning while the merchant is
+        // still here to act on it, instead of a silent 10-minute backoff.
+        if (cashupay_fire_cron_endpoint(15)) {
+            cashupay_flash('success', 'Connected! One more step below.');
+        } else {
+            cashupay_flash('warning', 'Connected! One more step below. (Heads up: a test request to the '
+                . 'install\'s background-task endpoint failed — payments will still work, but '
+                . 'confirmations may lag until your host allows this site to request its own URLs.)');
+        }
     } else {
         cashupay_flash('error', $result['message']);
     }
@@ -289,13 +300,20 @@ function cashupay_handle_finish(): void {
 /**
  * Start over: forget the chosen mode and connection details. Never touches an
  * installed BareBits server or its data — it only resets the plugin's own
- * state (an alongside install keeps running and can be reconnected by URL).
+ * state.
+ *
+ * When an alongside install exists, the install RECORD survives the reset:
+ * its location, its admin password, and its SSO key. That server keeps
+ * running with real money behind that password — the merchant never chose
+ * it and can't recover it, so deleting our only copy would lock them out of
+ * their own wallet UI. The chooser renders a reconnect hint (with a
+ * password reveal) from these surviving options.
  */
 function cashupay_handle_reset_onboarding(): void {
     cashupay_require_admin_post('cashupay_reset_onboarding');
 
     cashupay_cron_unschedule();
-    foreach ([
+    $options = [
         'cashupay_mode', 'cashupay_server_url', 'cashupay_store_id',
         'cashupay_api_key', 'cashupay_cron_key', 'cashupay_wired_at',
         'cashupay_discount_percent', 'cashupay_pairing_expected',
@@ -303,10 +321,22 @@ function cashupay_handle_reset_onboarding(): void {
         'cashupay_sso_key', 'cashupay_install_dir',
         'cashupay_install_data_dir', 'cashupay_install_dirname',
         'cashupay_btcpay_override_consent',
-    ] as $option) {
+    ];
+    $hasInstall = (string) get_option('cashupay_install_dir', '') !== '';
+    if ($hasInstall) {
+        $options = array_values(array_diff($options, [
+            'cashupay_server_url', 'cashupay_install_dir',
+            'cashupay_install_data_dir', 'cashupay_install_dirname',
+            'cashupay_admin_password', 'cashupay_sso_key',
+        ]));
+    }
+    foreach ($options as $option) {
         delete_option($option);
     }
-    cashupay_flash('success', 'Onboarding reset. Nothing on the BareBits side was removed.');
+    cashupay_flash('success', $hasInstall
+        ? 'Onboarding reset. Your BareBits install keeps running and nothing on its side was '
+            . 'removed; its address and admin password stay saved here so you can reconnect it below.'
+        : 'Onboarding reset. Nothing on the BareBits side was removed.');
     wp_safe_redirect(cashupay_onboarding_url());
     exit;
 }
@@ -342,8 +372,46 @@ function cashupay_render_onboarding(): void {
 }
 
 function cashupay_render_step_choose(): void {
+    // A surviving install record (a "Start over" or an earlier plugin
+    // removal left an alongside install running) gets a reconnect hint: the
+    // server's address prefilled for URL mode, and the saved admin password
+    // revealable — pairing needs it, and the merchant never chose one.
+    $existingInstall = (string) get_option('cashupay_install_dir', '') !== ''
+        ? cashupay_server_url() : '';
     ?>
     <p>Accept Bitcoin (on-chain and Lightning) in WooCommerce. Where should your BareBits server live?</p>
+    <?php if ($existingInstall !== ''): ?>
+        <div class="notice notice-info inline" style="margin: 0 0 1em;">
+            <p>
+                A BareBits server installed earlier by this plugin is still running at
+                <code><?= esc_html($existingInstall) ?></code> (its data and funds are untouched).
+                To reconnect it, pick "I already run a BareBits server" below — the address is
+                prefilled — and sign in with its saved admin password when asked:
+                <code id="cashupay-admin-password">••••••••••••</code>
+                <button type="button" class="button button-small" id="cashupay-reveal-password"
+                        data-nonce="<?= esc_attr(wp_create_nonce('cashupay_reveal_password')) ?>">Reveal</button>
+            </p>
+            <script>
+            document.getElementById('cashupay-reveal-password').addEventListener('click', function () {
+                const btn = this;
+                const body = new URLSearchParams();
+                body.set('action', 'cashupay_reveal_password');
+                body.set('nonce', btn.dataset.nonce);
+                fetch(ajaxurl, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body: body.toString(),
+                    credentials: 'same-origin'
+                }).then(r => r.json()).then(res => {
+                    if (res && res.success && res.data) {
+                        document.getElementById('cashupay-admin-password').textContent = res.data;
+                        btn.remove();
+                    }
+                });
+            });
+            </script>
+        </div>
+    <?php endif; ?>
     <form method="post" action="<?= esc_url(admin_url('admin-post.php')) ?>">
         <?php wp_nonce_field('cashupay_choose_mode'); ?>
         <input type="hidden" name="action" value="cashupay_choose_mode">
@@ -353,7 +421,8 @@ function cashupay_render_step_choose(): void {
                 <td>
                     <label for="cashupay-mode-url"><strong>I already run a BareBits server</strong></label>
                     <p class="description">Connect this shop to an existing server by URL.</p>
-                    <input type="url" name="cashupay_server_url" class="regular-text" placeholder="https://pay.example.com">
+                    <input type="url" name="cashupay_server_url" class="regular-text"
+                           placeholder="https://pay.example.com" value="<?= esc_attr($existingInstall) ?>">
                 </td>
             </tr>
             <tr>

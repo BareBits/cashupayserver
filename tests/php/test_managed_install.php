@@ -165,6 +165,43 @@ ManagedInstall::seedAdminIfProvisioned();
 assert_eq(1, count(user_rows()), 'a second call seeds nothing more');
 putenv('CASHUPAY_ADMIN_PASSWORD_HASH');
 
+// --- adminSeededFromProvisionedHash(): the wizard's password-screen gate -----
+//
+// The skip needs BOTH halves: a provisioned hash AND an admin account to
+// sign in with. The seeded admin from above is still in the table.
+
+assert_false(ManagedInstall::adminSeededFromProvisionedHash(),
+    'no provisioned hash means no skip, even with an admin present');
+putenv('CASHUPAY_ADMIN_PASSWORD_HASH=' . $provisionedHash);
+assert_true(ManagedInstall::adminSeededFromProvisionedHash(),
+    'hash + the seeded admin account allows the skip');
+
+// A merchant-created admin with a DIFFERENT password also allows the skip:
+// the merchant knows their own credentials, and the wizard's password screen
+// would refuse to run over an existing admin anyway.
+Database::update('users',
+    ['password_hash' => password_hash('merchant password', PASSWORD_DEFAULT)],
+    "username = 'admin'", []);
+assert_true(ManagedInstall::adminSeededFromProvisionedHash(),
+    'a pre-existing merchant admin still allows the skip');
+
+// The case the gate exists for: a hash provisioned over a users table with
+// NO admin row (only lesser roles survived, so the seed no-oped). Skipping
+// would complete a wizard nobody can ever log into — the password screen
+// must stay.
+Database::query("DELETE FROM users");
+Database::insert('users', [
+    'id'            => 'user_lesser_only',
+    'username'      => 'clerk',
+    'password_hash' => password_hash('irrelevant', PASSWORD_DEFAULT),
+    'role'          => Auth::ROLE_USER,
+    'created_at'    => Database::timestamp(),
+]);
+assert_false(ManagedInstall::adminSeededFromProvisionedHash(),
+    'a users table with no admin row must keep the password screen');
+Database::query("DELETE FROM users");
+putenv('CASHUPAY_ADMIN_PASSWORD_HASH');
+
 // --- Config::isPayerEmailCaptureEnabled(): the managed default flip ---------
 //
 // Explicit setting wins; unset/'' falls back to the deployment shape — ON

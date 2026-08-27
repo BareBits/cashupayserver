@@ -20,6 +20,8 @@
  *   cashupay_sso_key           install mode: key that mints one-time BareBits
  *                              sign-in tokens (see cashupay_sso_login_url)
  *   cashupay_cron_key          install mode: key for the WP-cron pinger
+ *   cashupay_cron_last_ok      install mode: unix ts of the last successful
+ *                              cron ping (drives the stale-heartbeat notice)
  *   cashupay_wired_at          unix ts when WooCommerce wiring completed
  *   cashupay_discount_percent  merchant's checkout discount answer (int)
  *   cashupay_pairing_expected  unix ts while a pairing redirect is in flight
@@ -46,16 +48,29 @@ function cashupay_is_configured(): bool {
 }
 
 /**
- * Whether $url points at the same host as this WordPress site. Same-host
- * requests (the alongside install, a loopback cron ping) skip TLS peer
- * verification the same way WordPress core's own loopbacks do — staging
- * boxes with self-signed certificates would otherwise break themselves.
- * Remote servers are always verified.
+ * Whether $url points at this WordPress site's own origin — scheme, host,
+ * AND port. Same-origin requests (the alongside install, a loopback cron
+ * ping) skip TLS peer verification the same way WordPress core's own
+ * loopbacks do — staging boxes with self-signed certificates would
+ * otherwise break themselves. The comparison is deliberately the full
+ * origin, not the hostname alone: a different service on another port of
+ * the same host is NOT this site and gets verified like any remote server.
  */
 function cashupay_is_same_host_url(string $url): bool {
-    $target = strtolower((string) parse_url($url, PHP_URL_HOST));
-    $self = strtolower((string) parse_url(site_url('/'), PHP_URL_HOST));
-    return $target !== '' && $target === $self;
+    $target = parse_url($url);
+    $self = parse_url(site_url('/'));
+    if (!is_array($target) || !is_array($self) || empty($target['host']) || empty($self['host'])) {
+        return false;
+    }
+    $port = static function (array $parts): int {
+        if (isset($parts['port'])) {
+            return (int) $parts['port'];
+        }
+        return strtolower((string) ($parts['scheme'] ?? '')) === 'https' ? 443 : 80;
+    };
+    return strtolower($target['host']) === strtolower($self['host'])
+        && strtolower((string) ($target['scheme'] ?? '')) === strtolower((string) ($self['scheme'] ?? ''))
+        && $port($target) === $port($self);
 }
 
 /**

@@ -190,18 +190,22 @@ class Config {
      * Get base URL for the application
      */
     public static function getBaseUrl(): string {
+        // Deployment-time pin (user_config.php), written by installers that
+        // know the served URL up front — e.g. the WordPress companion
+        // plugin's "install BareBits alongside" flow. A true pin, like
+        // CASHUPAY_DATA_DIR: it beats the database value AND auto-detection,
+        // so nothing an admin-UI action ever writes can silently defeat the
+        // deployment's declared URL — whoever controls user_config.php
+        // outranks the UI. It never trusts the Host header and stays correct
+        // behind routing setups where SCRIPT_NAME doesn't reflect the public
+        // path.
+        if (defined('CASHUPAY_BASE_URL') && CASHUPAY_BASE_URL !== '') {
+            return rtrim((string)CASHUPAY_BASE_URL, '/');
+        }
+
         $baseUrl = self::get('base_url');
         if ($baseUrl) {
             return rtrim($baseUrl, '/');
-        }
-
-        // Deployment-time pin (user_config.php), written by installers that
-        // know the served URL up front — e.g. the WordPress companion
-        // plugin's "install BareBits alongside" flow. Beats auto-detection:
-        // it never trusts the Host header and stays correct behind routing
-        // setups where SCRIPT_NAME doesn't reflect the public path.
-        if (defined('CASHUPAY_BASE_URL') && CASHUPAY_BASE_URL !== '') {
-            return rtrim((string)CASHUPAY_BASE_URL, '/');
         }
 
         // Auto-detect

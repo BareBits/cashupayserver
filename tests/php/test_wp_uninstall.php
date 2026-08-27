@@ -2,13 +2,19 @@
 /**
  * Plugin uninstall (wordpress/uninstall.php).
  *
- * Deleting the plugin from wp-admin must clean up the plugin's own
- * WordPress-side state — every cashupay_* option and the WP-cron pinger —
- * and reset the BTCPay gateway options ONLY when they point at the server
- * this plugin connected; a hand-configured BTCPay connection is not ours to
- * remove. The script has no filesystem or HTTP surface (the stub set below
- * provides none), which is the "never touches the server or its data"
- * promise in executable form.
+ * Deleting the plugin from wp-admin cleans up the plugin's WordPress-side
+ * state — the cashupay_* options and the WP-cron pinger — and resets the
+ * BTCPay gateway options ONLY when they point at the server this plugin
+ * connected; a hand-configured BTCPay connection is not ours to remove.
+ *
+ * When an alongside install exists, the install RECORD survives even the
+ * uninstall: its location, address, admin password, and SSO key. That
+ * server keeps running with real money behind a generated password the
+ * merchant never chose — these options are the only copy, and deleting
+ * them would lock the merchant out of their own wallet UI. A site with no
+ * alongside install keeps nothing. The script has no filesystem or HTTP
+ * surface (the stub set below provides none), which is the "never touches
+ * the server or its data" promise in executable form.
  *
  * uninstall.php is a plain top-level script (no exit, no functions), so each
  * scenario seeds the option store and requires it again.
@@ -30,40 +36,55 @@ function wp_unschedule_event($ts, $hook) { $GLOBALS['unscheduled'][] = $hook; $G
 
 const UNINSTALL = __DIR__ . '/../../wordpress/uninstall.php';
 
+// The install record that must survive whenever an alongside install exists.
+const INSTALL_RECORD = [
+    'cashupay_server_url', 'cashupay_install_dir', 'cashupay_install_data_dir',
+    'cashupay_install_dirname', 'cashupay_admin_password', 'cashupay_sso_key',
+];
+
 /** Every option the plugin owns, as a fully-populated install would hold them. */
-function seed_plugin_options(string $serverUrl): void {
+function seed_plugin_options(string $serverUrl, bool $withInstall): void {
     $GLOBALS['wp_options'] = array_merge($GLOBALS['wp_options'], [
-        'cashupay_mode' => 'install',
+        'cashupay_mode' => $withInstall ? 'install' : 'url',
         'cashupay_server_url' => $serverUrl,
         'cashupay_store_id' => 'store_x',
         'cashupay_api_key' => str_repeat('a', 64),
         'cashupay_cron_key' => str_repeat('b', 64),
         'cashupay_cron_backoff_until' => 1700000000,
+        'cashupay_cron_last_ok' => 1700000000,
         'cashupay_wired_at' => 1700000000,
         'cashupay_discount_percent' => 3,
         'cashupay_pairing_expected' => ['state' => 'x', 'at' => 1700000000],
         'cashupay_provision_token' => str_repeat('c', 64),
         'cashupay_admin_password' => 'super-secret',
         'cashupay_sso_key' => str_repeat('d', 64),
-        'cashupay_install_dir' => '/var/www/barebits',
-        'cashupay_install_data_dir' => '/var/www/barebits-data',
-        'cashupay_install_dirname' => 'barebits',
         'cashupay_gateway_icon_attachment_id' => 42,
         'cashupay_btcpay_override_consent' => 'https://old.example',
         'cashupay_review_banner' => ['count' => 1, 'dismissed_at' => 1700000000],
     ]);
+    if ($withInstall) {
+        $GLOBALS['wp_options'] += [
+            'cashupay_install_dir' => '/var/www/barebits',
+            'cashupay_install_data_dir' => '/var/www/barebits-data-abc123def456',
+            'cashupay_install_dirname' => 'barebits',
+        ];
+    }
 }
 
 function remaining_cashupay_options(): array {
-    return array_values(array_filter(
+    $keys = array_values(array_filter(
         array_keys($GLOBALS['wp_options']),
         fn($k) => str_starts_with($k, 'cashupay_')
     ));
+    sort($keys);
+    return $keys;
 }
 
-// --- Gateway pointed at OUR server: its options are reset too ----------------
+// --- Alongside install, gateway pointed at OUR server ------------------------
+//
+// Gateway options are reset, the install record survives, everything else goes.
 
-seed_plugin_options('http://wp.test/barebits');
+seed_plugin_options('http://wp.test/barebits', withInstall: true);
 $GLOBALS['wp_options'] += [
     'btcpay_gf_url' => 'http://wp.test/barebits',
     'btcpay_gf_api_key' => str_repeat('a', 64),
@@ -74,18 +95,23 @@ $GLOBALS['next_scheduled'] = 1700000000;
 
 require UNINSTALL;
 
-assert_eq([], remaining_cashupay_options(), 'every cashupay_* option is deleted');
+$expected = INSTALL_RECORD;
+sort($expected);
+assert_eq($expected, remaining_cashupay_options(),
+    'exactly the install record survives — every other cashupay_* option is deleted');
+assert_eq('super-secret', $GLOBALS['wp_options']['cashupay_admin_password'],
+    'the only copy of the server\'s admin password is preserved');
 foreach (['btcpay_gf_url', 'btcpay_gf_api_key', 'btcpay_gf_store_id', 'btcpay_gf_webhook'] as $option) {
     assert_false(array_key_exists($option, $GLOBALS['wp_options']),
         "{$option} pointing at our server is cleaned up");
 }
 assert_eq(['cashupay_cron_tick'], $GLOBALS['unscheduled'], 'the WP-cron pinger is unscheduled');
 
-// --- Gateway pointed at a REAL BTCPay Server: not ours to remove -------------
+// --- Alongside install, gateway pointed at a REAL BTCPay Server --------------
 
 $GLOBALS['wp_options'] = [];
 $GLOBALS['unscheduled'] = [];
-seed_plugin_options('http://wp.test/barebits');
+seed_plugin_options('http://wp.test/barebits', withInstall: true);
 $GLOBALS['wp_options'] += [
     'btcpay_gf_url' => 'https://btcpay.example.com',
     'btcpay_gf_api_key' => 'their-key',
@@ -95,11 +121,28 @@ $GLOBALS['wp_options'] += [
 
 require UNINSTALL;
 
-assert_eq([], remaining_cashupay_options(), 'plugin state is still fully deleted');
+assert_eq($expected, remaining_cashupay_options(), 'the install record still survives');
 assert_eq('https://btcpay.example.com', $GLOBALS['wp_options']['btcpay_gf_url'] ?? null,
     'a foreign BTCPay connection survives the uninstall');
 assert_eq('their-key', $GLOBALS['wp_options']['btcpay_gf_api_key'] ?? null,
     'so does its API key');
+
+// --- URL mode (no alongside install): nothing is kept ------------------------
+
+$GLOBALS['wp_options'] = [];
+$GLOBALS['unscheduled'] = [];
+seed_plugin_options('https://pay.example.com', withInstall: false);
+$GLOBALS['wp_options'] += [
+    'btcpay_gf_url' => 'https://pay.example.com',
+    'btcpay_gf_api_key' => str_repeat('a', 64),
+];
+
+require UNINSTALL;
+
+assert_eq([], remaining_cashupay_options(),
+    'a URL-mode uninstall keeps nothing — the remote server has its own credentials');
+assert_false(array_key_exists('btcpay_gf_url', $GLOBALS['wp_options']),
+    'the gateway options pointing at the connected server are cleaned up');
 
 // --- No server ever connected: gateway options are left alone entirely -------
 //

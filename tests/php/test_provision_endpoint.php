@@ -9,8 +9,10 @@
  * The invariants pinned here: the endpoint is a 404 on deployments that never
  * opted in, the token is checked in constant time against the sha256 hash,
  * nothing is minted before the wizard completes ({"status":"pending"} lets
- * the installer poll), and the first successful collection stamps
- * provision_consumed_at so every later attempt gets 410.
+ * the installer poll), the first successful collection stamps
+ * provision_consumed_at, a re-collection inside the short delivery-failure
+ * grace window returns the SAME credentials without moving the stamp, and
+ * every attempt after the window gets 410.
  *
  * provision.php echoes JSON and exits, so each scenario runs it in a
  * subprocess through a small driver that fakes the request superglobals and
@@ -125,9 +127,28 @@ assert_eq($apiKey, $storeRow['internal_api_key'] ?? null, 'apiKey matches stores
 assert_eq($cronKey, (string)Config::get('cron_key'), 'the lazily seeded cron_key is persisted in config');
 assert_true((int)Config::get('provision_consumed_at', 0) > 0, 'provision_consumed_at is stamped');
 
-// --- 6. Second collection: gone ---------------------------------------------
+// --- 6. Re-collection inside the delivery grace: same credentials ------------
+//
+// The consumed stamp records that the server SENT the response, not that the
+// installer received it; a response lost to a timeout must not orphan the
+// install. Within CASHUPAY_PROVISION_GRACE_SECONDS the same token repeats the
+// collection and gets the IDENTICAL credentials — nothing is re-minted, and
+// the original stamp is kept so polling can never extend the window.
+$firstStamp = (int)Config::get('provision_consumed_at', 0);
 $res = run_provision($tokenHash, 'POST', $token);
-assert_eq(410, $res['status'], 'a second collection gets 410');
+assert_eq(200, $res['status'], 'a re-collection inside the grace window succeeds');
+assert_eq('ready', $res['json']['status'] ?? null, 'and is a full ready answer');
+assert_eq($apiKey, $res['json']['apiKey'] ?? null, 'with the SAME apiKey — nothing re-minted');
+assert_eq($cronKey, $res['json']['cronKey'] ?? null, 'and the SAME cronKey');
+assert_eq('store_prov', $res['json']['storeId'] ?? null, 'and the same store');
+// Re-read raw: this process's Config cache already holds the first stamp.
+$row = Database::fetchOne("SELECT value FROM config WHERE key = 'provision_consumed_at'");
+assert_eq($firstStamp, (int)json_decode($row['value'], true), 'the grace re-collection keeps the ORIGINAL stamp');
+
+// --- 7. Past the grace window: gone ------------------------------------------
+Config::set('provision_consumed_at', time() - 700); // age past the 600 s grace
+$res = run_provision($tokenHash, 'POST', $token);
+assert_eq(410, $res['status'], 'a collection after the grace window gets 410');
 assert_true(str_contains((string)($res['json']['error'] ?? ''), 'already'), 'and says the credentials were already collected');
 
 // The refusal must not have rotated anything: the first collection's

@@ -88,6 +88,29 @@ final class ManagedInstall {
     }
 
     /**
+     * Whether the wizard may skip its password screen: a hash is provisioned
+     * AND an admin account exists to sign in with. Usually that account is
+     * the one seedAdminIfProvisioned just created; when the users table
+     * already held a merchant-created admin the seed no-ops, but skipping is
+     * still right — the merchant knows their own credentials, and the
+     * password screen would refuse to run anyway (its re-entry guard rejects
+     * any run with an existing admin). The one case this must catch is a
+     * hash provisioned over a users table with NO admin row (e.g. only
+     * lesser-role rows survived a partial restore, so the seed no-oped):
+     * skipping then would complete a wizard nobody can ever log into.
+     * Stable for the duration of a wizard run: nothing but the (absent)
+     * password screen writes users mid-run.
+     */
+    public static function adminSeededFromProvisionedHash(): bool {
+        if (self::adminPasswordHash() === '') {
+            return false;
+        }
+        return Database::fetchOne(
+            "SELECT id FROM users WHERE role = ? LIMIT 1", [Auth::ROLE_ADMIN]
+        ) !== null;
+    }
+
+    /**
      * Seed the provisioned admin account if it doesn't exist yet. Called
      * from the wizard's bootstrap; idempotent, a no-op unless a hash is
      * provisioned and the users table is still empty (a merchant-created
