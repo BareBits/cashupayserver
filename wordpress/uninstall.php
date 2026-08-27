@@ -48,6 +48,7 @@ $cashupay_options = [
     'cashupay_admin_password',
     'cashupay_sso_key',
     'cashupay_install_dir',
+    'cashupay_install_url',
     'cashupay_install_data_dir',
     'cashupay_install_dirname',
     'cashupay_gateway_icon_attachment_id',
@@ -68,10 +69,16 @@ if ((string) get_option('cashupay_install_dir', '') !== '') {
     $cashupay_options = array_values(array_diff($cashupay_options, [
         'cashupay_server_url',
         'cashupay_install_dir',
+        'cashupay_install_url',
         'cashupay_install_data_dir',
         'cashupay_install_dirname',
         'cashupay_admin_password',
         'cashupay_sso_key',
+        // The heartbeat key too: the install has no crontab of its own and
+        // the handshake that minted this key was one-time. The pinger stops
+        // with the plugin (the event above is unscheduled), but a reinstall
+        // resumes it from this key at activation.
+        'cashupay_cron_key',
     ]));
 }
 

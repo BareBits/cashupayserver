@@ -303,35 +303,49 @@ function cashupay_handle_finish(): void {
  * state.
  *
  * When an alongside install exists, the install RECORD survives the reset:
- * its location, its admin password, and its SSO key. That server keeps
- * running with real money behind that password — the merchant never chose
- * it and can't recover it, so deleting our only copy would lock them out of
- * their own wallet UI. The chooser renders a reconnect hint (with a
- * password reveal) from these surviving options.
+ * its location, its admin password, its SSO key, and its cron key. That
+ * server keeps running with real money behind that password — the merchant
+ * never chose it and can't recover it, so deleting our only copy would lock
+ * them out of their own wallet UI. The chooser renders a reconnect hint
+ * (with a password reveal) from these surviving options, and the WP-cron
+ * pinger keeps ticking the install (it has no crontab of its own — the
+ * plugin promised it the heartbeat at provision time).
  */
 function cashupay_handle_reset_onboarding(): void {
     cashupay_require_admin_post('cashupay_reset_onboarding');
 
-    cashupay_cron_unschedule();
     $options = [
         'cashupay_mode', 'cashupay_server_url', 'cashupay_store_id',
         'cashupay_api_key', 'cashupay_cron_key', 'cashupay_wired_at',
         'cashupay_discount_percent', 'cashupay_pairing_expected',
         'cashupay_provision_token', 'cashupay_admin_password',
         'cashupay_sso_key', 'cashupay_install_dir',
-        'cashupay_install_data_dir', 'cashupay_install_dirname',
-        'cashupay_btcpay_override_consent',
+        'cashupay_install_url', 'cashupay_install_data_dir',
+        'cashupay_install_dirname', 'cashupay_btcpay_override_consent',
     ];
     $hasInstall = (string) get_option('cashupay_install_dir', '') !== '';
     if ($hasInstall) {
+        // Make sure the install's own URL is recorded (backfills installs
+        // that predate the option) BEFORE the mode is forgotten — afterwards
+        // it can no longer be derived from the connected-server URL.
+        cashupay_install_url();
         $options = array_values(array_diff($options, [
             'cashupay_server_url', 'cashupay_install_dir',
-            'cashupay_install_data_dir', 'cashupay_install_dirname',
-            'cashupay_admin_password', 'cashupay_sso_key',
+            'cashupay_install_url', 'cashupay_install_data_dir',
+            'cashupay_install_dirname', 'cashupay_admin_password',
+            'cashupay_sso_key',
+            // The cron key too: the install has no crontab of its own (this
+            // plugin promised it the heartbeat at provision time) and the
+            // provisioning handshake that minted the key is one-time. The
+            // pinger keeps ticking the install through the reset.
+            'cashupay_cron_key',
         ]));
     }
     foreach ($options as $option) {
         delete_option($option);
+    }
+    if (!cashupay_cron_needed()) {
+        cashupay_cron_unschedule();
     }
     cashupay_flash('success', $hasInstall
         ? 'Onboarding reset. Your BareBits install keeps running and nothing on its side was '
@@ -374,10 +388,10 @@ function cashupay_render_onboarding(): void {
 function cashupay_render_step_choose(): void {
     // A surviving install record (a "Start over" or an earlier plugin
     // removal left an alongside install running) gets a reconnect hint: the
-    // server's address prefilled for URL mode, and the saved admin password
-    // revealable — pairing needs it, and the merchant never chose one.
-    $existingInstall = (string) get_option('cashupay_install_dir', '') !== ''
-        ? cashupay_server_url() : '';
+    // install's own address prefilled for URL mode, and the saved admin
+    // password revealable — pairing needs it, and the merchant never chose
+    // one.
+    $existingInstall = cashupay_install_url();
     ?>
     <p>Accept Bitcoin (on-chain and Lightning) in WooCommerce. Where should your BareBits server live?</p>
     <?php if ($existingInstall !== ''): ?>
@@ -421,7 +435,7 @@ function cashupay_render_step_choose(): void {
                 <td>
                     <label for="cashupay-mode-url"><strong>I already run a BareBits server</strong></label>
                     <p class="description">Connect this shop to an existing server by URL.</p>
-                    <input type="url" name="cashupay_server_url" class="regular-text"
+                    <input type="url" name="cashupay_server_url" id="cashupay-server-url" class="regular-text"
                            placeholder="https://pay.example.com" value="<?= esc_attr($existingInstall) ?>">
                 </td>
             </tr>
@@ -440,6 +454,30 @@ function cashupay_render_step_choose(): void {
         </table>
         <?php submit_button('Continue'); ?>
     </form>
+    <script>
+    // The URL field must only take part in the browser's form validation
+    // while "I already run a BareBits server" is the selected mode. Any text
+    // in a type="url" input that is not a scheme-qualified URL (a pasted
+    // "pay.example.com", browser autofill) otherwise blocks the WHOLE form
+    // with "Please enter a URL" — making the install option unselectable.
+    // Disabling also drops the field from the POST, which the install branch
+    // never reads anyway. Without JavaScript the field stays enabled and
+    // optional, and the server-side probe validates it as before.
+    (function () {
+        const urlField = document.getElementById('cashupay-server-url');
+        const sync = function () {
+            const urlMode = document.getElementById('cashupay-mode-url').checked;
+            urlField.disabled = !urlMode;
+            urlField.required = urlMode;
+        };
+        document.querySelectorAll('input[name="cashupay_mode"]').forEach(function (radio) {
+            radio.addEventListener('change', sync);
+        });
+        // Browsers restore form state on back-navigation after scripts ran.
+        window.addEventListener('pageshow', sync);
+        sync();
+    })();
+    </script>
     <?php
 }
 

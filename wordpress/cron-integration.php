@@ -10,9 +10,14 @@
  * (webhook drain, on-chain polling, sweeps, its own auto-updater, …).
  *
  * Pure HTTP: the cron key travels in the X-CRON-KEY header so it stays out
- * of access logs, and no BareBits code runs inside WordPress. Servers
- * connected by URL (mode 'url') run their own cron and get no pinger.
- * License: GPLv2 or later.
+ * of access logs, and no BareBits code runs inside WordPress. Servers this
+ * plugin did not install run their own cron and get no pinger.
+ *
+ * The heartbeat is owed to the INSTALL, not to whatever server happens to be
+ * connected: it keeps ticking the install's own URL through "Start over" and
+ * after the install is reconnected in URL mode — the install has no crontab
+ * of its own (the plugin promised it one at provision time), and it keeps
+ * running with real money either way. License: GPLv2 or later.
  */
 
 if (!defined('ABSPATH')) {
@@ -28,10 +33,15 @@ add_filter('cron_schedules', 'cashupay_register_cron_interval');
 // cadence until a ping succeeds again.
 const CASHUPAY_CRON_BACKOFF_SECONDS = 600;
 
-/** Whether this site owes the alongside install a cron heartbeat. */
+/**
+ * Whether this site owes the alongside install a cron heartbeat: an install
+ * record exists and the provisioning handshake handed us its cron key. NOT
+ * gated on the current mode — the key is unrecoverable (the handshake is
+ * one-time), and the install needs its heartbeat even mid-"Start over" or
+ * after being reconnected by URL.
+ */
 function cashupay_cron_needed(): bool {
-    return cashupay_mode() === 'install'
-        && cashupay_server_url() !== ''
+    return cashupay_install_url() !== ''
         && (string) get_option('cashupay_cron_key', '') !== '';
 }
 
@@ -77,7 +87,9 @@ function cashupay_cron_unschedule(): void {
  * warning (admin-menu.php) reads.
  */
 function cashupay_fire_cron_endpoint(int $timeoutSeconds): bool {
-    $server = cashupay_server_url();
+    // Always the install's own URL — never the connected server, which may
+    // be a different host entirely after a reconnect.
+    $server = cashupay_install_url();
     $cronKey = (string) get_option('cashupay_cron_key', '');
     if ($server === '' || $cronKey === '') {
         return false;
