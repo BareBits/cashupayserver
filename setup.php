@@ -45,6 +45,24 @@ require_once __DIR__ . '/includes/managed.php';
 // Initialize session early - needed for storing temp data during setup
 Auth::initSession();
 
+/**
+ * The URL of THIS wizard request (path only, query stripped) — the action for
+ * every in-wizard form, Back link, and AJAX call.
+ *
+ * Deliberately not Urls::setup(): that helper trusts the detected URL mode,
+ * and the default ('router') builds PATH_INFO-style URLs like
+ * /router.php/setup.php that plenty of hosts never route — a WordPress-
+ * alongside install behind nginx or a no-AllowOverride Apache serves a
+ * WordPress "page not found" for them, dumping the operator out of the wizard
+ * at the first screen whose form used an absolute action. The URL the
+ * operator is already viewing routed HERE by construction, so posting back to
+ * it works on every host and in every URL mode.
+ */
+function setupSelfUrl(): string {
+    $uri = strtok((string)($_SERVER['REQUEST_URI'] ?? ''), '?');
+    return ($uri !== '' && $uri !== false) ? $uri : Urls::setup();
+}
+
 // AJAX endpoints that are stateless and need to work both during and after
 // setup (e.g. the mint-discovery modal opens from add_store mode after
 // setup is complete). Handled before the redirect-if-set-up guard below.
@@ -853,7 +871,7 @@ function renderUrlModeDetectionScript(): void { ?>
             const detailsEl = document.getElementById('url-mode-details');
 
             const baseUrl = <?= json_encode(Urls::siteBase()) ?>;
-            const setupUrl = <?= json_encode(Urls::setup()) ?>;
+            const setupUrl = <?= json_encode(setupSelfUrl()) ?>;
 
             // Probe each routing style. The /health probe tells
             // "clean" (pretty URLs via the front-controller
@@ -1358,7 +1376,7 @@ function renderUrlModeDetectionScript(): void { ?>
             $backStep = SetupFlow::backStep($step, $renderSteps);
             $backUrl = $backStep === null
                 ? null
-                : Urls::setup() . '?step=' . urlencode($backStep)
+                : setupSelfUrl() . '?step=' . urlencode($backStep)
                     . ($mode === 'add_store' ? '&mode=add_store' : '');
             ?>
             <h1><?= $mode === 'add_store' ? 'Add New Store' : 'BareBits Setup' ?></h1>
@@ -1416,8 +1434,10 @@ function renderUrlModeDetectionScript(): void { ?>
                         <input type="checkbox" id="terms_legal" name="terms_legal" required>
                         <label for="terms_legal">
                             I promise not to use this software for anything
-                            illegal, and I'm good with the terms of the
-                            <a href="https://github.com/BareBits/cashupayserver/blob/main/LICENSE.md" target="_blank" rel="noopener" style="color: #63b3ed;">license</a>.
+                            illegal, and I agree with the terms of the
+                            <a href="https://github.com/BareBits/cashupayserver/blob/main/LICENSE.md" target="_blank" rel="noopener" style="color: #63b3ed;">license</a>
+                            and
+                            <a href="https://github.com/BareBits/cashupayserver/blob/main/USE_POLICY.md" target="_blank" rel="noopener" style="color: #63b3ed;">use policy</a>.
                         </label>
                     </div>
 
@@ -1901,7 +1921,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                     </div>
                 <?php endif; ?>
 
-                <form id="onchain-form" method="POST" action="<?= htmlspecialchars(Urls::setup()) ?>">
+                <form id="onchain-form" method="POST" action="<?= htmlspecialchars(setupSelfUrl()) ?>">
                     <input type="hidden" name="step" value="onchain">
                     <input type="hidden" name="onchain_action" value="save">
                     <input type="hidden" name="onchain_address_mode" id="onchain_address_mode" value="<?= htmlspecialchars($ocSavedMode) ?>">
@@ -1968,7 +1988,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                     </button>
                 </form>
 
-                <form method="POST" action="<?= htmlspecialchars(Urls::setup()) ?>" style="margin-top: 0.75rem;">
+                <form method="POST" action="<?= htmlspecialchars(setupSelfUrl()) ?>" style="margin-top: 0.75rem;">
                     <input type="hidden" name="step" value="onchain">
                     <input type="hidden" name="onchain_action" value="skip">
                     <?php if ($mode === 'add_store'): ?>
@@ -1985,7 +2005,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
 
                 <script>
                 (function () {
-                    var setupUrl = <?= json_encode(Urls::setup()) ?>;
+                    var setupUrl = <?= json_encode(setupSelfUrl()) ?>;
                     var validateBtn = document.getElementById('onchain-validate-btn');
                     var saveBtn = document.getElementById('onchain-save-btn');
                     var box = document.getElementById('onchain-validation');
@@ -2162,7 +2182,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                     that tiny risk.
                 </p>
 
-                <form method="POST" action="<?= htmlspecialchars(Urls::setup()) ?>">
+                <form method="POST" action="<?= htmlspecialchars(setupSelfUrl()) ?>">
                     <input type="hidden" name="step" value="zeroconf">
                     <?php if ($mode === 'add_store'): ?>
                         <input type="hidden" name="mode" value="add_store">
@@ -2224,7 +2244,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                     We'd really suggest turning it on! BareBits supports several types of lightning wallet backends. When invoices are generated for your customers, BareBits will try each option in sequence until it can successfully generate an invoice. <strong>Only one method is needed for lightning payments to work</strong>, you can use multiple methods if you want.
                 </p>
 
-                <form method="POST" action="<?= htmlspecialchars(Urls::setup()) ?>">
+                <form method="POST" action="<?= htmlspecialchars(setupSelfUrl()) ?>">
                     <input type="hidden" name="step" value="lightning">
                     <input type="hidden" name="lightning_action" value="save">
                     <?php if ($mode === 'add_store'): ?>
@@ -2423,7 +2443,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                 })();
                 </script>
 
-                <form method="POST" action="<?= htmlspecialchars(Urls::setup()) ?>" style="margin-top: 0.5rem;">
+                <form method="POST" action="<?= htmlspecialchars(setupSelfUrl()) ?>" style="margin-top: 0.5rem;">
                     <input type="hidden" name="step" value="lightning">
                     <input type="hidden" name="lightning_action" value="skip">
                     <?php if ($mode === 'add_store'): ?>
@@ -2465,7 +2485,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                     </div>
                 <?php endif; ?>
 
-                <form method="POST" action="<?= htmlspecialchars(Urls::setup()) ?>">
+                <form method="POST" action="<?= htmlspecialchars(setupSelfUrl()) ?>">
                     <input type="hidden" name="step" value="swaps">
                     <?php if ($mode === 'add_store'): ?>
                         <input type="hidden" name="mode" value="add_store">
@@ -2519,7 +2539,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                     </div>
                 <?php endif; ?>
 
-                <form method="POST" action="<?= htmlspecialchars(Urls::setup()) ?>" id="mints-form">
+                <form method="POST" action="<?= htmlspecialchars(setupSelfUrl()) ?>" id="mints-form">
                     <input type="hidden" name="step" value="mints">
                     <input type="hidden" name="mints_enabled" value="1">
                     <input type="hidden" name="mint_url" id="mint_url" value="<?= htmlspecialchars($_POST['mint_url'] ?? '') ?>">
@@ -2581,7 +2601,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                     <button type="submit" class="btn" style="width: 100%;" id="mints-continue-btn" disabled>Continue</button>
                 </form>
 
-                <form method="POST" action="<?= htmlspecialchars(Urls::setup()) ?>" style="margin-top: 0.5rem;">
+                <form method="POST" action="<?= htmlspecialchars(setupSelfUrl()) ?>" style="margin-top: 0.5rem;">
                     <input type="hidden" name="step" value="mints">
                     <input type="hidden" name="mints_enabled" value="0">
                     <?php if ($mode === 'add_store'): ?>
@@ -2658,7 +2678,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                 </p>
                 <pre style="background: rgba(0,0,0,0.3); padding: 0.75rem; border-radius: 6px; font-size: 0.8rem; user-select: all;"><?= htmlspecialchars($cronSchedule['line']) ?></pre>
 
-                <form method="POST" action="<?= htmlspecialchars(Urls::setup()) ?>" style="margin-top: 1.5rem;">
+                <form method="POST" action="<?= htmlspecialchars(setupSelfUrl()) ?>" style="margin-top: 1.5rem;">
                     <input type="hidden" name="step" value="cron">
                     <button type="submit" class="btn" style="width: 100%;">Continue</button>
                 </form>
@@ -2873,7 +2893,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
     var mintCountryCache = {};
 
     var FLAG_BASE = <?= json_encode(Urls::assets('img/flags/')) ?>;
-    var SETUP_URL = <?= json_encode(Urls::setup()) ?>;
+    var SETUP_URL = <?= json_encode(setupSelfUrl()) ?>;
 
     function normalizeMintUrl(u) {
         return String(u || '').replace(/\/+$/, '');

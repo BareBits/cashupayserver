@@ -9,6 +9,12 @@ publishes when $CASHUPAY_STANDALONE_ZIP is set.
 
 Serves:
     GET /releases/latest      GitHub-shaped JSON with the zip + SHA256SUMS assets
+                              (404 when the release is a prerelease — GitHub's
+                              /releases/latest never returns prereleases, which
+                              is exactly the trap the plugin's channel logic
+                              exists to avoid)
+    GET /releases             GitHub-shaped listing (newest first) — what the
+                              plugin's testing channel reads
     GET /assets/<name>        the asset bytes
 """
 from __future__ import annotations
@@ -69,12 +75,16 @@ class ReleaseServer:
 
 
 def start_release_server(
-    zip_path: Path, *, with_sums: bool = True, tamper: bool = False
+    zip_path: Path, *, with_sums: bool = True, tamper: bool = False,
+    prerelease: bool = False,
 ) -> ReleaseServer:
-    """Serve `zip_path` as the latest release. with_sums=False omits the
+    """Serve `zip_path` as the newest release. with_sums=False omits the
     SHA256SUMS asset, modeling an older release without checksums. tamper=True
     computes SHA256SUMS from the pristine zip but serves a corrupted one — the
-    shape of a modified-in-transit (or compromised-mirror) download."""
+    shape of a modified-in-transit (or compromised-mirror) download.
+    prerelease=True publishes it as a testing prerelease: it heads /releases
+    but /releases/latest answers 404, exactly like GitHub when a repository's
+    newest (or only) release is a prerelease."""
     zip_bytes = zip_path.read_bytes()
     sums_body = (
         f"{hashlib.sha256(zip_bytes).hexdigest()}  {ZIP_ASSET_NAME}\n".encode()
@@ -107,13 +117,28 @@ def start_release_server(
             {"name": "SHA256SUMS", "browser_download_url": f"{base}/assets/SHA256SUMS"}
         )
 
-    latest = json.dumps({"tag_name": RELEASE_TAG, "assets": release_assets}).encode()
+    release_obj = {
+        "tag_name": RELEASE_TAG,
+        "prerelease": prerelease,
+        "draft": False,
+        "assets": release_assets,
+    }
+    latest = json.dumps(release_obj).encode()
+    listing = json.dumps([release_obj]).encode()
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802 (http.server API)
             path = self.path.split("?", 1)[0]
             if path == "/releases/latest":
+                if prerelease:
+                    # GitHub's /releases/latest never returns prereleases.
+                    self.send_response(404)
+                    self.end_headers()
+                    return
                 self._respond(latest, "application/json")
+                return
+            if path == "/releases":
+                self._respond(listing, "application/json")
                 return
             if path.startswith("/assets/"):
                 name = path[len("/assets/"):]

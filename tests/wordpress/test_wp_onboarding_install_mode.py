@@ -84,10 +84,19 @@ def test_install_mode_end_to_end(wordpress_install_mode, mint, backup_mint) -> N
     assert "Download and install BareBits" in body, body[:2000]
 
     # Step 2: the installer downloads from the fixture release API, verifies
-    # the checksum, and unpacks next to WordPress.
+    # the checksum, and unpacks next to WordPress. The fixture publishes the
+    # release as a testing PRERELEASE and the plugin runs on the testing
+    # channel — /releases/latest answers 404 here, so a successful install is
+    # itself proof the channel logic read the /releases listing.
     body = post_onboarding(s, wp, "cashupay_run_install")
     assert "BareBits is installed at" in body, body[:2000]
     assert "not checksum-verified" not in body, "SHA256SUMS was published; the install must verify it"
+    # The wizard is embedded right below this notice — there is nowhere to
+    # "come back" from (the old wording sent merchants hunting for a page
+    # they were already on).
+    assert "come back here" not in body, body[:2000]
+    # Rewrites work on this host, so the routing probe must not cry wolf.
+    assert "routes are not answering" not in body, body[:2000]
 
     assert (wp.barebits_dir / "BUILD_INFO").is_file()
     assert (wp.barebits_dir / "setup.php").is_file()

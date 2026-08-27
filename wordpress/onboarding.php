@@ -139,8 +139,19 @@ function cashupay_handle_run_install(): void {
     if (empty($result['ok'])) {
         cashupay_flash('error', $result['message']);
     } else {
-        cashupay_flash('success', 'BareBits is installed at ' . $result['url'] . '. Finish its setup wizard, then come back here.'
-            . (empty($result['verified']) ? ' (Note: this release published no checksums; the download was TLS-protected but not checksum-verified.)' : ''));
+        // The next render embeds the setup wizard right below this notice, so
+        // no "come back here" choreography — just say where the install went.
+        $message = 'BareBits is installed at ' . $result['url'] . '.'
+            . (empty($result['verified']) ? ' (Note: this release published no checksums; the download was TLS-protected but not checksum-verified.)' : '');
+        if (cashupay_install_api_routes_ok($result['url'])) {
+            cashupay_flash('success', $message);
+        } else {
+            cashupay_flash('warning', $message . ' Heads up: the install\'s /api/v1 routes are not '
+                . 'answering, which usually means your web server ignores the install\'s .htaccess '
+                . 'rewrite rules (common on nginx). The setup wizard below still works, but the '
+                . 'final "connect WooCommerce" step will fail until those routes are reachable — '
+                . 'ask your host about enabling .htaccess/rewrite support for the install folder.');
+        }
     }
     wp_safe_redirect(cashupay_onboarding_url());
     exit;

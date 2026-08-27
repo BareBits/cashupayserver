@@ -32,7 +32,7 @@ $GLOBALS['unwritable'] = [];             // paths wp_is_writable reports false f
 $GLOBALS['http_routes'] = [];            // url-substring => ['code'=>…, 'body'=>…] | 'error'
 $GLOBALS['http_log'] = [];               // every wp_remote_get url
 $GLOBALS['download_content'] = null;     // bytes download_url writes; null = WP_Error
-$GLOBALS['unzip_layout'] = 'release';    // 'release' | 'no-buildinfo' | 'error'
+$GLOBALS['unzip_layout'] = 'release';    // 'release' | 'no-buildinfo' | 'no-provision' | 'error'
 
 function get_option($name, $default = false) { return $GLOBALS['wp_options'][$name] ?? $default; }
 function update_option($name, $value, $autoload = null) { $GLOBALS['wp_options'][$name] = $value; return true; }
@@ -87,9 +87,13 @@ function unzip_file($zip, $to) {
         return new WP_Error('corrupt zip');
     }
     mkdir($to . '/cashupayserver', 0750, true);
-    if ($GLOBALS['unzip_layout'] === 'release') {
+    if ($GLOBALS['unzip_layout'] === 'release' || $GLOBALS['unzip_layout'] === 'no-provision') {
         file_put_contents($to . '/cashupayserver/BUILD_INFO', "stub build\n");
         file_put_contents($to . '/cashupayserver/setup.php', "<?php // stub\n");
+    }
+    if ($GLOBALS['unzip_layout'] === 'release') {
+        // The managed-install marker: a release the install flow can finish.
+        file_put_contents($to . '/cashupayserver/provision.php', "<?php // stub\n");
     }
     return true;
 }
@@ -251,6 +255,17 @@ assert_eq([], glob(dirname($installDir) . '/*barebits-staging-*') ?: [],
 $staging = glob(WP_CONTENT_DIR . '/upgrade/barebits-staging-*') ?: [];
 assert_eq([], $staging, 'the staging directory is cleaned up');
 
+// A pre-managed-install release (v1.3.1 and older: no provision.php) must be
+// refused up front — its wizard would demand a password nobody provisioned
+// and there is no handshake to collect credentials from afterwards.
+$GLOBALS['unzip_layout'] = 'no-provision';
+$u = cashupay_unpack_release($zipFile, $installDir);
+assert_eq(false, $u['ok'], 'a release without provision.php is refused');
+assert_true(str_contains($u['message'], 'does not support'), 'with the too-old wording');
+assert_false(is_dir($installDir), 'nothing is left at the install target');
+assert_eq([], glob(WP_CONTENT_DIR . '/upgrade/barebits-staging-*') ?: [],
+    'the staging directory is cleaned up after the refusal');
+
 $GLOBALS['unzip_layout'] = 'error';
 $u = cashupay_unpack_release($zipFile, $installDir);
 assert_eq(false, $u['ok'], 'a corrupt zip is refused');
@@ -341,5 +356,17 @@ assert_eq('http://wp.test/barebits', get_option('cashupay_server_url'), 'and the
 assert_eq('http://wp.test/barebits', get_option('cashupay_install_url'), 'and the install\'s own URL');
 assert_eq($tokenBefore, get_option('cashupay_provision_token'),
     'a resume never regenerates the credentials behind the install\'s hashes');
+
+// Our own install, but from a pre-managed-install release (a leftover from a
+// plugin version that still read /releases/latest): resuming would walk the
+// merchant into the same dead end, so it is refused — and never deleted, the
+// folder could hold a database.
+unlink($installDir . '/provision.php');
+$GLOBALS['http_log'] = [];
+$r = cashupay_run_install('barebits');
+assert_eq(false, $r['ok'], 'a too-old own install refuses to resume');
+assert_true(str_contains($r['message'], 'too old'), 'with the too-old wording');
+assert_true(is_file($installDir . '/BUILD_INFO'), 'and the old install is left in place');
+assert_eq([], $GLOBALS['http_log'], 'nothing was downloaded over it');
 
 echo "test_wp_installer_paths: ok\n";
