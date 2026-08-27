@@ -170,6 +170,14 @@ if (preg_match('#^/provision$#', $uri)) {
 }
 
 // -----------------------------------------------------------------------------
+// SSO: /sso — login-token handoff for managed installs (see sso.php).
+// -----------------------------------------------------------------------------
+if (preg_match('#^/sso$#', $uri)) {
+    require __DIR__ . '/sso.php';
+    exit;
+}
+
+// -----------------------------------------------------------------------------
 // Product image: /product-image — serves uploaded product images (public).
 // -----------------------------------------------------------------------------
 if (preg_match('#^/product-image$#', $uri)) {
@@ -223,7 +231,7 @@ if ($uri === '/' || $uri === '') {
 // Direct .php file access (for backwards compatibility)
 // Only allow specific public files
 // -----------------------------------------------------------------------------
-$allowedFiles = ['index.php', 'admin.php', 'setup.php', 'payment.php', 'pay.php', 'api.php', 'cron.php', 'receive.php', 'recover.php', 'update.php', 'health.php', 'product-image.php', 'provision.php'];
+$allowedFiles = ['index.php', 'admin.php', 'setup.php', 'payment.php', 'pay.php', 'api.php', 'cron.php', 'receive.php', 'recover.php', 'update.php', 'health.php', 'product-image.php', 'provision.php', 'sso.php'];
 $requestedFile = basename($uri);
 
 if (in_array($requestedFile, $allowedFiles)) {

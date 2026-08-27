@@ -124,6 +124,7 @@ jobs:
             product-image.php \
             update.php \
             provision.php \
+            sso.php \
             recover.php \
             includes/database.php
 

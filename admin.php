@@ -22,6 +22,7 @@ require_once __DIR__ . '/includes/updater.php';
 require_once __DIR__ . '/includes/offline_cashu.php';
 require_once __DIR__ . '/includes/products.php';
 require_once __DIR__ . '/includes/cart.php';
+require_once __DIR__ . '/includes/managed.php';
 
 use Cashu\ProofState;
 
@@ -2568,6 +2569,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'enabled' => Config::get('notifications_enabled', false) === true,
                 'invoicePaidEnabled' => Config::get('notifications_invoice_paid_enabled', false) === true,
                 'autoCashoutEnabled' => Config::get('notifications_auto_cashout_enabled', false) === true,
+                // Effective value: explicit payer_email_capture_enabled config
+                // wins, else ON standalone / OFF on managed installs (the shop
+                // platform owns customer emails).
+                'payerEmailCaptureEnabled' => Config::isPayerEmailCaptureEnabled(),
                 'payerReceiptEnabled' => Config::get('notifications_payer_receipt_enabled', false) === true,
                 // Site-wide default for the payment-screen newsletter checkbox.
                 // Independent of receipt sending — email/newsletter capture works
@@ -2595,6 +2600,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $enabled = ($_POST['enabled'] ?? '0') === '1';
                 $invoicePaidEnabled = ($_POST['invoice_paid_enabled'] ?? '0') === '1';
                 $autoCashoutEnabled = ($_POST['auto_cashout_enabled'] ?? '0') === '1';
+                $payerEmailCaptureEnabled = ($_POST['payer_email_capture_enabled'] ?? '0') === '1';
                 $payerReceiptEnabled = ($_POST['payer_receipt_enabled'] ?? '0') === '1';
                 $newsletterDefaultChecked = ($_POST['newsletter_default_checked'] ?? '0') === '1';
                 $toEmail = trim((string)($_POST['to_email'] ?? ''));
@@ -2610,6 +2616,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 Config::set('notifications_enabled', $enabled);
                 Config::set('notifications_invoice_paid_enabled', $invoicePaidEnabled);
                 Config::set('notifications_auto_cashout_enabled', $autoCashoutEnabled);
+                // Explicit boolean: once saved, it overrides the managed/
+                // standalone default in Config::isPayerEmailCaptureEnabled().
+                Config::set('payer_email_capture_enabled', $payerEmailCaptureEnabled);
                 Config::set('notifications_payer_receipt_enabled', $payerReceiptEnabled);
                 Config::set('newsletter_default_checked', $newsletterDefaultChecked);
                 Config::set('notifications_to_email', $toEmail);
@@ -3740,6 +3749,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 $baseUrl = Config::getBaseUrl();
 $isLoggedIn = Auth::isLoggedIn();
 $currentUser = Auth::currentUser();   // null when not logged in
+$isManaged = ManagedInstall::isManaged();
 $currentRole = $currentUser['role'] ?? ($isLoggedIn ? Auth::ROLE_ADMIN : null);
 $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
 // Mechanism 2: surface the file-based reset on the lock screen when the trigger
@@ -4221,6 +4231,12 @@ header('Cache-Control: no-cache, must-revalidate');
         .hidden {
             display: none !important;
         }
+
+        /* Managed single-shop installs (ManagedInstall::isManaged) hide the
+           surfaces the shop platform owns and the account plumbing (login is
+           automatic via SSO). Server-rendered on purpose: a class the merchant
+           could untoggle in DevTools only hides UI, never capability. */
+        .managed-hidden { display: none !important; }
 
         /* Balance Card */
         .balance-card {
@@ -5200,7 +5216,7 @@ header('Cache-Control: no-cache, must-revalidate');
                     <img class="header-logo" src="<?= htmlspecialchars(Urls::assets('img/barebits-logo.svg')) ?>" alt="BareBits">
                     <span id="header-text">Dashboard</span>
                 </div>
-                <div class="header-store-selector" id="header-store-selector">
+                <div class="header-store-selector<?= $isManaged ? ' managed-hidden' : '' ?>" id="header-store-selector">
                     <span class="store-selector-label">Selected Store:</span>
                     <select id="store-select">
                         <option value="">Loading stores...</option>
@@ -5214,7 +5230,7 @@ header('Cache-Control: no-cache, must-revalidate');
                         <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path>
                     </svg>
                 </button>
-                <div class="user-menu" id="user-menu">
+                <div class="user-menu<?= $isManaged ? ' managed-hidden' : '' ?>" id="user-menu">
                     <button class="icon-btn" id="user-btn" title="Account">
                         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                             <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path>
@@ -6326,7 +6342,9 @@ header('Cache-Control: no-cache, must-revalidate');
                     <div class="empty-state">
                         <div class="empty-state-icon">🏪</div>
                         <p>No store selected</p>
-                        <button class="btn" id="btn-create-store" style="margin-top: 1rem;">Create Store</button>
+                        <!-- Managed installs run exactly one shop-provisioned store,
+                             so adding stores from the menu is hidden there. -->
+                        <button class="btn<?= $isManaged ? ' managed-hidden' : '' ?>" id="btn-create-store" style="margin-top: 1rem;">Create Store</button>
                     </div>
                 </div>
             </div>
@@ -6474,6 +6492,21 @@ header('Cache-Control: no-cache, must-revalidate');
                                 </label>
                             </div>
                             <div class="toggle-container" style="margin-top: 0.5rem;">
+                                <span>Offer payers an email / newsletter form on the payment page</span>
+                                <label class="toggle">
+                                    <input type="checkbox" id="notifications-payer-email-capture">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
+                            <p class="form-help" style="margin-top: 0.5rem;">
+                                When off, the payment-complete screen shows no email capture
+                                and receipt emails are never offered. Managed shop installs
+                                default this off &mdash; the shop owns customer emails.
+                            </p>
+                            <!-- The two toggles below only matter while the email capture
+                                 above is on; JS greys them out when it is off. -->
+                            <div id="payer-email-capture-dependent">
+                            <div class="toggle-container" style="margin-top: 0.5rem;">
                                 <span>Offer payer receipt on payment page</span>
                                 <label class="toggle">
                                     <input type="checkbox" id="notifications-payer-receipt">
@@ -6484,6 +6517,7 @@ header('Cache-Control: no-cache, must-revalidate');
                                 When enabled, after an invoice is paid the customer can
                                 optionally enter an email address to receive a payment
                                 confirmation. Receipts are queued to the same SMTP server.
+                                Requires the email/newsletter form above.
                             </p>
                             <div class="toggle-container" style="margin-top: 0.75rem;">
                                 <span>Newsletter checkbox checked by default</span>
@@ -6498,6 +6532,7 @@ header('Cache-Control: no-cache, must-revalidate');
                                 shown regardless of whether receipts are enabled. Individual
                                 stores can override this default in their store settings.
                             </p>
+                            </div>
                         </div>
 
                         <div style="margin-top: 1rem; padding: 0.75rem; background: rgba(0,0,0,0.2); border-radius: 8px;">
@@ -6723,8 +6758,9 @@ header('Cache-Control: no-cache, must-revalidate');
                     </div>
                 </div>
 
-                <!-- My Account card: own password + logout, available to every logged-in user -->
-                <div class="card collapsible" id="card-my-account">
+                <!-- My Account card: own password + logout, available to every logged-in user.
+                     Managed installs hide it: login is automatic via SSO from the shop admin. -->
+                <div class="card collapsible<?= $isManaged ? ' managed-hidden' : '' ?>" id="card-my-account">
                     <div class="card-header">
                         <div class="card-title">My Account</div>
                     </div>
@@ -6750,14 +6786,14 @@ header('Cache-Control: no-cache, must-revalidate');
                             </p>
                             <button class="btn btn-secondary btn-full" id="btn-save-recovery-email">Save recovery email</button>
                         </div>
-                        <button class="btn btn-danger btn-full" id="btn-logout">
+                        <button class="btn btn-danger btn-full<?= $isManaged ? ' managed-hidden' : '' ?>" id="btn-logout">
                             Logout
                         </button>
                     </div>
                 </div>
 
-                <!-- Users card: admin-only -->
-                <div class="card collapsible hidden" id="card-users" data-admin-only="true">
+                <!-- Users card: admin-only. Managed installs hide it (SSO owns accounts). -->
+                <div class="card collapsible hidden<?= $isManaged ? ' managed-hidden' : '' ?>" id="card-users" data-admin-only="true">
                     <div class="card-header">
                         <div class="card-title">Users</div>
                         <button class="btn" id="btn-add-user" style="padding: 0.25rem 0.75rem; font-size: 0.85rem;">Add user</button>
@@ -7050,7 +7086,7 @@ header('Cache-Control: no-cache, must-revalidate');
                 </svg>
                 Store
             </button>
-            <button class="nav-item hidden" data-view="products" data-admin-only="true" id="nav-products">
+            <button class="nav-item hidden<?= $isManaged ? ' managed-hidden' : '' ?>" data-view="products" data-admin-only="true" id="nav-products">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                     <path d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4"></path>
                 </svg>
@@ -7064,7 +7100,7 @@ header('Cache-Control: no-cache, must-revalidate');
                 </svg>
                 Stats
             </button>
-            <button class="nav-item hidden" data-view="customers" data-admin-only="true" id="nav-customers">
+            <button class="nav-item hidden<?= $isManaged ? ' managed-hidden' : '' ?>" data-view="customers" data-admin-only="true" id="nav-customers">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                     <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path>
                     <circle cx="9" cy="7" r="4"></circle>
@@ -7497,6 +7533,12 @@ header('Cache-Control: no-cache, must-revalidate');
         const adminBasePath = <?= json_encode($adminBasePath) ?>;
         const adminUrl = adminBasePath;
         const setupUrl = <?= json_encode(Urls::setup()) ?>;
+        // Public shop front page (managed installs) — where payer-facing
+        // redirect links for admin-created invoices should land. The admin
+        // SPA's own URL is login-gated, so it must never be handed to a
+        // payer. Null in standalone mode, where there is no public shop to
+        // return to.
+        const shopHomeUrl = <?= json_encode(ManagedInstall::shopUrl() ?: null) ?>;
         // Where to point "get a free lightning address" links (Strike). Operator
         // override via CASHUPAY_STRIKE_URL in user_config.php; defaults to strike.me.
         const strikeUrl = <?= json_encode(defined('CASHUPAY_STRIKE_URL') ? CASHUPAY_STRIKE_URL : 'http://strike.me') ?>;
@@ -7930,6 +7972,8 @@ header('Cache-Control: no-cache, must-revalidate');
             if (storeTestBtn) storeTestBtn.addEventListener('click', sendStoreTestNotification);
             const saveNotifsBtn = document.getElementById('btn-save-notifications');
             if (saveNotifsBtn) saveNotifsBtn.addEventListener('click', saveNotificationSettings);
+            const payerCaptureToggle = document.getElementById('notifications-payer-email-capture');
+            if (payerCaptureToggle) payerCaptureToggle.addEventListener('change', updatePayerCaptureDependents);
             const saveDevBtn = document.getElementById('btn-save-developer');
             if (saveDevBtn) saveDevBtn.addEventListener('click', saveDeveloperSettings);
             const testNotifsBtn = document.getElementById('btn-send-test-notification');
@@ -10374,9 +10418,11 @@ header('Cache-Control: no-cache, must-revalidate');
                     amount: amount,
                     currency: currency,
                     checkout: {
-                        // Payers land back on this admin page after paying
-                        // (there is no separate shop to return to).
-                        redirectURL: window.location.href.split('?')[0],
+                        // Managed installs: payers land on the shop's front
+                        // page — this admin's URL is login-gated and would
+                        // only show them the lock screen. Standalone keeps
+                        // the return-to-admin convenience (no shop exists).
+                        redirectURL: shopHomeUrl || window.location.href.split('?')[0],
                         redirectAutomatically: true
                     }
                 };
@@ -11630,10 +11676,15 @@ header('Cache-Control: no-cache, must-revalidate');
                 document.getElementById('notifications-enabled').checked = !!data.enabled;
                 document.getElementById('notifications-invoice-paid').checked = !!data.invoicePaidEnabled;
                 document.getElementById('notifications-auto-cashout').checked = !!data.autoCashoutEnabled;
+                // Effective server-side value (explicit config, or the
+                // managed/standalone default when never saved).
+                const payerCaptureEl = document.getElementById('notifications-payer-email-capture');
+                if (payerCaptureEl) payerCaptureEl.checked = !!data.payerEmailCaptureEnabled;
                 const payerReceiptEl = document.getElementById('notifications-payer-receipt');
                 if (payerReceiptEl) payerReceiptEl.checked = !!data.payerReceiptEnabled;
                 const newsletterDefaultEl = document.getElementById('notifications-newsletter-default');
                 if (newsletterDefaultEl) newsletterDefaultEl.checked = !!data.newsletterDefaultChecked;
+                updatePayerCaptureDependents();
                 document.getElementById('notifications-to-email').value = data.toEmail || '';
                 document.getElementById('notifications-smtp-warning').classList.toggle('hidden', !!data.smtpConfigured);
                 // Global SMTP server fields. Password is write-only: it's never
@@ -11660,10 +11711,24 @@ header('Cache-Control: no-cache, must-revalidate');
             }
         }
 
+        // Receipt + newsletter toggles are dead while payer email capture is
+        // off (the payment page never renders the form) — grey them out so
+        // the dependency is visible, but keep their stored values intact.
+        function updatePayerCaptureDependents() {
+            const captureEl = document.getElementById('notifications-payer-email-capture');
+            const depEl = document.getElementById('payer-email-capture-dependent');
+            if (!captureEl || !depEl) return;
+            const on = captureEl.checked;
+            depEl.style.opacity = on ? '' : '0.5';
+            depEl.style.pointerEvents = on ? '' : 'none';
+        }
+
         async function saveNotificationSettings() {
             const enabled = document.getElementById('notifications-enabled').checked ? '1' : '0';
             const invoicePaid = document.getElementById('notifications-invoice-paid').checked ? '1' : '0';
             const autoCashout = document.getElementById('notifications-auto-cashout').checked ? '1' : '0';
+            const payerCaptureEl = document.getElementById('notifications-payer-email-capture');
+            const payerEmailCapture = payerCaptureEl && payerCaptureEl.checked ? '1' : '0';
             const payerReceiptEl = document.getElementById('notifications-payer-receipt');
             const payerReceipt = payerReceiptEl && payerReceiptEl.checked ? '1' : '0';
             const newsletterDefaultEl = document.getElementById('notifications-newsletter-default');
@@ -11672,7 +11737,9 @@ header('Cache-Control: no-cache, must-revalidate');
             const params = new URLSearchParams({
                 action: 'save_notifications_settings',
                 enabled, invoice_paid_enabled: invoicePaid,
-                auto_cashout_enabled: autoCashout, payer_receipt_enabled: payerReceipt,
+                auto_cashout_enabled: autoCashout,
+                payer_email_capture_enabled: payerEmailCapture,
+                payer_receipt_enabled: payerReceipt,
                 newsletter_default_checked: newsletterDefault,
                 to_email: toEmail,
                 smtp_host: document.getElementById('smtp-host').value.trim(),

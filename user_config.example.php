@@ -149,6 +149,44 @@
 //
 // define('CASHUPAY_EXTERNAL_CRON', true);
 
+// CASHUPAY_MANAGED_INSTALL — declare this a managed single-shop install: the
+// orchestrator's plugin embeds and operates BareBits behind exactly one shop.
+// Shapes the product for that case — single-store admin UI (no store selector
+// or add-store), the shop-owned sections (Products, Customers) and account
+// management hidden (login is automatic via SSO tokens), payer email capture
+// defaulted off, payer redirects preferring the shop's front page — and
+// implies CASHUPAY_EXTERNAL_CRON's cron-screen skip. Constant wins over the
+// env var of the same name; "0" means off.
+//
+// define('CASHUPAY_MANAGED_INSTALL', true);
+
+// CASHUPAY_SHOP_URL — the shop's public front page, used for payer-facing
+// redirects (Return to Shop, admin-created invoices) on managed installs.
+//
+// define('CASHUPAY_SHOP_URL', 'https://example.com');
+
+// CASHUPAY_ADMIN_PASSWORD_HASH — a PHP password_hash() string for the admin
+// account. When set on a fresh install, the setup wizard seeds the `admin`
+// user from it and skips its password screen; the plaintext stays with the
+// orchestrator (the WordPress plugin can reveal it to the site admin).
+//
+// define('CASHUPAY_ADMIN_PASSWORD_HASH', '$2y$10$...');
+
+// CASHUPAY_SSO_KEY_HASH — SHA-256 hex hash of the orchestrator's SSO key.
+// Arms sso.php: POSTing the plaintext key mints a single-use 60-second admin
+// login token, which is how "open BareBits from the shop admin" signs the
+// operator in without a password prompt.
+//
+// define('CASHUPAY_SSO_KEY_HASH', 'hex-sha256-of-key');
+
+// CASHUPAY_RETRY_URL_TEMPLATE — URL of the shop-side "retry an expired
+// invoice" endpoint; {invoiceId} is substituted. When set, the payment page's
+// expired screen offers "Request a new invoice" for e-commerce invoices
+// (metadata orderId), landing the customer where the shop can mint a fresh
+// one (the WordPress plugin redirects to WooCommerce's order-pay page).
+//
+// define('CASHUPAY_RETRY_URL_TEMPLATE', 'https://example.com/?cashupay-retry={invoiceId}');
+
 // CASHUPAY_PROVISION_TOKEN_HASH — SHA-256 hex hash of a one-time provisioning
 // token. When set, provision.php lets the holder of the matching plaintext
 // token collect this install's integration credentials (store id, a freshly

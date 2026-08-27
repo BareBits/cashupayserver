@@ -335,6 +335,24 @@ class Config {
     }
 
     /**
+     * Whether the payment-complete screen offers the payer email/newsletter
+     * capture form (and its send_receipt endpoint accepts POSTs). The
+     * explicit setting (config key payer_email_capture_enabled, saved from
+     * the admin notifications card) wins; unset falls back to a
+     * deployment-shaped default — ON for standalone installs, OFF for
+     * managed single-shop installs, where the shop platform (WooCommerce)
+     * owns customer emails and a second capture form would be noise.
+     */
+    public static function isPayerEmailCaptureEnabled(): bool {
+        $explicit = self::get('payer_email_capture_enabled');
+        if ($explicit !== null && $explicit !== '') {
+            return $explicit === true || $explicit === 1 || $explicit === '1';
+        }
+        require_once __DIR__ . '/managed.php';
+        return !ManagedInstall::isManaged();
+    }
+
+    /**
      * Currencies that may be offered as a default display/input currency in
      * addition to the mint's native unit.
      */

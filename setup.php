@@ -40,6 +40,7 @@ require_once __DIR__ . '/includes/store_ln_addresses.php';
 require_once __DIR__ . '/includes/swap/config.php';
 require_once __DIR__ . '/includes/setup_flow.php';
 require_once __DIR__ . '/includes/desktop.php';
+require_once __DIR__ . '/includes/managed.php';
 
 // Initialize session early - needed for storing temp data during setup
 Auth::initSession();
@@ -117,10 +118,19 @@ if (!Database::isInitialized()) {
     Database::initialize();
 }
 
+// Managed installs provision the admin account up front (see managed.php);
+// seed it before the wizard's shape is computed so the password screen is
+// consistently absent from the very first render.
+ManagedInstall::seedAdminIfProvisioned();
+
 // One resolve per request: the answer can't change mid-request, and the
-// wizard's shape must not either.
+// wizard's shape must not either. A managed install implies the external
+// cron declaration (its orchestrator pings cron.php); the password skip is
+// keyed on the static deployment config, not the users table, so the step
+// counter can never change mid-run.
 $isDesktop = Desktop::isWindowsDesktop();
-$externalCron = SetupFlow::externalCronConfigured();
+$externalCron = SetupFlow::externalCronConfigured() || ManagedInstall::isManaged();
+$passwordPreseeded = ManagedInstall::adminPasswordHash() !== '';
 
 // The security screen exists to prove the data directory can't be fetched
 // over the web. With the directory outside the web root that exposure is
@@ -212,7 +222,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $storeIdForFlow = $_SESSION['setup_store_id'] ?? null;
     $flowSteps = SetupFlow::stepSequence(
         $mode, SetupFlow::onchainState($storeIdForFlow)['configured'],
-        $securityScreenNeeded, $isDesktop, $externalCron
+        $securityScreenNeeded, $isDesktop, $externalCron, $passwordPreseeded
     );
     // Set by the mints handler when it mints a fresh wallet seed. add_store
     // has to stop and show it rather than redirecting past it.
@@ -347,7 +357,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 // whether the zero-conf screen is in the sequence.
                 $flowSteps = SetupFlow::stepSequence(
                     $mode, SetupFlow::onchainState($storeId)['configured'],
-                    $securityScreenNeeded, $isDesktop, $externalCron
+                    $securityScreenNeeded, $isDesktop, $externalCron, $passwordPreseeded
                 );
                 $step = SetupFlow::nextStep('store', $flowSteps) ?? 'onchain';
                 break;
@@ -362,7 +372,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if ($onchainAction === 'skip') {
                     // Nothing saved; the zero-conf screen drops out of the
                     // sequence because there is no on-chain rail to time.
-                    $flowSteps = SetupFlow::stepSequence($mode, false, $securityScreenNeeded, $isDesktop, $externalCron);
+                    $flowSteps = SetupFlow::stepSequence($mode, false, $securityScreenNeeded, $isDesktop, $externalCron, $passwordPreseeded);
                     $step = SetupFlow::nextStep('onchain', $flowSteps) ?? 'lightning';
                     break;
                 }
@@ -472,7 +482,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     ], 'id = ?', [$storeId]);
                 }
 
-                $flowSteps = SetupFlow::stepSequence($mode, true, $securityScreenNeeded, $isDesktop, $externalCron);
+                $flowSteps = SetupFlow::stepSequence($mode, true, $securityScreenNeeded, $isDesktop, $externalCron, $passwordPreseeded);
                 $step = SetupFlow::nextStep('onchain', $flowSteps) ?? 'zeroconf';
                 break;
 
@@ -1332,7 +1342,7 @@ function renderUrlModeDetectionScript(): void { ?>
             $renderStoreId = $_SESSION['setup_store_id'] ?? null;
             $renderOnchain = SetupFlow::onchainState($renderStoreId);
             $renderSteps = SetupFlow::stepSequence(
-                $mode, $renderOnchain['configured'], $securityScreenNeeded, $isDesktop, $externalCron
+                $mode, $renderOnchain['configured'], $securityScreenNeeded, $isDesktop, $externalCron, $passwordPreseeded
             );
             $displayIndex = array_search($step, $renderSteps, true);
             $totalSteps = count($renderSteps);

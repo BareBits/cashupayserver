@@ -81,14 +81,21 @@ final class SetupFlow {
      * companion plugin, which pings cron.php from WP-cron): the installer
      * declared at deploy time that something else already ticks the cron
      * endpoint, so there is nothing for the operator to set up. See
-     * externalCronConfigured() for how the declaration is made.
+     * externalCronConfigured() for how the declaration is made (managed
+     * installs imply it — setup.php folds ManagedInstall::isManaged() in).
+     *
+     * $passwordPreseeded drops the password screen: the orchestrator
+     * provisioned the admin account up front (CASHUPAY_ADMIN_PASSWORD_HASH,
+     * seeded by ManagedInstall::seedAdminIfProvisioned), so there is no
+     * credential left for the wizard to collect. Decided statically from the
+     * deployment config so the step counter stays stable across the run.
      *
      * @return string[]
      */
     public static function stepSequence(
         string $mode, bool $includeZeroConf,
         bool $includeSecurity = true, bool $isDesktop = false,
-        bool $externalCron = false
+        bool $externalCron = false, bool $passwordPreseeded = false
     ): array {
         if ($mode === 'add_store') {
             $steps = self::ADD_STORE_STEPS;
@@ -99,6 +106,9 @@ final class SetupFlow {
             }
             if ($isDesktop || $externalCron) {
                 $steps = array_values(array_diff($steps, ['cron']));
+            }
+            if ($passwordPreseeded) {
+                $steps = array_values(array_diff($steps, ['password']));
             }
         }
         if (!$includeZeroConf) {

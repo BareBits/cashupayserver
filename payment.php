@@ -14,6 +14,7 @@ require_once __DIR__ . '/includes/background.php';
 require_once __DIR__ . '/includes/urls.php';
 require_once __DIR__ . '/includes/cart.php';
 require_once __DIR__ . '/includes/auth.php';
+require_once __DIR__ . '/includes/managed.php';
 require_once __DIR__ . '/includes/payment_path_debug.php';
 require_once __DIR__ . '/includes/offline_cashu.php';
 
@@ -169,6 +170,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'send_
     require_once __DIR__ . '/includes/notification_sender.php';
     header('Content-Type: application/json');
 
+    // Deployments with payer email capture off (managed single-shop installs
+    // by default — the shop owns customer emails) don't render the form, so
+    // reject the endpoint outright rather than trusting the client not to
+    // POST.
+    if (!Config::isPayerEmailCaptureEnabled()) {
+        cashupay_status(404);
+        echo json_encode(['error' => 'Not available.']);
+        exit;
+    }
+
     // Accepted for a settled invoice (receipt queued immediately) or while a
     // detected on-chain payment is still confirming (email saved now, receipt
     // queued at settlement — see NotificationSender::flushRequestedPayerReceipts).
@@ -250,6 +261,30 @@ $redirectUrl = $checkoutConfig['redirectURL'] ?? null;
 if ($redirectUrl !== null && $redirectUrl !== '') {
     $redirectUrl = Security::sanitizeUrl((string)$redirectUrl);
 }
+// Managed installs: payer-facing exits prefer the shop's front page. An
+// invoice with no redirect gets the provisioned shop URL, and a redirect
+// pointing at the BareBits admin/setup surfaces (invoices created from the
+// embedded admin's "Request payment" modal historically stored the admin
+// SPA's own URL) is rewritten there too — those surfaces are login-gated
+// and payer-hostile. Boundary-checked prefix match, so an unrelated page
+// that merely starts with the same string survives. Render-time (not
+// create-time) so invoices already carrying an admin URL are covered.
+$managedShopUrl = ManagedInstall::shopUrl();
+if ($managedShopUrl !== '') {
+    if ($redirectUrl === null || $redirectUrl === '') {
+        $redirectUrl = $managedShopUrl;
+    } else {
+        $adminBase = rtrim(Config::getBaseUrl(), '/');
+        foreach ([$adminBase . '/admin', $adminBase . '/setup'] as $surface) {
+            $next = $redirectUrl[strlen($surface)] ?? '';
+            if (strpos($redirectUrl, $surface) === 0
+                    && in_array($next, ['', '/', '?', '#', '.'], true)) {
+                $redirectUrl = $managedShopUrl;
+                break;
+            }
+        }
+    }
+}
 $redirectAuto = $checkoutConfig['redirectAutomatically'] ?? true;
 
 // Pull the payer-facing note out of the invoice's metadata. itemDesc is what
@@ -258,16 +293,33 @@ $redirectAuto = $checkoutConfig['redirectAutomatically'] ?? true;
 $invoiceMetadata = $invoice['metadata'] ? json_decode($invoice['metadata'], true) : null;
 $invoiceNote = is_array($invoiceMetadata) ? trim((string)($invoiceMetadata['itemDesc'] ?? '')) : '';
 
+// E-commerce invoices (metadata.orderId) get a retry link on the expired
+// screen when the deployment provisioned a shop-side retry endpoint
+// (CASHUPAY_RETRY_URL_TEMPLATE — the WordPress plugin's endpoint bounces the
+// customer to WooCommerce's order-pay page, where clicking "Pay" makes the
+// gateway mint a fresh invoice for the same order). Invoices with no order
+// to re-pay keep the plain Return-to-Shop exit.
+$retryUrl = null;
+$retryTemplate = ManagedInstall::retryUrlTemplate();
+if ($retryTemplate !== '' && is_array($invoiceMetadata) && !empty($invoiceMetadata['orderId'])) {
+    $retryUrl = str_replace('{invoiceId}', rawurlencode((string)$invoice['id']), $retryTemplate);
+}
+
+// Whether the payer email/newsletter capture form exists at all on this
+// deployment (managed single-shop installs default it off — the shop owns
+// customer emails). Gates the form, the newsletter default, and receipts.
+$emailCaptureEnabled = Config::isPayerEmailCaptureEnabled();
+
 // Decide whether to render the payer-receipt form. The check is composed of
 // site-wide master switch + per-type toggle + SMTP. When false, the success
 // modal shows a "screenshot this page" fallback instead.
 require_once __DIR__ . '/includes/notification_sender.php';
-$payerReceiptOffered = NotificationSender::isPayerReceiptOffered();
+$payerReceiptOffered = $emailCaptureEnabled && NotificationSender::isPayerReceiptOffered();
 
 // Resolve the newsletter checkbox's initial state for this store (per-store
 // override → site-wide default). The email/newsletter capture form is shown
 // regardless of whether receipts are offered.
-$newsletterDefaultChecked = Config::getNewsletterDefaultChecked($invoice['store_id']);
+$newsletterDefaultChecked = $emailCaptureEnabled && Config::getNewsletterDefaultChecked($invoice['store_id']);
 
 // An on-chain payment was seen in the mempool but hasn't confirmed yet. This
 // drives the unified detected/complete screen: same layout as the settled
@@ -1328,6 +1380,7 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                     <div><span class="label">Note:</span><span class="invoice-note-value"><?= htmlspecialchars($invoiceNote) ?></span></div>
                     <?php endif; ?>
                 </div>
+                <?php if ($emailCaptureEnabled): ?>
                 <form class="receipt-form" id="receipt-form" data-receipt-offered="<?= $payerReceiptOffered ? '1' : '0' ?>" novalidate>
                     <div class="receipt-prompt">
                         <?= $payerReceiptOffered ? 'Email me a payment confirmation' : 'Leave your email' ?>
@@ -1343,6 +1396,7 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                     <button type="button" class="receipt-skip" id="receipt-skip">No thanks</button>
                     <div class="receipt-status hidden" id="receipt-status"></div>
                 </form>
+                <?php endif; ?>
                 <?php if (!$payerReceiptOffered): ?>
                 <div class="receipt-fallback <?= $onchainPendingInitial ? 'hidden' : '' ?>" id="receipt-fallback">
                     Screenshot this page or save your invoice ID for your records.
@@ -1362,7 +1416,18 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                 <p style="color: var(--text-secondary); margin-top: 1rem;">
                     This invoice has expired. Please request a new one.
                 </p>
-                <?php if ($redirectUrl): ?>
+                <?php if ($retryUrl): ?>
+                    <a href="<?= htmlspecialchars($retryUrl) ?>" class="btn <?= $invoice['status'] === 'Invalid' ? 'hidden' : '' ?>" style="margin-top: 1.5rem;" id="retry-btn">
+                        Request a new invoice
+                    </a>
+                    <?php if ($redirectUrl): ?>
+                        <p style="margin-top: 1rem;">
+                            <a href="<?= htmlspecialchars($redirectUrl) ?>" style="color: var(--text-secondary);">
+                                Return to Shop
+                            </a>
+                        </p>
+                    <?php endif; ?>
+                <?php elseif ($redirectUrl): ?>
                     <a href="<?= htmlspecialchars($redirectUrl) ?>" class="btn" style="margin-top: 1.5rem;">
                         Return to Shop
                     </a>
