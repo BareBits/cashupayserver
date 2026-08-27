@@ -312,6 +312,12 @@ $releaseBase = getenv('CASHUPAY_RELEASE_API_BASE');
 if ($releaseBase !== false && $releaseBase !== '' && !defined('CASHUPAY_RELEASE_API_BASE')) {{
     define('CASHUPAY_RELEASE_API_BASE', $releaseBase);
 }}
+// Release channel override (the same wp-config.php constant a site operator
+// would use) so tests can exercise the testing-channel release pick.
+$releaseChannel = getenv('CASHUPAY_RELEASE_CHANNEL');
+if ($releaseChannel !== false && $releaseChannel !== '' && !defined('CASHUPAY_RELEASE_CHANNEL')) {{
+    define('CASHUPAY_RELEASE_CHANNEL', $releaseChannel);
+}}
 // WordPress front controller — fall through to wp's index.php on misses.
 //
 // Paths resolve against the WordPress docroot, NOT __DIR__: this router lives
@@ -328,36 +334,41 @@ if (substr($uri, -4) === '.php' && file_exists($file)) {{
     require $file;
     return true;
 }}
-// The BareBits server the plugin installed alongside WordPress lives at
-// /barebits inside this docroot. Apache would apply ITS .htaccess there; a
-// router script gets no .htaccess, so emulate the two rewrites the stack
-// depends on: the Greenfield API (the WooCommerce gateway calls
-// {{btcpay_gf_url}}/api/v1/... on the bare base URL) and the extensionless
-// pairing endpoint. Everything else under /barebits is real files (served
-// above) or the app's own router.php URLs.
-// PATH_INFO-style routing (Apache's AcceptPathInfo): the BareBits admin
-// canonicalizes to /barebits/admin.php/<view>.
+{barebits_rewrites}require {wp_index!r};
+"""
+
+# The BareBits server the plugin installed alongside WordPress lives at
+# /barebits inside this docroot. Apache would apply ITS .htaccess there; a
+# router script gets no .htaccess, so this block emulates the rewrites the
+# stack depends on: the Greenfield API (the WooCommerce gateway calls
+# {btcpay_gf_url}/api/v1/... on the bare base URL), the extensionless pairing
+# endpoint, and PATH_INFO-style routing (Apache's AcceptPathInfo — the
+# BareBits admin canonicalizes to /barebits/admin.php/<view>). Everything else
+# under /barebits is real files (served above) or the app's own router.php
+# URLs. Omitted entirely for the "hostile host" fixture (emulate_rewrites=
+# False): an nginx-style server that executes *.php files but applies no
+# rewrite rules at all, on which the setup wizard must still complete.
+BAREBITS_REWRITES_SNIPPET = """\
 if (preg_match('#^(/barebits/[^/]+\\.php)(/.*)$#', $uri, $m)
-        && is_file($docRoot . $m[1])) {{
+        && is_file($docRoot . $m[1])) {
     $_SERVER['PATH_INFO'] = $m[2];
     $_SERVER['SCRIPT_NAME'] = $m[1];
     require $docRoot . $m[1];
     return true;
-}}
+}
 if (preg_match('#^/barebits(/api/v1/.*)$#', $uri, $m)
-        && is_file($docRoot . '/barebits/api.php')) {{
+        && is_file($docRoot . '/barebits/api.php')) {
     $_SERVER['PATH_INFO'] = $m[1];
     $_SERVER['SCRIPT_NAME'] = '/barebits/api.php';
     require $docRoot . '/barebits/api.php';
     return true;
-}}
+}
 if ($uri === '/barebits/api-keys/authorize'
-        && is_file($docRoot . '/barebits/api-keys/authorize.php')) {{
+        && is_file($docRoot . '/barebits/api-keys/authorize.php')) {
     $_SERVER['SCRIPT_NAME'] = '/barebits/api-keys/authorize.php';
     require $docRoot . '/barebits/api-keys/authorize.php';
     return true;
-}}
-require {wp_index!r};
+}
 """
 
 
@@ -366,6 +377,8 @@ def start_wordpress(
     *,
     install_cashupay: bool = True,
     release_api_base: str | None = None,
+    release_channel: str | None = None,
+    emulate_rewrites: bool = True,
 ) -> WordPressHandle:
     """Stand up a fresh SQLite-backed WordPress install.
 
@@ -375,7 +388,14 @@ def start_wordpress(
     zip itself (`wp plugin install <zip>`) and exercise the shipped artifact.
 
     release_api_base points the plugin's "install BareBits alongside" flow at
-    a local fixture release server instead of api.github.com.
+    a local fixture release server instead of api.github.com; release_channel
+    pins the plugin's release channel the way a wp-config.php constant would
+    ('testing' makes it read the fixture's /releases listing).
+
+    emulate_rewrites=False serves /barebits WITHOUT the Apache-.htaccess
+    rewrite emulation — a "hostile host" (think nginx with a plain WordPress
+    config) that executes real *.php files but routes everything else into
+    WordPress. The setup wizard must survive such hosts.
     """
     php_exe = binaries.ensure(binaries.PHP)["php"]
     wp_cli_phar = binaries.ensure_file(binaries.WP_CLI)
@@ -421,6 +441,7 @@ def start_wordpress(
         ROUTER_WRAPPER_TEMPLATE.format(
             wp_root=str(wp_root),
             wp_index=str(wp_root / "index.php"),
+            barebits_rewrites=BAREBITS_REWRITES_SNIPPET if emulate_rewrites else "",
         )
     )
 
@@ -468,6 +489,8 @@ def start_wordpress(
     env.setdefault("CASHUPAY_ALLOW_PRIVATE_ENDPOINTS", "1")
     if release_api_base:
         env["CASHUPAY_RELEASE_API_BASE"] = release_api_base
+    if release_channel:
+        env["CASHUPAY_RELEASE_CHANNEL"] = release_channel
     # Fork multiple worker processes for the built-in server. A single-threaded
     # `php -S` deadlocks on any same-server loopback request, and this stack
     # makes several: the BTCPay gateway calls the BareBits Greenfield API (same

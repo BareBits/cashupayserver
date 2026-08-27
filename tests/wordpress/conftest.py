@@ -57,8 +57,20 @@ def standalone_zip() -> Path:
 
 @pytest.fixture
 def release_server(standalone_zip: Path) -> Iterator[ReleaseServer]:
-    """GitHub-releases stand-in serving the standalone zip + SHA256SUMS."""
+    """GitHub-releases stand-in serving the standalone zip + SHA256SUMS as a
+    STABLE release (/releases/latest answers)."""
     rs = start_release_server(standalone_zip)
+    yield rs
+    stop_release_server(rs)
+
+
+@pytest.fixture
+def testing_release_server(standalone_zip: Path) -> Iterator[ReleaseServer]:
+    """GitHub-releases stand-in publishing the zip as a testing PRERELEASE:
+    it heads /releases but /releases/latest answers 404, exactly like GitHub
+    when a repo's newest release is a prerelease. A testing-channel plugin
+    must find it; a stable-channel plugin must not."""
+    rs = start_release_server(standalone_zip, prerelease=True)
     yield rs
     stop_release_server(rs)
 
@@ -74,12 +86,52 @@ def wordpress_bare() -> Iterator[WordPressHandle]:
 
 
 @pytest.fixture
-def wordpress_install_mode(release_server: ReleaseServer) -> Iterator[WordPressHandle]:
-    """WordPress + plugin, with the plugin's release downloader pointed at the
-    fixture release server — the install-alongside path's test double for
-    api.github.com."""
+def wordpress_bare_install(release_server: ReleaseServer) -> Iterator[WordPressHandle]:
+    """Bare WordPress (no plugin) pointed at the stable fixture release
+    server — for tests that install the BUILT plugin zip themselves and then
+    walk the install-alongside flow the way a real merchant would."""
+    workdir = SESSION_TMP / f"wp-bare-inst-{uuid.uuid4().hex[:8]}"
+    handle = start_wordpress(
+        workdir, install_cashupay=False, release_api_base=release_server.api_base
+    )
+    _allow_nonstandard_ports(handle)
+    yield handle
+    stop_wordpress(handle)
+
+
+@pytest.fixture
+def wordpress_install_mode(testing_release_server: ReleaseServer) -> Iterator[WordPressHandle]:
+    """WordPress + plugin on the TESTING release channel, with the plugin's
+    release downloader pointed at the fixture release server — the
+    install-alongside path's test double for api.github.com. Testing channel
+    on purpose: it exercises the /releases prerelease pick end to end (the
+    stable /releases/latest pick is covered by the built-zip journey test and
+    the PHP unit tests)."""
     workdir = SESSION_TMP / f"wp-inst-{uuid.uuid4().hex[:8]}"
-    handle = start_wordpress(workdir, release_api_base=release_server.api_base)
+    handle = start_wordpress(
+        workdir,
+        release_api_base=testing_release_server.api_base,
+        release_channel="testing",
+    )
+    _allow_nonstandard_ports(handle)
+    yield handle
+    stop_wordpress(handle)
+
+
+@pytest.fixture
+def wordpress_hostile_host(testing_release_server: ReleaseServer) -> Iterator[WordPressHandle]:
+    """WordPress + plugin on a rewrite-hostile host: real *.php files execute,
+    but NO .htaccess-style rewrites apply under /barebits (nginx with a plain
+    WordPress config, Apache with AllowOverride None). Extension-less and
+    PATH_INFO URLs fall through to WordPress's themed 404. The setup wizard
+    must still complete on such a host."""
+    workdir = SESSION_TMP / f"wp-hostile-{uuid.uuid4().hex[:8]}"
+    handle = start_wordpress(
+        workdir,
+        release_api_base=testing_release_server.api_base,
+        release_channel="testing",
+        emulate_rewrites=False,
+    )
     _allow_nonstandard_ports(handle)
     yield handle
     stop_wordpress(handle)
