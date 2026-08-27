@@ -25,6 +25,11 @@ if (!defined('ABSPATH')) {
 add_action('admin_post_cashupay_choose_mode', 'cashupay_handle_choose_mode');
 add_action('admin_post_cashupay_run_install', 'cashupay_handle_run_install');
 add_action('admin_post_cashupay_collect_provision', 'cashupay_handle_collect_provision');
+add_action('admin_post_cashupay_provision_return', 'cashupay_handle_provision_return');
+// Logged-out variant: a wp-admin session that expired mid-wizard would
+// otherwise land the merchant on a blank admin-post.php page. Send them
+// through the login form and back to the onboarding page instead.
+add_action('admin_post_nopriv_cashupay_provision_return', 'cashupay_handle_provision_return_nopriv');
 add_action('admin_post_cashupay_start_pairing', 'cashupay_handle_start_pairing');
 add_action('admin_post_cashupay_finish', 'cashupay_handle_finish');
 add_action('admin_post_cashupay_reset_onboarding', 'cashupay_handle_reset_onboarding');
@@ -146,21 +151,28 @@ function cashupay_handle_run_install(): void {
         if (cashupay_install_api_routes_ok($result['url'])) {
             cashupay_flash('success', $message);
         } else {
+            // With the API bridge in place (api-bridge.php), /api/v1 answers
+            // even on hosts that ignore the install's .htaccess — so a failed
+            // probe now usually means this site cannot request its own URLs
+            // at all (a loopback block), which the bridge and the WP-cron
+            // heartbeat both depend on.
             cashupay_flash('warning', $message . ' Heads up: the install\'s /api/v1 routes are not '
-                . 'answering, which usually means your web server ignores the install\'s .htaccess '
-                . 'rewrite rules (common on nginx). The setup wizard below still works, but the '
-                . 'final "connect WooCommerce" step will fail until those routes are reachable — '
-                . 'ask your host about enabling .htaccess/rewrite support for the install folder.');
+                . 'answering. This usually means this WordPress site is blocked from making HTTP '
+                . 'requests to its own URL (a firewall or hosting "loopback" restriction). The setup '
+                . 'wizard below still works, but the final "connect WooCommerce" step will fail until '
+                . 'those routes are reachable — ask your host about allowing loopback requests.');
         }
     }
     wp_safe_redirect(cashupay_onboarding_url());
     exit;
 }
 
-/** Install mode: try to collect credentials through the handshake. */
-function cashupay_handle_collect_provision(): void {
-    cashupay_require_admin_post('cashupay_collect_provision');
-
+/**
+ * Collect credentials through the handshake, store them, and flash the
+ * outcome. Shared by the manual "I finished the wizard" button and the
+ * wizard's own return link (cashupay_handle_provision_return).
+ */
+function cashupay_collect_provision_and_store(): void {
     $result = cashupay_collect_provision();
     if ($result['status'] === 'pending') {
         cashupay_flash('warning', 'BareBits setup is not finished yet — complete the wizard, then try again.');
@@ -184,7 +196,47 @@ function cashupay_handle_collect_provision(): void {
     } else {
         cashupay_flash('error', $result['message']);
     }
+}
+
+/** Install mode: try to collect credentials through the handshake. */
+function cashupay_handle_collect_provision(): void {
+    cashupay_require_admin_post('cashupay_collect_provision');
+
+    cashupay_collect_provision_and_store();
     wp_safe_redirect(cashupay_onboarding_url());
+    exit;
+}
+
+/**
+ * Install mode: the wizard's completion screen sent the operator back here
+ * (CASHUPAY_MANAGED_RETURN_URL, written by the installer). Collect the
+ * credentials and land on the next onboarding step — the merchant clicks
+ * nothing on the WordPress side.
+ *
+ * Capability-gated but deliberately nonce-free: the link is minted at
+ * install time and rendered by the BareBits wizard, which cannot create
+ * WordPress nonces (and must not — it knows nothing of WordPress). The
+ * action is idempotent and merely advances the plugin's own onboarding
+ * state, the same thing the nonce-protected manual button does.
+ */
+function cashupay_handle_provision_return(): void {
+    if (!current_user_can('manage_options')) {
+        wp_die(__('Sorry, you are not allowed to do that.'), 403);
+    }
+    // Nothing left to collect (already collected, or not in install mode):
+    // just land on the onboarding page at whatever step it is on. Covers a
+    // re-click of the wizard's finish button after the handshake completed.
+    if (cashupay_mode() === 'install'
+            && (string) get_option('cashupay_provision_token', '') !== '') {
+        cashupay_collect_provision_and_store();
+    }
+    wp_safe_redirect(cashupay_onboarding_url());
+    exit;
+}
+
+/** See the admin_post_nopriv registration above. */
+function cashupay_handle_provision_return_nopriv(): void {
+    wp_safe_redirect(wp_login_url(cashupay_onboarding_url()));
     exit;
 }
 
@@ -219,7 +271,17 @@ function cashupay_handle_start_pairing(): void {
         $query[] = 'permissions=' . rawurlencode($permission);
     }
 
-    wp_redirect($server . '/api-keys/authorize?' . implode('&', $query));
+    // The alongside install may sit on a host that ignores its .htaccess and
+    // supports no PATH_INFO (Local WP's nginx), where the extension-less
+    // /api-keys/authorize never reaches BareBits. The real file at
+    // authorize.php answers on every host, and it builds its self-post URL
+    // from its own request path, so the whole approval flow stays on the
+    // .php form. Remote servers keep the pretty BTCPay-convention URL their
+    // operator's setup already proved.
+    $authorizePath = ($server !== '' && $server === cashupay_install_url())
+        ? '/api-keys/authorize.php'
+        : '/api-keys/authorize';
+    wp_redirect($server . $authorizePath . '?' . implode('&', $query));
     exit;
 }
 
@@ -526,16 +588,81 @@ function cashupay_render_step_provision(): void {
     ?>
     <h2>Finish the BareBits setup</h2>
     <p>BareBits is installed. Walk through its setup wizard below — it configures your store, wallets and payment rails, and shows you the recovery phrase to write down.
-       (Prefer a full window? <a href="<?= esc_url($setupUrl) ?>" target="_blank" rel="noopener">Open the wizard in a new tab</a>.)</p>
+       When the wizard says you're done, its finish button brings you straight back here.</p>
+    <p>
+        <button type="button" class="button button-primary button-hero" id="cashupay-wizard-expand">Continue — open the wizard full screen</button>
+        <a href="<?= esc_url($setupUrl) ?>" target="_blank" rel="noopener" style="margin-left: 0.75em;">or open it in a new tab</a>
+    </p>
+    <style>
+    #cashupay-wizard-shell { position: relative; }
+    /* Expanded: fill the whole wp-admin viewport except the admin bar and the
+       left menu, tracking WordPress's own menu breakpoints (folded 36px,
+       hidden + 46px-tall bar on mobile). z-index sits just under the admin
+       bar's 99999 so the bar stays usable. */
+    #cashupay-wizard-shell.cashupay-expanded {
+        position: fixed;
+        top: 32px;
+        left: 160px;
+        right: 0;
+        bottom: 0;
+        z-index: 99998;
+        margin: 0;
+        background: #fff;
+    }
+    #cashupay-wizard-shell.cashupay-expanded iframe {
+        width: 100% !important;
+        height: 100% !important;
+        border: 0 !important;
+        border-radius: 0 !important;
+        display: block;
+    }
+    body.folded #cashupay-wizard-shell.cashupay-expanded { left: 36px; }
+    @media screen and (max-width: 960px) {
+        #cashupay-wizard-shell.cashupay-expanded { left: 36px; }
+    }
+    @media screen and (max-width: 782px) {
+        #cashupay-wizard-shell.cashupay-expanded { left: 0; top: 46px; }
+    }
+    #cashupay-wizard-exit {
+        display: none;
+        position: absolute;
+        top: 8px;
+        right: 24px;
+        z-index: 1;
+    }
+    #cashupay-wizard-shell.cashupay-expanded #cashupay-wizard-exit { display: block; }
+    </style>
     <!-- Same-origin embed: the alongside install lives under this site's own
          origin, so the wizard runs inside wp-admin just like the old bundled
          plugin's did. -->
-    <iframe src="<?= esc_url($setupUrl) ?>" title="BareBits setup"
-            style="width: 100%; height: 70vh; border: 1px solid #c3c4c7; border-radius: 4px; background: #fff;"></iframe>
+    <div id="cashupay-wizard-shell">
+        <button type="button" class="button" id="cashupay-wizard-exit">Exit full screen</button>
+        <iframe src="<?= esc_url($setupUrl) ?>" title="BareBits setup"
+                style="width: 100%; height: 70vh; border: 1px solid #c3c4c7; border-radius: 4px; background: #fff;"></iframe>
+    </div>
+    <script>
+    (function () {
+        const shell = document.getElementById('cashupay-wizard-shell');
+        const setExpanded = function (on) {
+            shell.classList.toggle('cashupay-expanded', on);
+            // Survive reloads mid-wizard: an accidental refresh (or the
+            // page revisited while setup is unfinished) returns to the
+            // full-screen view the merchant chose.
+            try { sessionStorage.setItem('cashupayWizardExpanded', on ? '1' : '0'); } catch (e) {}
+        };
+        document.getElementById('cashupay-wizard-expand').addEventListener('click', function () { setExpanded(true); });
+        document.getElementById('cashupay-wizard-exit').addEventListener('click', function () { setExpanded(false); });
+        try {
+            if (sessionStorage.getItem('cashupayWizardExpanded') === '1') {
+                setExpanded(true);
+            }
+        } catch (e) {}
+    })();
+    </script>
     <form method="post" action="<?= esc_url(admin_url('admin-post.php')) ?>" style="margin-top: 1em;">
         <?php wp_nonce_field('cashupay_collect_provision'); ?>
         <input type="hidden" name="action" value="cashupay_collect_provision">
-        <p class="description">When the wizard says you're done, continue:</p>
+        <p class="description">Finished the wizard but still seeing this page? Continue manually:</p>
         <?php submit_button('I finished the wizard — continue', 'secondary'); ?>
     </form>
     <?php

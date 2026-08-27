@@ -49,9 +49,20 @@ if (!Security::checkRateLimit('api', $clientIp, 100)) {
 // Parse request
 $method = $_SERVER['REQUEST_METHOD'];
 
-// Use PATH_INFO if set (from router.php), otherwise parse REQUEST_URI
+// Use PATH_INFO if set (from router.php), else an explicit cashupay_path
+// query parameter, otherwise parse REQUEST_URI.
+//
+// The query form (/api.php?cashupay_path=/api/v1/...) exists for hosts where
+// NO path-based routing reaches PHP: no .htaccess rewrites and no PATH_INFO
+// (nginx with a stock WordPress config only executes URLs that end in .php).
+// A direct .php URL with the API path carried as data works on every such
+// host. The canonical caller is the GPL WordPress companion plugin's API
+// bridge, which catches /api/v1/* requests that fell through to WordPress
+// and replays them here in this form.
 if (!empty($_SERVER['PATH_INFO'])) {
     $path = $_SERVER['PATH_INFO'];
+} elseif (isset($_GET['cashupay_path']) && str_starts_with((string)$_GET['cashupay_path'], '/')) {
+    $path = (string)$_GET['cashupay_path'];
 } else {
     $path = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH);
 

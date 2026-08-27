@@ -24,6 +24,7 @@ define('CASHUPAY_PLUGIN_DIR', __DIR__);
 define('CASHUPAY_PLUGIN_FILE', __FILE__);
 
 require_once __DIR__ . '/state.php';
+require_once __DIR__ . '/api-bridge.php';
 require_once __DIR__ . '/installer.php';
 require_once __DIR__ . '/btcpay-integration.php';
 require_once __DIR__ . '/elex-discount.php';

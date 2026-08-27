@@ -75,6 +75,24 @@ final class ManagedInstall {
     }
 
     /**
+     * URL of the orchestrator's "the wizard is finished" endpoint. When
+     * provisioned, the wizard's completion screen renders a single primary
+     * "return to the shop admin" button pointing here (target="_top", so it
+     * breaks out of an embedding iframe) instead of the manual connect-your-
+     * e-commerce instructions — the orchestrator collects credentials through
+     * the provisioning handshake and finishes the wiring itself. Pure data:
+     * nothing on this side ever calls the URL; the operator's browser
+     * navigates to it. '' when not provisioned. http(s) only — the value
+     * ends up in an href.
+     */
+    public static function returnUrl(): string {
+        $url = defined('CASHUPAY_MANAGED_RETURN_URL') ? (string)CASHUPAY_MANAGED_RETURN_URL
+            : (string)(getenv('CASHUPAY_MANAGED_RETURN_URL') ?: '');
+        $url = trim($url);
+        return preg_match('#^https?://#i', $url) ? $url : '';
+    }
+
+    /**
      * URL template for the shop-side "retry an expired invoice" endpoint;
      * '{invoiceId}' is replaced with the raw invoice id. '' when not
      * provisioned. The payment page's expired screen renders a retry button

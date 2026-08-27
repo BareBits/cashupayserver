@@ -2747,6 +2747,28 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                 <?php endif; ?>
 
                 <?php
+                // Managed installs with a provisioned return URL hand the
+                // operator straight back to the orchestrator (the WordPress
+                // plugin's onboarding page), which collects credentials and
+                // wires the shop itself — the manual connect-your-e-commerce
+                // instructions below would only mislead. target="_top" breaks
+                // out of the orchestrator's embedding iframe; the URL is pure
+                // provisioned data and nothing here ever requests it.
+                $managedReturn = ManagedInstall::isManaged() ? ManagedInstall::returnUrl() : '';
+                ?>
+                <?php if ($managedReturn !== ''): ?>
+
+                <a id="managed-return-link" href="<?= htmlspecialchars($managedReturn) ?>" target="_top"
+                   class="btn" style="width: 100%; text-align: center; display: block;">
+                    Finish &mdash; return to WordPress
+                </a>
+                <p style="color: #a0aec0; font-size: 0.85rem; margin-top: 0.75rem; text-align: center;">
+                    Your shop finishes connecting automatically on the next screen.
+                </p>
+
+                <?php else: ?>
+
+                <?php
                 $baseUrl = Urls::siteBase();
                 ?>
 
@@ -2818,6 +2840,8 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                 <a href="<?= Urls::admin() ?>" class="btn" style="width: 100%; text-align: center; display: block;">
                     Go to BareBits Admin
                 </a>
+
+                <?php endif; // managed return vs. manual connect ?>
 
                 <?php
                 // Clear temporary session data.
