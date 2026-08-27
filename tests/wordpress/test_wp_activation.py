@@ -1,50 +1,64 @@
-"""WordPress fixture smoke tests: plugin activates, admin menu present."""
+"""Plugin activation smoke tests for the thin GPL plugin.
+
+The plugin is WordPress-only glue: no BareBits server code ships inside it,
+so activation must neither define the old embedded-mode constants nor
+register any /cashupay/* front-end routes. What it must do: register the
+top-level BareBits admin page (which renders the onboarding chooser until a
+server is wired), expose the installer entry point, and nag unconfigured
+admins toward setup — without ever leaking that nag to the storefront.
+"""
 from __future__ import annotations
 
 import pytest
+import requests
 
+from wordpress.conftest import onboarding_page, wp_login
 from fixtures.wordpress import WordPressHandle
 
 pytestmark = pytest.mark.wordpress
 
+CHOOSER_URL_COPY = "already run a BareBits server"
+CHOOSER_INSTALL_COPY = "Install BareBits alongside WordPress"
+
 
 def test_wp_install_is_reachable(wordpress: WordPressHandle) -> None:
     """The fresh WP install responds on its ephemeral port."""
-    import requests
     r = requests.get(wordpress.url, timeout=10)
     assert r.status_code == 200
     assert "wordpress" in r.text.lower() or "html" in r.headers.get("Content-Type", "").lower()
 
 
-def test_cashupay_plugin_is_active(wordpress: WordPressHandle) -> None:
-    """wp-cli reports cashupay as an active plugin."""
+def test_cashupay_plugin_activates_cleanly(wordpress: WordPressHandle) -> None:
+    """The copied-source plugin tree is active (the fixture activates it, which
+    already ran every __DIR__ require without a fatal) and its header parses."""
     result = wordpress.wp_cli("plugin", "list", "--field=name", "--status=active")
     active = result.stdout.split()
     assert "cashupay" in active, f"cashupay not active; active plugins: {active}"
 
+    version = wordpress.wp_cli("plugin", "get", "cashupay", "--field=version").stdout.strip()
+    assert version, "plugin version header empty — cashupay.php header not parsed"
 
-def test_cashupay_constants_defined(wordpress: WordPressHandle) -> None:
-    """Plugin bootstrap.php defines CASHUPAY_WORDPRESS and CASHUPAY_PLUGIN_DIR."""
-    # `wp eval` runs PHP within the WP context — including loaded plugins.
-    result = wordpress.wp_cli(
-        "eval",
-        "echo (int)defined('CASHUPAY_WORDPRESS') . '|' . (defined('CASHUPAY_PLUGIN_DIR') ? CASHUPAY_PLUGIN_DIR : 'undef');",
+
+def test_no_embedded_server_constants(wordpress: WordPressHandle) -> None:
+    """The GPL split removed the embedded server: CASHUPAY_WORDPRESS (the old
+    bootstrap.php marker) must no longer exist, while the installer entry point
+    the onboarding flow calls must."""
+    defined = wordpress.wp_cli(
+        "eval", "var_export(defined('CASHUPAY_WORDPRESS'));"
+    ).stdout.strip()
+    assert defined == "false", (
+        f"CASHUPAY_WORDPRESS must not be defined by the thin plugin: {defined!r}"
     )
-    flag, plugin_dir = result.stdout.strip().split("|", 1)
-    assert flag == "1", f"CASHUPAY_WORDPRESS not defined: {result.stdout!r} stderr={result.stderr!r}"
-    assert "cashupay" in plugin_dir, plugin_dir
 
-
-def test_cashupay_data_dir_honored(wordpress: WordPressHandle) -> None:
-    """wp-config.php pins CASHUPAY_DATA_DIR to the per-test isolated path."""
-    result = wordpress.wp_cli("eval", "echo CASHUPAY_DATA_DIR;")
-    assert str(wordpress.data_dir) == result.stdout.strip(), result.stdout
+    exists = wordpress.wp_cli(
+        "eval", "var_export(function_exists('cashupay_run_install'));"
+    ).stdout.strip()
+    assert exists == "true", "cashupay_run_install (installer.php) must be loaded"
 
 
 def test_plugin_uri_points_at_barebits_repo(wordpress: WordPressHandle) -> None:
     """The "Visit plugin site" link on the Plugins screen must lead to the
-    BareBits fork that actually ships this plugin, not the old ArcadeLabsInc
-    upstream URL that no longer hosts it."""
+    BareBits fork that actually ships this plugin."""
     result = wordpress.wp_cli(
         "eval",
         "require_once ABSPATH . 'wp-admin/includes/plugin.php';"
@@ -73,28 +87,45 @@ def test_admin_menu_is_a_top_level_section_not_under_tools(wordpress: WordPressH
     assert under_tools == "0", "BareBits must no longer live under the Tools menu"
 
 
-def test_unconfigured_admin_banner_invites_configuration(wordpress: WordPressHandle) -> None:
-    """A freshly installed, not-yet-configured plugin shows an admin banner that
-    links operators into setup via the embedded BareBits admin page (the menu
-    page iframes the wizard while setup is incomplete), keeping them inside
-    wp-admin. Rendered for a manage_options user."""
-    snippet = (
-        "wp_set_current_user(1);"
-        "ob_start(); cashupay_admin_notice(); echo ob_get_clean();"
+def test_admin_page_renders_the_onboarding_chooser(wordpress: WordPressHandle) -> None:
+    """Until a server is wired, the BareBits wp-admin page IS the onboarding
+    flow, opening on the two-way chooser (connect by URL / install alongside)."""
+    s = wp_login(wordpress)
+    body = onboarding_page(s, wordpress)
+    assert CHOOSER_URL_COPY in body, body[:2000]
+    assert CHOOSER_INSTALL_COPY in body, body[:2000]
+
+
+def test_admin_page_requires_authentication(wordpress: WordPressHandle) -> None:
+    """An anonymous request for the BareBits page never sees the chooser — WP
+    bounces it to the login screen before the plugin renders anything."""
+    r = requests.get(
+        f"{wordpress.url}/wp-admin/admin.php",
+        params={"page": "cashupay"},
+        timeout=30,
+        allow_redirects=False,
     )
-    body = wordpress.wp_cli("eval", snippet).stdout
-    assert "Configure BareBits" in body, body[:400]
-    assert "admin.php?page=cashupay" in body, (
-        "banner must link to the embedded admin page: " + body[:400]
-    )
-    assert "cashupay-setup" not in body, (
-        "banner must no longer navigate out of wp-admin to the bare wizard: " + body[:400]
+    assert r.status_code in (301, 302), f"expected a login redirect, got {r.status_code}"
+    assert "wp-login.php" in r.headers.get("Location", ""), r.headers.get("Location")
+    assert CHOOSER_URL_COPY not in r.text
+    assert CHOOSER_INSTALL_COPY not in r.text
+
+
+def test_unconfigured_admin_notice_invites_configuration(wordpress: WordPressHandle) -> None:
+    """While unconfigured, ordinary wp-admin pages carry the "Configure
+    BareBits" notice linking to the plugin's own page. /wp-admin/index.php is
+    used because the fixture's php -S router only serves real files."""
+    s = wp_login(wordpress)
+    r = s.get(f"{wordpress.url}/wp-admin/index.php", timeout=30)
+    assert r.status_code == 200, f"dashboard returned {r.status_code}"
+    assert "Configure BareBits" in r.text, r.text[:400]
+    assert "admin.php?page=cashupay" in r.text, (
+        "notice must link to the BareBits admin page"
     )
 
 
-def test_admin_banner_never_leaks_to_the_storefront(wordpress: WordPressHandle) -> None:
-    """The configuration banner is an admin_notices callback, so it must stay on
+def test_admin_notice_never_leaks_to_the_storefront(wordpress: WordPressHandle) -> None:
+    """The configuration nag is an admin_notices callback, so it must stay on
     wp-admin and never render on the customer-facing site."""
-    import requests
     r = requests.get(wordpress.url, timeout=10)
     assert "Configure BareBits" not in r.text

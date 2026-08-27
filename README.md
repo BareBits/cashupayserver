@@ -115,7 +115,7 @@ BareBits integrates with most ecommerce platforms including woocommerce, magneto
 2. When asked to input your BTCPayServer URL, input your store API URL instead. You can find this URL in the store settings
 
 #### WooCommerce
-Have WooCommerce? Download our plugin zip from the [latest GitHub release](https://github.com/BareBits/cashupayserver/releases/latest) and upload it to your WordPress installation, no need to install BareBits separately. Easy peasy!
+Have WooCommerce? Install the **BareBits** plugin in WordPress — grab the plugin zip from the [latest GitHub release](https://github.com/BareBits/cashupayserver/releases/latest) and upload it via Plugins → Add New (or install it from the WordPress plugin directory once listed). During onboarding, either connect an existing BareBits server by URL, or let the plugin install BareBits alongside your WordPress site automatically. Easy peasy!
 
 ## Payment Flow
 
@@ -304,11 +304,11 @@ The `router.php` handles routing and **blocks access to sensitive directories** 
 
 ### Docker Test Environment
 
-Two Docker configurations are available for **testing only** (not production). Both include WordPress, WooCommerce, and the BTCPay plugin pre-installed with SQLite (no MySQL needed).
+A Docker configuration is available for **testing only** (not production). It includes WordPress, WooCommerce, and the BTCPay plugin pre-installed with SQLite (no MySQL needed).
 
 See [DOCKER.md](DOCKER.md) for detailed setup instructions, persistent data volumes, and troubleshooting.
 
-#### Standalone + WordPress (for testing both)
+#### Standalone + WordPress
 
 ```bash
 git clone --recurse-submodules https://github.com/BareBits/cashupayserver.git
@@ -321,17 +321,6 @@ docker run -p 80:80 -p 8080:8080 cashupayserver-standalone
 This starts:
 - **WordPress + WooCommerce**: http://localhost (login: admin/admin)
 - **BareBits standalone**: http://localhost:8080
-
-#### WordPress Plugin Only
-
-```bash
-docker build -f docker/Dockerfile.wordpress -t cashupayserver-wordpress .
-docker run -p 80:80 cashupayserver-wordpress
-```
-
-This starts:
-- **WordPress with BareBits plugin pre-installed**: http://localhost (login: admin/admin)
-- Plugin available at **Tools → BareBits**
 
 ### Building Distribution Packages
 

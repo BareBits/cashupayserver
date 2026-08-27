@@ -1,12 +1,13 @@
 """WordPress "leave us a review" admin banner.
 
-Once setup is complete, cashupay_admin_notice() swaps the "Configure BareBits"
-nag for a dismissible review banner linking to the wordpress.org plugin
-search. Dismissal is persisted site-wide through a wp_ajax endpoint
-(nonce-gated): each dismissal hides the banner for 30 days, and after three
-dismissals it never returns. This test drives the real admin dashboard +
-admin-ajax.php over HTTP with an authenticated admin session; time travel and
-option inspection go through wp-cli.
+Once the plugin is configured (a server URL is connected and the WooCommerce
+wiring recorded cashupay_wired_at), cashupay_admin_notice() swaps the
+"Configure BareBits" nag for a dismissible review banner linking to the
+wordpress.org plugin search. Dismissal is persisted site-wide through a
+wp_ajax endpoint (nonce-gated): each dismissal hides the banner for 30 days,
+and after three dismissals it never returns. This test drives the real admin
+dashboard + admin-ajax.php over HTTP with an authenticated admin session; time
+travel and option inspection go through wp-cli.
 
 Not covered here: the browser-side delegated click listener that fires the
 AJAX call when WP core's dismiss (X) button is pressed — that needs a real
@@ -16,11 +17,13 @@ from __future__ import annotations
 
 import json
 import re
+import time
 
 import pytest
 import requests
 
-from fixtures.wordpress import WP_ADMIN_PASSWORD, WP_ADMIN_USER, WordPressHandle
+from wordpress.conftest import wp_login
+from fixtures.wordpress import WordPressHandle
 
 pytestmark = pytest.mark.wordpress
 
@@ -30,38 +33,12 @@ CONFIGURE_COPY = "Configure BareBits"
 OPTION = "cashupay_review_banner"
 
 
-def _wp_login(wp: WordPressHandle) -> requests.Session:
-    """Authenticate as the WordPress admin (see test_wp_onboarding for why the
-    redirect is deliberately not followed)."""
-    s = requests.Session()
-    s.cookies.set("wordpress_test_cookie", "WP+Cookie+check", domain="127.0.0.1")
-    r = s.post(
-        f"{wp.url}/wp-login.php",
-        data={
-            "log": WP_ADMIN_USER,
-            "pwd": WP_ADMIN_PASSWORD,
-            "wp-submit": "Log In",
-            "redirect_to": f"{wp.url}/wp-admin/",
-            "testcookie": "1",
-        },
-        timeout=30,
-        allow_redirects=False,
-    )
-    assert r.status_code in (302, 303), f"wp-login returned {r.status_code}"
-    assert any(c.startswith("wordpress_logged_in") for c in s.cookies.keys())
-    return s
-
-
-def _complete_setup(wp: WordPressHandle) -> None:
-    """Initialize the plugin DB and mark setup complete — the banner's
-    precondition. Mirrors what finishing the real wizard leaves behind."""
-    wp.wp_cli(
-        "eval",
-        "require_once CASHUPAY_PLUGIN_DIR . '/includes/database.php';"
-        "require_once CASHUPAY_PLUGIN_DIR . '/includes/config.php';"
-        "Database::ensureExists(); Database::initialize();"
-        "Config::set('setup_complete', true);",
-    )
+def _mark_configured(wp: WordPressHandle) -> None:
+    """The banner's precondition — cashupay_is_configured(): a server URL is
+    stored and the WooCommerce wiring stamped cashupay_wired_at. Mirrors what
+    finishing the real onboarding flow leaves behind."""
+    wp.wp_cli("option", "update", "cashupay_server_url", "http://127.0.0.1:1/barebits")
+    wp.wp_cli("option", "update", "cashupay_wired_at", str(int(time.time())))
 
 
 def _dashboard(wp: WordPressHandle, session: requests.Session) -> str:
@@ -94,15 +71,15 @@ def _dismiss(wp: WordPressHandle, session: requests.Session, nonce: str) -> requ
 
 
 def test_review_banner_lifecycle(wordpress: WordPressHandle) -> None:
-    session = _wp_login(wordpress)
+    session = wp_login(wordpress)
 
-    # Before setup: configure nag, no review banner.
+    # Unconfigured: the finish-setup nag, no review banner.
     html = _dashboard(wordpress, session)
     assert CONFIGURE_COPY in html
     assert REVIEW_COPY not in html
 
-    # After setup: review banner with the wordpress.org link, dismissible.
-    _complete_setup(wordpress)
+    # Configured: review banner with the wordpress.org link, dismissible.
+    _mark_configured(wordpress)
     html = _dashboard(wordpress, session)
     assert CONFIGURE_COPY not in html
     assert REVIEW_COPY in html
@@ -150,7 +127,7 @@ def test_dismiss_requires_authentication(wordpress: WordPressHandle) -> None:
     """An anonymous POST to the dismiss endpoint must not change state.
     wp_ajax_* actions are only registered for logged-in users, so WordPress
     itself rejects this before the plugin code runs."""
-    _complete_setup(wordpress)
+    _mark_configured(wordpress)
     r = requests.post(
         f"{wordpress.url}/wp-admin/admin-ajax.php",
         data={"action": "cashupay_dismiss_review", "nonce": "whatever"},

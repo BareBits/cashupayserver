@@ -93,8 +93,7 @@
 // the same name to a non-empty, non-"0" string). The updater respects the
 // CASHUPAY_UPDATE_CHANNEL setting above when fetching.
 //
-// Operators who don't want auto-update can leave this alone, or run the
-// WordPress plugin build (auto-update is skipped in WP mode regardless).
+// Operators who don't want auto-update can leave this alone.
 //
 // define('CASHUPAY_AUTO_UPDATE_ENABLED', true);
 
@@ -126,6 +125,79 @@
 // (also bundled). If the new build fails to boot, update.php restores the most
 // recent backup, blocks the broken build's commit so it is never re-applied,
 // and emails the address in the notification settings (Settings → Email).
+
+// =============================================================================
+// PROVISIONED INSTALLS (external orchestrators, e.g. the WordPress plugin)
+// =============================================================================
+// These settings are written by an installer that deploys BareBits on the
+// operator's behalf — the GPL WordPress companion plugin's "install BareBits
+// alongside WordPress" flow is the canonical example. A hand-managed install
+// never needs them.
+
+// CASHUPAY_BASE_URL — pin the public base URL of this install. Normally the
+// base URL is auto-detected per request (or set in the database); installers
+// that know the served URL up front write it here so it is correct from the
+// first request and never trusts the Host header. The pin wins over any
+// database-stored base_url — remove this line to hand control back to the
+// admin UI / auto-detection.
+//
+// define('CASHUPAY_BASE_URL', 'https://example.com/barebits');
+
+// CASHUPAY_EXTERNAL_CRON — declare that something outside this install
+// already requests cron.php every minute (the WordPress plugin pings it from
+// WP-cron). The setup wizard then skips the crontab screen, since there is
+// nothing for the operator to wire up. Constant wins over the env var of the
+// same name; "0" means off.
+//
+// define('CASHUPAY_EXTERNAL_CRON', true);
+
+// CASHUPAY_MANAGED_INSTALL — declare this a managed single-shop install: the
+// orchestrator's plugin embeds and operates BareBits behind exactly one shop.
+// Shapes the product for that case — single-store admin UI (no store selector
+// or add-store), the shop-owned sections (Products, Customers) and account
+// management hidden (login is automatic via SSO tokens), payer email capture
+// defaulted off, payer redirects preferring the shop's front page — and
+// implies CASHUPAY_EXTERNAL_CRON's cron-screen skip. Constant wins over the
+// env var of the same name; "0" means off.
+//
+// define('CASHUPAY_MANAGED_INSTALL', true);
+
+// CASHUPAY_SHOP_URL — the shop's public front page, used for payer-facing
+// redirects (Return to Shop, admin-created invoices) on managed installs.
+//
+// define('CASHUPAY_SHOP_URL', 'https://example.com');
+
+// CASHUPAY_ADMIN_PASSWORD_HASH — a PHP password_hash() string for the admin
+// account. When set on a fresh install, the setup wizard seeds the `admin`
+// user from it and skips its password screen; the plaintext stays with the
+// orchestrator (the WordPress plugin can reveal it to the site admin).
+//
+// define('CASHUPAY_ADMIN_PASSWORD_HASH', '$2y$10$...');
+
+// CASHUPAY_SSO_KEY_HASH — SHA-256 hex hash of the orchestrator's SSO key.
+// Arms sso.php: POSTing the plaintext key mints a single-use 60-second admin
+// login token, which is how "open BareBits from the shop admin" signs the
+// operator in without a password prompt.
+//
+// define('CASHUPAY_SSO_KEY_HASH', 'hex-sha256-of-key');
+
+// CASHUPAY_RETRY_URL_TEMPLATE — URL of the shop-side "retry an expired
+// invoice" endpoint; {invoiceId} is substituted. When set, the payment page's
+// expired screen offers "Request a new invoice" for e-commerce invoices
+// (metadata orderId), landing the customer where the shop can mint a fresh
+// one (the WordPress plugin redirects to WooCommerce's order-pay page).
+//
+// define('CASHUPAY_RETRY_URL_TEMPLATE', 'https://example.com/?cashupay-retry={invoiceId}');
+
+// CASHUPAY_PROVISION_TOKEN_HASH — SHA-256 hex hash of a one-time provisioning
+// token. When set, provision.php lets the holder of the matching plaintext
+// token collect this install's integration credentials (store id, a freshly
+// minted BTCPay-compatible API key, and the cron key) exactly once after the
+// setup wizard completes. The installer generates the token, writes only its
+// hash here, and keeps the plaintext on its own side. The exchange
+// self-invalidates after first use; remove the line to revoke an unused token.
+//
+// define('CASHUPAY_PROVISION_TOKEN_HASH', 'hex-sha256-of-token');
 
 // =============================================================================
 // EMAIL NOTIFICATIONS — SMTP (optional)

@@ -1,14 +1,20 @@
 """BareBits branding of the BTCPay WooCommerce gateway settings.
 
-cashupay_apply_btcpay_gateway_branding() runs during setup completion and must
-set the checkout title, customer message, and gateway logo — but only when
-those fields are empty or still carry the stock BTCPay defaults, so a
-merchant's manual customization survives re-runs. The logo is sideloaded into
-the media library WITHOUT intermediate sizes (the BTCPay plugin fetches the
-icon at 'thumbnail' size, and a 150x150 crop would truncate the wordmark).
+cashupay_apply_btcpay_gateway_branding() runs as part of the WooCommerce
+wiring (cashupay_ensure_woocommerce_integration) and must set the checkout
+title, customer message, and gateway logo — but only when those fields are
+empty or still carry the stock BTCPay defaults, so a merchant's manual
+customization survives re-runs. The logo is sideloaded into the media library
+WITHOUT intermediate sizes (the BTCPay plugin fetches the icon at 'thumbnail'
+size, and a 150x150 crop would truncate the wordmark).
+
+cashupay_apply_btcpay_order_states() applies the same conservatism to the
+Expired→wc-failed remap: WooCommerce keeps failed orders payable, so an
+expired invoice leaves the customer a retry affordance, but a merchant's
+deliberate mapping choice is never overwritten.
 
 These tests drive the real plugin PHP via wp-cli eval; they need neither
-WooCommerce nor the BTCPay plugin installed, because the branding only touches
+WooCommerce nor the BTCPay plugin installed, because both writers only touch
 wp_options and the media library.
 """
 from __future__ import annotations
@@ -16,6 +22,7 @@ from __future__ import annotations
 import json
 
 import pytest
+import requests
 
 from fixtures.wordpress import WordPressHandle
 
@@ -29,21 +36,25 @@ BAREBITS_DESCRIPTION = (
 STOCK_TITLE = "BTCPay (Bitcoin, Lightning Network, ...)"
 STOCK_DESCRIPTION = "You will be redirected to BTCPay to complete your purchase."
 
-APPLY = (
-    "require_once CASHUPAY_PLUGIN_DIR . '/btcpay-integration.php';"
-    "cashupay_apply_btcpay_gateway_branding();"
-)
-APPLY_WITH_DISCOUNT = (
-    "require_once CASHUPAY_PLUGIN_DIR . '/btcpay-integration.php';"
-    "cashupay_apply_btcpay_gateway_branding(5);"
-)
+APPLY = "cashupay_apply_btcpay_gateway_branding();"
+APPLY_WITH_DISCOUNT = "cashupay_apply_btcpay_gateway_branding(5);"
 DUMP = "echo json_encode(get_option('woocommerce_btcpaygf_default_settings'));"
+
+APPLY_STATES = "cashupay_apply_btcpay_order_states();"
+DUMP_STATES = "echo json_encode(get_option('btcpay_gf_order_states'));"
 
 
 def _settings(wp: WordPressHandle) -> dict:
     out = wp.wp_cli("eval", DUMP).stdout.strip().splitlines()[-1]
     data = json.loads(out)
     assert isinstance(data, dict), f"unexpected settings payload: {out!r}"
+    return data
+
+
+def _order_states(wp: WordPressHandle) -> dict:
+    out = wp.wp_cli("eval", DUMP_STATES).stdout.strip().splitlines()[-1]
+    data = json.loads(out)
+    assert isinstance(data, dict), f"unexpected order-states payload: {out!r}"
     return data
 
 
@@ -69,7 +80,6 @@ def test_branding_applied_on_fresh_settings(wordpress: WordPressHandle) -> None:
     assert info["src"] and info["src"].endswith("barebits-gateway-logo.png"), info
     assert not info["sizes"], f"intermediate sizes must not exist: {info}"
 
-    import requests
     r = requests.get(info["src"], timeout=10)
     assert r.status_code == 200 and r.content[:8] == b"\x89PNG\r\n\x1a\n"
 
@@ -88,8 +98,8 @@ def test_branding_replaces_stock_btcpay_defaults(wordpress: WordPressHandle) -> 
 
 
 def test_discount_percent_lands_in_the_checkout_title(wordpress: WordPressHandle) -> None:
-    """A wizard-chosen Bitcoin discount is advertised in the gateway title so
-    customers see the incentive before picking a payment method."""
+    """The merchant's chosen Bitcoin discount is advertised in the gateway
+    title so customers see the incentive before picking a payment method."""
     wordpress.wp_cli(
         "eval", "delete_option('woocommerce_btcpaygf_default_settings');"
     )
@@ -145,3 +155,45 @@ def test_branding_is_idempotent_reuses_attachment(wordpress: WordPressHandle) ->
         " 's' => 'BareBits payment gateway logo']));",
     ).stdout.strip().splitlines()[-1]
     assert count == "1", f"expected exactly one logo attachment, got {count}"
+
+
+def test_order_states_expired_remapped_to_failed(wordpress: WordPressHandle) -> None:
+    """Fresh settings: the full mapping is written (the gateway's webhook
+    handler indexes every state once the option exists) with Expired remapped
+    from the stock wc-cancelled to wc-failed, keeping expired orders payable."""
+    wordpress.wp_cli("eval", APPLY_STATES)
+    states = _order_states(wordpress)
+    assert states["Expired"] == "wc-failed", states
+    # The rest of the map keeps the plugin's stock defaults.
+    assert states["New"] == "wc-pending", states
+    assert states["Settled"] == "BTCPAY_IGNORE", states
+    assert states["SettledPaidOver"] == "wc-processing", states
+    assert states["Invalid"] == "wc-failed", states
+    assert states["ExpiredPaidPartial"] == "wc-failed", states
+    assert states["ExpiredPaidLate"] == "wc-processing", states
+
+
+def test_order_states_stock_cancelled_mapping_is_still_remapped(wordpress: WordPressHandle) -> None:
+    """A stored mapping still carrying the stock wc-cancelled for Expired is
+    treated as untouched-by-the-merchant and remapped."""
+    wordpress.wp_cli(
+        "eval",
+        "update_option('btcpay_gf_order_states', ['Expired' => 'wc-cancelled']);",
+    )
+    wordpress.wp_cli("eval", APPLY_STATES)
+    assert _order_states(wordpress)["Expired"] == "wc-failed"
+
+
+def test_order_states_preserve_merchant_choice(wordpress: WordPressHandle) -> None:
+    """A merchant who deliberately mapped Expired to something else keeps that
+    choice across re-runs of the wiring."""
+    wordpress.wp_cli(
+        "eval",
+        "update_option('btcpay_gf_order_states',"
+        " ['Expired' => 'wc-on-hold', 'New' => 'wc-pending']);",
+    )
+    wordpress.wp_cli("eval", APPLY_STATES)
+    states = _order_states(wordpress)
+    assert states["Expired"] == "wc-on-hold", (
+        "a merchant's deliberate Expired mapping must survive the wiring"
+    )

@@ -123,6 +123,8 @@ jobs:
             pay.php \
             product-image.php \
             update.php \
+            provision.php \
+            sso.php \
             recover.php \
             includes/database.php
 
@@ -130,22 +132,28 @@ jobs:
         run: ./scripts/build-wordpress-plugin.sh
 
       - name: Verify WordPress plugin layout
+        # The plugin is GPL WordPress glue only — verify no BareBits server
+        # code (includes/, vendor/, entry points) leaks into the zip.
         run: |
           php scripts/verify-plugin-build.php build/cashupay \
             cashupay.php \
             uninstall.php \
-            bootstrap.php \
-            rewrite-rules.php \
+            state.php \
+            installer.php \
+            onboarding.php \
             admin-menu.php \
             cron-integration.php \
-            activation.php \
             btcpay-integration.php \
-            setup.php \
-            admin.php \
-            api.php \
-            pay.php \
-            includes/database.php \
+            elex-discount.php \
+            gateway-guard.php \
+            readme.txt \
             assets/img/barebits-gateway-logo.png
+          for leaked in includes vendor setup.php admin.php api.php cron.php payment.php; do
+            if [ -e "build/cashupay/$leaked" ]; then
+              echo "BareBits server code leaked into the GPL plugin build: $leaked" >&2
+              exit 1
+            fi
+          done
 
       - name: Build Windows desktop zip
         run: ./scripts/build-windows-desktop.sh
@@ -178,6 +186,13 @@ jobs:
           cp build/cashupayserver.zip "build/cashupayserver-${tag}.zip"
           cp build/wordpress_plugin.zip "build/wordpress_plugin-${tag}.zip"
           cp build/cashupayserver-windows.zip "build/cashupayserver-windows-${tag}.zip"
+          # Checksums for everything we publish. The WordPress plugin's
+          # "install BareBits alongside" flow verifies its downloaded
+          # standalone zip against this file.
+          (cd build && sha256sum \
+            "cashupayserver-${tag}.zip" \
+            "wordpress_plugin-${tag}.zip" \
+            "cashupayserver-windows-${tag}.zip" > SHA256SUMS)
 
       - name: Upload release assets for later jobs
         uses: actions/upload-artifact@v4
@@ -189,6 +204,7 @@ jobs:
             build/cashupayserver-${{ env.TAG }}.zip
             build/wordpress_plugin-${{ env.TAG }}.zip
             build/cashupayserver-windows-${{ env.TAG }}.zip
+            build/SHA256SUMS
             build/cashupayserver/BUILD_INFO
 
   # Boot the Windows desktop package on real Windows before publishing. The
@@ -251,6 +267,7 @@ jobs:
             - `cashupayserver-${{ env.TAG }}.zip` — standalone server (the auto-updater pulls this)
             - `cashupayserver-windows-${{ env.TAG }}.zip` — Windows desktop package (portable point-of-sale; see README.txt inside)
             - `wordpress_plugin-${{ env.TAG }}.zip` — WordPress plugin
+            - `SHA256SUMS` — checksums of the zips above
             - `BUILD_INFO` — build metadata
           prerelease: ${{ needs.build.outputs.prerelease }}
           make_latest: ${{ needs.build.outputs.make_latest }}
@@ -258,4 +275,5 @@ jobs:
             build/cashupayserver-${{ env.TAG }}.zip
             build/wordpress_plugin-${{ env.TAG }}.zip
             build/cashupayserver-windows-${{ env.TAG }}.zip
+            build/SHA256SUMS
             build/cashupayserver/BUILD_INFO

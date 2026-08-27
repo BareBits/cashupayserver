@@ -567,7 +567,7 @@ if (!$swapOnly && !$skipNonEssential) try {
     $results['tasks']['ipgeo'] = 'error: ' . $e->getMessage();
 }
 
-// Task 12: Auto-update trigger. Daily, no-op in WordPress mode. Skipped on
+// Task 12: Auto-update trigger. Daily. Skipped on
 // internal background self-requests so checkout traffic doesn't trigger
 // a download — only the dedicated cron tick nudges the updater.
 //
@@ -594,7 +594,7 @@ if (!$isInternal && !$swapOnly) {
 // of the auto-update opt-in — the banner has to nudge operators who have NOT
 // enabled auto-update. This only compares the remote channel's COMMIT_SHA to
 // the local one; it never downloads or applies anything. Self-throttled to a
-// daily check and a no-op in WordPress / test-disabled environments.
+// daily check and a no-op in test-disabled environments.
 if (!$isInternal && !$swapOnly && !$skipNonEssential) {
     try {
         $av = Updater::checkForUpdate();

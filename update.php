@@ -167,10 +167,6 @@ function upd_setting(string $name) {
     return getenv($name);
 }
 
-function upd_is_wordpress(): bool {
-    return defined('CASHUPAY_WORDPRESS') && CASHUPAY_WORDPRESS;
-}
-
 /** Operator opt-in — mirrors Updater::isAutoUpdateEnabled(). Default OFF. */
 function upd_is_enabled(): bool {
     if (defined('CASHUPAY_AUTO_UPDATE_ENABLED') && CASHUPAY_AUTO_UPDATE_ENABLED) {
@@ -566,16 +562,8 @@ if (!$cronKey || !is_string($providedKey) || !hash_equals((string)$cronKey, (str
 // phase runs regardless of this flag.
 $manual = isset($_GET['manual']) && $_GET['manual'] !== '' && $_GET['manual'] !== '0';
 
-// Hard stops for BOTH auto and manual. WordPress has its own update path, and
-// the test/dev kill switch must never let a manual click overlay an
-// in-progress dev branch.
-if (upd_is_wordpress()) {
-    if ($manual) {
-        upd_set_manual_run('blocked', ['reason' => 'wordpress']);
-    }
-    echo json_encode(['ok' => true, 'skipped' => 'wordpress']);
-    exit;
-}
+// Hard stop for BOTH auto and manual: the test/dev kill switch must never
+// let a manual click overlay an in-progress dev branch.
 if (upd_is_disabled_for_tests()) {
     if ($manual) {
         upd_set_manual_run('blocked', ['reason' => 'disabled']);

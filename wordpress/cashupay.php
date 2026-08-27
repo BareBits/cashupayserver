@@ -2,30 +2,54 @@
 /**
  * Plugin Name: BareBits - Lightning Payments via Bitcoin
  * Plugin URI: https://github.com/BareBits/cashupayserver
- * Description: Accept Bitcoin payments (on-chain and lightning). No approval process, no middlemen. 1% fee.
+ * Description: Accept Bitcoin payments (on-chain and lightning) in WooCommerce through a BareBits server — connect an existing one or install one alongside WordPress. No approval process, no middlemen.
  * Version: 1.3.1
  * Requires PHP: 8.0
  * Author: BareBits
- * License: MIT
+ * License: GPLv2 or later
+ * License URI: https://www.gnu.org/licenses/gpl-2.0.html
+ *
+ * This plugin is deliberately thin: it contains only WordPress-specific glue
+ * (onboarding UI, installing/configuring the BTCPay for WooCommerce gateway,
+ * the checkout discount, a WP-cron pinger). The BareBits payment server it
+ * talks to is a separate application with its own license, reached purely
+ * over HTTP — no BareBits code ships inside this plugin.
  */
 
 if (!defined('ABSPATH')) {
     exit;
 }
 
-// Load bootstrap (constants, data dir logic)
-require_once __DIR__ . '/bootstrap.php';
+define('CASHUPAY_PLUGIN_DIR', __DIR__);
+define('CASHUPAY_PLUGIN_FILE', __FILE__);
 
-// Load plugin components
-require_once __DIR__ . '/activation.php';
-require_once __DIR__ . '/rewrite-rules.php';
+require_once __DIR__ . '/state.php';
+require_once __DIR__ . '/installer.php';
+require_once __DIR__ . '/btcpay-integration.php';
+require_once __DIR__ . '/elex-discount.php';
+require_once __DIR__ . '/onboarding.php';
 require_once __DIR__ . '/admin-menu.php';
-// Named cron-integration (not cron.php) deliberately: the build flattens
-// wordpress/*.php into the same directory as the top-level cron.php endpoint,
-// so a wordpress/cron.php would collide with it in the shipped plugin.
+// Named cron-integration (not cron.php) so nothing can ever shadow the
+// BareBits server's own cron.php endpoint in any layout.
 require_once __DIR__ . '/cron-integration.php';
 require_once __DIR__ . '/gateway-guard.php';
 
-// Register activation/deactivation hooks
 register_activation_hook(__FILE__, 'cashupay_activate');
 register_deactivation_hook(__FILE__, 'cashupay_deactivate');
+
+/**
+ * Activation: register the every-minute interval and, when an alongside
+ * install is already wired (re-activation), restart its cron pinger.
+ */
+function cashupay_activate(): void {
+    cashupay_cron_reschedule();
+}
+
+/**
+ * Deactivation: stop the WP-cron pinger. The BareBits server itself (and its
+ * data) is deliberately untouched — deactivating the WordPress glue must
+ * never take the payment server down.
+ */
+function cashupay_deactivate(): void {
+    cashupay_cron_unschedule();
+}

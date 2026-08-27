@@ -15,7 +15,7 @@ final class SetupFlow {
     /** Every screen the wizard knows, in canonical order. */
     public const STEPS = [
         'terms', 'security', 'password', 'store', 'onchain', 'zeroconf',
-        'lightning', 'swaps', 'mints', 'discount', 'cron', 'done',
+        'lightning', 'swaps', 'mints', 'cron', 'done',
     ];
 
     /** The screens add_store mode walks before returning to admin. */
@@ -43,7 +43,7 @@ final class SetupFlow {
      * Screens that render after setup_complete has been set, and therefore
      * have to survive setup.php's redirect-if-set-up guard.
      */
-    public const POST_COMPLETION = ['discount', 'cron', 'done'];
+    public const POST_COMPLETION = ['cron', 'done'];
 
     public static function isKnownStep(string $step): bool {
         return in_array($step, self::STEPS, true) || $step === self::ADD_STORE_COMPLETE;
@@ -74,34 +74,41 @@ final class SetupFlow {
      * $isDesktop drops the cron screen: the Windows desktop package's
      * launcher already ticks cron-runner.php on a timer (see windows/), so
      * there is nothing for the operator to set up — and the crontab line the
-     * screen shows is meaningless on a system without cron. The same skip
-     * pattern WordPress uses after its cron self-test, decided statically
-     * because the desktop wiring ships with the package.
+     * screen shows is meaningless on a system without cron.
+     *
+     * $externalCron drops the cron screen for the same reason on installs
+     * provisioned by an external orchestrator (e.g. the GPL WordPress
+     * companion plugin, which pings cron.php from WP-cron): the installer
+     * declared at deploy time that something else already ticks the cron
+     * endpoint, so there is nothing for the operator to set up. See
+     * externalCronConfigured() for how the declaration is made (managed
+     * installs imply it — setup.php folds ManagedInstall::isManaged() in).
+     *
+     * $passwordPreseeded drops the password screen: the orchestrator
+     * provisioned the admin account up front (CASHUPAY_ADMIN_PASSWORD_HASH,
+     * seeded by ManagedInstall::seedAdminIfProvisioned), so there is no
+     * credential left for the wizard to collect. Decided statically from the
+     * deployment config so the step counter stays stable across the run.
      *
      * @return string[]
      */
     public static function stepSequence(
-        string $mode, bool $isWordPress, bool $includeZeroConf,
-        bool $includeSecurity = true, bool $isDesktop = false
+        string $mode, bool $includeZeroConf,
+        bool $includeSecurity = true, bool $isDesktop = false,
+        bool $externalCron = false, bool $passwordPreseeded = false
     ): array {
         if ($mode === 'add_store') {
             $steps = self::ADD_STORE_STEPS;
         } else {
             $steps = self::STEPS;
-            if ($isWordPress) {
-                // WordPress supplies its own authentication.
-                $steps = array_values(array_diff($steps, ['password']));
-            } else {
-                // The Bitcoin-discount screen configures a WooCommerce
-                // checkout discount (via the ELEX plugin); outside WordPress
-                // there is no WooCommerce to apply it to.
-                $steps = array_values(array_diff($steps, ['discount']));
-            }
             if (!$includeSecurity) {
                 $steps = array_values(array_diff($steps, ['security']));
             }
-            if ($isDesktop) {
+            if ($isDesktop || $externalCron) {
                 $steps = array_values(array_diff($steps, ['cron']));
+            }
+            if ($passwordPreseeded) {
+                $steps = array_values(array_diff($steps, ['password']));
             }
         }
         if (!$includeZeroConf) {
@@ -215,27 +222,20 @@ final class SetupFlow {
     }
 
     /**
-     * Parse the Bitcoin-discount screen's answer: a whole number of percent,
-     * 0–100. Null means the value is unusable and the screen should re-render
-     * with an error rather than saving anything.
-     *
-     * Whole numbers only: the free ELEX plugin that applies the discount
-     * renders its own settings form with a step-1 number input, so a
-     * fractional value saved here would trap the merchant in browser
-     * validation if they ever edited the rule there.
+     * Has an external orchestrator declared that it drives cron.php, making
+     * the wizard's crontab screen pointless? Declared at deploy time — the
+     * same way CASHUPAY_DATA_DIR is — via a `CASHUPAY_EXTERNAL_CRON` constant
+     * in user_config.php (the GPL WordPress companion plugin's installer
+     * writes one) or the environment variable of the same name. Mirrors the
+     * Desktop::isWindowsDesktop() convention: constant wins, env accepted,
+     * "0" means off.
      */
-    public static function parseDiscountPercent(string $raw): ?int {
-        $raw = trim($raw);
-        // An empty submit means "no discount", not an error — the field
-        // defaults to 0 and clearing it reads as declining the offer.
-        if ($raw === '') {
-            return 0;
+    public static function externalCronConfigured(): bool {
+        if (defined('CASHUPAY_EXTERNAL_CRON')) {
+            return (bool)CASHUPAY_EXTERNAL_CRON;
         }
-        if (!preg_match('/^[0-9]{1,3}$/', $raw)) {
-            return null;
-        }
-        $value = (int)$raw;
-        return $value <= 100 ? $value : null;
+        $env = getenv('CASHUPAY_EXTERNAL_CRON');
+        return $env !== false && $env !== '' && $env !== '0';
     }
 
     /**

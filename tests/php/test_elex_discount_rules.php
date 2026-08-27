@@ -1,14 +1,16 @@
 <?php
 /**
- * Rule-array merge for the ELEX Discount Per Payment Method option.
+ * Bitcoin-discount auto-configuration: the pure pieces of
+ * wordpress/elex-discount.php.
  *
- * cashupay_elex_upsert_discount_rule is the piece of the Bitcoin-discount
- * auto-configuration that decides what gets written into the ELEX plugin's
- * option — and the one invariant that must never break is "a merchant's
- * existing rule for the gateway survives every completion-screen re-render".
- * The function is pure (no WordPress calls) precisely so this file can pin
- * that behaviour without a WordPress install; the ABSPATH define below only
- * satisfies the helper file's direct-access guard.
+ * cashupay_elex_upsert_discount_rule decides what gets written into the ELEX
+ * plugin's option — and the one invariant that must never break is "a
+ * merchant's existing rule for the gateway survives every completion-screen
+ * re-render". cashupay_parse_discount_percent validates the merchant's
+ * onboarding answer before anything is installed or written. Both are pure
+ * (no WordPress calls) precisely so this file can pin them without a
+ * WordPress install; the ABSPATH define below only satisfies the helper
+ * file's direct-access guard.
  */
 declare(strict_types=1);
 require __DIR__ . '/harness.php';
@@ -17,6 +19,22 @@ define('ABSPATH', sys_get_temp_dir() . '/');
 require_once dirname(__DIR__, 2) . '/wordpress/elex-discount.php';
 
 const GW = 'btcpaygf_default';
+
+// --- Discount percent parsing ---------------------------------------------
+//
+// Whole numbers 0–100 only; the ELEX plugin that applies the discount renders
+// a step-1 number input in its own settings form, so accepting fractions here
+// would strand the merchant later. Empty means "no discount", not an error;
+// null means re-render the form with an error rather than saving anything.
+assert_eq(0, cashupay_parse_discount_percent(''), 'empty input reads as declining the discount');
+assert_eq(0, cashupay_parse_discount_percent('0'), 'zero is a valid answer');
+assert_eq(5, cashupay_parse_discount_percent('5'), 'a plain whole percent parses');
+assert_eq(7, cashupay_parse_discount_percent(' 7 '), 'surrounding whitespace is tolerated');
+assert_eq(100, cashupay_parse_discount_percent('100'), 'the top of the range is inclusive');
+assert_null(cashupay_parse_discount_percent('101'), 'above 100 is rejected');
+assert_null(cashupay_parse_discount_percent('-1'), 'negative is rejected');
+assert_null(cashupay_parse_discount_percent('2.5'), 'fractional values are rejected, not rounded');
+assert_null(cashupay_parse_discount_percent('abc'), 'non-numeric input is rejected');
 
 // --- Adding to an empty option --------------------------------------------
 

@@ -18,7 +18,6 @@ if (!Database::isInitialized()) {
     // bare directory URL then fails on every visit until setup.php has run
     // once. A relative redirect needs no configuration and always resolves
     // from the directory index (and through router.php's front controller).
-    // WordPress mode routes through its own bootstrap and never reaches here.
     header('Location: setup.php');
     exit;
 }
