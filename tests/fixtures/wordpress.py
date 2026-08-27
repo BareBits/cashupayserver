@@ -331,6 +331,15 @@ if (substr($uri, -4) === '.php' && file_exists($file)) {{
 // {{btcpay_gf_url}}/api/v1/... on the bare base URL) and the extensionless
 // pairing endpoint. Everything else under /barebits is real files (served
 // above) or the app's own router.php URLs.
+// PATH_INFO-style routing (Apache's AcceptPathInfo): the BareBits admin
+// canonicalizes to /barebits/admin.php/<view>.
+if (preg_match('#^(/barebits/[^/]+\\.php)(/.*)$#', $uri, $m)
+        && is_file($docRoot . $m[1])) {{
+    $_SERVER['PATH_INFO'] = $m[2];
+    $_SERVER['SCRIPT_NAME'] = $m[1];
+    require $docRoot . $m[1];
+    return true;
+}}
 if (preg_match('#^/barebits(/api/v1/.*)$#', $uri, $m)
         && is_file($docRoot . '/barebits/api.php')) {{
     $_SERVER['PATH_INFO'] = $m[1];

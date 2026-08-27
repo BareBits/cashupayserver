@@ -5,18 +5,21 @@ End to end, the way a merchant on shared hosting would experience it:
     choose "install" → the plugin downloads the latest release from the
     (fixture) GitHub API, verifies it against SHA256SUMS, unpacks it to
     ABSPATH/barebits with its data dir OUTSIDE the docroot → the merchant
-    walks the real BareBits setup wizard (password screen included — no WP
-    auth bridging, and no cron screen thanks to CASHUPAY_EXTERNAL_CRON) →
-    the plugin collects credentials through the one-time provisioning
+    walks the real BareBits setup wizard (managed install: the admin account
+    is pre-seeded so there is NO password screen, and no cron screen either)
+    → the plugin collects credentials through the one-time provisioning
     handshake → WooCommerce is wired (gateway plugin + webhook over the
     Greenfield API + branding + ELEX discount) → the WP-cron pinger drives
-    the install's cron.php.
+    the install's cron.php, SSO tokens sign the operator into the embedded
+    admin, and the managed-install UI shaping is live (single store, no
+    Products/Customers, payer email capture off, shop-facing redirects).
 
 Needs the mint fixtures (the wizard's mints screen talks to a live mint).
 """
 from __future__ import annotations
 
 import json
+import re
 
 import pytest
 import requests
@@ -35,20 +38,20 @@ pytestmark = pytest.mark.wordpress
 
 def _walk_barebits_wizard(wp: WordPressHandle, mint_url: str, backup_mint_url: str) -> None:
     """Drive the alongside install's real standalone wizard. The install was
-    provisioned with its data dir outside the docroot, so the security screen
-    is skipped; CASHUPAY_EXTERNAL_CRON drops the cron screen."""
+    provisioned with its data dir outside the docroot (security screen
+    skipped), a pre-seeded admin account (password screen skipped — the
+    merchant never types a BareBits password), and CASHUPAY_MANAGED_INSTALL
+    (cron screen skipped)."""
     wiz = SetupWizard(wp.url, setup_path="/barebits/setup.php")
     body = wiz.accept_terms()
     heading = wizard_heading(body)
-    # Data dir outside the web root ⇒ terms lands straight on the password
-    # screen (a standalone install now ALWAYS has its own password — the WP
-    # admin is not bridged).
-    assert "password" in heading.lower(), f"expected the password screen, got {heading!r}"
-    body = wiz.post(
-        step="password",
-        password=SetupWizard.DEFAULT_PASSWORD,
-        confirm_password=SetupWizard.DEFAULT_PASSWORD,
+    # Managed install: terms lands straight on the store screen — no
+    # security screen (data dir outside the web root) and no password screen
+    # (the admin account was pre-seeded from CASHUPAY_ADMIN_PASSWORD_HASH).
+    assert "password" not in heading.lower(), (
+        f"password screen rendered despite the pre-seeded admin: {heading!r}"
     )
+    assert "store" in heading.lower(), f"expected the store screen, got {heading!r}"
     body = wiz.post(step="store", store_name="Alongside Store", default_currency="sat")
     body = wiz.post(step="onchain", onchain_action="skip")
     body = wiz.post(step="lightning", lightning_action="skip")
@@ -60,11 +63,11 @@ def _walk_barebits_wizard(wp: WordPressHandle, mint_url: str, backup_mint_url: s
         backup_mint_url=backup_mint_url,
         mint_unit="sat",
     )
-    # CASHUPAY_EXTERNAL_CRON: the wizard must land on completion, never the
-    # crontab screen — WP-cron owns the heartbeat.
+    # Managed install: the wizard must land on completion, never the crontab
+    # screen — WP-cron owns the heartbeat.
     heading = wizard_heading(body)
     assert "cron" not in heading.lower(), (
-        f"cron screen rendered despite CASHUPAY_EXTERNAL_CRON: {heading!r}"
+        f"cron screen rendered despite CASHUPAY_MANAGED_INSTALL: {heading!r}"
     )
 
 
@@ -91,9 +94,17 @@ def test_install_mode_end_to_end(wordpress_install_mode, mint, backup_mint) -> N
     assert (wp.barebits_dir / "provision.php").is_file()
     user_config = (wp.barebits_dir / "user_config.php").read_text()
     assert str(wp.barebits_data_dir) in user_config
-    assert "CASHUPAY_EXTERNAL_CRON" in user_config
+    assert "CASHUPAY_MANAGED_INSTALL" in user_config
+    assert "CASHUPAY_SHOP_URL" in user_config
+    assert "CASHUPAY_RETRY_URL_TEMPLATE" in user_config
+    assert "CASHUPAY_ADMIN_PASSWORD_HASH" in user_config
+    assert "CASHUPAY_SSO_KEY_HASH" in user_config
     assert "CASHUPAY_PROVISION_TOKEN_HASH" in user_config
     assert f"{wp.url}/barebits" in user_config  # pinned base URL
+    # The plugin holds the plaintexts the hashes were derived from.
+    admin_password = wp_option(wp, "cashupay_admin_password")
+    sso_key = wp_option(wp, "cashupay_sso_key")
+    assert len(admin_password) >= 20 and len(sso_key) == 64
     # The data dir landed OUTSIDE the served docroot (sibling of ABSPATH).
     assert wp.barebits_data_dir.is_dir()
     assert wp_option(wp, "cashupay_server_url") == wp.barebits_url
@@ -175,10 +186,57 @@ def test_install_mode_end_to_end(wordpress_install_mode, mint, backup_mint) -> N
         for rule in elex
     ), elex
 
-    # The status panel replaces the onboarding flow once wired.
+    # Once wired, clicking "BareBits" in wp-admin embeds the admin behind a
+    # one-time SSO sign-in URL — the old windowed experience, no password.
     body = onboarding_page(s, wp)
-    assert "WooCommerce is connected" in body
-    assert "Installed alongside WordPress" in body
+    assert 'id="cashupay-admin-frame"' in body, body[-1500:]
+    assert "sso.php?token=" in body
+    # The Connection page carries the status table and the password reveal.
+    conn = s.get(
+        f"{wp.url}/wp-admin/admin.php", params={"page": "cashupay-connection"}, timeout=60
+    ).text
+    assert "WooCommerce is connected" in conn
+    assert "Installed alongside WordPress" in conn
+    nonce = re.search(r'id="cashupay-reveal-password"\s+data-nonce="([^"]+)"', conn).group(1)
+    reveal = s.post(
+        f"{wp.url}/wp-admin/admin-ajax.php",
+        data={"action": "cashupay_reveal_password", "nonce": nonce},
+        timeout=30,
+    ).json()
+    assert reveal.get("success") is True and reveal.get("data") == admin_password
+
+    # SSO end to end: mint a token with the plugin's key, consume it, and
+    # land in the admin as a signed-in operator with the managed-install UI
+    # shaping live (single store, shop-owned sections hidden).
+    minted = requests.post(
+        f"{wp.barebits_url}/sso.php",
+        headers={"X-SSO-KEY": sso_key},
+        timeout=30,
+    ).json()
+    assert minted.get("status") == "ready" and re.fullmatch(r"[0-9a-f]{64}", minted["token"])
+    bs = requests.Session()
+    landed = bs.get(
+        f"{wp.barebits_url}/sso.php", params={"token": minted["token"]},
+        timeout=30, allow_redirects=False,
+    )
+    assert landed.status_code in (301, 302), landed.text[:300]
+    admin_page = bs.get(f"{wp.barebits_url}/admin.php", timeout=60).text
+    assert "managed-hidden" in admin_page, "managed-install UI shaping missing from the admin"
+    # A consumed token can never be replayed.
+    replayed = requests.get(
+        f"{wp.barebits_url}/sso.php", params={"token": minted["token"]},
+        timeout=30, allow_redirects=False,
+    )
+    assert replayed.status_code == 403
+    # The pre-seeded credentials also work for a direct (non-SSO) login —
+    # the fallback if the plugin is ever removed, and the password BareBits
+    # asks for before revealing a wallet recovery phrase.
+    direct = requests.Session().post(
+        f"{wp.barebits_url}/admin.php",
+        data={"action": "login", "username": "admin", "password": admin_password},
+        timeout=30,
+    )
+    assert direct.status_code == 200 and direct.json().get("success") is True, direct.text[:300]
 
     # Step 5: the WP-cron pinger reaches the install's cron.php with the
     # provisioned key — the install sees a real external cron run.
@@ -199,7 +257,43 @@ def test_install_mode_end_to_end(wordpress_install_mode, mint, backup_mint) -> N
         timeout=60,
     )
     assert invoice.status_code == 200, invoice.text[:300]
-    assert invoice.json().get("id")
+    invoice_id = invoice.json().get("id")
+    assert invoice_id
+
+    # Managed installs default payer email capture OFF: the payment page
+    # renders no email/newsletter form and the endpoint refuses POSTs.
+    pay_page = requests.get(
+        f"{wp.barebits_url}/payment.php", params={"id": invoice_id}, timeout=30
+    ).text
+    assert 'id="receipt-form"' not in pay_page
+    refused = requests.post(
+        f"{wp.barebits_url}/payment.php",
+        params={"id": invoice_id},
+        data={"action": "send_receipt", "email": "x@example.test"},
+        timeout=30,
+    )
+    assert refused.status_code == 404
+
+    # E-commerce invoices carry the shop-side retry link (rendered in the
+    # expired screen's markup) built from the provisioned template…
+    order_invoice = requests.post(
+        f"{wp.barebits_url}/api/v1/stores/{store_id}/invoices",
+        json={"amount": "21", "currency": "SATS", "metadata": {"orderId": "4242"}},
+        headers={"Authorization": f"token {internal_key['internal_api_key']}"},
+        timeout=60,
+    ).json()
+    order_page = requests.get(
+        f"{wp.barebits_url}/payment.php", params={"id": order_invoice["id"]}, timeout=30
+    ).text
+    assert "?cashupay-retry=" in order_page, "retry link missing for an e-commerce invoice"
+    # …and the plugin's endpoint answers it (no matching order here, so it
+    # falls back to the shop's front page rather than a dead end).
+    bounced = requests.get(
+        f"{wp.url}/?cashupay-retry={order_invoice['id']}",
+        timeout=30, allow_redirects=False,
+    )
+    assert bounced.status_code in (301, 302), bounced.text[:300]
+    assert bounced.headers["Location"].rstrip("/") == wp.url.rstrip("/")
 
 
 def test_install_refuses_checksum_mismatch(standalone_zip) -> None:

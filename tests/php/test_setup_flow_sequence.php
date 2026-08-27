@@ -111,6 +111,54 @@ assert_false(SetupFlow::externalCronConfigured(), 'an empty CASHUPAY_EXTERNAL_CR
 putenv('CASHUPAY_EXTERNAL_CRON');
 assert_false(SetupFlow::externalCronConfigured(), 'cleanup: unset reads as off again');
 
+// --- Pre-seeded password drops exactly the password screen -----------------
+//
+// A managed install provisioned the admin account up front
+// (CASHUPAY_ADMIN_PASSWORD_HASH, seeded by ManagedInstall::seedAdminIfProvisioned),
+// so the wizard has no credential left to collect — and only that screen may
+// disappear.
+
+$preseeded = SetupFlow::stepSequence('', true, true, false, false, true);
+assert_eq(
+    ['terms', 'security', 'store', 'onchain', 'zeroconf', 'lightning', 'swaps', 'mints', 'cron', 'done'],
+    $preseeded,
+    'a pre-seeded password drops the password screen and nothing else'
+);
+assert_eq(
+    array_values(array_diff($withOnchain, ['password'])),
+    $preseeded,
+    'the pre-seeded sequence is exactly the standalone one minus password'
+);
+assert_eq('store', SetupFlow::nextStep('security', $preseeded), 'with the password pre-seeded, store follows the safety check');
+
+// An explicit false keeps the screen — identical to omitting the flag.
+assert_eq(
+    $withOnchain,
+    SetupFlow::stepSequence('', true, true, false, false, false),
+    'passwordPreseeded=false keeps the password screen'
+);
+
+// add_store never had the password screen, so the flag must change nothing.
+assert_eq(
+    SetupFlow::stepSequence('add_store', true),
+    SetupFlow::stepSequence('add_store', true, true, false, false, true),
+    'add_store is unaffected by the password-preseeded flag'
+);
+
+// The canonical managed install sets both: the orchestrator ticks cron AND
+// seeded the admin — both screens go, independently.
+$managed = SetupFlow::stepSequence('', true, true, false, true, true);
+assert_eq(
+    ['terms', 'security', 'store', 'onchain', 'zeroconf', 'lightning', 'swaps', 'mints', 'done'],
+    $managed,
+    'external cron + pre-seeded password drop both cron and password'
+);
+assert_eq(
+    array_values(array_diff($withOnchain, ['cron', 'password'])),
+    $managed,
+    'the managed sequence is exactly the standalone one minus cron and password'
+);
+
 // --- add_store mode runs only the store-scoped screens --------------------
 
 $addStore = SetupFlow::stepSequence('add_store', true);
