@@ -129,6 +129,10 @@ jobs:
             includes/database.php
 
       - name: Build WordPress plugin
+        env:
+          # A testing-channel plugin must install a testing-channel server
+          # (see the channel stamp in build-wordpress-plugin.sh).
+          CASHUPAY_PLUGIN_CHANNEL: ${{ steps.classify.outputs.prerelease == 'true' && 'testing' || 'stable' }}
         run: ./scripts/build-wordpress-plugin.sh
 
       - name: Verify WordPress plugin layout

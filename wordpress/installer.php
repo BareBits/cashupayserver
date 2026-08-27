@@ -32,6 +32,32 @@ function cashupay_release_api_base(): string {
 }
 
 /**
+ * Release channel THIS plugin build was cut from. 'stable' in the source
+ * tree; the testing release workflow stamps 'testing' into the plugin zips
+ * it publishes (scripts/build-wordpress-plugin.sh does the stamping).
+ */
+const CASHUPAY_PLUGIN_RELEASE_CHANNEL = 'stable';
+
+/**
+ * Which release channel the install-alongside flow downloads from. A plugin
+ * must install a server from its own channel: GitHub's /releases/latest only
+ * ever returns the newest STABLE release, so a testing-channel plugin
+ * pointing there would deploy a server missing the features this very flow
+ * depends on (the provisioning handshake, the pre-seeded admin, the pinned
+ * base URL) — the merchant would be walked into a wizard that asks for a
+ * password and an onboarding that can never collect credentials. Overridable
+ * per site via a CASHUPAY_RELEASE_CHANNEL constant (wp-config.php) or the
+ * cashupay_release_channel filter; anything but 'testing' means 'stable'.
+ */
+function cashupay_release_channel(): string {
+    $channel = defined('CASHUPAY_RELEASE_CHANNEL')
+        ? (string) CASHUPAY_RELEASE_CHANNEL
+        : CASHUPAY_PLUGIN_RELEASE_CHANNEL;
+    $channel = (string) apply_filters('cashupay_release_channel', $channel);
+    return $channel === 'testing' ? 'testing' : 'stable';
+}
+
+/**
  * Where the alongside install goes. $dirname is the merchant's optional
  * override from the onboarding form; it is a single path segment, not a full
  * path, so the result is always web-served under the site. Preference order:
@@ -126,13 +152,18 @@ function cashupay_install_preflight(): array {
 }
 
 /**
- * Resolve the latest stable release's app zip (and SHA256SUMS when the
- * release publishes one).
+ * Resolve the newest release's app zip (and SHA256SUMS when the release
+ * publishes one) for this plugin's channel: /releases/latest (newest stable)
+ * on the stable channel, the head of /releases (newest release of ANY kind,
+ * prereleases included — the same semantics as the server's own 'testing'
+ * update channel) on the testing channel.
  *
  * @return array{ok:bool, message?:string, tag?:string, zip_url?:string, zip_name?:string, sums_url?:?string}
  */
 function cashupay_fetch_latest_release(): array {
-    $response = wp_remote_get(cashupay_release_api_base() . '/releases/latest', [
+    $testing = cashupay_release_channel() === 'testing';
+    $endpoint = $testing ? '/releases?per_page=15' : '/releases/latest';
+    $response = wp_remote_get(cashupay_release_api_base() . $endpoint, [
         'timeout' => 15,
         'headers' => ['Accept' => 'application/vnd.github+json'],
     ]);
@@ -141,8 +172,17 @@ function cashupay_fetch_latest_release(): array {
     }
     $code = (int) wp_remote_retrieve_response_code($response);
     $release = json_decode((string) wp_remote_retrieve_body($response), true);
+    if ($testing && is_array($release)) {
+        // The listing is newest-first; drafts never appear for anonymous
+        // callers but are skipped anyway in case a token-authed proxy is in
+        // front of the API.
+        $release = array_values(array_filter($release, function ($entry) {
+            return is_array($entry) && empty($entry['draft']);
+        }))[0] ?? null;
+    }
     if ($code !== 200 || !is_array($release) || empty($release['assets'])) {
-        return ['ok' => false, 'message' => 'GitHub did not return a usable latest release (HTTP ' . $code . ').'];
+        return ['ok' => false, 'message' => 'GitHub did not return a usable '
+            . ($testing ? 'testing-channel release' : 'latest release') . ' (HTTP ' . $code . ').'];
     }
 
     $zipUrl = $zipName = null;
@@ -260,6 +300,21 @@ function cashupay_unpack_release(string $zipPath, string $installDir): array {
         return ['ok' => false, 'message' => 'The downloaded zip does not look like a BareBits release (no cashupayserver/BUILD_INFO inside).'];
     }
 
+    // A release that predates the managed-install support cannot be finished
+    // by this flow: its wizard would demand a password nobody provisioned and
+    // there is no provisioning endpoint to collect credentials from — the
+    // merchant would only discover that after walking the whole wizard.
+    // provision.php shipping in the zip is the canonical marker for the whole
+    // feature set (it landed together with managed.php / sso.php / the
+    // config constants this installer writes).
+    if (!is_file($unpacked . '/provision.php')) {
+        $wp_filesystem->delete($staging, true);
+        return ['ok' => false, 'message' => 'The newest release on this update channel does not support '
+            . 'being installed by this plugin yet (it predates the automatic-setup handshake). '
+            . 'Use "Start over" and connect a BareBits server you set up yourself by URL, '
+            . 'or try again once a newer release is published.'];
+    }
+
     if (!wp_mkdir_p(dirname($installDir)) || !@rename($unpacked, $installDir)) {
         // rename() can fail across filesystems; fall back to a copy.
         if (!wp_mkdir_p($installDir) || is_wp_error(copy_dir($unpacked, $installDir))) {
@@ -344,6 +399,18 @@ function cashupay_run_install(string $dirname = ''): array {
     if (is_dir($installDir)) {
         $ours = (string) get_option('cashupay_install_dir', '');
         if ($ours === $installDir && is_file($installDir . '/user_config.php') && is_file($installDir . '/BUILD_INFO')) {
+            // Our own earlier install — but only resumable if that release can
+            // actually finish this flow. An install made while the plugin still
+            // downloaded /releases/latest may be a pre-managed-install release
+            // (no provision.php): resuming it would walk the merchant into the
+            // same dead end the channel fix exists to prevent. Never deleted
+            // automatically — the folder could hold a database.
+            if (!is_file($installDir . '/provision.php')) {
+                return ['ok' => false, 'message' => 'A BareBits install from an older release is already at '
+                    . $installDir . ', and it is too old for this plugin to finish setting up. '
+                    . 'Rename that folder aside (renaming keeps anything stored inside it), '
+                    . 'then run the install again.'];
+            }
             // Resuming after a partial onboarding run (or after "Start over"
             // kept the install record): the install is in place. Restore the
             // connection options a reset may have cleared — but never the
@@ -399,6 +466,31 @@ function cashupay_run_install(string $dirname = ''): array {
     update_option('cashupay_sso_key', $config['sso_key'], false);
 
     return ['ok' => true, 'url' => $target['url'], 'verified' => !empty($download['verified'])];
+}
+
+/**
+ * Does the fresh install's /api/v1 route answer? The WooCommerce gateway
+ * talks to {url}/api/v1/... which the install's .htaccess rewrites to
+ * api.php — a host that ignores .htaccess (nginx, Apache with AllowOverride
+ * None) serves the surrounding site's "page not found" there instead.
+ * Probed right after the install, while the merchant is still looking at
+ * the screen, rather than surfacing as a cryptic wiring failure at the very
+ * end of onboarding. Pre-setup the endpoint answers 503 with a JSON body,
+ * after setup 200; both prove the route reaches BareBits. The JSON check
+ * matters: a WordPress 404 page (or a redirect-a-404-home plugin) answers
+ * with HTML, which must not count as routing.
+ */
+function cashupay_install_api_routes_ok(string $url): bool {
+    $response = wp_remote_get($url . '/api/v1/server/info', [
+        'timeout' => 10,
+        'sslverify' => !cashupay_is_same_host_url($url),
+    ]);
+    if (is_wp_error($response)) {
+        return false;
+    }
+    $code = (int) wp_remote_retrieve_response_code($response);
+    return in_array($code, [200, 503], true)
+        && is_array(json_decode((string) wp_remote_retrieve_body($response), true));
 }
 
 /**
