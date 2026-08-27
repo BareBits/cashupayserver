@@ -351,6 +351,7 @@ function cashupay_run_install(string $dirname = ''): array {
             // user_config.php and must not be regenerated out from under it.
             update_option('cashupay_mode', 'install');
             update_option('cashupay_server_url', $target['url']);
+            update_option('cashupay_install_url', $target['url'], false);
             return ['ok' => true, 'url' => $target['url'], 'verified' => true];
         }
         if (count(array_diff((array) scandir($installDir), ['.', '..'])) > 0) {
@@ -386,6 +387,9 @@ function cashupay_run_install(string $dirname = ''): array {
     update_option('cashupay_install_dir', $installDir, false);
     update_option('cashupay_install_data_dir', $dataDir, false);
     update_option('cashupay_server_url', $target['url']);
+    // The install's own address, kept separate from the connected-server URL
+    // so the cron heartbeat can outlive resets and mode changes.
+    update_option('cashupay_install_url', $target['url'], false);
     update_option('cashupay_provision_token', $config['token'], false);
     // The BareBits admin password (its account is pre-seeded from the hash;
     // day-to-day login is automatic via SSO — this is the copy the site

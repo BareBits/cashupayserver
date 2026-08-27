@@ -12,6 +12,9 @@
  *   cashupay_server_url        BareBits base URL (the BTCPay "server URL")
  *   cashupay_store_id          store id on that server
  *   cashupay_install_dir       install mode: absolute path of the install
+ *   cashupay_install_url       install mode: the alongside install's own base
+ *                              URL — survives mode changes so the cron
+ *                              heartbeat can keep finding the install
  *   cashupay_install_data_dir  install mode: absolute path of the data dir
  *   cashupay_provision_token   install mode: one-time token (deleted on use)
  *   cashupay_admin_password    install mode: the BareBits admin password the
@@ -40,6 +43,41 @@ function cashupay_mode(): string {
 /** The BareBits server base URL (no trailing slash), or '' if not set yet. */
 function cashupay_server_url(): string {
     return rtrim((string) get_option('cashupay_server_url', ''), '/');
+}
+
+/**
+ * The base URL of the alongside install this plugin provisioned (no trailing
+ * slash), or '' when none exists. Deliberately distinct from
+ * cashupay_server_url: the CONNECTED server can change — "Start over", then
+ * reconnecting the install by URL, or connecting some other server entirely —
+ * while the install this plugin promised a cron heartbeat to (it was
+ * provisioned with its own cron screen skipped) keeps running at its own
+ * address. Installs recorded before this option existed are backfilled from
+ * the connected URL while the plugin is still in install mode, when the two
+ * are the same thing by construction.
+ */
+function cashupay_install_url(): string {
+    if ((string) get_option('cashupay_install_dir', '') === '') {
+        return '';
+    }
+    $url = rtrim((string) get_option('cashupay_install_url', ''), '/');
+    if ($url !== '') {
+        return $url;
+    }
+    // Backfill for installs recorded before this option existed. In install
+    // mode the connected server IS the install, so the connected URL is
+    // proven and worth persisting. After an old-code reset (mode '') the
+    // surviving connected URL is still the best available answer, but only
+    // install mode proves it — return it without persisting the guess. In
+    // URL mode the connected server may be a different host entirely.
+    if (cashupay_mode() === 'install') {
+        $url = cashupay_server_url();
+        if ($url !== '') {
+            update_option('cashupay_install_url', $url, false);
+        }
+        return $url;
+    }
+    return cashupay_mode() === '' ? cashupay_server_url() : '';
 }
 
 /** Whether onboarding finished: a server is connected and WooCommerce wired. */

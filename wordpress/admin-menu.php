@@ -184,6 +184,11 @@ function cashupay_admin_notice(): void {
         return;
     }
 
+    // Before the configured check: an alongside install is owed its
+    // heartbeat even while onboarding is unfinished (mid-"Start over"), and
+    // a stall there must not be invisible.
+    cashupay_cron_stale_notice();
+
     if (!cashupay_is_configured()) {
         // Not on the plugin's own page — it already renders the flow.
         if (($_GET['page'] ?? '') === 'cashupay') {
@@ -196,25 +201,27 @@ function cashupay_admin_notice(): void {
         return;
     }
 
-    cashupay_cron_stale_notice();
     cashupay_review_notice();
 }
 
 /**
  * Warn when the alongside install's background heartbeat has gone quiet.
  *
- * Install mode delegates the server's cron to the WP-cron pinger, and
- * WP-cron only fires on site traffic — a quiet shop, a DISABLE_WP_CRON
+ * An alongside install delegates the server's cron to the WP-cron pinger,
+ * and WP-cron only fires on site traffic — a quiet shop, a DISABLE_WP_CRON
  * without a system cron, or a host that blocks self-requests silently
  * stalls payment confirmations. cashupay_cron_last_ok is stamped on every
  * successful ping (seeded synchronously when onboarding collects the
  * credentials); staleness is measured from the LATER of that stamp and the
  * wiring time, so installs wired before the stamp existed don't warn until
- * they have actually been quiet. State-only on purpose: this reads options
- * and never fires HTTP from an admin pageview.
+ * they have actually been quiet. Gated on the same condition as the pinger
+ * itself (an install record plus its cron key — not the mode, which a reset
+ * or a URL-mode reconnect changes while the heartbeat is still owed).
+ * State-only on purpose: this reads options and never fires HTTP from an
+ * admin pageview.
  */
 function cashupay_cron_stale_notice(): void {
-    if (cashupay_mode() !== 'install' || (string) get_option('cashupay_cron_key', '') === '') {
+    if (cashupay_install_url() === '' || (string) get_option('cashupay_cron_key', '') === '') {
         return;
     }
     $baseline = max((int) get_option('cashupay_cron_last_ok', 0), (int) get_option('cashupay_wired_at', 0));

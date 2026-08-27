@@ -8,11 +8,13 @@
  * connected; a hand-configured BTCPay connection is not ours to remove.
  *
  * When an alongside install exists, the install RECORD survives even the
- * uninstall: its location, address, admin password, and SSO key. That
- * server keeps running with real money behind a generated password the
- * merchant never chose — these options are the only copy, and deleting
- * them would lock the merchant out of their own wallet UI. A site with no
- * alongside install keeps nothing. The script has no filesystem or HTTP
+ * uninstall: its location, address, admin password, SSO key, and cron key
+ * (the one-time provisioning handshake can never mint another — a reinstall
+ * of the plugin resumes the install's heartbeat from it). That server keeps
+ * running with real money behind a generated password the merchant never
+ * chose — these options are the only copy, and deleting them would lock the
+ * merchant out of their own wallet UI. A site with no alongside install
+ * keeps nothing. The script has no filesystem or HTTP
  * surface (the stub set below provides none), which is the "never touches
  * the server or its data" promise in executable form.
  *
@@ -38,8 +40,9 @@ const UNINSTALL = __DIR__ . '/../../wordpress/uninstall.php';
 
 // The install record that must survive whenever an alongside install exists.
 const INSTALL_RECORD = [
-    'cashupay_server_url', 'cashupay_install_dir', 'cashupay_install_data_dir',
-    'cashupay_install_dirname', 'cashupay_admin_password', 'cashupay_sso_key',
+    'cashupay_server_url', 'cashupay_install_dir', 'cashupay_install_url',
+    'cashupay_install_data_dir', 'cashupay_install_dirname',
+    'cashupay_admin_password', 'cashupay_sso_key', 'cashupay_cron_key',
 ];
 
 /** Every option the plugin owns, as a fully-populated install would hold them. */
@@ -65,6 +68,7 @@ function seed_plugin_options(string $serverUrl, bool $withInstall): void {
     if ($withInstall) {
         $GLOBALS['wp_options'] += [
             'cashupay_install_dir' => '/var/www/barebits',
+            'cashupay_install_url' => $serverUrl,
             'cashupay_install_data_dir' => '/var/www/barebits-data-abc123def456',
             'cashupay_install_dirname' => 'barebits',
         ];

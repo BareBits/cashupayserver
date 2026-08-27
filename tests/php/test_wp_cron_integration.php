@@ -10,10 +10,14 @@
  * key — full run, essentials, and the lock-bounce all carry one), and backs
  * off for ten minutes after any failure so loopback-hostile hosts don't burn
  * every wp-cron request on a timeout. Pure HTTP — there is no inline Invoice
- * fallback and no BareBits code runs inside WordPress; servers connected by
- * URL (mode 'url') run their own cron and get no pinger. The WordPress
- * HTTP/cron/option API surface is stubbed below; the HTTP stub records every
- * request so the tests can assert exactly what was sent and how often.
+ * fallback and no BareBits code runs inside WordPress; servers this plugin
+ * did not install run their own cron and get no pinger. The heartbeat is
+ * owed to the INSTALL (install record + cron key), not to the current mode:
+ * it keeps ticking the install's own URL through "Start over" and after the
+ * install is reconnected in URL mode — and never pings a different server
+ * the merchant connected instead. The WordPress HTTP/cron/option API surface
+ * is stubbed below; the HTTP stub records every request so the tests can
+ * assert exactly what was sent and how often.
  */
 declare(strict_types=1);
 require __DIR__ . '/harness.php';
@@ -64,6 +68,8 @@ function reset_http(): void {
 function configure_install(): void {
     $GLOBALS['wp_options']['cashupay_mode'] = 'install';
     $GLOBALS['wp_options']['cashupay_server_url'] = 'http://wp.test/barebits';
+    $GLOBALS['wp_options']['cashupay_install_dir'] = '/var/www/barebits';
+    $GLOBALS['wp_options']['cashupay_install_url'] = 'http://wp.test/barebits';
     $GLOBALS['wp_options']['cashupay_cron_key'] = 'k';
 }
 
@@ -73,16 +79,26 @@ assert_false(cashupay_cron_needed(), 'a fresh plugin owes no heartbeat');
 cashupay_cron_tick();
 assert_eq(0, count($GLOBALS['http_requests']), 'unconfigured tick sends nothing');
 
-// Every leg of the gate matters: a URL-mode server runs its own cron, and
-// without a cron key there is nothing to authenticate with.
-configure_install();
+// Every leg of the gate matters: a server this plugin did not install runs
+// its own cron, and without a cron key there is nothing to authenticate with.
 $GLOBALS['wp_options']['cashupay_mode'] = 'url';
-assert_false(cashupay_cron_needed(), 'URL-mode servers run their own cron');
-$GLOBALS['wp_options']['cashupay_mode'] = 'install';
+$GLOBALS['wp_options']['cashupay_server_url'] = 'https://pay.example.com';
+$GLOBALS['wp_options']['cashupay_cron_key'] = 'k';
+assert_false(cashupay_cron_needed(), 'a URL-mode server with no install record runs its own cron');
+unset($GLOBALS['wp_options']['cashupay_cron_key']);
+configure_install();
 $GLOBALS['wp_options']['cashupay_cron_key'] = '';
 assert_false(cashupay_cron_needed(), 'no cron key means no heartbeat');
 configure_install();
 assert_true(cashupay_cron_needed(), 'a wired alongside install owes the heartbeat');
+
+// The heartbeat is owed to the INSTALL, not to the mode: mid-"Start over"
+// (mode forgotten) and after a URL-mode reconnect it is still owed.
+$GLOBALS['wp_options']['cashupay_mode'] = '';
+assert_true(cashupay_cron_needed(), 'the heartbeat survives a reset (mode forgotten)');
+$GLOBALS['wp_options']['cashupay_mode'] = 'url';
+assert_true(cashupay_cron_needed(), 'the heartbeat survives a URL-mode reconnect');
+configure_install();
 
 // --- the ping: authenticated GET at the install's cron.php -------------------
 reset_http();
@@ -99,6 +115,22 @@ assert_false(isset($GLOBALS['wp_options']['cashupay_cron_backoff_until']), 'succ
 // Every success stamps the heartbeat — the wp-admin stale warning reads this.
 $lastOk = (int)($GLOBALS['wp_options']['cashupay_cron_last_ok'] ?? 0);
 assert_true($lastOk > 0 && $lastOk <= time(), 'success stamps cashupay_cron_last_ok');
+
+// --- connected to a DIFFERENT server by URL: the install still gets the ping --
+reset_http();
+$GLOBALS['wp_options']['cashupay_mode'] = 'url';
+$GLOBALS['wp_options']['cashupay_server_url'] = 'https://other.example.com';
+cashupay_cron_tick();
+assert_eq('http://wp.test/barebits/cron.php', $GLOBALS['http_requests'][0]['url'] ?? null,
+    'the ping targets the install\'s own URL, never the connected server');
+configure_install();
+
+// --- pre-upgrade installs: the install URL is backfilled in install mode -----
+unset($GLOBALS['wp_options']['cashupay_install_url']);
+assert_eq('http://wp.test/barebits', cashupay_install_url(),
+    'a pre-upgrade install-mode record falls back to the connected URL');
+assert_eq('http://wp.test/barebits', $GLOBALS['wp_options']['cashupay_install_url'] ?? null,
+    'and the backfill is persisted');
 
 // --- cron-shaped 200 succeeds and clears a standing backoff ------------------
 reset_http();
@@ -172,10 +204,10 @@ assert_eq(1, count($GLOBALS['scheduled']), 'present event is not double-schedule
 
 $GLOBALS['scheduled'] = [];
 $GLOBALS['next_scheduled'] = false;
-$GLOBALS['wp_options']['cashupay_mode'] = 'url';
+unset($GLOBALS['wp_options']['cashupay_install_dir'], $GLOBALS['wp_options']['cashupay_install_url']);
 cashupay_cron_reschedule();
-assert_eq([], $GLOBALS['scheduled'], 'no heartbeat owed, nothing scheduled');
-$GLOBALS['wp_options']['cashupay_mode'] = 'install';
+assert_eq([], $GLOBALS['scheduled'], 'no heartbeat owed (no install record), nothing scheduled');
+configure_install();
 
 // --- unschedule clears both the event and the backoff ------------------------
 $GLOBALS['next_scheduled'] = 12345;

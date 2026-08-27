@@ -320,6 +320,8 @@ assert_true(str_contains($config, hash('sha256', $token)), 'the token hash is wh
 assert_true(str_contains($config, hash('sha256', $ssoKey)), 'the SSO key hash is what got written');
 assert_eq('install', get_option('cashupay_mode'), 'mode recorded');
 assert_eq($installDir, get_option('cashupay_install_dir'), 'install dir recorded');
+assert_eq('http://wp.test/barebits', get_option('cashupay_install_url'),
+    'the install\'s own URL recorded (the cron heartbeat outlives mode changes)');
 assert_eq($outside, get_option('cashupay_install_data_dir'), 'data dir recorded (outside the web root)');
 
 // Resuming with our own completed install in place: reused, nothing
@@ -328,6 +330,7 @@ assert_eq($outside, get_option('cashupay_install_data_dir'), 'data dir recorded 
 // user_config.php) are left untouched.
 delete_option('cashupay_mode');
 delete_option('cashupay_server_url');
+delete_option('cashupay_install_url');
 $tokenBefore = get_option('cashupay_provision_token');
 $GLOBALS['http_log'] = [];
 $r = cashupay_run_install('barebits');
@@ -335,6 +338,7 @@ assert_eq(true, $r['ok'], 'our own completed install resumes');
 assert_eq([], $GLOBALS['http_log'], 'a resume never re-downloads');
 assert_eq('install', get_option('cashupay_mode'), 'a resume restores the mode');
 assert_eq('http://wp.test/barebits', get_option('cashupay_server_url'), 'and the server URL');
+assert_eq('http://wp.test/barebits', get_option('cashupay_install_url'), 'and the install\'s own URL');
 assert_eq($tokenBefore, get_option('cashupay_provision_token'),
     'a resume never regenerates the credentials behind the install\'s hashes');
 

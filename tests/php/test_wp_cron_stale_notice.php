@@ -48,6 +48,8 @@ function set_install_state(int $lastOk, int $wiredAt): void {
     $GLOBALS['wp_options'] = array_merge($GLOBALS['wp_options'], [
         'cashupay_mode' => 'install',
         'cashupay_server_url' => 'http://wp.test/barebits',
+        'cashupay_install_dir' => '/var/www/barebits',
+        'cashupay_install_url' => 'http://wp.test/barebits',
         'cashupay_wired_at' => $wiredAt,
         'cashupay_cron_key' => str_repeat('b', 64),
         'cashupay_cron_last_ok' => $lastOk,
@@ -82,11 +84,29 @@ assert_true(str_contains(render_notices(), WARNING_MARKER), 'but not forever —
 $html = render_notices();
 assert_true(str_contains($html, 'Leave us a review!'), 'the review banner still renders alongside');
 
-// --- URL mode: the remote server runs its own cron — never warn --------------
+// --- URL mode with no install record: the remote server runs its own cron ----
 set_install_state(lastOk: 0, wiredAt: time() - 86400);
 $GLOBALS['wp_options']['cashupay_mode'] = 'url';
-assert_false(str_contains(render_notices(), WARNING_MARKER), 'URL-mode connections never warn');
-$GLOBALS['wp_options']['cashupay_mode'] = 'install';
+unset($GLOBALS['wp_options']['cashupay_install_dir'], $GLOBALS['wp_options']['cashupay_install_url'],
+    $GLOBALS['wp_options']['cashupay_cron_key'], $GLOBALS['wp_options']['cashupay_cron_last_ok']);
+assert_false(str_contains(render_notices(), WARNING_MARKER), 'plain URL-mode connections never warn');
+
+// --- but a surviving alongside install is owed its heartbeat in ANY mode ------
+//
+// The pinger keeps ticking the install through "Start over" and after a
+// URL-mode reconnect, so its staleness must stay visible there too.
+set_install_state(lastOk: time() - 1800, wiredAt: time() - 86400);
+$GLOBALS['wp_options']['cashupay_mode'] = 'url';
+assert_true(str_contains(render_notices(), WARNING_MARKER),
+    'a reconnected-by-URL alongside install still warns when stale');
+unset($GLOBALS['wp_options']['cashupay_mode'], $GLOBALS['wp_options']['cashupay_wired_at']);
+$html = render_notices();
+assert_true(str_contains($html, WARNING_MARKER),
+    'mid-reset (unconfigured) the surviving install still warns when stale');
+assert_true(str_contains($html, 'almost ready'),
+    'alongside the finish-setup nag, not instead of it');
+// Back to a stale install-mode state so the remaining gates are meaningful.
+set_install_state(lastOk: time() - 1800, wiredAt: time() - 86400);
 
 // --- No cron key (nothing to ping with): quiet --------------------------------
 $GLOBALS['wp_options']['cashupay_cron_key'] = '';
