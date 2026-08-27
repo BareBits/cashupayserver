@@ -14,6 +14,7 @@ if (!defined('ABSPATH')) {
 add_action('admin_menu', 'cashupay_admin_menu');
 add_action('admin_notices', 'cashupay_admin_notice');
 add_action('wp_ajax_cashupay_dismiss_review', 'cashupay_dismiss_review_notice');
+add_action('wp_ajax_cashupay_reveal_password', 'cashupay_reveal_password_ajax');
 
 // Review-banner dismissal state, stored site-wide (one admin dismissing hides
 // it for everyone): ['dismissed_at' => unix ts of last dismissal, 'count' =>
@@ -33,17 +34,70 @@ function cashupay_admin_menu(): void {
         'dashicons-money-alt',
         58
     );
+    if (cashupay_is_configured()) {
+        // Rename the auto-created first submenu entry and add the details page.
+        add_submenu_page('cashupay', 'BareBits', cashupay_mode() === 'install' ? 'Dashboard' : 'Status', 'manage_options', 'cashupay', 'cashupay_admin_page');
+        add_submenu_page('cashupay', 'BareBits connection', 'Connection', 'manage_options', 'cashupay-connection', 'cashupay_connection_page');
+    }
 }
 
 /**
- * The BareBits page: onboarding until wired, then the status panel.
+ * The BareBits page: onboarding until wired; then, for an alongside install,
+ * the BareBits admin embedded full-height in wp-admin — signed in
+ * automatically through a one-time SSO token, so clicking "BareBits" in the
+ * sidebar drops the operator straight into the dashboard, exactly like the
+ * old bundled plugin. Remote (URL-mode) servers get the connection panel
+ * instead: cross-site embedding is unreliable (third-party cookies) so they
+ * link out.
  */
 function cashupay_admin_page(): void {
     if (!cashupay_is_configured()) {
         cashupay_render_onboarding();
         return;
     }
+    if (cashupay_mode() !== 'install') {
+        cashupay_connection_page();
+        return;
+    }
 
+    // Mint the sign-in handoff; on failure (install briefly unreachable, SSO
+    // not provisioned on an old install) fall back to the plain admin URL,
+    // where BareBits shows its own login.
+    $src = cashupay_sso_login_url() ?: (cashupay_server_url() . '/admin.php');
+    // Consume any pending one-shot notice here too — the wiring's "Finish"
+    // redirects straight to this page, and its success message must not lie
+    // in wait to pop up on some later Connection-page visit instead.
+    $flash = cashupay_take_flash();
+    if ($flash) {
+        echo '<div class="notice notice-' . esc_attr($flash['kind'] === 'error' ? 'error' : ($flash['kind'] === 'warning' ? 'warning' : 'success')) . '"><p>' . esc_html($flash['message']) . '</p></div>';
+    }
+    ?>
+    <style>
+        /* Hand the whole content area to the iframe; wp-admin's own padding
+           and footer would otherwise add a page scrollbar under the SPA. */
+        #wpcontent, #wpbody-content { padding: 0; }
+        #wpfooter { display: none; }
+        #cashupay-admin-frame {
+            display: block;
+            width: 100%;
+            /* WP 5.9+ exposes the admin-bar height (32px, 46px on small
+               screens) as a custom property; older cores get the 32px
+               fallback. */
+            height: calc(100vh - var(--wp-admin--admin-bar--height, 32px));
+            border: 0;
+        }
+    </style>
+    <iframe id="cashupay-admin-frame" src="<?= esc_url($src) ?>" title="BareBits"></iframe>
+    <?php
+}
+
+/**
+ * Connection details: status table, wiring re-run, and (install mode) the
+ * BareBits admin password reveal — day-to-day sign-in is automatic via SSO,
+ * but BareBits still asks for the password before showing a wallet recovery
+ * phrase, and it is the fallback if this plugin is ever removed.
+ */
+function cashupay_connection_page(): void {
     $mode = cashupay_mode();
     $server = cashupay_server_url();
     $flash = cashupay_take_flash();
@@ -69,11 +123,43 @@ function cashupay_admin_page(): void {
                         </td>
                     </tr>
                     <tr><td>Background jobs</td><td>Driven by WP-cron (this plugin pings the server every minute).</td></tr>
+                    <?php if ((string) get_option('cashupay_admin_password', '') !== ''): ?>
+                    <tr>
+                        <td>Admin password</td>
+                        <td>
+                            <code id="cashupay-admin-password">••••••••••••</code>
+                            <button type="button" class="button button-small" id="cashupay-reveal-password"
+                                    data-nonce="<?= esc_attr(wp_create_nonce('cashupay_reveal_password')) ?>">Reveal</button>
+                            <p class="description">Sign-in from here is automatic; BareBits asks for this password only for
+                            sensitive actions (revealing a wallet recovery phrase), and it lets you sign in directly if this
+                            plugin is ever removed.</p>
+                            <script>
+                            document.getElementById('cashupay-reveal-password').addEventListener('click', function () {
+                                const btn = this;
+                                const body = new URLSearchParams();
+                                body.set('action', 'cashupay_reveal_password');
+                                body.set('nonce', btn.dataset.nonce);
+                                fetch(ajaxurl, {
+                                    method: 'POST',
+                                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                                    body: body.toString(),
+                                    credentials: 'same-origin'
+                                }).then(r => r.json()).then(res => {
+                                    if (res && res.success && res.data) {
+                                        document.getElementById('cashupay-admin-password').textContent = res.data;
+                                        btn.remove();
+                                    }
+                                });
+                            });
+                            </script>
+                        </td>
+                    </tr>
+                    <?php endif; ?>
                 <?php endif; ?>
             </tbody>
         </table>
         <p style="margin-top: 1em;">
-            <a href="<?= esc_url($server . '/admin.php') ?>" target="_blank" rel="noopener" class="button button-primary">Open the BareBits admin</a>
+            <a href="<?= esc_url($server . '/admin.php') ?>" target="_blank" rel="noopener" class="button button-primary">Open the BareBits admin<?= $mode === 'install' ? ' in a new tab' : '' ?></a>
         </p>
         <form method="post" action="<?= esc_url(admin_url('admin-post.php')) ?>" style="margin-top: 1em;">
             <?php wp_nonce_field('cashupay_finish'); ?>
@@ -163,6 +249,22 @@ function cashupay_review_notice_visible(): bool {
         return false;
     }
     return true;
+}
+
+/**
+ * Reveal the provisioned BareBits admin password to a site admin (nonce +
+ * capability gated; the Connection page's Reveal button calls this).
+ */
+function cashupay_reveal_password_ajax(): void {
+    check_ajax_referer('cashupay_reveal_password', 'nonce');
+    if (!current_user_can('manage_options')) {
+        wp_send_json_error(null, 403);
+    }
+    $password = (string) get_option('cashupay_admin_password', '');
+    if ($password === '') {
+        wp_send_json_error(null, 404);
+    }
+    wp_send_json_success($password);
 }
 
 function cashupay_dismiss_review_notice(): void {

@@ -307,6 +307,57 @@ function cashupay_apply_btcpay_order_states(): void {
 }
 
 /**
+ * Redirect a payer whose invoice expired back to a page where they can pay.
+ *
+ * The install's payment page links here (CASHUPAY_RETRY_URL_TEMPLATE, written
+ * by the installer) as /?cashupay-retry={invoiceId}. Resolves the invoice
+ * back to its WooCommerce order via the BTCPay_id order meta (the same lookup
+ * the gateway's webhook handler uses), then sends the customer to
+ * WooCommerce's order-pay page — where clicking "Pay" makes the gateway
+ * notice the old invoice is Expired and mint a fresh one. Orders that no
+ * longer need payment (paid meanwhile, cancelled, refunded) go to the
+ * order-received page instead, which explains the order's actual state.
+ */
+function cashupay_maybe_handle_retry(): void {
+    $invoiceId = isset($_GET['cashupay-retry'])
+        ? sanitize_text_field((string) wp_unslash($_GET['cashupay-retry']))
+        : '';
+    if ($invoiceId === '') {
+        return;
+    }
+
+    // Without WooCommerce (or if the invoice can't be resolved to exactly one
+    // order) the front page beats a dead end — the expired payment page is
+    // what linked here, so bouncing back to it would loop.
+    $fallback = home_url('/');
+
+    if (!function_exists('wc_get_orders')) {
+        wp_safe_redirect($fallback);
+        exit;
+    }
+
+    $orders = wc_get_orders([
+        'meta_key' => 'BTCPay_id',
+        'meta_value' => $invoiceId,
+    ]);
+
+    if (!is_array($orders) || count($orders) !== 1) {
+        wp_safe_redirect($fallback);
+        exit;
+    }
+
+    $order = $orders[0];
+    if ($order->needs_payment()) {
+        wp_safe_redirect($order->get_checkout_payment_url());
+        exit;
+    }
+
+    wp_safe_redirect($order->get_checkout_order_received_url());
+    exit;
+}
+add_action('template_redirect', 'cashupay_maybe_handle_retry');
+
+/**
  * Whether this WordPress install can install plugins programmatically without
  * prompting for FTP/SSH credentials.
  *

@@ -299,7 +299,8 @@ function cashupay_handle_reset_onboarding(): void {
         'cashupay_mode', 'cashupay_server_url', 'cashupay_store_id',
         'cashupay_api_key', 'cashupay_cron_key', 'cashupay_wired_at',
         'cashupay_discount_percent', 'cashupay_pairing_expected',
-        'cashupay_provision_token', 'cashupay_install_dir',
+        'cashupay_provision_token', 'cashupay_admin_password',
+        'cashupay_sso_key', 'cashupay_install_dir',
         'cashupay_install_data_dir', 'cashupay_install_dirname',
         'cashupay_btcpay_override_consent',
     ] as $option) {
@@ -406,12 +407,17 @@ function cashupay_render_step_provision(): void {
     $setupUrl = cashupay_server_url() . '/setup.php';
     ?>
     <h2>Finish the BareBits setup</h2>
-    <p>BareBits is installed. Now walk through its setup wizard — it configures your store, wallets and payment rails, and shows you the recovery phrase to write down.</p>
-    <p><a href="<?= esc_url($setupUrl) ?>" target="_blank" rel="noopener" class="button button-primary">Open the BareBits setup wizard</a></p>
-    <form method="post" action="<?= esc_url(admin_url('admin-post.php')) ?>">
+    <p>BareBits is installed. Walk through its setup wizard below — it configures your store, wallets and payment rails, and shows you the recovery phrase to write down.
+       (Prefer a full window? <a href="<?= esc_url($setupUrl) ?>" target="_blank" rel="noopener">Open the wizard in a new tab</a>.)</p>
+    <!-- Same-origin embed: the alongside install lives under this site's own
+         origin, so the wizard runs inside wp-admin just like the old bundled
+         plugin's did. -->
+    <iframe src="<?= esc_url($setupUrl) ?>" title="BareBits setup"
+            style="width: 100%; height: 70vh; border: 1px solid #c3c4c7; border-radius: 4px; background: #fff;"></iframe>
+    <form method="post" action="<?= esc_url(admin_url('admin-post.php')) ?>" style="margin-top: 1em;">
         <?php wp_nonce_field('cashupay_collect_provision'); ?>
         <input type="hidden" name="action" value="cashupay_collect_provision">
-        <p class="description">When the wizard says you're done, come back and continue:</p>
+        <p class="description">When the wizard says you're done, continue:</p>
         <?php submit_button('I finished the wizard — continue', 'secondary'); ?>
     </form>
     <?php

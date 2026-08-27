@@ -44,6 +44,8 @@ foreach ([
     'cashupay_discount_percent',
     'cashupay_pairing_expected',
     'cashupay_provision_token',
+    'cashupay_admin_password',
+    'cashupay_sso_key',
     'cashupay_install_dir',
     'cashupay_install_data_dir',
     'cashupay_install_dirname',

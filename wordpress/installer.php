@@ -253,24 +253,49 @@ function cashupay_unpack_release(string $zipPath, string $installDir): array {
 }
 
 /**
- * Write the install's user_config.php: the data directory, the declaration
- * that WP-cron drives cron.php (so the BareBits wizard skips its crontab
- * screen), and the hash of a freshly generated one-time provisioning token.
- * The plaintext token is returned and kept in a WordPress option; only its
- * hash ever touches the BareBits side.
+ * Write the install's user_config.php. Everything BareBits needs to run as a
+ * managed single-shop install is declared here as data — never code:
  *
- * @return array{ok:bool, token?:string, message?:string}
+ *   - the data directory and pinned base URL,
+ *   - CASHUPAY_MANAGED_INSTALL (shapes the product for the single-shop
+ *     case and implies the wizard's cron-screen skip — WP-cron pings
+ *     cron.php),
+ *   - the shop's front page + retry endpoint for payer-facing links,
+ *   - a pre-seeded admin password (hash only; the wizard skips its
+ *     password screen and this plugin can reveal the plaintext to the
+ *     site admin when BareBits ever asks for it),
+ *   - an SSO key (hash only) so opening BareBits from wp-admin signs the
+ *     operator in via single-use login tokens,
+ *   - a one-time provisioning token (hash only) for the credentials
+ *     handshake after setup.
+ *
+ * The plaintexts are returned and kept in WordPress options; only hashes
+ * ever touch the BareBits side.
+ *
+ * @return array{ok:bool, token?:string, admin_password?:string, sso_key?:string, message?:string}
  */
 function cashupay_write_install_config(string $installDir, string $dataDir, string $baseUrl): array {
     $token = bin2hex(random_bytes(32));
+    $adminPassword = wp_generate_password(24, true, false);
+    $ssoKey = bin2hex(random_bytes(32));
     $config = "<?php\n"
         . "// Written by the BareBits WordPress plugin's installer.\n"
         . "define('CASHUPAY_DATA_DIR', " . var_export(rtrim($dataDir, '/'), true) . ");\n"
         . "// The URL this install is served at; pinned so the app never has\n"
         . "// to trust the Host header or guess its own path.\n"
         . "define('CASHUPAY_BASE_URL', " . var_export(rtrim($baseUrl, '/'), true) . ");\n"
-        . "// WP-cron pings cron.php every minute; the setup wizard skips its cron screen.\n"
-        . "define('CASHUPAY_EXTERNAL_CRON', true);\n"
+        . "// Managed single-shop install: single-store admin UI, shop-owned\n"
+        . "// sections hidden, payer email capture defaulted off, cron screen\n"
+        . "// skipped (WP-cron pings cron.php every minute).\n"
+        . "define('CASHUPAY_MANAGED_INSTALL', true);\n"
+        . "// Payer-facing links prefer the shop.\n"
+        . "define('CASHUPAY_SHOP_URL', " . var_export(rtrim(home_url('/'), '/'), true) . ");\n"
+        . "define('CASHUPAY_RETRY_URL_TEMPLATE', " . var_export(home_url('/?cashupay-retry={invoiceId}'), true) . ");\n"
+        . "// Pre-seeded admin account (wizard skips its password screen); the\n"
+        . "// plaintext is held by the WordPress plugin (BareBits page -> reveal).\n"
+        . "define('CASHUPAY_ADMIN_PASSWORD_HASH', " . var_export(password_hash($adminPassword, PASSWORD_DEFAULT), true) . ");\n"
+        . "// SSO login-token handoff (see sso.php in the install).\n"
+        . "define('CASHUPAY_SSO_KEY_HASH', '" . hash('sha256', $ssoKey) . "');\n"
         . "// One-time provisioning handshake (see provision.php in the install).\n"
         . "define('CASHUPAY_PROVISION_TOKEN_HASH', '" . hash('sha256', $token) . "');\n";
     if (file_put_contents(rtrim($installDir, '/') . '/user_config.php', $config) === false) {
@@ -279,7 +304,7 @@ function cashupay_write_install_config(string $installDir, string $dataDir, stri
     if (!is_dir($dataDir) && !wp_mkdir_p($dataDir)) {
         return ['ok' => false, 'message' => 'Could not create the data directory at ' . $dataDir . '.'];
     }
-    return ['ok' => true, 'token' => $token];
+    return ['ok' => true, 'token' => $token, 'admin_password' => $adminPassword, 'sso_key' => $ssoKey];
 }
 
 /**
@@ -337,6 +362,12 @@ function cashupay_run_install(string $dirname = ''): array {
     update_option('cashupay_install_data_dir', $dataDir, false);
     update_option('cashupay_server_url', $target['url']);
     update_option('cashupay_provision_token', $config['token'], false);
+    // The BareBits admin password (its account is pre-seeded from the hash;
+    // day-to-day login is automatic via SSO — this is the copy the site
+    // admin can reveal when BareBits asks for a password, e.g. revealing a
+    // wallet recovery phrase) and the SSO key that mints login tokens.
+    update_option('cashupay_admin_password', $config['admin_password'], false);
+    update_option('cashupay_sso_key', $config['sso_key'], false);
 
     return ['ok' => true, 'url' => $target['url'], 'verified' => !empty($download['verified'])];
 }

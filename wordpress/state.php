@@ -14,6 +14,11 @@
  *   cashupay_install_dir       install mode: absolute path of the install
  *   cashupay_install_data_dir  install mode: absolute path of the data dir
  *   cashupay_provision_token   install mode: one-time token (deleted on use)
+ *   cashupay_admin_password    install mode: the BareBits admin password the
+ *                              installer generated (account pre-seeded from
+ *                              its hash; revealable on the Connection page)
+ *   cashupay_sso_key           install mode: key that mints one-time BareBits
+ *                              sign-in tokens (see cashupay_sso_login_url)
  *   cashupay_cron_key          install mode: key for the WP-cron pinger
  *   cashupay_wired_at          unix ts when WooCommerce wiring completed
  *   cashupay_discount_percent  merchant's checkout discount answer (int)
@@ -77,6 +82,34 @@ function cashupay_probe_server(string $url): array {
         return ['ok' => false, 'message' => 'That URL answered, but it does not look like a BareBits server (HTTP ' . $code . ').'];
     }
     return ['ok' => true, 'version' => (string) ($body['version'] ?? '')];
+}
+
+/**
+ * Mint a one-time BareBits admin sign-in URL through the install's SSO
+ * handoff (install mode only — the plugin holds the SSO key it provisioned).
+ * Returns the URL to send the browser/iframe to, or null when SSO isn't
+ * available (URL mode, setup not finished, install unreachable) — callers
+ * fall back to the plain admin URL, where BareBits shows its own login.
+ */
+function cashupay_sso_login_url(): ?string {
+    $server = cashupay_server_url();
+    $ssoKey = (string) get_option('cashupay_sso_key', '');
+    if ($server === '' || $ssoKey === '') {
+        return null;
+    }
+    $response = wp_remote_post($server . '/sso.php', [
+        'timeout' => 10,
+        'sslverify' => !cashupay_is_same_host_url($server),
+        'headers' => ['X-SSO-KEY' => $ssoKey],
+    ]);
+    if (is_wp_error($response) || (int) wp_remote_retrieve_response_code($response) !== 200) {
+        return null;
+    }
+    $body = json_decode((string) wp_remote_retrieve_body($response), true);
+    if (!is_array($body) || ($body['status'] ?? '') !== 'ready' || empty($body['token'])) {
+        return null;
+    }
+    return $server . '/sso.php?token=' . rawurlencode((string) $body['token']);
 }
 
 /**
