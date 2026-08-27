@@ -41,6 +41,7 @@ function apply_filters($hook, $value) { return $value; }
 function site_url($path = '') { return 'http://wp.test' . $path; }
 function content_url($path = '') { return 'http://wp.test/wp-content' . $path; }
 function home_url($path = '') { return 'http://wp.test' . $path; }
+function admin_url($path = '') { return 'http://wp.test/wp-admin/' . ltrim($path, '/'); }
 function wp_is_writable($path) {
     return !in_array(rtrim((string)$path, '/'), $GLOBALS['unwritable'], true) && is_writable($path);
 }
@@ -320,9 +321,13 @@ $config = (string)file_get_contents($installDir . '/user_config.php');
 foreach (['CASHUPAY_DATA_DIR', 'CASHUPAY_BASE_URL', 'CASHUPAY_MANAGED_INSTALL',
           'CASHUPAY_SHOP_URL', 'CASHUPAY_RETRY_URL_TEMPLATE',
           'CASHUPAY_ADMIN_PASSWORD_HASH', 'CASHUPAY_SSO_KEY_HASH',
-          'CASHUPAY_PROVISION_TOKEN_HASH'] as $constant) {
+          'CASHUPAY_PROVISION_TOKEN_HASH', 'CASHUPAY_MANAGED_RETURN_URL'] as $constant) {
     assert_true(str_contains($config, $constant), "user_config.php declares {$constant}");
 }
+// The return URL is the plugin's credential-collection endpoint — the wizard's
+// completion screen sends the operator there and onboarding resumes itself.
+assert_true(str_contains($config, 'http://wp.test/wp-admin/admin-post.php?action=cashupay_provision_return'),
+    'the managed return URL points at the provision-return admin-post action');
 // Only hashes touch the install; the plaintexts live in WordPress options.
 $token = (string)get_option('cashupay_provision_token');
 $ssoKey = (string)get_option('cashupay_sso_key');
