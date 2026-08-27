@@ -19,6 +19,9 @@ declare(strict_types=1);
 require __DIR__ . '/harness.php';
 
 define('ABSPATH', sys_get_temp_dir() . '/');
+// The helper file registers its retry endpoint on template_redirect at
+// include time; the decision function under test stays pure.
+function add_action($hook, $cb) {}
 require_once dirname(__DIR__, 2) . '/wordpress/btcpay-integration.php';
 
 const OURS = 'https://shop.example/cashupay';
