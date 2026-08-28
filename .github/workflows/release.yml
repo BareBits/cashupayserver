@@ -267,7 +267,12 @@ jobs:
           # already exists (the tag-push path).
           target_commitish: ${{ github.sha }}
           name: "CashuPayServer ${{ env.TAG }}"
+          # Prerelease (testing-channel) bodies lead with an instability
+          # warning pointing at the stable channel; on stable releases the
+          # expression yields an empty line, which GitHub's renderer trims.
           body: |
+            ${{ needs.build.outputs.prerelease == 'true' && 'Warning: This is a testing release and may be unstable or insecure, use the [latest main](https://github.com/BareBits/cashupayserver/releases/latest) release instead' || '' }}
+
             CashuPayServer ${{ env.TAG }}, built from ${{ github.sha }}.
 
             Assets:
