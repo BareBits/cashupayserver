@@ -112,6 +112,50 @@ function cashupay_is_same_host_url(string $url): bool {
 }
 
 /**
+ * The absolute URL a Greenfield API call against $server should target.
+ *
+ * For the same-origin alongside install ($server is the install this plugin
+ * provisioned), that is api.php with the API path carried in the
+ * cashupay_path query parameter — api.php's query-path transport — rather
+ * than the canonical /api/v1 path. On rewrite-hostile hosts (Local WP,
+ * managed nginx) the canonical URL falls through the web server into
+ * WordPress, where the API bridge replays it against api.php: one plugin
+ * call becomes a chain of THREE simultaneous PHP requests on the same site
+ * (the wp-admin request making the call, the bridged WordPress request, and
+ * api.php). Hosts with small per-site PHP worker pools starve on that chain
+ * and the call dies as a bare timeout — cURL error 28 at the WooCommerce
+ * wiring step on Local WP. api.php is a real file every host executes
+ * directly, so the query form works on friendly and hostile hosts alike and
+ * keeps the plugin's own API calls one loopback deep. Any other server
+ * (URL mode, remote) keeps the canonical URL its operator's setup proved.
+ *
+ * Pure (no WordPress calls) so tests/php can pin the selection without a
+ * WordPress install; cashupay_api_url() is the live wrapper. $server and
+ * $installUrl arrive normalized (no trailing slash) from
+ * cashupay_server_url() / cashupay_install_url().
+ */
+function cashupay_api_transport_url(string $server, string $path, string $installUrl): string {
+    if ($server === '' || $installUrl === '' || $server !== $installUrl) {
+        return $server . $path;
+    }
+    // No current caller passes a query string in $path, but carry one through
+    // the way the bridge does (as real parameters, outside cashupay_path)
+    // rather than corrupting it into the encoded path.
+    $query = '';
+    $mark = strpos($path, '?');
+    if ($mark !== false) {
+        $query = '&' . substr($path, $mark + 1);
+        $path = substr($path, 0, $mark);
+    }
+    return $server . '/api.php?cashupay_path=' . rawurlencode($path) . $query;
+}
+
+/** The live wrapper: transport decision against the recorded install. */
+function cashupay_api_url(string $server, string $path): string {
+    return cashupay_api_transport_url($server, $path, cashupay_install_url());
+}
+
+/**
  * Probe a candidate BareBits server URL: fetch {url}/api/v1/server/info and
  * require the isCashuPayServer marker. Returns ['ok' => true, 'version' => …]
  * or ['ok' => false, 'message' => operator-facing reason].
@@ -121,7 +165,11 @@ function cashupay_probe_server(string $url): array {
     if ($url === '' || !preg_match('#^https?://#i', $url)) {
         return ['ok' => false, 'message' => 'Enter the full URL, starting with https:// (or http:// for a local server).'];
     }
-    $response = wp_remote_get($url . '/api/v1/server/info', [
+    // Reconnecting the alongside install goes through api.php directly, like
+    // every other plugin call to it — the canonical /api/v1 form would nest
+    // through the bridge on rewrite-hostile hosts (see
+    // cashupay_api_transport_url).
+    $response = wp_remote_get(cashupay_api_url($url, '/api/v1/server/info'), [
         'timeout' => 10,
         'redirection' => 3,
         'sslverify' => !cashupay_is_same_host_url($url),
@@ -191,9 +239,19 @@ function cashupay_api_request(string $method, string $path, ?array $body = null,
     if ($body !== null) {
         $args['body'] = wp_json_encode($body);
     }
-    $response = wp_remote_request($server . $path, $args);
+    $response = wp_remote_request(cashupay_api_url($server, $path), $args);
     if (is_wp_error($response)) {
-        return ['code' => 0, 'body' => null, 'error' => $response->get_error_message()];
+        $message = $response->get_error_message();
+        // A timeout against this site's own origin is almost never the
+        // server being slow — it is the host refusing or starving loopback
+        // requests. Say so where the raw cURL text would send the merchant
+        // hunting in the wrong direction.
+        if (cashupay_is_same_host_url($server) && stripos($message, 'timed out') !== false) {
+            $message .= ' — the request went to this site\'s own URL, so this usually means '
+                . 'the host blocks or limits requests from this site to itself (a "loopback" '
+                . 'restriction, or too few PHP workers). Ask your host about allowing loopback requests.';
+        }
+        return ['code' => 0, 'body' => null, 'error' => $message];
     }
     return [
         'code' => (int) wp_remote_retrieve_response_code($response),
