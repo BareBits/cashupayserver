@@ -287,7 +287,10 @@ if (isset($_GET['api'])) {
                 // keep:<id> ref. On save, the UI posts the ref back and the
                 // server resolves it to the stored value — the raw URI never
                 // round-trips through the browser.
-                if ($r['type'] === StoreLnAddresses::TYPE_NWC) {
+                if ($r['type'] === StoreLnAddresses::TYPE_NWC
+                        || $r['type'] === StoreLnAddresses::TYPE_STRIKE) {
+                    // Strike API keys are the account credential and get the
+                    // same masked-label + keep-ref treatment.
                     return [
                         'address' => StoreLnAddresses::displayValue($r['type'], $r['address']),
                         'type' => $r['type'],
@@ -2317,10 +2320,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 // callers may still send a single auto-detected addresses[] /
                 // address; honour that by classifying each entry by shape
                 // ('noffer1…' vs nostr+walletconnect://… vs local@host).
-                if (isset($_POST['ln_addresses']) || isset($_POST['noffers']) || isset($_POST['nwc'])) {
+                if (isset($_POST['ln_addresses']) || isset($_POST['noffers'])
+                        || isset($_POST['nwc']) || isset($_POST['strike'])) {
                     $lnList = $_POST['ln_addresses'] ?? [];
                     $nofferList = $_POST['noffers'] ?? [];
                     $nwcList = $_POST['nwc'] ?? [];
+                    $strikeList = $_POST['strike'] ?? [];
                     if (!is_array($lnList)) {
                         $lnList = [(string)$lnList];
                     }
@@ -2330,13 +2335,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     if (!is_array($nwcList)) {
                         $nwcList = [(string)$nwcList];
                     }
-                    // NWC entries arrive either as full connection URIs (new)
-                    // or opaque keep:<row-id> refs (kept) — the browser never
-                    // holds the stored secret-bearing URIs. Resolve refs to
-                    // the stored values before validation; kept entries also
-                    // skip the save-time probe in probeAndGateChain.
+                    if (!is_array($strikeList)) {
+                        $strikeList = [(string)$strikeList];
+                    }
+                    // NWC and Strike entries arrive either as full secrets
+                    // (new) or opaque keep:<row-id> refs (kept) — the browser
+                    // never holds the stored secret-bearing values. Resolve
+                    // refs to the stored values before validation; kept
+                    // entries also skip the save-time probe in
+                    // probeAndGateChain.
                     [$nwcList, ] = StoreLnAddresses::resolveKeepRefs($storeId, $nwcList);
-                    $destinations = StoreLnAddresses::chainFromLists($lnList, $nofferList, $nwcList);
+                    [$strikeList, ] = StoreLnAddresses::resolveKeepRefs(
+                        $storeId, $strikeList, StoreLnAddresses::TYPE_STRIKE
+                    );
+                    $destinations = StoreLnAddresses::chainFromLists($lnList, $nofferList, $nwcList, $strikeList);
                 } else {
                     // Legacy single auto-detected chain.
                     $rawAddresses = $_POST['addresses'] ?? null;
@@ -5527,8 +5539,34 @@ header('Cache-Control: no-cache, must-revalidate');
                             ?>
                             <p class="form-help" style="margin-top:0;">
                                 Lightning payment paths are tried in the following order &mdash;
-                                you can use multiple paths: LNURL/lightning address, NWC, noffer.
+                                you can use multiple paths: Strike API, LNURL/lightning address,
+                                NWC, noffer.
                             </p>
+
+                            <div class="form-group" id="auto-melt-strike-group">
+                                <label class="form-label">Strike API keys (priority order)</label>
+                                <p class="form-help">
+                                    Take Lightning payments straight into your
+                                    <a href="https://strike.me" target="_blank" rel="noopener noreferrer" style="color: var(--accent);">Strike</a>
+                                    account. Strike lightning addresses (&hellip;@strike.me)
+                                    don&rsquo;t support LUD-21 payment verification and can&rsquo;t
+                                    be used in the Lightning Addresses list below &mdash; an API key
+                                    works fully, and is tried <em>first</em> when generating
+                                    invoices. Create a key in the
+                                    <a href="https://dashboard.strike.me/" target="_blank" rel="noopener noreferrer" style="color: var(--accent);">Strike dashboard</a>
+                                    (API Keys section) with <em>only</em> the
+                                    <strong>create invoices</strong>, <strong>generate invoice
+                                    quotes</strong> and <strong>read invoices</strong> scopes
+                                    &mdash; such a key cannot spend or withdraw funds. New keys are
+                                    tested with a 1-sat test invoice when you save (it&rsquo;s never
+                                    paid). Saved keys show only a masked label; the key stays on
+                                    the server.
+                                </p>
+                                <div id="auto-melt-strike-list"></div>
+                                <button type="button" class="btn btn-secondary" id="btn-add-strike" style="margin-top: 0.5rem;">
+                                    + Add Strike API key
+                                </button>
+                            </div>
 
                             <div class="form-group" id="auto-melt-address-group">
                                 <label class="form-label">Lightning Addresses (priority order)</label>
@@ -7944,6 +7982,8 @@ header('Cache-Control: no-cache, must-revalidate');
             if (btnAddNoffer) btnAddNoffer.addEventListener('click', addNofferRow);
             const btnAddNwc = document.getElementById('btn-add-nwc');
             if (btnAddNwc) btnAddNwc.addEventListener('click', addNwcRow);
+            const btnAddStrike = document.getElementById('btn-add-strike');
+            if (btnAddStrike) btnAddStrike.addEventListener('click', addStrikeRow);
             // Live-update LN-address vs swap-mode hint pane when the operator
             // changes the dropdown, even before they save.
             const autoMeltModeSel = document.getElementById('auto-melt-mode-override');
@@ -9696,6 +9736,7 @@ header('Cache-Control: no-cache, must-revalidate');
         function renderPaymentMethod(rail, mintUrl) {
             const map = {
                 mint:    { icon: '⚡', label: 'Lightning (cashu)' },
+                strike:  { icon: '⚡', label: 'Lightning (Strike)' },
                 onchain: { icon: '🔗', label: 'On-chain' },
                 swap:    { icon: '🔄', label: 'Swap' },
                 cashu:   { icon: '🥜', label: 'Cashu' },
@@ -10814,6 +10855,7 @@ header('Cache-Control: no-cache, must-revalidate');
             syncLnAddressesFromInputs();
             syncNoffersFromInputs();
             syncNwcFromInputs();
+            syncStrikeFromInputs();
             const lnAddresses = awLnAddresses
                 .map(a => (a.address || '').trim())
                 .filter(a => a.length > 0);
@@ -10825,10 +10867,25 @@ header('Cache-Control: no-cache, must-revalidate');
             const nwcEntries = awNwc
                 .map(a => a.ref ? a.ref : (a.uri || '').trim())
                 .filter(a => a.length > 0);
+            // Strike entries post the same way: keep:<id> refs or raw keys.
+            const strikeEntries = awStrike
+                .map(a => a.ref ? a.ref : (a.key || '').trim())
+                .filter(a => a.length > 0);
 
             // Validate each section against its own type before saving so bad
             // data surfaces inline rather than failing silently on the server.
+            for (const s of strikeEntries) {
+                if (s.startsWith('keep:')) continue; // saved row reference
+                if (!isStrikeKeyValue(s)) {
+                    // Don't echo the paste back — even a malformed key paste
+                    // may be (most of) the real credential.
+                    return awError('lightning-payments-error', 'That Strike API entry doesn\'t look like a valid key (one unbroken block of letters and numbers, copied from the Strike dashboard).');
+                }
+            }
             for (const a of lnAddresses) {
+                if (isStrikeLnAddress(a)) {
+                    return awError('lightning-payments-error', `"${a}" is a Strike lightning address — those don't support LUD-21 payment verification. Use the Strike API keys section above instead.`);
+                }
                 if (isNofferValue(a)) {
                     const nofferGated = !!document.getElementById('auto-melt-noffer-group')?.dataset.envError;
                     return awError('lightning-payments-error', nofferGated
@@ -10876,6 +10933,9 @@ header('Cache-Control: no-cache, must-revalidate');
                 for (const w of nwcEntries) {
                     body += `&nwc%5B%5D=${encodeURIComponent(w)}`;
                 }
+                for (const s of strikeEntries) {
+                    body += `&strike%5B%5D=${encodeURIComponent(s)}`;
+                }
 
                 const response = await postWithCsrf(adminUrl, body);
 
@@ -10909,15 +10969,15 @@ header('Cache-Control: no-cache, must-revalidate');
                             lud21Support: (r.lud21Support === null || r.lud21Support === undefined)
                                 ? null : Number(r.lud21Support),
                         }));
-                        awLnAddresses = mapped.filter(a => a.type !== 'noffer' && a.type !== 'nwc');
+                        awLnAddresses = mapped.filter(a => a.type !== 'noffer' && a.type !== 'nwc' && a.type !== 'strike');
                         awNoffers = mapped.filter(a => a.type === 'noffer');
                         if (dashboardData && dashboardData.autoMelt) {
-                            // nwc rows are cached from loadDashboard() only —
-                            // the save response has their masked label but not
-                            // the keep-ref, and a ref-less row would rerender
-                            // as an editable (bogus) URI input.
+                            // nwc/strike rows are cached from loadDashboard()
+                            // only — the save response has their masked label
+                            // but not the keep-ref, and a ref-less row would
+                            // rerender as an editable (bogus) secret input.
                             dashboardData.autoMelt.addresses = mapped
-                                .filter(a => a.type !== 'nwc')
+                                .filter(a => a.type !== 'nwc' && a.type !== 'strike')
                                 .map(a => ({ ...a }));
                         }
                         renderLnAddressRows();
@@ -10953,12 +11013,14 @@ header('Cache-Control: no-cache, must-revalidate');
                 syncLnAddressesFromInputs();
                 syncNoffersFromInputs();
                 syncNwcFromInputs();
+                syncStrikeFromInputs();
                 const haveDestinations =
                     awLnAddresses.some(a => (a.address || '').trim().length > 0)
                     || awNoffers.some(a => (a.address || '').trim().length > 0)
-                    || awNwc.some(a => a.ref || (a.uri || '').trim().length > 0);
+                    || awNwc.some(a => a.ref || (a.uri || '').trim().length > 0)
+                    || awStrike.some(a => a.ref || (a.key || '').trim().length > 0);
                 if (enabled === '1' && !haveDestinations) {
-                    return awError('aw-store-error', 'Add at least one lightning address, NWC connection, or noffer in the Lightning payments section to withdraw to.');
+                    return awError('aw-store-error', 'Add at least one Strike API key, lightning address, NWC connection, or noffer in the Lightning payments section to withdraw to.');
                 }
             } else if (modeOverride === '1') {
                 if (!storeHasOnchain()) {
@@ -11126,6 +11188,11 @@ header('Cache-Control: no-cache, must-revalidate');
         // which embeds the wallet secret; shown read-only) or new rows
         // ({uri, ref:null} — an editable input the operator pastes into).
         let awNwc = [];
+        // Strike API keys, own section above the lightning addresses (they
+        // lead the chain at invoice time). Same kept/new row shapes as awNwc:
+        // {label, ref:'keep:<id>'} for saved keys (the server never sends the
+        // raw key) or {key, ref:null} for a freshly pasted one.
+        let awStrike = [];
 
         // A destination is a CLINK noffer if it's a bech32 'noffer1…' string
         // (optionally lightning:-prefixed), otherwise it's a Lightning address.
@@ -11138,6 +11205,20 @@ header('Cache-Control: no-cache, must-revalidate');
         // fully re-validates (and probes) on save.
         function isNwcValue(v) {
             return /^nostr\+walletconnect:(\/\/)?[0-9a-f]{64}\?/i.test(String(v || '').trim());
+        }
+
+        // Cheap client-side shape check for a Strike API key (one unbroken
+        // alphanumeric token); the server fully re-validates (and probes with
+        // a 1-sat test invoice) on save.
+        function isStrikeKeyValue(v) {
+            return /^[A-Za-z0-9]{16,256}$/.test(String(v || '').trim());
+        }
+
+        // A @strike.me lightning address can never work as an LNURL
+        // destination (no LUD-21 verify) — the Strike API section is the
+        // supported path.
+        function isStrikeLnAddress(v) {
+            return /@strike\.me$/i.test(String(v || '').trim());
         }
 
         function setLnAddressRowsFromData() {
@@ -11153,15 +11234,18 @@ header('Cache-Control: no-cache, must-revalidate');
                     ? null : Number(a.lud21Support),
                 ref: a.ref || null,
             }));
-            awLnAddresses = mapped.filter(a => a.type !== 'noffer' && a.type !== 'nwc');
+            awLnAddresses = mapped.filter(a => a.type !== 'noffer' && a.type !== 'nwc' && a.type !== 'strike');
             awNoffers = mapped.filter(a => a.type === 'noffer');
-            // Stored nwc rows arrive masked: address is the display label and
-            // ref the opaque keep:<id> the save posts back.
+            // Stored nwc/strike rows arrive masked: address is the display
+            // label and ref the opaque keep:<id> the save posts back.
             awNwc = mapped.filter(a => a.type === 'nwc')
                 .map(a => ({ label: a.address, uri: '', ref: a.ref }));
+            awStrike = mapped.filter(a => a.type === 'strike')
+                .map(a => ({ label: a.address, key: '', ref: a.ref }));
             renderLnAddressRows();
             renderNofferRows();
             renderNwcRows();
+            renderStrikeRows();
         }
 
         // Read the current input values back into awLnAddresses (preserving the
@@ -11252,8 +11336,20 @@ header('Cache-Control: no-cache, must-revalidate');
                         awLnAddresses[i].lud21Support = null;
                         awLnAddresses[i].type = isNofferValue(input.value) ? 'noffer' : 'lnaddress';
                     }
-                    const hintEl = row.querySelector('.ln-address-hint');
-                    if (hintEl) hintEl.style.display = 'none';
+                    const hintEl = row.nextElementSibling;
+                    if (!hintEl || !hintEl.classList.contains('ln-address-hint')) return;
+                    // Live warning for @strike.me — those addresses can never
+                    // pass the LUD-21 save gate; the Strike API section is the
+                    // supported path.
+                    if (isStrikeLnAddress(input.value)) {
+                        hintEl.textContent = 'Strike lightning addresses don\'t support LUD-21 '
+                            + 'payment verification and can\'t be used here — use the '
+                            + 'Strike API keys section above instead.';
+                        hintEl.style.color = 'var(--warning, #b07b00)';
+                        hintEl.style.display = '';
+                    } else {
+                        hintEl.style.display = 'none';
+                    }
                 });
                 row.appendChild(input);
 
@@ -11291,6 +11387,11 @@ header('Cache-Control: no-cache, must-revalidate');
                         + 'invoices as “unpaid”. There is no risk to funds from this, but it '
                         + 'does mean an order may show unpaid when it was, in fact, paid.';
                     hintEl.style.color = 'var(--success, #2d7a3a)';
+                } else if (isStrikeLnAddress(entry.address)) {
+                    hintEl.textContent = 'Strike lightning addresses don\'t support LUD-21 '
+                        + 'payment verification and can\'t be used here — use the '
+                        + 'Strike API keys section above instead.';
+                    hintEl.style.color = 'var(--warning, #b07b00)';
                 } else {
                     const hint = lud21HintFor(entry.lud21Support);
                     if (hint) {
@@ -11492,6 +11593,105 @@ header('Cache-Control: no-cache, must-revalidate');
                 row.appendChild(mkBtn('↑', 'Move up', () => moveNwcRow(i, -1), envGated || i === 0));
                 row.appendChild(mkBtn('↓', 'Move down', () => moveNwcRow(i, 1), envGated || i === awNwc.length - 1));
                 row.appendChild(mkBtn('✕', 'Remove', () => removeNwcRow(i), false));
+
+                list.appendChild(row);
+            });
+        }
+
+        function syncStrikeFromInputs() {
+            const list = document.getElementById('auto-melt-strike-list');
+            if (!list) return;
+            const next = [];
+            list.querySelectorAll('[data-strike-entry]').forEach((el) => {
+                if (el.dataset.strikeRef) {
+                    next.push({ label: el.dataset.strikeLabel || '', key: '', ref: el.dataset.strikeRef });
+                } else {
+                    const inp = el.querySelector('input.strike-input');
+                    next.push({ label: '', key: inp ? inp.value : '', ref: null });
+                }
+            });
+            awStrike = next;
+        }
+
+        function addStrikeRow() {
+            syncStrikeFromInputs();
+            awStrike.push({ label: '', key: '', ref: null });
+            renderStrikeRows();
+            const list = document.getElementById('auto-melt-strike-list');
+            if (list) {
+                const inputs = list.querySelectorAll('input.strike-input');
+                if (inputs.length) inputs[inputs.length - 1].focus();
+            }
+        }
+
+        function removeStrikeRow(index) {
+            syncStrikeFromInputs();
+            awStrike.splice(index, 1);
+            renderStrikeRows();
+        }
+
+        function moveStrikeRow(index, delta) {
+            syncStrikeFromInputs();
+            const target = index + delta;
+            if (target < 0 || target >= awStrike.length) return;
+            const tmp = awStrike[index];
+            awStrike[index] = awStrike[target];
+            awStrike[target] = tmp;
+            renderStrikeRows();
+        }
+
+        function renderStrikeRows() {
+            const list = document.getElementById('auto-melt-strike-list');
+            if (!list) return;
+            list.innerHTML = '';
+            awStrike.forEach((entry, i) => {
+                const row = document.createElement('div');
+                row.className = 'strike-row';
+                row.setAttribute('data-strike-entry', '1');
+                if (entry.ref) {
+                    row.dataset.strikeRef = entry.ref;
+                    row.dataset.strikeLabel = entry.label || '';
+                }
+                row.style.cssText = 'display:flex; align-items:center; gap:0.4rem; margin-bottom:0.4rem;';
+
+                const prio = document.createElement('span');
+                prio.textContent = (i + 1) + '.';
+                prio.style.cssText = 'min-width:1.4rem; text-align:right; opacity:0.7; font-size:0.85rem;';
+                row.appendChild(prio);
+
+                if (entry.ref) {
+                    const label = document.createElement('span');
+                    label.className = 'strike-saved-label';
+                    label.textContent = entry.label || 'Strike API key';
+                    label.title = 'Saved Strike API key — the key stays on the server. Remove and re-add to change it.';
+                    label.style.cssText = 'flex:1; padding:0.45rem 0.6rem; border:1px dashed var(--border, #ccc); border-radius:6px; opacity:0.85; font-size:0.9rem;';
+                    row.appendChild(label);
+                } else {
+                    const input = document.createElement('input');
+                    input.type = 'text';
+                    input.className = 'form-input strike-input';
+                    input.placeholder = 'paste your Strike API key';
+                    input.autocomplete = 'off';
+                    input.spellcheck = false;
+                    input.value = entry.key || '';
+                    input.style.flex = '1';
+                    row.appendChild(input);
+                }
+
+                const mkBtn = (label, title, handler, disabled) => {
+                    const b = document.createElement('button');
+                    b.type = 'button';
+                    b.className = 'btn btn-secondary';
+                    b.textContent = label;
+                    b.title = title;
+                    b.style.cssText = 'padding:0.3rem 0.55rem; line-height:1;';
+                    if (disabled) { b.disabled = true; b.style.opacity = '0.4'; }
+                    else b.addEventListener('click', handler);
+                    return b;
+                };
+                row.appendChild(mkBtn('↑', 'Move up', () => moveStrikeRow(i, -1), i === 0));
+                row.appendChild(mkBtn('↓', 'Move down', () => moveStrikeRow(i, 1), i === awStrike.length - 1));
+                row.appendChild(mkBtn('✕', 'Remove', () => removeStrikeRow(i), false));
 
                 list.appendChild(row);
             });

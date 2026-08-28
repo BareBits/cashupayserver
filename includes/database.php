@@ -102,7 +102,8 @@ class Database {
             // that migration ran — getInstance() will then trigger runMigrations()
             // on existing installs that haven't yet picked it up. All migrations
             // are idempotent, so a fire is safe.
-            $hasLatestMigration = $hasConfig && self::tableExists(self::$instance, 'admin_event_log');
+            $hasLatestMigration = $hasConfig
+                && self::columnExists(self::$instance, 'invoices', 'strike_invoice_id');
             // The auto-withdraw → auto-cashout rename is a data-only migration
             // (config key + notification event labels) with no schema artifact
             // to mark it done, so probe for the legacy config key directly. The
@@ -1638,8 +1639,7 @@ HTACCESS;
             $pdo->exec("ALTER TABLE invoices ADD COLUMN receive_errors TEXT DEFAULT NULL");
         }
 
-        // Admin event log for endpoint failures (see AdminLog). This is the
-        // "latest" migration marker (see getInstance), so it stays last.
+        // Admin event log for endpoint failures (see AdminLog).
         if (!self::tableExists($pdo, 'admin_event_log')) {
             $pdo->exec("
                 CREATE TABLE admin_event_log (
@@ -1654,6 +1654,24 @@ HTACCESS;
                 );
             ");
             $pdo->exec("CREATE INDEX idx_admin_event_log_ts ON admin_event_log(timestamp DESC);");
+        }
+
+        // Strike API receive rail (payment_rail='strike'): the customer pays a
+        // BOLT11 quoted from a Strike invoice we created with the merchant's
+        // API key. strike_invoice_id is what the settlement polls read back
+        // (GET /invoices/{id} until state=PAID). Like nwc_uri, strike_api_key
+        // is secret-bearing (it's the account credential) and must never ride
+        // an API/browser payload (see Invoice::formatForApi); it is persisted
+        // per-invoice so pending invoices stay verifiable even if the operator
+        // later replaces the key in store_ln_addresses. strike_invoice_id is
+        // the "latest" migration marker (see getInstance), so this stays last.
+        foreach ([
+            'strike_invoice_id' => 'TEXT DEFAULT NULL',
+            'strike_api_key' => 'TEXT DEFAULT NULL',
+        ] as $col => $decl) {
+            if (!self::columnExists($pdo, 'invoices', $col)) {
+                $pdo->exec("ALTER TABLE invoices ADD COLUMN {$col} {$decl}");
+            }
         }
     }
 

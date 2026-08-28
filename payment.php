@@ -1157,6 +1157,7 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                     'nwc' => 'NWC wallet',
                     'noffer' => 'Noffer (Nostr offer)',
                     'lnurl' => 'Lightning address',
+                    'strike' => 'Strike API',
                     'swap' => 'Lightning (submarine swap)',
                 ];
                 if ($receiveErrors !== []): ?>

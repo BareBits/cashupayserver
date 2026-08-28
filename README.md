@@ -66,7 +66,9 @@ BareBits is robust payment software that can direct payments to you via many met
 
 ### Dead simple setup with automatic USD conversion
 - Get an account at [strike.me](https://strike.me) and enable USD conversion in settings. Strike works in over 100 countries and native fiat currencies.
-- You can grab an LNURL (lightning address) from your profile page and an on-chain address from the receive tab.
+- In the [Strike dashboard](https://dashboard.strike.me/), create an API key with only the **create invoices**, **generate invoice quotes** and **read invoices** scopes, and paste it into the "Strike API" section of the setup wizard (or the store's Lightning payments settings). A key with just those scopes can create and verify invoices but cannot spend funds from your account.
+- Note: a Strike *lightning address* (…@strike.me) can NOT be used in the LNURL box — Strike addresses don't support LUD-21 payment verification, so BareBits could never confirm a payment against one. The API key method above works fully and is tried first when generating invoices.
+- You can still grab an on-chain address from the receive tab (or use static-address mode).
 - Note: Strike is a custodial exchange that holds onto funds for you, which means there is risk they may take them. Don't keep significant funds on exchanges.
 - Note: Strike does not work with all kinds of merchants.
   
@@ -218,7 +220,7 @@ Many centralized exchanges like [Strike](https://strike.me) offer LNURLs out of 
 
 | Provider   |      USD Conversion |  Notes |
 |----------|:-------------:|------:|
-| [Strike](https://strike.me) |  ✅ | Works in most countries, some merchant type restrictions, KYC process |
+| [Strike](https://strike.me) |  ✅ | Use the dedicated **Strike API** method (scope-limited API key), NOT the @strike.me lightning address — Strike addresses don't support LUD-21 verification. Works in most countries, some merchant type restrictions, KYC process |
 | [CoinOS](https://coinos.io) |    ✖️   |  Works in all countries, no restrictions, no KYC, no USD conversion |
 | [Rizful](https://rizful.com/) |  ✖️ |    Works in all countries, no restrictions, no KYC, no USD conversion |
 

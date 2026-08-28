@@ -25,6 +25,7 @@ require_once __DIR__ . '/lnurl_receive.php';
 require_once __DIR__ . '/store_ln_addresses.php';
 require_once __DIR__ . '/clink/client.php';
 require_once __DIR__ . '/nwc/client.php';
+require_once __DIR__ . '/strike/client.php';
 require_once __DIR__ . '/fee_redirect.php';
 require_once __DIR__ . '/admin_log.php';
 
@@ -332,6 +333,7 @@ class Invoice {
         $lnurlAttempt = null;          // ['bolt11','verify_url','amount_sats'] on success
         $nofferAttempt = null;         // CLINK noffer receive context on success
         $nwcAttempt = null;            // NWC (NIP-47) receive context on success
+        $strikeAttempt = null;         // Strike API receive context on success
         // Sanitized [{type, reason}] records of destinations that failed while
         // walking the chain, persisted as invoices.receive_errors and shown to
         // the payer on the payment page. Reasons are fixed server-side phrases
@@ -354,6 +356,10 @@ class Invoice {
         // cron's DevFee::settleStore pass. The old fees-due override — which
         // parked payments on the mint rail for immediate collection — was
         // removed in favor of those two paths.
+        // Generated up front (rather than at insert time below) so the Strike
+        // rail can stamp it into the Strike invoice's correlationId, letting
+        // the merchant match the two in Strike's dashboard.
+        $invoiceId = Database::generateId('inv');
         if ($feeLightning === null && !empty($destinations)) {
             $lnurlTargetSats = (int) ExchangeRates::convertToSats((string)$amount, $currency, 'sat');
             if ($lnurlTargetSats > 0) {
@@ -361,6 +367,45 @@ class Invoice {
                 // invoice wins; the rest are only tried when earlier ones are
                 // down / out of range / can't produce a verifiable invoice.
                 foreach ($destinations as $priority => $dest) {
+                    if ($dest['type'] === StoreLnAddresses::TYPE_STRIKE) {
+                        // Strike API: create a BTC invoice in the merchant's
+                        // Strike account and quote it into a BOLT11. Settlement
+                        // is later confirmed by reading the Strike invoice back
+                        // (payment page + cron) until state=PAID. Strike keys
+                        // sort to position 0 in chainFromLists, so this rail is
+                        // tried first whenever a key is configured. Strike caps
+                        // descriptions at 200 chars, so the memo gets the wider
+                        // cap rather than the 100-char CLINK one.
+                        $strikeMemo = self::buildInvoiceMemo($store, $metadata, 200);
+                        try {
+                            $made = StrikeClient::createInvoiceWithQuote(
+                                $dest['value'],
+                                $lnurlTargetSats,
+                                $strikeMemo !== '' ? $strikeMemo : null,
+                                $invoiceId,
+                                self::directReceiveTimeoutSec('STRIKE_TIMEOUT_SEC')
+                            );
+                        } catch (Throwable $e) {
+                            error_log(sprintf(
+                                '[strike-receive] create+quote failed store=%s priority=%d dest=%s: %s; trying next',
+                                $storeId, $priority, StrikeClient::maskKey($dest['value']), $e->getMessage()
+                            ));
+                            $receiveErrors[] = ['type' => 'strike', 'reason' => StrikeClient::describeFailure($e)];
+                            AdminLog::log('strike', 'checkout', $storeId, null, StrikeClient::maskKey($dest['value']), $e->getMessage());
+                            continue;
+                        }
+                        $strikeAttempt = [
+                            'bolt11' => $made['bolt11'],
+                            'amount_sats' => $lnurlTargetSats,
+                            'api_key' => $dest['value'],
+                            'strike_invoice_id' => $made['invoice_id'],
+                        ];
+                        if ($priority > 0) {
+                            error_log("[strike-receive] using fallback Strike key store={$storeId} priority={$priority}");
+                        }
+                        break;
+                    }
+
                     if ($dest['type'] === StoreLnAddresses::TYPE_NOFFER) {
                         // CLINK noffer: act as the payer toward the merchant's
                         // Nostr service and fetch a BOLT11. Settlement is later
@@ -493,7 +538,8 @@ class Invoice {
                     AdminLog::log('lnurl', 'checkout', $storeId, null, $dest['value'],
                         $lnurlFailReason ?? 'probe failed');
                 }
-                if ($lnurlAttempt === null && $nofferAttempt === null && $nwcAttempt === null) {
+                if ($lnurlAttempt === null && $nofferAttempt === null && $nwcAttempt === null
+                        && $strikeAttempt === null) {
                     error_log(sprintf(
                         '[direct-receive] all %d destination(s) failed for store=%s amount_sats=%d; falling back to swap/mint/onchain',
                         count($destinations), $storeId, $lnurlTargetSats
@@ -513,6 +559,7 @@ class Invoice {
         // below from quoting in violation of strict mode.
         $strictMintFallbackBlocked = false;
         if ($lnurlAttempt === null && $nofferAttempt === null && $nwcAttempt === null
+            && $strikeAttempt === null
             && $feeLightning === null && $feeOnchain === null
             && SwapsConfig::isEnabledForStore($storeId) && $onchainConfigured) {
             // Target = what the merchant wants to receive on-chain in sats.
@@ -575,7 +622,7 @@ class Invoice {
         $usedMintUrl = null;
         $amountInMintUnit = null;
         if ($cashuConfigured && !$strictMintFallbackBlocked && $swapAttempt === null
-            && $lnurlAttempt === null
+            && $lnurlAttempt === null && $strikeAttempt === null
             && $nofferAttempt === null && $nwcAttempt === null && $feeLightning === null) {
             $mintUnit = $store['mint_unit'];
             $lastError = null;
@@ -695,8 +742,6 @@ class Invoice {
             $expiration = $defaultExpiration;
         }
 
-        // Generate invoice ID
-        $invoiceId = Database::generateId('inv');
         $now = Database::timestamp();
 
         // Decide payment_rail + final field values
@@ -719,6 +764,12 @@ class Invoice {
         // 'nwc' rail.
         $nwcUri = null;
         $nwcPaymentHash = null;
+        // Strike receive context: the Strike invoice id the settlement polls
+        // read back, plus the API key it was created with (secret-bearing,
+        // like nwc_uri — never rides an API/browser payload). Only set on the
+        // 'strike' rail.
+        $strikeInvoiceId = null;
+        $strikeApiKey = null;
         if ($feeLightning !== null) {
             // Fee-redirect lightning rail: the customer pays the fee LNURL's
             // bolt11 directly. Rides payment_rail='lnaddress' so the existing
@@ -731,6 +782,17 @@ class Invoice {
             $amountSatsFinal = $invoiceSats;
             $lnurlVerifyUrl = $feeLightning['verify_url'];
             $lnDestination = $feeLightning['destination'] ?? null;
+        } elseif ($strikeAttempt !== null) {
+            $paymentRail = 'strike';
+            $bolt11Final = $strikeAttempt['bolt11'];
+            $mintUrlFinal = null;
+            $quoteIdFinal = null;
+            $amountSatsFinal = $strikeAttempt['amount_sats'];
+            // Masked label only — ln_destination surfaces in the admin invoice
+            // view and API payloads, and the raw key is the account credential.
+            $lnDestination = StrikeClient::maskKey($strikeAttempt['api_key']);
+            $strikeInvoiceId = $strikeAttempt['strike_invoice_id'];
+            $strikeApiKey = $strikeAttempt['api_key'];
         } elseif ($lnurlAttempt !== null) {
             $paymentRail = 'lnaddress';
             $bolt11Final = $lnurlAttempt['bolt11'];
@@ -837,6 +899,8 @@ class Invoice {
             'noffer_created_at' => $nofferCreatedAt,
             'nwc_uri' => $nwcUri,
             'nwc_payment_hash' => $nwcPaymentHash,
+            'strike_invoice_id' => $strikeInvoiceId,
+            'strike_api_key' => $strikeApiKey,
             'fee_redirect_note' => $feeNote,
             'fee_redirect_destination' => $feeDestination,
             'fee_redirect_rails' => $feeRails ? implode(',', $feeRails) : null,
@@ -1744,6 +1808,146 @@ class Invoice {
     }
 
     /**
+     * Cron poll for pending Strike-rail invoices: read each Strike invoice
+     * back until it reports PAID. Like the NWC lookup this is a stored-state
+     * query, so it settles invoices whose customer closed the payment page.
+     */
+    public static function pollPendingStrike(int $minInterval = 15, int $batchLimit = 10): void {
+        self::markExpiredInvoices();
+        $now = time();
+
+        $pending = Database::fetchAll(
+            "SELECT * FROM invoices
+              WHERE status = 'New'
+                AND payment_rail = 'strike'
+                AND strike_invoice_id IS NOT NULL
+                AND expiration_time > ?
+                AND (last_polled_at IS NULL OR (? - last_polled_at) >= ?)
+              ORDER BY
+                  CASE WHEN last_polled_at IS NULL THEN 0 ELSE 1 END,
+                  last_polled_at ASC
+              LIMIT ?",
+            [$now, $now, $minInterval, $batchLimit]
+        );
+
+        foreach ($pending as $invoice) {
+            try {
+                Database::update('invoices', ['last_polled_at' => $now], 'id = ?', [$invoice['id']]);
+                self::checkStrikeSettlement($invoice);
+            } catch (Throwable $e) {
+                error_log("[strike-receive] cron poll failed for invoice {$invoice['id']}: " . $e->getMessage());
+                AdminLog::log('strike', 'poll', $invoice['store_id'], $invoice['id'],
+                    $invoice['ln_destination'] ?? null, $e->getMessage());
+            }
+        }
+    }
+
+    /**
+     * Single-invoice Strike poll for the live payment-page tick. Each check
+     * is an HTTPS round trip against the Strike API, so — like pollSingleNwc —
+     * a small atomic min-interval gate keeps the 2s checkout ticks (and any
+     * concurrent tabs) from hammering the API and its rate limits.
+     */
+    public static function pollSingleStrike(string $invoiceId): void {
+        $minInterval = 5;
+        $invoice = self::getById($invoiceId);
+        if (!$invoice) {
+            return;
+        }
+        if (($invoice['payment_rail'] ?? null) !== 'strike') {
+            return;
+        }
+        if (!in_array($invoice['status'], ['New', 'Processing'], true)) {
+            return;
+        }
+        if ($invoice['status'] === 'New' && (int)$invoice['expiration_time'] < time()) {
+            self::updateStatus((string)$invoice['id'], 'Expired');
+            return;
+        }
+        if (empty($invoice['strike_invoice_id']) || empty($invoice['strike_api_key'])) {
+            return;
+        }
+        $now = time();
+        $claimed = Database::update(
+            'invoices',
+            ['last_polled_at' => $now],
+            'id = ? AND (last_polled_at IS NULL OR last_polled_at <= ?)',
+            [$invoice['id'], $now - $minInterval]
+        );
+        if ($claimed !== 1) {
+            return; // another poller checked within the window
+        }
+        try {
+            self::checkStrikeSettlement($invoice);
+        } catch (Throwable $e) {
+            error_log("[strike-receive] single poll failed for {$invoiceId}: " . $e->getMessage());
+            AdminLog::log('strike', 'poll', $invoice['store_id'], $invoiceId,
+                $invoice['ln_destination'] ?? null, $e->getMessage());
+        }
+    }
+
+    /**
+     * One read-back round trip for a pending Strike-rail invoice; settles it
+     * when Strike reports state=PAID. A CANCELLED invoice is left pending —
+     * the expiry sweep will close it out.
+     */
+    private static function checkStrikeSettlement(array $invoice): void {
+        $result = StrikeClient::findInvoice(
+            (string)$invoice['strike_api_key'],
+            (string)$invoice['strike_invoice_id']
+        );
+        if ($result['state'] === 'paid') {
+            self::markStrikePaid($invoice);
+        }
+    }
+
+    /**
+     * Mark a Strike-rail invoice as Settled. Strike's read-back has no
+     * preimage to record — its PAID state is the settlement assertion of the
+     * account that received the funds. Fires webhooks + notification queue
+     * parallel to the other direct-receive settlement paths. No minting —
+     * the funds landed in the merchant's Strike account. The Strike rail is
+     * never fee-routed (fee-redirect lightning rides payment_rail=
+     * 'lnaddress'), so there is no fee-credit branch here.
+     */
+    private static function markStrikePaid(array $invoice): void {
+        Database::beginTransaction();
+        try {
+            // Status-guarded settle (see mintAndStoreTokens): the checkout
+            // poll, cron, and the API can race. Only the winner of the
+            // New/Processing -> Settled transition fires webhooks below.
+            $settled = Database::update(
+                'invoices',
+                [
+                    'status' => 'Settled',
+                    'paid_at' => time(),
+                    'settled_rail' => 'strike',
+                ],
+                'id = ? AND status != ?',
+                [$invoice['id'], 'Settled']
+            );
+            Database::commit();
+        } catch (Throwable $e) {
+            Database::rollback();
+            throw $e;
+        }
+
+        if ($settled !== 1) {
+            return; // already settled by another poller
+        }
+
+        $updated = self::getById((string)$invoice['id']);
+        if ($updated !== null) {
+            WebhookSender::fireEvent($invoice['store_id'], 'InvoiceSettled', $updated);
+            NotificationSender::queueInvoicePaid($updated);
+        }
+        error_log(sprintf(
+            '[strike-receive] invoice=%s store=%s settled via strike (strike_invoice_id=%s)',
+            $invoice['id'], $invoice['store_id'], (string)$invoice['strike_invoice_id']
+        ));
+    }
+
+    /**
      * Rebuild the CLINK client context (relay, keys, request id) from a
      * persisted noffer-rail invoice, or null if the row lacks it.
      *
@@ -2033,12 +2237,12 @@ class Invoice {
                     $result['claimTxid'] = $sa['claim_txid'];
                 }
             }
-        } elseif (($rail === 'lnaddress' || $rail === 'noffer' || $rail === 'nwc' || $rail === 'mint') && !empty($invoice['bolt11'])) {
+        } elseif (($rail === 'lnaddress' || $rail === 'noffer' || $rail === 'nwc' || $rail === 'strike' || $rail === 'mint') && !empty($invoice['bolt11'])) {
             // Lightning rails have no block-chain txid; surface the bolt11 as the
             // "TxID" (rendered copy-only, not as an explorer link) and the LN
             // address / LNURL / noffer it was sent to as the destination (for
-            // nwc, ln_destination is the masked connection label — the raw URI
-            // embeds the wallet secret and never leaves the server). The
+            // nwc and strike, ln_destination is a masked label — the raw NWC URI
+            // and Strike API key are secrets and never leave the server). The
             // mint rail has no such destination (paid to the mint), so
             // ln_destination is NULL there and the destination cell stays empty.
             $result['txid'] = $invoice['bolt11'];
@@ -2241,10 +2445,13 @@ class Invoice {
         //              Nostr Wallet Connect. Each check is a full relay
         //              round trip, so pollSingleNwc keeps its own small
         //              min-interval gate against the 2s checkout tick.
+        //   strike   — read the Strike invoice back over the Strike API until
+        //              it reports PAID. Same min-interval gate as nwc so the
+        //              checkout tick stays clear of Strike's rate limits.
         //
         // If the rail has no on-chain address, we're done after the LN poll.
         $rail = $invoice['payment_rail'] ?? null;
-        if (in_array($rail, ['swap', 'noffer', 'lnaddress', 'nwc'], true)) {
+        if (in_array($rail, ['swap', 'noffer', 'lnaddress', 'nwc', 'strike'], true)) {
             if ($rail === 'swap') {
                 try {
                     SwapPoller::pollByInvoiceId($invoiceId);
@@ -2255,6 +2462,8 @@ class Invoice {
                 self::pollSingleLnAddress($invoiceId);
             } elseif ($rail === 'nwc') {
                 self::pollSingleNwc($invoiceId);
+            } elseif ($rail === 'strike') {
+                self::pollSingleStrike($invoiceId);
             } elseif ($rail === 'noffer') {
                 self::pollSingleNoffer($invoiceId);
             }

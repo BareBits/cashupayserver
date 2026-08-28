@@ -311,3 +311,20 @@
 // the probe to fail and the invoice falls back to mint/swap.
 //
 // define('LNURL_RECEIVE_PROBE_TIMEOUT_SEC', 5);
+
+// --------------------
+// STRIKE API RECEIVE
+// --------------------
+// When a store has a Strike API key configured (Lightning payments settings
+// or the setup wizard), it is the FIRST Lightning method tried: invoices are
+// created in the merchant's Strike account (BTC-denominated for the exact
+// sat amount) and settlement is confirmed by reading the Strike invoice
+// back until it reports PAID. The key only needs the create/quote/read
+// invoice scopes — it can never spend funds.
+//
+// STRIKE_TIMEOUT_SEC: checkout-path wall-clock budget (seconds) for the
+// create+quote round trips while the customer waits. Defaults to the same
+// 5s the other direct-receive rails use; settlement polls and the save-time
+// probe use a 10s budget.
+//
+// define('STRIKE_TIMEOUT_SEC', 5);
