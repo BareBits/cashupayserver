@@ -208,10 +208,11 @@ def test_full_journey_on_rewrite_hostile_host(wordpress_hostile_host, page) -> N
     """nginx-style host (Local WP's layout): /barebits/*.php executes, every
     other /barebits URL (extension-less, PATH_INFO) falls into WordPress.
     The plugin's API bridge catches those fallen-through /api/v1 requests and
-    replays them against the install's api.php — so the routing probe must
-    stay quiet, the wizard must walk start to finish, and the WooCommerce
-    wiring (whose webhook registration is a real Greenfield API call) must
-    complete end to end THROUGH the bridge."""
+    replays them against the install's api.php — so the routing probe (which
+    rides the canonical /api/v1 URL) must stay quiet, the wizard must walk
+    start to finish, and the WooCommerce wiring (whose webhook registration
+    goes to the install's api.php directly — see cashupay_api_transport_url)
+    must complete end to end."""
     wp = wordpress_hostile_host
     page.set_default_timeout(60_000)
 
@@ -235,9 +236,9 @@ def test_full_journey_on_rewrite_hostile_host(wordpress_hostile_host, page) -> N
     assert wp_option(wp, "cashupay_store_id") != ""
     assert wp_option(wp, "cashupay_cron_key") != ""
 
-    # Wire WooCommerce: registering the invoice webhook is a live
-    # /api/v1/stores/{id}/webhooks call that only succeeds if the bridge
-    # really carries the Greenfield API on this host.
+    # Wire WooCommerce: registering the invoice webhook is a live Greenfield
+    # call to the install (via api.php's query-path transport — one loopback
+    # deep, no bridge nesting).
     page.wait_for_selector("h2:has-text('connect WooCommerce')")
     page.fill("#cashupay-discount", "0")
     page.click("#submit")

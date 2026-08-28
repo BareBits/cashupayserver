@@ -137,6 +137,27 @@ def wordpress_hostile_host(testing_release_server: ReleaseServer) -> Iterator[Wo
     stop_wordpress(handle)
 
 
+@pytest.fixture
+def wordpress_hostile_tight_pool(testing_release_server: ReleaseServer) -> Iterator[WordPressHandle]:
+    """The rewrite-hostile host with a TIGHT PHP worker pool (2 workers) —
+    Local WP's shape. Two workers cover exactly one wp-admin request plus one
+    loopback it makes; anything that nests a further same-site request (the
+    canonical /api/v1 URLs, which fall through into WordPress and are
+    replayed by the API bridge as a third simultaneous request) starves and
+    times out. The plugin's own calls must survive this host."""
+    workdir = SESSION_TMP / f"wp-tight-{uuid.uuid4().hex[:8]}"
+    handle = start_wordpress(
+        workdir,
+        release_api_base=testing_release_server.api_base,
+        release_channel="testing",
+        emulate_rewrites=False,
+        php_workers=2,
+    )
+    _allow_nonstandard_ports(handle)
+    yield handle
+    stop_wordpress(handle)
+
+
 def _allow_nonstandard_ports(wp: WordPressHandle) -> None:
     """Test-only mu-plugin: download_url() (wp_safe_remote_get) rejects URLs
     on non-{80,443,8080} ports unless they match the site's own port. The

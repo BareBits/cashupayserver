@@ -379,6 +379,7 @@ def start_wordpress(
     release_api_base: str | None = None,
     release_channel: str | None = None,
     emulate_rewrites: bool = True,
+    php_workers: int | None = None,
 ) -> WordPressHandle:
     """Stand up a fresh SQLite-backed WordPress install.
 
@@ -396,6 +397,11 @@ def start_wordpress(
     rewrite emulation — a "hostile host" (think nginx with a plain WordPress
     config) that executes real *.php files but routes everything else into
     WordPress. The setup wizard must survive such hosts.
+
+    php_workers pins PHP_CLI_SERVER_WORKERS for this instance (default 6, see
+    below) — a small value emulates hosts with tight per-site PHP pools
+    (Local WP), where nested same-site loopback requests starve into
+    timeouts.
     """
     php_exe = binaries.ensure(binaries.PHP)["php"]
     wp_cli_phar = binaries.ensure_file(binaries.WP_CLI)
@@ -498,7 +504,10 @@ def start_wordpress(
     # wc-api endpoint during the cron request, and the plugin's WP-cron pinger
     # GETs the alongside install's cron.php. Production (Apache/php-fpm) is
     # multi-process; this mirrors that. Honored by the pinned static PHP 8.3.
-    env.setdefault("PHP_CLI_SERVER_WORKERS", "6")
+    if php_workers is not None:
+        env["PHP_CLI_SERVER_WORKERS"] = str(php_workers)
+    else:
+        env.setdefault("PHP_CLI_SERVER_WORKERS", "6")
     log = (workdir / "wp-server.log").open("ab")
     proc = subprocess.Popen(
         [
