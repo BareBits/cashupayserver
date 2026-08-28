@@ -14,10 +14,12 @@ jobs:
     name: E2E + UI
     runs-on: ubuntu-22.04
     # The full e2e+ui+wordpress suite runs serially (session-scoped bitcoind/
-    # lnd/mint/channels rule out xdist), taking ~40m and growing. 40m left no
-    # headroom — runs were cancelled mid-suite at ~96%. 60m gives room until
-    # sharding becomes worthwhile.
-    timeout-minutes: 60
+    # lnd/mint/channels rule out xdist) and keeps growing: ~59m of pytest by
+    # 2026-08, plus a few minutes of setup — more when a binaries.py change
+    # rotates the bins cache and the pinned downloads run cold. 60m was
+    # cancelling completed-except-for-the-last-tests runs at ~97%. 75m buys
+    # headroom again; sharding remains the real fix once this ceiling is hit.
+    timeout-minutes: 75
     # Depend on the artifact build so the WordPress E2E tier can exercise the
     # EXACT zips CI publishes: the GPL plugin zip, and the standalone server
     # zip its "install BareBits alongside" flow downloads and unpacks.
