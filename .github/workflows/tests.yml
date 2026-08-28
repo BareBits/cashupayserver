@@ -111,6 +111,9 @@ jobs:
             tests/.tmp/**/*.sqlite
           retention-days: 7
           if-no-files-found: ignore
+          # tests/.tmp is a dot-directory; without this the globs silently
+          # match nothing ("No files were found") and failures ship no logs.
+          include-hidden-files: true
 
   build-artifacts:
     name: Build artifacts
