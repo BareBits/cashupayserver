@@ -35,6 +35,11 @@ class BinarySpec:
     archive_root: str        # top-level dir inside the tarball
     executables: tuple[str, ...]  # relative paths inside archive_root
     env_override: str        # env var name that can short-circuit lookup
+    # Whether a same-named executable on $PATH may satisfy this spec when
+    # tests/bin/ has no installed copy. Off for binaries whose EXACT version
+    # is load-bearing: an unrelated host build silently changes what the
+    # suite runs against (the explicit env_override still wins either way).
+    allow_path_fallback: bool = True
 
 
 BITCOIND = BinarySpec(
@@ -68,6 +73,14 @@ PHP = BinarySpec(
     archive_root="",  # flat tarball: just `php` at the root
     executables=("php",),
     env_override="CASHUPAY_TEST_PHP",
+    # Never substitute a host PHP: the suite is only proven against this
+    # pinned build. GitHub's runners ship PHP 8.1, whose `php -S` worker mode
+    # (PHP_CLI_SERVER_WORKERS, the WordPress fixture) mishandles concurrent
+    # browser connections — workers accept Chromium's speculative sockets and
+    # then never answer the real request, so every Playwright-vs-WordPress
+    # test died on a page-load timeout while the same tests passed locally on
+    # the pinned 8.3.31.
+    allow_path_fallback=False,
 )
 
 FULCRUM = BinarySpec(
@@ -287,9 +300,10 @@ def ensure(spec: BinarySpec) -> dict[str, Path]:
         return _executable_paths(spec)
 
     # 3. PATH (best-effort; we don't version-check rigorously)
-    on_path = {Path(rel).name: _probe_path(Path(rel).name) for rel in spec.executables}
-    if all(on_path.values()):
-        return {k: v for k, v in on_path.items() if v is not None}
+    if spec.allow_path_fallback:
+        on_path = {Path(rel).name: _probe_path(Path(rel).name) for rel in spec.executables}
+        if all(on_path.values()):
+            return {k: v for k, v in on_path.items() if v is not None}
 
     # 4. Download + extract
     archive = _download(spec)
