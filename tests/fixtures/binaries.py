@@ -69,7 +69,12 @@ PHP = BinarySpec(
     name="php",
     version="8.3.31",
     url="https://dl.static-php.dev/static-php-cli/common/php-8.3.31-cli-linux-x86_64.tar.gz",
-    sha256="d14236dbd35333425f703f7deb4486c9255bf3e1dbffdee2a86a451e3bc24612",
+    # static-php.dev's common/ artifacts are ROLLING rebuilds of the same
+    # version (like the clink release asset): the bytes churn even though
+    # the PHP version doesn't. When this mismatches, download the current
+    # file, sanity-check it (php -v, required extensions), re-pin from the
+    # error's "got" hash. Current: build of 2026-07-01.
+    sha256="4f340f035846d47d5c0eddd2064d360aa25fb29e81e1d369a644440a55c500b8",
     archive_root="",  # flat tarball: just `php` at the root
     executables=("php",),
     env_override="CASHUPAY_TEST_PHP",
