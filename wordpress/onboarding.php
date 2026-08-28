@@ -148,22 +148,28 @@ function cashupay_handle_run_install(): void {
         // no "come back here" choreography — just say where the install went.
         $message = 'BareBits is installed at ' . $result['url'] . '.'
             . (empty($result['verified']) ? ' (Note: this release published no checksums; the download was TLS-protected but not checksum-verified.)' : '');
-        if (cashupay_install_api_routes_ok($result['url'])) {
+        // One question gates payments and is worth answering while the
+        // merchant is still here: can this site reach its own URLs over HTTP
+        // at all? (The WP-cron heartbeat, the API bridge, and checkout's
+        // Greenfield calls all ride loopback requests.) The probe goes to the
+        // install's api.php directly — see cashupay_install_loopback_verdict
+        // on why the canonical /api/v1 form must NOT be probed from here: on
+        // rewrite-hostile hosts with tight worker pools (Local WP) that
+        // chain starves, and it used to cry "loopback blocked" on sites
+        // whose loopback works fine.
+        $verdict = cashupay_install_loopback_verdict($result['url']);
+        if ($verdict === 'ok') {
             cashupay_flash('success', $message);
-        } else {
-            // With the API bridge in place (api-bridge.php), /api/v1 answers
-            // even on hosts that ignore the install's .htaccess — so a failed
-            // probe now usually means this site cannot request its own URLs
-            // at all (a loopback block), which the bridge and the WP-cron
-            // heartbeat both depend on. Onboarding itself no longer rides
-            // these routes (the plugin's own calls go to api.php directly,
-            // see cashupay_api_transport_url) — checkout does: the WooCommerce
-            // gateway calls /api/v1 on the connected server for every payment.
-            cashupay_flash('warning', $message . ' Heads up: the install\'s /api/v1 routes are not '
-                . 'answering. This usually means this WordPress site is blocked from making HTTP '
+        } elseif ($verdict === 'unreachable') {
+            cashupay_flash('warning', $message . ' Heads up: this WordPress site cannot make HTTP '
                 . 'requests to its own URL (a firewall or hosting "loopback" restriction). Setup '
-                . 'can still complete, but taking payments needs those routes — ask your host '
+                . 'can still complete, but taking payments needs those requests — ask your host '
                 . 'about allowing loopback requests.');
+        } else { // 'unexpected': something answered, but not the install's API
+            cashupay_flash('warning', $message . ' Heads up: the install\'s API did not answer as '
+                . 'expected — something on this site (a security plugin, or the web server\'s '
+                . 'configuration) may be intercepting requests to it. Setup can still complete, '
+                . 'but taking payments needs the install\'s API to answer.');
         }
     }
     wp_safe_redirect(cashupay_onboarding_url());

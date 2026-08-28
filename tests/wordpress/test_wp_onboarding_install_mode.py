@@ -95,8 +95,8 @@ def test_install_mode_end_to_end(wordpress_install_mode, mint, backup_mint) -> N
     # "come back" from (the old wording sent merchants hunting for a page
     # they were already on).
     assert "come back here" not in body, body[:2000]
-    # Rewrites work on this host, so the routing probe must not cry wolf.
-    assert "routes are not answering" not in body, body[:2000]
+    # Loopback works on this host, so the post-install probe must not cry wolf.
+    assert "Heads up" not in body, body[:2000]
 
     assert (wp.barebits_dir / "BUILD_INFO").is_file()
     assert (wp.barebits_dir / "setup.php").is_file()

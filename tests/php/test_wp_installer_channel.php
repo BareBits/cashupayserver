@@ -11,9 +11,11 @@
  * This file pins the channel logic that prevents that: the stable channel
  * keeps /releases/latest, the testing channel reads the head of /releases
  * (newest release of any kind, drafts skipped), and the channel value itself
- * is sanitized. Plus cashupay_install_api_routes_ok, the probe that tells a
- * BareBits JSON answer apart from a WordPress "page not found" swallowing
- * the install's /api/v1 route.
+ * is sanitized. Plus the post-install loopback probe (cashupay_api_probe_verdict
+ * / cashupay_install_loopback_verdict), which tells a BareBits JSON answer
+ * apart from an intercepted one or no answer at all — and must go to the
+ * install's api.php directly, never the canonical /api/v1 route (whose
+ * bridge chain starves tight worker pools into a false "blocked" alarm).
  */
 declare(strict_types=1);
 require __DIR__ . '/harness.php';
@@ -50,8 +52,13 @@ function wp_remote_get($url, $args = []) {
 function wp_remote_retrieve_response_code($response) { return $response['code'] ?? 0; }
 function wp_remote_retrieve_body($response) { return $response['body'] ?? ''; }
 
-// installer.php calls this (defined in state.php in the real plugin).
+// installer.php calls these (defined in state.php in the real plugin).
 function cashupay_is_same_host_url(string $url): bool { return true; }
+// Mirrors state.php's same-origin form: the loopback probe always targets the
+// install's own URL, so this is the branch the real function would take.
+function cashupay_api_transport_url(string $server, string $path, string $installUrl): string {
+    return $server . '/api.php?cashupay_path=' . rawurlencode($path);
+}
 
 require dirname(__DIR__, 2) . '/wordpress/installer.php';
 
@@ -125,33 +132,54 @@ assert_true(str_contains($r['message'], 'testing-channel release'), 'naming the 
 unset($GLOBALS['filters']['cashupay_release_channel']);
 
 // =============================================================================
-// cashupay_install_api_routes_ok — BareBits JSON vs a WordPress 404
+// cashupay_api_probe_verdict — the pure classification matrix
 // =============================================================================
 
-// Fresh install, wizard not run: api.php answers 503 with a JSON body.
-$GLOBALS['http_routes'] = ['/api/v1/server/info' => [
+assert_eq('ok', cashupay_api_probe_verdict(false, 503, json_encode(['code' => 'service-unavailable'])),
+    'a pre-setup 503 JSON answer proves the request reached BareBits');
+assert_eq('ok', cashupay_api_probe_verdict(false, 200, json_encode(['version' => '9.9'])),
+    'a 200 JSON answer counts too');
+assert_eq('unreachable', cashupay_api_probe_verdict(true, 0, ''),
+    'a failed HTTP request (timeout, refused) means the site cannot reach the URL');
+assert_eq('unexpected', cashupay_api_probe_verdict(false, 404, '<html><body>Page not found</body></html>'),
+    'a WordPress 404 page answered, so loopback works — but it is not the API');
+assert_eq('unexpected', cashupay_api_probe_verdict(false, 200, '<html><body>Welcome to the shop</body></html>'),
+    'a 200 HTML page (404-to-home redirect plugins) is not the API either');
+assert_eq('unexpected', cashupay_api_probe_verdict(false, 500, json_encode(['error' => 'boom'])),
+    'a 500 — even a JSON one — is a broken install, not a working API');
+assert_eq('unexpected', cashupay_api_probe_verdict(false, 200, json_encode('just a string')),
+    'a JSON scalar is not an API object answer');
+
+// =============================================================================
+// cashupay_install_loopback_verdict — the live probe goes to api.php directly
+// =============================================================================
+
+// Fresh install, wizard not run: api.php answers 503 with a JSON body. The
+// probe must target the query-path transport (api.php?cashupay_path=…), NOT
+// the canonical /api/v1 URL — on rewrite-hostile hosts the canonical form is
+// only answered by the API bridge, whose three-request chain starves tight
+// worker pools (Local WP) into a false "blocked" alarm.
+$GLOBALS['http_routes'] = ['/api.php?cashupay_path=' => [
     'code' => 503,
     'body' => json_encode(['code' => 'service-unavailable', 'message' => 'BareBits setup not complete']),
 ]];
-assert_eq(true, cashupay_install_api_routes_ok('http://wp.test/barebits'),
-    'a pre-setup 503 JSON answer proves the route reaches BareBits');
+$GLOBALS['http_log'] = [];
+assert_eq('ok', cashupay_install_loopback_verdict('http://wp.test/barebits'),
+    'a pre-setup 503 JSON answer from api.php probes ok');
+assert_eq(1, count($GLOBALS['http_log']), 'one probe request');
+assert_true(str_contains($GLOBALS['http_log'][0], '/api.php?cashupay_path='),
+    'probed through the direct api.php transport');
+assert_false(str_contains($GLOBALS['http_log'][0], '/barebits/api/v1/'),
+    'never the canonical route (its bridge chain starves tight worker pools)');
 
-// Set-up install: 200 JSON.
-$GLOBALS['http_routes'] = ['/api/v1/server/info' => ['code' => 200, 'body' => json_encode(['version' => '9.9'])]];
-assert_eq(true, cashupay_install_api_routes_ok('http://wp.test/barebits'), 'a 200 JSON answer counts too');
+// Loopback genuinely blocked: the request itself dies.
+$GLOBALS['http_routes'] = ['/api.php?cashupay_path=' => 'error'];
+assert_eq('unreachable', cashupay_install_loopback_verdict('http://wp.test/barebits'),
+    'an unreachable api.php means the site cannot request its own URL');
 
-// A host that ignores .htaccess: WordPress swallows the path with its themed
-// 404 page (HTML, status 404).
-$GLOBALS['http_routes'] = ['/api/v1/server/info' => ['code' => 404, 'body' => '<html><body>Page not found</body></html>']];
-assert_eq(false, cashupay_install_api_routes_ok('http://wp.test/barebits'), 'a WordPress 404 is not routing');
-
-// A redirect-404s-home plugin: HTML with a 200. Still not BareBits.
-$GLOBALS['http_routes'] = ['/api/v1/server/info' => ['code' => 200, 'body' => '<html><body>Welcome to the shop</body></html>']];
-assert_eq(false, cashupay_install_api_routes_ok('http://wp.test/barebits'),
-    'a 200 HTML page (404-to-home redirect plugins) is not routing either');
-
-// Unreachable — no false alarm suppression, the probe just reports false.
-$GLOBALS['http_routes'] = ['/api/v1/server/info' => 'error'];
-assert_eq(false, cashupay_install_api_routes_ok('http://wp.test/barebits'), 'an unreachable install probes false');
+// Loopback works but something else answers (security plugin, WAF, fatal).
+$GLOBALS['http_routes'] = ['/api.php?cashupay_path=' => ['code' => 403, 'body' => '<html>Forbidden</html>']];
+assert_eq('unexpected', cashupay_install_loopback_verdict('http://wp.test/barebits'),
+    'an interception answers HTTP but is not the API — must not read as a loopback block');
 
 echo "test_wp_installer_channel: ok\n";

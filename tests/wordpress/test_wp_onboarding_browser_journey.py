@@ -183,8 +183,8 @@ def test_full_merchant_journey_in_browser(wordpress_bare_install, wp_plugin_zip,
 
     _open_onboarding(page, wp)
     flash = _choose_install_and_run(page, wp)
-    # Friendly host: the routing probe must not cry wolf.
-    assert "routes are not answering" not in flash, flash
+    # Friendly host: the post-install loopback probe must not cry wolf.
+    assert "Heads up" not in flash, flash
 
     page.wait_for_selector(WIZARD_IFRAME)
     _expand_wizard(page)
@@ -221,10 +221,10 @@ def test_full_journey_on_rewrite_hostile_host(wordpress_hostile_host, page) -> N
     _login(page, wp, f"{wp.url}/wp-admin/admin.php?page=cashupay")
     page.wait_for_selector("h1:has-text('BareBits')")
     flash = _choose_install_and_run(page, wp)
-    # The install-time probe goes through the freshly recorded install's
-    # /api/v1 URL — on this host that means through the bridge. It answering
-    # is the whole fix: no warning, no dead end at the wiring step.
-    assert "routes are not answering" not in flash, flash
+    # The install-time probe goes to the install's api.php directly — a real
+    # file this host executes — so even with the canonical routes only
+    # answered by the bridge, loopback provably works: no warning.
+    assert "Heads up" not in flash, flash
 
     page.wait_for_selector(WIZARD_IFRAME)
     _walk_wizard_in_iframe(page)
