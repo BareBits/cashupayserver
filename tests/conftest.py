@@ -46,6 +46,11 @@ from fixtures.nutshell import MintHandle, start_mint, stop_mint  # noqa: E402
 from fixtures.onchain import OnchainContext, make_onchain_context  # noqa: E402,F401
 from fixtures.payserver import PayserverHandle, start_payserver, stop_payserver  # noqa: E402
 from fixtures.setup_helpers import run_setup_wizard  # noqa: E402
+from fixtures.strike_api import (  # noqa: E402
+    StrikeApiServer,
+    start_strike_api,
+    stop_strike_api,
+)
 from fixtures.webhook_sink import WebhookSink, start_webhook_sink, stop_webhook_sink  # noqa: E402
 from fixtures.wordpress import (  # noqa: E402
     WordPressHandle,
@@ -181,6 +186,26 @@ def woocommerce(wordpress: WordPressHandle) -> Iterator[tuple[WordPressHandle, d
 
 
 @pytest.fixture
+def strike_api() -> Iterator[StrikeApiServer]:
+    """Mock Strike REST API (create/quote/read invoices) for the Strike rail."""
+    s = start_strike_api()
+    yield s
+    stop_strike_api(s)
+
+
+@pytest.fixture
+def payserver_with_strike(strike_api: StrikeApiServer) -> Iterator[PayserverHandle]:
+    """payserver fixture variant pointed at the local Strike API mock."""
+    workdir = SESSION_TMP / f"payserver-{uuid.uuid4().hex[:8]}"
+    handle = start_payserver(
+        workdir,
+        extra_env={"CASHUPAY_STRIKE_API_BASE": strike_api.api_base},
+    )
+    yield handle
+    stop_payserver(handle)
+
+
+@pytest.fixture
 def payserver_with_lnurlp(lnurlp_server: LnurlpServer) -> Iterator[PayserverHandle]:
     """payserver fixture variant that points cashu-wallet-php at the local
     LNURL-pay mock. Used by auto-melt tests."""
@@ -252,3 +277,11 @@ def configured_with_lnurlp(
 ) -> ConfiguredPayserver:
     """Same as `configured` but uses the LNURL-mock-aware payserver."""
     return _configure(payserver_with_lnurlp, mint, backup_mint)
+
+
+@pytest.fixture
+def configured_with_strike(
+    payserver_with_strike: PayserverHandle, mint: MintHandle, backup_mint: MintHandle
+) -> ConfiguredPayserver:
+    """Same as `configured` but uses the Strike-mock-aware payserver."""
+    return _configure(payserver_with_strike, mint, backup_mint)

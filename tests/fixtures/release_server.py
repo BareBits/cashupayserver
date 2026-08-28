@@ -33,7 +33,7 @@ from . import binaries, ports
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
 RELEASE_TAG = "v0.0-test"
-ZIP_ASSET_NAME = f"cashupayserver-{RELEASE_TAG}.zip"
+ZIP_ASSET_NAME = f"barebits-{RELEASE_TAG}.zip"
 
 
 def ensure_standalone_zip() -> Path:
@@ -56,9 +56,9 @@ def ensure_standalone_zip() -> Path:
     env["PHP_BIN"] = str(php_exe)
     print(f"[release] building standalone zip via {script.name} ...")
     subprocess.run(["bash", str(script)], cwd=str(REPO_ROOT), env=env, check=True)
-    zip_path = REPO_ROOT / "build" / "cashupayserver.zip"
+    zip_path = REPO_ROOT / "build" / "barebits.zip"
     if not zip_path.is_file():
-        raise RuntimeError("build-standalone.sh did not produce build/cashupayserver.zip")
+        raise RuntimeError("build-standalone.sh did not produce build/barebits.zip")
     return zip_path
 
 
@@ -102,12 +102,12 @@ def start_release_server(
         # Realistic clutter the plugin must skip over.
         {"name": "BUILD_INFO", "browser_download_url": f"{base}/assets/BUILD_INFO"},
         {
-            "name": f"cashupayserver-windows-{RELEASE_TAG}.zip",
-            "browser_download_url": f"{base}/assets/cashupayserver-windows-{RELEASE_TAG}.zip",
+            "name": f"barebits-windows-{RELEASE_TAG}.zip",
+            "browser_download_url": f"{base}/assets/barebits-windows-{RELEASE_TAG}.zip",
         },
         {
-            "name": f"wordpress_plugin-{RELEASE_TAG}.zip",
-            "browser_download_url": f"{base}/assets/wordpress_plugin-{RELEASE_TAG}.zip",
+            "name": f"barebits_wordpress_plugin-{RELEASE_TAG}.zip",
+            "browser_download_url": f"{base}/assets/barebits_wordpress_plugin-{RELEASE_TAG}.zip",
         },
     ]
     assets["BUILD_INFO"] = (b"COMMIT_SHA=test\n", "text/plain")

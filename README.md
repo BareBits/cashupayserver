@@ -7,7 +7,7 @@
 
 # BareBits
 
-Accept Bitcoin payments (lightning and on-chain) without running a full BTCPay Server instance. No Docker, no VPS, no command line. Just upload and go. **Works on all "shared" web hosting, if it can host WordPress, it can host BareBits**. Low 1% fee.
+Accept Bitcoin payments (lightning and on-chain) without running a full BTCPay Server instance. No Docker, no VPS, no command line. Just upload and go. **Works on all "shared" web hosting, if it can host WordPress, it can host BareBits**. Low 1% fee. Ready to install? Use our [latest release](https://github.com/BareBits/cashupayserver/releases/latest).
 
 **Are you a web developer? Re-sell this software to your customers at a custom fee rate.** Your customers pay a x% fee, payments go directly to your lightning address/LNURL. Just modify the appropriate settings in the config file.
 
@@ -66,7 +66,9 @@ BareBits is robust payment software that can direct payments to you via many met
 
 ### Dead simple setup with automatic USD conversion
 - Get an account at [strike.me](https://strike.me) and enable USD conversion in settings. Strike works in over 100 countries and native fiat currencies.
-- You can grab an LNURL (lightning address) from your profile page and an on-chain address from the receive tab.
+- In the [Strike dashboard](https://dashboard.strike.me/), create an API key with only the **create invoices**, **generate invoice quotes** and **read invoices** scopes, and paste it into the "Strike API" section of the setup wizard (or the store's Lightning payments settings). A key with just those scopes can create and verify invoices but cannot spend funds from your account.
+- Note: a Strike *lightning address* (…@strike.me) can NOT be used in the LNURL box — Strike addresses don't support LUD-21 payment verification, so BareBits could never confirm a payment against one. The API key method above works fully and is tried first when generating invoices.
+- You can still grab an on-chain address from the receive tab (or use static-address mode).
 - Note: Strike is a custodial exchange that holds onto funds for you, which means there is risk they may take them. Don't keep significant funds on exchanges.
 - Note: Strike does not work with all kinds of merchants.
   
@@ -87,7 +89,7 @@ Don't want to mess around with LNURLs or CLINK noffers? Just want everything to 
 
 ### Standalone (Any PHP Hosting)
 
-1. **Download** the latest `cashupayserver.zip` from the [latest GitHub release](https://github.com/BareBits/cashupayserver/releases/latest)
+1. **Download** the latest `barebits-v*.zip` from the [latest GitHub release](https://github.com/BareBits/cashupayserver/releases/latest)
 2. **Extract** the zip file
 3. **Upload** to your web hosting via FTP or file manager
 4. **Open** the URL in your browser (e.g., `https://yourdomain.com/barebits/`)
@@ -99,9 +101,9 @@ Don't want to mess around with LNURLs or CLINK noffers? Just want everything to 
 Run BareBits as a local point-of-sale app on a Windows 10/11 PC or tablet —
 no web server, no hosting account. You DO need to have internet access for payment confirmation.
 
-1. **Download** the latest `cashupayserver-windows-*.zip` from the [latest GitHub release](https://github.com/BareBits/cashupayserver/releases/latest)
+1. **Download** the latest `barebits-windows-*.zip` from the [latest GitHub release](https://github.com/BareBits/cashupayserver/releases/latest)
 2. **Extract** it anywhere you have write access (Desktop, Documents — not `Program Files`)
-3. **Double-click** `CashuPayServer.bat` — your browser opens the setup wizard
+3. **Double-click** `BareBits.bat` — your browser opens the setup wizard
 
 The package bundles its own PHP runtime and runs only on `127.0.0.1` — nothing is reachable
 from the network. See `README.txt` inside the zip for backups, updates,
@@ -218,7 +220,7 @@ Many centralized exchanges like [Strike](https://strike.me) offer LNURLs out of 
 
 | Provider   |      USD Conversion |  Notes |
 |----------|:-------------:|------:|
-| [Strike](https://strike.me) |  ✅ | Works in most countries, some merchant type restrictions, KYC process |
+| [Strike](https://strike.me) |  ✅ | Use the dedicated **Strike API** method (scope-limited API key), NOT the @strike.me lightning address — Strike addresses don't support LUD-21 verification. Works in most countries, some merchant type restrictions, KYC process |
 | [CoinOS](https://coinos.io) |    ✖️   |  Works in all countries, no restrictions, no KYC, no USD conversion |
 | [Rizful](https://rizful.com/) |  ✖️ |    Works in all countries, no restrictions, no KYC, no USD conversion |
 
@@ -239,7 +241,7 @@ The `data/` directory contains your SQLite database with ecash tokens (real Bitc
 
 **Verify protection**:
 ```bash
-curl -I https://yoursite.com/cashupayserver/data/cashupay.sqlite
+curl -I https://yoursite.com/barebits/data/cashupay.sqlite
 # Should return 403 Forbidden or 404 Not Found, NOT the file!
 ```
 
@@ -327,11 +329,11 @@ This starts:
 ```bash
 # Build standalone zip
 ./scripts/build-standalone.sh
-# Output: build/cashupayserver.zip
+# Output: build/barebits.zip
 
 # Build WordPress plugin
 ./scripts/build-wordpress-plugin.sh
-# Output: build/wordpress_plugin.zip
+# Output: build/barebits_wordpress_plugin.zip
 ```
 
 ### Building mint-discovery Bundle
@@ -449,7 +451,7 @@ Webhook events: `InvoiceCreated`, `InvoiceReceivedPayment`, `InvoiceProcessing`,
 
 Your server may not support URL rewriting. Use the front controller URL:
 ```
-https://yoursite.com/cashupayserver/router.php
+https://yoursite.com/barebits/router.php
 ```
 
 ### "Forbidden" when accessing setup

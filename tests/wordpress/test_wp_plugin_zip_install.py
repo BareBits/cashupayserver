@@ -1,7 +1,7 @@
 """E2E: the SHIPPED WordPress plugin zip installs and activates cleanly.
 
 Every other WP test copies the plugin from live source. This one consumes the
-real ``build/wordpress_plugin.zip`` artifact — the exact bytes the release
+real ``build/barebits_wordpress_plugin.zip`` artifact — the exact bytes the release
 workflow publishes — and installs it the way an operator does:
 ``wp plugin install <zip>``. Beyond proving the flattened requires resolve, it
 pins the GPL-only layout: the zip is thin WordPress glue and must never again

@@ -1,6 +1,6 @@
 <?php
 /**
- * CashuPayServer Windows desktop — php.ini renderer.
+ * BareBits Windows desktop — php.ini renderer.
  *
  * Run by the launcher with `php -n` (no ini needed) on EVERY start: writes
  * php.ini next to this script from php.ini.template, substituting {{ROOT}}

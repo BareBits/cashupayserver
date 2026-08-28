@@ -1,6 +1,6 @@
 <?php
 /**
- * CashuPayServer Windows desktop — CLI cron runner.
+ * BareBits Windows desktop — CLI cron runner.
  *
  * The desktop package serves the app with PHP's built-in web server, which on
  * Windows is strictly single-threaded — background work can't be left to the

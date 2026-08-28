@@ -155,12 +155,15 @@ function cashupay_handle_run_install(): void {
             // even on hosts that ignore the install's .htaccess — so a failed
             // probe now usually means this site cannot request its own URLs
             // at all (a loopback block), which the bridge and the WP-cron
-            // heartbeat both depend on.
+            // heartbeat both depend on. Onboarding itself no longer rides
+            // these routes (the plugin's own calls go to api.php directly,
+            // see cashupay_api_transport_url) — checkout does: the WooCommerce
+            // gateway calls /api/v1 on the connected server for every payment.
             cashupay_flash('warning', $message . ' Heads up: the install\'s /api/v1 routes are not '
                 . 'answering. This usually means this WordPress site is blocked from making HTTP '
-                . 'requests to its own URL (a firewall or hosting "loopback" restriction). The setup '
-                . 'wizard below still works, but the final "connect WooCommerce" step will fail until '
-                . 'those routes are reachable — ask your host about allowing loopback requests.');
+                . 'requests to its own URL (a firewall or hosting "loopback" restriction). Setup '
+                . 'can still complete, but taking payments needs those routes — ask your host '
+                . 'about allowing loopback requests.');
         }
     }
     wp_safe_redirect(cashupay_onboarding_url());

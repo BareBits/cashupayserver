@@ -1,7 +1,7 @@
 @echo off
 setlocal
 REM ===========================================================================
-REM CashuPayServer - Windows desktop launcher
+REM BareBits - Windows desktop launcher
 REM
 REM Starts a local-only web server (127.0.0.1, never reachable from the
 REM network) and opens the point-of-sale in the default browser.
@@ -75,7 +75,7 @@ REM CASHUPAY_BROWSER_CMD hook (documented in desktop-helper.php) is honored
 REM here too, so the CI smoke can observe this branch without a real browser.
 "%PHPEXE%" -n -r "exit(@fsockopen('127.0.0.1',(int)$argv[1]) ? 0 : 1);" %PORT% >nul 2>&1
 if errorlevel 1 goto notrunning
-echo CashuPayServer is already running on port %PORT% - opening it.
+echo BareBits is already running on port %PORT% - opening it.
 if defined CASHUPAY_BROWSER_CMD goto reopen_hook
 start "" "http://127.0.0.1:%PORT%/"
 exit /b 0
@@ -87,11 +87,11 @@ exit /b 0
 REM Background helper: waits for the server, opens the browser, then keeps
 REM background tasks ticking (invoice polling, webhooks, auto-melt). It exits
 REM by itself shortly after the server window is closed.
-start "CashuPayServer background tasks" /min "%PHPEXE%" -c "%PHPDIR%\php.ini" "%ROOT%desktop-helper.php" %PORT%
+start "BareBits background tasks" /min "%PHPEXE%" -c "%PHPDIR%\php.ini" "%ROOT%desktop-helper.php" %PORT%
 
-title CashuPayServer
+title BareBits
 echo.
-echo   CashuPayServer is running at  http://127.0.0.1:%PORT%/
+echo   BareBits is running at  http://127.0.0.1:%PORT%/
 echo.
 echo   Close this window to stop it.
 echo.
@@ -101,14 +101,14 @@ exit /b 0
 
 :badpath
 echo.
-echo   CashuPayServer cannot start from this folder:
+echo   BareBits cannot start from this folder:
 echo.
 echo     %ROOT%
 echo.
 echo   PHP could not load its bundled extensions here. This usually means
 echo   the folder path contains special characters (accents, symbols).
-echo   Please move the whole CashuPayServer folder to a simpler location,
-echo   for example C:\CashuPayServer, and start it again.
+echo   Please move the whole BareBits folder to a simpler location,
+echo   for example C:\BareBits, and start it again.
 echo   If the path looks plain, re-extract the downloaded zip and retry.
 pause
 exit /b 1

@@ -238,7 +238,8 @@ class Updater {
      *
      * Within the chosen release the stable-named BUILD_INFO asset carries
      * COMMIT_SHA/VERSION; the app zip is found by name pattern
-     * (cashupayserver-<version>.zip), never matching wordpress_plugin-*.zip.
+     * (barebits-<version>.zip), never matching barebits-windows-*.zip or
+     * barebits_wordpress_plugin-*.zip.
      */
     private static function fetchRemoteBuildInfo(string $channel): ?array {
         $release = self::fetchChannelRelease($channel);
@@ -308,13 +309,14 @@ class Updater {
 
     /**
      * Is $name the standalone app zip asset? Matches the version-stamped
-     * cashupayserver-<version>.zip the release workflow emits (plus the bare
-     * cashupayserver.zip as a defensive fallback), while never matching the
-     * WordPress plugin asset (wordpress_plugin-*.zip).
+     * barebits-<version>.zip the release workflow emits (plus the bare
+     * barebits.zip as a defensive fallback), while never matching the
+     * Windows desktop asset (barebits-windows-*.zip) or the WordPress
+     * plugin asset (barebits_wordpress_plugin-*.zip).
      */
     private static function isAppZipAsset(string $name): bool {
-        return $name === 'cashupayserver.zip'
-            || (bool)preg_match('/^cashupayserver-.+\.zip$/', $name);
+        return $name === 'barebits.zip'
+            || (bool)preg_match('/^barebits-(?!windows-).+\.zip$/', $name);
     }
 
     public static function getLocalBuildInfo(): array {
@@ -474,11 +476,11 @@ class Updater {
         $zip->close();
         @unlink($zipPath);
 
-        // The build script wraps everything under cashupayserver/, so the
-        // real source dir is staging/<sha>/cashupayserver.
-        $sourceDir = $stagingDir . '/cashupayserver';
+        // The build script wraps everything under barebits/, so the
+        // real source dir is staging/<sha>/barebits.
+        $sourceDir = $stagingDir . '/barebits';
         if (!is_dir($sourceDir) || !is_file($sourceDir . '/BUILD_INFO')) {
-            self::log('extracted zip missing expected cashupayserver/ layout');
+            self::log('extracted zip missing expected barebits/ layout');
             self::rmrf($stagingDir);
             return false;
         }

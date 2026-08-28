@@ -44,7 +44,7 @@ class AdminLog {
     private const MAX_MESSAGE_LEN = 300;
 
     /** Categories recent() understands (admin_event_log + derived sources). */
-    public const CATEGORIES = ['nwc', 'noffer', 'lnurl', 'mint', 'webhook', 'email', 'swap', 'sweep'];
+    public const CATEGORIES = ['nwc', 'noffer', 'lnurl', 'strike', 'mint', 'webhook', 'email', 'swap', 'sweep'];
 
     public static function suppressOnInvoice(): bool {
         return Config::get(self::SUPPRESS_CONFIG_KEY, false) === true;

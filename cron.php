@@ -213,6 +213,19 @@ if (!$swapOnly) {
     }
 }
 
+// Task 1a''': Poll Strike-rail invoices via the Strike API. Reliable
+// (stored-state read-back of the Strike invoice, like the NWC lookup above) —
+// settles a Strike invoice whose customer paid and closed the tab before the
+// page poll caught it.
+if (!$swapOnly) {
+    try {
+        Invoice::pollPendingStrike();
+        $results['tasks']['poll_strike'] = 'success';
+    } catch (\Throwable $e) {
+        $results['tasks']['poll_strike'] = 'error: ' . $e->getMessage();
+    }
+}
+
 // Task 1b: Settle dev / hosting fees for every store. Runs
 // BEFORE auto-melt so the fee math sees revenue that may otherwise drain in
 // this same cron pass. Per-fee failures are caught inside settleStore() so a

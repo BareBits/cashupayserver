@@ -14,10 +14,12 @@ jobs:
     name: E2E + UI
     runs-on: ubuntu-22.04
     # The full e2e+ui+wordpress suite runs serially (session-scoped bitcoind/
-    # lnd/mint/channels rule out xdist), taking ~40m and growing. 40m left no
-    # headroom — runs were cancelled mid-suite at ~96%. 60m gives room until
-    # sharding becomes worthwhile.
-    timeout-minutes: 60
+    # lnd/mint/channels rule out xdist) and keeps growing: ~59m of pytest by
+    # 2026-08, plus a few minutes of setup — more when a binaries.py change
+    # rotates the bins cache and the pinned downloads run cold. 60m was
+    # cancelling completed-except-for-the-last-tests runs at ~97%. 75m buys
+    # headroom again; sharding remains the real fix once this ceiling is hit.
+    timeout-minutes: 75
     # Depend on the artifact build so the WordPress E2E tier can exercise the
     # EXACT zips CI publishes: the GPL plugin zip, and the standalone server
     # zip its "install BareBits alongside" flow downloads and unpacks.
@@ -98,8 +100,8 @@ jobs:
           # The WP tests consume these exact artifacts instead of rebuilding
           # them (the E2E job has no Node/composer). If unset, the fixtures
           # build them locally — the path a dev run takes.
-          CASHUPAY_WP_PLUGIN_ZIP: ${{ github.workspace }}/build/wordpress_plugin.zip
-          CASHUPAY_STANDALONE_ZIP: ${{ github.workspace }}/build/cashupayserver.zip
+          CASHUPAY_WP_PLUGIN_ZIP: ${{ github.workspace }}/build/barebits_wordpress_plugin.zip
+          CASHUPAY_STANDALONE_ZIP: ${{ github.workspace }}/build/barebits.zip
 
       - name: Upload test logs on failure
         if: failure() || cancelled()
@@ -111,6 +113,9 @@ jobs:
             tests/.tmp/**/*.sqlite
           retention-days: 7
           if-no-files-found: ignore
+          # tests/.tmp is a dot-directory; without this the globs silently
+          # match nothing ("No files were found") and failures ship no logs.
+          include-hidden-files: true
 
   build-artifacts:
     name: Build artifacts
@@ -184,7 +189,7 @@ jobs:
         # health.php, pay.php and product-image.php were all missing until this
         # check was added.
         run: |
-          php scripts/verify-plugin-build.php build/cashupayserver \
+          php scripts/verify-plugin-build.php build/barebits \
             setup.php \
             admin.php \
             api.php \
@@ -206,7 +211,7 @@ jobs:
         with:
           name: build-artifacts
           path: |
-            build/wordpress_plugin.zip
-            build/cashupayserver.zip
+            build/barebits_wordpress_plugin.zip
+            build/barebits.zip
           retention-days: 7
           if-no-files-found: error

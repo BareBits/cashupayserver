@@ -556,17 +556,25 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if ($nwc === '' && ($_POST['nwc_clear'] ?? '') !== '1') {
                     $nwc = trim($_POST['nwc_keep_ref'] ?? '');
                 }
+                // Strike API key: same saved-secret controls as NWC — a pasted
+                // key replaces, the clear checkbox removes, and otherwise the
+                // hidden keep ref preserves the stored key.
+                $strikeKey = trim($_POST['strike_api_key'] ?? '');
+                if ($strikeKey === '' && ($_POST['strike_clear'] ?? '') !== '1') {
+                    $strikeKey = trim($_POST['strike_keep_ref'] ?? '');
+                }
 
                 if ($lnAction === 'skip') {
                     $lnAddress = '';
                     $nofferPosted = [];
                     $nwc = '';
+                    $strikeKey = '';
                 }
 
                 // Validate separately so the operator gets a message naming the
                 // field they got wrong, rather than chainFromLists' generic one.
                 if ($lnAddress !== '' && !StoreLnAddresses::isValid($lnAddress)) {
-                    throw new Exception('Lightning addresses look like myname@strike.me. Check the spelling and try again.');
+                    throw new Exception('Lightning addresses look like myname@wallet.com. Check the spelling and try again.');
                 }
                 foreach ($nofferPosted as $nofferRow) {
                     if (!ClinkNoffer::isValid($nofferRow)) {
@@ -581,6 +589,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if ($nwc !== '' && !str_starts_with($nwc, StoreLnAddresses::KEEP_REF_PREFIX)
                         && !NwcUri::isValid($nwc)) {
                     throw new Exception('That NWC connection string doesn\'t look right. It should start with nostr+walletconnect:// — copy the whole string from your wallet.');
+                }
+                require_once __DIR__ . '/includes/strike/client.php';
+                if ($strikeKey !== '' && !str_starts_with($strikeKey, StoreLnAddresses::KEEP_REF_PREFIX)
+                        && !StrikeClient::isValidKey($strikeKey)) {
+                    throw new Exception('That Strike API key doesn\'t look right. Copy the whole key from the Strike dashboard (it\'s one long block of letters and numbers).');
                 }
 
                 // Environment gate: the CLINK client can't sign Nostr
@@ -635,12 +648,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $nwcList = $storedNwc;
                 }
 
-                // Address first, then NWC, noffer as final fallback — the
-                // order Invoice::create walks the chain at payment time.
+                // Strike API key: resolve a keep:<id> ref back to the stored
+                // key. No environment gate — the Strike client is plain HTTPS
+                // + JSON, no bignum math involved.
+                [$strikeList, ] = StoreLnAddresses::resolveKeepRefs(
+                    $storeId, $strikeKey !== '' ? [$strikeKey] : [], StoreLnAddresses::TYPE_STRIKE
+                );
+
+                // Strike first, then address, NWC, noffer as final fallback —
+                // the order Invoice::create walks the chain at payment time.
                 $chain = StoreLnAddresses::chainFromLists(
                     $lnAddress !== '' ? [$lnAddress] : [],
                     $noffers,
-                    $nwcList
+                    $nwcList,
+                    $strikeList
                 );
                 // Same LUD-21 gate as the admin auto-cashout card: a new
                 // address whose host can't confirm a verify URL (or can't be
@@ -2205,6 +2226,10 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                 // the browser.
                 $lnExistingNwcRef = '';
                 $lnExistingNwcLabel = '';
+                // A stored Strike API key prefills the same way — masked label
+                // + keep:<id> ref; the key itself never reaches the browser.
+                $lnExistingStrikeRef = '';
+                $lnExistingStrikeLabel = '';
                 foreach ($renderStoreId ? StoreLnAddresses::listForStore($renderStoreId) : [] as $lnRow) {
                     if ($lnRow['type'] === StoreLnAddresses::TYPE_NOFFER) {
                         $lnExistingNoffers[] = $lnRow['address'];
@@ -2212,6 +2237,11 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                         if ($lnExistingNwcRef === '') {
                             $lnExistingNwcRef = StoreLnAddresses::KEEP_REF_PREFIX . $lnRow['id'];
                             $lnExistingNwcLabel = StoreLnAddresses::displayValue($lnRow['type'], $lnRow['address']);
+                        }
+                    } elseif ($lnRow['type'] === StoreLnAddresses::TYPE_STRIKE) {
+                        if ($lnExistingStrikeRef === '') {
+                            $lnExistingStrikeRef = StoreLnAddresses::KEEP_REF_PREFIX . $lnRow['id'];
+                            $lnExistingStrikeLabel = StoreLnAddresses::displayValue($lnRow['type'], $lnRow['address']);
                         }
                     } elseif ($lnExistingAddress === '') {
                         $lnExistingAddress = $lnRow['address'];
@@ -2234,6 +2264,11 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                 // stored connection round-trips.
                 $lnNwcValue = trim((string)($_POST['nwc_keep_ref'] ?? $lnExistingNwcRef));
                 $lnNwcShowsSaved = $lnNwcValue !== '' && str_starts_with($lnNwcValue, StoreLnAddresses::KEEP_REF_PREFIX);
+                // Same invariant for the Strike API key: a POSTed key is never
+                // echoed back into the re-rendered form — only the opaque keep
+                // ref of a stored key round-trips.
+                $lnStrikeValue = trim((string)($_POST['strike_keep_ref'] ?? $lnExistingStrikeRef));
+                $lnStrikeShowsSaved = $lnStrikeValue !== '' && str_starts_with($lnStrikeValue, StoreLnAddresses::KEEP_REF_PREFIX);
                 ?>
                 <h2 style="margin-bottom: 1rem;">⚡ Lightning payments</h2>
                 <p style="margin-bottom: 0.75rem;">
@@ -2256,17 +2291,28 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                          path, so it stays visible by default while remaining
                          collapsible. -->
                     <details class="form-group" id="lnurl-section" open>
-                        <summary style="cursor: pointer; font-weight: 500; margin-bottom: 0.5rem;">Method 1: LNURL/lightning address eg myname@strike.me</summary>
+                        <summary style="cursor: pointer; font-weight: 500; margin-bottom: 0.5rem;">Method 1: LNURL/lightning address eg myname@wallet.com</summary>
                         <input type="text" id="lightning_address" name="lightning_address" aria-label="LNURL/lightning address"
                                style="font-family: monospace; font-size: 0.9rem; margin-bottom: 0.5rem;"
                                value="<?= htmlspecialchars($_POST['lightning_address'] ?? $lnExistingAddress) ?>"
-                               placeholder="myname@strike.me">
+                               placeholder="myname@wallet.com">
+                        <div id="strike-address-warning" class="warning" style="display: none; margin-bottom: 0.5rem;">
+                            ⚠️ Strike lightning addresses (&hellip;@strike.me) can't be used
+                            here &mdash; they don't fully support payment verification
+                            (LUD-21), so payments to them could never be confirmed at
+                            checkout. Use the
+                            <a href="#strike-section" id="strike-address-warning-link" style="color: #63b3ed;">Strike API method below</a>
+                            instead.
+                        </div>
                         <div id="ln-help-box" style="background: rgba(0,0,0,0.2); padding: 1rem; border-radius: 8px; font-size: 0.9rem; color: #a0aec0;">
                             <p style="margin-bottom: 0.75rem;">
-                                Don't have a lightning address? You can get one for free
-                                (and enable instant fiat/USD conversion) in 100+
-                                countries at
-                                <a href="https://strike.me" target="_blank" rel="noopener noreferrer" style="color: #63b3ed;">strike.me</a>.
+                                Have a Strike account (or want a free one with instant
+                                fiat/USD conversion, available in 100+ countries at
+                                <a href="https://strike.me" target="_blank" rel="noopener noreferrer" style="color: #63b3ed;">strike.me</a>)?
+                                Don't enter your &hellip;@strike.me address here &mdash;
+                                Strike addresses don't support LUD-21 payment
+                                verification. Use the <strong>Strike API</strong> method
+                                below instead.
                             </p>
                             <p style="margin-bottom: 0.75rem;">
                                 Don't want to use strike? Want full self-custody? You can
@@ -2307,6 +2353,70 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                         </div>
                     </details>
 
+                    <!-- Collapsed by default (like the NWC/noffer sections
+                         below); open only when a key is already saved. Sits
+                         right beneath the LNURL section because it's the
+                         Strike-account alternative to a @strike.me address —
+                         but at payment time it is the FIRST method tried. -->
+                    <details class="form-group" id="strike-section"<?= $lnStrikeShowsSaved ? ' open' : '' ?>>
+                        <summary style="cursor: pointer; font-weight: 500; margin-bottom: 0.5rem;">Method 2: Strike API</summary>
+                        <p style="margin-bottom: 0.5rem; font-size: 0.9rem;">
+                            Take Lightning payments straight into your
+                            <a href="https://strike.me" target="_blank" rel="noopener noreferrer" style="color: #63b3ed;">Strike</a>
+                            account. Strike lightning addresses can't be used in the
+                            LNURL box above, but a Strike API key works fully &mdash;
+                            and when one is configured it's the <strong>first</strong>
+                            method tried when generating invoices.
+                        </p>
+                        <div style="background: rgba(0,0,0,0.2); padding: 1rem; border-radius: 8px; font-size: 0.9rem; color: #a0aec0; margin-bottom: 0.5rem;">
+                            <p style="margin-bottom: 0.5rem;">To create a key:</p>
+                            <ol style="margin: 0 0 0.5rem 1.25rem; padding: 0;">
+                                <li>Open the
+                                    <a href="https://dashboard.strike.me/" target="_blank" rel="noopener noreferrer" style="color: #63b3ed;">Strike dashboard</a>
+                                    (opens in a new tab), log in, and go to the
+                                    <strong>API Keys</strong> section.</li>
+                                <li>Create a new key with <em>only</em> these three scopes:
+                                    <strong>Create invoices</strong>
+                                    (<code>partner.invoice.create</code>),
+                                    <strong>Generate invoice quotes</strong>
+                                    (<code>partner.invoice.quote.generate</code>) and
+                                    <strong>Read invoices</strong>
+                                    (<code>partner.invoice.read</code>).</li>
+                                <li>Copy the key and paste it below.</li>
+                            </ol>
+                            <p style="margin: 0;">
+                                With just those scopes the key can create and verify
+                                invoices but <strong>cannot spend or withdraw funds</strong>
+                                from your account. When you continue, the key is tested
+                                with a 1-sat test invoice (it's never paid).
+                            </p>
+                        </div>
+                        <?php if ($lnStrikeShowsSaved): ?>
+                            <!-- A key is stored. It never reaches the browser: the
+                                 hidden keep ref keeps it on save, pasting a new key
+                                 replaces it, and the checkbox removes it. -->
+                            <input type="hidden" name="strike_keep_ref" value="<?= htmlspecialchars($lnStrikeValue) ?>">
+                            <input type="text" readonly
+                                   style="font-family: monospace; font-size: 0.9rem; opacity: 0.7; margin-bottom: 0.5rem;"
+                                   value="<?= htmlspecialchars($lnExistingStrikeLabel !== '' ? $lnExistingStrikeLabel : 'Saved Strike API key') ?>">
+                            <label style="display:block; font-size: 0.85rem; margin-bottom: 0.5rem;">
+                                <input type="checkbox" name="strike_clear" value="1">
+                                Remove this saved key
+                            </label>
+                            <input type="text" id="strike_api_key" name="strike_api_key" aria-label="Strike API key"
+                                   autocomplete="off" spellcheck="false"
+                                   style="font-family: monospace; font-size: 0.9rem;"
+                                   value=""
+                                   placeholder="paste a new API key to replace">
+                        <?php else: ?>
+                            <input type="text" id="strike_api_key" name="strike_api_key" aria-label="Strike API key"
+                                   autocomplete="off" spellcheck="false"
+                                   style="font-family: monospace; font-size: 0.9rem;"
+                                   value=""
+                                   placeholder="paste your Strike API key">
+                        <?php endif; ?>
+                    </details>
+
                     <!-- Collapsed by default; open only when the section already
                          shows stored content (the saved-connection label here, a
                          rendered noffer value below — including the POST echo
@@ -2314,7 +2424,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                          stays visible). An environment warning alone doesn't
                          force a section open. -->
                     <details class="form-group" id="nwc-section"<?= $lnNwcShowsSaved ? ' open' : '' ?>>
-                        <summary style="cursor: pointer; font-weight: 500; margin-bottom: 0.5rem;">Method 2: Nostr Wallet Connect (NWC) (Electrum)</summary>
+                        <summary style="cursor: pointer; font-weight: 500; margin-bottom: 0.5rem;">Method 3: Nostr Wallet Connect (NWC) (Electrum)</summary>
                         <div class="warning" style="margin-bottom: 0.5rem;">
                             ⚠️ Your wallet must be ONLINE to receive lightning payments
                         </div>
@@ -2377,7 +2487,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                     }
                     ?>
                     <details class="form-group" id="noffer-section"<?= $lnNofferValues !== [] ? ' open' : '' ?>>
-                        <summary style="cursor: pointer; font-weight: 500; margin-bottom: 0.5rem;">Method 3: noffer (CLINK) (Electrum)</summary>
+                        <summary style="cursor: pointer; font-weight: 500; margin-bottom: 0.5rem;">Method 4: noffer (CLINK) (Electrum)</summary>
                         <div class="warning" style="margin-bottom: 0.5rem;">
                             ⚠️ Your wallet must be ONLINE to receive lightning payments
                         </div>
@@ -2440,6 +2550,28 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                         list.appendChild(row);
                         row.focus();
                     });
+                })();
+                (function () {
+                    // Strike lightning addresses don't support LUD-21, so the
+                    // save would be refused anyway — warn while typing and
+                    // point at the Strike API section instead of letting the
+                    // operator find out from the server error.
+                    var input = document.getElementById('lightning_address');
+                    var warning = document.getElementById('strike-address-warning');
+                    if (!input || !warning) { return; }
+                    function update() {
+                        var isStrike = /@strike\.me$/i.test(input.value.trim());
+                        warning.style.display = isStrike ? '' : 'none';
+                    }
+                    input.addEventListener('input', update);
+                    update();
+                    var link = document.getElementById('strike-address-warning-link');
+                    var strikeSection = document.getElementById('strike-section');
+                    if (link && strikeSection) {
+                        link.addEventListener('click', function () {
+                            strikeSection.open = true;
+                        });
+                    }
                 })();
                 </script>
 

@@ -6,7 +6,7 @@
 #   1. Runtime: package layout, php.ini renders, every required extension
 #      loads, gmp does real arithmetic, cron-runner bails politely on a
 #      fresh (unconfigured) install.
-#   2. Launcher: CashuPayServer.bat boots the server on the default port,
+#   2. Launcher: BareBits.bat boots the server on the default port,
 #      the helper fires the browser hook, the app answers over HTTP.
 #   3. Functional: scripts/desktop-smoke.php drives the real HTTP surface —
 #      onboarding wizard (desktop shape) to completion, admin login, API key,
@@ -28,7 +28,7 @@
 #   7. Shutdown: after the server is stopped, the helper exits on its own
 #      within three ticks.
 #
-# Usage: pwsh scripts/windows-smoke.ps1 -Zip build/cashupayserver-windows-<tag>.zip
+# Usage: pwsh scripts/windows-smoke.ps1 -Zip build/barebits-windows-<tag>.zip
 # Run from a repo checkout (the functional scenario needs scripts/desktop-smoke.php).
 
 param(
@@ -76,7 +76,7 @@ function Start-Launcher([string]$Root, [string[]]$BatArgs = @(), [switch]$Wait, 
     $script:DiagOut = Join-Path (Get-Location).Path "launcher-$tag.out.log"
     $script:DiagErr = Join-Path (Get-Location).Path "launcher-$tag.err.log"
     $params = @{
-        FilePath = (Join-Path $Root 'CashuPayServer.bat')
+        FilePath = (Join-Path $Root 'BareBits.bat')
         WindowStyle = 'Hidden'
         RedirectStandardOutput = $script:DiagOut
         RedirectStandardError = $script:DiagErr
@@ -155,7 +155,7 @@ function Stop-ServerAndAwaitHelperExit([string]$Root) {
 
 # --- Extract -----------------------------------------------------------------
 Expand-Archive $Zip -DestinationPath smoke
-$root = (Resolve-Path 'smoke/CashuPayServer').Path
+$root = (Resolve-Path 'smoke/BareBits').Path
 $php = Join-Path $root 'php/php.exe'
 if (-not (Test-Path $php)) { throw "package layout wrong: php/php.exe missing" }
 
@@ -230,7 +230,7 @@ Write-Host "custom port: OK"
 $hostileBase = Join-Path (Get-Location).Path 'smoke-hostile/Coffee Shop 2/New folder (2)'
 New-Item -ItemType Directory -Path $hostileBase -Force | Out-Null
 Expand-Archive $Zip -DestinationPath $hostileBase
-$hroot = Join-Path $hostileBase 'CashuPayServer'
+$hroot = Join-Path $hostileBase 'BareBits'
 # Marker lands on an ASCII path — the accented part under test is the package
 # location, not where cmd's redirection writes.
 $hostileMarker = Join-Path (Get-Location).Path 'hostile-browser-opened.txt'
@@ -250,7 +250,7 @@ Write-Host "hostile install path: OK"
 $accentBase = Join-Path (Get-Location).Path 'smoke-hostile/José María'
 New-Item -ItemType Directory -Path $accentBase -Force | Out-Null
 Expand-Archive $Zip -DestinationPath $accentBase
-$aroot = Join-Path $accentBase 'CashuPayServer'
+$aroot = Join-Path $accentBase 'BareBits'
 # The refusal path ends in `pause`; feed stdin a newline so the .bat can exit.
 $stdinFile = Join-Path (Get-Location).Path 'preflight-stdin.txt'
 Set-Content -Path $stdinFile -Value "`r`n`r`n"
@@ -258,7 +258,7 @@ $refused = Start-Launcher $aroot @('9255') -Wait -StdIn $stdinFile
 if ($refused.ExitCode -ne 1) {
     throw "non-ASCII path: launcher exited $($refused.ExitCode), expected the preflight refusal (1)"
 }
-if (-not (Select-String -Path $script:DiagOut -Pattern 'move the whole CashuPayServer folder' -SimpleMatch -Quiet)) {
+if (-not (Select-String -Path $script:DiagOut -Pattern 'move the whole BareBits folder' -SimpleMatch -Quiet)) {
     throw "non-ASCII path: refusal message missing from launcher output"
 }
 if (@(Get-ServerProcs $aroot).Count -ne 0) { throw "non-ASCII path: a server was started despite the refusal" }

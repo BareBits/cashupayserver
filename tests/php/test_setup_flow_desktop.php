@@ -51,7 +51,7 @@ assert_eq(
 
 // --- Detection: explicit env var ------------------------------------------
 //
-// CashuPayServer.bat sets CASHUPAY_DESKTOP=1 for every process it starts.
+// BareBits.bat sets CASHUPAY_DESKTOP=1 for every process it starts.
 // Same env conventions as the updater's kill switches: non-empty and not "0".
 
 putenv('CASHUPAY_DESKTOP=1');

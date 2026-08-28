@@ -197,7 +197,7 @@ function cashupay_fetch_latest_release(): array {
         // The standalone app zip only — never the WordPress-plugin or
         // Windows-desktop artifacts that sit on the same release.
         if ($zipUrl === null
-                && preg_match('/^cashupayserver(-.+)?\.zip$/', $name)
+                && preg_match('/^barebits(-.+)?\.zip$/', $name)
                 && strpos($name, 'windows') === false
                 && strpos($name, 'wordpress') === false) {
             $zipUrl = $url;
@@ -262,7 +262,7 @@ function cashupay_download_release(array $release): array {
 }
 
 /**
- * Unpack the release zip (top-level directory `cashupayserver/`) into
+ * Unpack the release zip (top-level directory `barebits/`) into
  * $installDir. Unzips to a staging directory first so a half-extracted
  * archive can never masquerade as an install.
  *
@@ -294,10 +294,10 @@ function cashupay_unpack_release(string $zipPath, string $installDir): array {
         return ['ok' => false, 'message' => 'Unzip failed: ' . $result->get_error_message()];
     }
 
-    $unpacked = $staging . '/cashupayserver';
+    $unpacked = $staging . '/barebits';
     if (!is_dir($unpacked) || !is_file($unpacked . '/BUILD_INFO')) {
         $wp_filesystem->delete($staging, true);
-        return ['ok' => false, 'message' => 'The downloaded zip does not look like a BareBits release (no cashupayserver/BUILD_INFO inside).'];
+        return ['ok' => false, 'message' => 'The downloaded zip does not look like a BareBits release (no barebits/BUILD_INFO inside).'];
     }
 
     // A release that predates the managed-install support cannot be finished

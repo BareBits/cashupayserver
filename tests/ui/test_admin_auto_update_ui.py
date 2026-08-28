@@ -76,12 +76,21 @@ def test_auto_rollback_banner_shows_and_dismisses(
         " return w && w.classList.contains('hidden'); }"
     )
 
-    # The dismissal is persisted so it doesn't re-appear on reload.
-    with configured.handle.db() as db:
-        row = db.execute(
-            "SELECT value FROM config WHERE key = 'updater_auto_rollback_dismissed'"
-        ).fetchone()
-    assert row is not None and json.loads(row[0]) is True
+    # The dismissal is persisted so it doesn't re-appear on reload. The UI
+    # hides the banner optimistically BEFORE its POST resolves, so poll the
+    # config write instead of racing it with a single read.
+    deadline = time.monotonic() + 15
+    while True:
+        with configured.handle.db() as db:
+            row = db.execute(
+                "SELECT value FROM config WHERE key = 'updater_auto_rollback_dismissed'"
+            ).fetchone()
+        if row is not None and json.loads(row[0]) is True:
+            break
+        assert time.monotonic() < deadline, (
+            f"dismissal never persisted; row={row[0] if row else None!r}"
+        )
+        time.sleep(0.2)
 
 
 def test_recommended_cron_line_is_shown(

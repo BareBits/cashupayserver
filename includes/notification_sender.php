@@ -273,6 +273,7 @@ class NotificationSender {
             case 'onchain':   return 'On-chain Bitcoin';
             case 'swap':      return 'Lightning → submarine swap to on-chain';
             case 'lnaddress': return 'Lightning (LNURL)';
+            case 'strike':    return 'Lightning (Strike API)';
             case 'mint':      return 'Lightning (cashu)' . $mintSuffix;
             case 'cashu':     return 'Cashu' . $mintSuffix;
             default:          return $rail !== '' ? $rail : '(unknown)';
