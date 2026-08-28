@@ -87,14 +87,14 @@ function unzip_file($zip, $to) {
     if ($GLOBALS['unzip_layout'] === 'error') {
         return new WP_Error('corrupt zip');
     }
-    mkdir($to . '/cashupayserver', 0750, true);
+    mkdir($to . '/barebits', 0750, true);
     if ($GLOBALS['unzip_layout'] === 'release' || $GLOBALS['unzip_layout'] === 'no-provision') {
-        file_put_contents($to . '/cashupayserver/BUILD_INFO', "stub build\n");
-        file_put_contents($to . '/cashupayserver/setup.php', "<?php // stub\n");
+        file_put_contents($to . '/barebits/BUILD_INFO', "stub build\n");
+        file_put_contents($to . '/barebits/setup.php', "<?php // stub\n");
     }
     if ($GLOBALS['unzip_layout'] === 'release') {
         // The managed-install marker: a release the install flow can finish.
-        file_put_contents($to . '/cashupayserver/provision.php', "<?php // stub\n");
+        file_put_contents($to . '/barebits/provision.php', "<?php // stub\n");
     }
     return true;
 }
@@ -188,8 +188,8 @@ $GLOBALS['download_content'] = $zipBytes;
 $release = [
     'ok' => true,
     'tag' => 'v9.9',
-    'zip_url' => 'http://releases.test/dl/cashupayserver.zip',
-    'zip_name' => 'cashupayserver.zip',
+    'zip_url' => 'http://releases.test/dl/barebits.zip',
+    'zip_name' => 'barebits.zip',
     'sums_url' => 'http://releases.test/dl/SHA256SUMS',
 ];
 
@@ -206,12 +206,12 @@ $GLOBALS['http_routes'] = ['SHA256SUMS' => [
 ]];
 $d = cashupay_download_release($release);
 assert_eq(false, $d['ok'], 'a SHA256SUMS with no entry for the zip aborts');
-assert_true(str_contains($d['message'], 'no entry for cashupayserver.zip'), 'and names the missing entry');
+assert_true(str_contains($d['message'], 'no entry for barebits.zip'), 'and names the missing entry');
 
 // Mismatch: abort (the e2e proves this end to end; pinned here too).
 $GLOBALS['http_routes'] = ['SHA256SUMS' => [
     'code' => 200,
-    'body' => str_repeat('0', 64) . "  cashupayserver.zip\n",
+    'body' => str_repeat('0', 64) . "  barebits.zip\n",
 ]];
 $d = cashupay_download_release($release);
 assert_eq(false, $d['ok'], 'a checksum mismatch aborts');
@@ -220,7 +220,7 @@ assert_true(str_contains($d['message'], 'Checksum mismatch'), 'with the mismatch
 // Match (BSD-style asterisk marker included): verified download.
 $GLOBALS['http_routes'] = ['SHA256SUMS' => [
     'code' => 200,
-    'body' => hash('sha256', $zipBytes) . " *cashupayserver.zip\n",
+    'body' => hash('sha256', $zipBytes) . " *barebits.zip\n",
 ]];
 $d = cashupay_download_release($release);
 assert_eq(true, $d['ok'], 'a matching checksum passes');
@@ -246,7 +246,7 @@ file_put_contents($zipFile, $zipBytes);
 
 $GLOBALS['unzip_layout'] = 'no-buildinfo';
 $u = cashupay_unpack_release($zipFile, $installDir);
-assert_eq(false, $u['ok'], 'a zip without cashupayserver/BUILD_INFO is refused');
+assert_eq(false, $u['ok'], 'a zip without barebits/BUILD_INFO is refused');
 assert_true(str_contains($u['message'], 'does not look like a BareBits release'), 'with the refusal wording');
 assert_false(is_dir($installDir), 'nothing is left at the install target');
 // Staging lives under wp-content/upgrade (WordPress's own staging area),
@@ -289,14 +289,14 @@ $GLOBALS['http_routes']['releases/latest'] = [
     'body' => json_encode(['tag_name' => 'v9.9', 'assets' => [
         ['name' => 'SHA256SUMS', 'browser_download_url' => 'http://releases.test/dl/SHA256SUMS'],
         // Decoys the asset picker must skip.
-        ['name' => 'cashupayserver-windows.zip', 'browser_download_url' => 'http://releases.test/dl/win.zip'],
-        ['name' => 'wordpress_plugin.zip', 'browser_download_url' => 'http://releases.test/dl/wp.zip'],
-        ['name' => 'cashupayserver-v9.9.zip', 'browser_download_url' => 'http://releases.test/dl/cashupayserver.zip'],
+        ['name' => 'barebits-windows.zip', 'browser_download_url' => 'http://releases.test/dl/win.zip'],
+        ['name' => 'barebits_wordpress_plugin.zip', 'browser_download_url' => 'http://releases.test/dl/wp.zip'],
+        ['name' => 'barebits-v9.9.zip', 'browser_download_url' => 'http://releases.test/dl/barebits.zip'],
     ]]),
 ];
 $GLOBALS['http_routes']['SHA256SUMS'] = [
     'code' => 200,
-    'body' => hash('sha256', $zipBytes) . "  cashupayserver-v9.9.zip\n",
+    'body' => hash('sha256', $zipBytes) . "  barebits-v9.9.zip\n",
 ];
 
 // A directory we did not create is never touched — and never even fetched for.

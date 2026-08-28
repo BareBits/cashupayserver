@@ -65,8 +65,8 @@ jobs:
 
       - name: Verify Windows desktop layout
         run: |
-          php scripts/verify-plugin-build.php build/CashuPayServer \
-            CashuPayServer.bat \
+          php scripts/verify-plugin-build.php build/BareBits \
+            BareBits.bat \
             desktop-helper.php \
             cron-runner.php \
             README.txt \
@@ -86,7 +86,7 @@ jobs:
           name: windows-desktop-zip
           if-no-files-found: error
           retention-days: 3
-          path: build/cashupayserver-windows.zip
+          path: build/barebits-windows.zip
 
   smoke:
     needs: build
@@ -104,4 +104,4 @@ jobs:
 
       - name: Run Windows desktop smoke
         shell: pwsh
-        run: ./scripts/windows-smoke.ps1 -Zip build/cashupayserver-windows.zip
+        run: ./scripts/windows-smoke.ps1 -Zip build/barebits-windows.zip

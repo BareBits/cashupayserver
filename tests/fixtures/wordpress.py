@@ -297,9 +297,9 @@ def ensure_wp_plugin_zip() -> Path:
     env["PHP_BIN"] = str(php_exe)
     print(f"[wp] building plugin zip via {script.name} ...")
     subprocess.run(["bash", str(script)], cwd=str(REPO_ROOT), env=env, check=True)
-    zip_path = REPO_ROOT / "build" / "wordpress_plugin.zip"
+    zip_path = REPO_ROOT / "build" / "barebits_wordpress_plugin.zip"
     if not zip_path.is_file():
-        raise RuntimeError("build-wordpress-plugin.sh did not produce build/wordpress_plugin.zip")
+        raise RuntimeError("build-wordpress-plugin.sh did not produce build/barebits_wordpress_plugin.zip")
     return zip_path
 
 

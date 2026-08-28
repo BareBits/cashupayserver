@@ -74,7 +74,7 @@ unset($GLOBALS['filters']['cashupay_release_channel']);
 
 $assets = [
     ['name' => 'SHA256SUMS', 'browser_download_url' => 'http://releases.test/dl/SHA256SUMS'],
-    ['name' => 'cashupayserver-v9.9.zip', 'browser_download_url' => 'http://releases.test/dl/cashupayserver.zip'],
+    ['name' => 'barebits-v9.9.zip', 'browser_download_url' => 'http://releases.test/dl/barebits.zip'],
 ];
 
 $GLOBALS['http_routes'] = ['/releases/latest' => [
@@ -85,7 +85,7 @@ $GLOBALS['http_log'] = [];
 $r = cashupay_fetch_latest_release();
 assert_eq(true, $r['ok'], 'stable channel resolves the latest stable release');
 assert_eq('v9.9', $r['tag'], 'with its tag');
-assert_eq('cashupayserver-v9.9.zip', $r['zip_name'], 'and the standalone zip');
+assert_eq('barebits-v9.9.zip', $r['zip_name'], 'and the standalone zip');
 assert_eq(1, count($GLOBALS['http_log']), 'one API call');
 assert_true(str_contains($GLOBALS['http_log'][0], '/releases/latest'), 'to /releases/latest');
 assert_false(str_contains($GLOBALS['http_log'][0], '/releases?'), 'never the prerelease listing');
@@ -104,7 +104,7 @@ $GLOBALS['http_routes'] = ['/releases?' => [
         ['tag_name' => 'v9.10-draft', 'draft' => true, 'prerelease' => true, 'assets' => $assets],
         ['tag_name' => 'v9.9-testing.7', 'draft' => false, 'prerelease' => true, 'assets' => [
             ['name' => 'SHA256SUMS', 'browser_download_url' => 'http://releases.test/dl/SHA256SUMS'],
-            ['name' => 'cashupayserver-v9.9-testing.7.zip', 'browser_download_url' => 'http://releases.test/dl/t.zip'],
+            ['name' => 'barebits-v9.9-testing.7.zip', 'browser_download_url' => 'http://releases.test/dl/t.zip'],
         ]],
         ['tag_name' => 'v9.8', 'draft' => false, 'prerelease' => false, 'assets' => $assets],
     ]),
@@ -113,7 +113,7 @@ $GLOBALS['http_log'] = [];
 $r = cashupay_fetch_latest_release();
 assert_eq(true, $r['ok'], 'testing channel resolves a release');
 assert_eq('v9.9-testing.7', $r['tag'], 'the newest NON-DRAFT release, prereleases included');
-assert_eq('cashupayserver-v9.9-testing.7.zip', $r['zip_name'], 'with its standalone zip');
+assert_eq('barebits-v9.9-testing.7.zip', $r['zip_name'], 'with its standalone zip');
 assert_true(str_contains($GLOBALS['http_log'][0], '/releases?'), 'read from the /releases listing');
 
 // An empty listing (or one of drafts only) is a clean channel-specific error.

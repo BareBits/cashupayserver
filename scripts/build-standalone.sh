@@ -1,12 +1,12 @@
 #!/bin/bash
-# Build standalone CashuPayServer distribution zip
+# Build standalone BareBits distribution zip
 
 set -e
 
 cd "$(dirname "$0")/.."
 
-BUILD_DIR="build/cashupayserver"
-rm -rf build/cashupayserver build/cashupayserver.zip
+BUILD_DIR="build/barebits"
+rm -rf build/barebits build/barebits.zip
 
 mkdir -p "$BUILD_DIR"
 
@@ -74,6 +74,6 @@ HTACCESS_SHA256="$(sha256sum "$BUILD_DIR/.htaccess" | awk '{print $1}')"
 } > "$BUILD_DIR/BUILD_INFO"
 
 # Create zip
-cd build && zip -r cashupayserver.zip cashupayserver/ && cd ..
+cd build && zip -r barebits.zip barebits/ && cd ..
 
-echo "Standalone build: build/cashupayserver.zip"
+echo "Standalone build: build/barebits.zip"

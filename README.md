@@ -89,7 +89,7 @@ Don't want to mess around with LNURLs or CLINK noffers? Just want everything to 
 
 ### Standalone (Any PHP Hosting)
 
-1. **Download** the latest `cashupayserver.zip` from the [latest GitHub release](https://github.com/BareBits/cashupayserver/releases/latest)
+1. **Download** the latest `barebits-v*.zip` from the [latest GitHub release](https://github.com/BareBits/cashupayserver/releases/latest)
 2. **Extract** the zip file
 3. **Upload** to your web hosting via FTP or file manager
 4. **Open** the URL in your browser (e.g., `https://yourdomain.com/barebits/`)
@@ -101,9 +101,9 @@ Don't want to mess around with LNURLs or CLINK noffers? Just want everything to 
 Run BareBits as a local point-of-sale app on a Windows 10/11 PC or tablet —
 no web server, no hosting account. You DO need to have internet access for payment confirmation.
 
-1. **Download** the latest `cashupayserver-windows-*.zip` from the [latest GitHub release](https://github.com/BareBits/cashupayserver/releases/latest)
+1. **Download** the latest `barebits-windows-*.zip` from the [latest GitHub release](https://github.com/BareBits/cashupayserver/releases/latest)
 2. **Extract** it anywhere you have write access (Desktop, Documents — not `Program Files`)
-3. **Double-click** `CashuPayServer.bat` — your browser opens the setup wizard
+3. **Double-click** `BareBits.bat` — your browser opens the setup wizard
 
 The package bundles its own PHP runtime and runs only on `127.0.0.1` — nothing is reachable
 from the network. See `README.txt` inside the zip for backups, updates,
@@ -241,7 +241,7 @@ The `data/` directory contains your SQLite database with ecash tokens (real Bitc
 
 **Verify protection**:
 ```bash
-curl -I https://yoursite.com/cashupayserver/data/cashupay.sqlite
+curl -I https://yoursite.com/barebits/data/cashupay.sqlite
 # Should return 403 Forbidden or 404 Not Found, NOT the file!
 ```
 
@@ -329,11 +329,11 @@ This starts:
 ```bash
 # Build standalone zip
 ./scripts/build-standalone.sh
-# Output: build/cashupayserver.zip
+# Output: build/barebits.zip
 
 # Build WordPress plugin
 ./scripts/build-wordpress-plugin.sh
-# Output: build/wordpress_plugin.zip
+# Output: build/barebits_wordpress_plugin.zip
 ```
 
 ### Building mint-discovery Bundle
@@ -451,7 +451,7 @@ Webhook events: `InvoiceCreated`, `InvoiceReceivedPayment`, `InvoiceProcessing`,
 
 Your server may not support URL rewriting. Use the front controller URL:
 ```
-https://yoursite.com/cashupayserver/router.php
+https://yoursite.com/barebits/router.php
 ```
 
 ### "Forbidden" when accessing setup

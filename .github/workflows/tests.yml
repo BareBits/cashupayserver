@@ -100,8 +100,8 @@ jobs:
           # The WP tests consume these exact artifacts instead of rebuilding
           # them (the E2E job has no Node/composer). If unset, the fixtures
           # build them locally — the path a dev run takes.
-          CASHUPAY_WP_PLUGIN_ZIP: ${{ github.workspace }}/build/wordpress_plugin.zip
-          CASHUPAY_STANDALONE_ZIP: ${{ github.workspace }}/build/cashupayserver.zip
+          CASHUPAY_WP_PLUGIN_ZIP: ${{ github.workspace }}/build/barebits_wordpress_plugin.zip
+          CASHUPAY_STANDALONE_ZIP: ${{ github.workspace }}/build/barebits.zip
 
       - name: Upload test logs on failure
         if: failure() || cancelled()
@@ -189,7 +189,7 @@ jobs:
         # health.php, pay.php and product-image.php were all missing until this
         # check was added.
         run: |
-          php scripts/verify-plugin-build.php build/cashupayserver \
+          php scripts/verify-plugin-build.php build/barebits \
             setup.php \
             admin.php \
             api.php \
@@ -211,7 +211,7 @@ jobs:
         with:
           name: build-artifacts
           path: |
-            build/wordpress_plugin.zip
-            build/cashupayserver.zip
+            build/barebits_wordpress_plugin.zip
+            build/barebits.zip
           retention-days: 7
           if-no-files-found: error

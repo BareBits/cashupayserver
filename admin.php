@@ -6732,7 +6732,7 @@ header('Cache-Control: no-cache, must-revalidate');
                     Auto-update — channel selector + last-update info + rollback.
                     The isolated update.php endpoint (nudged by Task 12 in
                     cron.php, and by the optional dedicated cron line) fetches
-                    the latest cashupayserver.zip built by CI for the chosen
+                    the latest barebits-<tag>.zip built by CI for the chosen
                     channel and overlays it on the install. data/ and
                     user_config.php are preserved. .htaccess is only overwritten
                     if untouched. After applying, it probes health.php and
