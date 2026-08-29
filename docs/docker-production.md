@@ -29,6 +29,14 @@ shared-hosting deploy described in the README — just packaged for
 
 - **TLS termination.** The image serves HTTP on port 80 only. Put a
   reverse proxy in front (Caddy, Traefik, nginx, Cloudflare).
+- **nginx + php-fpm serving.** The image is Apache/mod_php. nginx *in front
+  of* this container as a reverse proxy needs nothing special; if you instead
+  run the app natively under nginx + php-fpm (no Apache at all), use the
+  canonical server block at [`docker/nginx-site.conf`](../docker/nginx-site.conf)
+  — it is the tested equivalent of the in-repo `.htaccess` (deny rules, API
+  rewrites, clean-URL front controller; url_mode detects `clean` with it, and
+  degrades to `direct`/`router` without its front controller). Either way,
+  verify a deployment with `scripts/webserver-smoke.sh <url> [--nginx]`.
 - **WordPress / WooCommerce integration testing.** That's what the other
   two `docker/Dockerfile.*` images are for — see [DOCKER.md](../DOCKER.md).
 - **Multi-tenant orchestration.** This is one container per deployment.

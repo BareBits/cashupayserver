@@ -237,7 +237,12 @@ The `data/` directory contains your SQLite database with ecash tokens (real Bitc
 
 **Apache**: The `.htaccess` file handles this automatically, if enabled and honored. Verify.
 
-**nginx**: Add `location /data/ { deny all; }` to your config.
+**nginx**: Use the shipped, tested server block at
+[`docker/nginx-site.conf`](docker/nginx-site.conf) — it carries the deny rules
+(`data/`, dotfiles, `*.sqlite`/`*.db` + WAL sidecars, `user_config.php`), the
+API rewrites, and the clean-URL front controller that mirrors what `.htaccess`
+does on Apache. nginx never reads `.htaccess`, so at minimum the deny rules
+from that file are mandatory.
 
 **Verify protection**:
 ```bash
@@ -381,24 +386,24 @@ curl -I http://localhost/cashu-wallet-php/test-wallet.php
 
 ### nginx (Development)
 
-nginx ignores `.htaccess`. Add this to your server block:
+nginx ignores `.htaccess`. Use the canonical, tested server block shipped at
+[`docker/nginx-site.conf`](docker/nginx-site.conf): it contains the deny rules
+(sensitive directories, dotfiles, database files including WAL/SHM sidecars,
+`user_config.php`), the `/api/v1` and `/v1` rewrites, PATH_INFO-preserving
+PHP execution, and the clean-URL front controller. With its front controller
+in place the setup wizard detects clean URLs, exactly as on Apache with
+mod_rewrite; without it the app falls back to `direct`/`router`-style URLs
+automatically — but the deny rules are not optional.
 
-```nginx
-# Block sensitive directories
-location ~ ^/(data|includes|cashu-wallet-php|mint-discovery|scripts|docker|docs|\.claude)/ {
-    deny all;
-    return 403;
-}
+The e2e suite runs against this exact file (`tests/scripts/run-tests.sh`
+with no `--backend` flag, or `CASHUPAY_TEST_BACKEND=nginx`), and the
+`webserver-smoke` CI workflow asserts its deny/routing behaviour on every
+change to it.
 
-# Block dotfiles
-location ~ /\. {
-    deny all;
-}
-
-# Block database files
-location ~* \.(sqlite|db)$ {
-    deny all;
-}
+**Verify any deployment** (works for Apache and nginx):
+```bash
+scripts/webserver-smoke.sh https://yoursite.com          # Apache
+scripts/webserver-smoke.sh https://yoursite.com --nginx  # nginx
 ```
 
 ### PHP Built-in Server

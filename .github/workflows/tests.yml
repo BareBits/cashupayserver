@@ -93,8 +93,12 @@ jobs:
           path: build
 
       - name: Run test suite
+        # --backend=phps: CI runs the full suite on the php -S backend only.
+        # The Apache/nginx passes (run-tests.sh with no --backend runs all
+        # three) are the local full-coverage run; CI's webserver coverage is
+        # the fast webserver-smoke workflow.
         run: |
-          ./tests/scripts/run-tests.sh -v
+          ./tests/scripts/run-tests.sh --backend=phps -v
         env:
           PYTHONUNBUFFERED: "1"
           # The WP tests consume these exact artifacts instead of rebuilding

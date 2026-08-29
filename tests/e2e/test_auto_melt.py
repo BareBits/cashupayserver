@@ -8,6 +8,7 @@ import time
 import pytest
 
 from conftest import ConfiguredPayserver
+from fixtures import backend
 from fixtures.lnd import LndHandle
 from fixtures.lnurlp_server import LnurlpServer
 
@@ -61,6 +62,22 @@ def _store_balance(configured: ConfiguredPayserver) -> int:
     return int(r.json()["balance"])
 
 
+def _run_auto_melt_cron(configured: ConfiguredPayserver) -> object:
+    """Trigger cron and return the parsed `auto_melt` task result, tolerating
+    non-JSON preamble lines the cron may emit before its JSON payload."""
+    r = configured.handle.trigger_cron()
+    assert r.status_code == 200, r.text
+    body_text = r.text.strip()
+    try:
+        cron_body = r.json()
+    except Exception:
+        import json as _json
+
+        idx = body_text.find("{")
+        cron_body = _json.loads(body_text[idx:]) if idx >= 0 else {}
+    return cron_body.get("tasks", {}).get("auto_melt")
+
+
 def test_auto_melt_drains_balance_to_lightning_address(
     configured_with_lnurlp: ConfiguredPayserver,
     lnd_payer: LndHandle,
@@ -78,54 +95,36 @@ def test_auto_melt_drains_balance_to_lightning_address(
     #    because CASHU_LNURL_URL_TEMPLATE overrides the URL builder.
     _enable_auto_melt(configured, address="test@example.test", threshold_sat=AUTO_MELT_THRESHOLD_SAT)
 
-    # 3. Trigger cron; this fires LightningAddress::checkAutoMelt() which
-    #    drains balance > threshold to the configured address.
-    r = configured.handle.trigger_cron()
-    assert r.status_code == 200, r.text
-    # Cron may emit non-JSON lines (e.g. a Donation::send HTTP 500 warning from
-    # the donation sink) before the JSON payload. Parse what we can find.
-    body_text = r.text.strip()
-    try:
-        cron_body = r.json()
-    except Exception:
-        # Find the first valid JSON object in the body.
-        import json as _json
-        idx = body_text.find("{")
-        cron_body = _json.loads(body_text[idx:]) if idx >= 0 else {}
-    auto_melt_result = cron_body.get("tasks", {}).get("auto_melt")
-    assert auto_melt_result and auto_melt_result != "skipped", (
-        f"auto_melt task didn't run; body={body_text[:600]!r}"
+    # 3. On the deterministic php -S backend only our trigger runs cron, so
+    #    this exact run must report the task fired. On apache/nginx an
+    #    opportunistic background cron (Background::trigger on page loads) may
+    #    race us and drain first, making any particular run report "skipped" —
+    #    there the drained *outcome* below is the assertion.
+    if backend.is_phps():
+        auto_melt_result = _run_auto_melt_cron(configured)
+        assert auto_melt_result and auto_melt_result != "skipped", (
+            f"auto_melt task didn't run; result={auto_melt_result!r}"
+        )
+
+    # 4. Drive cron until the drain is observable: balance near zero and the
+    #    funds delivered to the receiving LND (allowing 1-100 sat regtest
+    #    routing fees).
+    configured.handle.drive_cron_until(
+        lambda: _store_balance(configured) < AUTO_MELT_THRESHOLD_SAT
+        and lnd_payer.channel_balance_sat() - payer_channel_before
+        >= SETTLE_AMOUNT_SAT - 200,
+        timeout_s=60,
+        label="auto-melt drains the balance to the lightning address",
     )
 
-    # 4. Receiving LND should now have higher channel balance, and the
-    #    store balance should have dropped near zero.
-    payer_channel_after = lnd_payer.channel_balance_sat()
-    delta = payer_channel_after - payer_channel_before
-    # Allow for routing fees (1-100 sat in regtest).
+    delta = lnd_payer.channel_balance_sat() - payer_channel_before
     assert delta >= SETTLE_AMOUNT_SAT - 200, (
         f"expected ~{SETTLE_AMOUNT_SAT} sats delivered, got delta={delta}"
     )
-
     remaining = _store_balance(configured)
     # After a melt the residual change is folded back as new proofs; the
     # remainder should be small relative to the melt amount.
     assert remaining < AUTO_MELT_THRESHOLD_SAT, f"store balance not drained: {remaining}"
-
-
-def _run_auto_melt_cron(configured: ConfiguredPayserver) -> object:
-    """Trigger cron and return the parsed `auto_melt` task result, tolerating
-    non-JSON preamble lines the cron may emit before its JSON payload."""
-    r = configured.handle.trigger_cron()
-    assert r.status_code == 200, r.text
-    body_text = r.text.strip()
-    try:
-        cron_body = r.json()
-    except Exception:
-        import json as _json
-
-        idx = body_text.find("{")
-        cron_body = _json.loads(body_text[idx:]) if idx >= 0 else {}
-    return cron_body.get("tasks", {}).get("auto_melt")
 
 
 def test_auto_melt_ignores_threshold_for_lightning(
@@ -148,19 +147,27 @@ def test_auto_melt_ignores_threshold_for_lightning(
     huge_threshold = SETTLE_AMOUNT_SAT * 1000  # balance is nowhere near this
     _enable_auto_melt(configured, address="test@example.test", threshold_sat=huge_threshold)
 
-    # 2. Trigger cron; the drain must fire even though balance < threshold.
-    auto_melt_result = _run_auto_melt_cron(configured)
-    assert auto_melt_result and auto_melt_result != "skipped", (
-        f"auto_melt task didn't run despite a fundable balance; result={auto_melt_result!r}"
-    )
+    # 2. The drain must fire even though balance < threshold. Same backend
+    #    split as above: pin the task result only where cron is deterministic.
+    if backend.is_phps():
+        auto_melt_result = _run_auto_melt_cron(configured)
+        assert auto_melt_result and auto_melt_result != "skipped", (
+            f"auto_melt task didn't run despite a fundable balance; result={auto_melt_result!r}"
+        )
 
     # 3. Funds were delivered to the receiving node and the mint was drained.
-    payer_channel_after = lnd_payer.channel_balance_sat()
-    delta = payer_channel_after - payer_channel_before
+    configured.handle.drive_cron_until(
+        lambda: _store_balance(configured) < 500
+        and lnd_payer.channel_balance_sat() - payer_channel_before
+        >= SETTLE_AMOUNT_SAT - 200,
+        timeout_s=60,
+        label="lightning drain fires despite huge threshold",
+    )
+
+    delta = lnd_payer.channel_balance_sat() - payer_channel_before
     assert delta >= SETTLE_AMOUNT_SAT - 200, (
         f"expected ~{SETTLE_AMOUNT_SAT} sats delivered, got delta={delta}"
     )
-
     remaining = _store_balance(configured)
     assert remaining < 500, (
         f"store balance not drained despite huge threshold: {remaining}"

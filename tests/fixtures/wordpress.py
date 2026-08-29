@@ -2,18 +2,19 @@
 
 Uses wp-cli + the static PHP binary to stand up a fresh SQLite-backed WP
 install per test, with the GPL plugin copied from wordpress/ so any local
-change is exercised. Same `php -S` mechanic as the standalone payserver
-fixture — front controller through a tiny wrapper that falls through to
-WordPress's index.php and serves real files (including, in install-mode
-tests, the BareBits server the plugin installed at wp_root/barebits/)
-directly.
+change is exercised. Serving is backend-selectable (CASHUPAY_TEST_BACKEND,
+see tests/fixtures/webserver.py): php -S through a tiny front-controller
+wrapper (default), or real Apache / nginx containers. The `emulate_rewrites`
+host-shape flag maps per backend — under php -S it toggles the wrapper's
+.htaccess emulation snippet, under Apache it toggles AllowOverride (the real
+unpacked .htaccess does the work), under nginx it picks a site config with or
+without the /barebits rules and PATH_INFO support.
 """
 from __future__ import annotations
 
 import hashlib
 import os
 import shutil
-import signal
 import sqlite3
 import subprocess
 import time
@@ -25,7 +26,7 @@ from typing import Iterator
 
 import requests
 
-from . import binaries, ports
+from . import binaries, ports, webserver
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 TESTS_DIR = REPO_ROOT / "tests"
@@ -79,13 +80,18 @@ ELEX_DPP_CACHE = BIN_DIR / f"elex-discount-per-payment-method-{ELEX_DPP_VERSION}
 
 @dataclass
 class WordPressHandle:
-    process: subprocess.Popen[bytes]
+    server: webserver.ManagedServer
     port: int
     wp_root: Path
     data_dir: Path
     workdir: Path
     php_exe: Path
     wp_cli_phar: Path
+
+    @property
+    def process(self) -> subprocess.Popen[bytes] | None:
+        """Back-compat accessor: the php -S Popen, None on container backends."""
+        return self.server.popen
 
     @property
     def url(self) -> str:
@@ -306,19 +312,10 @@ def ensure_wp_plugin_zip() -> Path:
 # ---------- fixture ----------
 
 ROUTER_WRAPPER_TEMPLATE = """<?php
-// Point the plugin's release downloader at the test's fixture release server
-// instead of api.github.com (see wordpress/installer.php).
-$releaseBase = getenv('CASHUPAY_RELEASE_API_BASE');
-if ($releaseBase !== false && $releaseBase !== '' && !defined('CASHUPAY_RELEASE_API_BASE')) {{
-    define('CASHUPAY_RELEASE_API_BASE', $releaseBase);
-}}
-// Release channel override (the same wp-config.php constant a site operator
-// would use) so tests can exercise the testing-channel release pick.
-$releaseChannel = getenv('CASHUPAY_RELEASE_CHANNEL');
-if ($releaseChannel !== false && $releaseChannel !== '' && !defined('CASHUPAY_RELEASE_CHANNEL')) {{
-    define('CASHUPAY_RELEASE_CHANNEL', $releaseChannel);
-}}
 // WordPress front controller — fall through to wp's index.php on misses.
+// (The release-server constants the plugin's installer reads live in
+// wp-config.php — the same place a real operator puts them — so they apply
+// identically on every backend, not just under this php -S wrapper.)
 //
 // Paths resolve against the WordPress docroot, NOT __DIR__: this router lives
 // in the workdir alongside the install, so __DIR__ would never match a real WP
@@ -421,6 +418,28 @@ def start_wordpress(
     if not wp_root.exists():
         shutil.copytree(core, wp_root)
 
+    # 1b. The standard WordPress .htaccess block, which every real Apache WP
+    #     install has. wp-cli's `rewrite --hard` cannot write it (CLI SAPI ⇒
+    #     got_mod_rewrite() false), and without it pretty-permalink routes
+    #     (/wp-json/... — the WooCommerce Store API) 404 on the apache
+    #     backend. Inert under php -S (the wrapper never reads .htaccess) and
+    #     under the hostile AllowOverride None shape; /barebits/* keeps its
+    #     own .htaccess, which takes per-directory precedence.
+    wp_htaccess = wp_root / ".htaccess"
+    if not wp_htaccess.exists():
+        wp_htaccess.write_text(
+            "# BEGIN WordPress\n"
+            "<IfModule mod_rewrite.c>\n"
+            "RewriteEngine On\n"
+            "RewriteBase /\n"
+            "RewriteRule ^index\\.php$ - [L]\n"
+            "RewriteCond %{REQUEST_FILENAME} !-f\n"
+            "RewriteCond %{REQUEST_FILENAME} !-d\n"
+            "RewriteRule . /index.php [L]\n"
+            "</IfModule>\n"
+            "# END WordPress\n"
+        )
+
     # 2. SQLite drop-in.
     sqlite_plugin = _ensure_sqlite_plugin()
     target_plugin_dir = wp_root / "wp-content" / "plugins" / "sqlite-database-integration"
@@ -435,11 +454,18 @@ def start_wordpress(
     if install_cashupay:
         _assemble_plugin(wp_root / "wp-content" / "plugins" / "cashupay")
 
-    # 4. wp-config.php with SQLite config + WP_HOME.
+    # 4. wp-config.php with SQLite config + WP_HOME (+ the release-server
+    #    constants the plugin's installer reads, when the caller provides them).
     port = ports.allocate(1)[0]
     config = wp_root / "wp-config.php"
     if not config.exists():
-        config.write_text(_wp_config_php(port=port))
+        config.write_text(
+            _wp_config_php(
+                port=port,
+                release_api_base=release_api_base,
+                release_channel=release_channel,
+            )
+        )
 
     # 5. Router wrapper.
     router_wrapper = workdir / "wp-router.php"
@@ -487,7 +513,7 @@ def start_wordpress(
             text=True,
         )
 
-    # 8. Spin php -S.
+    # 8. Serve the tree on the active backend.
     env = os.environ.copy()
     # SafeHttp blocks loopback/RFC1918 destinations by default; the webhook
     # sink and the alongside BareBits install both live on 127.0.0.1, so the
@@ -497,33 +523,38 @@ def start_wordpress(
         env["CASHUPAY_RELEASE_API_BASE"] = release_api_base
     if release_channel:
         env["CASHUPAY_RELEASE_CHANNEL"] = release_channel
-    # Fork multiple worker processes for the built-in server. A single-threaded
-    # `php -S` deadlocks on any same-server loopback request, and this stack
-    # makes several: the BTCPay gateway calls the BareBits Greenfield API (same
-    # host) during checkout, BareBits' webhook cron POSTs back to WooCommerce's
-    # wc-api endpoint during the cron request, and the plugin's WP-cron pinger
-    # GETs the alongside install's cron.php. Production (Apache/php-fpm) is
-    # multi-process; this mirrors that. Honored by the pinned static PHP 8.3.
-    if php_workers is not None:
-        env["PHP_CLI_SERVER_WORKERS"] = str(php_workers)
-    else:
-        env.setdefault("PHP_CLI_SERVER_WORKERS", "6")
-    log = (workdir / "wp-server.log").open("ab")
-    proc = subprocess.Popen(
-        [
-            str(php_exe),
-            "-S", f"127.0.0.1:{port}",
-            "-t", str(wp_root),
-            str(router_wrapper),
-        ],
+    # A multi-worker pool on every backend. A single-threaded server deadlocks
+    # on any same-server loopback request, and this stack makes several: the
+    # BTCPay gateway calls the BareBits Greenfield API (same host) during
+    # checkout, BareBits' webhook cron POSTs back to WooCommerce's wc-api
+    # endpoint during the cron request, and the plugin's WP-cron pinger GETs
+    # the alongside install's cron.php. Maps to PHP_CLI_SERVER_WORKERS under
+    # php -S, prefork MaxRequestWorkers under Apache, pm.max_children under
+    # FPM; a small value emulates hosts with tight per-site pools (Local WP).
+    workers = php_workers if php_workers is not None else 6
+
+    server = webserver.start_php_site(
+        port=port,
+        docroot=wp_root,
+        workdir=workdir,
         env=env,
-        cwd=str(wp_root),
-        stdout=log,
-        stderr=subprocess.STDOUT,
+        role="wordpress",
+        log_path=workdir / "wp-server.log",
+        workers=workers,
+        phps_router=router_wrapper,
+        phps_cwd=wp_root,
+        phps_binary=str(php_exe),
+        # Host-shape mapping: friendly Apache honours the real .htaccess the
+        # install-alongside flow unpacks at wp_root/barebits/.htaccess; the
+        # hostile host is AllowOverride None.
+        apache_allow_override=emulate_rewrites,
+        nginx_site_conf=_wp_nginx_site(
+            port=port, wp_root=wp_root, friendly=emulate_rewrites
+        ),
     )
 
     handle = WordPressHandle(
-        process=proc,
+        server=server,
         port=port,
         wp_root=wp_root,
         data_dir=data_dir,
@@ -540,13 +571,73 @@ def start_wordpress(
 
 
 def stop_wordpress(handle: WordPressHandle) -> None:
-    if handle.process.poll() is None:
-        handle.process.send_signal(signal.SIGTERM)
-        try:
-            handle.process.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            handle.process.kill()
-            handle.process.wait()
+    handle.server.stop(grace_s=10.0)
+
+
+# ---------- nginx site config (container backend) ----------
+
+def _wp_nginx_site(*, port: int, wp_root: Path, friendly: bool) -> str:
+    """The WordPress server block for the nginx backend.
+
+    friendly=True models the canonical well-configured host: WP front
+    controller, PATH_INFO-capable PHP location, and the /barebits rules the
+    install's own .htaccess would provide under Apache. friendly=False is the
+    genuinely rewrite-hostile host — a stock WP nginx config whose plain
+    `\\.php$` location executes real files with no PATH_INFO and routes
+    everything else into WordPress (the fixture's `emulate_rewrites=False`
+    contract).
+    """
+    barebits_rules = """
+    # What the BareBits install's .htaccess provides under Apache: the
+    # extensionless pairing endpoint and the Greenfield API on the bare base.
+    location = /barebits/api-keys/authorize {
+        rewrite ^ /barebits/api-keys/authorize.php last;
+    }
+    location ^~ /barebits/api/v1/ {
+        rewrite ^/barebits(/api/v1/.*)$ /barebits/api.php$1 last;
+    }
+""" if friendly else ""
+
+    if friendly:
+        php_location = """
+    location ~ [^/]\\.php(/|$) {
+        fastcgi_split_path_info ^(.+?\\.php)(/.*)$;
+        set $wp_path_info $fastcgi_path_info;
+        try_files $fastcgi_script_name =404;
+        include fastcgi_params;
+        # Debian's fastcgi_params rewrites HTTP_HOST to $host (port dropped);
+        # WordPress then canonical-redirects to WP_HOME's ported URL forever.
+        fastcgi_param HTTP_HOST $http_host if_not_empty;
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        fastcgi_param PATH_INFO $wp_path_info;
+        fastcgi_pass unix:%(sock)s;
+    }
+""" % {"sock": webserver.FPM_SOCKET}
+    else:
+        php_location = """
+    # Stock shape: no fastcgi_split_path_info, so /barebits/api.php/api/v1/...
+    # never matches — only real .php files execute, everything else lands in
+    # WordPress. This is what the same-origin api.php transport exists for.
+    location ~ \\.php$ {
+        try_files $uri =404;
+        include fastcgi_params;
+        fastcgi_param HTTP_HOST $http_host if_not_empty;
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        fastcgi_pass unix:%(sock)s;
+    }
+""" % {"sock": webserver.FPM_SOCKET}
+
+    return f"""server {{
+    listen 127.0.0.1:{port};
+    server_name _;
+    root {wp_root};
+    index index.php;
+{barebits_rules}
+    location / {{
+        try_files $uri $uri/ /index.php?$args;
+    }}
+{php_location}}}
+"""
 
 
 # ---------- WooCommerce + BTCPay gateway on top of a running WP ----------
@@ -651,8 +742,27 @@ def stage_elex_discount_plugin(handle: WordPressHandle) -> None:
         os.symlink(src, dst)
 
 
-def _wp_config_php(*, port: int) -> str:
+def _wp_config_php(
+    *,
+    port: int,
+    release_api_base: str | None = None,
+    release_channel: str | None = None,
+) -> str:
+    release_defines = ""
+    if release_api_base:
+        release_defines += (
+            "// Point the plugin's release downloader at the test's fixture release\n"
+            "// server instead of api.github.com (see wordpress/installer.php).\n"
+            f"define('CASHUPAY_RELEASE_API_BASE', '{release_api_base}');\n"
+        )
+    if release_channel:
+        release_defines += (
+            "// Release channel override — the same wp-config.php constant a site\n"
+            "// operator would use to opt into the testing channel.\n"
+            f"define('CASHUPAY_RELEASE_CHANNEL', '{release_channel}');\n"
+        )
     return f"""<?php
+{release_defines}
 // SQLite drop-in expects these even though they're unused.
 define('DB_NAME', 'wordpress');
 define('DB_USER', '');

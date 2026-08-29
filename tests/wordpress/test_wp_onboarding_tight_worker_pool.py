@@ -19,10 +19,14 @@ PHP_CLI_SERVER_WORKERS=2 yields three serving processes (the master accepts
 too), and one of them is pinned for the whole test by a long-running
 request — leaving exactly TWO free workers, one short of what the bridge
 chain needs. Onboarding must complete end to end anyway, including the
-WooCommerce wiring's webhook registration. The canonical /api/v1 routes DO
-starve on this host (the install step's routing probe warns — checkout
-traffic depends on the host having enough workers), and the warning's copy
-must no longer claim onboarding itself will fail.
+WooCommerce wiring's webhook registration.
+
+The install step's probe is part of the same story: it used to ride the
+canonical /api/v1 route, starve on exactly this pool shape, and warn that
+the site "is blocked from making HTTP requests to its own URL" — a false
+alarm (loopback works fine here, as the rest of the flow proves). The probe
+now goes to api.php directly, one loopback deep, so on this host it must
+SUCCEED and the install step must show no warning at all.
 """
 from __future__ import annotations
 
@@ -88,14 +92,12 @@ def test_onboarding_completes_on_a_starved_worker_pool(wordpress_hostile_tight_p
     post_onboarding(s, wp, "cashupay_choose_mode", {"cashupay_mode": "install"})
     body = post_onboarding(s, wp, "cashupay_run_install")
     assert "BareBits is installed at" in body, body[:2000]
-    # The canonical /api/v1 probe nests through the bridge — three deep — and
-    # starves here (two free workers), so the warning is EXPECTED. Its copy
-    # must not claim onboarding will fail (it no longer does; checkout
-    # traffic is what rides those routes).
-    assert "routes are not answering" in body, body[:2000]
-    assert "step will fail" not in body, (
-        "the routing warning must not claim the connect step will fail"
-    )
+    # Loopback works on this host — only the canonical /api/v1 bridge chain
+    # starves. The probe goes to api.php directly (one loopback deep, one
+    # free worker suffices), so it must succeed and the old false alarm
+    # ("blocked from making HTTP requests to its own URL") must be gone.
+    assert "Heads up" not in body, body[:2000]
+    assert "blocked" not in body, body[:2000]
 
     _walk_wizard_declining_everything(wp)
 

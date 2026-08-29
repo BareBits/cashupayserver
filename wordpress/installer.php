@@ -475,28 +475,61 @@ function cashupay_run_install(string $dirname = ''): array {
 }
 
 /**
- * Does the fresh install's /api/v1 route answer? The WooCommerce gateway
- * talks to {url}/api/v1/... which the install's .htaccess rewrites to
- * api.php — a host that ignores .htaccess (nginx, Apache with AllowOverride
- * None) serves the surrounding site's "page not found" there instead.
- * Probed right after the install, while the merchant is still looking at
- * the screen, rather than surfacing as a cryptic wiring failure at the very
- * end of onboarding. Pre-setup the endpoint answers 503 with a JSON body,
- * after setup 200; both prove the route reaches BareBits. The JSON check
- * matters: a WordPress 404 page (or a redirect-a-404-home plugin) answers
- * with HTML, which must not count as routing.
+ * Classify one probe answer from the install's API:
+ *
+ *   'ok'          it answered like BareBits — pre-setup the endpoint answers
+ *                 503 with a JSON body, after setup 200; both prove the
+ *                 request reached the install.
+ *   'unreachable' the HTTP request itself failed (timeout, connection
+ *                 refused) — the site cannot reach the URL at all.
+ *   'unexpected'  some OTHER HTTP answer: a WordPress 404 page, a
+ *                 redirect-a-404-home plugin, a security plugin or WAF
+ *                 intercepting, a fatal error in the install. The JSON check
+ *                 matters: an HTML page must never count as the API.
+ *
+ * Pure (no WordPress calls) so tests/php can pin the matrix without a
+ * WordPress install; cashupay_install_loopback_verdict() is the live prober.
  */
-function cashupay_install_api_routes_ok(string $url): bool {
-    $response = wp_remote_get($url . '/api/v1/server/info', [
+function cashupay_api_probe_verdict(bool $requestFailed, int $code, string $body): string {
+    if ($requestFailed) {
+        return 'unreachable';
+    }
+    return in_array($code, [200, 503], true) && is_array(json_decode($body, true))
+        ? 'ok'
+        : 'unexpected';
+}
+
+/**
+ * Can this WordPress site reach its own fresh install over HTTP at all?
+ * Payments depend on it — the WP-cron heartbeat, the API bridge, and
+ * checkout's Greenfield calls all ride loopback requests — so a host that
+ * blocks them is surfaced right after the install, while the merchant is
+ * still looking at the screen, instead of as a cryptic failure later.
+ *
+ * Deliberately probes api.php directly (the query-path transport, one
+ * loopback deep — the same URL shape every call the plugin itself makes
+ * uses), NOT the canonical /api/v1 route: on rewrite-hostile hosts the
+ * canonical form is only answered by the API bridge (api-bridge.php), and
+ * probing through that chain from inside the installer request needs a
+ * THIRD simultaneous PHP worker — tight per-site pools (Local WP) starve it
+ * into a false "loopback blocked" alarm, and the abandoned bridge request
+ * then wedges a worker for its full inner timeout. api.php is a real file
+ * every host executes directly, so this probe answers wherever loopback
+ * works at all.
+ */
+function cashupay_install_loopback_verdict(string $url): string {
+    $response = wp_remote_get(cashupay_api_transport_url($url, '/api/v1/server/info', $url), [
         'timeout' => 10,
         'sslverify' => !cashupay_is_same_host_url($url),
     ]);
     if (is_wp_error($response)) {
-        return false;
+        return 'unreachable';
     }
-    $code = (int) wp_remote_retrieve_response_code($response);
-    return in_array($code, [200, 503], true)
-        && is_array(json_decode((string) wp_remote_retrieve_body($response), true));
+    return cashupay_api_probe_verdict(
+        false,
+        (int) wp_remote_retrieve_response_code($response),
+        (string) wp_remote_retrieve_body($response)
+    );
 }
 
 /**

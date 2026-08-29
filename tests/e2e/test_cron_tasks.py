@@ -1,6 +1,8 @@
 """cron.php auth, task execution, and pre-setup behavior."""
 from __future__ import annotations
 
+import time
+
 import requests
 
 from conftest import ConfiguredPayserver
@@ -15,11 +17,22 @@ def test_cron_returns_503_before_setup(payserver: PayserverHandle) -> None:
 
 def test_cron_runs_with_seeded_key(configured: ConfiguredPayserver) -> None:
     """`cron_key` is seeded during install (Database::initialize); the fixture
-    reads it and passes it as ?key=, so the cron endpoint runs all tasks."""
-    r = configured.handle.trigger_cron()
-    assert r.status_code == 200, r.text
-    body = r.json()
-    assert "tasks" in body
+    reads it and passes it as ?key=, so the cron endpoint runs all tasks.
+
+    Under Apache/nginx an opportunistic background cron (Background::trigger
+    on page loads) can hold the cron lock when we call, yielding
+    {"skipped": "another cron run in progress"} — retry until a run of OURS
+    actually executes; the task-list contract is the assertion."""
+    deadline = time.monotonic() + 30
+    while True:
+        r = configured.handle.trigger_cron()
+        assert r.status_code == 200, r.text
+        body = r.json()
+        if "tasks" in body:
+            break
+        assert "skipped" in body, body
+        assert time.monotonic() < deadline, f"cron lock never freed: {body}"
+        time.sleep(1)
     # All four cron tasks should be present.
     for task in ("poll_quotes", "auto_melt", "clean_cache", "expire_invoices"):
         assert task in body["tasks"], body
