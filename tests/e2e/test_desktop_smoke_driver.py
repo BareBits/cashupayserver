@@ -32,12 +32,10 @@ def desktop_payserver() -> Iterator[PayserverHandle]:
     stop_payserver(handle)
 
 
-def test_driver_passes_against_a_desktop_mode_instance(
-    desktop_payserver: PayserverHandle,
-) -> None:
+def _run_driver(url: str, *args: str) -> None:
     php = str(binaries.ensure(binaries.PHP)["php"])
     result = subprocess.run(
-        [php, str(DRIVER), desktop_payserver.url],
+        [php, str(DRIVER), url, *args],
         capture_output=True,
         text=True,
         timeout=180,
@@ -49,3 +47,18 @@ def test_driver_passes_against_a_desktop_mode_instance(
     # The driver prints one "ok - ..." line per stage; all five must have run.
     assert result.stdout.count("ok - ") == 5, result.stdout
     assert "all checks passed" in result.stdout
+
+
+def test_driver_passes_against_a_desktop_mode_instance(
+    desktop_payserver: PayserverHandle,
+) -> None:
+    _run_driver(desktop_payserver.url)
+
+
+def test_driver_server_shape_passes_against_a_plain_instance(
+    payserver: PayserverHandle,
+) -> None:
+    """The `server` shape drives the ordinary (non-desktop) wizard — security
+    screen, "of 10" counter, cron screen with a crontab line. The webserver
+    smoke workflow runs this same invocation against real Apache and nginx."""
+    _run_driver(payserver.url, "server")

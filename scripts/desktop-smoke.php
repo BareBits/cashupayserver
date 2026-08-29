@@ -13,11 +13,18 @@
  *      "no payment methods" validation error — the whole API stack (auth,
  *      routing, JSON handling, DB writes) proves out without needing a mint.
  *
- * Run by scripts/windows-smoke.ps1 against the real package in CI, and by
- * tests/e2e/test_desktop_smoke_driver.py against a Linux desktop-mode
- * instance so the driver itself cannot rot unnoticed between releases.
+ * Run by scripts/windows-smoke.ps1 against the real package in CI, by
+ * tests/e2e/test_desktop_smoke_driver.py against Linux desktop-mode and
+ * server-mode instances so the driver itself cannot rot unnoticed between
+ * releases, and by .github/workflows/webserver-smoke.yml (server shape)
+ * against real Apache and nginx containers.
  *
- * Usage: php desktop-smoke.php <base-url>      (exit 0 = pass)
+ * The optional shape argument selects which wizard the target shows:
+ *   desktop (default)  terms -> password, "of 8", no security or cron screens
+ *   server             terms -> security -> password, "of 10" (data dir
+ *                      inside the webroot), cron screen with a crontab line
+ *
+ * Usage: php desktop-smoke.php <base-url> [desktop|server]   (exit 0 = pass)
  */
 
 declare(strict_types=1);
@@ -28,8 +35,10 @@ if (PHP_SAPI !== 'cli') {
 }
 
 $base = rtrim((string) ($argv[1] ?? ''), '/');
-if ($base === '' || !preg_match('#^https?://#', $base)) {
-    fwrite(STDERR, "usage: php desktop-smoke.php <base-url>\n");
+$shape = (string) ($argv[2] ?? 'desktop');
+if ($base === '' || !preg_match('#^https?://#', $base)
+        || !in_array($shape, ['desktop', 'server'], true)) {
+    fwrite(STDERR, "usage: php desktop-smoke.php <base-url> [desktop|server]\n");
     exit(2);
 }
 
@@ -144,13 +153,28 @@ $wpost = function (array $data) use ($ch, $setupUrl): string {
     return $body;
 };
 
-// --- 2. The wizard's desktop shape, to completion ---------------------------
+// --- 2. The wizard, in the requested shape, to completion --------------------
 $body = $wpost(['step' => 'terms', 'terms_legal' => '1', 'terms_warranty' => '1', 'terms_fee' => '1']);
-if (heading($body) !== 'Create your admin password') {
-    fail("desktop mode must go straight from terms to password, landed on '" . heading($body) . "'", $body);
-}
-if (strpos($body, 'of 8') === false) {
-    fail('step counter must show the desktop count ("of 8")', $body);
+if ($shape === 'desktop') {
+    if (heading($body) !== 'Create your admin password') {
+        fail("desktop mode must go straight from terms to password, landed on '" . heading($body) . "'", $body);
+    }
+    if (strpos($body, 'of 8') === false) {
+        fail('step counter must show the desktop count ("of 8")', $body);
+    }
+} else {
+    if (heading($body) !== 'Quick safety check') {
+        fail("server mode must show the security screen after terms, landed on '" . heading($body) . "'", $body);
+    }
+    // "of 10": full sequence minus zeroconf (no on-chain rail in this walk),
+    // with the security screen present (data dir inside the webroot).
+    if (strpos($body, 'of 10') === false) {
+        fail('step counter must show the server count ("of 10")', $body);
+    }
+    $body = $wpost(['step' => 'security', 'security_acknowledged' => '1']);
+    if (heading($body) !== 'Create your admin password') {
+        fail("acknowledging the security screen must land on password, landed on '" . heading($body) . "'", $body);
+    }
 }
 
 $password = 'desktop-smoke-pw-1234';
@@ -161,16 +185,36 @@ $wpost(['step' => 'lightning', 'lightning_action' => 'skip']);
 $wpost(['step' => 'swaps', 'swaps_enabled' => '0']);
 $body = $wpost(['step' => 'mints', 'mints_enabled' => '0']);
 
-if (heading($body) !== "You're all set!") {
-    fail("declining mints must land on the completion screen, landed on '" . heading($body) . "'", $body);
+if ($shape === 'desktop') {
+    if (heading($body) !== "You're all set!") {
+        fail("declining mints must land on the completion screen, landed on '" . heading($body) . "'", $body);
+    }
+    if (strpos($body, 'Background jobs run automatically') === false) {
+        fail('completion screen must carry the desktop background-jobs note', $body);
+    }
+    if (stripos($body, 'crontab') !== false) {
+        fail('crontab instructions must not appear on a desktop install', $body);
+    }
+    ok('onboarding wizard completes in its desktop shape (no security or cron screens)');
+} else {
+    if (heading($body) !== 'Enable cron') {
+        fail("declining mints must land on the cron screen, landed on '" . heading($body) . "'", $body);
+    }
+    if (stripos($body, 'crontab') === false) {
+        fail('server cron screen must show the crontab instructions', $body);
+    }
+    if (stripos($body, 'schtasks') !== false) {
+        fail('Windows schtasks instructions must not appear on a Linux server install', $body);
+    }
+    $body = $wpost(['step' => 'cron']);
+    if (heading($body) !== "You're all set!") {
+        fail("the cron step must land on the completion screen, landed on '" . heading($body) . "'", $body);
+    }
+    if (strpos($body, 'Background jobs run automatically') !== false) {
+        fail('the desktop background-jobs note must not appear on a server install', $body);
+    }
+    ok('onboarding wizard completes in its server shape (security + cron screens)');
 }
-if (strpos($body, 'Background jobs run automatically') === false) {
-    fail('completion screen must carry the desktop background-jobs note', $body);
-}
-if (stripos($body, 'crontab') !== false) {
-    fail('crontab instructions must not appear on a desktop install', $body);
-}
-ok('onboarding wizard completes in its desktop shape (no security or cron screens)');
 
 // --- 3. Admin session -------------------------------------------------------
 [$status, $body] = request($ch, 'POST', $base . '/admin', [
