@@ -565,10 +565,38 @@ class Auth {
     // =========================================================================
 
     /**
+     * The raw Authorization header, wherever the SAPI put it.
+     *
+     * Apache never exports Authorization into the CGI-style environment for
+     * non-Basic schemes: under mod_php $_SERVER['HTTP_AUTHORIZATION'] is
+     * simply unset (verified against stock php:8.3-apache), and FastCGI
+     * strips it per RFC 3875 unless CGIPassAuth is on. Without this fallback
+     * every `Authorization: token …` API call 401s on Apache. Same technique
+     * as the WordPress api-bridge (wordpress/api-bridge.php).
+     */
+    public static function authorizationHeader(): string {
+        $header = $_SERVER['HTTP_AUTHORIZATION']
+            ?? $_SERVER['REDIRECT_HTTP_AUTHORIZATION']
+            ?? '';
+        if ($header === '' && function_exists('apache_request_headers')) {
+            $headers = apache_request_headers();
+            if (is_array($headers)) {
+                foreach ($headers as $name => $value) {
+                    if (strcasecmp((string) $name, 'Authorization') === 0 && is_string($value)) {
+                        $header = $value;
+                        break;
+                    }
+                }
+            }
+        }
+        return is_string($header) ? $header : '';
+    }
+
+    /**
      * Validate API request and return store ID
      */
     public static function validateApiRequest(): ?array {
-        $authHeader = $_SERVER['HTTP_AUTHORIZATION'] ?? '';
+        $authHeader = self::authorizationHeader();
 
         // BTCPay format: "token API_KEY"
         if (preg_match('/^token\s+(.+)$/i', $authHeader, $matches)) {

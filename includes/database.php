@@ -139,6 +139,12 @@ class Database {
         $dir = self::getDataDir();
         if (!is_dir($dir)) {
             self::createDataDirectory($dir);
+        } else {
+            // A pre-created dir (Docker entrypoint's mkdir -p, an operator's
+            // mkdir, the test fixtures) never went through createDataDirectory,
+            // so it has no deny-all .htaccess — on Apache the SQLite file would
+            // be downloadable. Idempotent, so run it on every connect.
+            self::ensureDataDirectoryProtections($dir);
         }
 
         $pdo = new PDO('sqlite:' . self::getDbPath());
@@ -160,9 +166,20 @@ class Database {
             throw new Exception("Failed to create data directory: $dir");
         }
 
+        self::ensureDataDirectoryProtections($dir);
+    }
+
+    /**
+     * Write the web-facing protection files into the data directory when they
+     * are missing: a deny-all .htaccess (Apache) and a 403 index.php. Only
+     * absent files are written, so an operator-customized .htaccess is never
+     * overwritten.
+     */
+    public static function ensureDataDirectoryProtections(string $dir): void {
         // Create .htaccess for Apache protection
         $htaccess = $dir . '/.htaccess';
-        $htaccessContent = <<<'HTACCESS'
+        if (!file_exists($htaccess)) {
+            $htaccessContent = <<<'HTACCESS'
 # Deny all access to this directory
 <IfModule mod_authz_core.c>
     Require all denied
@@ -172,11 +189,14 @@ class Database {
     Deny from all
 </IfModule>
 HTACCESS;
-        file_put_contents($htaccess, $htaccessContent);
+            file_put_contents($htaccess, $htaccessContent);
+        }
 
         // Create index.php as additional protection
         $indexPhp = $dir . '/index.php';
-        file_put_contents($indexPhp, "<?php http_response_code(403); exit('Forbidden');");
+        if (!file_exists($indexPhp)) {
+            file_put_contents($indexPhp, "<?php http_response_code(403); exit('Forbidden');");
+        }
     }
 
     /**

@@ -66,8 +66,20 @@ COPY images/                                                       /usr/src/cash
 COPY cashu-wallet-php/CashuWallet.php                              /usr/src/cashupayserver/cashu-wallet-php/CashuWallet.php
 COPY cashu-wallet-php/bip39-english.txt                            /usr/src/cashupayserver/cashu-wallet-php/bip39-english.txt
 COPY admin.php setup.php api.php payment.php receive.php cron.php \
-     router.php index.php recover.php                              /usr/src/cashupayserver/
+     router.php index.php recover.php health.php pay.php \
+     product-image.php update.php provision.php sso.php            /usr/src/cashupayserver/
 COPY .htaccess manifest.json favicon.ico                           /usr/src/cashupayserver/
+
+# Fail the build if any entry point router.php dispatches to is missing or any
+# literal require doesn't resolve — the same guard tests.yml applies to the
+# standalone zip. health.php was absent from this image until this check
+# existed, which silently broke /health (and with it the clean-URL probe).
+COPY scripts/verify-plugin-build.php /usr/src/verify-plugin-build.php
+RUN php /usr/src/verify-plugin-build.php /usr/src/cashupayserver \
+        setup.php admin.php api.php router.php index.php health.php pay.php \
+        product-image.php update.php provision.php sso.php recover.php \
+        cron.php payment.php receive.php includes/database.php \
+    && rm /usr/src/verify-plugin-build.php
 
 # Entrypoint.
 COPY docker/entrypoint-production.sh /usr/local/bin/cashupay-entrypoint.sh
