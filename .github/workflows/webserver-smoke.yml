@@ -143,8 +143,11 @@ jobs:
               -e "s|^.*# TEST-SUBST: root$|    root $GITHUB_WORKSPACE;|" \
               -e "s|^.*# TEST-SUBST: fastcgi_pass$|        fastcgi_pass unix:/tmp/fpm/fpm.sock;|" \
               docker/nginx-site.conf > /tmp/nginx-conf/site.conf
-          ! grep -q "TEST-SUBST" /tmp/nginx-conf/site.conf || {
-            echo "TEST-SUBST anchors were not all substituted" >&2; exit 1; }
+          # Only directive lines may carry a leftover anchor — the file's
+          # header comment legitimately mentions TEST-SUBST.
+          if grep "TEST-SUBST" /tmp/nginx-conf/site.conf | grep -vqE '^\s*#'; then
+            echo "TEST-SUBST anchors were not all substituted" >&2; exit 1
+          fi
           cat > /tmp/nginx-conf/fpm-pool.conf <<'EOF'
           [www]
           listen = /tmp/fpm/fpm.sock
