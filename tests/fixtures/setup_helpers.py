@@ -277,6 +277,55 @@ def run_setup_wizard(
     )
 
 
+def run_add_store_wizard(
+    base_url: str,
+    *,
+    admin_password: str,
+    store_name: str,
+    mint_url: str,
+    backup_mint_url: str,
+    mint_unit: str = "sat",
+    default_currency: str = "sat",
+) -> None:
+    """Walk the admin-gated add_store wizard (store → onchain skip →
+    lightning skip → swaps off → mints), creating one more store on an
+    already-set-up instance. Each store minted this way gets its own fresh
+    wallet seed, so stores on a shared instance never collide at the mint."""
+    s = requests.Session()
+    r = s.post(
+        f"{base_url.rstrip('/')}/admin",
+        data={"action": "login", "username": "admin", "password": admin_password},
+        timeout=15,
+    )
+    assert r.status_code == 200 and r.json().get("success") is True, (
+        f"admin login before add_store failed: {r.status_code} {r.text[:200]}"
+    )
+
+    setup = f"{base_url.rstrip('/')}/setup"
+    # Priming GET clears any store id left in the session from a previous
+    # wizard run — what makes add_store add rather than rename.
+    s.get(setup, params={"mode": "add_store"}, timeout=30)
+
+    def post(label: str, timeout: int = 15, **data) -> None:
+        data["mode"] = "add_store"
+        r = s.post(setup, data=data, timeout=timeout, allow_redirects=False)
+        _assert_step_ok(r, f"add_store {label}")
+
+    post("store", step="store", store_name=store_name, default_currency=default_currency)
+    post("onchain (skip)", step="onchain", onchain_action="skip")
+    post("lightning (skip)", step="lightning", lightning_action="skip")
+    post("swaps (off)", step="swaps", swaps_enabled="0")
+    post(
+        "mints",
+        timeout=60,
+        step="mints",
+        mints_enabled="1",
+        mint_url=mint_url,
+        backup_mint_url=backup_mint_url,
+        mint_unit=mint_unit,
+    )
+
+
 def _assert_step_ok(r: requests.Response, label: str) -> None:
     if r.status_code >= 400:
         raise AssertionError(f"{label} returned {r.status_code}: {r.text[:400]}")
