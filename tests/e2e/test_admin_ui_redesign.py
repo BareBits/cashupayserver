@@ -18,19 +18,22 @@ from __future__ import annotations
 
 import pytest
 
-from conftest import ConfiguredPayserver, DEFAULT_ADMIN_PASSWORD
+from conftest import ConfiguredPayserver
 
 
 @pytest.fixture
-def admin_page(configured: ConfiguredPayserver, browser):
-    """A logged-in admin browser page (cookie established via context.request)."""
+def admin_page(shared_server: ConfiguredPayserver, browser):
+    """A logged-in admin browser page (cookie established via context.request).
+
+    These tests only read the admin UI (no settings are saved), so they run
+    against the module-scoped shared server's base store directly."""
     ctx = browser.new_context(viewport={"width": 1280, "height": 900})
     ctx.request.post(
-        f"{configured.handle.url}/admin",
-        form={"action": "login", "username": "admin", "password": DEFAULT_ADMIN_PASSWORD},
+        f"{shared_server.handle.url}/admin",
+        form={"action": "login", "username": "admin", "password": shared_server.admin_password},
     )
     page = ctx.new_page()
-    yield page, configured.handle.url
+    yield page, shared_server.handle.url
     ctx.close()
 
 

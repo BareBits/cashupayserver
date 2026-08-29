@@ -48,6 +48,9 @@ def test_onchain_pending_screen_flips_to_settled_preserving_email(
     configured: ConfiguredPayserver,
     page,
 ) -> None:
+    # Stays on the function-scoped `configured` fixture: _enable_payer_receipts
+    # writes server-global config rows (notifications_enabled, smtp_host) and
+    # never restores them, which would leak into a module-shared server.
     page.set_default_timeout(20000)
     _enable_payer_receipts(configured)
 
@@ -133,11 +136,12 @@ def test_onchain_pending_screen_flips_to_settled_preserving_email(
 
 
 def test_transient_processing_keeps_generic_block(
-    configured: ConfiguredPayserver,
+    shared_configured: ConfiguredPayserver,
     page,
 ) -> None:
     """Processing WITHOUT an on-chain observation (Cashu minting after a
     Lightning payment) keeps the old generic block — no confirmation copy."""
+    configured = shared_configured
     page.set_default_timeout(15000)
 
     invoice = configured.greenfield.create_invoice(

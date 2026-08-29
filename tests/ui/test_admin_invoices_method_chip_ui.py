@@ -49,8 +49,8 @@ MOCK_INVOICES = [
 ]
 
 
-def test_invoices_table_method_chips(configured: ConfiguredPayserver, page) -> None:
-    _login(page, configured)
+def test_invoices_table_method_chips(shared_configured: ConfiguredPayserver, page) -> None:
+    _login(page, shared_configured)
 
     page.evaluate(
         "(rows) => renderInvoicesTable('all-invoices', rows)",

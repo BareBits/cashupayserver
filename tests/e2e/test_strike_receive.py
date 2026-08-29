@@ -94,20 +94,26 @@ def _create_strike_invoice(configured: ConfiguredPayserver) -> tuple[str, str, d
 
 
 def test_strike_receive_round_trip(
-    configured_with_strike: ConfiguredPayserver, strike_api: StrikeApiServer
+    shared_configured_with_strike: ConfiguredPayserver, strike_api_shared: StrikeApiServer
 ) -> None:
-    configured = configured_with_strike
+    configured = shared_configured_with_strike
+    strike_api = strike_api_shared
     admin = configured.admin
     store_id = configured.store_id
     payserver = configured.handle
 
     # 1. Save the key — the probe runs create+quote+read through the mock.
+    # The mock is module-scoped (other tests' invoices accumulate in it), so
+    # the probe assertion counts only invoices created by THIS save.
+    ids_before = set(strike_api.invoices)
     save = save_strike_destination(admin, store_id, TEST_STRIKE_KEY)
     results = save.get("addresses") or []
     assert results and results[0]["type"] == "strike", save
     assert TEST_STRIKE_KEY not in str(save), "save response must never echo the key"
     assert results[0]["address"].startswith("Strike API ("), results
-    probe_invoices = list(strike_api.invoices.values())
+    probe_invoices = [
+        inv for iid, inv in strike_api.invoices.items() if iid not in ids_before
+    ]
     assert len(probe_invoices) == 1, "the probe issued exactly one test invoice"
     assert probe_invoices[0]["body"]["amount"]["amount"] == "0.00000001", "probe is 1 sat"
 
@@ -151,11 +157,12 @@ def test_strike_receive_round_trip(
 
 
 def test_strike_settles_via_cron_after_tab_closed(
-    configured_with_strike: ConfiguredPayserver, strike_api: StrikeApiServer
+    shared_configured_with_strike: ConfiguredPayserver, strike_api_shared: StrikeApiServer
 ) -> None:
     """The Strike read-back is a stored-state query, so cron settles a Strike
     invoice nobody is watching."""
-    configured = configured_with_strike
+    configured = shared_configured_with_strike
+    strike_api = strike_api_shared
     payserver = configured.handle
     save_strike_destination(configured.admin, configured.store_id, TEST_STRIKE_KEY)
 
@@ -175,12 +182,17 @@ def test_strike_settles_via_cron_after_tab_closed(
 
 
 def test_strike_failure_falls_back_to_mint(
-    configured_with_strike: ConfiguredPayserver, strike_api: StrikeApiServer
+    shared_configured_with_strike: ConfiguredPayserver, strike_api_shared: StrikeApiServer
 ) -> None:
     """A dead Strike API doesn't take Lightning off the checkout: the walk
     falls through to the store's mint and the payer-facing receive_errors
-    records a sanitized strike entry with no key material."""
-    configured = configured_with_strike
+    records a sanitized strike entry with no key material.
+
+    fail_create is a mock-global toggle, but tests run sequentially and only
+    this test issues creates while it is set (read-backs use GET); it is
+    restored in the finally, so sharing the module mock is safe."""
+    configured = shared_configured_with_strike
+    strike_api = strike_api_shared
     save_strike_destination(configured.admin, configured.store_id, TEST_STRIKE_KEY)
 
     strike_api.fail_create = 500

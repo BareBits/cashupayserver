@@ -79,11 +79,11 @@ def _run_auto_melt_cron(configured: ConfiguredPayserver) -> object:
 
 
 def test_auto_melt_drains_balance_to_lightning_address(
-    configured_with_lnurlp: ConfiguredPayserver,
+    shared_configured_with_lnurlp: ConfiguredPayserver,
     lnd_payer: LndHandle,
-    lnurlp_server: LnurlpServer,
+    lnurlp_server_shared: LnurlpServer,
 ) -> None:
-    configured = configured_with_lnurlp
+    configured = shared_configured_with_lnurlp
 
     # 1. Fund the store via a paid invoice.
     _settle_invoice(configured, lnd_payer, SETTLE_AMOUNT_SAT)
@@ -128,15 +128,15 @@ def test_auto_melt_drains_balance_to_lightning_address(
 
 
 def test_auto_melt_ignores_threshold_for_lightning(
-    configured_with_lnurlp: ConfiguredPayserver,
+    shared_configured_with_lnurlp: ConfiguredPayserver,
     lnd_payer: LndHandle,
-    lnurlp_server: LnurlpServer,
+    lnurlp_server_shared: LnurlpServer,
 ) -> None:
     """The LNURL/noffer rail is the always-on primary drain: it cashes the mint
     balance out to the configured Lightning address every cycle regardless of
     auto_melt_threshold. Funding a balance far *below* a huge threshold must
     still drain — under the old threshold-gated behaviour it would not have."""
-    configured = configured_with_lnurlp
+    configured = shared_configured_with_lnurlp
 
     # 1. Fund the store, then set a threshold far above the funded balance.
     _settle_invoice(configured, lnd_payer, SETTLE_AMOUNT_SAT)

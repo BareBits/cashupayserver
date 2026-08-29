@@ -40,47 +40,47 @@ def _read_invoice_row(handle, invoice_id: str) -> dict:
         return dict(row)
 
 
-def _new_invoice(configured: ConfiguredPayserver) -> str:
-    inv = configured.greenfield.create_invoice(configured.store_id, amount="1000", currency="sat")
+def _new_invoice(shared_configured: ConfiguredPayserver) -> str:
+    inv = shared_configured.greenfield.create_invoice(shared_configured.store_id, amount="1000", currency="sat")
     return inv["id"]
 
 
-def test_newsletter_checkbox_default_rendering(configured: ConfiguredPayserver) -> None:
+def test_newsletter_checkbox_default_rendering(shared_configured: ConfiguredPayserver) -> None:
     """The checkbox defaults to checked site-wide; a per-store override of
     'unchecked' flips it. The form renders regardless of payer-receipt setup."""
     # Default: site-wide default is "checked" and nothing is configured.
-    inv_a = _new_invoice(configured)
-    assert _newsletter_checkbox_checked(_payment_html(configured.handle.url, inv_a)) is True
+    inv_a = _new_invoice(shared_configured)
+    assert _newsletter_checkbox_checked(_payment_html(shared_configured.handle.url, inv_a)) is True
 
     # Per-store override → unchecked. save_store_notifications routes the
     # newsletter_default_checked write straight to the stores table.
-    res = configured.admin._post_action(
+    res = shared_configured.admin._post_action(
         "save_store_notifications",
-        store_id=configured.store_id,
+        store_id=shared_configured.store_id,
         enabled="0",
         email="",
         newsletter_default_checked="0",
     )
     assert res.get("success"), res
 
-    inv_b = _new_invoice(configured)
-    assert _newsletter_checkbox_checked(_payment_html(configured.handle.url, inv_b)) is False
+    inv_b = _new_invoice(shared_configured)
+    assert _newsletter_checkbox_checked(_payment_html(shared_configured.handle.url, inv_b)) is False
 
     # Override = checked again.
-    configured.admin._post_action(
+    shared_configured.admin._post_action(
         "save_store_notifications",
-        store_id=configured.store_id,
+        store_id=shared_configured.store_id,
         enabled="0",
         email="",
         newsletter_default_checked="1",
     )
-    inv_c = _new_invoice(configured)
-    assert _newsletter_checkbox_checked(_payment_html(configured.handle.url, inv_c)) is True
+    inv_c = _new_invoice(shared_configured)
+    assert _newsletter_checkbox_checked(_payment_html(shared_configured.handle.url, inv_c)) is True
 
 
 @pytest.mark.slow
 def test_customer_capture_and_listing(
-    configured: ConfiguredPayserver,
+    shared_configured: ConfiguredPayserver,
     lnd_payer: LndHandle,
 ) -> None:
     """Pay an invoice, submit the email/newsletter form, and verify the email is
@@ -88,10 +88,10 @@ def test_customer_capture_and_listing(
     payer receipts left OFF, proving capture is decoupled from receipt sending."""
     import requests
 
-    gc = configured.greenfield
-    url = configured.handle.url
+    gc = shared_configured.greenfield
+    url = shared_configured.handle.url
 
-    invoice = gc.create_invoice(configured.store_id, amount="1000", currency="sat")
+    invoice = gc.create_invoice(shared_configured.store_id, amount="1000", currency="sat")
     invoice_id = invoice["id"]
     bolt11 = (
         invoice.get("checkout", {})
@@ -107,7 +107,7 @@ def test_customer_capture_and_listing(
     # Wait for settlement.
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
-        if gc.get_invoice(configured.store_id, invoice_id).get("status") == "Settled":
+        if gc.get_invoice(shared_configured.store_id, invoice_id).get("status") == "Settled":
             break
         time.sleep(0.5)
     else:
@@ -127,12 +127,12 @@ def test_customer_capture_and_listing(
     assert body.get("success") is True, body
     assert body.get("receiptQueued") is False, "receipts are off; capture must still succeed"
 
-    row = _read_invoice_row(configured.handle, invoice_id)
+    row = _read_invoice_row(shared_configured.handle, invoice_id)
     assert row["customer_email"] == email
     assert int(row["newsletter_opt_in"]) == 1
 
     # Admin Customers API: the customer shows up, subscribed.
-    cust = configured.admin.s.get(f"{url}/admin?api=customers", timeout=15).json()
+    cust = shared_configured.admin.s.get(f"{url}/admin?api=customers", timeout=15).json()
     emails = [c["email"] for c in cust["customers"]]
     assert email in emails, cust
     me = next(c for c in cust["customers"] if c["email"] == email)
@@ -141,13 +141,13 @@ def test_customer_capture_and_listing(
     assert cust["total"] >= 1
 
     # Subscription filter: present under "subscribed", absent under "unsubscribed".
-    subbed = configured.admin.s.get(f"{url}/admin?api=customers&subscription=subscribed", timeout=15).json()
+    subbed = shared_configured.admin.s.get(f"{url}/admin?api=customers&subscription=subscribed", timeout=15).json()
     assert email in [c["email"] for c in subbed["customers"]]
-    unsub = configured.admin.s.get(f"{url}/admin?api=customers&subscription=unsubscribed", timeout=15).json()
+    unsub = shared_configured.admin.s.get(f"{url}/admin?api=customers&subscription=unsubscribed", timeout=15).json()
     assert email not in [c["email"] for c in unsub["customers"]]
 
     # CSV export contains the captured email.
-    csv = configured.admin.s.get(f"{url}/admin?api=export_customers_csv", timeout=15)
+    csv = shared_configured.admin.s.get(f"{url}/admin?api=export_customers_csv", timeout=15)
     assert "text/csv" in csv.headers.get("Content-Type", "")
     assert email in csv.text
     assert "Email,Subscribed,Store" in csv.text
@@ -156,17 +156,17 @@ def test_customer_capture_and_listing(
 @pytest.mark.slow
 @pytest.mark.ui
 def test_customers_view_renders_in_admin_ui(
-    configured: ConfiguredPayserver,
+    shared_configured: ConfiguredPayserver,
     lnd_payer: LndHandle,
     browser,
 ) -> None:
     """The admin Customers view loads and shows a captured customer row."""
     import requests
 
-    gc = configured.greenfield
-    url = configured.handle.url
+    gc = shared_configured.greenfield
+    url = shared_configured.handle.url
 
-    invoice = gc.create_invoice(configured.store_id, amount="1000", currency="sat")
+    invoice = gc.create_invoice(shared_configured.store_id, amount="1000", currency="sat")
     invoice_id = invoice["id"]
     bolt11 = (
         invoice.get("checkout", {})
@@ -177,7 +177,7 @@ def test_customers_view_renders_in_admin_ui(
     lnd_payer.pay_invoice_sync(bolt11, timeout=30)
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
-        if gc.get_invoice(configured.store_id, invoice_id).get("status") == "Settled":
+        if gc.get_invoice(shared_configured.store_id, invoice_id).get("status") == "Settled":
             break
         time.sleep(0.5)
     else:
@@ -194,7 +194,7 @@ def test_customers_view_renders_in_admin_ui(
     ctx = browser.new_context(viewport={"width": 1280, "height": 900})
     ctx.request.post(
         f"{url}/admin",
-        form={"action": "login", "username": "admin", "password": configured.admin_password},
+        form={"action": "login", "username": "admin", "password": shared_configured.admin_password},
     )
     page = ctx.new_page()
     page.goto(f"{url}/admin/customers", wait_until="networkidle")

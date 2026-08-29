@@ -34,10 +34,10 @@ def _login_to_stores_view(configured: ConfiguredPayserver, page) -> None:
 
 
 def test_create_store_dropdown_option_navigates_to_wizard(
-    configured: ConfiguredPayserver, page
+    shared_configured: ConfiguredPayserver, page
 ) -> None:
     """+ Create Store in the header store dropdown must land on the wizard."""
-    _login_to_stores_view(configured, page)
+    _login_to_stores_view(shared_configured, page)
 
     # Land on a non-dashboard view so the bug (relative URL resolving
     # against /admin/<view>) actually triggers. Dashboard happens to be
@@ -57,11 +57,11 @@ def test_create_store_dropdown_option_navigates_to_wizard(
 
 
 def test_create_store_empty_state_button_navigates_to_wizard(
-    configured: ConfiguredPayserver, page
+    shared_configured: ConfiguredPayserver, page
 ) -> None:
     """The empty-state "Create Store" button (shown when no store is
     selected on the stores view) must also land on the wizard."""
-    _login_to_stores_view(configured, page)
+    _login_to_stores_view(shared_configured, page)
 
     # The empty-state button lives inside #store-settings-empty, which is
     # display:none unless loadStoreSettings() decides there's no store.

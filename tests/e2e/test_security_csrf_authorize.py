@@ -41,12 +41,12 @@ def _login(s: requests.Session, base: str) -> None:
     assert r.status_code == 200, r.text
 
 
-def test_login_post_without_csrf_token_is_rejected(configured: ConfiguredPayserver) -> None:
+def test_login_post_without_csrf_token_is_rejected(shared_configured: ConfiguredPayserver) -> None:
     s = requests.Session()
     # Prime session so a SID exists (otherwise no CSRF token in $_SESSION yet).
-    s.get(f"{configured.handle.url}{AUTH_PATH}?applicationName=Test", timeout=15)
+    s.get(f"{shared_configured.handle.url}{AUTH_PATH}?applicationName=Test", timeout=15)
     r = s.post(
-        f"{configured.handle.url}{AUTH_PATH}?applicationName=Test",
+        f"{shared_configured.handle.url}{AUTH_PATH}?applicationName=Test",
         data={"action": "login", "username": "admin", "password": DEFAULT_ADMIN_PASSWORD},
         timeout=15,
         allow_redirects=False,
@@ -55,12 +55,12 @@ def test_login_post_without_csrf_token_is_rejected(configured: ConfiguredPayserv
     assert "Session expired" in r.text or "invalid" in r.text.lower()
 
 
-def test_login_post_with_valid_csrf_token_succeeds(configured: ConfiguredPayserver) -> None:
+def test_login_post_with_valid_csrf_token_succeeds(shared_configured: ConfiguredPayserver) -> None:
     s = requests.Session()
-    page = s.get(f"{configured.handle.url}{AUTH_PATH}?applicationName=Test", timeout=15)
+    page = s.get(f"{shared_configured.handle.url}{AUTH_PATH}?applicationName=Test", timeout=15)
     token = _csrf_from(page.text)
     r = s.post(
-        f"{configured.handle.url}{AUTH_PATH}?applicationName=Test",
+        f"{shared_configured.handle.url}{AUTH_PATH}?applicationName=Test",
         data={"action": "login", "username": "admin", "password": DEFAULT_ADMIN_PASSWORD,
               "csrf_token": token},
         timeout=15,
@@ -72,26 +72,26 @@ def test_login_post_with_valid_csrf_token_succeeds(configured: ConfiguredPayserv
 
 
 def test_approve_post_without_csrf_token_does_not_mint_key(
-    configured: ConfiguredPayserver,
+    shared_configured: ConfiguredPayserver,
 ) -> None:
     """The critical exploit path: malicious page forges an approve POST while
     admin is logged in. Without a CSRF token, no key should be created."""
     s = requests.Session()
-    _login(s, configured.handle.url)
+    _login(s, shared_configured.handle.url)
 
     # Count keys before — use the admin API client to query.
     from fixtures.api_client import AdminClient
-    admin = AdminClient(configured.handle.url, session=requests.Session())
+    admin = AdminClient(shared_configured.handle.url, session=requests.Session())
     admin.login(DEFAULT_ADMIN_PASSWORD)
-    keys_before = admin._post_action("get_api_keys", store_id=configured.store_id) if False else None
+    keys_before = admin._post_action("get_api_keys", store_id=shared_configured.store_id) if False else None
     # Simpler: list via the dashboard helper.
     # Actually, just attempt the unsafe POST and assert the response is 403.
 
     r = s.post(
-        f"{configured.handle.url}{AUTH_PATH}?applicationName=Test",
+        f"{shared_configured.handle.url}{AUTH_PATH}?applicationName=Test",
         data={
             "action": "approve",
-            "store_id": configured.store_id,
+            "store_id": shared_configured.store_id,
             "approved_permissions[]": "*",
         },
         timeout=15,
@@ -103,21 +103,21 @@ def test_approve_post_without_csrf_token_does_not_mint_key(
 
 
 def test_approve_post_with_valid_csrf_token_succeeds(
-    configured: ConfiguredPayserver,
+    shared_configured: ConfiguredPayserver,
 ) -> None:
     s = requests.Session()
-    _login(s, configured.handle.url)
+    _login(s, shared_configured.handle.url)
 
     # Fetch the approval page to learn its CSRF token.
-    page = s.get(f"{configured.handle.url}{AUTH_PATH}?applicationName=Test", timeout=15)
+    page = s.get(f"{shared_configured.handle.url}{AUTH_PATH}?applicationName=Test", timeout=15)
     token = _csrf_from(page.text)
 
     r = s.post(
-        f"{configured.handle.url}{AUTH_PATH}?applicationName=Test",
+        f"{shared_configured.handle.url}{AUTH_PATH}?applicationName=Test",
         data={
             "action": "approve",
             "csrf_token": token,
-            "store_id": configured.store_id,
+            "store_id": shared_configured.store_id,
             "approved_permissions[]": "btcpay.store.cancreateinvoice",
         },
         timeout=15,
@@ -129,12 +129,12 @@ def test_approve_post_with_valid_csrf_token_succeeds(
 
 
 def test_deny_post_without_csrf_token_is_rejected(
-    configured: ConfiguredPayserver,
+    shared_configured: ConfiguredPayserver,
 ) -> None:
     s = requests.Session()
-    _login(s, configured.handle.url)
+    _login(s, shared_configured.handle.url)
     r = s.post(
-        f"{configured.handle.url}{AUTH_PATH}?applicationName=Test",
+        f"{shared_configured.handle.url}{AUTH_PATH}?applicationName=Test",
         data={"action": "deny"},
         timeout=15,
         allow_redirects=False,

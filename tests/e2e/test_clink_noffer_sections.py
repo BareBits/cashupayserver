@@ -20,6 +20,7 @@ test_clink_noffer.py (back-compat path), which this change preserves.
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 
 import pytest
@@ -70,10 +71,10 @@ def _chain_rows(payserver, store_id: str) -> list[sqlite3.Row]:
 
 
 def test_split_lists_persist_ln_first_then_noffers(
-    configured_with_lnurlp: ConfiguredPayserver,
+    shared_configured_with_lnurlp: ConfiguredPayserver,
 ) -> None:
     # lnaddresses in the chain must pass the save-time LUD-21 gate.
-    configured = configured_with_lnurlp
+    configured = shared_configured_with_lnurlp
     admin, store_id = configured.admin, configured.store_id
     r = _post_split(
         admin, store_id,
@@ -94,18 +95,18 @@ def test_split_lists_persist_ln_first_then_noffers(
     assert rows[2]["supports_verify"] is None
 
 
-def test_noffers_only_chain(configured: ConfiguredPayserver) -> None:
-    admin, store_id = configured.admin, configured.store_id
+def test_noffers_only_chain(shared_configured: ConfiguredPayserver) -> None:
+    admin, store_id = shared_configured.admin, shared_configured.store_id
     r = _post_split(admin, store_id, ln=[], noffers=[REFERENCE_NOFFER])
     assert r.status_code == 200, r.text
-    rows = _chain_rows(configured.handle, store_id)
+    rows = _chain_rows(shared_configured.handle, store_id)
     assert len(rows) == 1, [dict(r) for r in rows]
     assert rows[0]["type"] == "noffer"
     assert rows[0]["address"] == REFERENCE_NOFFER
 
 
-def test_noffer_in_address_list_rejected(configured: ConfiguredPayserver) -> None:
-    admin, store_id = configured.admin, configured.store_id
+def test_noffer_in_address_list_rejected(shared_configured: ConfiguredPayserver) -> None:
+    admin, store_id = shared_configured.admin, shared_configured.store_id
     # A noffer declared as a lightning address must be rejected (the address
     # section is type-specific now).
     r = _post_split(admin, store_id, ln=[REFERENCE_NOFFER], noffers=[])
@@ -113,8 +114,8 @@ def test_noffer_in_address_list_rejected(configured: ConfiguredPayserver) -> Non
     assert "lightning address" in r.json().get("error", "").lower()
 
 
-def test_address_in_noffer_list_rejected(configured: ConfiguredPayserver) -> None:
-    admin, store_id = configured.admin, configured.store_id
+def test_address_in_noffer_list_rejected(shared_configured: ConfiguredPayserver) -> None:
+    admin, store_id = shared_configured.admin, shared_configured.store_id
     r = _post_split(admin, store_id, ln=[], noffers=["someone@example.test"])
     assert r.status_code == 400, r.text
     assert "noffer" in r.json().get("error", "").lower()
@@ -124,15 +125,22 @@ def test_address_in_noffer_list_rejected(configured: ConfiguredPayserver) -> Non
 
 
 @pytest.fixture
-def admin_page(configured: ConfiguredPayserver, browser):
-    """A logged-in admin browser page (cookie established via context.request)."""
+def admin_page(shared_configured: ConfiguredPayserver, browser):
+    """A logged-in admin browser page (cookie established via context.request).
+
+    On the shared server multiple stores exist and the dashboard defaults to
+    stores[0], so pin the UI to this test's own store before any navigation."""
     ctx = browser.new_context(viewport={"width": 1280, "height": 900})
+    ctx.add_init_script(
+        "window.localStorage.setItem('selectedStoreId', "
+        f"{json.dumps(shared_configured.store_id)});"
+    )
     ctx.request.post(
-        f"{configured.handle.url}/admin",
+        f"{shared_configured.handle.url}/admin",
         form={"action": "login", "username": "admin", "password": DEFAULT_ADMIN_PASSWORD},
     )
     page = ctx.new_page()
-    yield page, configured.handle.url
+    yield page, shared_configured.handle.url
     ctx.close()
 
 
@@ -170,7 +178,7 @@ def test_noffer_section_renders_below_addresses(admin_page) -> None:
     assert 'href="https://github.com/BareBits/electrum_clink"' in group_html
 
 
-def test_add_noffer_via_ui_persists(admin_page, configured: ConfiguredPayserver) -> None:
+def test_add_noffer_via_ui_persists(admin_page, shared_configured: ConfiguredPayserver) -> None:
     page, base = admin_page
     _goto_stores(page, base)
 
@@ -181,7 +189,7 @@ def test_add_noffer_via_ui_persists(admin_page, configured: ConfiguredPayserver)
     page.query_selector("#btn-save-lightning-payments").click()
     page.wait_for_timeout(1500)
 
-    rows = _chain_rows(configured.handle, configured.store_id)
+    rows = _chain_rows(shared_configured.handle, shared_configured.store_id)
     noffers = [dict(r) for r in rows if r["type"] == "noffer"]
     assert len(noffers) == 1, [dict(r) for r in rows]
     assert noffers[0]["address"] == REFERENCE_NOFFER

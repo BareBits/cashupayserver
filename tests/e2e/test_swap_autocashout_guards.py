@@ -28,11 +28,11 @@ FORCE_ON = 1
 FORCE_SWAP = 1
 
 
-def _post(configured: ConfiguredPayserver, action: str, **fields) -> requests.Response:
-    return configured.admin.s.post(
-        f"{configured.handle.url}/admin",
+def _post(shared_configured: ConfiguredPayserver, action: str, **fields) -> requests.Response:
+    return shared_configured.admin.s.post(
+        f"{shared_configured.handle.url}/admin",
         data={"action": action, **fields},
-        headers={"X-CSRF-Token": configured.admin.csrf_token},
+        headers={"X-CSRF-Token": shared_configured.admin.csrf_token},
         timeout=15,
     )
 
@@ -68,10 +68,10 @@ def _store_swap_flag(db_path: str, store_id: str) -> int | None:
 # ---------- refusal guards (no on-chain configured) ----------
 
 
-def test_force_store_swap_without_onchain_is_rejected(configured: ConfiguredPayserver) -> None:
+def test_force_store_swap_without_onchain_is_rejected(shared_configured: ConfiguredPayserver) -> None:
     r = _post(
-        configured, "save_store_swaps",
-        store_id=configured.store_id,
+        shared_configured, "save_store_swaps",
+        store_id=shared_configured.store_id,
         enabled="1",
         provider_order="boltz",
     )
@@ -79,10 +79,10 @@ def test_force_store_swap_without_onchain_is_rejected(configured: ConfiguredPays
     assert "on-chain" in r.json()["error"].lower()
 
 
-def test_onchain_automelt_without_onchain_is_rejected(configured: ConfiguredPayserver) -> None:
+def test_onchain_automelt_without_onchain_is_rejected(shared_configured: ConfiguredPayserver) -> None:
     r = _post(
-        configured, "save_auto_melt",
-        store_id=configured.store_id,
+        shared_configured, "save_auto_melt",
+        store_id=shared_configured.store_id,
         enabled="1",
         threshold="2000",
         mode_override=str(FORCE_SWAP),
@@ -94,12 +94,12 @@ def test_onchain_automelt_without_onchain_is_rejected(configured: ConfiguredPays
 # ---------- legacy tri-state values are dead ----------
 
 
-def test_automelt_rejects_legacy_inherit_mode(configured: ConfiguredPayserver) -> None:
+def test_automelt_rejects_legacy_inherit_mode(shared_configured: ConfiguredPayserver) -> None:
     # '-1' meant "inherit the site default"; the site default is gone, so the
     # value is now a 400 rather than being silently normalized on write.
     r = _post(
-        configured, "save_auto_melt",
-        store_id=configured.store_id,
+        shared_configured, "save_auto_melt",
+        store_id=shared_configured.store_id,
         enabled="1",
         threshold="2000",
         mode_override="-1",
@@ -108,10 +108,10 @@ def test_automelt_rejects_legacy_inherit_mode(configured: ConfiguredPayserver) -
     assert "mode" in r.json()["error"].lower()
 
 
-def test_store_swaps_rejects_legacy_inherit_value(configured: ConfiguredPayserver) -> None:
+def test_store_swaps_rejects_legacy_inherit_value(shared_configured: ConfiguredPayserver) -> None:
     r = _post(
-        configured, "save_store_swaps",
-        store_id=configured.store_id,
+        shared_configured, "save_store_swaps",
+        store_id=shared_configured.store_id,
         enabled="-1",
         provider_order="boltz",
     )
@@ -122,22 +122,22 @@ def test_store_swaps_rejects_legacy_inherit_value(configured: ConfiguredPayserve
 # ---------- positive: on-chain auto-cashout forces the store swaps flag ----------
 
 
-def test_onchain_automelt_forces_store_swap_flag(configured: ConfiguredPayserver) -> None:
-    _set_static_onchain(configured.handle.db_path, configured.store_id)
+def test_onchain_automelt_forces_store_swap_flag(shared_configured: ConfiguredPayserver) -> None:
+    _set_static_onchain(shared_configured.handle.db_path, shared_configured.store_id)
 
     # The store flag starts non-forced (legacy -1 default on a fresh store).
-    assert _store_swap_flag(configured.handle.db_path, configured.store_id) != FORCE_ON
+    assert _store_swap_flag(shared_configured.handle.db_path, shared_configured.store_id) != FORCE_ON
 
     # There is no site-wide switch any more: the old site-settings actions
     # fall through to the unknown-action handler.
     for dead_action in ("get_swap_settings", "save_swap_settings"):
-        gone = _post(configured, dead_action)
+        gone = _post(shared_configured, dead_action)
         assert gone.status_code == 400, (dead_action, gone.status_code, gone.text[:200])
         assert gone.json().get("error") == "Unknown action", (dead_action, gone.text[:200])
 
     r = _post(
-        configured, "save_auto_melt",
-        store_id=configured.store_id,
+        shared_configured, "save_auto_melt",
+        store_id=shared_configured.store_id,
         enabled="1",
         threshold="2000",
         mode_override=str(FORCE_SWAP),
@@ -150,29 +150,29 @@ def test_onchain_automelt_forces_store_swap_flag(configured: ConfiguredPayserver
     assert "addresses" not in body, body
 
     # The store's swaps flag is now forced-on — the only flag there is.
-    assert _store_swap_flag(configured.handle.db_path, configured.store_id) == FORCE_ON
+    assert _store_swap_flag(shared_configured.handle.db_path, shared_configured.store_id) == FORCE_ON
 
 
-def test_force_store_swap_with_onchain_succeeds(configured: ConfiguredPayserver) -> None:
-    _set_static_onchain(configured.handle.db_path, configured.store_id)
+def test_force_store_swap_with_onchain_succeeds(shared_configured: ConfiguredPayserver) -> None:
+    _set_static_onchain(shared_configured.handle.db_path, shared_configured.store_id)
     r = _post(
-        configured, "save_store_swaps",
-        store_id=configured.store_id,
+        shared_configured, "save_store_swaps",
+        store_id=shared_configured.store_id,
         enabled="1",
         provider_order="boltz",
     )
     assert r.ok, r.text
     assert r.json()["success"] is True
-    assert _store_swap_flag(configured.handle.db_path, configured.store_id) == FORCE_ON
+    assert _store_swap_flag(shared_configured.handle.db_path, shared_configured.store_id) == FORCE_ON
 
 
-def test_enabling_store_swaps_requires_a_provider(configured: ConfiguredPayserver) -> None:
+def test_enabling_store_swaps_requires_a_provider(shared_configured: ConfiguredPayserver) -> None:
     # enabled=1 with an empty provider_order can never produce a working swap
     # rail, so the save is refused rather than persisting a dead setting.
-    _set_static_onchain(configured.handle.db_path, configured.store_id)
+    _set_static_onchain(shared_configured.handle.db_path, shared_configured.store_id)
     r = _post(
-        configured, "save_store_swaps",
-        store_id=configured.store_id,
+        shared_configured, "save_store_swaps",
+        store_id=shared_configured.store_id,
         enabled="1",
         provider_order="",
     )

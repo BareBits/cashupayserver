@@ -27,8 +27,14 @@ def _login(configured: ConfiguredPayserver, page) -> None:
     )
 
 
-def test_create_product_and_cart_checkout(configured: ConfiguredPayserver, page) -> None:
+def test_create_product_and_cart_checkout(shared_configured: ConfiguredPayserver, page) -> None:
+    configured = shared_configured
     _login(configured, page)
+
+    # Pin the header selector to this test's own store: the shared server
+    # auto-selects its first store, and the product catalog, cart and checkout
+    # all operate on currentStoreId.
+    page.select_option("#store-select", configured.store_id)
 
     # --- Create a product via the Products view ---
     page.click('[data-view="products"]')

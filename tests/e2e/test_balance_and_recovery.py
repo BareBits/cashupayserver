@@ -1,4 +1,11 @@
-"""Local proof-based balance and proof persistence after settlement."""
+"""Local proof-based balance and proof persistence after settlement.
+
+The dashboard balance sums cashu_proofs by wallet_id = sha256(mint:unit) —
+it is per MINT, not per store, so on the shared server every store's settles
+pool into one number. Balance assertions are therefore deltas around this
+test's own settles (tests in a module run sequentially, so the delta is
+exact), never absolute totals.
+"""
 from __future__ import annotations
 
 import time
@@ -10,17 +17,27 @@ from fixtures.lnd import LndHandle
 INVOICE_AMOUNT_SAT = 1500
 
 
-def _settle_an_invoice(configured: ConfiguredPayserver, lnd_payer: LndHandle, amount_sat: int) -> str:
+def _wallet_balance(shared_configured: ConfiguredPayserver) -> int:
+    r = shared_configured.admin.s.get(
+        f"{shared_configured.handle.url}/admin?api=dashboard&store_id={shared_configured.store_id}",
+        timeout=15,
+    )
+    r.raise_for_status()
+    # Local balance reads from cached proofs only — no mint contact required.
+    return r.json()["balance"]
+
+
+def _settle_an_invoice(shared_configured: ConfiguredPayserver, lnd_payer: LndHandle, amount_sat: int) -> str:
     """Create + pay + wait for settle. Returns invoice ID."""
-    invoice = configured.greenfield.create_invoice(
-        configured.store_id, amount=str(amount_sat), currency="sat"
+    invoice = shared_configured.greenfield.create_invoice(
+        shared_configured.store_id, amount=str(amount_sat), currency="sat"
     )
     bolt11 = invoice["checkout"]["paymentMethods"]["BTC-LightningNetwork"]["destination"]
     lnd_payer.pay_invoice_sync(bolt11, timeout=30)
 
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
-        got = configured.greenfield.get_invoice(configured.store_id, invoice["id"])
+        got = shared_configured.greenfield.get_invoice(shared_configured.store_id, invoice["id"])
         if got["status"] == "Settled":
             return invoice["id"]
         time.sleep(0.3)
@@ -28,28 +45,21 @@ def _settle_an_invoice(configured: ConfiguredPayserver, lnd_payer: LndHandle, am
 
 
 def test_local_balance_matches_settled_amount(
-    configured: ConfiguredPayserver,
+    shared_configured: ConfiguredPayserver,
     lnd_payer: LndHandle,
 ) -> None:
-    _settle_an_invoice(configured, lnd_payer, INVOICE_AMOUNT_SAT)
-
-    r = configured.admin.s.get(
-        f"{configured.handle.url}/admin?api=dashboard&store_id={configured.store_id}",
-        timeout=15,
-    )
-    r.raise_for_status()
-    body = r.json()
-    # Local balance reads from cached proofs only — no mint contact required.
-    assert body["balance"] == INVOICE_AMOUNT_SAT, body
+    before = _wallet_balance(shared_configured)
+    _settle_an_invoice(shared_configured, lnd_payer, INVOICE_AMOUNT_SAT)
+    assert _wallet_balance(shared_configured) - before == INVOICE_AMOUNT_SAT
 
 
 def test_proofs_persisted_locally_after_settle(
-    configured: ConfiguredPayserver,
+    shared_configured: ConfiguredPayserver,
     lnd_payer: LndHandle,
 ) -> None:
-    _settle_an_invoice(configured, lnd_payer, INVOICE_AMOUNT_SAT)
+    _settle_an_invoice(shared_configured, lnd_payer, INVOICE_AMOUNT_SAT)
 
-    with configured.handle.db() as db:
+    with shared_configured.handle.db() as db:
         proof_tables = db.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE '%proof%'"
         ).fetchall()
@@ -67,15 +77,10 @@ def test_proofs_persisted_locally_after_settle(
 
 
 def test_subsequent_invoice_adds_to_balance(
-    configured: ConfiguredPayserver,
+    shared_configured: ConfiguredPayserver,
     lnd_payer: LndHandle,
 ) -> None:
-    _settle_an_invoice(configured, lnd_payer, 1000)
-    _settle_an_invoice(configured, lnd_payer, 500)
-
-    r = configured.admin.s.get(
-        f"{configured.handle.url}/admin?api=dashboard&store_id={configured.store_id}",
-        timeout=15,
-    )
-    r.raise_for_status()
-    assert r.json()["balance"] == 1500
+    before = _wallet_balance(shared_configured)
+    _settle_an_invoice(shared_configured, lnd_payer, 1000)
+    _settle_an_invoice(shared_configured, lnd_payer, 500)
+    assert _wallet_balance(shared_configured) - before == 1500

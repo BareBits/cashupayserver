@@ -13,7 +13,16 @@ from __future__ import annotations
 
 import requests
 
-from conftest import ConfiguredPayserver, DEFAULT_ADMIN_PASSWORD
+from conftest import ConfiguredPayserver
+
+# Shared-server note: the offline-token tests below deliberately stay on the
+# function-scoped `configured` fixture. They all present the SAME NUT-12 vector
+# token and insert the SAME fixed (wallet_id, keyset_id) row into
+# cashu_keyset_keys — and both cashu_offline_locks (y TEXT PRIMARY KEY) and
+# cashu_keyset_keys (PRIMARY KEY(wallet_id, keyset_id)) are server-global
+# tables, so on one shared instance the first accepting test's replay lock and
+# cached-keys row would poison every later test. Only the two store-scoped
+# tests at the bottom use the shared server.
 
 # Dead mint — nothing listens on 127.0.0.1:1, so the server's swap attempt fails
 # fast with a network error, triggering the offline path.
@@ -217,15 +226,15 @@ def test_offline_token_underpays_invoice_rejected(configured: ConfiguredPayserve
     assert "less than the invoice amount" in resp.json()["error"].lower()
 
 
-def test_checkout_shows_cashu_method(configured: ConfiguredPayserver) -> None:
+def test_checkout_shows_cashu_method(shared_configured: ConfiguredPayserver) -> None:
     """A New cashu invoice's checkout page offers the Cashu pay option (the QR
     request + token paste box) so it can be paid by presenting a token.
 
     The Cashu rail is gated on the store opting into offline acceptance (see
     payment.php, commit "gate Cashu on offline"), so enable it on the live-mint
     store before rendering the checkout."""
-    handle = configured.handle
-    store_id = configured.store_id  # live-mint store from the fixture
+    handle = shared_configured.handle
+    store_id = shared_configured.store_id  # live-mint per-test store from the fixture
     with handle.db() as conn:
         conn.execute(
             "UPDATE stores SET offline_cashu_enabled = 1, offline_cashu_policy = 'dleq'"
@@ -241,18 +250,18 @@ def test_checkout_shows_cashu_method(configured: ConfiguredPayserver) -> None:
     assert "creq" in html  # the serialized NUT-18 request string
 
 
-def test_offline_settings_ui_roundtrip(configured: ConfiguredPayserver, browser) -> None:
+def test_offline_settings_ui_roundtrip(shared_configured: ConfiguredPayserver, browser) -> None:
     """In a real logged-in admin browser, exercise the offline-cashu settings
     and allowlist endpoints (auth + CSRF go through the live admin JS) and
     confirm the settings card shipped in the store-settings UI."""
     ctx = browser.new_context(viewport={"width": 1280, "height": 900})
     ctx.request.post(
-        f"{configured.handle.url}/admin",
-        form={"action": "login", "username": "admin", "password": DEFAULT_ADMIN_PASSWORD},
+        f"{shared_configured.handle.url}/admin",
+        form={"action": "login", "username": "admin", "password": shared_configured.admin_password},
     )
     page = ctx.new_page()
-    base = configured.handle.url
-    sid = configured.store_id
+    base = shared_configured.handle.url
+    sid = shared_configured.store_id
     try:
         page.goto(f"{base}/admin/stores", wait_until="networkidle")
         page.wait_for_timeout(800)

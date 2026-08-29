@@ -34,6 +34,10 @@ def _login_to_stores(page, configured: ConfiguredPayserver) -> None:
     page.fill("#password-input", configured.admin_password)
     page.click("#password-submit")
     page.wait_for_selector("#app", state="visible")
+    # Pin the header selector to this test's own store: the shared server
+    # auto-selects its first store, and these tests rely on the selected
+    # store having no xpub yet (fresh per-test store guarantees that).
+    page.select_option("#store-select", configured.store_id)
     page.locator('.nav-item[data-view="stores"]').click()
     page.wait_for_selector("#onchain-xpub", state="visible")
 
@@ -54,8 +58,8 @@ def _fulfil_500_for(page, action: str) -> None:
     page.route("**/admin*", handler)
 
 
-def test_save_onchain_surfaces_non_json_500(configured: ConfiguredPayserver, page) -> None:
-    _login_to_stores(page, configured)
+def test_save_onchain_surfaces_non_json_500(shared_configured: ConfiguredPayserver, page) -> None:
+    _login_to_stores(page, shared_configured)
     _fulfil_500_for(page, "save_onchain")
 
     # Fresh store has no xpub yet, so no confirm modal — the POST fires directly.
@@ -68,8 +72,8 @@ def test_save_onchain_surfaces_non_json_500(configured: ConfiguredPayserver, pag
     assert "Save failed" in text, f"expected a visible failure, got: {text!r}"
 
 
-def test_validate_preview_surfaces_non_json_500(configured: ConfiguredPayserver, page) -> None:
-    _login_to_stores(page, configured)
+def test_validate_preview_surfaces_non_json_500(shared_configured: ConfiguredPayserver, page) -> None:
+    _login_to_stores(page, shared_configured)
     _fulfil_500_for(page, "validate_onchain_xpub")
 
     page.fill("#onchain-xpub", _MAINNET_XPUB)

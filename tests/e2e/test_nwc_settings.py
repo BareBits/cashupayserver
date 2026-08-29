@@ -39,8 +39,11 @@ DEAD_NWC = (
 )
 
 
-@pytest.fixture
+@pytest.fixture(scope="module")
 def nwc_stack(lnd_mint: LndHandle, channels: None) -> Iterator[NwcStack]:
+    """Module-scoped: generic infrastructure (each test wires its own store
+    to it); the save-time probes are keyed per invoice, so wallet/relay state
+    can't leak between tests."""
     workdir = SESSION_TMP / f"nwc-settings-{int(time.time())}"
     workdir.mkdir(parents=True, exist_ok=True)
     stack = start_nwc_stack(
@@ -69,18 +72,26 @@ def _post_save(admin: AdminClient, store_id: str, data: list[tuple[str, str]],
     return r.status_code, parsed
 
 
-def _chain(payserver) -> list[tuple[str, str, int]]:
+def _chain(payserver, store_id: str | None = None) -> list[tuple[str, str, int]]:
+    """The persisted destination chain. Pass ``store_id`` on a shared server
+    (multiple stores exist there); ``None`` reads all rows — only valid on a
+    dedicated single-store instance (the wizard test)."""
+    query = "SELECT address, type, position FROM store_ln_addresses"
+    params: tuple = ()
+    if store_id is not None:
+        query += " WHERE store_id = ?"
+        params = (store_id,)
+    query += " ORDER BY position ASC"
     with sqlite3.connect(str(payserver.data_dir / "cashupay.sqlite")) as conn:
         conn.row_factory = sqlite3.Row
-        rows = conn.execute(
-            "SELECT address, type, position FROM store_ln_addresses ORDER BY position ASC"
-        ).fetchall()
+        rows = conn.execute(query, params).fetchall()
     return [(r["type"], r["address"], r["position"]) for r in rows]
 
 
 def test_three_list_chain_order_and_keep_ref_round_trip(
-    configured: ConfiguredPayserver, nwc_stack: NwcStack
+    shared_configured: ConfiguredPayserver, nwc_stack: NwcStack
 ) -> None:
+    configured = shared_configured
     admin = configured.admin
     store_id = configured.store_id
     payserver = configured.handle
@@ -91,7 +102,7 @@ def test_three_list_chain_order_and_keep_ref_round_trip(
     # (The LN address probe needs a LUD-21 host; use the noffer-free contract
     # here — address handling is covered by the lnurlp-backed tests.)
     _status, save = _post_save(admin, store_id, [("nwc[]", uri), ("noffers[]", REFERENCE_NOFFER)])
-    chain = _chain(payserver)
+    chain = _chain(payserver, store_id)
     assert [(t, p) for t, _a, p in chain] == [("nwc", 0), ("noffer", 1)], chain
     assert chain[0][1] == uri, "raw URI stored server-side"
     assert secret not in str(save), "save response leaks no secret"
@@ -107,17 +118,18 @@ def test_three_list_chain_order_and_keep_ref_round_trip(
     assert ref.startswith("keep:"), nwc_rows
 
     _status, _save2 = _post_save(admin, store_id, [("nwc[]", ref)])
-    chain2 = _chain(payserver)
+    chain2 = _chain(payserver, store_id)
     assert chain2 == [("nwc", uri, 0)], "keep ref preserved the stored URI unchanged"
 
     # Dropping the entry clears it.
     _post_save(admin, store_id, [("noffers[]", REFERENCE_NOFFER)])
-    assert [(t, p) for t, _a, p in _chain(payserver)] == [("noffer", 0)]
+    assert [(t, p) for t, _a, p in _chain(payserver, store_id)] == [("noffer", 0)]
 
 
 def test_rejections_are_masked_and_blocking(
-    configured: ConfiguredPayserver
+    shared_configured: ConfiguredPayserver
 ) -> None:
+    configured = shared_configured
     admin = configured.admin
     store_id = configured.store_id
     payserver = configured.handle
@@ -131,14 +143,14 @@ def test_rejections_are_masked_and_blocking(
     )
     assert status == 400, body
     assert secret not in str(body), "error must not echo the (secret-bearing) paste"
-    assert _chain(payserver) == [], "nothing persisted on rejection"
+    assert _chain(payserver, store_id) == [], "nothing persisted on rejection"
 
     # Structurally valid but dead-relay connection: blocked by the probe gate.
     status, body = _post_save(admin, store_id, [("nwc[]", DEAD_NWC)], expect_ok=False)
     assert status == 400, body
     assert "connection test" in body.get("error", ""), body
     assert "cd" * 32 not in str(body), "gate error leaks no secret"
-    assert _chain(payserver) == []
+    assert _chain(payserver, store_id) == []
 
     # Forged keep ref: rejected.
     status, body = _post_save(admin, store_id, [("nwc[]", "keep:424242")], expect_ok=False)
@@ -146,8 +158,9 @@ def test_rejections_are_masked_and_blocking(
 
 
 def test_spend_capable_connection_warns_but_saves(
-    configured: ConfiguredPayserver, lnd_mint: LndHandle, channels: None
+    shared_configured: ConfiguredPayserver, lnd_mint: LndHandle, channels: None
 ) -> None:
+    configured = shared_configured
     workdir = SESSION_TMP / f"nwc-spendy-{int(time.time())}"
     workdir.mkdir(parents=True, exist_ok=True)
     stack = start_nwc_stack(
@@ -160,7 +173,7 @@ def test_spend_capable_connection_warns_but_saves(
         results = [a for a in save.get("addresses", []) if a["type"] == "nwc"]
         assert results and results[0].get("warning"), save
         assert "pay_invoice" in results[0]["warning"], results
-        assert _chain(configured.handle)[0][0] == "nwc", "warned but saved"
+        assert _chain(configured.handle, configured.store_id)[0][0] == "nwc", "warned but saved"
     finally:
         stop_nwc_stack(stack)
 

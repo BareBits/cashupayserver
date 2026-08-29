@@ -8,17 +8,17 @@ from fixtures.webhook_sink import WebhookSink
 
 
 def test_multiple_webhooks_each_receive_event(
-    configured: ConfiguredPayserver,
+    shared_configured: ConfiguredPayserver,
     webhook_sink: WebhookSink,
 ) -> None:
-    configured.greenfield.create_webhook(
-        configured.store_id, webhook_sink.endpoint("alpha"), secret="a"
+    shared_configured.greenfield.create_webhook(
+        shared_configured.store_id, webhook_sink.endpoint("alpha"), secret="a"
     )
-    configured.greenfield.create_webhook(
-        configured.store_id, webhook_sink.endpoint("beta"), secret="b"
+    shared_configured.greenfield.create_webhook(
+        shared_configured.store_id, webhook_sink.endpoint("beta"), secret="b"
     )
 
-    configured.greenfield.create_invoice(configured.store_id, amount="500", currency="sat")
+    shared_configured.greenfield.create_invoice(shared_configured.store_id, amount="500", currency="sat")
 
     alpha = webhook_sink.wait_for("/hook/alpha", count=1, timeout_s=15)
     beta = webhook_sink.wait_for("/hook/beta", count=1, timeout_s=15)
@@ -28,18 +28,18 @@ def test_multiple_webhooks_each_receive_event(
 
 
 def test_event_filter_only_delivers_subscribed_events(
-    configured: ConfiguredPayserver,
+    shared_configured: ConfiguredPayserver,
     webhook_sink: WebhookSink,
 ) -> None:
     """A webhook subscribed only to InvoiceSettled should NOT receive InvoiceCreated."""
-    configured.greenfield.create_webhook(
-        configured.store_id,
+    shared_configured.greenfield.create_webhook(
+        shared_configured.store_id,
         webhook_sink.endpoint("settled-only"),
         secret="x",
         authorized_events={"specificEvents": ["InvoiceSettled"]},
     )
 
-    configured.greenfield.create_invoice(configured.store_id, amount="500", currency="sat")
+    shared_configured.greenfield.create_invoice(shared_configured.store_id, amount="500", currency="sat")
 
     # Brief wait — if the filter is wrong, an InvoiceCreated webhook would land.
     import time
@@ -50,18 +50,18 @@ def test_event_filter_only_delivers_subscribed_events(
 
 
 def test_webhook_delivery_logged_in_database(
-    configured: ConfiguredPayserver,
+    shared_configured: ConfiguredPayserver,
     webhook_sink: WebhookSink,
 ) -> None:
     """Each delivery attempt should create a row in webhook_deliveries."""
-    configured.greenfield.create_webhook(
-        configured.store_id, webhook_sink.endpoint("logged"), secret="x"
+    shared_configured.greenfield.create_webhook(
+        shared_configured.store_id, webhook_sink.endpoint("logged"), secret="x"
     )
-    invoice = configured.greenfield.create_invoice(configured.store_id, amount="500", currency="sat")
+    invoice = shared_configured.greenfield.create_invoice(shared_configured.store_id, amount="500", currency="sat")
 
     webhook_sink.wait_for("/hook/logged", count=1, timeout_s=15)
 
-    with configured.handle.db() as db:
+    with shared_configured.handle.db() as db:
         deliveries = db.execute(
             "SELECT event_type, status_code, invoice_id FROM webhook_deliveries WHERE invoice_id = ?",
             (invoice["id"],),
@@ -72,7 +72,7 @@ def test_webhook_delivery_logged_in_database(
 
 
 def test_webhook_retried_on_5xx_response(
-    configured: ConfiguredPayserver,
+    shared_configured: ConfiguredPayserver,
     webhook_sink: WebhookSink,
 ) -> None:
     """A 5xx response should re-queue the delivery; a later cron drain retries it.
@@ -85,10 +85,10 @@ def test_webhook_retried_on_5xx_response(
     import time
 
     webhook_sink.force_response("/hook/retry", 503)
-    configured.greenfield.create_webhook(
-        configured.store_id, webhook_sink.endpoint("retry"), secret="x"
+    shared_configured.greenfield.create_webhook(
+        shared_configured.store_id, webhook_sink.endpoint("retry"), secret="x"
     )
-    configured.greenfield.create_invoice(configured.store_id, amount="500", currency="sat")
+    shared_configured.greenfield.create_invoice(shared_configured.store_id, amount="500", currency="sat")
 
     # First attempt (fails with 503).
     webhook_sink.wait_for("/hook/retry", count=1, timeout_s=15)
@@ -98,7 +98,7 @@ def test_webhook_retried_on_5xx_response(
     while time.time() < deadline:
         if len(webhook_sink.by_path("/hook/retry")) >= 2:
             break
-        configured.handle.trigger_cron()
+        shared_configured.handle.trigger_cron()
         time.sleep(3)
 
     captured = webhook_sink.by_path("/hook/retry")
@@ -109,7 +109,7 @@ def test_webhook_retried_on_5xx_response(
     # test stays fast; this exercises the drain's success path on a recovered
     # endpoint.
     webhook_sink.force_response("/hook/retry", 200)
-    with configured.handle.db() as db:
+    with shared_configured.handle.db() as db:
         db.execute(
             "UPDATE webhook_deliveries SET next_retry_at = 0 "
             "WHERE event_type = 'InvoiceCreated' AND status = 'pending'"
@@ -117,8 +117,8 @@ def test_webhook_retried_on_5xx_response(
     deadline = time.time() + 30
     delivered = False
     while time.time() < deadline:
-        configured.handle.trigger_cron()
-        with configured.handle.db() as db:
+        shared_configured.handle.trigger_cron()
+        with shared_configured.handle.db() as db:
             row = db.execute(
                 "SELECT status FROM webhook_deliveries "
                 "WHERE event_type = 'InvoiceCreated' AND status = 'delivered' LIMIT 1"

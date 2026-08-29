@@ -15,19 +15,22 @@ import json
 
 import pytest
 
-from conftest import ConfiguredPayserver, DEFAULT_ADMIN_PASSWORD
+from conftest import ConfiguredPayserver
 
 
 @pytest.fixture
-def admin_page(configured: ConfiguredPayserver, browser):
-    """A logged-in admin browser page with downloads enabled."""
+def admin_page(shared_server: ConfiguredPayserver, browser):
+    """A logged-in admin browser page with downloads enabled.
+
+    The diagnostics export is read-only (nothing is saved server-side), so
+    these tests run against the module-scoped shared server directly."""
     ctx = browser.new_context(viewport={"width": 1280, "height": 900}, accept_downloads=True)
     ctx.request.post(
-        f"{configured.handle.url}/admin",
-        form={"action": "login", "username": "admin", "password": DEFAULT_ADMIN_PASSWORD},
+        f"{shared_server.handle.url}/admin",
+        form={"action": "login", "username": "admin", "password": shared_server.admin_password},
     )
     page = ctx.new_page()
-    yield page, configured.handle.url
+    yield page, shared_server.handle.url
     ctx.close()
 
 

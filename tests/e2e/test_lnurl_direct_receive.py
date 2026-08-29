@@ -237,13 +237,13 @@ def _poll_payment_page(payserver: PayserverHandle, invoice_id: str) -> dict:
 
 
 def test_lnurl_direct_receive_happy_path(
-    configured_with_lnurlp: ConfiguredPayserver,
+    shared_configured_with_lnurlp: ConfiguredPayserver,
     lnd_mint: LndHandle,
-    lnurlp_server: LnurlpServer,
+    lnurlp_server_shared: LnurlpServer,
 ) -> None:
     """A LUD-21-enabled LN address receives the customer payment directly;
     the cashupayserver detects settlement via the verify URL."""
-    configured = configured_with_lnurlp
+    configured = shared_configured_with_lnurlp
 
     # 1. Save the auto-melt LN address. The save_lightning_payments handler
     #    probes the mock LNURL host (which advertises a verify URL via
@@ -277,7 +277,7 @@ def test_lnurl_direct_receive_happy_path(
         f"expected lnaddress rail, got payment_rail={row['payment_rail']!r}"
     )
     assert row["lnurl_verify_url"], "verify URL should be populated"
-    assert lnurlp_server.base_url in row["lnurl_verify_url"], (
+    assert lnurlp_server_shared.base_url in row["lnurl_verify_url"], (
         f"verify URL should point at the mock host: {row['lnurl_verify_url']}"
     )
     assert row["lnurl_override_reason"] is None, "no override should fire when fees=0"
@@ -335,14 +335,14 @@ def test_lnurl_direct_receive_happy_path(
 
 
 def test_lnurl_direct_receive_without_auto_cashout(
-    configured_with_lnurlp: ConfiguredPayserver,
-    lnurlp_server: LnurlpServer,
+    shared_configured_with_lnurlp: ConfiguredPayserver,
+    lnurlp_server_shared: LnurlpServer,
 ) -> None:
     """LUD-21 direct-receive must engage at invoice creation even when the
     auto-cashout (threshold-melt) toggle is OFF — configuring a destination is
     enough. Regression guard for the decoupling fix; mirrors the noffer case in
     test_clink_noffer_receive.py."""
-    configured = configured_with_lnurlp
+    configured = shared_configured_with_lnurlp
 
     save_result = _enable_auto_melt(configured, enabled="0")
     assert save_result.get("success") is True, save_result
@@ -395,7 +395,12 @@ def test_fee_redirect_lightning_claims_whole_invoice(
     largest owed fee is the dev fee; its LNURL resolves through the mock host,
     so the invoice lands on the lnaddress rail tagged fee_redirect_note=DEV_FEE.
     Paying it settles the invoice and records a via='redirect' melts credit —
-    the funds went to the fee payee, not the merchant."""
+    the funds went to the fee payee, not the merchant.
+
+    Stays on the function-scoped `configured_with_lnurlp` (not migrated to the
+    shared-server fixtures): _seed_fee_revenue rewrites the GLOBAL
+    fee_tracking_start_at config row, which would leak into every other store
+    on a shared instance."""
     configured = configured_with_lnurlp
 
     save_result = _enable_auto_melt(configured)
