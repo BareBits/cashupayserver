@@ -43,7 +43,7 @@ from typing import Any
 import urllib.request
 import urllib.error
 
-from . import binaries
+from . import backend, binaries
 from .boltz_regtest import BoltzRegtestHandle
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -394,12 +394,12 @@ def setup_payserver(workdir: Path, vpub: str, boltz_api_url: str,
         cur = conn.cursor()
         kvs = [
             ("setup_complete", json.dumps(True)),
-            # PHP's built-in server treats /router.php as a real file and
-            # bypasses our router_wrapper.php (which is the only way
-            # CASHUPAY_DATA_DIR gets defined). Using direct URLs routes
-            # everything through the wrapper. The setup wizard normally
-            # detects this; we skip the wizard, so set it explicitly.
-            ("url_mode", json.dumps("direct")),
+            # We skip the wizard, so pin the url_mode its probe would have
+            # detected on the active backend (see fixtures.backend): 'direct'
+            # under php -S — where /router.php is a real file that bypasses
+            # the router wrapper and its CASHUPAY_DATA_DIR define — and
+            # 'clean' under the real Apache/nginx front controllers.
+            ("url_mode", json.dumps(backend.default_url_mode())),
             # swaps_boltz_regtest_url is still a live config key (dev/test
             # knob); the other swap settings moved to stores columns below.
             ("swaps_boltz_regtest_url", json.dumps(boltz_api_url)),
@@ -848,7 +848,7 @@ def setup_payserver_for_sweep(workdir: Path, vpub: str, mint_url: str,
         cur = conn.cursor()
         kvs = [
             ("setup_complete", json.dumps(True)),
-            ("url_mode", json.dumps("direct")),
+            ("url_mode", json.dumps(backend.default_url_mode())),
             # swaps_boltz_regtest_url is still a live config key (dev/test
             # knob); every other swap / cashout-mode setting is per-store now.
             ("swaps_boltz_regtest_url", json.dumps(boltz_api_url)),

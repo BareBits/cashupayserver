@@ -59,10 +59,47 @@ from fixtures.wordpress import (  # noqa: E402
     stop_wordpress,
 )
 
+from fixtures import webserver  # noqa: E402
+
 DEFAULT_ADMIN_PASSWORD = "test-admin-pw-1234"
 DEFAULT_STORE_NAME = "Test Store"
 
 SESSION_TMP = TESTS_DIR / ".tmp"
+
+
+# ---------------------------------------------------------------------------
+# Serving backend (CASHUPAY_TEST_BACKEND=phps|apache|nginx, default phps)
+
+def pytest_report_header(config) -> str:
+    return f"serving backend: {webserver.current_backend()} (CASHUPAY_TEST_BACKEND)"
+
+
+def pytest_collection_modifyitems(config, items) -> None:
+    backend = webserver.current_backend()
+    if backend != "phps":
+        reason = webserver.docker_unavailable_reason()
+        if reason is not None:
+            skip_all = pytest.mark.skip(
+                reason=f"CASHUPAY_TEST_BACKEND={backend} needs docker: {reason}"
+            )
+            for item in items:
+                item.add_marker(skip_all)
+            return
+        for item in items:
+            if item.get_closest_marker("phps_only") is not None:
+                item.add_marker(
+                    pytest.mark.skip(
+                        reason=f"phps_only test on the {backend} backend"
+                    )
+                )
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _webserver_session_cleanup() -> Iterator[None]:
+    """Remove any containers this session's serving backend leaves behind
+    (per-test stop() already handles the common case)."""
+    yield
+    webserver.cleanup_session_containers()
 
 
 @pytest.fixture(scope="session")

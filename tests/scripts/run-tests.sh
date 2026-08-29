@@ -6,11 +6,38 @@
 # - Creates tests/.venv-nutshell/ (managed lazily by the mint fixture).
 # - Downloads pinned bitcoind/lnd into tests/bin/ (cached on disk; gitignored).
 # - Forwards any extra args straight to pytest.
+#
+# Serving backend (--backend=phps|apache|nginx|all):
+#   With no flag the suite runs on ALL THREE backends sequentially — php -S,
+#   then real Apache, then nginx+FPM in docker (see tests/fixtures/
+#   webserver.py). A single backend runs exactly one pytest pass. CI pins
+#   --backend=phps; the containerized passes are the local full-coverage run.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TESTS_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 REPO_ROOT="$(cd "${TESTS_DIR}/.." && pwd)"
+
+BACKEND="all"
+PYTEST_ARGS=()
+for arg in "$@"; do
+  case "$arg" in
+    --backend=*) BACKEND="${arg#--backend=}" ;;
+    *) PYTEST_ARGS+=("$arg") ;;
+  esac
+done
+case "$BACKEND" in
+  phps|apache|nginx|all) ;;
+  *) echo "[run-tests] invalid --backend=${BACKEND} (phps|apache|nginx|all)" >&2; exit 2 ;;
+esac
+
+# The docker backends need `sudo -n docker`; warn early so a passwordless-sudo
+# gap doesn't surface as a fully-skipped pass an hour in.
+if [ "$BACKEND" != "phps" ]; then
+  if ! sudo -n docker version >/dev/null 2>&1; then
+    echo "[run-tests] warning: 'sudo -n docker' unavailable — apache/nginx passes will skip all tests" >&2
+  fi
+fi
 
 # 1. Submodules
 if [ ! -f "${REPO_ROOT}/cashu-wallet-php/CashuWallet.php" ]; then
@@ -67,4 +94,31 @@ fi
 
 # 5. Hand off to pytest
 cd "${TESTS_DIR}"
-exec pytest "$@"
+if [ "$BACKEND" != "all" ]; then
+  export CASHUPAY_TEST_BACKEND="$BACKEND"
+  exec pytest "${PYTEST_ARGS[@]+"${PYTEST_ARGS[@]}"}"
+fi
+
+# --backend=all: one full pass per backend, sequentially, with a summary.
+declare -A RESULTS
+overall=0
+for backend in phps apache nginx; do
+  echo ""
+  echo "[run-tests] ===== pytest pass: CASHUPAY_TEST_BACKEND=${backend} ====="
+  if CASHUPAY_TEST_BACKEND="$backend" pytest "${PYTEST_ARGS[@]+"${PYTEST_ARGS[@]}"}"; then
+    RESULTS[$backend]="pass"
+    # A green pass's workdirs (~4-5G of payserver data dirs + WP trees per
+    # pass) have no postmortem value; three passes don't fit most disks.
+    # Failed passes keep theirs.
+    rm -rf .tmp/payserver-* .tmp/wp-* .tmp/session-* 2>/dev/null || true
+  else
+    RESULTS[$backend]="FAIL($?)"
+    overall=1
+  fi
+done
+echo ""
+echo "[run-tests] backend summary:"
+for backend in phps apache nginx; do
+  echo "  ${backend}: ${RESULTS[$backend]}"
+done
+exit "$overall"

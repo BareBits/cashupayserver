@@ -27,7 +27,34 @@ This will:
 2. Create `tests/.venv/` and install Python deps from `requirements.txt`.
 3. Download + verify bitcoind and LND into `tests/bin/` if not already cached.
 4. Install Playwright's Chromium browser into `tests/bin/playwright-browsers/`.
-5. Run `pytest`.
+5. Run `pytest` — once per serving backend (php -S, Apache, nginx; see below).
+
+## Serving backends
+
+The app under test is served by one of three backends, selected with
+`CASHUPAY_TEST_BACKEND` (see `fixtures/webserver.py`):
+
+| backend  | what serves the app | needs |
+|----------|---------------------|-------|
+| `phps`   | `php -S` + router wrapper (the default for a bare `pytest`) | nothing |
+| `apache` | `php:8.3-apache` (mod_php) container, real `.htaccess` semantics | `sudo -n docker` |
+| `nginx`  | nginx + php-fpm container, the canonical `docker/nginx-site.conf` | `sudo -n docker` |
+
+- `./scripts/run-tests.sh` with **no** `--backend` flag runs the full suite on
+  **all three** sequentially (the local full-coverage run, ~3h). Pass
+  `--backend=phps|apache|nginx` for a single pass — CI pins `--backend=phps`
+  and covers the webservers with the fast `webserver-smoke` workflow instead.
+- Containers run with `--network=host`, as your uid, with the repo bind-mounted
+  at its own path, so URLs, data dirs, and sqlite access behave exactly as
+  under `php -S`. Test images build once (content-hash tagged) on first use.
+- Version drift caveat: the host-side pinned PHP is the static-cli 8.3.31
+  build (`fixtures/binaries.py`); `php:8.3-apache` / `php:8.3-fpm` float
+  within 8.3.x and are different builds — which is exactly the production
+  reality the container backends exist to exercise.
+- Backend-conditional test logic lives in `fixtures/backend.py`
+  (`is_phps()`, `default_url_mode()`, ...). Under Apache/nginx the app's
+  opportunistic background cron really runs, so prefer outcome-polling
+  (`PayserverHandle.drive_cron_until`) over "nothing happened yet" assertions.
 
 ## Layout
 
