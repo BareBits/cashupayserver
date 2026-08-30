@@ -59,10 +59,15 @@ class ClinkStack:
     noffer: str                 # a fresh spontaneous offer from the merchant
 
 
-@pytest.fixture
+@pytest.fixture(scope="module")
 def clink_stack(
     session_workdir: Path, bitcoind: BitcoindHandle, installed_binaries: dict
 ) -> Iterator[ClinkStack]:
+    """Module-scoped: relay + fulcrum + 2×Electrum + a channel take minutes to
+    boot and are generic infrastructure — each test wires its own store to the
+    (reusable, spontaneous) noffer. Cross-test relay traffic is filtered out by
+    the per-invoice ``noffer_request_event_id``; the channel's 5M-sat capacity
+    dwarfs the few 1000-sat test payments, so liquidity never runs out."""
     workdir = SESSION_TMP / f"clink-stack-{int(time.time())}"
     workdir.mkdir(parents=True, exist_ok=True)
 
@@ -315,8 +320,9 @@ def _poll_invoice_status(configured: ConfiguredPayserver, invoice_id: str,
 # The e2e
 # ---------------------------------------------------------------------------
 def test_clink_noffer_receive_round_trip(
-    configured: ConfiguredPayserver, clink_stack: ClinkStack
+    shared_configured: ConfiguredPayserver, clink_stack: ClinkStack
 ) -> None:
+    configured = shared_configured
     admin = configured.admin
     store_id = configured.store_id
     payserver = configured.handle
@@ -375,12 +381,13 @@ def test_clink_noffer_receive_round_trip(
 
 
 def test_clink_noffer_direct_receive_without_auto_cashout(
-    configured: ConfiguredPayserver, clink_stack: ClinkStack
+    shared_configured: ConfiguredPayserver, clink_stack: ClinkStack
 ) -> None:
     """Direct-receive over a noffer must work at invoice creation even when the
     auto-cashout (threshold-melt) toggle is OFF. Configuring a destination is
     enough — the toggle only governs the cron melt of accumulated mint balance.
     Regression guard for the fix that decoupled the two."""
+    configured = shared_configured
     admin = configured.admin
     store_id = configured.store_id
     payserver = configured.handle
@@ -408,11 +415,12 @@ def test_clink_noffer_direct_receive_without_auto_cashout(
 
 
 def test_clink_noffer_receipt_via_cron(
-    configured: ConfiguredPayserver, clink_stack: ClinkStack
+    shared_configured: ConfiguredPayserver, clink_stack: ClinkStack
 ) -> None:
     """The best-effort cron receipt poll settles a noffer invoice too: after the
     customer pays, ``cron.php`` re-subscribes (fetchReceipt) and the relay's
     recent buffer hands it the merchant receipt."""
+    configured = shared_configured
     admin = configured.admin
     store_id = configured.store_id
     payserver = configured.handle
@@ -445,7 +453,7 @@ def test_clink_noffer_receipt_via_cron(
 
 
 def test_clink_noffer_receipt_via_checkout_poll(
-    configured: ConfiguredPayserver, clink_stack: ClinkStack
+    shared_configured: ConfiguredPayserver, clink_stack: ClinkStack
 ) -> None:
     """The payment page's 2s JSON poll settles a noffer invoice entirely
     server-side: pollSingleQuote -> pollSingleNoffer re-subscribes to the
@@ -453,6 +461,7 @@ def test_clink_noffer_receipt_via_checkout_poll(
     merchant receipt with no help from the browser's own relay subscription
     and no cron. Regression guard for payments stuck at "waiting for payment"
     after the browser missed the ephemeral kind-21001 receipt."""
+    configured = shared_configured
     admin = configured.admin
     store_id = configured.store_id
     payserver = configured.handle

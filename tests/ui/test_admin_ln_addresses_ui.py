@@ -10,15 +10,18 @@ half of auto-cashout is saved separately via #btn-save-auto-melt and is
 exercised alongside the list saves.
 
 Saving the lists runs the server-side LUD-21 gate, so the persistence tests use
-the `configured_with_lnurlp` stack — its CASHU_LNURL_URL_TEMPLATE routes every
-address to the mock LNURL host, which advertises a verify URL. The last test
-runs against the plain `configured` stack (no LNURL host reachable) and
-asserts the gate blocks the save with a visible error.
+the `shared_configured_with_lnurlp` stack — its CASHU_LNURL_URL_TEMPLATE routes
+every address to the mock LNURL host, which advertises a verify URL. The last
+test runs against the plain `shared_configured` stack (no LNURL host reachable)
+and asserts the gate blocks the save with a visible error. Both are shared
+module servers with one store per test, so each test pins the UI to its own
+store via localStorage before navigating.
 
 Run with: pytest tests/ui/test_admin_ln_addresses_ui.py -v -s
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 
 import pytest
@@ -44,6 +47,11 @@ def _ln_addresses(handle, store_id: str) -> list[str]:
 
 def _open_lightning_payments(page, configured: ConfiguredPayserver) -> None:
     page.set_default_timeout(15000)
+    # On the shared server multiple stores exist and the dashboard defaults to
+    # stores[0]; pin the UI to this test's own store before any navigation.
+    page.add_init_script(
+        f"window.localStorage.setItem('selectedStoreId', {json.dumps(configured.store_id)});"
+    )
     page.goto(f"{configured.handle.url}/admin")
     page.fill("#password-input", configured.admin_password)
     page.click("#password-submit")
@@ -109,8 +117,10 @@ def _fill_rows(page, addresses: list[str]) -> None:
         inputs.nth(i).fill(addr)
 
 
-def test_add_reorder_and_save_chain(configured_with_lnurlp: ConfiguredPayserver, page) -> None:
-    configured = configured_with_lnurlp
+def test_add_reorder_and_save_chain(
+    shared_configured_with_lnurlp: ConfiguredPayserver, page
+) -> None:
+    configured = shared_configured_with_lnurlp
     _open_lightning_payments(page, configured)
 
     # Add three addresses in order A, B, C.
@@ -133,8 +143,8 @@ def test_add_reorder_and_save_chain(configured_with_lnurlp: ConfiguredPayserver,
     ], "saved chain should match on-screen priority order after reorder"
 
 
-def test_remove_row(configured_with_lnurlp: ConfiguredPayserver, page) -> None:
-    configured = configured_with_lnurlp
+def test_remove_row(shared_configured_with_lnurlp: ConfiguredPayserver, page) -> None:
+    configured = shared_configured_with_lnurlp
     _open_lightning_payments(page, configured)
     _fill_rows(page, [ADDR_A, ADDR_B])
 
@@ -148,7 +158,8 @@ def test_remove_row(configured_with_lnurlp: ConfiguredPayserver, page) -> None:
     assert _ln_addresses(configured.handle, configured.store_id) == [ADDR_B]
 
 
-def test_duplicate_rejected_client_side(configured: ConfiguredPayserver, page) -> None:
+def test_duplicate_rejected_client_side(shared_configured: ConfiguredPayserver, page) -> None:
+    configured = shared_configured
     _open_lightning_payments(page, configured)
     _fill_rows(page, [ADDR_A, ADDR_A])
 
@@ -164,11 +175,12 @@ def test_duplicate_rejected_client_side(configured: ConfiguredPayserver, page) -
 
 
 def test_unverifiable_address_blocked_server_side(
-    configured: ConfiguredPayserver, page
+    shared_configured: ConfiguredPayserver, page
 ) -> None:
     """On the plain stack no LNURL host is reachable, so the server-side
     LUD-21 gate rejects the save: the error toast shows and nothing lands in
     store_ln_addresses."""
+    configured = shared_configured
     _open_lightning_payments(page, configured)
     _fill_rows(page, [ADDR_A])
 

@@ -30,10 +30,10 @@ def _session_set_cookie(resp) -> str:
     )
 
 
-def test_session_cookie_is_httponly_and_samesite_lax(configured: ConfiguredPayserver) -> None:
+def test_session_cookie_is_httponly_and_samesite_lax(shared_server: ConfiguredPayserver) -> None:
     """Anonymous GET should already set the hardened cookie."""
     s = requests.Session()
-    r = s.get(f"{configured.handle.url}/admin", timeout=15)
+    r = s.get(f"{shared_server.handle.url}/admin", timeout=15)
     set_cookie = _session_set_cookie(r)
     assert "HttpOnly" in set_cookie, set_cookie
     assert "SameSite=Lax" in set_cookie, set_cookie
@@ -41,11 +41,11 @@ def test_session_cookie_is_httponly_and_samesite_lax(configured: ConfiguredPayse
     assert "Secure" not in set_cookie, set_cookie
 
 
-def test_session_cookie_is_cleared_on_logout(configured: ConfiguredPayserver) -> None:
+def test_session_cookie_is_cleared_on_logout(shared_server: ConfiguredPayserver) -> None:
     s = requests.Session()
     # Log in to start a real session.
     s.post(
-        f"{configured.handle.url}/admin",
+        f"{shared_server.handle.url}/admin",
         data={"action": "login", "username": "admin", "password": DEFAULT_ADMIN_PASSWORD},
         timeout=15,
     )
@@ -53,14 +53,14 @@ def test_session_cookie_is_cleared_on_logout(configured: ConfiguredPayserver) ->
     assert sid_before
 
     # Fetch CSRF token for the logout POST.
-    page = s.get(f"{configured.handle.url}/admin", timeout=15)
+    page = s.get(f"{shared_server.handle.url}/admin", timeout=15)
     import re
     m = re.search(r'name="csrf-token"\s+content="([^"]+)"', page.text)
     assert m, "expected csrf-token meta on admin page"
     csrf = m.group(1)
 
     r = s.post(
-        f"{configured.handle.url}/admin",
+        f"{shared_server.handle.url}/admin",
         data={"action": "logout"},
         headers={"X-CSRF-Token": csrf},
         timeout=15,
@@ -68,5 +68,5 @@ def test_session_cookie_is_cleared_on_logout(configured: ConfiguredPayserver) ->
     assert r.status_code == 200, r.text
 
     # After logout, the same client should no longer be authenticated.
-    follow = s.get(f"{configured.handle.url}/admin?api=dashboard", timeout=15)
+    follow = s.get(f"{shared_server.handle.url}/admin?api=dashboard", timeout=15)
     assert follow.status_code == 401

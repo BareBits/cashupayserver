@@ -47,9 +47,14 @@ def _login_admin(page, configured: ConfiguredPayserver) -> None:
 
 
 def test_per_store_onchain_offer_toggle_persists(
-    configured: ConfiguredPayserver, page
+    shared_configured: ConfiguredPayserver, page
 ) -> None:
+    configured = shared_configured
     _login_admin(page, configured)
+    # Pin the header selector to this test's own store — the shared server
+    # auto-selects its first store, and both the instant-save and the DB
+    # assertions below must target the per-test store's row.
+    page.select_option("#store-select", configured.store_id)
     page.locator('.nav-item[data-view="stores"]').click()
     page.wait_for_selector("#onchain-offer-override", state="visible")
     # Wait until the card is populated from dashboardData ("Currently
@@ -66,8 +71,8 @@ def test_per_store_onchain_offer_toggle_persists(
         )
         assert values == ["1", "0"], f"expected only on/off options, got {values}"
 
-        # Default: the wizard-created store still has the legacy -1 (or NULL)
-        # row, which resolves to ON.
+        # Default: the wizard-created store (add_store wizard skips on-chain,
+        # leaving the column's -1 default / legacy NULL) resolves to ON.
         assert _store_offer(configured.handle, configured.store_id) in (-1, None)
         assert page.locator("#onchain-offer-override").input_value() == "1"
 
@@ -93,12 +98,12 @@ def test_per_store_onchain_offer_toggle_persists(
 
 
 def test_site_wide_onchain_card_is_gone(
-    configured: ConfiguredPayserver, page
+    shared_configured: ConfiguredPayserver, page
 ) -> None:
     """The store-only settings refactor removed the site-wide on-chain offer
     card entirely — the Settings view must not render the old card, checkbox
     or save button under any id."""
-    _login_admin(page, configured)
+    _login_admin(page, shared_configured)
     page.locator('.nav-item[data-view="settings"]').click()
     # The Email Notifications card survives the refactor — use it as the
     # signal that the Settings view has rendered.

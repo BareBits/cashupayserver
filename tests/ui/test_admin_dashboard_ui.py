@@ -11,7 +11,8 @@ from fixtures.lnd import LndHandle
 pytestmark = pytest.mark.ui
 
 
-def test_password_login_loads_dashboard(configured: ConfiguredPayserver, page) -> None:
+def test_password_login_loads_dashboard(shared_configured: ConfiguredPayserver, page) -> None:
+    configured = shared_configured
     page.set_default_timeout(15000)
     page.goto(f"{configured.handle.url}/admin")
 
@@ -27,10 +28,11 @@ def test_password_login_loads_dashboard(configured: ConfiguredPayserver, page) -
 
 
 def test_dashboard_shows_balance_after_settle(
-    configured: ConfiguredPayserver,
+    shared_configured: ConfiguredPayserver,
     lnd_payer: LndHandle,
     page,
 ) -> None:
+    configured = shared_configured
     # Settle 2500 sats first so there's a visible balance.
     invoice = configured.greenfield.create_invoice(
         configured.store_id, amount="2500", currency="sat"
@@ -49,6 +51,11 @@ def test_dashboard_shows_balance_after_settle(
     page.click("#password-submit")
     page.wait_for_selector("#app", state="visible")
 
+    # On the shared server the SPA auto-selects the first store (the base
+    # wizard store), so pin the header selector to this test's own store —
+    # the dashboard balance is fetched per selected store.
+    page.select_option("#store-select", configured.store_id)
+
     # The balance card eventually renders "2500" once the SPA finishes the
     # dashboard fetch.
     page.wait_for_function(
@@ -58,12 +65,13 @@ def test_dashboard_shows_balance_after_settle(
 
 
 def test_dashboard_balance_and_invoice_button_labels(
-    configured: ConfiguredPayserver, page,
+    shared_configured: ConfiguredPayserver, page,
 ) -> None:
     """The balance card reads "Balance stored in Cashu Mint" and the request
     buttons are named "Create invoice" / "Create invoice (simple)". The balance
     label is asserted after the dashboard fetch because loadDashboard() rewrites
     it from JS (mint-online path) and would clobber a rename done only in HTML."""
+    configured = shared_configured
     page.set_default_timeout(15000)
     page.goto(f"{configured.handle.url}/admin")
     page.fill("#password-input", configured.admin_password)

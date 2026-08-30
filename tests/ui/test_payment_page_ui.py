@@ -10,10 +10,11 @@ pytestmark = pytest.mark.ui
 
 
 def test_payment_page_renders_qr_and_polls_to_settled(
-    configured: ConfiguredPayserver,
+    shared_configured: ConfiguredPayserver,
     lnd_payer: LndHandle,
     page,
 ) -> None:
+    configured = shared_configured
     page.set_default_timeout(20000)
 
     invoice = configured.greenfield.create_invoice(
@@ -44,12 +45,13 @@ def test_payment_page_renders_qr_and_polls_to_settled(
 
 
 def test_payment_page_qr_size_and_button_row(
-    configured: ConfiguredPayserver,
+    shared_configured: ConfiguredPayserver,
     page,
 ) -> None:
     """The QR fills the checkout column (not the old fixed 220px), the
     open-in-wallet / copy buttons share one row, and the invoice-details box
     sits below the payment method blocks."""
+    configured = shared_configured
     invoice = configured.greenfield.create_invoice(
         configured.store_id, amount="1000", currency="sat"
     )
@@ -92,9 +94,10 @@ def test_payment_page_qr_size_and_button_row(
 
 
 def test_payment_page_displays_invoice_amount(
-    configured: ConfiguredPayserver,
+    shared_configured: ConfiguredPayserver,
     page,
 ) -> None:
+    configured = shared_configured
     invoice = configured.greenfield.create_invoice(
         configured.store_id, amount="4242", currency="sat"
     )
@@ -115,9 +118,10 @@ EXPECTED_BRANDS = {
 
 
 def test_payment_page_provider_logos_link_and_label(
-    configured: ConfiguredPayserver,
+    shared_configured: ConfiguredPayserver,
     page,
 ) -> None:
+    configured = shared_configured
     invoice = configured.greenfield.create_invoice(
         configured.store_id, amount="1000", currency="sat"
     )
@@ -140,9 +144,10 @@ def test_payment_page_provider_logos_link_and_label(
 
 
 def test_payment_page_footer_powered_by_links_to_barebits(
-    configured: ConfiguredPayserver,
+    shared_configured: ConfiguredPayserver,
     page,
 ) -> None:
+    configured = shared_configured
     invoice = configured.greenfield.create_invoice(
         configured.store_id, amount="1000", currency="sat"
     )
@@ -156,11 +161,13 @@ def test_payment_page_footer_powered_by_links_to_barebits(
 
 
 def test_cashu_option_only_shown_when_offline_acceptance_enabled(
-    configured: ConfiguredPayserver,
+    shared_configured: ConfiguredPayserver,
     page,
 ) -> None:
     """Cashu is offered on the payment screen only when the store has opted
-    into offline Cashu acceptance (offline_cashu_enabled)."""
+    into offline Cashu acceptance (offline_cashu_enabled). The DB writes are
+    scoped to this test's own store on the shared server (and restored)."""
+    configured = shared_configured
     page.set_default_timeout(15000)
 
     # Offline acceptance is OFF by default → no Cashu tab or block.

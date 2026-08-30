@@ -71,8 +71,8 @@ MOCK_INVOICES = [
 ]
 
 
-def test_invoices_table_badge_and_lightning_cells(configured: ConfiguredPayserver, page) -> None:
-    _login(page, configured)
+def test_invoices_table_badge_and_lightning_cells(shared_configured: ConfiguredPayserver, page) -> None:
+    _login(page, shared_configured)
 
     # Render the table with our mock data using the page's own render function.
     page.evaluate(

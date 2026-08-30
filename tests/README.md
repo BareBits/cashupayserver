@@ -56,6 +56,44 @@ The app under test is served by one of three backends, selected with
   opportunistic background cron really runs, so prefer outcome-polling
   (`PayserverHandle.drive_cron_until`) over "nothing happened yet" assertions.
 
+## Shared servers vs. fresh installs
+
+Two families of payserver fixtures exist (`conftest.py`):
+
+- **`shared_configured`** (plus `shared_configured_with_lnurlp` /
+  `shared_configured_with_strike`, and `shared_server` for read-only tests):
+  ONE payserver boots per test module and each test gets its own store —
+  created through the add_store wizard, so it has its own wallet seed (no
+  mint collisions) — plus its own API key. Same `ConfiguredPayserver`
+  interface as `configured`; the per-test store's unique name is
+  `.store_name`. This is the default for new tests: it skips a server boot
+  and a 9-step wizard walk per test.
+- **`configured` / `payserver`**: a fresh install per test. Required when a
+  test mutates server-global state: admin password or users, global config
+  rows (SMTP, updater, cron_key, update channel), failed logins (global
+  lockout counter), the global API rate limiter, process restarts, unscoped
+  sqlite writes, or the setup wizard itself.
+
+Playwright note: the admin SPA auto-selects `stores[0]` unless
+`localStorage.selectedStoreId` is set, so UI tests on a shared server must
+pin their own store (see `add_init_script(...selectedStoreId...)` uses).
+
+## Workdir cleanup
+
+A test that passes deletes its workdir in teardown; failures keep theirs for
+postmortem, and a fully green session removes the shared stack dir too. Set
+`CASHUPAY_KEEP_WORKDIRS=1` to keep everything. At session start, orphaned
+fixture processes from previously killed runs (anything with `tests/.tmp` in
+its cmdline) are swept — set `CASHUPAY_NO_STALE_SWEEP=1` when deliberately
+running two suites concurrently from this checkout.
+
+## CI sharding
+
+`pytest --split-group=M/N` runs the Mth of N deterministic file-level shards
+(`fixtures/partition.py`; whole files stay together because of the
+module-scoped shared servers). CI runs 3 shards in parallel; the shard count
+lives in `.github/workflows/tests.yml` (matrix AND --split-group must match).
+
 ## Layout
 
 ```

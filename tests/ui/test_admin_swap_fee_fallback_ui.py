@@ -31,6 +31,13 @@ def _login(page, configured: ConfiguredPayserver) -> None:
 
 
 def _open_store_swaps_card(page, configured: ConfiguredPayserver) -> None:
+    # Pin the SPA to this test's own store BEFORE the first load: the shared
+    # server otherwise auto-selects its first store and switching afterwards
+    # kicks off a second async dashboard load whose re-render can clobber
+    # in-flight DOM edits (seen resetting the swaps checkbox mid-test).
+    page.add_init_script(
+        f"localStorage.setItem('selectedStoreId', {configured.store_id!r})"
+    )
     _login(page, configured)
     page.locator('.nav-item[data-view="stores"]').click()
     page.wait_for_selector("#store-swaps-fee-pct", state="visible")
@@ -51,10 +58,10 @@ def _store_swaps_row(configured: ConfiguredPayserver) -> tuple:
         ).fetchone()
 
 
-def test_site_swaps_card_is_gone(configured: ConfiguredPayserver, page) -> None:
+def test_site_swaps_card_is_gone(shared_configured: ConfiguredPayserver, page) -> None:
     """The Settings view must no longer render the site-wide swaps card (or
     the site auto-cashout default selector) under any of the old ids."""
-    _login(page, configured)
+    _login(page, shared_configured)
     page.locator('.nav-item[data-view="settings"]').click()
     # The Email Notifications card survives the refactor — use it as the
     # signal that the Settings view has rendered.
@@ -69,8 +76,8 @@ def test_site_swaps_card_is_gone(configured: ConfiguredPayserver, page) -> None:
         )
 
 
-def test_store_swaps_card_controls(configured: ConfiguredPayserver, page) -> None:
-    _open_store_swaps_card(page, configured)
+def test_store_swaps_card_controls(shared_configured: ConfiguredPayserver, page) -> None:
+    _open_store_swaps_card(page, shared_configured)
 
     # The old tri-state select is gone; the checkbox replaces it.
     assert page.locator("#store-swaps-override").count() == 0
@@ -94,9 +101,11 @@ def test_store_swaps_card_controls(configured: ConfiguredPayserver, page) -> Non
     assert strict_values == ["0", "1"], strict_values
 
 
-def test_enable_without_xpub_is_blocked(configured: ConfiguredPayserver, page) -> None:
-    """The wizard-walked store has no on-chain xpub, so turning swaps on is
-    refused client-side with an inline error and nothing is saved."""
+def test_enable_without_xpub_is_blocked(shared_configured: ConfiguredPayserver, page) -> None:
+    """The wizard-walked store has no on-chain xpub (the add_store wizard
+    skips it and forces swaps off), so turning swaps on is refused
+    client-side with an inline error and nothing is saved."""
+    configured = shared_configured
     _open_store_swaps_card(page, configured)
     assert _store_swaps_row(configured)[0] == 0, "wizard turned swaps off"
 
@@ -108,7 +117,8 @@ def test_enable_without_xpub_is_blocked(configured: ConfiguredPayserver, page) -
     assert _store_swaps_row(configured)[0] == 0, "blocked save must not persist"
 
 
-def test_store_fee_fallback_round_trip(configured: ConfiguredPayserver, page) -> None:
+def test_store_fee_fallback_round_trip(shared_configured: ConfiguredPayserver, page) -> None:
+    configured = shared_configured
     _open_store_swaps_card(page, configured)
 
     page.fill("#store-swaps-fee-pct", "3.5")

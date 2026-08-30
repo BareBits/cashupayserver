@@ -11,15 +11,22 @@ concurrency:
 
 jobs:
   e2e-and-ui:
-    name: E2E + UI
+    name: E2E + UI (shard ${{ matrix.shard }}/3)
     runs-on: ubuntu-22.04
-    # The full e2e+ui+wordpress suite runs serially (session-scoped bitcoind/
-    # lnd/mint/channels rule out xdist) and keeps growing: ~59m of pytest by
-    # 2026-08, plus a few minutes of setup — more when a binaries.py change
-    # rotates the bins cache and the pinned downloads run cold. 60m was
-    # cancelling completed-except-for-the-last-tests runs at ~97%. 75m buys
-    # headroom again; sharding remains the real fix once this ceiling is hit.
-    timeout-minutes: 75
+    # The suite runs serially within a shard (session-scoped bitcoind/lnd/
+    # mint/channels rule out xdist), sharded 3 ways across runners via the
+    # deterministic file-level partitioner (--split-group, see
+    # tests/fixtures/partition.py). Each shard boots its own full stack, so
+    # shards share no RAM/disk budget. Pre-sharding the single serial run was
+    # ~59m of pytest against a 75m ceiling; a shard should stay well under
+    # 45m even as the suite grows — if one starts brushing this limit,
+    # rebalance by bumping the shard count in the matrix AND in the
+    # --split-group denominator below (they must match).
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
     # Depend on the artifact build so the WordPress E2E tier can exercise the
     # EXACT zips CI publishes: the GPL plugin zip, and the standalone server
     # zip its "install BareBits alongside" flow downloads and unpacks.
@@ -98,7 +105,7 @@ jobs:
         # three) are the local full-coverage run; CI's webserver coverage is
         # the fast webserver-smoke workflow.
         run: |
-          ./tests/scripts/run-tests.sh --backend=phps -v
+          ./tests/scripts/run-tests.sh --backend=phps -v --split-group=${{ matrix.shard }}/3
         env:
           PYTHONUNBUFFERED: "1"
           # The WP tests consume these exact artifacts instead of rebuilding
@@ -111,7 +118,7 @@ jobs:
         if: failure() || cancelled()
         uses: actions/upload-artifact@v4
         with:
-          name: test-logs
+          name: test-logs-shard-${{ matrix.shard }}
           path: |
             tests/.tmp/**/*.log
             tests/.tmp/**/*.sqlite

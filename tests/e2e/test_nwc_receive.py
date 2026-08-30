@@ -34,10 +34,14 @@ from fixtures.nwc_wallet import NwcStack, start_nwc_stack, stop_nwc_stack
 INVOICE_AMOUNT_SAT = 1_000
 
 
-@pytest.fixture
+@pytest.fixture(scope="module")
 def nwc_stack(lnd_mint: LndHandle, channels: None) -> Iterator[NwcStack]:
     """Relay + fake wallet minting from lnd_mint (lnd_payer pays over the
-    session's dual channels). get_info reports a receive-only connection."""
+    session's dual channels). get_info reports a receive-only connection.
+
+    Module-scoped: the stack is generic infrastructure (each test wires its
+    own store to it), and every lookup is keyed by per-invoice payment hash,
+    so accumulated relay/wallet state can't leak between tests."""
     workdir = SESSION_TMP / f"nwc-stack-{int(time.time())}"
     workdir.mkdir(parents=True, exist_ok=True)
     stack = start_nwc_stack(
@@ -127,8 +131,9 @@ def _create_nwc_invoice(configured: ConfiguredPayserver) -> tuple[str, str, dict
 
 
 def test_nwc_receive_round_trip(
-    configured: ConfiguredPayserver, nwc_stack: NwcStack, lnd_payer: LndHandle
+    shared_configured: ConfiguredPayserver, nwc_stack: NwcStack, lnd_payer: LndHandle
 ) -> None:
+    configured = shared_configured
     admin = configured.admin
     store_id = configured.store_id
     payserver = configured.handle
@@ -182,10 +187,11 @@ def test_nwc_receive_round_trip(
 
 
 def test_nwc_settles_via_cron_after_tab_closed(
-    configured: ConfiguredPayserver, nwc_stack: NwcStack, lnd_payer: LndHandle
+    shared_configured: ConfiguredPayserver, nwc_stack: NwcStack, lnd_payer: LndHandle
 ) -> None:
     """lookup_invoice is a stored-state query, so cron settles an NWC invoice
     nobody is watching — the shared-hosting answer to 'no background threads'."""
+    configured = shared_configured
     admin = configured.admin
     payserver = configured.handle
     save_nwc_destination(admin, configured.store_id, nwc_stack.wallet.connection_uri())
@@ -209,10 +215,11 @@ def test_nwc_settles_via_cron_after_tab_closed(
 
 
 def test_nwc_direct_receive_without_auto_cashout(
-    configured: ConfiguredPayserver, nwc_stack: NwcStack
+    shared_configured: ConfiguredPayserver, nwc_stack: NwcStack
 ) -> None:
     """Configuring an NWC destination is enough for direct-receive; the
     auto-cashout toggle only governs the cron melt (noffer-parity guard)."""
+    configured = shared_configured
     payserver = configured.handle
     save_nwc_destination(
         configured.admin, configured.store_id,

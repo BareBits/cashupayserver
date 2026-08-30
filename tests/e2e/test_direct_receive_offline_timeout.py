@@ -47,9 +47,11 @@ MAX_CREATE_SECONDS = 17.0
 MIN_CREATE_SECONDS = 9.0
 
 
-@pytest.fixture
+@pytest.fixture(scope="module")
 def dead_relay() -> Iterator[ClinkRelayHandle]:
-    """A live in-rig relay with no wallet or noffer service connected."""
+    """A live in-rig relay with no wallet or noffer service connected.
+    Module-scoped: nothing ever answers on it, and no test asserts on its
+    contents, so accumulated (unanswered) requests can't leak."""
     workdir = SESSION_TMP / f"dead-relay-{int(time.time())}"
     workdir.mkdir(parents=True, exist_ok=True)
     relay = start_clink_relay(workdir)
@@ -88,8 +90,9 @@ def _set_destinations(payserver, store_id: str, chain: list[tuple[str, str]]) ->
 
 
 def test_offline_destinations_fall_back_to_mint_within_budget(
-    configured: ConfiguredPayserver, dead_relay: ClinkRelayHandle
+    shared_configured: ConfiguredPayserver, dead_relay: ClinkRelayHandle
 ) -> None:
+    configured = shared_configured
     payserver = configured.handle
     store_id = configured.store_id
 

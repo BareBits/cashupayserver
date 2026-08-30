@@ -22,17 +22,18 @@ from __future__ import annotations
 
 import requests
 
+from conftest import ConfiguredPayserver
 from fixtures.payserver import PayserverHandle
 
 
-def test_extensionless_health_route_resolves(payserver: PayserverHandle) -> None:
+def test_extensionless_health_route_resolves(shared_server: ConfiguredPayserver) -> None:
     """/health (no .php) must reach health.php, not 404.
 
     health.php is cron-key gated, so unauthenticated it answers 403 — the point
     is only that the pretty path routed to the handler. A 404 would mean the
     front controller has no extension-less /health route (the very thing the
     url-mode probe relies on to detect clean mode)."""
-    r = requests.get(f"{payserver.url}/health", timeout=15, allow_redirects=False)
+    r = requests.get(f"{shared_server.handle.url}/health", timeout=15, allow_redirects=False)
     assert r.status_code != 404, "extension-less /health did not route to health.php"
     assert r.status_code == 403, (
         f"expected cron-key-gated 403 from /health, got {r.status_code}: {r.text[:200]}"
@@ -40,20 +41,24 @@ def test_extensionless_health_route_resolves(payserver: PayserverHandle) -> None
 
 
 def test_extensionless_setup_route_resolves(payserver: PayserverHandle) -> None:
-    """/setup (no .php) must reach the setup wizard (HTTP 200)."""
+    """/setup (no .php) must reach the setup wizard (HTTP 200).
+
+    Stays on the bare unconfigured `payserver` fixture: landing on the setup
+    wizard is exactly the un-walked-install behavior — a configured shared
+    server would bounce away from /setup."""
     r = requests.get(f"{payserver.url}/setup", timeout=15, allow_redirects=True)
     assert r.status_code == 200, f"extension-less /setup did not resolve: {r.status_code}"
     assert "setup" in r.url.lower(), f"did not land on the setup wizard: {r.url}"
 
 
-def test_extensionless_admin_route_resolves(payserver: PayserverHandle) -> None:
+def test_extensionless_admin_route_resolves(shared_server: ConfiguredPayserver) -> None:
     """/admin (no .php) must reach admin.php and not 404.
 
-    On this un-walked install admin.php sees setup is incomplete and redirects
-    to the setup wizard, so we assert the pretty path *routed into the app*
-    (a redirect, never router.php's hard 404) rather than pinning the landing
-    page — post-setup it would instead canonicalize to /admin/dashboard."""
-    r = requests.get(f"{payserver.url}/admin", timeout=15, allow_redirects=False)
+    We assert the pretty path *routed into the app* (a 200 or a redirect,
+    never router.php's hard 404) rather than pinning the landing page — on
+    a configured install it serves the login page or canonicalizes to
+    /admin/dashboard."""
+    r = requests.get(f"{shared_server.handle.url}/admin", timeout=15, allow_redirects=False)
     assert r.status_code != 404, "extension-less /admin did not route to admin.php"
     assert r.status_code in (200, 302), (
         f"unexpected status from /admin: {r.status_code}: {r.text[:200]}"
@@ -61,7 +66,7 @@ def test_extensionless_admin_route_resolves(payserver: PayserverHandle) -> None:
 
 
 def test_payment_method_logo_served_through_front_controller(
-    payserver: PayserverHandle,
+    shared_server: ConfiguredPayserver,
 ) -> None:
     """/images/payment-methods/*.png must serve the real image, not 404.
 
@@ -70,7 +75,7 @@ def test_payment_method_logo_served_through_front_controller(
     through the front controller (the router serves /images/* the same way it
     serves /assets/*); a 404 here is exactly the blank-logo regression."""
     r = requests.get(
-        f"{payserver.url}/images/payment-methods/strike.png",
+        f"{shared_server.handle.url}/images/payment-methods/strike.png",
         timeout=15,
         allow_redirects=False,
     )
@@ -82,12 +87,14 @@ def test_payment_method_logo_served_through_front_controller(
     )
 
 
-def test_api_reachable_at_bare_base(payserver: PayserverHandle) -> None:
+def test_api_reachable_at_bare_base(shared_server: ConfiguredPayserver) -> None:
     """The BTCPay-compat API base must answer at the bare /api/v1 path (this is
     what 'clean' and 'direct' modes both advertise as the server URL)."""
-    r = requests.get(f"{payserver.url}/api/v1/server/info", timeout=15, allow_redirects=False)
-    # 200 once configured, 503 before setup completes — both mean the route
-    # resolved. Never 404.
+    r = requests.get(
+        f"{shared_server.handle.url}/api/v1/server/info", timeout=15, allow_redirects=False
+    )
+    # 200 once configured (server/info needs no auth), 503 before setup
+    # completes — both mean the route resolved. Never 404.
     assert r.status_code in (200, 503), (
         f"/api/v1/server/info did not resolve: {r.status_code}: {r.text[:200]}"
     )

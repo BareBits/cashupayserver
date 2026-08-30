@@ -13,6 +13,7 @@ Run with: pytest tests/ui/test_admin_strike_ui.py -v -s
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 
 import pytest
@@ -47,6 +48,11 @@ def _save_lists_and_wait(page) -> None:
 
 def _open_lightning_payments(page, configured: ConfiguredPayserver) -> None:
     page.set_default_timeout(20000)
+    # On the shared server multiple stores exist and the dashboard defaults to
+    # stores[0]; pin the UI to this test's own store before any navigation.
+    page.add_init_script(
+        f"window.localStorage.setItem('selectedStoreId', {json.dumps(configured.store_id)});"
+    )
     page.goto(f"{configured.handle.url}/admin")
     page.fill("#password-input", configured.admin_password)
     page.click("#password-submit")
@@ -63,18 +69,25 @@ def _open_lightning_payments(page, configured: ConfiguredPayserver) -> None:
 
 
 def test_add_save_masked_rerender_and_remove(
-    configured_with_strike: ConfiguredPayserver, strike_api: StrikeApiServer, page
+    shared_configured_with_strike: ConfiguredPayserver,
+    strike_api_shared: StrikeApiServer,
+    page,
 ) -> None:
-    configured = configured_with_strike
+    configured = shared_configured_with_strike
+    strike_api = strike_api_shared
     store_id = configured.store_id
 
     # --- add + save (runs the live probe against the mock) ---
+    # The mock is module-scoped (other tests' invoices accumulate in it), so
+    # the probe assertions count only invoices created by this test's saves.
     _open_lightning_payments(page, configured)
+    ids_before = set(strike_api.invoices)
     page.click("#btn-add-strike")
     page.locator("#auto-melt-strike-list input.strike-input").fill(TEST_STRIKE_KEY)
     _save_lists_and_wait(page)
     assert _chain(configured.handle, store_id) == [("strike", TEST_STRIKE_KEY)]
-    assert len(strike_api.invoices) == 1, "probe issued exactly one test invoice"
+    probe_ids = set(strike_api.invoices) - ids_before
+    assert len(probe_ids) == 1, "probe issued exactly one test invoice"
 
     # --- masked re-render: label row, keep ref, no key in the DOM ---
     page.wait_for_selector("#auto-melt-strike-list .strike-saved-label", timeout=20000)
@@ -89,7 +102,7 @@ def test_add_save_masked_rerender_and_remove(
     # grandfathered key is NOT re-probed (no second mock invoice) ---
     _save_lists_and_wait(page)
     assert _chain(configured.handle, store_id) == [("strike", TEST_STRIKE_KEY)]
-    assert len(strike_api.invoices) == 1, "kept keys are not re-probed"
+    assert set(strike_api.invoices) - ids_before == probe_ids, "kept keys are not re-probed"
 
     # --- remove + save clears the chain ---
     page.wait_for_timeout(1500)  # let the post-save dashboard reload land
@@ -100,11 +113,11 @@ def test_add_save_masked_rerender_and_remove(
 
 
 def test_strike_lightning_address_blocked_with_pointer(
-    configured_with_strike: ConfiguredPayserver, page
+    shared_configured_with_strike: ConfiguredPayserver, page
 ) -> None:
     """A @strike.me lightning address can never pass the LUD-21 gate; the
     client blocks it up front and points at the Strike API section."""
-    configured = configured_with_strike
+    configured = shared_configured_with_strike
     _open_lightning_payments(page, configured)
     page.click("#btn-add-ln-address")
     addr_input = page.locator("#auto-melt-address-list input.ln-address-input")
@@ -123,11 +136,11 @@ def test_strike_lightning_address_blocked_with_pointer(
 
 
 def test_malformed_key_rejected_client_side(
-    configured_with_strike: ConfiguredPayserver, page
+    shared_configured_with_strike: ConfiguredPayserver, page
 ) -> None:
     """A malformed key paste is caught by the client shape check with a
     message that does not echo the paste (it may be most of a real key)."""
-    configured = configured_with_strike
+    configured = shared_configured_with_strike
     _open_lightning_payments(page, configured)
     page.click("#btn-add-strike")
     bogus = "almost-a-key-with-dashes-0000"
