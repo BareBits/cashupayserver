@@ -78,11 +78,34 @@ Playwright note: the admin SPA auto-selects `stores[0]` unless
 `localStorage.selectedStoreId` is set, so UI tests on a shared server must
 pin their own store (see `add_init_script(...selectedStoreId...)` uses).
 
+## WordPress golden templates
+
+The WP tier used to run `wp core install` (+ plugin activations, + the whole
+WooCommerce/BTCPay install for checkout tests) per test. Now the first install
+of each DB-affecting shape per session — `bare` (no cashupay plugin), `plugin`
+(cashupay active), `woo` (plugin + WooCommerce + BTC store + one product) — is
+kept as a golden tree under `tests/.tmp/wp-golden-*`, and every later test
+gets a `cp -a` clone of it (`fixtures/wordpress.py`).
+
+Safe because the only per-instance state is serve-time: each clone gets a
+fresh `wp-config.php` (own port, salts, release-server constants) whose
+`WP_HOME`/`WP_SITEURL` constants override every URL the golden's DB stores,
+plus its own router wrapper/vhost. `emulate_rewrites`, `php_workers`,
+`release_api_base`, `release_channel` never touch the tree or DB, so all
+fixture variants share the same three goldens. Escape hatch:
+`CASHUPAY_WP_NO_TEMPLATE=1` restores the per-test real install; the template
+contract itself is pinned by `wordpress/test_wp_template_clone.py`.
+
 ## Workdir cleanup
 
 A test that passes deletes its workdir in teardown; failures keep theirs for
-postmortem, and a fully green session removes the shared stack dir too. Set
-`CASHUPAY_KEEP_WORKDIRS=1` to keep everything. At session start, orphaned
+postmortem, and a fully green session removes the shared stack dir too (the
+`wp-golden-*` template dirs are removed with it). Set
+`CASHUPAY_KEEP_WORKDIRS=1` to keep everything. `run-tests.sh` also checks
+free disk/RAM before each pytest pass and refuses to start below 4G disk /
+2G available RAM (warns below 10G / 4G) — `CASHUPAY_SKIP_PREFLIGHT=1`
+bypasses. Every run ends with pytest's `--durations` ranking of the slowest
+tests and fixture setups, so future speedup work starts from data. At session start, orphaned
 fixture processes from previously killed runs (anything with `tests/.tmp` in
 its cmdline) are swept — set `CASHUPAY_NO_STALE_SWEEP=1` when deliberately
 running two suites concurrently from this checkout.

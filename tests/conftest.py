@@ -333,9 +333,14 @@ def lnurlp_server(lnd_payer: LndHandle, channels: None) -> Iterator[LnurlpServer
 @pytest.fixture
 def wordpress(request) -> Iterator[WordPressHandle]:
     """Fresh WordPress install with the cashupay plugin activated.
-    Function-scoped — each test gets its own WP root + SQLite DB."""
+    Function-scoped — each test gets its own WP root + SQLite DB (a clone of
+    the session's golden template; see fixtures/wordpress.py). When the test
+    also requests `woocommerce`, the WooCommerce golden is cloned so the WC
+    install cost is paid once per session, not per test."""
     workdir = SESSION_TMP / f"wp-{uuid.uuid4().hex[:8]}"
-    handle = start_wordpress(workdir)
+    handle = start_wordpress(
+        workdir, with_woocommerce="woocommerce" in request.fixturenames
+    )
     yield handle
     stop_wordpress(handle)
     _maybe_remove_workdir(workdir, _test_went_green(request))
@@ -346,8 +351,15 @@ def woocommerce(wordpress: WordPressHandle) -> Iterator[tuple[WordPressHandle, d
     """The `wordpress` fixture plus a live WooCommerce store and the real BTCPay
     Greenfield gateway plugin (both pinned). Yields (handle, info) where info
     carries the created product_id. The gateway is installed but not yet wired
-    to BareBits — that wiring is what the checkout test exercises."""
-    info = install_woocommerce(wordpress)
+    to BareBits — that wiring is what the checkout test exercises.
+
+    Normally satisfied by the WooCommerce golden template (the `wordpress`
+    fixture sees this fixture in request.fixturenames and clones the woo
+    golden); the live install only runs with CASHUPAY_WP_NO_TEMPLATE=1."""
+    if wordpress.woo_product_id is not None:
+        info = {"product_id": wordpress.woo_product_id}
+    else:
+        info = install_woocommerce(wordpress)
     yield wordpress, info
 
 
