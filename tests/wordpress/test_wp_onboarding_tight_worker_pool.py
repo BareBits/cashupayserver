@@ -114,7 +114,7 @@ def test_onboarding_completes_on_a_starved_worker_pool(wordpress_hostile_tight_p
     body = post_onboarding(s, wp, "cashupay_finish", {"cashupay_discount_percent": "0"})
     assert "WooCommerce now takes Bitcoin" in body, body[:2000]
 
-    assert wp_option(wp, "btcpay_gf_url") == wp.barebits_url
+    assert wp_option(wp, "btcpay_gf_url") == wp.barebits_gateway_url
     assert wp_option(wp, "cashupay_wired_at") != ""
     # The webhook really landed on the server, secret shared with the gateway.
     webhook_opt = json.loads(

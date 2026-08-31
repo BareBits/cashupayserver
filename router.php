@@ -94,6 +94,20 @@ if (preg_match('#^/payment(?:/(.+))?$#', $uri, $matches)) {
 }
 
 // -----------------------------------------------------------------------------
+// BTCPay-compatible invoice URL: /i/{invoiceId}. BTCPay API clients (the
+// WooCommerce Greenfield gateway among them) build this link themselves off
+// the configured server URL when re-opening an existing invoice; BareBits'
+// checkout page is payment.php, so serve it there. The .htaccess catch-all
+// and the nginx @router front controller both forward /i/* here; the query
+// transport (api.php?cashupay_path=/i/{id}) answers with a redirect instead.
+// -----------------------------------------------------------------------------
+if (preg_match('#^/i/([^/]+)$#', $uri, $matches)) {
+    $_GET['id'] = rawurldecode($matches[1]);
+    require __DIR__ . '/payment.php';
+    exit;
+}
+
+// -----------------------------------------------------------------------------
 // Self-serve invoice page: /pay/{storeId} — public, unauthenticated page where
 // a customer creates and pays their own invoice (gated per store; see pay.php).
 // -----------------------------------------------------------------------------

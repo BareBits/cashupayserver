@@ -569,7 +569,10 @@ function cashupay_configure_btcpay_plugin(string $store_id, string $api_key): ar
         ];
     }
 
-    update_option('btcpay_gf_url', cashupay_server_url());
+    // The gateway base: api.php's query-transport form for a same-origin
+    // alongside install (one loopback deep on every host — see
+    // cashupay_gateway_base_url), the canonical URL for remote servers.
+    update_option('btcpay_gf_url', cashupay_gateway_server_url());
     update_option('btcpay_gf_api_key', $api_key);
     update_option('btcpay_gf_store_id', $store_id);
 

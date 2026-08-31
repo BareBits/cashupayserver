@@ -77,6 +77,42 @@ assert_eq(
     'a query string survives the transport rewrite'
 );
 
+// --- Gateway base selection (btcpay_gf_url) ----------------------------------
+// The BTCPay WooCommerce gateway builds every request URL by concatenation
+// onto its configured server URL ({base}/api/v1/..., {base}/i/{invoiceId}).
+// For the same-origin alongside install the wiring must hand it api.php's
+// query-transport BASE, so the gateway's own calls are one loopback deep too
+// — the canonical bare URL rides the API bridge's three-request chain, which
+// starves Local WP-sized pools at checkout ("payment could not be started"
+// on every order).
+assert_eq(
+    'http://wp.test/barebits/api.php?cashupay_path=',
+    cashupay_gateway_base_url($install, $install),
+    'the alongside install gateway base is the api.php query-transport form'
+);
+assert_eq(
+    'https://pay.example.com',
+    cashupay_gateway_base_url('https://pay.example.com', $install),
+    'a remote server keeps the canonical URL as the gateway base'
+);
+assert_eq(
+    'https://pay.example.com',
+    cashupay_gateway_base_url('https://pay.example.com', ''),
+    'no install recorded: canonical gateway base'
+);
+// Concatenation shapes the gateway actually produces off this base.
+$gwBase = cashupay_gateway_base_url($install, $install);
+assert_eq(
+    'http://wp.test/barebits/api.php?cashupay_path=/api/v1/stores/s1/invoices',
+    $gwBase . '/api/v1/stores/s1/invoices',
+    'greenfield-php getApiUrl() concatenation lands on the query transport'
+);
+assert_eq(
+    'http://wp.test/barebits/api.php?cashupay_path=/i/inv123',
+    $gwBase . '/i/inv123',
+    "the gateway's /i/{invoiceId} re-checkout link lands on the query transport"
+);
+
 // --- cashupay_api_request routes through the selector ------------------------
 $GLOBALS['wp_options'] = [
     'cashupay_mode' => 'install',

@@ -113,6 +113,14 @@ class WordPressHandle:
         return f"{self.url}/barebits"
 
     @property
+    def barebits_gateway_url(self) -> str:
+        """The btcpay_gf_url the WooCommerce wiring writes for the alongside
+        install: api.php's query-transport BASE, so every URL the BTCPay
+        gateway builds by concatenation lands directly on api.php — one
+        loopback deep on every host (see cashupay_gateway_base_url)."""
+        return f"{self.barebits_url}/api.php?cashupay_path="
+
+    @property
     def barebits_data_dir(self) -> Path:
         """The data dir the installer prefers: outside the docroot, a sibling
         of ABSPATH, namespaced per site so co-hosted WordPress installs can

@@ -82,6 +82,20 @@ if (!str_starts_with($path, '/')) {
     $path = '/' . $path;
 }
 
+// BTCPay-compatible invoice URL: /i/{invoiceId}. BTCPay clients (the
+// WooCommerce gateway's "pay again" redirect among them) build this link by
+// concatenation off their configured server URL — which, for a same-origin
+// WordPress-alongside install, is api.php's query transport base. Send the
+// buyer to the real checkout page. Canonical /i/{id} URLs are served by
+// router.php (via the .htaccess / nginx front controllers); this handles the
+// query form api.php?cashupay_path=/i/{id}.
+if (preg_match('#^/i/([^/]+)$#', $path, $m)) {
+    require_once __DIR__ . '/includes/urls.php';
+    cashupay_status(302);
+    header('Location: ' . Urls::payment(rawurldecode($m[1])));
+    exit;
+}
+
 // API version prefix
 if (!str_starts_with($path, '/api/v1/')) {
     // Also support paths without /api prefix for BTCPay compatibility

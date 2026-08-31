@@ -156,6 +156,43 @@ function cashupay_api_url(string $server, string $path): string {
 }
 
 /**
+ * The server URL the BTCPay WooCommerce gateway should be configured with
+ * (btcpay_gf_url).
+ *
+ * For the same-origin alongside install this is api.php's query-transport
+ * BASE — {install}/api.php?cashupay_path= — not the bare install URL. The
+ * gateway's Greenfield library builds every request URL by plain string
+ * concatenation onto this value ({base}/api/v1/..., {base}/i/{invoiceId}),
+ * so each call it makes lands directly on api.php with the path carried in
+ * cashupay_path: one loopback deep, executable on every host. The canonical
+ * bare-URL form would instead ride /install/api/v1/... — which, on
+ * rewrite-hostile hosts, falls into WordPress and is replayed by the API
+ * bridge as a THIRD simultaneous same-site PHP request. Hosts with small
+ * per-site worker pools (Local WP) starve on that chain at checkout: the
+ * invoice-creation call dies as a bare timeout and every single order fails
+ * with the generic "payment could not be started" error. Same worker math,
+ * same fix as cashupay_api_transport_url() gave the plugin's own calls.
+ *
+ * Any other server (URL mode, remote) keeps the canonical URL its
+ * operator's setup proved.
+ *
+ * Pure (no WordPress calls) so tests/php can pin the selection;
+ * cashupay_gateway_server_url() is the live wrapper. $server and
+ * $installUrl arrive normalized (no trailing slash).
+ */
+function cashupay_gateway_base_url(string $server, string $installUrl): string {
+    if ($server === '' || $installUrl === '' || $server !== $installUrl) {
+        return $server;
+    }
+    return $server . '/api.php?cashupay_path=';
+}
+
+/** The live wrapper: gateway base decision against the recorded install. */
+function cashupay_gateway_server_url(): string {
+    return cashupay_gateway_base_url(cashupay_server_url(), cashupay_install_url());
+}
+
+/**
  * Probe a candidate BareBits server URL: fetch {url}/api/v1/server/info and
  * require the isCashuPayServer marker. Returns ['ok' => true, 'version' => …]
  * or ['ok' => false, 'message' => operator-facing reason].

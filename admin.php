@@ -3775,15 +3775,31 @@ $fileResetRequested = !$isLoggedIn && Auth::fileResetRequested();
 // parsed here so a refresh restores the operator's current page instead of
 // always dropping them back on the dashboard.
 //
-// The view slug comes from $_SERVER['PATH_INFO'] (direct, router, or
-// PATH_INFO mode).
+// The view slug comes from $_SERVER['PATH_INFO'] (clean mode's front
+// controller, router mode, Apache AcceptPathInfo) or, on hosts that route
+// neither, from the ?view= query parameter — the form every host serves.
 //
-// Unknown or empty view → 302 to <base>/dashboard so /admin canonicalizes to
-// /admin/dashboard and bookmarks of removed views still resolve sensibly.
+// Whether URLs GENERATED for this session are path-style or query-style is
+// decided by Urls::adminUsesPathUrls(): path URLs only where the host
+// provably routes them (clean mode, or this very request arrived with a
+// PATH_INFO tail). Everywhere else — notably the WordPress-alongside install
+// on a stock nginx host (Local WP), where /barebits/admin.php/dashboard
+// falls through the web server into WordPress's themed 404 — views ride
+// admin.php?view=… instead.
+//
+// Unknown or empty view: with path URLs, 302 to <base>/dashboard so /admin
+// canonicalizes to /admin/dashboard and bookmarks of removed views still
+// resolve sensibly; with query URLs, serve the dashboard directly (a
+// path-style redirect is exactly what such hosts cannot serve).
 // -----------------------------------------------------------------------------
 const ADMIN_VIEWS = ['dashboard', 'invoices', 'customers', 'stores', 'products', 'settings', 'stats', 'log'];
 
+$adminUsesPathUrls = Urls::adminUsesPathUrls($_SERVER['PATH_INFO'] ?? null, Config::getUrlMode());
+
 $rawAdminView = trim((string)($_SERVER['PATH_INFO'] ?? ''), '/');
+if ($rawAdminView === '' && isset($_GET['view'])) {
+    $rawAdminView = (string)$_GET['view'];
+}
 
 // Compute the base path the JS uses to build view URLs and to call back into
 // admin.php for ?api=... requests: REQUEST_URI minus the PATH_INFO tail and
@@ -3799,12 +3815,18 @@ if ($adminBasePath === '') {
     $adminBasePath = rtrim(Urls::admin(), '/');
 }
 
-// Canonicalize: unknown or empty view → /admin/dashboard, preserving query.
+// Canonicalize: unknown or empty view → /admin/dashboard, preserving query —
+// but only where path URLs provably route (see above). Query-URL hosts serve
+// the dashboard directly: the request's own query string is already in place,
+// and the client canonicalizes the visible URL via history.replaceState.
 if (!in_array($rawAdminView, ADMIN_VIEWS, true)) {
-    $reqQuery = parse_url((string)($_SERVER['REQUEST_URI'] ?? ''), PHP_URL_QUERY);
-    $location = $adminBasePath . '/dashboard' . ($reqQuery ? '?' . $reqQuery : '');
-    header('Location: ' . $location);
-    exit;
+    if ($adminUsesPathUrls) {
+        $reqQuery = parse_url((string)($_SERVER['REQUEST_URI'] ?? ''), PHP_URL_QUERY);
+        $location = $adminBasePath . '/dashboard' . ($reqQuery ? '?' . $reqQuery : '');
+        header('Location: ' . $location);
+        exit;
+    }
+    $rawAdminView = 'dashboard';
 }
 
 $adminView = $rawAdminView;
@@ -7563,12 +7585,16 @@ header('Cache-Control: no-cache, must-revalidate');
             role:     <?= json_encode($currentRole) ?>,
             email:    <?= json_encode($currentUser['email'] ?? null) ?>,
         };
-        // Path-based SPA routing: adminBasePath is the URL prefix the user
-        // reached the admin under (no trailing slash, no view tail). All view
-        // URLs and ?api=... fetches build off this so the same code works
-        // under direct and router modes — and under PATH_INFO
-        // where relative URLs would otherwise resolve incorrectly.
+        // SPA routing: adminBasePath is the URL prefix the user reached the
+        // admin under (no trailing slash, no view tail). All view URLs and
+        // ?api=... fetches build off this so the same code works under
+        // direct and router modes — and under PATH_INFO where relative URLs
+        // would otherwise resolve incorrectly. adminUsesPathUrls picks the
+        // view-URL shape: path-style (/admin/invoices) where the host
+        // provably routes it, query-style (admin.php?view=invoices)
+        // everywhere else — see the server-side routing block above.
         const adminBasePath = <?= json_encode($adminBasePath) ?>;
+        const adminUsesPathUrls = <?= json_encode($adminUsesPathUrls) ?>;
         const adminUrl = adminBasePath;
         const setupUrl = <?= json_encode(Urls::setup()) ?>;
         // Public shop front page (managed installs) — where payer-facing
@@ -8273,9 +8299,16 @@ header('Cache-Control: no-cache, must-revalidate');
         // Build a URL for a view, preserving the invoices ?status filter when
         // navigating between invoices states. Other views drop the query
         // string — none of them currently carry URL-resident state.
+        // Path-style only where the host provably routes it; otherwise the
+        // ?view= query form, which every host serves (see adminUsesPathUrls).
         function urlForView(view, query) {
-            let url = adminBasePath + '/' + view;
-            if (query) url += '?' + query;
+            if (adminUsesPathUrls) {
+                let url = adminBasePath + '/' + view;
+                if (query) url += '?' + query;
+                return url;
+            }
+            let url = adminBasePath + '?view=' + encodeURIComponent(view);
+            if (query) url += '&' + query;
             return url;
         }
 
@@ -8295,9 +8328,12 @@ header('Cache-Control: no-cache, must-revalidate');
         // Browser Back/Forward should navigate between admin views without a
         // full page reload — derive the target view from the new URL.
         window.addEventListener('popstate', () => {
+            // Query-form URLs carry the view in ?view=; path-form URLs carry
+            // it as the last non-empty path segment. Check the query first —
+            // it is only ever present on query-form URLs.
+            const qsView = new URLSearchParams(window.location.search).get('view');
             const path = window.location.pathname;
-            // The view slug is the last non-empty path segment.
-            const seg = path.split('/').filter(Boolean).pop() || 'dashboard';
+            const seg = qsView || path.split('/').filter(Boolean).pop() || 'dashboard';
             const view = ADMIN_VIEWS.includes(seg) ? seg : 'dashboard';
             switchView(view, { replace: true });
         });
