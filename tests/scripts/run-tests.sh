@@ -31,6 +31,34 @@ case "$BACKEND" in
   *) echo "[run-tests] invalid --backend=${BACKEND} (phps|apache|nginx|all)" >&2; exit 2 ;;
 esac
 
+# Resource preflight: a full pass eats ~4-5G of tests/.tmp workdirs and the
+# fixture stack (bitcoind + 2 LND + 2 mints + Chromium) sits at ~2-3G RSS.
+# Refuse to start a doomed multi-hour run on a box that will OOM or fill the
+# disk mid-pass; re-checked between backend passes because a red pass keeps
+# its workdirs. CASHUPAY_SKIP_PREFLIGHT=1 bypasses (e.g. tiny targeted runs).
+preflight_resources() {
+  local label="$1"
+  if [ -n "${CASHUPAY_SKIP_PREFLIGHT:-}" ]; then
+    return 0
+  fi
+  local disk_gb mem_gb
+  disk_gb=$(df -Pk "${TESTS_DIR}" | awk 'NR==2 {print int($4 / 1024 / 1024)}')
+  mem_gb=$(awk '/MemAvailable/ {print int($2 / 1024 / 1024)}' /proc/meminfo)
+  if [ "$disk_gb" -lt 4 ] || [ "$mem_gb" -lt 2 ]; then
+    echo "[run-tests] ABORT (${label}): ${disk_gb}G disk free / ${mem_gb}G RAM available;" \
+         "need >=4G disk and >=2G RAM. Stale workdirs under tests/.tmp/ and orphaned" \
+         "fixture processes from killed runs are the usual culprits" \
+         "(CASHUPAY_SKIP_PREFLIGHT=1 overrides)." >&2
+    exit 3
+  fi
+  if [ "$disk_gb" -lt 10 ]; then
+    echo "[run-tests] warning (${label}): only ${disk_gb}G disk free — a red pass keeps its workdirs and may not fit" >&2
+  fi
+  if [ "$mem_gb" -lt 4 ]; then
+    echo "[run-tests] warning (${label}): only ${mem_gb}G RAM available — check for stale fixture processes before heavy suites" >&2
+  fi
+}
+
 # The docker backends need `sudo -n docker`; warn early so a passwordless-sudo
 # gap doesn't surface as a fully-skipped pass an hour in.
 if [ "$BACKEND" != "phps" ]; then
@@ -95,6 +123,7 @@ fi
 # 5. Hand off to pytest
 cd "${TESTS_DIR}"
 if [ "$BACKEND" != "all" ]; then
+  preflight_resources "$BACKEND"
   export CASHUPAY_TEST_BACKEND="$BACKEND"
   exec pytest "${PYTEST_ARGS[@]+"${PYTEST_ARGS[@]}"}"
 fi
@@ -105,6 +134,7 @@ overall=0
 for backend in phps apache nginx; do
   echo ""
   echo "[run-tests] ===== pytest pass: CASHUPAY_TEST_BACKEND=${backend} ====="
+  preflight_resources "$backend"
   if CASHUPAY_TEST_BACKEND="$backend" pytest "${PYTEST_ARGS[@]+"${PYTEST_ARGS[@]}"}"; then
     RESULTS[$backend]="pass"
     # A green pass's workdirs (~4-5G of payserver data dirs + WP trees per

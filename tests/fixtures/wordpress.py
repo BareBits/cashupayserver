@@ -13,12 +13,14 @@ without the /barebits rules and PATH_INFO support.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import shutil
 import sqlite3
 import subprocess
 import time
 import urllib.request
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -87,6 +89,9 @@ class WordPressHandle:
     workdir: Path
     php_exe: Path
     wp_cli_phar: Path
+    # Set when the install came from (or built) the WooCommerce golden
+    # template: the pre-created virtual product's id. None on plain installs.
+    woo_product_id: int | None = None
 
     @property
     def process(self) -> subprocess.Popen[bytes] | None:
@@ -377,6 +382,8 @@ def start_wordpress(
     release_channel: str | None = None,
     emulate_rewrites: bool = True,
     php_workers: int | None = None,
+    with_woocommerce: bool = False,
+    _from_template: bool = True,
 ) -> WordPressHandle:
     """Stand up a fresh SQLite-backed WordPress install.
 
@@ -399,6 +406,22 @@ def start_wordpress(
     below) — a small value emulates hosts with tight per-site PHP pools
     (Local WP), where nested same-site loopback requests starve into
     timeouts.
+
+    with_woocommerce=True yields an install that already carries WooCommerce +
+    the BTCPay gateway + the configured BTC store and one virtual product
+    (`install_woocommerce`'s end state); the product id is on
+    `handle.woo_product_id`.
+
+    Golden templates: the first install of each DB-affecting shape (bare /
+    plugin / plugin+woocommerce) per pytest session is kept as a golden tree,
+    and later installs of that shape are file-copies of it — skipping
+    `wp core install` and plugin activations entirely. Safe because every
+    URL-bearing value WordPress persists is overridden at runtime by the
+    WP_HOME/WP_SITEURL constants in the per-clone wp-config.php (regenerated
+    with the clone's own port), and release_api_base/release_channel/
+    emulate_rewrites/php_workers are all serve-time parameters, not DB state.
+    Set CASHUPAY_WP_NO_TEMPLATE=1 to force the old fresh-install-per-test
+    behaviour.
     """
     php_exe = binaries.ensure(binaries.PHP)["php"]
     wp_cli_phar = binaries.ensure_file(binaries.WP_CLI)
@@ -413,10 +436,29 @@ def start_wordpress(
         "barebits-data-" + hashlib.sha256(f"{wp_root}/".encode()).hexdigest()[:12]
     )
 
+    use_template = (
+        _from_template
+        and not os.environ.get("CASHUPAY_WP_NO_TEMPLATE")
+        and not wp_root.exists()
+    )
+    woo_product_id: int | None = None
+    if use_template:
+        golden_wp, meta = _ensure_golden_install(
+            install_cashupay=install_cashupay, with_woocommerce=with_woocommerce
+        )
+        # cp -a: preserves the symlinked wp.org plugins and is much faster
+        # than shutil.copytree on WP core's thousands of small files. The
+        # suite is Linux-only (tests/README.md).
+        subprocess.run(
+            ["cp", "-a", str(golden_wp), str(wp_root)], check=True, timeout=120
+        )
+        woo_product_id = meta.get("product_id")
+
     # 1. Copy WP core into wp_root (fresh per test; isolated).
-    core = _ensure_wp_core()
-    if not wp_root.exists():
-        shutil.copytree(core, wp_root)
+    if not use_template:
+        core = _ensure_wp_core()
+        if not wp_root.exists():
+            shutil.copytree(core, wp_root)
 
     # 1b. The standard WordPress .htaccess block, which every real Apache WP
     #     install has. wp-cli's `rewrite --hard` cannot write it (CLI SAPI ⇒
@@ -456,9 +498,12 @@ def start_wordpress(
 
     # 4. wp-config.php with SQLite config + WP_HOME (+ the release-server
     #    constants the plugin's installer reads, when the caller provides them).
+    #    A template clone force-overwrites the golden's config: the clone's own
+    #    port and release constants live here, and the WP_HOME/WP_SITEURL
+    #    constants are what make the golden's DB-stored URLs irrelevant.
     port = ports.allocate(1)[0]
     config = wp_root / "wp-config.php"
-    if not config.exists():
+    if use_template or not config.exists():
         config.write_text(
             _wp_config_php(
                 port=port,
@@ -477,41 +522,45 @@ def start_wordpress(
         )
     )
 
-    # 6. wp core install (uses the static PHP via wp-cli).
-    install_env = os.environ.copy()
-    subprocess.run(
-        [
-            str(php_exe), str(wp_cli_phar),
-            f"--path={wp_root}",
-            "--allow-root",
-            "core", "install",
-            f"--url=http://127.0.0.1:{port}",
-            f"--title={WP_SITE_TITLE}",
-            f"--admin_user={WP_ADMIN_USER}",
-            f"--admin_password={WP_ADMIN_PASSWORD}",
-            f"--admin_email={WP_ADMIN_EMAIL}",
-            "--skip-email",
-        ],
-        env=install_env,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-
-    # 7. Activate cashupay plugin (unless the caller installs the zip itself).
-    if install_cashupay:
+    # 6. wp core install (uses the static PHP via wp-cli). A template clone
+    #    carries the golden's installed DB, so both install and activation
+    #    are already done.
+    if not use_template:
+        install_env = os.environ.copy()
         subprocess.run(
             [
                 str(php_exe), str(wp_cli_phar),
                 f"--path={wp_root}",
                 "--allow-root",
-                "plugin", "activate", "cashupay",
+                "core", "install",
+                f"--url=http://127.0.0.1:{port}",
+                f"--title={WP_SITE_TITLE}",
+                f"--admin_user={WP_ADMIN_USER}",
+                f"--admin_password={WP_ADMIN_PASSWORD}",
+                f"--admin_email={WP_ADMIN_EMAIL}",
+                "--skip-email",
             ],
             env=install_env,
             check=True,
             capture_output=True,
             text=True,
         )
+
+        # 7. Activate cashupay plugin (unless the caller installs the zip
+        #    itself).
+        if install_cashupay:
+            subprocess.run(
+                [
+                    str(php_exe), str(wp_cli_phar),
+                    f"--path={wp_root}",
+                    "--allow-root",
+                    "plugin", "activate", "cashupay",
+                ],
+                env=install_env,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
 
     # 8. Serve the tree on the active backend.
     env = os.environ.copy()
@@ -561,13 +610,69 @@ def start_wordpress(
         workdir=workdir,
         php_exe=php_exe,
         wp_cli_phar=wp_cli_phar,
+        woo_product_id=woo_product_id,
     )
     try:
         handle.wait_ready()
+        if with_woocommerce and woo_product_id is None:
+            # Non-template path (golden build itself, or templates disabled):
+            # install WooCommerce for real on the now-running site.
+            info = install_woocommerce(handle)
+            handle.woo_product_id = info["product_id"]
     except Exception:
         stop_wordpress(handle)
         raise
     return handle
+
+
+# ---------- golden templates (one real install per shape per session) ----------
+#
+# Cache key is the install's DB-affecting shape only. release_api_base /
+# release_channel are wp-config constants (rewritten per clone), and
+# emulate_rewrites / php_workers only shape serving — none of them touch the
+# installed tree or the SQLite DB.
+_GOLDEN_CACHE: dict[str, tuple[Path, dict]] = {}
+
+
+def _golden_template_key(*, install_cashupay: bool, with_woocommerce: bool) -> str:
+    if with_woocommerce:
+        return "woo"
+    return "plugin" if install_cashupay else "bare"
+
+
+def _ensure_golden_install(
+    *, install_cashupay: bool, with_woocommerce: bool
+) -> tuple[Path, dict]:
+    """Build (once per session) and return (golden wp_root, meta) for the
+    requested shape. The golden is produced by the exact same code path a
+    templateless install takes — server booted, wizard-equivalent wp-cli
+    install run, plugins activated, then stopped — so clones inherit a state
+    byte-identical to what each test used to build for itself."""
+    key = _golden_template_key(
+        install_cashupay=install_cashupay, with_woocommerce=with_woocommerce
+    )
+    if key in _GOLDEN_CACHE:
+        return _GOLDEN_CACHE[key]
+
+    workdir = TESTS_DIR / ".tmp" / f"wp-golden-{key}-{uuid.uuid4().hex[:8]}"
+    print(f"[wp] building golden '{key}' WordPress template (once per session) ...")
+    handle = start_wordpress(
+        workdir,
+        install_cashupay=install_cashupay or with_woocommerce,
+        with_woocommerce=with_woocommerce,
+        _from_template=False,
+    )
+    try:
+        meta: dict = {}
+        if handle.woo_product_id is not None:
+            meta["product_id"] = handle.woo_product_id
+    finally:
+        stop_wordpress(handle)
+    # Serve-time leftovers (router wrapper, server log) stay outside wp/ and
+    # are never cloned; the golden's wp-config.php is overwritten per clone.
+    (workdir / "template-meta.json").write_text(json.dumps({"key": key, **meta}))
+    _GOLDEN_CACHE[key] = (handle.wp_root, meta)
+    return _GOLDEN_CACHE[key]
 
 
 def stop_wordpress(handle: WordPressHandle) -> None:
@@ -699,6 +804,16 @@ def install_woocommerce(handle: WordPressHandle) -> dict:
         "woocommerce_coming_soon": "no",
         # Skip the onboarding wizard so the REST endpoints behave normally.
         "woocommerce_task_list_hidden": "yes",
+        # Pin order storage to the legacy posts table, and drop the
+        # "newly installed" flag WC's deferred HPOS-for-new-shops job keys
+        # off. Without the pin that job flips HPOS on minutes after install
+        # (fresh per-test installs never lived long enough to see it; golden
+        # clones boot with it overdue), and the HPOS order table's DECIMAL
+        # column round-trips through SQLite as a REAL — 0.00001500 comes back
+        # "1.5e-05", which the BTCPay gateway's bcmath-based amount parsing
+        # truncates at the exponent into a 1.5 BTC invoice.
+        "woocommerce_custom_orders_table_enabled": "no",
+        "woocommerce_newly_installed": "no",
     }.items():
         handle.wp_cli("option", "update", key, value, check=False)
     handle.wp_cli(
