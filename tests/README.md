@@ -43,7 +43,10 @@ The app under test is served by one of three backends, selected with
 - `./scripts/run-tests.sh` with **no** `--backend` flag runs the full suite on
   **all three** sequentially (the local full-coverage run, ~3h). Pass
   `--backend=phps|apache|nginx` for a single pass — CI pins `--backend=phps`
-  and covers the webservers with the fast `webserver-smoke` workflow instead.
+  for the full suite, covers the standalone server on real webservers with
+  the fast `webserver-smoke` workflow, and runs the WooCommerce checkout
+  tier (plugin zip install → wiring → guest + browser checkout → Lightning
+  settle) on real Apache and nginx in the `wp-checkout` job of `tests.yml`.
 - Containers run with `--network=host`, as your uid, with the repo bind-mounted
   at its own path, so URLs, data dirs, and sqlite access behave exactly as
   under `php -S`. Test images build once (content-hash tagged) on first use.

@@ -539,6 +539,7 @@ function cashupay_ensure_woocommerce_integration(string $store_id, string $api_k
     cashupay_enable_btcpay_gateway();
     cashupay_apply_btcpay_gateway_branding($discountPercent);
     cashupay_apply_btcpay_order_states();
+    cashupay_pin_order_storage_for_sqlite();
 
     // Consent is single-use: it covered the server that was just replaced.
     // Deleted on every successful wiring (not only a consented takeover) so
@@ -556,6 +557,87 @@ function cashupay_ensure_woocommerce_integration(string $store_id, string $api_k
 }
 
 /**
+ * Decide whether the wiring should pin WooCommerce's order storage to the
+ * legacy posts table. Pure (no WordPress calls) so tests/php can pin the
+ * matrix.
+ *
+ * Why pin at all: on the SQLite database drop-in, HPOS's DECIMAL total
+ * column is a REAL. The drop-in stringifies the value it reads back the way
+ * PHP prints floats — a 0.00001500 BTC total becomes "1.5E-5" — and
+ * WooCommerce's wc_format_decimal() strips every character outside
+ * [0-9.-] during order hydration, mangling it to 1.50000000. Every consumer
+ * of the order total (this gateway's invoice amount first among them, but
+ * also order emails, refunds, reports) sees the wrong number, and no filter
+ * fires early enough to repair it. The posts-table store keeps totals as
+ * plain-decimal meta strings and is immune. WooCommerce auto-enables HPOS
+ * on every new shop, so SQLite hosts hit this out of the box.
+ *
+ * The one state left alone is HPOS already on WITH orders already in its
+ * table: flipping storage then would make those orders invisible (they
+ * only migrate back via WooCommerce's own sync tooling), which is worse
+ * than degraded totals. Everything else on a SQLite host is pinned —
+ * including HPOS freshly auto-enabled before any order exists.
+ *
+ * Returns 'pin' or 'leave'.
+ */
+function cashupay_order_storage_pin_decision(bool $sqliteEngine, bool $hposEnabled, int $hposOrderCount): string {
+    if (!$sqliteEngine) {
+        return 'leave'; // real MySQL DECIMAL columns round-trip exactly
+    }
+    if ($hposEnabled && $hposOrderCount > 0) {
+        return 'leave'; // never orphan existing HPOS orders
+    }
+    return 'pin';
+}
+
+/**
+ * Apply cashupay_order_storage_pin_decision on this host: pin order storage
+ * to the posts table, and drop the "newly installed" flag WooCommerce's
+ * deferred HPOS-for-new-shops job keys off (without that, the job flips
+ * HPOS back on minutes after the wiring ran).
+ *
+ * Runs on every successful wiring — first onboarding and every re-run —
+ * so a shop whose host later gains the auto-enabled flag gets re-pinned
+ * the next time the merchant re-wires.
+ */
+function cashupay_pin_order_storage_for_sqlite(): void {
+    global $wpdb;
+    $sqlite = (defined('DB_ENGINE') && DB_ENGINE === 'sqlite')
+        || class_exists('WP_SQLite_Translator', false)
+        || (isset($wpdb) && is_a($wpdb, 'WP_SQLite_DB'));
+    if (!$sqlite) {
+        return;
+    }
+
+    $hposEnabled = get_option('woocommerce_custom_orders_table_enabled') === 'yes';
+    $hposOrderCount = 0;
+    if ($hposEnabled) {
+        // The table exists whenever WooCommerce has HPOS enabled; suppress
+        // the drop-in's error chatter anyway in case it does not.
+        $suppress = $wpdb->suppress_errors();
+        $hposOrderCount = (int) $wpdb->get_var(
+            "SELECT COUNT(*) FROM {$wpdb->prefix}wc_orders"
+        );
+        $wpdb->suppress_errors($suppress);
+    }
+
+    if (cashupay_order_storage_pin_decision($sqlite, $hposEnabled, $hposOrderCount) === 'pin') {
+        try {
+            update_option('woocommerce_custom_orders_table_enabled', 'no');
+        } catch (\Throwable $e) {
+            // WooCommerce THROWS from pre_update_option when orders are
+            // pending sync between the two stores
+            // (CustomOrdersTableController::process_pre_update_option). The
+            // pin-decision inputs make that unreachable in any state
+            // WooCommerce itself can produce, but a shop in a state we did
+            // not foresee must degrade to unpinned totals — never to a
+            // fatal that breaks the wiring and the merchant's onboarding.
+        }
+        update_option('woocommerce_newly_installed', 'no');
+    }
+}
+
+/**
  * Point the BTCPay WooCommerce plugin at the connected BareBits server.
  */
 function cashupay_configure_btcpay_plugin(string $store_id, string $api_key): array {
@@ -569,7 +651,10 @@ function cashupay_configure_btcpay_plugin(string $store_id, string $api_key): ar
         ];
     }
 
-    update_option('btcpay_gf_url', cashupay_server_url());
+    // The gateway base: api.php's query-transport form for a same-origin
+    // alongside install (one loopback deep on every host — see
+    // cashupay_gateway_base_url), the canonical URL for remote servers.
+    update_option('btcpay_gf_url', cashupay_gateway_server_url());
     update_option('btcpay_gf_api_key', $api_key);
     update_option('btcpay_gf_store_id', $store_id);
 

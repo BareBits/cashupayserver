@@ -166,7 +166,7 @@ def test_install_mode_end_to_end(wordpress_install_mode, mint, backup_mint) -> N
     body = post_onboarding(s, wp, "cashupay_finish", {"cashupay_discount_percent": "3"})
     assert "WooCommerce now takes Bitcoin" in body, body[:2000]
 
-    assert wp_option(wp, "btcpay_gf_url") == wp.barebits_url
+    assert wp_option(wp, "btcpay_gf_url") == wp.barebits_gateway_url
     assert wp_option(wp, "btcpay_gf_store_id") == store_id
     assert wp_option(wp, "btcpay_gf_api_key") == internal_key["internal_api_key"]
 

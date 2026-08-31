@@ -106,6 +106,21 @@ fi
 
 check_status "clean URL /setup routes" "$BASE/setup" 200
 check_status "clean URL /admin routes" "$BASE/admin" 200 302
+
+# /i/{invoiceId} is the BTCPay-compatible invoice URL BTCPay API clients (the
+# WooCommerce gateway's "pay again" link) build themselves off the server URL;
+# the front controller serves it through payment.php. payment.php's own
+# answers ("Service unavailable" pre-setup, "Invoice not found" for a bogus
+# id) prove the route reached PHP — a bare web-server 404 body means it never
+# did.
+fetch "$BASE/i/smoke-nonexistent"
+if { [ "$STATUS" = "503" ] && printf '%s' "$BODY" | grep -q "Service unavailable"; } \
+    || { [ "$STATUS" = "404" ] && printf '%s' "$BODY" | grep -q "Invoice not found"; }; then
+  ok "BTCPay invoice URL /i/{id} routes (payment.php answered $STATUS)"
+else
+  fail "BTCPay invoice URL /i/{id}: got $STATUS, wanted payment.php's 503/404 body" \
+       "body: $(echo "$BODY" | head -c 200)"
+fi
 check_status "API rewrite /api/v1/server/info" "$BASE/api/v1/server/info" 200 401 503
 check_status "BTCPay alias /v1/server/info" "$BASE/v1/server/info" 200 401 503
 check_status "pairing endpoint /api-keys/authorize" "$BASE/api-keys/authorize" 200 302 400 401 405 503

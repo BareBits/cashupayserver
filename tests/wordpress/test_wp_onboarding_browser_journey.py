@@ -164,6 +164,26 @@ def _finish_wizard_via_return(page) -> None:
     page.wait_for_selector(".notice p:has-text('Connected!')")
 
 
+def _assert_dashboard_reachable(page, wp: WordPressHandle) -> None:
+    """The journey is only over when the merchant can actually USE the thing:
+    re-open the BareBits wp-admin page in its configured state and require the
+    embedded admin dashboard to render, signed in through the SSO handoff.
+
+    This is the regression guard for the hostile-host dashboard 404: admin.php
+    used to 302 every bare request to /barebits/admin.php/dashboard — a
+    PATH_INFO-style URL that stock-nginx hosts (Local WP) route into
+    WordPress's themed "Page not found", stranding the operator with no way
+    into the admin at all. Both journeys assert this so the friendly host
+    pins the SSO handoff too.
+    """
+    page.goto(f"{wp.url}/wp-admin/admin.php?page=cashupay")
+    frame = page.frame_locator("#cashupay-admin-frame")
+    # Signed in automatically (SSO): the lock screen must be hidden — if the
+    # iframe landed on WordPress's 404 neither selector ever appears.
+    frame.locator("#lock-screen.hidden").wait_for(state="attached")
+    frame.locator("#view-dashboard.active").wait_for()
+
+
 def test_full_merchant_journey_in_browser(wordpress_bare_install, wp_plugin_zip, page) -> None:
     wp = wordpress_bare_install
     page.set_default_timeout(60_000)
@@ -198,10 +218,12 @@ def test_full_merchant_journey_in_browser(wordpress_bare_install, wp_plugin_zip,
     page.wait_for_selector(".notice p:has-text('WooCommerce now takes Bitcoin')")
 
     assert wp_option(wp, "cashupay_store_id") != ""
-    assert wp_option(wp, "btcpay_gf_url") == wp.barebits_url
+    assert wp_option(wp, "btcpay_gf_url") == wp.barebits_gateway_url
     assert wp_option(wp, "cashupay_wired_at") != ""
     # The one-time provisioning token is spent.
     assert wp_option(wp, "cashupay_provision_token") == ""
+
+    _assert_dashboard_reachable(page, wp)
 
 
 def test_full_journey_on_rewrite_hostile_host(wordpress_hostile_host, page) -> None:
@@ -243,5 +265,9 @@ def test_full_journey_on_rewrite_hostile_host(wordpress_hostile_host, page) -> N
     page.fill("#cashupay-discount", "0")
     page.click("#submit")
     page.wait_for_selector(".notice p:has-text('WooCommerce now takes Bitcoin')")
-    assert wp_option(wp, "btcpay_gf_url") == wp.barebits_url
+    assert wp_option(wp, "btcpay_gf_url") == wp.barebits_gateway_url
     assert wp_option(wp, "cashupay_wired_at") != ""
+
+    # The whole point of this host shape: the dashboard must render even
+    # though every PATH_INFO URL under /barebits 404s into WordPress.
+    _assert_dashboard_reachable(page, wp)

@@ -203,6 +203,28 @@ class Urls {
     }
 
     /**
+     * Whether the admin SPA may emit path-style view URLs
+     * (/admin/<view>, /admin.php/<view>) for this request, as opposed to the
+     * query form (admin.php?view=<view>) that works on every host.
+     *
+     * Path URLs are only used where the host provably routes them: clean
+     * mode's front controller was verified by the setup wizard's probe, and a
+     * request that itself ARRIVED carrying PATH_INFO proves the serving host
+     * forwards path tails to admin.php. A bare admin.php request in any other
+     * mode must get query URLs: PATH_INFO-hostile hosts (a stock nginx
+     * WordPress config — Local WP, most managed nginx — or php -S) execute
+     * only real *.php URLs, and a path-style URL there falls through the web
+     * server into the surrounding site's 404 page with no way back into the
+     * admin.
+     *
+     * Pure (no Config/global reads) so tests/php can pin the matrix; the live
+     * caller is admin.php's view-routing block.
+     */
+    public static function adminUsesPathUrls(?string $pathInfo, string $urlMode): bool {
+        return $urlMode === 'clean' || ($pathInfo !== null && $pathInfo !== '');
+    }
+
+    /**
      * Get site base URL (for security tests and redirects)
      */
     public static function siteBase(): string {
