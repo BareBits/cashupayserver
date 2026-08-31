@@ -41,8 +41,18 @@ from fixtures.wordpress import WordPressHandle
 
 pytestmark = pytest.mark.wordpress
 
-STORE_API = "/wp-json/wc/store/v1"
 GATEWAY_ID = "btcpaygf_default"
+
+
+def _store_api(wp: WordPressHandle, path: str) -> str:
+    """A WooCommerce Store API endpoint in the ?rest_route= query form — the
+    one URL shape every host serves. The pretty /wp-json route needs working
+    rewrites: on the apache hostile shape (AllowOverride None, no .htaccess)
+    it plain 404s, which is exactly how WordPress behaves on such hosts —
+    they run plain permalinks and WordPress itself emits ?rest_route= URLs.
+    The buyer browser journey still exercises whatever URL shape the checkout
+    page's own JS uses on a friendly host."""
+    return f"{wp.url}/?rest_route=/wc/store/v1{path}"
 
 
 def _flush_rewrites(wp: WordPressHandle) -> None:
@@ -106,11 +116,10 @@ def _checkout_response(wp: WordPressHandle, product_id: int) -> requests.Respons
     """The raw Store API checkout exchange behind _place_order, for tests that
     expect the payment step to fail."""
     s = requests.Session()
-    base = wp.url + STORE_API
 
     # Priming GET issues the Store API nonce + a Cart-Token that carries the
     # guest cart across the stateless requests that follow.
-    r = s.get(f"{base}/cart", timeout=30)
+    r = s.get(_store_api(wp, "/cart"), timeout=30)
     r.raise_for_status()
     nonce = r.headers.get("Nonce") or r.headers.get("X-WC-Store-API-Nonce")
     cart_token = r.headers.get("Cart-Token")
@@ -124,7 +133,7 @@ def _checkout_response(wp: WordPressHandle, product_id: int) -> requests.Respons
         return h
 
     r = s.post(
-        f"{base}/cart/add-item",
+        _store_api(wp, "/cart/add-item"),
         json={"id": product_id, "quantity": 1},
         headers=headers(),
         timeout=30,
@@ -142,7 +151,7 @@ def _checkout_response(wp: WordPressHandle, product_id: int) -> requests.Respons
         },
         "payment_method": GATEWAY_ID,
     }
-    return s.post(f"{base}/checkout", json=payload, headers=headers(), timeout=60)
+    return s.post(_store_api(wp, "/checkout"), json=payload, headers=headers(), timeout=60)
 
 
 def _order_field(wp: WordPressHandle, order_id: int, method: str) -> str:
