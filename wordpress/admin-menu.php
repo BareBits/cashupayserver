@@ -169,6 +169,7 @@ function cashupay_connection_page(): void {
         <p style="margin-top: 1em;">
             <a href="<?= esc_url($server . '/admin.php') ?>" target="_blank" rel="noopener" class="button button-primary">Open the BareBits admin<?= $mode === 'install' ? ' in a new tab' : '' ?></a>
         </p>
+        <?php cashupay_render_discount_settings(); ?>
         <form method="post" action="<?= esc_url(admin_url('admin-post.php')) ?>" style="margin-top: 1em;">
             <?php wp_nonce_field('cashupay_finish'); ?>
             <input type="hidden" name="action" value="cashupay_finish">

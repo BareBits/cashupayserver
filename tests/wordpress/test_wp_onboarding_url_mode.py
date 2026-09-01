@@ -4,7 +4,7 @@ A separate, already-configured standalone payserver plays the merchant's
 existing server. The plugin validates the URL, pairs through the server's
 BTCPay-compatible /api-keys/authorize redirect flow (state-token
 authenticated callback), then wires WooCommerce: gateway plugin options,
-webhook registered over the Greenfield API, branding, ELEX discount.
+webhook registered over the Greenfield API, branding, discount saved.
 """
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ from wordpress.conftest import (
     wp_login,
     wp_option,
 )
-from fixtures.wordpress import install_woocommerce, stage_elex_discount_plugin
+from fixtures.wordpress import install_woocommerce
 
 pytestmark = pytest.mark.wordpress
 
@@ -118,7 +118,6 @@ def test_url_mode_end_to_end(wordpress, woocommerce, configured) -> None:
     assert wp_option(wp, "cashupay_store_id") == configured.store_id
 
     # Finish: wire WooCommerce with a 2% discount.
-    stage_elex_discount_plugin(wp)
     body = post_onboarding(s, wp, "cashupay_finish", {"cashupay_discount_percent": "2"})
     assert "WooCommerce now takes Bitcoin" in body, body[:2000]
 
@@ -140,6 +139,9 @@ def test_url_mode_end_to_end(wordpress, woocommerce, configured) -> None:
     ours = [h for h in listed if h["id"] == webhook_opt["id"]]
     assert ours and ours[0]["enabled"] is True
 
+    # `wp option get` reads through the runtime title filter (a CLI context is
+    # not wp-admin), so this is the title customers see: suffixed with the
+    # discount the merchant just chose.
     gateway = json.loads(
         wp.wp_cli(
             "option", "get", "woocommerce_btcpaygf_default_settings", "--format=json"
@@ -148,15 +150,9 @@ def test_url_mode_end_to_end(wordpress, woocommerce, configured) -> None:
     assert gateway["enabled"] == "yes"
     assert "2% discount" in gateway["title"]
 
-    elex = json.loads(
-        wp.wp_cli(
-            "option", "get", "elex_discount_per_payment_method_options", "--format=json"
-        ).stdout.strip()
-    )
-    assert any(
-        rule.get("id") == "btcpaygf_default" and rule.get("value") == "2"
-        for rule in elex
-    ), elex
+    # The discount option itself carries the answer; the checkout fee and the
+    # title suffix are both derived from it at runtime (payment-discount.php).
+    assert wp_option(wp, "cashupay_discount_percent") == "2"
 
     # No cron pinger in URL mode: the remote server runs its own cron.
     assert wp_option(wp, "cashupay_cron_key") == ""

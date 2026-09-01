@@ -26,7 +26,9 @@
  *   cashupay_cron_last_ok      install mode: unix ts of the last successful
  *                              cron ping (drives the stale-heartbeat notice)
  *   cashupay_wired_at          unix ts when WooCommerce wiring completed
- *   cashupay_discount_percent  merchant's checkout discount answer (int)
+ *   cashupay_discount_percent  merchant's Bitcoin-checkout discount, percent
+ *                              0-100 with up to two decimals, stored as the
+ *                              normalized string payment-discount.php writes
  *   cashupay_pairing_expected  unix ts while a pairing redirect is in flight
  */
 

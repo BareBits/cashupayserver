@@ -45,7 +45,6 @@ from fixtures.wordpress import (
     WP_ADMIN_USER,
     WordPressHandle,
     install_woocommerce,
-    stage_elex_discount_plugin,
 )
 
 pytestmark = [pytest.mark.wordpress, pytest.mark.ui]
@@ -224,7 +223,6 @@ def test_full_merchant_journey_in_browser(wordpress_bare_install, wp_plugin_zip,
 
     # WooCommerce up front so the final wiring step has something to wire.
     install_woocommerce(wp)
-    stage_elex_discount_plugin(wp)
 
     # Install the BUILT plugin zip through wp-admin's upload form — the exact
     # artifact (and the exact path) a real merchant uses.

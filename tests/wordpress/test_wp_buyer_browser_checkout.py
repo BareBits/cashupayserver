@@ -58,6 +58,19 @@ def _fill_if_empty(page, selector: str, value: str) -> None:
         field.fill(value)
 
 
+def _fill_billing_blocks(page) -> None:
+    """Fill the blocks checkout's billing fields (only the ones the block
+    hasn't prefilled)."""
+    page.fill("#email", "buyer@example.test")
+    _fill_if_empty(page, "#billing-first_name", "Sat")
+    _fill_if_empty(page, "#billing-last_name", "Oshi")
+    _fill_if_empty(page, "#billing-country", "US")
+    _fill_if_empty(page, "#billing-address_1", "1 Genesis Block")
+    _fill_if_empty(page, "#billing-city", "Cypherpunk")
+    _fill_if_empty(page, "#billing-state", "CA")
+    _fill_if_empty(page, "#billing-postcode", "94016")
+
+
 def _checkout_blockers(page) -> str:
     """Collect whatever the blocks checkout is showing the shopper — error
     banners and per-field validation messages — for assertion output."""
@@ -71,6 +84,40 @@ def _checkout_blockers(page) -> str:
             if t:
                 texts.append(t)
     return "; ".join(texts) or "(no notice rendered)"
+
+
+def _click_place_order(page, events: list[str]) -> None:
+    """Click the blocks Place Order button with verify-and-retry: the click
+    occasionally lands while the block is re-rendering and gets swallowed, so
+    verify the checkout store actually left 'idle' and escalate through
+    alternative activation strategies if it didn't."""
+    def _checkout_left_idle() -> bool:
+        return page.evaluate(
+            """() => {
+                const sel = window.wp && window.wp.data && window.wp.data.select;
+                if (!sel) return false;
+                const c = sel('wc/store/checkout');
+                return !!(c && c.getCheckoutStatus && c.getCheckoutStatus() !== 'idle');
+            }"""
+        )
+
+    clicked = False
+    for attempt, do_click in (
+        ("css", lambda: page.click(".wc-block-components-checkout-place-order-button")),
+        ("role", lambda: page.get_by_role("button", name="Place Order").click()),
+        ("enter", lambda: page.locator(
+            ".wc-block-components-checkout-place-order-button").press("Enter")),
+    ):
+        do_click()
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if _checkout_left_idle():
+                clicked = True
+                break
+            time.sleep(0.25)
+        events.append(f"place-order attempt {attempt}: {'took' if clicked else 'ignored'}")
+        if clicked:
+            break
 
 
 def test_buyer_checks_out_and_pays_in_browser(
@@ -114,14 +161,7 @@ def test_buyer_checks_out_and_pays_in_browser(
     page.goto(checkout_url)
     page.wait_for_selector(".wc-block-checkout")
 
-    page.fill("#email", "buyer@example.test")
-    _fill_if_empty(page, "#billing-first_name", "Sat")
-    _fill_if_empty(page, "#billing-last_name", "Oshi")
-    _fill_if_empty(page, "#billing-country", "US")
-    _fill_if_empty(page, "#billing-address_1", "1 Genesis Block")
-    _fill_if_empty(page, "#billing-city", "Cypherpunk")
-    _fill_if_empty(page, "#billing-state", "CA")
-    _fill_if_empty(page, "#billing-postcode", "94016")
+    _fill_billing_blocks(page)
 
     # The BareBits-branded gateway must be offered, and selectable.
     gateway_radio = page.locator(
@@ -135,33 +175,7 @@ def test_buyer_checks_out_and_pays_in_browser(
     gateway_radio.check()
 
     # --- place the order; the gateway must hand the browser to BareBits ---
-    def _checkout_left_idle() -> bool:
-        return page.evaluate(
-            """() => {
-                const sel = window.wp && window.wp.data && window.wp.data.select;
-                if (!sel) return false;
-                const c = sel('wc/store/checkout');
-                return !!(c && c.getCheckoutStatus && c.getCheckoutStatus() !== 'idle');
-            }"""
-        )
-
-    clicked = False
-    for attempt, do_click in (
-        ("css", lambda: page.click(".wc-block-components-checkout-place-order-button")),
-        ("role", lambda: page.get_by_role("button", name="Place Order").click()),
-        ("enter", lambda: page.locator(
-            ".wc-block-components-checkout-place-order-button").press("Enter")),
-    ):
-        do_click()
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline:
-            if _checkout_left_idle():
-                clicked = True
-                break
-            time.sleep(0.25)
-        events.append(f"place-order attempt {attempt}: {'took' if clicked else 'ignored'}")
-        if clicked:
-            break
+    _click_place_order(page, events)
     try:
         page.wait_for_url(f"{configured.handle.url}/**", timeout=90_000)
     except Exception:
@@ -242,3 +256,103 @@ def test_buyer_checks_out_and_pays_in_browser(
     assert status in ("processing", "completed"), (
         f"order never reached a paid state (last status {status!r})"
     )
+
+
+def test_blocks_checkout_discount_updates_live_and_prices_the_invoice(
+    woocommerce,
+    configured,
+    page,
+) -> None:
+    """The Bitcoin discount on the BLOCKS checkout, in a real browser — the
+    scenario the retired ELEX plugin could never handle. Selecting the
+    BareBits gateway must add the discount row to the totals sidebar without
+    a reload (the plugin's discount-blocks.js syncs the selection through the
+    Store API), switching away must remove it, and the order placed with the
+    gateway must invoice the payserver for the DISCOUNTED amount.
+
+    Product: 1500 sats; 2.5% -> 37.5 sats, rounded to 38 -> 1462-sat total.
+    """
+    wp, info = woocommerce
+    page.set_default_timeout(60_000)
+    _flush_rewrites(wp)
+    _wire(wp, configured, percent="2.5")
+    # A second gateway so the payment-method choice is a real choice and the
+    # selection-change path is exercised in both directions.
+    wp.wp_cli("option", "update", "woocommerce_cod_settings", '{"enabled":"yes","enable_for_virtual":"yes"}',
+              "--format=json", check=False)
+
+    events: list[str] = []
+    page.on("console", lambda m: events.append(f"console[{m.type}] {m.text[:300]}"))
+    page.on("pageerror", lambda e: events.append(f"pageerror {str(e)[:300]}"))
+
+    product_url = _wp_eval(wp, f"echo get_permalink({info['product_id']});")
+    page.goto(product_url)
+    page.click("button.single_add_to_cart_button")
+    page.wait_for_selector(".woocommerce-message, .wc-block-components-notice-banner")
+
+    checkout_url = _wp_eval(wp, "echo wc_get_checkout_url();")
+    page.goto(checkout_url)
+    page.wait_for_selector(".wc-block-checkout")
+
+    fee_row = page.get_by_text("Bitcoin discount (2.5%)")
+    barebits_radio = page.locator(
+        "input[name='radio-control-wc-payment-method-options'][value='btcpaygf_default']"
+    )
+    cod_radio = page.locator(
+        "input[name='radio-control-wc-payment-method-options'][value='cod']"
+    )
+    barebits_radio.wait_for(state="attached")
+    cod_radio.wait_for(state="attached")
+
+    # Selecting BareBits shows the discount, live; the total drops with it.
+    barebits_radio.check()
+    fee_row.wait_for(state="visible")
+    footer = page.locator(".wc-block-components-totals-footer-item")
+    footer_shows = lambda amount: amount in " ".join(footer.inner_text().split())
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline and not footer_shows("0.00001462"):
+        time.sleep(0.25)
+    assert footer_shows("0.00001462"), (
+        f"discounted total never rendered; footer: {footer.inner_text()!r}; "
+        f"events: {events[-15:]}"
+    )
+
+    # Switching to COD removes it — the discount is BareBits-only.
+    cod_radio.check()
+    fee_row.wait_for(state="hidden")
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline and not footer_shows("0.00001500"):
+        time.sleep(0.25)
+    assert footer_shows("0.00001500"), (
+        f"full total never came back after deselecting; footer: {footer.inner_text()!r}"
+    )
+
+    # Back to BareBits, place the order: the payserver invoice must carry the
+    # discounted amount.
+    barebits_radio.check()
+    fee_row.wait_for(state="visible")
+    _fill_billing_blocks(page)
+    _click_place_order(page, events)
+    try:
+        page.wait_for_url(f"{configured.handle.url}/**", timeout=90_000)
+    except Exception:
+        shot = wp.workdir / "blocks-discount-failure.png"
+        page.screenshot(path=str(shot), full_page=True)
+        raise AssertionError(
+            "Place Order never reached the BareBits payment page; "
+            f"still on {page.url}; checkout shows: {_checkout_blockers(page)}; "
+            f"screenshot: {shot}; events: {events[-30:]}"
+        )
+
+    invoice_id = page.url.split("id=")[-1].split("&")[0]
+    inv = requests.get(
+        f"{configured.handle.url}/api/v1/stores/{configured.store_id}/invoices/{invoice_id}",
+        headers={"Authorization": f"token {configured.api_token}"},
+        timeout=15,
+    )
+    inv.raise_for_status()
+    assert float(inv.json()["amount"]) == pytest.approx(0.00001462), inv.json()
+
+    order_id = int(inv.json()["metadata"]["orderId"])
+    total = _order_field(wp, order_id, "get_total()")
+    assert float(total) == pytest.approx(0.00001462), total

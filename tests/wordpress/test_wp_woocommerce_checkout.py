@@ -74,14 +74,17 @@ def _connect_plugin(wp: WordPressHandle, configured) -> None:
 
 
 def _ensure_integration(
-    wp: WordPressHandle, store_id: str, api_key: str, percent: int = 0
+    wp: WordPressHandle, store_id: str, api_key: str, percent: str = "0"
 ) -> dict:
-    """Drive the one entry point cashupay_handle_finish calls: install-if-
-    needed + configure + webhook + enable + branding, all unattended. Returns
-    the function's status plus the resulting gateway-enabled flag and the
-    BTCPay URL the plugin ended up pointed at."""
+    """Drive the one entry point cashupay_handle_finish calls: save the
+    discount option, then install-if-needed + configure + webhook + enable +
+    branding, all unattended. Returns the function's status plus the
+    resulting gateway-enabled flag and the BTCPay URL the plugin ended up
+    pointed at. The reported title is the FILTERED read (wp-cli eval is not
+    wp-admin), i.e. the customer-facing one with the discount suffix."""
+    wp.wp_cli("option", "update", "cashupay_discount_percent", percent, check=False)
     snippet = f"""
-$res = cashupay_ensure_woocommerce_integration({store_id!r}, {api_key!r}, {percent});
+$res = cashupay_ensure_woocommerce_integration({store_id!r}, {api_key!r});
 $gw = get_option('woocommerce_{GATEWAY_ID}_settings', []);
 echo json_encode([
     'res' => $res,
@@ -94,7 +97,7 @@ echo json_encode([
     return json.loads(out)
 
 
-def _wire(wp: WordPressHandle, configured, percent: int = 0) -> dict:
+def _wire(wp: WordPressHandle, configured, percent: str = "0") -> dict:
     """Connect + wire the plugin against the live payserver and require the
     'ready' outcome every test below builds on."""
     _connect_plugin(wp, configured)
@@ -112,46 +115,74 @@ def _place_order(wp: WordPressHandle, product_id: int) -> dict:
     return r.json()
 
 
+BILLING_ADDRESS = {
+    "first_name": "Sat", "last_name": "Oshi",
+    "address_1": "1 Genesis Block", "city": "Cypherpunk",
+    "state": "CA", "postcode": "94016", "country": "US",
+    "email": "buyer@example.test", "phone": "5551234567",
+}
+
+
+class _StoreApiSession:
+    """A guest Store API session: one requests.Session plus the Nonce +
+    Cart-Token header dance that carries the cart across the stateless
+    requests. The priming GET issues both; every later response may rotate
+    them."""
+
+    def __init__(self, wp: WordPressHandle):
+        self.wp = wp
+        self.s = requests.Session()
+        r = self.s.get(_store_api(wp, "/cart"), timeout=30)
+        r.raise_for_status()
+        self.nonce = r.headers.get("Nonce") or r.headers.get("X-WC-Store-API-Nonce")
+        self.cart_token = r.headers.get("Cart-Token")
+
+    def _headers(self) -> dict:
+        h = {}
+        if self.nonce:
+            h["Nonce"] = self.nonce
+        if self.cart_token:
+            h["Cart-Token"] = self.cart_token
+        return h
+
+    def post(self, path: str, payload: dict, timeout: int = 30) -> requests.Response:
+        r = self.s.post(
+            _store_api(self.wp, path), json=payload, headers=self._headers(),
+            timeout=timeout,
+        )
+        self.nonce = r.headers.get("Nonce", self.nonce)
+        self.cart_token = r.headers.get("Cart-Token", self.cart_token)
+        return r
+
+    def add_item(self, product_id: int, quantity: int = 1) -> None:
+        r = self.post("/cart/add-item", {"id": product_id, "quantity": quantity})
+        assert r.status_code in (200, 201), f"add-item failed: {r.status_code} {r.text}"
+
+    def select_payment_method(self, method: str) -> dict:
+        """What the blocks checkout's discount script does on a payment-method
+        change: POST the selection through the cart/extensions endpoint, which
+        runs the plugin's update callback and returns the recalculated cart."""
+        r = self.post(
+            "/cart/extensions",
+            {"namespace": "cashupay-discount", "data": {"payment_method": method}},
+        )
+        assert r.status_code == 200, f"cart/extensions failed: {r.status_code} {r.text}"
+        return r.json()
+
+    def checkout(self, payment_method: str) -> requests.Response:
+        return self.post(
+            "/checkout",
+            {"billing_address": dict(BILLING_ADDRESS), "payment_method": payment_method},
+            timeout=60,
+        )
+
+
 def _checkout_response(wp: WordPressHandle, product_id: int) -> requests.Response:
     """The raw Store API checkout exchange behind _place_order, for tests that
     expect the payment step to fail."""
-    s = requests.Session()
-
-    # Priming GET issues the Store API nonce + a Cart-Token that carries the
-    # guest cart across the stateless requests that follow.
-    r = s.get(_store_api(wp, "/cart"), timeout=30)
-    r.raise_for_status()
-    nonce = r.headers.get("Nonce") or r.headers.get("X-WC-Store-API-Nonce")
-    cart_token = r.headers.get("Cart-Token")
-
-    def headers() -> dict:
-        h = {}
-        if nonce:
-            h["Nonce"] = nonce
-        if cart_token:
-            h["Cart-Token"] = cart_token
-        return h
-
-    r = s.post(
-        _store_api(wp, "/cart/add-item"),
-        json={"id": product_id, "quantity": 1},
-        headers=headers(),
-        timeout=30,
-    )
-    assert r.status_code in (200, 201), f"add-item failed: {r.status_code} {r.text}"
-    nonce = r.headers.get("Nonce", nonce)
-    cart_token = r.headers.get("Cart-Token", cart_token)
-
-    payload = {
-        "billing_address": {
-            "first_name": "Sat", "last_name": "Oshi",
-            "address_1": "1 Genesis Block", "city": "Cypherpunk",
-            "state": "CA", "postcode": "94016", "country": "US",
-            "email": "buyer@example.test", "phone": "5551234567",
-        },
-        "payment_method": GATEWAY_ID,
-    }
-    return s.post(_store_api(wp, "/checkout"), json=payload, headers=headers(), timeout=60)
+    session = _StoreApiSession(wp)
+    session.add_item(product_id)
+    return session.checkout(GATEWAY_ID)
 
 
 def _order_field(wp: WordPressHandle, order_id: int, method: str) -> str:
@@ -204,7 +235,7 @@ def test_wiring_readies_gateway_and_registers_webhook(woocommerce, configured) -
     fixture, so nothing should report as auto-installed."""
     wp, _info = woocommerce
 
-    data = _wire(wp, configured, percent=2)
+    data = _wire(wp, configured, percent="2")
     assert data["res"]["auto_installed"] is False, (
         "an already-active plugin must not report as auto-installed"
     )
@@ -226,6 +257,97 @@ def test_wiring_readies_gateway_and_registers_webhook(woocommerce, configured) -
     ).json()
     ours = [h for h in listed if h["id"] == webhook_opt["id"]]
     assert ours and ours[0]["enabled"] is True, listed
+
+
+def test_discount_fee_follows_payment_method_selection(woocommerce, configured) -> None:
+    """The Bitcoin discount, headlessly, exactly as the blocks checkout drives
+    it: selecting the BareBits gateway through the cart/extensions endpoint
+    adds the negative fee to the recalculated cart, and selecting any other
+    method removes it. Store API money fields are minor-unit strings — with
+    the shop's 8-decimal BTC config a 0.00003000 cart reads as \"3000\"."""
+    wp, info = woocommerce
+    _wire(wp, configured, percent="2.5")
+    wp.wp_cli("option", "update", "woocommerce_cod_settings", '{"enabled":"yes","enable_for_virtual":"yes"}',
+              "--format=json", check=False)
+
+    session = _StoreApiSession(wp)
+    session.add_item(info["product_id"], quantity=2)
+
+    cart = session.select_payment_method(GATEWAY_ID)
+    fees = cart.get("fees", [])
+    assert [f["name"] for f in fees] == ["Bitcoin discount (2.5%)"], fees
+    assert fees[0]["totals"]["total"] == "-75", fees[0]["totals"]
+    assert cart["totals"]["total_price"] == "2925", cart["totals"]
+
+    # Switching away removes the fee on the very next recalculation.
+    cart = session.select_payment_method("cod")
+    assert cart.get("fees", []) == [], cart.get("fees")
+    assert cart["totals"]["total_price"] == "3000", cart["totals"]
+
+
+def test_checkout_totals_match_submitted_payment_method(woocommerce, configured) -> None:
+    """The money is right at place-order time in both directions, whatever
+    state the extension sync left the session in:
+
+    - paying with BareBits WITHOUT any prior selection sync (a blocked or
+      racing script) still yields a discounted order, and the invoice the
+      gateway creates on the payserver carries the discounted amount;
+    - paying with another method AFTER the cart was discounted strips the
+      fee, so no card/COD order ever leaves with the Bitcoin discount."""
+    wp, info = woocommerce
+    _wire(wp, configured, percent="2.5")
+    wp.wp_cli("option", "update", "woocommerce_cod_settings", '{"enabled":"yes","enable_for_virtual":"yes"}',
+              "--format=json", check=False)
+
+    # --- BareBits order, session never told about the selection ---
+    session = _StoreApiSession(wp)
+    session.add_item(info["product_id"], quantity=2)
+    r = session.checkout(GATEWAY_ID)
+    assert r.status_code in (200, 201), f"checkout failed: {r.status_code} {r.text}"
+    checkout = r.json()
+
+    # The checkout response carries no totals; the order and the invoice are
+    # the authoritative record of what was charged.
+    order_id = checkout["order_id"]
+    snippet = (
+        f"$o = wc_get_order({order_id});"
+        "echo json_encode(['total' => $o->get_total(),"
+        " 'fees' => array_values(array_map(fn($f) => ['name' => $f->get_name(),"
+        " 'total' => $f->get_total()], $o->get_fees()))]);"
+    )
+    order = json.loads(wp.wp_cli("eval", snippet).stdout.strip().splitlines()[-1])
+    assert float(order["total"]) == pytest.approx(0.00002925), order
+    assert [f["name"] for f in order["fees"]] == ["Bitcoin discount (2.5%)"], order
+    assert float(order["fees"][0]["total"]) == pytest.approx(-0.00000075), order
+
+    # The gateway invoiced the payserver for the DISCOUNTED total.
+    invoice_id = _order_field(wp, order_id, "get_meta('BTCPay_id')")
+    assert invoice_id and invoice_id != "NO_ORDER", checkout
+    inv = requests.get(
+        f"{configured.handle.url}/api/v1/stores/{configured.store_id}/invoices/{invoice_id}",
+        headers={"Authorization": f"token {configured.api_token}"},
+        timeout=15,
+    )
+    inv.raise_for_status()
+    assert float(inv.json()["amount"]) == pytest.approx(0.00002925), inv.json()
+
+    # --- COD order placed from a cart the sync had already discounted ---
+    session = _StoreApiSession(wp)
+    session.add_item(info["product_id"], quantity=2)
+    cart = session.select_payment_method(GATEWAY_ID)
+    assert cart["totals"]["total_price"] == "2925", cart["totals"]
+    r = session.checkout("cod")
+    assert r.status_code in (200, 201), f"checkout failed: {r.status_code} {r.text}"
+    checkout = r.json()
+    snippet = (
+        f"$o = wc_get_order({checkout['order_id']});"
+        "echo json_encode(['total' => $o->get_total(), 'fees' => count($o->get_fees())]);"
+    )
+    order = json.loads(wp.wp_cli("eval", snippet).stdout.strip().splitlines()[-1])
+    assert float(order["total"]) == pytest.approx(0.00003000), (
+        f"a non-BareBits order must never keep the Bitcoin discount: {order}"
+    )
+    assert order["fees"] == 0, order
 
 
 def test_wiring_never_clobbers_a_real_btcpay_server(woocommerce) -> None:

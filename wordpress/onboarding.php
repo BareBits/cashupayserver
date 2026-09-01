@@ -11,7 +11,8 @@
  *      the one-time provisioning handshake after the operator finishes the
  *      BareBits setup wizard.
  *   3. Ask the Bitcoin checkout discount, then wire WooCommerce (gateway
- *      plugin + webhook + branding + ELEX discount rule).
+ *      plugin + webhook + branding; payment-discount.php applies the
+ *      discount at checkout from the saved option).
  *
  * Rendering happens inside the wp-admin "BareBits" page (admin-menu.php
  * calls cashupay_render_onboarding()); actions POST to admin-post.php.
@@ -350,11 +351,11 @@ function cashupay_handle_finish(): void {
     if (isset($_POST['cashupay_discount_percent'])) {
         $percent = cashupay_parse_discount_percent((string) wp_unslash($_POST['cashupay_discount_percent']));
         if ($percent === null) {
-            cashupay_flash('error', 'The discount must be a whole number between 0 and 100.');
+            cashupay_flash('error', 'The discount must be a number between 0 and 100 (up to two decimal places).');
             wp_safe_redirect(cashupay_onboarding_url());
             exit;
         }
-        update_option('cashupay_discount_percent', $percent);
+        cashupay_save_discount_percent($percent);
     }
 
     if (!empty($_POST['cashupay_btcpay_override_consent'])) {
@@ -363,14 +364,10 @@ function cashupay_handle_finish(): void {
 
     $storeId = (string) get_option('cashupay_store_id', '');
     $apiKey = (string) get_option('cashupay_api_key', '');
-    $percent = (int) get_option('cashupay_discount_percent', 0);
-    $status = cashupay_ensure_woocommerce_integration($storeId, $apiKey, $percent);
+    $status = cashupay_ensure_woocommerce_integration($storeId, $apiKey);
 
     if (($status['status'] ?? '') === 'ready') {
         update_option('cashupay_wired_at', time());
-        if ($percent > 0) {
-            cashupay_ensure_elex_discount($percent);
-        }
         cashupay_flash('success', 'Done — WooCommerce now takes Bitcoin through BareBits.');
     } elseif (($status['status'] ?? '') === 'existing_btcpay') {
         cashupay_flash('warning', 'A BTCPay Server is already connected at ' . ($status['current_url'] ?? '') . '. Tick the consent box below to replace that connection.');
@@ -706,9 +703,9 @@ function cashupay_render_step_wire(): void {
         <?php if ($hasWoo): ?>
             <p><label for="cashupay-discount">Offer customers a discount for paying with Bitcoin (Bitcoin payments have no card fees or chargebacks):</label></p>
             <p>
-                <input type="number" min="0" max="100" step="1" id="cashupay-discount"
-                       name="cashupay_discount_percent" value="<?= esc_attr($saved === null ? '0' : (string) (int) $saved) ?>" style="width: 5em;"> %
-                <span class="description">0 = no discount. Applied automatically at checkout via the free "ELEX Discount Per Payment Method" plugin.</span>
+                <input type="number" min="0" max="100" step="0.01" id="cashupay-discount"
+                       name="cashupay_discount_percent" value="<?= esc_attr($saved === null ? '0' : (string) $saved) ?>" style="width: 6em;"> %
+                <span class="description">0 = no discount. Applied automatically at checkout when the customer pays with BareBits, and advertised in the payment method's title.</span>
             </p>
         <?php else: ?>
             <p><strong>WooCommerce is not active.</strong> Install and activate WooCommerce first, then click Finish.</p>
