@@ -22,7 +22,9 @@ Two scenarios, both driven with Playwright:
      the wizard (full screen by default — exit/re-expand are exercised too),
      walk it (no password screen — the admin is pre-seeded), return through
      the wizard's own finish button (which collects the credentials with no
-     manual step), wire WooCommerce.
+     manual step) — clicked while WordPress sits behind its maintenance
+     screen (a wp-cron auto-update mid-onboarding, the collision a real
+     merchant hit), which the handoff must wait out — then wire WooCommerce.
   2. The SAME full journey on a rewrite-hostile host (nginx-style: real
      *.php files execute, everything else falls into WordPress — Local WP's
      layout): the plugin's API bridge must keep the /api/v1 routes answering
@@ -32,7 +34,10 @@ Two scenarios, both driven with Playwright:
 """
 from __future__ import annotations
 
+import time
+
 import pytest
+import requests
 
 from wordpress.conftest import wp_option
 from fixtures.wordpress import (
@@ -155,14 +160,42 @@ def _expand_wizard(page) -> None:
     assert "cashupay-expanded" in (shell.get_attribute("class") or "")
 
 
-def _finish_wizard_via_return(page) -> None:
+def _finish_wizard_via_return_during_wp_maintenance(page, wp: WordPressHandle) -> None:
     """The wizard's completion screen carries the managed-install return
     button (CASHUPAY_MANAGED_RETURN_URL): one click breaks out of the iframe
     (target=_top), the plugin collects the credentials itself, and the
-    onboarding page lands on the wire step — no manual collect."""
-    frame = page.frame_locator(WIZARD_IFRAME)
-    frame.locator("#managed-return-link").click()
-    page.wait_for_selector(".notice p:has-text('Connected!')")
+    onboarding page lands on the wire step — no manual collect. Driven here
+    while WordPress is mid-auto-update.
+
+    A wp-cron run performing a core/plugin/translation auto-update drops a
+    .maintenance file into the WP root; from that moment EVERY WordPress URL
+    — the return endpoint included — answers the 503 "Briefly unavailable
+    for scheduled maintenance" screen, while the BareBits install (not
+    WordPress) keeps working. Merchants used to be dumped onto that screen
+    mid-setup, right before the discount step. The completion screen's
+    handoff guard must probe first, wait the maintenance window out on the
+    wizard's own screen, and complete the handoff automatically once
+    WordPress answers again — the post-maintenance leg is the same
+    probe-then-navigate path an undisturbed merchant takes."""
+    maintenance = wp.wp_root / ".maintenance"
+    maintenance.write_text(f"<?php $upgrading = {int(time.time())}; ?>")
+    try:
+        # The flag must actually gate WordPress on this fixture, or the wait
+        # below would pass vacuously.
+        probe = requests.get(f"{wp.url}/wp-admin/admin-post.php", timeout=30)
+        assert probe.status_code == 503, probe.status_code
+
+        frame = page.frame_locator(WIZARD_IFRAME)
+        frame.locator("#managed-return-link").click()
+        # The guard holds the merchant on the completion screen with the
+        # waiting notice — no navigation onto the maintenance screen.
+        frame.locator("#managed-return-waiting").wait_for(state="visible")
+        assert page.locator(WIZARD_IFRAME).count() == 1, "must still be on the wizard, not the maintenance screen"
+    finally:
+        maintenance.unlink()
+    # Within one ~5s probe cycle the guard sees WordPress back and finishes
+    # the handoff on its own — no reload, no extra click.
+    page.wait_for_selector(".notice p:has-text('Connected!')", timeout=60_000)
 
 
 def _assert_dashboard_reachable(page, wp: WordPressHandle) -> None:
@@ -210,7 +243,10 @@ def test_full_merchant_journey_in_browser(wordpress_bare_install, wp_plugin_zip,
     page.wait_for_selector(WIZARD_IFRAME)
     _expand_wizard(page)
     _walk_wizard_in_iframe(page)
-    _finish_wizard_via_return(page)
+    # The return handoff is driven under WordPress maintenance mode — the
+    # wp-cron auto-update collision a real merchant hit. Its recovery leg IS
+    # the plain probe-then-navigate handoff, so both shapes are covered.
+    _finish_wizard_via_return_during_wp_maintenance(page, wp)
 
     # Wire WooCommerce (no discount) and land fully configured.
     page.wait_for_selector("h2:has-text('connect WooCommerce')")

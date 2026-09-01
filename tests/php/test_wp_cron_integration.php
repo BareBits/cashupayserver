@@ -42,7 +42,7 @@ function get_option($name, $default = false) { return $GLOBALS['wp_options'][$na
 function update_option($name, $value, $autoload = null) { $GLOBALS['wp_options'][$name] = $value; return true; }
 function delete_option($name) { unset($GLOBALS['wp_options'][$name]); return true; }
 function wp_next_scheduled($hook) { return $GLOBALS['next_scheduled']; }
-function wp_schedule_event($ts, $recurrence, $hook) { $GLOBALS['scheduled'][] = [$recurrence, $hook]; return true; }
+function wp_schedule_event($ts, $recurrence, $hook) { $GLOBALS['scheduled'][] = [$ts, $recurrence, $hook]; return true; }
 function wp_unschedule_event($ts, $hook) { $GLOBALS['unscheduled'][] = [$ts, $hook]; return true; }
 function wp_remote_get($url, $args = []) {
     $GLOBALS['http_requests'][] = ['url' => $url, 'args' => $args];
@@ -144,6 +144,30 @@ reset_http();
 $GLOBALS['http_body'] = '{"skipped":"another cron run in progress","mode":"all"}';
 assert_true(cashupay_fire_cron_endpoint(15), 'the lock-bounce JSON still proves the mechanism');
 
+// --- ping mode: reachability proof without triggering a task run -------------
+//
+// Interactive callers (onboarding's synchronous heartbeat proof) must not
+// trigger the install's first-ever FULL cron pass inside a request the
+// merchant's page is blocked on — ?ping=1 asks cron.php to answer right
+// after auth. The scheduled tick keeps the bare URL: full runs ARE the
+// heartbeat.
+reset_http();
+$GLOBALS['http_body'] = '{"mode":"ping","ok":true}';
+unset($GLOBALS['wp_options']['cashupay_cron_last_ok']);
+assert_true(cashupay_fire_cron_endpoint(15, true), 'a ping-mode answer proves the mechanism');
+assert_eq('http://wp.test/barebits/cron.php?ping=1', $GLOBALS['http_requests'][0]['url'] ?? null,
+    'ping mode rides the ?ping=1 query');
+assert_true((int)($GLOBALS['wp_options']['cashupay_cron_last_ok'] ?? 0) > 0,
+    'a successful ping seeds the heartbeat stamp');
+// An older server ignores the flag and answers with a full run — the same
+// JSON shape, so the ping caller still reads success.
+reset_http();
+assert_true(cashupay_fire_cron_endpoint(15, true), 'a full-run answer to a ping still proves the mechanism');
+reset_http();
+cashupay_cron_tick();
+assert_eq('http://wp.test/barebits/cron.php', $GLOBALS['http_requests'][0]['url'] ?? null,
+    'the scheduled tick never sends ping — full runs are the heartbeat');
+
 // --- a 200 with a non-cron body is some OTHER page answering -----------------
 //
 // A misrouted install serving an HTML front page for /cron.php must not count
@@ -195,8 +219,17 @@ assert_eq($custom, cashupay_register_cron_interval($custom), 'an every_minute so
 
 // --- reschedule self-heals, and only when a heartbeat is owed ----------------
 $GLOBALS['next_scheduled'] = false;
+$before = time();
 cashupay_cron_reschedule();
-assert_eq([['every_minute', 'cashupay_cron_tick']], $GLOBALS['scheduled'], 'missing event is rescheduled every_minute');
+assert_eq(1, count($GLOBALS['scheduled']), 'missing event is rescheduled');
+[$ts, $recurrence, $hook] = $GLOBALS['scheduled'][0];
+assert_eq('every_minute', $recurrence, 'rescheduled every_minute');
+assert_eq('cashupay_cron_tick', $hook, 'rescheduled the tick hook');
+// First run a minute out, never immediately due: the credential-collection
+// request that (re)schedules this just proved the endpoint synchronously,
+// and an immediately-due event would pile a full cron chain onto the
+// merchant's very next page load.
+assert_true($ts >= $before + 60 && $ts <= time() + 60, 'the first run is deferred one minute');
 
 $GLOBALS['next_scheduled'] = time() + 30;
 cashupay_cron_reschedule();
