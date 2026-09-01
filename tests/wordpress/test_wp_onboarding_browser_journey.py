@@ -18,10 +18,11 @@ were exactly that kind of blind spot:
 Two scenarios, both driven with Playwright:
 
   1. The full journey on a friendly (Apache-like) host: upload + activate
-     the BUILT plugin zip through wp-admin, choose install-alongside, expand
-     the wizard to full screen, walk it (no password screen — the admin is
-     pre-seeded), return through the wizard's own finish button (which
-     collects the credentials with no manual step), wire WooCommerce.
+     the BUILT plugin zip through wp-admin, choose install-alongside, land in
+     the wizard (full screen by default — exit/re-expand are exercised too),
+     walk it (no password screen — the admin is pre-seeded), return through
+     the wizard's own finish button (which collects the credentials with no
+     manual step), wire WooCommerce.
   2. The SAME full journey on a rewrite-hostile host (nginx-style: real
      *.php files execute, everything else falls into WordPress — Local WP's
      layout): the plugin's API bridge must keep the /api/v1 routes answering
@@ -138,12 +139,11 @@ def _collect_credentials(page) -> None:
 
 
 def _expand_wizard(page) -> None:
-    """The provision step's "Continue" button must switch the embedded wizard
-    into the full-viewport view (everything except the admin menu + bar), and
-    the exit control must switch it back."""
-    page.click("#cashupay-wizard-expand")
+    """The provision step opens the embedded wizard in the full-viewport view
+    BY DEFAULT (no click — everything except the admin menu + bar); the exit
+    control must collapse it and the expand button must bring it back."""
+    page.wait_for_selector("#cashupay-wizard-shell.cashupay-expanded")
     shell = page.locator("#cashupay-wizard-shell")
-    assert "cashupay-expanded" in (shell.get_attribute("class") or "")
     # position:fixed makes it viewport-sized; sanity-check it actually grew
     # past the 720px column the step normally renders in.
     box = shell.bounding_box()
@@ -152,6 +152,7 @@ def _expand_wizard(page) -> None:
     assert "cashupay-expanded" not in (shell.get_attribute("class") or "")
     # Leave it expanded for the walk — the way a merchant would use it.
     page.click("#cashupay-wizard-expand")
+    assert "cashupay-expanded" in (shell.get_attribute("class") or "")
 
 
 def _finish_wizard_via_return(page) -> None:
@@ -253,7 +254,10 @@ def test_full_journey_on_rewrite_hostile_host(wordpress_hostile_host, page) -> N
 
     # Credential collection via the manual fallback button — the path a
     # merchant takes if they never click the wizard's own return link (the
-    # friendly-host journey drives that link).
+    # friendly-host journey drives that link). The wizard opens full screen
+    # by default, so a merchant reaching for the fallback form must exit
+    # full screen first — the form sits under the fixed overlay.
+    page.click("#cashupay-wizard-exit")
     _collect_credentials(page)
     assert wp_option(wp, "cashupay_store_id") != ""
     assert wp_option(wp, "cashupay_cron_key") != ""

@@ -348,7 +348,8 @@ class LightningAddress {
                             $networkFeeSats,
                             $usedAddress,
                             $meltResult['preimage'] ?? null,
-                            null
+                            null,
+                            $meltResult['strike_invoice_id'] ?? null
                         );
 
                         $results[] = [
@@ -691,7 +692,12 @@ class LightningAddress {
             // against the mint's melt quote before proofs are spent.
             require_once __DIR__ . '/strike/client.php';
             $made = StrikeClient::createInvoiceWithQuote($value, $amountSats, $comment);
-            return self::meltToBolt11($storeId, $made['bolt11'], $amountSats);
+            $result = self::meltToBolt11($storeId, $made['bolt11'], $amountSats);
+            // Ride Strike's invoice id along so cashout call sites can log
+            // it (melts.strike_invoice_id) for reconciliation in the
+            // merchant's Strike dashboard.
+            $result['strike_invoice_id'] = $made['invoice_id'];
+            return $result;
         }
         return self::meltToAddress($storeId, $value, $amountSats, $comment);
     }

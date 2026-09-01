@@ -9346,10 +9346,13 @@ header('Cache-Control: no-cache, must-revalidate');
                     ? `${base} <span class="inv-fee-badge" title="Paid by redirecting a customer invoice straight to the fee destination (no wallet melt).">redirect</span>`
                     : base;
             };
+            // Strike cashouts carry the Strike invoice id created for the
+            // payout, so the merchant can match the incoming payment in
+            // their Strike dashboard.
             const rows = data.rows.map(row => `
                 <tr>
                     <td>${new Date(row.created_at * 1000).toLocaleString()}</td>
-                    <td class="truncate" title="${escapeHtml(row.destination || '')}">${escapeHtml(row.destination || '')}</td>
+                    <td class="truncate" title="${escapeHtml(row.destination || '')}">${escapeHtml(row.destination || '')}${row.strike_invoice_id ? ` <span class="inv-mono">${renderCopyMono(row.strike_invoice_id, 'Strike invoice ID')}</span>` : ''}</td>
                     ${showType ? `<td>${typeCell(row)}</td>` : ''}
                     <td style="text-align:right">${formatStatsAmount(row.amount_sats)}</td>
                     <td style="text-align:right">${formatStatsAmount(row.network_fee_sats)}</td>
@@ -9855,11 +9858,19 @@ header('Cache-Control: no-cache, must-revalidate');
                 const emailCell = inv.customerEmail
                     ? `<span class="inv-mono">${escapeHtml(inv.customerEmail)}</span>${inv.newsletterOptIn ? ' <span title="Subscribed to newsletter" style="color: var(--success, #48bb78);">✓</span>' : ''}`
                     : '<span style="color: var(--text-secondary);">—</span>';
+                // Strike receives carry Strike's own invoice id next to the
+                // masked destination label — the id the operator can look up
+                // in their Strike dashboard to reconcile the payment.
+                const strikeIdPart = inv.strikeInvoiceId
+                    ? ` ${renderCopyMono(inv.strikeInvoiceId, 'Strike invoice ID')}`
+                    : '';
                 const destCell = inv.destination
                     ? `<span class="inv-mono">${inv.destinationIsLightning
                         ? renderCopyMono(inv.destination, 'Lightning destination')
-                        : renderMonoLink('address', inv.destination, network)}</span>`
-                    : '<span style="color: var(--text-secondary);">—</span>';
+                        : renderMonoLink('address', inv.destination, network)}${strikeIdPart}</span>`
+                    : (inv.strikeInvoiceId
+                        ? `<span class="inv-mono">${renderCopyMono(inv.strikeInvoiceId, 'Strike invoice ID')}</span>`
+                        : '<span style="color: var(--text-secondary);">—</span>');
                 const txidCell = inv.txid
                     ? `<span class="inv-mono">${inv.txidIsLightning
                         ? renderCopyMono(inv.txid, 'Lightning invoice (bolt11)')

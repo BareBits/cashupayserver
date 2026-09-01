@@ -2253,6 +2253,14 @@ class Invoice {
             }
         }
 
+        // Strike receive: Strike's own invoice id lets the operator look the
+        // payment up in their Strike dashboard (it's also searchable there by
+        // correlationId = our invoice id). The bearer strike_api_key never
+        // rides an API payload.
+        if ($rail === 'strike' && !empty($invoice['strike_invoice_id'])) {
+            $result['strikeInvoiceId'] = $invoice['strike_invoice_id'];
+        }
+
         // Aggregate payment methods (Lightning + on-chain, both optional).
         $methods = [];
         if ($invoice['bolt11']) {

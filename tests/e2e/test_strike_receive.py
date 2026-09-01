@@ -150,10 +150,13 @@ def test_strike_receive_round_trip(
     final = _invoice_row(payserver, invoice_id)
     assert final["settled_rail"] == "strike", final
 
-    # The Greenfield payload shows the masked destination, never the key.
+    # The Greenfield payload shows the masked destination, never the key —
+    # and Strike's own invoice id, so the operator can reconcile the payment
+    # in their Strike dashboard (the admin invoices table renders it).
     api_view = configured.greenfield.get_invoice(store_id, invoice_id)
     assert TEST_STRIKE_KEY not in str(api_view), "API payload must never contain the key"
     assert api_view.get("destination", "").startswith("Strike API ("), api_view
+    assert api_view.get("strikeInvoiceId") == row["strike_invoice_id"], api_view
 
 
 def test_strike_settles_via_cron_after_tab_closed(

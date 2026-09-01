@@ -103,7 +103,7 @@ class Database {
             // on existing installs that haven't yet picked it up. All migrations
             // are idempotent, so a fire is safe.
             $hasLatestMigration = $hasConfig
-                && self::columnExists(self::$instance, 'invoices', 'strike_invoice_id');
+                && self::columnExists(self::$instance, 'melts', 'strike_invoice_id');
             // The auto-withdraw → auto-cashout rename is a data-only migration
             // (config key + notification event labels) with no schema artifact
             // to mark it done, so probe for the legacy config key directly. The
@@ -1683,8 +1683,7 @@ HTACCESS;
         // is secret-bearing (it's the account credential) and must never ride
         // an API/browser payload (see Invoice::formatForApi); it is persisted
         // per-invoice so pending invoices stay verifiable even if the operator
-        // later replaces the key in store_ln_addresses. strike_invoice_id is
-        // the "latest" migration marker (see getInstance), so this stays last.
+        // later replaces the key in store_ln_addresses.
         foreach ([
             'strike_invoice_id' => 'TEXT DEFAULT NULL',
             'strike_api_key' => 'TEXT DEFAULT NULL',
@@ -1692,6 +1691,16 @@ HTACCESS;
             if (!self::columnExists($pdo, 'invoices', $col)) {
                 $pdo->exec("ALTER TABLE invoices ADD COLUMN {$col} {$decl}");
             }
+        }
+
+        // Strike cashout reconciliation: a melt to a Strike-typed destination
+        // pays a bolt11 quoted from a Strike invoice created in the merchant's
+        // account; recording that invoice's id lets the merchant match the
+        // incoming payment in their Strike dashboard (the receive side already
+        // records invoices.strike_invoice_id). melts.strike_invoice_id is the
+        // "latest" migration marker (see getInstance), so this stays last.
+        if (!self::columnExists($pdo, 'melts', 'strike_invoice_id')) {
+            $pdo->exec("ALTER TABLE melts ADD COLUMN strike_invoice_id TEXT DEFAULT NULL");
         }
     }
 

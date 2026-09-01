@@ -475,7 +475,41 @@ class Stats {
     }
 
     /**
+     * Columns the invoice CSV exports emit. An explicit allowlist rather than
+     * SELECT * because the invoices table also carries secret-bearing columns
+     * that must never leave the server, not even in an admin-gated download:
+     * strike_api_key (the Strike account credential), nwc_uri (embeds the
+     * wallet secret), noffer_ephemeral_sk (a Nostr secret key), and
+     * cashu_offline_token (a bearer ecash token). A new invoices column only
+     * reaches the CSV by being added here deliberately.
+     */
+    public static function invoiceExportColumns(): array {
+        return [
+            'id', 'store_id', 'status', 'additional_status', 'amount',
+            'currency', 'amount_sats', 'exchange_rate', 'quote_id', 'bolt11',
+            'mint_url', 'metadata', 'checkout_config', 'created_at',
+            'expiration_time', 'last_polled_at', 'paid_at', 'settled_rail',
+            'payment_rail', 'customer_email', 'newsletter_opt_in',
+            'payer_receipt_requested', 'receive_errors',
+            'onchain_address', 'onchain_address_index', 'onchain_amount_sat',
+            'onchain_first_seen_at', 'onchain_created_tip_height',
+            'onchain_amount_tweak_sats', 'onchain_needs_manual_confirmation',
+            'onchain_manual_candidates',
+            'fee_redirect_note', 'fee_redirect_destination', 'fee_redirect_rails',
+            'ln_destination', 'lnurl_verify_url', 'lnurl_preimage',
+            'lnurl_override_reason',
+            'noffer_relay', 'noffer_receiver_pubkey', 'noffer_ephemeral_pubkey',
+            'noffer_request_event_id', 'noffer_created_at',
+            'nwc_payment_hash', 'nwc_preimage',
+            'cashu_offline_allow_any_mint', 'cashu_offline_fail_reason',
+            'cart_purchase_counted', 'strike_invoice_id',
+        ];
+    }
+
+    /**
      * Yield all invoices matching the filter, one row at a time, for CSV.
+     * Projects through invoiceExportColumns() so secret-bearing columns never
+     * reach an export.
      */
     public static function streamInvoices(string $storeId, ?string $range, bool $paidOnly): \Generator {
         $startTs = $range !== null ? self::rangeStart($range) : null;
@@ -487,8 +521,9 @@ class Stats {
             self::storeWhere($storeId),
             self::rangeWhere($startTs)
         );
+        $cols = implode(', ', self::invoiceExportColumns());
         $rows = Database::fetchAll(
-            "SELECT * FROM invoices" . $w['sql'] . " ORDER BY created_at ASC",
+            "SELECT {$cols} FROM invoices" . $w['sql'] . " ORDER BY created_at ASC",
             $w['params']
         );
         foreach ($rows as $r) yield $r;
