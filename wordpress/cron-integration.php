@@ -65,7 +65,14 @@ function cashupay_cron_reschedule(): void {
         return;
     }
     if (!wp_next_scheduled('cashupay_cron_tick')) {
-        wp_schedule_event(time(), 'every_minute', 'cashupay_cron_tick');
+        // First run a minute out, not now: this is (re)scheduled in the same
+        // request that just proved the endpoint synchronously (credential
+        // collection), and an immediately-due event would pile a full cron
+        // chain onto the merchant's very next page load — the onboarding
+        // page itself — which on tight per-site worker pools (Local WP) is
+        // the starvation pattern. Cron work has waited this long; one more
+        // minute costs nothing.
+        wp_schedule_event(time() + 60, 'every_minute', 'cashupay_cron_tick');
     }
 }
 
@@ -81,12 +88,21 @@ function cashupay_cron_unschedule(): void {
 /**
  * Fire one authenticated request at the install's cron endpoint. Returns
  * true when cron.php itself answered — it always returns JSON with a 'mode'
- * field (full / essentials / lock-bounce alike); a 200 carrying anything
- * else means some other page answered and must read as failure. Every
- * success stamps cashupay_cron_last_ok, which the wp-admin stale-heartbeat
- * warning (admin-menu.php) reads.
+ * field (full / essentials / lock-bounce / ping alike); a 200 carrying
+ * anything else means some other page answered and must read as failure.
+ * Every success stamps cashupay_cron_last_ok, which the wp-admin
+ * stale-heartbeat warning (admin-menu.php) reads.
+ *
+ * $ping asks for cron.php's reachability-ping mode (?ping=1): routing and
+ * key are proven but no tasks run. Interactive callers (onboarding's
+ * synchronous heartbeat proof, with the merchant's page blocked on the
+ * answer) use it so the install's first-ever full pass — updater check,
+ * IP-geo download, mint syncs, minutes of worker time on a tight pool —
+ * never runs inside their request. A server that predates the flag ignores
+ * it and does a full run: same JSON shape, same success signal. The
+ * scheduled tick keeps full runs — that IS the heartbeat.
  */
-function cashupay_fire_cron_endpoint(int $timeoutSeconds): bool {
+function cashupay_fire_cron_endpoint(int $timeoutSeconds, bool $ping = false): bool {
     // Always the install's own URL — never the connected server, which may
     // be a different host entirely after a reconnect.
     $server = cashupay_install_url();
@@ -94,7 +110,7 @@ function cashupay_fire_cron_endpoint(int $timeoutSeconds): bool {
     if ($server === '' || $cronKey === '') {
         return false;
     }
-    $response = wp_remote_get($server . '/cron.php', [
+    $response = wp_remote_get($server . '/cron.php' . ($ping ? '?ping=1' : ''), [
         'timeout' => $timeoutSeconds,
         'redirection' => 2,
         // Same-origin self-request; mirrors WordPress core's own loopbacks,

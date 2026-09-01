@@ -96,8 +96,12 @@ def test_onboarding_completes_on_a_starved_worker_pool(wordpress_hostile_tight_p
     # starves. The probe goes to api.php directly (one loopback deep, one
     # free worker suffices), so it must succeed and the old false alarm
     # ("blocked from making HTTP requests to its own URL") must be gone.
+    # Both warning flashes carry "Heads up"; "loopback" pins the unreachable
+    # one's wording specifically. A bare "blocked" substring is off limits:
+    # the same response embeds the wizard iframe's JavaScript, whose
+    # sessionStorage comment tripped it.
     assert "Heads up" not in body, body[:2000]
-    assert "blocked" not in body, body[:2000]
+    assert "loopback" not in body, body[:2000]
 
     _walk_wizard_declining_everything(wp)
 

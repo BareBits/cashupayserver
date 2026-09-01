@@ -2897,6 +2897,63 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                 <p style="color: #a0aec0; font-size: 0.85rem; margin-top: 0.75rem; text-align: center;">
                     Your shop finishes connecting automatically on the next screen.
                 </p>
+                <div id="managed-return-waiting" class="warning" style="display: none; margin-top: 0.75rem;">
+                    WordPress is briefly updating itself (maintenance mode) &mdash;
+                    continuing automatically as soon as it's back, usually under a
+                    minute. Clicking the button again goes there right away.
+                </div>
+                <script>
+                // WordPress auto-updates (wp-cron: core/plugin/translation
+                // updates) put the WHOLE WordPress site behind its
+                // "Briefly unavailable for scheduled maintenance" screen —
+                // every wp URL answers 503 until the update finishes. This
+                // server is not WordPress, so THIS screen keeps working;
+                // navigating to the return URL at that exact moment would
+                // dump the merchant on the maintenance screen mid-setup,
+                // which reads as "the install broke". WordPress checks its
+                // .maintenance flag before any plugin loads, so the plugin
+                // cannot intercept it over there — the handoff has to wait
+                // it out from here: probe the WordPress origin first and
+                // only navigate once it answers. 503 is the ONLY status
+                // that waits; anything else (including errors a broken
+                // probe might fabricate) falls through to plain navigation
+                // — this guard may delay the merchant, never trap them.
+                // Without JavaScript the link works exactly as before.
+                (function () {
+                    const link = document.getElementById('managed-return-link');
+                    const waitingNote = document.getElementById('managed-return-waiting');
+                    // The return URL minus its query: admin-post.php with no
+                    // action is a cheap no-op that still answers 503 while
+                    // WordPress is in maintenance mode. Probing the full
+                    // return URL would run the credential collection once
+                    // per probe for nothing.
+                    const probeUrl = link.href.split('?')[0];
+                    let waiting = false;
+                    const go = function () { window.top.location.href = link.href; };
+                    const probe = function () {
+                        fetch(probeUrl, { credentials: 'same-origin', cache: 'no-store' })
+                            .then(function (res) {
+                                if (res.status === 503) {
+                                    waitingNote.style.display = 'block';
+                                    setTimeout(probe, 5000);
+                                } else {
+                                    go();
+                                }
+                            })
+                            .catch(go);
+                    };
+                    link.addEventListener('click', function (e) {
+                        // A second click while waiting is the manual
+                        // override: let the browser follow the link.
+                        if (waiting) {
+                            return;
+                        }
+                        e.preventDefault();
+                        waiting = true;
+                        probe();
+                    });
+                })();
+                </script>
 
                 <?php else: ?>
 

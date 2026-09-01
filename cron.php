@@ -79,6 +79,25 @@ if ($isInternal) {
     }
 }
 
+// Reachability ping: answer right after authentication, before the last-run
+// stamp, the overlap lock, and every task. Orchestrators that drive this
+// endpoint on the operator's behalf (the WordPress plugin's onboarding) need
+// a synchronous "can I reach cron.php with this key?" probe while the
+// operator is watching — and the full task set is exactly what must NOT run
+// inside that interactive request: a first-ever full pass (updater check,
+// IP-geo download, mint syncs) can hold a PHP worker for minutes, which on
+// tight per-site pools starves the very page the operator is waiting on. A
+// ping proves routing + key and nothing else; it deliberately skips the
+// last_external_cron_at stamp, because it is not a task run and must not
+// mask a scheduler that never actually ticks. Servers that predate this
+// block ignore the parameter and answer with a full run — the same JSON
+// shape — so callers sending it degrade gracefully against them.
+if (($_GET['ping'] ?? '') === '1') {
+    header('Content-Type: application/json');
+    echo json_encode(['mode' => 'ping', 'ok' => true]);
+    exit;
+}
+
 // Stamp the last *external* cron run so the dashboard can warn admins when
 // the operator's environment isn't actually invoking cron.php on a schedule.
 // Internal self-requests do not count, otherwise opportunistic admin/checkout

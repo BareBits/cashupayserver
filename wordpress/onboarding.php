@@ -195,7 +195,11 @@ function cashupay_collect_provision_and_store(): void {
         // cashupay_cron_last_ok so the stale-heartbeat warning starts from a
         // known-good point; failure is worth a warning while the merchant is
         // still here to act on it, instead of a silent 10-minute backoff.
-        if (cashupay_fire_cron_endpoint(15)) {
+        // Ping mode: proves routing + key without triggering the install's
+        // first-ever FULL cron pass inside this blocked interactive request
+        // (see cashupay_fire_cron_endpoint) — the scheduled tick, due a
+        // minute out, does the first real run.
+        if (cashupay_fire_cron_endpoint(15, true)) {
             cashupay_flash('success', 'Connected! One more step below.');
         } else {
             cashupay_flash('warning', 'Connected! One more step below. (Heads up: a test request to the '
