@@ -600,7 +600,6 @@ function cashupay_render_step_provision(): void {
        When the wizard says you're done, its finish button brings you straight back here.</p>
     <p>
         <button type="button" class="button button-primary button-hero" id="cashupay-wizard-expand">Continue — open the wizard full screen</button>
-        <a href="<?= esc_url($setupUrl) ?>" target="_blank" rel="noopener" style="margin-left: 0.75em;">or open it in a new tab</a>
     </p>
     <style>
     #cashupay-wizard-shell { position: relative; }
@@ -656,16 +655,18 @@ function cashupay_render_step_provision(): void {
             shell.classList.toggle('cashupay-expanded', on);
             // Survive reloads mid-wizard: an accidental refresh (or the
             // page revisited while setup is unfinished) returns to the
-            // full-screen view the merchant chose.
+            // view the merchant chose.
             try { sessionStorage.setItem('cashupayWizardExpanded', on ? '1' : '0'); } catch (e) {}
         };
         document.getElementById('cashupay-wizard-expand').addEventListener('click', function () { setExpanded(true); });
         document.getElementById('cashupay-wizard-exit').addEventListener('click', function () { setExpanded(false); });
-        try {
-            if (sessionStorage.getItem('cashupayWizardExpanded') === '1') {
-                setExpanded(true);
-            }
-        } catch (e) {}
+        // Full screen by default — the wizard is the whole point of this
+        // step, so it opens expanded with no click. Only a stored '0' (the
+        // merchant clicked "Exit full screen" this session) keeps it
+        // collapsed; blocked sessionStorage also falls back to expanded.
+        let collapsed = false;
+        try { collapsed = sessionStorage.getItem('cashupayWizardExpanded') === '0'; } catch (e) {}
+        setExpanded(!collapsed);
     })();
     </script>
     <form method="post" action="<?= esc_url(admin_url('admin-post.php')) ?>" style="margin-top: 1em;">

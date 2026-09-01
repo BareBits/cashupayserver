@@ -104,11 +104,14 @@ try {
         'memo carries the order reference');
     assert_eq('0.00000100', $req['amount']['amount'], 'BTC amount is the exact sat value');
 
-    // API shape: the key never leaves the server; the masked label does.
+    // API shape: the key never leaves the server; the masked label does, and
+    // Strike's invoice id is exposed for dashboard reconciliation.
     $api = Invoice::formatForApi($row);
     $apiJson = json_encode($api, JSON_UNESCAPED_UNICODE);
     assert_false(strpos($apiJson, $KEY) !== false, 'formatForApi never contains the key');
     assert_true(strpos($apiJson, 'Strike API (…') !== false, 'formatForApi shows the masked destination');
+    assert_eq($row['strike_invoice_id'], $api['strikeInvoiceId'] ?? null,
+        'formatForApi exposes the Strike invoice id');
 
     // ---------- 2. settlement ----------
     Invoice::pollSingleStrike((string)$inv['id']);
