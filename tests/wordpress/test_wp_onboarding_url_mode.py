@@ -42,6 +42,9 @@ def _drive_pairing(wp, configured, s: requests.Session) -> None:
     assert r.status_code == 302, r.text[:300]
     authorize_url = r.headers["Location"]
     assert authorize_url.startswith(configured.handle.url), authorize_url
+    # Always the real file, never the pretty /api-keys/authorize rewrite —
+    # remote hosts that ignore .htaccess 404 the extension-less path.
+    assert urlparse(authorize_url).path.endswith("/api-keys/authorize.php"), authorize_url
     query = parse_qs(urlparse(authorize_url).query)
     callback = query["redirect"][0]
     assert "state=" in callback

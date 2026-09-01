@@ -33,7 +33,7 @@ def _login_and_open_onboarding(page, wp: WordPressHandle) -> None:
 def test_stale_url_text_does_not_block_install_mode(wordpress, page) -> None:
     """Regression: text left in the URL field must not veto the install
     choice. The merchant types a schemeless address, thinks better of it,
-    picks "Install alongside", and must land on the install preflight."""
+    picks "Install alongside", and must land on the install confirmation."""
     wp = wordpress
     _login_and_open_onboarding(page, wp)
 

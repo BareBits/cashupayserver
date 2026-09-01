@@ -5,7 +5,9 @@
  * Walks the merchant from "no server" to "WooCommerce takes Bitcoin":
  *
  *   1. Choose: connect an existing BareBits server by URL, or install
- *      BareBits alongside WordPress (see installer.php).
+ *      BareBits alongside WordPress (see installer.php). The install-
+ *      alongside server checks render right on this chooser (the option is
+ *      disabled, and its POST refused, while one fails).
  *   2. Get credentials: URL mode pairs via the server's BTCPay-compatible
  *      /api-keys/authorize redirect flow; install mode collects them through
  *      the one-time provisioning handshake after the operator finishes the
@@ -127,9 +129,19 @@ function cashupay_handle_choose_mode(): void {
         update_option('cashupay_mode', 'url');
         update_option('cashupay_server_url', $url);
     } elseif ($mode === 'install') {
+        // Save the folder name BEFORE the preflight so the writable-location
+        // check resolves the merchant's Advanced choice, not the default —
+        // the chooser's table only ever showed the saved/default target.
         $dirname = sanitize_file_name((string) ($_POST['cashupay_install_dirname'] ?? ''));
-        update_option('cashupay_mode', 'install');
         update_option('cashupay_install_dirname', $dirname, false);
+        $failed = cashupay_install_preflight_failure();
+        if ($failed !== null) {
+            cashupay_flash('error', 'This host does not pass the server checks for installing '
+                . 'alongside (' . $failed . '). Fix that and try again, or connect a BareBits '
+                . 'server running elsewhere by URL.');
+        } else {
+            update_option('cashupay_mode', 'install');
+        }
     } else {
         cashupay_flash('error', 'Pick one of the two options.');
     }
@@ -140,6 +152,16 @@ function cashupay_handle_choose_mode(): void {
 /** Install mode: download + unpack + configure the BareBits release. */
 function cashupay_handle_run_install(): void {
     cashupay_require_admin_post('cashupay_run_install');
+
+    // Conditions can regress between the chooser (which gated on the same
+    // checks) and this click — a permissions change, a removed extension.
+    // Installing anyway would leave a server this host cannot run.
+    $failed = cashupay_install_preflight_failure();
+    if ($failed !== null) {
+        cashupay_flash('error', 'This host no longer passes the server checks (' . $failed . ').');
+        wp_safe_redirect(cashupay_onboarding_url());
+        exit;
+    }
 
     $result = cashupay_run_install((string) get_option('cashupay_install_dirname', ''));
     if (empty($result['ok'])) {
@@ -285,17 +307,16 @@ function cashupay_handle_start_pairing(): void {
         $query[] = 'permissions=' . rawurlencode($permission);
     }
 
-    // The alongside install may sit on a host that ignores its .htaccess and
-    // supports no PATH_INFO (Local WP's nginx), where the extension-less
-    // /api-keys/authorize never reaches BareBits. The real file at
-    // authorize.php answers on every host, and it builds its self-post URL
-    // from its own request path, so the whole approval flow stays on the
-    // .php form. Remote servers keep the pretty BTCPay-convention URL their
-    // operator's setup already proved.
-    $authorizePath = ($server !== '' && $server === cashupay_install_url())
-        ? '/api-keys/authorize.php'
-        : '/api-keys/authorize';
-    wp_redirect($server . $authorizePath . '?' . implode('&', $query));
+    // Always the real file, never the pretty /api-keys/authorize rewrite.
+    // Any host that ignores .htaccess and has no PATH_INFO routing (Local
+    // WP's nginx, hardened shared hosts) 404s the extension-less path —
+    // and that is just as true for a REMOTE server connected by URL as for
+    // the alongside install (a merchant hit exactly that pairing with an
+    // existing server). authorize.php executes anywhere BareBits itself
+    // runs — the whole app is served as .php files — and it builds its
+    // self-post URL from its own request path, so the entire approval flow
+    // stays on the .php form.
+    wp_redirect($server . '/api-keys/authorize.php?' . implode('&', $query));
     exit;
 }
 
@@ -468,6 +489,23 @@ function cashupay_render_onboarding(): void {
     <?php
 }
 
+/** The ✅/❌ server-checks table, shared by the chooser and the install confirmation. */
+function cashupay_render_preflight_table(array $checks): void {
+    ?>
+    <table class="widefat striped" style="max-width: 680px;">
+        <tbody>
+        <?php foreach ($checks as $label => $check): ?>
+            <tr>
+                <td><?= $check['ok'] ? '✅' : '❌' ?></td>
+                <td><?= esc_html($label) ?></td>
+                <td class="description"><?= esc_html($check['detail']) ?></td>
+            </tr>
+        <?php endforeach; ?>
+        </tbody>
+    </table>
+    <?php
+}
+
 function cashupay_render_step_choose(): void {
     // A surviving install record (a "Start over" or an earlier plugin
     // removal left an alongside install running) gets a reconnect hint: the
@@ -475,6 +513,16 @@ function cashupay_render_step_choose(): void {
     // password revealable — pairing needs it, and the merchant never chose
     // one.
     $existingInstall = cashupay_install_url();
+    // The server checks that used to live on their own page after picking
+    // "install alongside" — surfaced below the choices instead, so the
+    // merchant sees whether this host qualifies while still choosing and
+    // the separate checks page is gone from the flow. All checks are local
+    // and cheap (extensions, writability): no HTTP, safe on every render.
+    $checks = cashupay_install_preflight();
+    $installOk = true;
+    foreach ($checks as $check) {
+        $installOk = $installOk && $check['ok'];
+    }
     ?>
     <p>Accept Bitcoin (on-chain and Lightning) in WooCommerce. Where should your BareBits server live?</p>
     <?php if ($existingInstall !== ''): ?>
@@ -523,18 +571,27 @@ function cashupay_render_step_choose(): void {
                 </td>
             </tr>
             <tr>
-                <td style="vertical-align: top;"><input type="radio" name="cashupay_mode" value="install" id="cashupay-mode-install"></td>
+                <td style="vertical-align: top;"><input type="radio" name="cashupay_mode" value="install" id="cashupay-mode-install" <?php disabled(!$installOk); ?>></td>
                 <td>
                     <label for="cashupay-mode-install"><strong>Install BareBits alongside WordPress</strong></label>
                     <p class="description">Downloads the latest stable BareBits release from GitHub and installs it next to this WordPress site (its own folder, its own license, updated independently of this plugin).</p>
+                    <?php if (!$installOk): ?>
+                        <p class="description"><strong>This host does not pass the server checks below yet, so this option is unavailable.</strong></p>
+                    <?php endif; ?>
                     <details>
                         <summary>Advanced: folder name</summary>
-                        <input type="text" name="cashupay_install_dirname" class="regular-text" placeholder="barebits">
+                        <input type="text" name="cashupay_install_dirname" class="regular-text" placeholder="barebits"
+                               value="<?= esc_attr((string) get_option('cashupay_install_dirname', '')) ?>">
                         <p class="description">Folder under your site the server is installed into (default <code>barebits</code>, served at <?= esc_html(site_url('/barebits')) ?>).</p>
                     </details>
                 </td>
             </tr>
         </table>
+        <h2 style="font-size: 1.1em;">Server checks for installing alongside</h2>
+        <?php cashupay_render_preflight_table($checks); ?>
+        <?php if (!$installOk): ?>
+            <p><strong>Fix the failed checks above, then reload this page.</strong> If your host cannot pass them, you can still run BareBits on another host and connect it by URL with the first option.</p>
+        <?php endif; ?>
         <?php submit_button('Continue'); ?>
     </form>
     <script>
@@ -565,29 +622,29 @@ function cashupay_render_step_choose(): void {
 }
 
 function cashupay_render_step_install(): void {
+    // The chooser already showed — and its POST handler gated on — the full
+    // server checks, so this page is just the "download now" confirmation.
+    // Conditions can still regress between the two screens (a permissions
+    // change, a removed extension), so re-verify quietly and only resurface
+    // the checks table when something actually broke.
     $checks = cashupay_install_preflight();
     $allOk = true;
+    foreach ($checks as $check) {
+        $allOk = $allOk && $check['ok'];
+    }
     ?>
     <h2>Install BareBits alongside WordPress</h2>
-    <table class="widefat striped" style="max-width: 680px;">
-        <tbody>
-        <?php foreach ($checks as $label => $check): $allOk = $allOk && $check['ok']; ?>
-            <tr>
-                <td><?= $check['ok'] ? '✅' : '❌' ?></td>
-                <td><?= esc_html($label) ?></td>
-                <td class="description"><?= esc_html($check['detail']) ?></td>
-            </tr>
-        <?php endforeach; ?>
-        </tbody>
-    </table>
-    <?php if ($allOk): ?>
+    <?php if ($allOk): $target = cashupay_resolve_install_target((string) get_option('cashupay_install_dirname', '')); ?>
         <form method="post" action="<?= esc_url(admin_url('admin-post.php')) ?>" style="margin-top: 1em;">
             <?php wp_nonce_field('cashupay_run_install'); ?>
             <input type="hidden" name="action" value="cashupay_run_install">
-            <p>This downloads the latest stable release (a few MB) and installs it. It can take a minute on slow hosts.</p>
+            <p>This downloads the latest stable release (a few MB) and installs it
+               <?php if (!empty($target['url'])): ?> to <code><?= esc_html($target['url']) ?></code><?php endif; ?>.
+               It can take a minute on slow hosts.</p>
             <?php submit_button('Download and install BareBits'); ?>
         </form>
     <?php else: ?>
+        <?php cashupay_render_preflight_table($checks); ?>
         <p><strong>Fix the failed checks above, then reload this page.</strong> If your host cannot pass them, you can still run BareBits on another host and connect it by URL (use "Start over" below).</p>
     <?php endif; ?>
     <?php

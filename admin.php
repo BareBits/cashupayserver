@@ -13003,7 +13003,10 @@ header('Cache-Control: no-cache, must-revalidate');
                 'permissions[]': 'btcpay.store.cancreateinvoice',
                 strict: 'true'
             });
-            const pairingUrl = serverUrl + '/api-keys/authorize?' + pairingParams.toString();
+            // The real file, not the pretty /api-keys/authorize rewrite:
+            // rewrite-hostile hosts 404 the extension-less spelling, and
+            // authorize.php executes anywhere this admin itself is served.
+            const pairingUrl = serverUrl + '/api-keys/authorize.php?' + pairingParams.toString();
 
             // All references to the store-scoped values (id/name) are placed
             // into data-* attributes; click handlers are wired up below. That

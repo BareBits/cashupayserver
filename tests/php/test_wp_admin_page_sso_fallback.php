@@ -52,6 +52,9 @@ function wp_remote_retrieve_body($response) { return $response['body'] ?? ''; }
 // whole admin-post surface; the page under test only *calls* these two.
 function cashupay_render_onboarding(): void { echo 'ONBOARDING-FLOW'; }
 function cashupay_take_flash(): ?array { return null; }
+// Likewise the discount settings block (payment-discount.php, the whole
+// WooCommerce surface): the Connection page under test only *calls* it.
+function cashupay_render_discount_settings(): void { echo 'DISCOUNT-SETTINGS'; }
 
 require dirname(__DIR__, 2) . '/wordpress/state.php';
 require dirname(__DIR__, 2) . '/wordpress/admin-menu.php';

@@ -75,13 +75,23 @@ def test_install_mode_end_to_end(wordpress_install_mode, mint, backup_mint) -> N
     wp = wordpress_install_mode
     s = wp_login(wp)
 
-    # Step 1: the chooser offers both paths.
+    # Step 1: the chooser offers both paths, with the install-alongside
+    # server checks shown right below the choices (the separate checks page
+    # was folded into the chooser) — all green on this host, so the install
+    # option is live.
     body = onboarding_page(s, wp)
     assert "already run a BareBits server" in body
     assert "Install BareBits alongside WordPress" in body
+    assert "Server checks for installing alongside" in body, body[:3000]
+    assert "PDO SQLite extension" in body
+    assert "❌" not in body, "no check may fail on the fixture host"
+    assert "does not pass the server checks" not in body
 
     body = post_onboarding(s, wp, "cashupay_choose_mode", {"cashupay_mode": "install"})
     assert "Download and install BareBits" in body, body[:2000]
+    # The chooser already showed the checks; the confirmation page stays slim
+    # and only resurfaces the table when a check regressed.
+    assert "PDO SQLite extension" not in body, "green checks must not repeat on the confirmation page"
 
     # Step 2: the installer downloads from the fixture release API, verifies
     # the checksum, and unpacks next to WordPress. The fixture publishes the
@@ -303,6 +313,31 @@ def test_install_mode_end_to_end(wordpress_install_mode, mint, backup_mint) -> N
     )
     assert bounced.status_code in (301, 302), bounced.text[:300]
     assert bounced.headers["Location"].rstrip("/") == wp.url.rstrip("/")
+
+
+def test_failing_check_disables_and_refuses_install(wordpress) -> None:
+    """A host that fails a server check gets the install option disabled on
+    the chooser — and, because the disabled radio is only markup, the mode
+    POST is refused by the same gate server-side."""
+    wp = wordpress
+    # The cheapest deterministic failure on a healthy fixture host: a saved
+    # folder name the installer's target resolution refuses (too long), which
+    # fails the writable-location check.
+    bad_dirname = "a" * 70
+    wp.wp_cli("option", "update", "cashupay_install_dirname", bad_dirname)
+    s = wp_login(wp)
+
+    body = onboarding_page(s, wp)
+    assert "❌" in body, body[:3000]
+    assert "does not pass the server checks below yet" in body
+    assert re.search(r'id="cashupay-mode-install"\s+disabled', body), "install radio must be disabled"
+
+    body = post_onboarding(
+        s, wp, "cashupay_choose_mode",
+        {"cashupay_mode": "install", "cashupay_install_dirname": bad_dirname},
+    )
+    assert "does not pass the server checks" in body, body[:2000]
+    assert wp_option(wp, "cashupay_mode") == ""
 
 
 def test_install_refuses_checksum_mismatch(standalone_zip) -> None:

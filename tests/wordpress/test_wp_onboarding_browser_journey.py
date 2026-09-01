@@ -66,7 +66,8 @@ def _open_onboarding(page, wp: WordPressHandle) -> None:
 
 
 def _choose_install_and_run(page, wp: WordPressHandle) -> str:
-    """Chooser -> preflight -> run the installer. Returns the flash text."""
+    """Chooser (checks shown inline) -> confirmation -> run the installer.
+    Returns the flash text."""
     page.wait_for_selector("#cashupay-mode-install")
     page.check("#cashupay-mode-install")
     page.click("#submit")
