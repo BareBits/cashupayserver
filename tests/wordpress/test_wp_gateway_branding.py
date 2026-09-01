@@ -37,8 +37,13 @@ STOCK_TITLE = "BTCPay (Bitcoin, Lightning Network, ...)"
 STOCK_DESCRIPTION = "You will be redirected to BTCPay to complete your purchase."
 
 APPLY = "cashupay_apply_btcpay_gateway_branding();"
-APPLY_WITH_DISCOUNT = "cashupay_apply_btcpay_gateway_branding(5);"
+# A wp-cli eval is not a wp-admin request, so a plain get_option runs through
+# payment-discount.php's runtime title filter — that read is what customers
+# see. The RAW dump bypasses the filter to inspect what is actually stored.
 DUMP = "echo json_encode(get_option('woocommerce_btcpaygf_default_settings'));"
+DUMP_RAW = (
+    "echo json_encode(cashupay_gateway_stored_settings());"
+)
 
 APPLY_STATES = "cashupay_apply_btcpay_order_states();"
 DUMP_STATES = "echo json_encode(get_option('btcpay_gf_order_states'));"
@@ -49,6 +54,20 @@ def _settings(wp: WordPressHandle) -> dict:
     data = json.loads(out)
     assert isinstance(data, dict), f"unexpected settings payload: {out!r}"
     return data
+
+
+def _stored_settings(wp: WordPressHandle) -> dict:
+    out = wp.wp_cli("eval", DUMP_RAW).stdout.strip().splitlines()[-1]
+    data = json.loads(out)
+    assert isinstance(data, dict), f"unexpected raw settings payload: {out!r}"
+    return data
+
+
+def _set_discount(wp: WordPressHandle, value: str | None) -> None:
+    if value is None:
+        wp.wp_cli("option", "delete", "cashupay_discount_percent", check=False)
+    else:
+        wp.wp_cli("option", "update", "cashupay_discount_percent", value, check=False)
 
 
 def _order_states(wp: WordPressHandle) -> dict:
@@ -99,29 +118,52 @@ def test_branding_replaces_stock_btcpay_defaults(wordpress: WordPressHandle) -> 
 
 def test_discount_percent_lands_in_the_checkout_title(wordpress: WordPressHandle) -> None:
     """The merchant's chosen Bitcoin discount is advertised in the gateway
-    title so customers see the incentive before picking a payment method."""
+    title so customers see the incentive before picking a payment method —
+    as a read-time suffix. The STORED title stays clean: the suffix must
+    track later percent changes without ever rewriting the option."""
     wordpress.wp_cli(
         "eval", "delete_option('woocommerce_btcpaygf_default_settings');"
     )
-    wordpress.wp_cli("eval", APPLY_WITH_DISCOUNT)
-    settings = _settings(wordpress)
-    assert settings["title"] == f"{BAREBITS_TITLE} 5% discount"
-    assert settings["description"] == BAREBITS_DESCRIPTION
+    _set_discount(wordpress, "5")
+    try:
+        wordpress.wp_cli("eval", APPLY)
+        settings = _settings(wordpress)
+        assert settings["title"] == f"{BAREBITS_TITLE} (5% discount)"
+        assert settings["description"] == BAREBITS_DESCRIPTION
+        assert _stored_settings(wordpress)["title"] == BAREBITS_TITLE, (
+            "the stored title must never carry the runtime discount suffix"
+        )
+    finally:
+        _set_discount(wordpress, None)
 
 
-def test_discount_title_is_write_once_like_the_rest_of_branding(wordpress: WordPressHandle) -> None:
-    """The branding pass is deliberately write-once: a title we already wrote
-    (with or without a discount) is neither re-suffixed nor updated when the
-    percentage changes later."""
+def test_discount_title_tracks_percent_changes(wordpress: WordPressHandle) -> None:
+    """Changing the percent changes the advertised title immediately — no
+    re-run of the branding pass, no write to the gateway settings. This is
+    the behaviour the old write-once baked-in suffix could not deliver."""
     wordpress.wp_cli(
         "eval", "delete_option('woocommerce_btcpaygf_default_settings');"
     )
     wordpress.wp_cli("eval", APPLY)
-    wordpress.wp_cli("eval", APPLY_WITH_DISCOUNT)
-    settings = _settings(wordpress)
-    assert settings["title"] == BAREBITS_TITLE, (
-        "an already-written title must not gain a discount suffix on re-run"
-    )
+    try:
+        _set_discount(wordpress, "5")
+        assert _settings(wordpress)["title"] == f"{BAREBITS_TITLE} (5% discount)"
+
+        _set_discount(wordpress, "2.5")
+        assert _settings(wordpress)["title"] == f"{BAREBITS_TITLE} (2.5% discount)", (
+            "the advertised percent must follow the option, decimals included"
+        )
+
+        _set_discount(wordpress, "0")
+        assert _settings(wordpress)["title"] == BAREBITS_TITLE, (
+            "no discount, no suffix"
+        )
+
+        assert _stored_settings(wordpress)["title"] == BAREBITS_TITLE, (
+            "none of the reads above may have baked a suffix into the option"
+        )
+    finally:
+        _set_discount(wordpress, None)
 
 
 def test_branding_never_clobbers_merchant_customization(wordpress: WordPressHandle) -> None:
@@ -135,11 +177,20 @@ def test_branding_never_clobbers_merchant_customization(wordpress: WordPressHand
         f"update_option('woocommerce_btcpaygf_default_settings', json_decode({seed!r}, true));",
     )
     wordpress.wp_cli("eval", APPLY)
-    wordpress.wp_cli("eval", APPLY_WITH_DISCOUNT)
     settings = _settings(wordpress)
     assert settings["title"] == "My Custom Gateway"
     assert settings["description"] == "Pay me in corn."
     assert settings["icon_media_id"] == "424242"
+
+    # A customized title still gets the runtime discount advertisement — the
+    # point of the read-time suffix is that it composes with ANY stored title
+    # instead of fighting the merchant for ownership of the field.
+    _set_discount(wordpress, "3")
+    try:
+        assert _settings(wordpress)["title"] == "My Custom Gateway (3% discount)"
+        assert _stored_settings(wordpress)["title"] == "My Custom Gateway"
+    finally:
+        _set_discount(wordpress, None)
 
 
 def test_branding_is_idempotent_reuses_attachment(wordpress: WordPressHandle) -> None:

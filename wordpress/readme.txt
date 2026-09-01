@@ -19,7 +19,7 @@ This plugin is the WordPress-side glue. During onboarding you either:
 * **Connect an existing BareBits server** by entering its URL, or
 * **Install BareBits alongside WordPress** — the plugin downloads the latest stable BareBits release from GitHub and installs it next to your WordPress site (in its own folder, updated independently of this plugin).
 
-Either way, the plugin then installs and configures the "BTCPay for WooCommerce" gateway plugin, points it at your BareBits server, registers the payment webhook, and can set up an automatic checkout discount for Bitcoin payments (via the free "ELEX Discount Per Payment Method" plugin).
+Either way, the plugin then installs and configures the "BTCPay for WooCommerce" gateway plugin, points it at your BareBits server, registers the payment webhook, and can apply an automatic checkout discount for Bitcoin payments — on both the classic and the block-based checkout, with the percentage advertised in the payment method's title.
 
 The BareBits server itself is a separate, self-hosted application (https://github.com/BareBits/cashupayserver) with its own license. This plugin contains no BareBits server code and talks to it purely over its HTTP API.
 
@@ -38,6 +38,9 @@ To wallets you control: your own Lightning address, your own on-chain wallet (xp
 Only the WordPress-side wiring is removed. A BareBits server installed alongside WordPress keeps running, and its data directory (which holds wallet keys) is never deleted by this plugin. The record of where that server lives — including its saved admin password, which is your only way into its dashboard — also survives, so reinstalling the plugin later offers to reconnect it.
 
 == Changelog ==
+
+= Unreleased =
+* The Bitcoin checkout discount is now applied by this plugin itself instead of the third-party ELEX plugin, and works on the block-based checkout as well as the classic one. The percentage (decimals allowed) is editable on the BareBits Connection page and in the gateway's WooCommerce settings, and the payment method's title always advertises the current value.
 
 = 1.3.1 =
 * The plugin no longer bundles the BareBits server. Onboarding now connects an existing server by URL or installs the latest stable release alongside WordPress.

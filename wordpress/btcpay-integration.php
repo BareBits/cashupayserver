@@ -156,13 +156,11 @@ function cashupay_is_btcpay_plugin_active(): bool {
  * that last manual step so payments work the moment onboarding finishes.
  */
 function cashupay_enable_btcpay_gateway(): void {
-    $optionKey = 'woocommerce_btcpaygf_default_settings';
-    $settings = get_option($optionKey, []);
-    if (!is_array($settings)) {
-        $settings = [];
-    }
+    // Raw read on purpose: read-modify-write of this option must bypass the
+    // discount title suffix payment-discount.php applies at read time.
+    $settings = cashupay_gateway_stored_settings();
     $settings['enabled'] = 'yes';
-    update_option($optionKey, $settings);
+    update_option('woocommerce_btcpaygf_default_settings', $settings);
 }
 
 /**
@@ -226,16 +224,17 @@ function cashupay_ensure_gateway_icon_attachment(): int {
  * WooCommerce -> Settings -> Payments -> BTCPay survive every re-run of the
  * onboarding flow.
  *
- * $discountPercent (the merchant's discount answer, validated 0-100) is
- * advertised in the checkout title so customers see the incentive before
- * picking a payment method.
+ * The merchant's discount is deliberately NOT part of the stored title: it
+ * is appended at read time by payment-discount.php's option filter, so the
+ * advertised percentage always tracks the current setting without ever
+ * touching a title the merchant may have customized.
  */
-function cashupay_apply_btcpay_gateway_branding(int $discountPercent = 0): void {
+function cashupay_apply_btcpay_gateway_branding(): void {
     $optionKey = 'woocommerce_btcpaygf_default_settings';
-    $settings = get_option($optionKey, []);
-    if (!is_array($settings)) {
-        $settings = [];
-    }
+    // Raw read on purpose: this is a read-modify-write, and reading through
+    // the discount title filter would bake the runtime suffix into the
+    // stored title.
+    $settings = cashupay_gateway_stored_settings();
 
     // Stock defaults from the BTCPay plugin's DefaultGateway::getTitle() /
     // getDescription(). Anything else means the merchant customized it.
@@ -244,8 +243,7 @@ function cashupay_apply_btcpay_gateway_branding(int $discountPercent = 0): void 
 
     $title = trim((string) ($settings['title'] ?? ''));
     if ($title === '' || $title === $stockTitle) {
-        $settings['title'] = 'BareBits (Bitcoin + Lightning)'
-            . ($discountPercent > 0 ? sprintf(' %d%% discount', $discountPercent) : '');
+        $settings['title'] = 'BareBits (Bitcoin + Lightning)';
     }
 
     $description = trim((string) ($settings['description'] ?? ''));
@@ -482,7 +480,7 @@ function cashupay_install_btcpay_plugin(): array {
  *
  * @return array{status:string, auto_installed:bool, message?:string, current_url?:string, replaced_url?:string, webhook?:mixed}
  */
-function cashupay_ensure_woocommerce_integration(string $store_id, string $api_key, int $discountPercent = 0): array {
+function cashupay_ensure_woocommerce_integration(string $store_id, string $api_key): array {
     // A real BTCPay Server connection is only replaced after the merchant
     // explicitly consented on the onboarding screen. Without that consent:
     // hands off entirely.
@@ -537,7 +535,7 @@ function cashupay_ensure_woocommerce_integration(string $store_id, string $api_k
     }
 
     cashupay_enable_btcpay_gateway();
-    cashupay_apply_btcpay_gateway_branding($discountPercent);
+    cashupay_apply_btcpay_gateway_branding();
     cashupay_apply_btcpay_order_states();
     cashupay_pin_order_storage_for_sqlite();
 

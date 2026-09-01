@@ -68,18 +68,6 @@ BTCPAY_WC_URL = (
 BTCPAY_WC_SHA256 = "b06a4da4835d984ddd870c3bfafb6fc4c524fe0ef988f22cd1575a8a7b77d236"
 BTCPAY_WC_CACHE = BIN_DIR / f"btcpay-greenfield-{BTCPAY_WC_VERSION}"
 
-# ELEX Discount Per Payment Method — the free plugin the onboarding wizard's
-# Bitcoin-discount step auto-installs. Tests stage it pre-installed (NOT
-# active) so cashupay_ensure_elex_discount exercises its activate+configure
-# path without a live wordpress.org download mid-test.
-ELEX_DPP_VERSION = "1.3.2"
-ELEX_DPP_URL = (
-    f"https://downloads.wordpress.org/plugin/elex-discount-per-payment-method.{ELEX_DPP_VERSION}.zip"
-)
-ELEX_DPP_SHA256 = "dbce21758f7bf76968880ed5e0750b73aa6621a8c944d2a13441fef47535dfd1"
-ELEX_DPP_CACHE = BIN_DIR / f"elex-discount-per-payment-method-{ELEX_DPP_VERSION}"
-
-
 @dataclass
 class WordPressHandle:
     server: webserver.ManagedServer
@@ -854,20 +842,20 @@ def install_woocommerce(handle: WordPressHandle) -> dict:
     return {"product_id": product_id}
 
 
-def stage_elex_discount_plugin(handle: WordPressHandle) -> None:
-    """Place the ELEX Discount Per Payment Method plugin in wp-content/plugins
-    WITHOUT activating it.
+def use_classic_checkout(handle: WordPressHandle) -> None:
+    """Switch the shop's checkout page from the WooCommerce checkout block
+    (the 9.x default) to the classic [woocommerce_checkout] shortcode.
 
-    This is the state cashupay_ensure_elex_discount finds on a host where the
-    plugin is present but dormant: it must take the activate+configure path,
-    and the test avoids depending on a live wordpress.org download (the
-    fresh-install path is byte-identical from activation onward)."""
-    src = _ensure_cached_plugin(
-        ELEX_DPP_CACHE, ELEX_DPP_URL, ELEX_DPP_SHA256, "elex-discount-per-payment-method"
+    WooCommerce keys its classic-vs-blocks behaviour off the checkout page's
+    content, so rewriting the page is the same switch a merchant makes in the
+    editor. Used by the classic-checkout discount tests — the two checkouts
+    take entirely different code paths to the payment-method-driven fee."""
+    page_id = handle.wp_cli(
+        "option", "get", "woocommerce_checkout_page_id"
+    ).stdout.strip().splitlines()[-1]
+    handle.wp_cli(
+        "post", "update", page_id, "--post_content=[woocommerce_checkout]"
     )
-    dst = handle.wp_root / "wp-content" / "plugins" / src.name
-    if not dst.exists():
-        os.symlink(src, dst)
 
 
 def _wp_config_php(

@@ -27,7 +27,7 @@ require_once __DIR__ . '/state.php';
 require_once __DIR__ . '/api-bridge.php';
 require_once __DIR__ . '/installer.php';
 require_once __DIR__ . '/btcpay-integration.php';
-require_once __DIR__ . '/elex-discount.php';
+require_once __DIR__ . '/payment-discount.php';
 require_once __DIR__ . '/onboarding.php';
 require_once __DIR__ . '/admin-menu.php';
 // Named cron-integration (not cron.php) so nothing can ever shadow the

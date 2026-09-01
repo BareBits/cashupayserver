@@ -9,7 +9,7 @@ End to end, the way a merchant on shared hosting would experience it:
     is pre-seeded so there is NO password screen, and no cron screen either)
     → the plugin collects credentials through the one-time provisioning
     handshake → WooCommerce is wired (gateway plugin + webhook over the
-    Greenfield API + branding + ELEX discount) → the WP-cron pinger drives
+    Greenfield API + branding + discount saved) → the WP-cron pinger drives
     the install's cron.php, SSO tokens sign the operator into the embedded
     admin, and the managed-install UI shaping is live (single store, no
     Products/Customers, payer email capture off, shop-facing redirects).
@@ -31,7 +31,7 @@ from wordpress.conftest import (
     wp_option,
 )
 from fixtures.setup_helpers import SetupWizard, wizard_heading
-from fixtures.wordpress import WordPressHandle, install_woocommerce, stage_elex_discount_plugin
+from fixtures.wordpress import WordPressHandle, install_woocommerce
 
 pytestmark = pytest.mark.wordpress
 
@@ -162,7 +162,6 @@ def test_install_mode_end_to_end(wordpress_install_mode, mint, backup_mint) -> N
 
     # Step 4: WooCommerce wiring with a 3% discount.
     install_woocommerce(wp)
-    stage_elex_discount_plugin(wp)
     body = post_onboarding(s, wp, "cashupay_finish", {"cashupay_discount_percent": "3"})
     assert "WooCommerce now takes Bitcoin" in body, body[:2000]
 
@@ -183,7 +182,10 @@ def test_install_mode_end_to_end(wordpress_install_mode, mint, backup_mint) -> N
     assert row is not None and row["enabled"] == 1
     assert row["secret"] == webhook_opt["secret"]
 
-    # Gateway enabled at checkout, discount advertised, ELEX rule written.
+    # Gateway enabled at checkout, discount saved and advertised (the `wp
+    # option get` read runs through payment-discount.php's runtime title
+    # filter — a CLI context is not wp-admin — so this is the customer-facing
+    # title).
     gateway = json.loads(
         wp.wp_cli(
             "option", "get", "woocommerce_btcpaygf_default_settings", "--format=json"
@@ -191,15 +193,7 @@ def test_install_mode_end_to_end(wordpress_install_mode, mint, backup_mint) -> N
     )
     assert gateway["enabled"] == "yes"
     assert "3% discount" in gateway["title"]
-    elex = json.loads(
-        wp.wp_cli(
-            "option", "get", "elex_discount_per_payment_method_options", "--format=json"
-        ).stdout.strip()
-    )
-    assert any(
-        rule.get("id") == "btcpaygf_default" and rule.get("value") == "3"
-        for rule in elex
-    ), elex
+    assert wp_option(wp, "cashupay_discount_percent") == "3"
 
     # Once wired, clicking "BareBits" in wp-admin embeds the admin behind a
     # one-time SSO sign-in URL — the old windowed experience, no password.

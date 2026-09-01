@@ -25,13 +25,15 @@ EXPECTED_FILES = [
     "installer.php",
     "onboarding.php",
     "btcpay-integration.php",
-    "elex-discount.php",
+    "payment-discount.php",
     "cron-integration.php",
     "admin-menu.php",
     "gateway-guard.php",
     "uninstall.php",
     "readme.txt",
     "assets/img/barebits-gateway-logo.png",
+    "assets/js/discount-classic.js",
+    "assets/js/discount-blocks.js",
 ]
 
 # Server code and the pre-split embedded entry points that must NEVER ship in
