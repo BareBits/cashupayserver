@@ -152,6 +152,23 @@ function cashupay_install_preflight(): array {
 }
 
 /**
+ * The first failing preflight check as "label — detail" (label alone when
+ * the check carries no detail), or null when the host passes them all. The
+ * chooser disables the install option on a failure, but that gate is only
+ * markup: the choose and install POST handlers refuse on this same answer,
+ * so a hand-crafted POST or a chooser rendered before conditions changed
+ * can never start an install the host cannot run.
+ */
+function cashupay_install_preflight_failure(): ?string {
+    foreach (cashupay_install_preflight() as $label => $check) {
+        if (empty($check['ok'])) {
+            return $label . ($check['detail'] !== '' ? ' — ' . $check['detail'] : '');
+        }
+    }
+    return null;
+}
+
+/**
  * Resolve the newest release's app zip (and SHA256SUMS when the release
  * publishes one) for this plugin's channel: /releases/latest (newest stable)
  * on the stable channel, the head of /releases (newest release of ANY kind,

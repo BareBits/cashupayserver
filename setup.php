@@ -2997,7 +2997,10 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                         'permissions[]' => 'btcpay.store.canviewinvoices',
                         'strict' => 'true'
                     ]) . '&permissions[]=btcpay.store.cancreateinvoice&permissions[]=btcpay.store.webhooks.canmodifywebhooks';
-                    $pairingUrl = $serverUrl . '/api-keys/authorize?' . $pairingParams;
+                    // The real file, not the pretty /api-keys/authorize rewrite:
+                    // rewrite-hostile hosts 404 the extension-less spelling, and
+                    // authorize.php executes anywhere this very page is being served.
+                    $pairingUrl = $serverUrl . '/api-keys/authorize.php?' . $pairingParams;
                     ?>
                     <a id="test-pairing-link" href="<?= htmlspecialchars($pairingUrl) ?>" class="btn btn-secondary" style="display: inline-block; font-size: 0.9rem; padding: 0.5rem 1rem;">
                         Test Pairing Flow

@@ -124,6 +124,9 @@ fi
 check_status "API rewrite /api/v1/server/info" "$BASE/api/v1/server/info" 200 401 503
 check_status "BTCPay alias /v1/server/info" "$BASE/v1/server/info" 200 401 503
 check_status "pairing endpoint /api-keys/authorize" "$BASE/api-keys/authorize" 200 302 400 401 405 503
+# The real-file form the WordPress plugin always targets (rewrite-hostile
+# hosts 404 the pretty spelling above) — every backend must serve it too.
+check_status "pairing endpoint /api-keys/authorize.php" "$BASE/api-keys/authorize.php" 200 302 400 401 405 503
 
 # --- 2. Deny rules ------------------------------------------------------------
 check_denied "dotfile .htaccess blocked" "$BASE/.htaccess"

@@ -75,9 +75,13 @@ if (preg_match('#^/api/v1/#', $uri)) {
 }
 
 // -----------------------------------------------------------------------------
-// API Key Authorization: /api-keys/authorize
+// API Key Authorization: /api-keys/authorize, and its real-file .php form.
+// The WordPress plugin always targets authorize.php (rewrite-hostile hosts
+// 404 the extension-less spelling), and the root-level $allowedFiles pass
+// below matches basename() only — without this, a router-mode deployment
+// (PHP built-in server, nginx front controller) would 404 the .php form.
 // -----------------------------------------------------------------------------
-if (preg_match('#^/api-keys/authorize$#', $uri)) {
+if (preg_match('#^/api-keys/authorize(?:\.php)?$#', $uri)) {
     require __DIR__ . '/api-keys/authorize.php';
     exit;
 }
