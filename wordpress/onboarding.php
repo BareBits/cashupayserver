@@ -484,8 +484,83 @@ function cashupay_render_onboarding(): void {
         if ($step !== 'choose') {
             cashupay_render_reset_form();
         }
+        cashupay_render_maintenance_guard();
         ?>
     </div>
+    <?php
+}
+
+/**
+ * Gate every onboarding form on WordPress not being in maintenance mode.
+ *
+ * WordPress auto-updates (wp-cron: core/plugin/translation updates) put the
+ * WHOLE site behind the "Briefly unavailable for scheduled maintenance"
+ * screen — every wp URL answers 503 until the update finishes, usually
+ * under a minute. A merchant who loaded this page just before that window
+ * and clicks a button during it lands on the maintenance screen, their
+ * choice unsaved (WordPress checks its .maintenance flag before any plugin
+ * loads, so nothing server-side here can intercept it). Same failure, same
+ * cure as the setup wizard's return-to-WordPress handoff (setup.php): probe
+ * first, and only submit once WordPress answers. 503 is the ONLY status
+ * that waits; anything else (including errors a broken probe might
+ * fabricate) falls through to a plain submit — this guard may delay the
+ * merchant, never trap them. A second click while waiting is the manual
+ * override, and without JavaScript every form submits exactly as before.
+ */
+function cashupay_render_maintenance_guard(): void {
+    ?>
+    <div class="notice notice-warning inline" id="cashupay-maintenance-waiting" style="display: none; margin: 1em 0 0;">
+        <p>WordPress is briefly updating itself (maintenance mode) &mdash; continuing automatically
+           as soon as it's back, usually under a minute. Clicking again goes ahead right away.</p>
+    </div>
+    <script>
+    (function () {
+        const note = document.getElementById('cashupay-maintenance-waiting');
+        // admin-post.php with no action is a cheap no-op that still answers
+        // 503 while WordPress is in maintenance mode.
+        const probeUrl = <?= wp_json_encode(admin_url('admin-post.php')) ?>;
+        document.querySelectorAll('form').forEach(function (form) {
+            if ((form.getAttribute('action') || '').indexOf('admin-post.php') === -1) {
+                return;
+            }
+            let cleared = false;
+            form.addEventListener('submit', function (e) {
+                if (cleared) {
+                    return; // the probe said go
+                }
+                if (form.dataset.cashupayWaiting === '1') {
+                    cleared = true; // second click while waiting: manual override
+                    return;
+                }
+                // Native validation already passed (the submit event only
+                // fires afterwards), so submitting programmatically — which
+                // skips both validation and this handler — is safe. Via the
+                // prototype: WordPress's submit_button() renders an input
+                // NAMED "submit", which shadows form.submit with the element.
+                e.preventDefault();
+                form.dataset.cashupayWaiting = '1';
+                const go = function () {
+                    cleared = true;
+                    HTMLFormElement.prototype.submit.call(form);
+                };
+                const probe = function () {
+                    fetch(probeUrl, { credentials: 'same-origin', cache: 'no-store' })
+                        .then(function (res) {
+                            if (res.status === 503) {
+                                form.insertAdjacentElement('afterend', note);
+                                note.style.display = '';
+                                setTimeout(probe, 5000);
+                            } else {
+                                go();
+                            }
+                        })
+                        .catch(go);
+                };
+                probe();
+            });
+        });
+    })();
+    </script>
     <?php
 }
 
