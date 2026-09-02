@@ -36,6 +36,16 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
+/**
+ * Whether the install-alongside flow ships in this build. The wordpress.org
+ * distribution excludes installer.php (the directory's guidelines forbid
+ * plugins fetching executable code), so every install-related UI element and
+ * POST handler gates on this; the GitHub distribution ships the full flow.
+ */
+function cashupay_installer_available(): bool {
+    return function_exists('cashupay_run_install');
+}
+
 /** Chosen onboarding mode: 'url', 'install', or '' while undecided. */
 function cashupay_mode(): string {
     $mode = (string) get_option('cashupay_mode', '');
@@ -97,8 +107,8 @@ function cashupay_is_configured(): bool {
  * the same host is NOT this site and gets verified like any remote server.
  */
 function cashupay_is_same_host_url(string $url): bool {
-    $target = parse_url($url);
-    $self = parse_url(site_url('/'));
+    $target = wp_parse_url($url);
+    $self = wp_parse_url(site_url('/'));
     if (!is_array($target) || !is_array($self) || empty($target['host']) || empty($self['host'])) {
         return false;
     }

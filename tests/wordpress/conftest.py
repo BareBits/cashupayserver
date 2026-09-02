@@ -33,6 +33,7 @@ from fixtures.wordpress import (
     WP_ADMIN_USER,
     WordPressHandle,
     ensure_wp_plugin_zip,
+    ensure_wp_plugin_wporg_zip,
     start_wordpress,
     stop_wordpress,
 )
@@ -46,6 +47,12 @@ def wp_plugin_zip() -> Path:
     """The built WordPress plugin zip (CI artifact, or built locally). Session
     scoped so the build happens at most once."""
     return ensure_wp_plugin_zip()
+
+
+@pytest.fixture(scope="session")
+def wp_plugin_wporg_zip() -> Path:
+    """The wordpress.org variant of the plugin zip (no installer.php)."""
+    return ensure_wp_plugin_wporg_zip()
 
 
 @pytest.fixture(scope="session")

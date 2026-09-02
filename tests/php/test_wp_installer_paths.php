@@ -80,6 +80,9 @@ function download_url($url, $timeout = 300) {
 
 class StubFilesystem {
     public function delete($path, $recursive = false) { cleanup_db((string)$path); return true; }
+    // Same contract as WP_Filesystem_Direct::move — a rename underneath;
+    // installer.php falls back to copy_dir when it returns false.
+    public function move($source, $destination, $overwrite = false) { return @rename((string)$source, (string)$destination); }
 }
 function WP_Filesystem() { $GLOBALS['wp_filesystem'] = new StubFilesystem(); return true; }
 
@@ -106,6 +109,7 @@ function copy_dir($from, $to) {
     return true;
 }
 
+require __DIR__ . '/wp_compat_stubs.php';
 require dirname(__DIR__, 2) . '/wordpress/installer.php';
 
 // =============================================================================

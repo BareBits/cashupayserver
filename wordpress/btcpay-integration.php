@@ -114,6 +114,10 @@ function cashupay_reset_btcpay_plugin_settings(): void {
         'btcpay_gf_review_dismissed_forever',
         'btcpay_gf_order_states_warning',
     ];
+    // Direct, uncached on purpose: enumerating ANOTHER plugin's options by
+    // prefix has no WordPress API, and this one-shot cleanup must see the
+    // live table, not a cache.
+    // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching
     $names = $wpdb->get_col(
         "SELECT option_name FROM {$wpdb->options}
           WHERE option_name LIKE 'btcpay\\_gf\\_%'
@@ -317,9 +321,14 @@ function cashupay_apply_btcpay_order_states(): void {
  * order-received page instead, which explains the order's actual state.
  */
 function cashupay_maybe_handle_retry(): void {
+    // A payer-facing link from the install's payment page — no WordPress
+    // session, so no nonce applies; the id is sanitized and only used in a
+    // meta lookup.
+    // phpcs:disable WordPress.Security.NonceVerification.Recommended
     $invoiceId = isset($_GET['cashupay-retry'])
         ? sanitize_text_field((string) wp_unslash($_GET['cashupay-retry']))
         : '';
+    // phpcs:enable
     if ($invoiceId === '') {
         return;
     }
@@ -334,10 +343,15 @@ function cashupay_maybe_handle_retry(): void {
         exit;
     }
 
+    // The gateway stores the invoice id in order meta; resolving an invoice
+    // back to its order has no other lookup. Bounded by the exactly-one-match
+    // requirement below.
+    // phpcs:disable WordPress.DB.SlowDBQuery.slow_db_query_meta_key,WordPress.DB.SlowDBQuery.slow_db_query_meta_value
     $orders = wc_get_orders([
         'meta_key' => 'BTCPay_id',
         'meta_value' => $invoiceId,
     ]);
+    // phpcs:enable
 
     if (!is_array($orders) || count($orders) !== 1) {
         wp_safe_redirect($fallback);
@@ -613,6 +627,10 @@ function cashupay_pin_order_storage_for_sqlite(): void {
         // The table exists whenever WooCommerce has HPOS enabled; suppress
         // the drop-in's error chatter anyway in case it does not.
         $suppress = $wpdb->suppress_errors();
+        // Direct, uncached on purpose: WooCommerce's HPOS table has no
+        // count API this early in boot, and the one-shot pin decision must
+        // see the live row count.
+        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching
         $hposOrderCount = (int) $wpdb->get_var(
             "SELECT COUNT(*) FROM {$wpdb->prefix}wc_orders"
         );

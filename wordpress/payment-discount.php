@@ -418,14 +418,14 @@ add_action('wp_enqueue_scripts', 'cashupay_enqueue_discount_scripts');
 function cashupay_render_discount_settings(): void {
     $current = cashupay_format_discount_percent(cashupay_discount_percent());
     ?>
-    <form method="post" action="<?= esc_url(admin_url('admin-post.php')) ?>" style="margin-top: 1em;">
+    <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>" style="margin-top: 1em;">
         <?php wp_nonce_field('cashupay_save_discount'); ?>
         <input type="hidden" name="action" value="cashupay_save_discount">
         <h2 style="font-size: 1.1em;">Bitcoin discount</h2>
         <p>
             <label for="cashupay-discount-setting">Discount for paying with Bitcoin:</label>
             <input type="number" min="0" max="100" step="0.01" id="cashupay-discount-setting"
-                   name="cashupay_discount_percent" value="<?= esc_attr($current) ?>" style="width: 6em;"> %
+                   name="cashupay_discount_percent" value="<?php echo esc_attr($current); ?>" style="width: 6em;"> %
         </p>
         <p class="description">0 = no discount. Applied automatically at checkout when the customer pays
             with BareBits, and advertised in the payment method's title. Also editable under
@@ -439,7 +439,9 @@ function cashupay_render_discount_settings(): void {
 function cashupay_handle_save_discount(): void {
     cashupay_require_admin_post('cashupay_save_discount');
 
-    $parsed = cashupay_parse_discount_percent((string)wp_unslash($_POST['cashupay_discount_percent'] ?? ''));
+    // Nonce verified above in cashupay_require_admin_post().
+    // phpcs:ignore WordPress.Security.NonceVerification.Missing
+    $parsed = cashupay_parse_discount_percent(sanitize_text_field(wp_unslash((string) ($_POST['cashupay_discount_percent'] ?? ''))));
     if ($parsed === null) {
         cashupay_flash('error', 'The discount must be a number between 0 and 100 (up to two decimal places).');
     } else {

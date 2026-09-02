@@ -3,11 +3,13 @@
  * Plugin Name: BareBits - Lightning Payments via Bitcoin
  * Plugin URI: https://github.com/BareBits/cashupayserver
  * Description: Accept Bitcoin payments (on-chain and lightning) in WooCommerce through a BareBits server — connect an existing one or install one alongside WordPress. No approval process, no middlemen.
- * Version: 1.4
+ * Version: 1.4.1
+ * Requires at least: 6.0
  * Requires PHP: 8.0
  * Author: BareBits
  * License: GPLv2 or later
  * License URI: https://www.gnu.org/licenses/gpl-2.0.html
+ * Text Domain: cashupay
  *
  * This plugin is deliberately thin: it contains only WordPress-specific glue
  * (onboarding UI, installing/configuring the BTCPay for WooCommerce gateway,
@@ -25,7 +27,13 @@ define('CASHUPAY_PLUGIN_FILE', __FILE__);
 
 require_once __DIR__ . '/state.php';
 require_once __DIR__ . '/api-bridge.php';
-require_once __DIR__ . '/installer.php';
+// The wordpress.org distribution ships WITHOUT installer.php (the directory's
+// guidelines forbid fetching executable code, which the install-alongside
+// flow exists to do); onboarding degrades to connect-by-URL only. The GitHub
+// distribution ships the full flow.
+if (file_exists(__DIR__ . '/installer.php')) {
+    require_once __DIR__ . '/installer.php';
+}
 require_once __DIR__ . '/btcpay-integration.php';
 require_once __DIR__ . '/payment-discount.php';
 require_once __DIR__ . '/onboarding.php';

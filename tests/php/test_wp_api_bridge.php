@@ -17,6 +17,7 @@ require __DIR__ . '/harness.php';
 define('ABSPATH', '/tmp/');
 function add_action($hook, $callable) {}
 
+require __DIR__ . '/wp_compat_stubs.php';
 require dirname(__DIR__, 2) . '/wordpress/api-bridge.php';
 
 // --- No install, nothing claimed --------------------------------------------

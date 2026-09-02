@@ -58,6 +58,7 @@ function cashupay_render_discount_settings(): void { echo 'DISCOUNT-SETTINGS'; }
 // And the wait-out-maintenance form gate (onboarding.php as well).
 function cashupay_render_maintenance_guard(): void { echo 'MAINTENANCE-GUARD'; }
 
+require __DIR__ . '/wp_compat_stubs.php';
 require dirname(__DIR__, 2) . '/wordpress/state.php';
 require dirname(__DIR__, 2) . '/wordpress/admin-menu.php';
 

@@ -55,6 +55,7 @@ function is_wp_error($thing) { return $thing instanceof WP_Error; }
 function wp_remote_retrieve_response_code($response) { return $response['response']['code'] ?? 0; }
 function wp_remote_retrieve_body($response) { return $response['body'] ?? ''; }
 
+require __DIR__ . '/wp_compat_stubs.php';
 require dirname(__DIR__, 2) . '/wordpress/state.php';
 require dirname(__DIR__, 2) . '/wordpress/cron-integration.php';
 

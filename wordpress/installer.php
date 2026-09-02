@@ -115,6 +115,10 @@ function cashupay_resolve_data_dir(string $installDir): string {
     if (is_dir($outside) && wp_is_writable($outside)) {
         return $outside;
     }
+    // Deliberately mkdir, not wp_mkdir_p: the data directory holds wallet
+    // keys and must be created 0750 (no world access), a mode wp_mkdir_p
+    // cannot be told to use — it copies the parent's permissions.
+    // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_mkdir
     if (!is_dir($outside) && wp_is_writable(dirname($outside)) && @mkdir($outside, 0750, true)) {
         return $outside;
     }
@@ -253,7 +257,7 @@ function cashupay_download_release(array $release): array {
     if (!empty($release['sums_url'])) {
         $sums = wp_remote_get($release['sums_url'], ['timeout' => 30]);
         if (is_wp_error($sums) || (int) wp_remote_retrieve_response_code($sums) !== 200) {
-            @unlink($file);
+            wp_delete_file($file);
             return ['ok' => false, 'message' => 'The release publishes SHA256SUMS but it could not be downloaded; aborting rather than installing unverified code.'];
         }
         $expected = null;
@@ -265,11 +269,11 @@ function cashupay_download_release(array $release): array {
             }
         }
         if ($expected === null) {
-            @unlink($file);
+            wp_delete_file($file);
             return ['ok' => false, 'message' => 'SHA256SUMS has no entry for ' . $release['zip_name'] . '; aborting.'];
         }
         if (!hash_equals($expected, hash_file('sha256', $file))) {
-            @unlink($file);
+            wp_delete_file($file);
             return ['ok' => false, 'message' => 'Checksum mismatch on the downloaded release — refusing to install it.'];
         }
         $verified = true;
@@ -305,6 +309,11 @@ function cashupay_unpack_release(string $zipPath, string $installDir): array {
         return ['ok' => false, 'message' => 'Could not create the staging directory.'];
     }
 
+    // Staging only, never persistence: wp-content/upgrade is WordPress core's
+    // own unpack staging area, and the tree is moved to its final home (and
+    // the staging directory deleted) a few lines down. Nothing is stored
+    // under wp-content across requests.
+    // phpcs:ignore PluginCheck.CodeAnalysis.WriteFile.PluginDirectoryWrite
     $result = unzip_file($zipPath, $staging);
     if (is_wp_error($result)) {
         $wp_filesystem->delete($staging, true);
@@ -332,8 +341,9 @@ function cashupay_unpack_release(string $zipPath, string $installDir): array {
             . 'or try again once a newer release is published.'];
     }
 
-    if (!wp_mkdir_p(dirname($installDir)) || !@rename($unpacked, $installDir)) {
-        // rename() can fail across filesystems; fall back to a copy.
+    if (!wp_mkdir_p(dirname($installDir)) || !$wp_filesystem->move($unpacked, $installDir)) {
+        // The move (a rename underneath) can fail across filesystems; fall
+        // back to a copy.
         if (!wp_mkdir_p($installDir) || is_wp_error(copy_dir($unpacked, $installDir))) {
             $wp_filesystem->delete($staging, true);
             return ['ok' => false, 'message' => 'Could not move the unpacked release into place at ' . $installDir . '.'];
@@ -371,6 +381,9 @@ function cashupay_write_install_config(string $installDir, string $dataDir, stri
     $token = bin2hex(random_bytes(32));
     $adminPassword = wp_generate_password(24, true, false);
     $ssoKey = bin2hex(random_bytes(32));
+    // Not debug output: var_export() is generating the PHP config file the
+    // BareBits install boots from — safely quoted PHP string literals.
+    // phpcs:disable WordPress.PHP.DevelopmentFunctions.error_log_var_export
     $config = "<?php\n"
         . "// Written by the BareBits WordPress plugin's installer.\n"
         . "define('CASHUPAY_DATA_DIR', " . var_export(rtrim($dataDir, '/'), true) . ");\n"
@@ -395,6 +408,7 @@ function cashupay_write_install_config(string $installDir, string $dataDir, stri
         . "// plugin's return endpoint, which collects the credentials through\n"
         . "// the handshake above and finishes the WooCommerce wiring flow.\n"
         . "define('CASHUPAY_MANAGED_RETURN_URL', " . var_export(admin_url('admin-post.php') . '?action=cashupay_provision_return', true) . ");\n";
+    // phpcs:enable
     if (file_put_contents(rtrim($installDir, '/') . '/user_config.php', $config) === false) {
         return ['ok' => false, 'message' => 'Could not write user_config.php into the install.'];
     }
@@ -447,7 +461,11 @@ function cashupay_run_install(string $dirname = ''): array {
         if (count(array_diff((array) scandir($installDir), ['.', '..'])) > 0) {
             return ['ok' => false, 'message' => 'The directory ' . $installDir . ' already exists and is not empty. Move it aside, or choose a different folder name.'];
         }
-        // Empty leftover directory: remove it so rename() can take its place.
+        // Empty leftover directory: remove it so the unpack's move can take
+        // its place. Just-verified empty, and the WP_Filesystem API is not
+        // initialized this early in the flow (cashupay_unpack_release does
+        // that right before the move).
+        // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_rmdir
         @rmdir($installDir);
     }
 
@@ -462,7 +480,7 @@ function cashupay_run_install(string $dirname = ''): array {
     }
 
     $unpack = cashupay_unpack_release($download['file'], $installDir);
-    @unlink($download['file']);
+    wp_delete_file($download['file']);
     if (empty($unpack['ok'])) {
         return ['ok' => false, 'message' => $unpack['message']];
     }

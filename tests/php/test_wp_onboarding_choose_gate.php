@@ -75,6 +75,9 @@ function sanitize_key($key) { return preg_replace('/[^a-z0-9_\-]/', '', strtolow
 function sanitize_file_name($name) { return trim((string)$name); }
 function get_bloginfo($show = '') { return 'Test Shop'; }
 function __($s) { return $s; }
+function esc_html__($s, $domain = 'default') { return htmlspecialchars((string)$s, ENT_QUOTES); }
+function wp_unslash($value) { return is_string($value) ? stripslashes($value) : $value; }
+function sanitize_text_field($str) { return trim(preg_replace('/[\r\n\t ]+/', ' ', strip_tags((string)$str))); }
 // Defined in btcpay-integration.php, which stays out of this stub set; the
 // env flag is the test's lever for failing exactly one preflight check.
 function cashupay_can_install_plugins(): bool { return getenv('T_PREFLIGHT_FAIL') !== '1'; }

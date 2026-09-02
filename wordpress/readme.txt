@@ -2,9 +2,9 @@
 Contributors: barebits
 Tags: bitcoin, lightning, payments, woocommerce, btcpay
 Requires at least: 6.0
-Tested up to: 6.6
+Tested up to: 7.1
 Requires PHP: 8.0
-Stable tag: 1.3.1
+Stable tag: 1.4.1
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -14,12 +14,9 @@ Accept Bitcoin (on-chain and Lightning) in WooCommerce through a BareBits server
 
 BareBits lets your WooCommerce shop accept Bitcoin — on-chain and over the Lightning Network — with funds going straight to wallets you control. No payment processor account, no approval process, no chargebacks.
 
-This plugin is the WordPress-side glue. During onboarding you either:
+This plugin is the WordPress-side glue: during onboarding you connect your self-hosted BareBits server by entering its URL. (The plugin's full build, distributed on the project's GitHub releases page, can additionally install a BareBits server alongside WordPress for you.)
 
-* **Connect an existing BareBits server** by entering its URL, or
-* **Install BareBits alongside WordPress** — the plugin downloads the latest stable BareBits release from GitHub and installs it next to your WordPress site (in its own folder, updated independently of this plugin).
-
-Either way, the plugin then installs and configures the "BTCPay for WooCommerce" gateway plugin, points it at your BareBits server, registers the payment webhook, and can apply an automatic checkout discount for Bitcoin payments — on both the classic and the block-based checkout, with the percentage advertised in the payment method's title.
+The plugin then installs and configures the "BTCPay for WooCommerce" gateway plugin, points it at your BareBits server, registers the payment webhook, and can apply an automatic checkout discount for Bitcoin payments — on both the classic and the block-based checkout, with the percentage advertised in the payment method's title.
 
 The BareBits server itself is a separate, self-hosted application (https://github.com/BareBits/cashupayserver) with its own license. This plugin contains no BareBits server code and talks to it purely over its HTTP API.
 
@@ -27,7 +24,7 @@ The BareBits server itself is a separate, self-hosted application (https://githu
 
 = Do I need my own server? =
 
-No — any host that can run WordPress can run BareBits. The "install alongside WordPress" option sets it up next to your existing site, even on shared hosting.
+Yes — a BareBits server you host yourself, which is the point: your money never touches anyone else's infrastructure. Any host that can run WordPress can run BareBits, even shared hosting; set it up once and connect it here by URL. (The full plugin build from the project's GitHub releases can also install it next to your existing site for you.)
 
 = Where does the money go? =
 
@@ -39,7 +36,11 @@ Only the WordPress-side wiring is removed. A BareBits server installed alongside
 
 == Changelog ==
 
-= Unreleased =
+= 1.4.1 =
+* The plugin now passes WordPress.org's Plugin Check with zero errors and zero warnings: escaped output everywhere, WordPress filesystem/URL APIs, sanitized request input, and readme metadata kept in sync with the plugin version by the build.
+* A wordpress.org distribution variant is now built alongside the full plugin. It omits the install-alongside flow (the plugin directory's guidelines forbid plugins downloading executable code) and connects to a BareBits server by URL only; the full plugin from GitHub releases is unchanged.
+
+= 1.4 =
 * The Bitcoin checkout discount is now applied by this plugin itself instead of the third-party ELEX plugin, and works on the block-based checkout as well as the classic one. The percentage (decimals allowed) is editable on the BareBits Connection page and in the gateway's WooCommerce settings, and the payment method's title always advertises the current value.
 * Pairing with an existing BareBits server no longer shows "page not found" on servers whose host ignores rewrite rules: the plugin now always opens the authorization page by its real file name (/api-keys/authorize.php).
 * The install-alongside server checks now show directly on the onboarding chooser, below the two options, instead of on a separate page afterwards. When a check fails, the install option is disabled with the reason in view.

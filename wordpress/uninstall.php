@@ -18,8 +18,8 @@ if (!defined('WP_UNINSTALL_PLUGIN')) {
 // Reset BTCPay gateway options only if they point at the server this plugin
 // connected — a hand-configured BTCPay connection is not ours to remove.
 $cashupay_server = rtrim((string) get_option('cashupay_server_url', ''), '/');
-$btcpay_url = (string) get_option('btcpay_gf_url', '');
-if ($cashupay_server !== '' && $btcpay_url !== '' && strpos($btcpay_url, $cashupay_server) === 0) {
+$cashupay_btcpay_url = (string) get_option('btcpay_gf_url', '');
+if ($cashupay_server !== '' && $cashupay_btcpay_url !== '' && strpos($cashupay_btcpay_url, $cashupay_server) === 0) {
     delete_option('btcpay_gf_url');
     delete_option('btcpay_gf_api_key');
     delete_option('btcpay_gf_store_id');
@@ -27,9 +27,9 @@ if ($cashupay_server !== '' && $btcpay_url !== '' && strpos($btcpay_url, $cashup
 }
 
 // Stop the WP-cron pinger.
-$timestamp = wp_next_scheduled('cashupay_cron_tick');
-if ($timestamp) {
-    wp_unschedule_event($timestamp, 'cashupay_cron_tick');
+$cashupay_timestamp = wp_next_scheduled('cashupay_cron_tick');
+if ($cashupay_timestamp) {
+    wp_unschedule_event($cashupay_timestamp, 'cashupay_cron_tick');
 }
 
 // The plugin's own state.
