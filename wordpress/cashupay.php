@@ -3,7 +3,7 @@
  * Plugin Name: BareBits - Lightning Payments via Bitcoin
  * Plugin URI: https://github.com/BareBits/cashupayserver
  * Description: Accept Bitcoin payments (on-chain and lightning) in WooCommerce through a BareBits server — connect an existing one or install one alongside WordPress. No approval process, no middlemen.
- * Version: 1.3.1
+ * Version: 1.4
  * Requires PHP: 8.0
  * Author: BareBits
  * License: GPLv2 or later
