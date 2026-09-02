@@ -34,6 +34,7 @@ from typing import Iterator
 import pytest
 
 from conftest import ConfiguredPayserver, SESSION_TMP
+from fixtures import backend
 from fixtures.api_client import AdminClient
 from fixtures.bitcoind import BitcoindHandle
 from fixtures.clink_relay import ClinkRelayHandle, start_clink_relay, stop_clink_relay
@@ -230,23 +231,23 @@ def test_auto_melt_drains_balance_to_noffer(
     # 2. Point auto-cashout at the merchant's noffer.
     _save_noffer_destination(configured.admin, configured.store_id, noffer_drain_stack.noffer)
 
-    # 3. Trigger cron: checkAutoMelt() dials the noffer over the relay, the
-    #    plugin issues a real bolt11, and the mint melts ecash to pay it.
-    r = configured.handle.trigger_cron()
-    assert r.status_code == 200, r.text
-    body_text = r.text.strip()
-    try:
-        cron_body = r.json()
-    except Exception:
-        import json as _json
-
-        idx = body_text.find("{")
-        cron_body = _json.loads(body_text[idx:]) if idx >= 0 else {}
-    auto_melt_result = cron_body.get("tasks", {}).get("auto_melt")
-    assert auto_melt_result and auto_melt_result != "skipped", (
-        f"auto_melt task didn't run; body={body_text[:600]!r}"
-    )
+    # 3. Cron fires checkAutoMelt(): it dials the noffer over the relay, the
+    #    plugin issues a real bolt11, and the mint melts ecash to pay it. Only
+    #    pin the task result on php -S, where no opportunistic background cron
+    #    can race the trigger.
+    if backend.is_phps():
+        auto_melt_result = configured.handle.trigger_cron_json().get("tasks", {}).get(
+            "auto_melt"
+        )
+        assert auto_melt_result and auto_melt_result != "skipped", (
+            f"auto_melt task didn't run; result={auto_melt_result!r}"
+        )
 
     # 4. The mint balance drained — proof the noffer melt actually settled.
+    configured.handle.drive_cron_until(
+        lambda: _store_balance(configured) < 500,
+        timeout_s=60,
+        label="noffer auto-melt drains the balance",
+    )
     remaining = _store_balance(configured)
     assert remaining < 500, f"store balance not drained via noffer: {remaining}"

@@ -28,19 +28,19 @@ import json
 
 import pytest
 
-from conftest import ConfiguredPayserver, DEFAULT_ADMIN_PASSWORD, DEFAULT_STORE_NAME
+from conftest import ConfiguredPayserver
 
 
 @pytest.fixture
-def admin_page(configured: ConfiguredPayserver, browser):
-    """A logged-in admin browser page plus the base URL and seeded store id."""
+def admin_page(shared_configured: ConfiguredPayserver, browser):
+    """A logged-in admin browser page plus the per-test store's config."""
     ctx = browser.new_context(viewport={"width": 1280, "height": 900})
     ctx.request.post(
-        f"{configured.handle.url}/admin",
-        form={"action": "login", "username": "admin", "password": DEFAULT_ADMIN_PASSWORD},
+        f"{shared_configured.handle.url}/admin",
+        form={"action": "login", "username": "admin", "password": shared_configured.admin_password},
     )
     page = ctx.new_page()
-    yield page, configured
+    yield page, shared_configured
     ctx.close()
 
 
@@ -179,7 +179,7 @@ def test_store_name_still_shown_on_payment_page_when_hidden(admin_page):
         cfg.store_id, "1000", "sat", metadata={"itemDesc": "2x Latte"},
     )
     page.goto(inv["checkoutLink"], wait_until="networkidle")
-    assert DEFAULT_STORE_NAME in page.content()
+    assert cfg.store_name in page.content()
 
 
 # ------------------------------------------------------------------- browser

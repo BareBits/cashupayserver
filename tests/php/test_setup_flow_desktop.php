@@ -5,7 +5,7 @@
  * The desktop package (windows/ launcher + bundled PHP) handles cron itself
  * (desktop-helper.php ticks cron-runner.php) and only listens on 127.0.0.1,
  * so the wizard must drop the cron and security screens there — while a
- * plain server install, WordPress, and add_store keep their exact shapes.
+ * plain server install and add_store keep their exact shapes.
  * Also covers the cron screen's OS-keyed scheduler line: a Windows server
  * host has no crontab, so it must be handed a schtasks command instead.
  */
@@ -16,7 +16,7 @@ require_once dirname(__DIR__, 2) . '/includes/desktop.php';
 
 // --- Desktop drops the cron screen ----------------------------------------
 
-$desktop = SetupFlow::stepSequence('', false, false, true, true);
+$desktop = SetupFlow::stepSequence('', false, true, true);
 assert_eq(
     ['terms', 'security', 'password', 'store', 'onchain', 'lightning', 'swaps', 'mints', 'done'],
     $desktop,
@@ -27,7 +27,7 @@ assert_eq('done', SetupFlow::nextStep('mints', $desktop), 'on desktop, done foll
 // The realistic desktop shape: data dir sits inside the web root (app/data),
 // but the security screen is dropped by the caller anyway because the server
 // only listens on loopback — both screens gone.
-$desktopNoSecurity = SetupFlow::stepSequence('', false, false, false, true);
+$desktopNoSecurity = SetupFlow::stepSequence('', false, false, true);
 assert_eq(
     ['terms', 'password', 'store', 'onchain', 'lightning', 'swaps', 'mints', 'done'],
     $desktopNoSecurity,
@@ -38,20 +38,20 @@ assert_eq('password', SetupFlow::nextStep('terms', $desktopNoSecurity), 'terms g
 // Omitting the flag keeps the screen — every historical call site behaves
 // as before.
 assert_true(
-    in_array('cron', SetupFlow::stepSequence('', false, false), true),
+    in_array('cron', SetupFlow::stepSequence('', false), true),
     'the cron screen stays by default'
 );
 
 // add_store never had the tail screens; the flag must not disturb it.
 assert_eq(
-    SetupFlow::stepSequence('add_store', false, true),
-    SetupFlow::stepSequence('add_store', false, true, true, true),
+    SetupFlow::stepSequence('add_store', true),
+    SetupFlow::stepSequence('add_store', true, true, true),
     'add_store is unaffected by the desktop flag'
 );
 
 // --- Detection: explicit env var ------------------------------------------
 //
-// CashuPayServer.bat sets CASHUPAY_DESKTOP=1 for every process it starts.
+// BareBits.bat sets CASHUPAY_DESKTOP=1 for every process it starts.
 // Same env conventions as the updater's kill switches: non-empty and not "0".
 
 putenv('CASHUPAY_DESKTOP=1');

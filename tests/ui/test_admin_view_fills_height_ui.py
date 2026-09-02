@@ -54,8 +54,8 @@ def _gap_to_main_bottom(page, selector: str) -> float:
     )
 
 
-def test_settings_footer_pinned_to_bottom(configured: ConfiguredPayserver, page) -> None:
-    _login(configured, page)
+def test_settings_footer_pinned_to_bottom(shared_configured: ConfiguredPayserver, page) -> None:
+    _login(shared_configured, page)
 
     page.click('.nav-item[data-view="settings"]')
     page.wait_for_selector("#view-settings.active")
@@ -71,7 +71,7 @@ def test_settings_footer_pinned_to_bottom(configured: ConfiguredPayserver, page)
 
 
 def test_settings_footer_always_visible_on_desktop(
-    configured: ConfiguredPayserver, page
+    shared_configured: ConfiguredPayserver, page
 ) -> None:
     """Desktop: footer stays on screen even when the card list overflows.
 
@@ -80,6 +80,7 @@ def test_settings_footer_always_visible_on_desktop(
     fixed below it, so the footer is visible WITHOUT any scrolling. Before this
     change the footer scrolled with the content and sat below the fold.
     """
+    configured = shared_configured
     # Short, wide viewport: wide => desktop layout (>=768px); short => the
     # admin card list is taller than the viewport so the scroll region engages.
     page.set_viewport_size({"width": 1280, "height": 600})
@@ -136,7 +137,7 @@ def test_settings_footer_always_visible_on_desktop(
 
 
 def test_settings_footer_visible_above_mobile_nav(
-    configured: ConfiguredPayserver, page
+    shared_configured: ConfiguredPayserver, page
 ) -> None:
     """Footer must not be hidden behind the fixed bottom nav on mobile.
 
@@ -145,6 +146,7 @@ def test_settings_footer_visible_above_mobile_nav(
     (short content) or the page scrolls (tall content), scrolling to the very
     bottom must leave the footer fully above the nav bar.
     """
+    configured = shared_configured
     page.set_viewport_size({"width": 390, "height": 844})
     page.set_default_timeout(15000)
     page.goto(f"{configured.handle.url}/admin")
@@ -187,8 +189,8 @@ def test_settings_footer_visible_above_mobile_nav(
     )
 
 
-def test_invoices_list_card_fills_height(configured: ConfiguredPayserver, page) -> None:
-    _login(configured, page)
+def test_invoices_list_card_fills_height(shared_configured: ConfiguredPayserver, page) -> None:
+    _login(shared_configured, page)
 
     page.locator('.nav-item[data-view="invoices"]').click()
     page.wait_for_selector("#view-invoices.active")

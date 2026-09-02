@@ -180,7 +180,7 @@ def test_invalid_inputs_are_rejected_with_readable_messages(payserver: Payserver
     w.post(step="onchain", onchain_action="skip")
 
     body = w.post(step="lightning", lightning_action="save", lightning_address="not-an-address")
-    assert "myname@strike.me" in (_error(body) or ""), _error(body)
+    assert "myname@wallet.com" in (_error(body) or ""), _error(body)
 
     body = w.post(step="lightning", lightning_action="save", **{"noffers[]": "noffer1garbage"})
     assert "noffer1" in (_error(body) or ""), _error(body)

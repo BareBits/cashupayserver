@@ -27,13 +27,13 @@ def _payment_html(session: requests.Session, base_url: str, invoice_id: str) -> 
     return r.text
 
 
-def test_payment_subid_uses_csprng(configured: ConfiguredPayserver) -> None:
-    base_url = configured.handle.url
+def test_payment_subid_uses_csprng(shared_configured: ConfiguredPayserver) -> None:
+    base_url = shared_configured.handle.url
 
-    invoice = configured.greenfield.create_invoice(
-        configured.store_id, amount=INVOICE_AMOUNT_SAT, currency="sat"
+    invoice = shared_configured.greenfield.create_invoice(
+        shared_configured.store_id, amount=INVOICE_AMOUNT_SAT, currency="sat"
     )
-    html = _payment_html(configured.admin.s, base_url, invoice["id"])
+    html = _payment_html(shared_configured.admin.s, base_url, invoice["id"])
 
     # The watcher function (and therefore the sub-id generator) must be present.
     assert "startNofferReceiptWatch" in html, "noffer watcher JS missing from payment page"

@@ -11,10 +11,10 @@
  *       → JSON array of all non-draft releases, newest-first (what the
  *         'testing' channel scans; it takes the first entry).
  *   GET /assets/<tag>/BUILD_INFO          → that release's BUILD_INFO file
- *   GET /assets/<tag>/cashupayserver-<tag>.zip → that release's app zip
+ *   GET /assets/<tag>/barebits-<tag>.zip → that release's app zip
  *
  * Each release JSON carries the two assets the updater looks for: a
- * stable-named BUILD_INFO and a version-stamped cashupayserver-<tag>.zip.
+ * stable-named BUILD_INFO and a version-stamped barebits-<tag>.zip.
  *
  * Returns an array with:
  *   - 'baseUrl'     — pass to Updater::$releaseApiUrlBase. It is the releases
@@ -41,7 +41,7 @@ function updater_fixture_pick_free_port(): int {
 }
 
 function updater_fixture_make_zip(string $zipPath, string $stagedRoot): void {
-    // The build script wraps content under cashupayserver/.
+    // The build script wraps content under barebits/.
     $zip = new ZipArchive();
     if ($zip->open($zipPath, ZipArchive::CREATE | ZipArchive::OVERWRITE) !== true) {
         fail("could not create zip $zipPath");
@@ -53,7 +53,7 @@ function updater_fixture_make_zip(string $zipPath, string $stagedRoot): void {
     $prefixLen = strlen($stagedRoot) + 1;
     foreach ($iter as $item) {
         $rel = substr($item->getPathname(), $prefixLen);
-        $entry = 'cashupayserver/' . $rel;
+        $entry = 'barebits/' . $rel;
         if ($item->isDir()) {
             $zip->addEmptyDir($entry);
         } else {
@@ -94,7 +94,7 @@ function updater_fixture_start_releases(array $releases): array {
         $extra = $r['extra'] ?? [];
 
         // Stage the release content (this is what goes INSIDE the zip, under
-        // cashupayserver/).
+        // barebits/).
         $stage = $work . '/stage-' . $i;
         mkdir($stage . '/data', 0755, true);
         $lines = [];
@@ -112,7 +112,7 @@ function updater_fixture_start_releases(array $releases): array {
         // Serve this release's assets under /assets/<tag>/.
         $assetDir = $serveDir . '/assets/' . $tag;
         mkdir($assetDir, 0755, true);
-        $zipName = 'cashupayserver-' . $tag . '.zip';
+        $zipName = 'barebits-' . $tag . '.zip';
         updater_fixture_make_zip($assetDir . '/' . $zipName, $stage);
         copy($stage . '/BUILD_INFO', $assetDir . '/BUILD_INFO');
 
@@ -246,7 +246,7 @@ PHP;
  * $newBuildInfo: BUILD_INFO keys for the release (e.g. ['COMMIT_SHA'=>...,
  *                'VERSION'=>'0.2']). The tag is derived from VERSION.
  * $extraFiles:   relative path => contents to place inside the zip's
- *                cashupayserver/ tree (e.g. ['admin.php' => 'NEW']).
+ *                barebits/ tree (e.g. ['admin.php' => 'NEW']).
  */
 function updater_fixture_start(string $channel, array $newBuildInfo, array $extraFiles = []): array {
     $version = (string)($newBuildInfo['VERSION'] ?? '0.0.0-fixture');

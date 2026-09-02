@@ -8,6 +8,11 @@ gate end-to-end against the rendered HTML:
   - admin session + toggle ON   -> labels visible
   - admin session + toggle OFF  -> labels hidden
   - no session   + toggle ON    -> labels hidden (a payer never sees them)
+
+Deliberately NOT on the shared-server fixture: save_developer_settings writes
+the server-global show_payment_path_debug config row (and the test relies on
+its site-wide default being OFF), which would race other tests' payment pages
+on a shared instance.
 """
 from __future__ import annotations
 

@@ -2,8 +2,8 @@
 
   - New "Lightning payments" card sits between Store Info and the cashout
     card and carries the LN-address / NWC / noffer priority lists plus the
-    path-order note (LNURL/lightning address, NWC, noffer — the order the
-    saved chain is actually walked in).
+    path-order note (Strike API, LNURL/lightning address, NWC, noffer — the
+    order the saved chain is actually walked in).
   - "Auto-Cashout" is renamed "Cashu automatic cashout"; its column selector
     has exactly two modes (the "Use global settings" card is gone).
   - The site-wide settings cards for swaps / self-serve / on-chain default
@@ -74,9 +74,10 @@ def test_lightning_payments_card_order_and_note(mintless_payserver) -> None:
     assert ">Lightning payments<" in page
     assert ">Cashu automatic cashout<" in page
 
-    # Path-order note states the real order (LNURL → NWC → noffer).
+    # Path-order note states the real order (Strike → LNURL → NWC → noffer).
+    # The note wraps across source lines, so compare whitespace-normalized.
     assert "Lightning payment paths are tried in the following order" in page
-    assert "LNURL/lightning address, NWC, noffer" in page
+    assert "Strike API, LNURL/lightning address, NWC, noffer" in re.sub(r"\s+", " ", page)
 
     # The three priority lists moved into the new card (all appear after the
     # card opens and before the cashout card opens).

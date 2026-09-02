@@ -127,6 +127,8 @@ class MeltLog {
      * @param string      $destination      BOLT-11 / LNURL / sink URL
      * @param string|null $preimage         Lightning preimage when available
      * @param string|null $note             One of FEE_NOTE_*, or NULL for user/auto-melt
+     * @param string|null $strikeInvoiceId  Strike invoice id when the melt paid a
+     *                                      Strike-quoted bolt11 (dashboard reconciliation)
      */
     public static function record(
         string $storeId,
@@ -134,7 +136,8 @@ class MeltLog {
         int $networkFeeSats,
         string $destination,
         ?string $preimage,
-        ?string $note
+        ?string $note,
+        ?string $strikeInvoiceId = null
     ): int {
         return (int) Database::insert('melts', [
             'store_id' => $storeId,
@@ -144,6 +147,7 @@ class MeltLog {
             'preimage' => $preimage,
             'note' => $note,
             'status' => 'paid',
+            'strike_invoice_id' => $strikeInvoiceId,
             'created_at' => time(),
         ]);
     }

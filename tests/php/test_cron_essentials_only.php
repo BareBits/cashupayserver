@@ -12,6 +12,21 @@ require __DIR__ . '/harness.php';
 fresh_db();
 require_once dirname(__DIR__, 2) . '/includes/background.php';
 
+// cron.php's refusal paths end in a bare `exit` (status 0). A case that trips
+// one kills this process mid-file "successfully", and run.php counts the
+// silently truncated test as green — exactly what happened when cron_key
+// seeding landed in Database::initialize and the external-call cases stopped
+// authenticating: everything from case 4 on simply never ran. Turn any early
+// exit into a failure (an exit() inside a shutdown function overrides the
+// process's exit status).
+$GLOBALS['test_done'] = false;
+register_shutdown_function(function () {
+    if (empty($GLOBALS['test_done'])) {
+        fwrite(STDERR, "test exited before completion (a cron.php refusal path fired)\n");
+        exit(1);
+    }
+});
+
 $threshold = Background::EXTERNAL_CRON_FRESH_THRESHOLD_SECS;
 assert_eq(3600, $threshold, 'fresh threshold is 1h');
 
@@ -114,8 +129,11 @@ foreach ($nonEssentialKeys as $k) {
 // last_external_cron_at is recent. (And of course the call itself re-stamps
 // it, so we measure mode before that matters.)
 Config::set('last_external_cron_at', time() - 60);
-// No cron_key configured, so any key (or none) is accepted on external path.
-$res = run_cron([]);
+// External calls authenticate against the cron_key Database::initialize
+// seeded (raw hex in the config table, so Config::get returns it verbatim).
+$seededCronKey = (string)Config::get('cron_key');
+assert_true($seededCronKey !== '', 'Database::initialize seeded a cron_key');
+$res = run_cron(['key' => $seededCronKey]);
 assert_eq('all', $res['mode'], 'external call → all regardless of stamp');
 foreach ($nonEssentialKeys as $k) {
     assert_true(isset($res['tasks'][$k]), "non-essential '$k' must be present on external call");
@@ -123,7 +141,7 @@ foreach ($nonEssentialKeys as $k) {
 
 // Case 5: ?only=swaps remains swaps-only regardless of staleness.
 Config::set('last_external_cron_at', time() - 60);
-$res = run_cron(['only' => 'swaps']);
+$res = run_cron(['only' => 'swaps', 'key' => $seededCronKey]);
 assert_eq('swaps-only', $res['mode'], 'swaps-only mode unchanged');
 assert_true(isset($res['tasks']['poll_swaps']), 'poll_swaps runs in swaps-only');
 foreach ($nonEssentialKeys as $k) {
@@ -133,4 +151,5 @@ foreach (['poll_quotes', 'expire_invoices', 'poll_onchain', 'recover_orphaned'] 
     assert_true(!isset($res['tasks'][$k]), "non-swap essential '$k' absent in swaps-only");
 }
 
+$GLOBALS['test_done'] = true;
 echo "test_cron_essentials_only: ok\n";

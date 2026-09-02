@@ -38,5 +38,13 @@ MeltLog::record($store, -100, -50, 'whatever', null, null);
 $last = Database::fetchOne("SELECT * FROM melts WHERE store_id = ? ORDER BY id DESC LIMIT 1", [$store]);
 assert_eq(0, (int)$last['amount_sats']);
 assert_eq(0, (int)$last['network_fee_sats']);
+assert_eq(null, $last['strike_invoice_id'], 'no Strike id unless the melt paid a Strike quote');
+
+// Strike cashout: the Strike invoice id created for the payout is recorded
+// for dashboard reconciliation.
+MeltLog::record($store, 12000, 15, 'Strike API (…ABCD)', 'p3', null, 'strk_inv_123');
+$last = Database::fetchOne("SELECT * FROM melts WHERE store_id = ? ORDER BY id DESC LIMIT 1", [$store]);
+assert_eq('strk_inv_123', $last['strike_invoice_id'], 'strike_invoice_id persisted');
+assert_eq('Strike API (…ABCD)', $last['destination']);
 
 echo "test_melt_log_record: ok\n";

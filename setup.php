@@ -9,15 +9,16 @@
  *
  * Sequence (standalone first run):
  *   security   Requirements + database-exposure check + URL-mode detection
- *   password   Admin password (skipped in WordPress mode)
+ *   password   Admin password
  *   store      Store name
  *   onchain    On-chain destination — xpub (preferred) or single address
  *   zeroconf   Zero-conf vs 1-confirmation (skipped when onchain was skipped)
  *   lightning  LNURL/Lightning address + CLINK noffer
  *   swaps      Submarine swaps on/off
  *   mints      Cashu mints on/off; auto-picks a main + backup when on
- *   discount   Bitcoin checkout discount %, WordPress mode only
- *   cron       Reminder to install the cron entry
+ *   cron       Reminder to install the cron entry (skipped on the desktop
+ *              package, and on provisioned installs that declare
+ *              CASHUPAY_EXTERNAL_CRON — see SetupFlow::externalCronConfigured)
  *   done       Completion, seed phrase, e-commerce pairing
  *
  * `?mode=add_store` (from the admin panel) runs store → mints only and then
@@ -39,32 +40,28 @@ require_once __DIR__ . '/includes/store_ln_addresses.php';
 require_once __DIR__ . '/includes/swap/config.php';
 require_once __DIR__ . '/includes/setup_flow.php';
 require_once __DIR__ . '/includes/desktop.php';
-
-/**
- * Load the WooCommerce/BTCPay auto-wiring helper (WordPress mode only). Its
- * location depends on how the plugin was assembled: build-wordpress-plugin.sh
- * keeps wordpress/ as a subdirectory, while docker/Dockerfile.wordpress
- * flattens wordpress/*.php to the plugin root — a bare __DIR__ include only
- * resolves under the second. Returns false rather than fataling when neither
- * layout matches, so callers degrade to "no WooCommerce wiring offered"
- * instead of killing the page. Used by the terms screen (existing-BTCPay
- * consent), the done-step POST handler, and the completion screen.
- */
-function setupLoadBtcpayIntegration(): bool {
-    foreach ([
-        __DIR__ . '/wordpress/btcpay-integration.php',
-        __DIR__ . '/btcpay-integration.php',
-    ] as $candidate) {
-        if (is_file($candidate)) {
-            require_once $candidate;
-            return true;
-        }
-    }
-    return false;
-}
+require_once __DIR__ . '/includes/managed.php';
 
 // Initialize session early - needed for storing temp data during setup
 Auth::initSession();
+
+/**
+ * The URL of THIS wizard request (path only, query stripped) — the action for
+ * every in-wizard form, Back link, and AJAX call.
+ *
+ * Deliberately not Urls::setup(): that helper trusts the detected URL mode,
+ * and the default ('router') builds PATH_INFO-style URLs like
+ * /router.php/setup.php that plenty of hosts never route — a WordPress-
+ * alongside install behind nginx or a no-AllowOverride Apache serves a
+ * WordPress "page not found" for them, dumping the operator out of the wizard
+ * at the first screen whose form used an absolute action. The URL the
+ * operator is already viewing routed HERE by construction, so posting back to
+ * it works on every host and in every URL mode.
+ */
+function setupSelfUrl(): string {
+    $uri = strtok((string)($_SERVER['REQUEST_URI'] ?? ''), '?');
+    return ($uri !== '' && $uri !== false) ? $uri : Urls::setup();
+}
 
 // AJAX endpoints that are stateless and need to work both during and after
 // setup (e.g. the mint-discovery modal opens from add_store mode after
@@ -139,9 +136,23 @@ if (!Database::isInitialized()) {
     Database::initialize();
 }
 
+// Managed installs provision the admin account up front (see managed.php);
+// seed it before the wizard's shape is computed so the password screen is
+// consistently absent from the very first render.
+ManagedInstall::seedAdminIfProvisioned();
+
 // One resolve per request: the answer can't change mid-request, and the
-// wizard's shape must not either.
+// wizard's shape must not either. A managed install implies the external
+// cron declaration (its orchestrator pings cron.php). The password skip
+// requires the seeded account to actually EXIST, not just the hash constant:
+// if a merchant-created account predated the hash, the seed above no-oped,
+// and the wizard must still collect a password rather than strand the
+// operator with credentials nobody knows. Stable mid-run — only the
+// password screen itself writes users, and it is exactly the screen that is
+// absent when this is true.
 $isDesktop = Desktop::isWindowsDesktop();
+$externalCron = SetupFlow::externalCronConfigured() || ManagedInstall::isManaged();
+$passwordPreseeded = ManagedInstall::adminSeededFromProvisionedHash();
 
 // The security screen exists to prove the data directory can't be fetched
 // over the web. With the directory outside the web root that exposure is
@@ -232,8 +243,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     // each handler runs so the advance lands on the right screen.
     $storeIdForFlow = $_SESSION['setup_store_id'] ?? null;
     $flowSteps = SetupFlow::stepSequence(
-        $mode, Urls::isWordPress(), SetupFlow::onchainState($storeIdForFlow)['configured'],
-        $securityScreenNeeded, $isDesktop
+        $mode, SetupFlow::onchainState($storeIdForFlow)['configured'],
+        $securityScreenNeeded, $isDesktop, $externalCron, $passwordPreseeded
     );
     // Set by the mints handler when it mints a fresh wallet seed. add_store
     // has to stop and show it rather than redirecting past it.
@@ -244,21 +255,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             case 'terms':
                 if (empty($_POST['terms_legal']) || empty($_POST['terms_warranty']) || empty($_POST['terms_fee'])) {
                     throw new Exception('Please accept all three terms to continue.');
-                }
-                // WordPress mode: a WooCommerce checkout already paying
-                // through a real BTCPay Server is about to be replaced by the
-                // completion screen. That is destructive (all BTCPay plugin
-                // settings are reset to BareBits defaults), so it needs the
-                // merchant's explicit consent — collected here, on the first
-                // screen, where the warning is impossible to miss. The state
-                // is re-checked server-side rather than trusting the render:
-                // the config can change between the GET and this POST.
-                if (Urls::isWordPress() && setupLoadBtcpayIntegration()
-                        && cashupay_btcpay_takeover_state() === 'needs_consent') {
-                    if (empty($_POST['btcpay_override_consent'])) {
-                        throw new Exception('Please confirm that your existing BTCPay Server settings may be replaced.');
-                    }
-                    cashupay_record_btcpay_override_consent();
                 }
                 $step = SetupFlow::nextStep('terms', $flowSteps) ?? 'security';
                 break;
@@ -382,8 +378,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 // reached by going Back may already have one, which decides
                 // whether the zero-conf screen is in the sequence.
                 $flowSteps = SetupFlow::stepSequence(
-                    $mode, Urls::isWordPress(), SetupFlow::onchainState($storeId)['configured'],
-                    $securityScreenNeeded, $isDesktop
+                    $mode, SetupFlow::onchainState($storeId)['configured'],
+                    $securityScreenNeeded, $isDesktop, $externalCron, $passwordPreseeded
                 );
                 $step = SetupFlow::nextStep('store', $flowSteps) ?? 'onchain';
                 break;
@@ -398,7 +394,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if ($onchainAction === 'skip') {
                     // Nothing saved; the zero-conf screen drops out of the
                     // sequence because there is no on-chain rail to time.
-                    $flowSteps = SetupFlow::stepSequence($mode, Urls::isWordPress(), false, $securityScreenNeeded, $isDesktop);
+                    $flowSteps = SetupFlow::stepSequence($mode, false, $securityScreenNeeded, $isDesktop, $externalCron, $passwordPreseeded);
                     $step = SetupFlow::nextStep('onchain', $flowSteps) ?? 'lightning';
                     break;
                 }
@@ -508,7 +504,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     ], 'id = ?', [$storeId]);
                 }
 
-                $flowSteps = SetupFlow::stepSequence($mode, Urls::isWordPress(), true, $securityScreenNeeded, $isDesktop);
+                $flowSteps = SetupFlow::stepSequence($mode, true, $securityScreenNeeded, $isDesktop, $externalCron, $passwordPreseeded);
                 $step = SetupFlow::nextStep('onchain', $flowSteps) ?? 'zeroconf';
                 break;
 
@@ -560,17 +556,25 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if ($nwc === '' && ($_POST['nwc_clear'] ?? '') !== '1') {
                     $nwc = trim($_POST['nwc_keep_ref'] ?? '');
                 }
+                // Strike API key: same saved-secret controls as NWC — a pasted
+                // key replaces, the clear checkbox removes, and otherwise the
+                // hidden keep ref preserves the stored key.
+                $strikeKey = trim($_POST['strike_api_key'] ?? '');
+                if ($strikeKey === '' && ($_POST['strike_clear'] ?? '') !== '1') {
+                    $strikeKey = trim($_POST['strike_keep_ref'] ?? '');
+                }
 
                 if ($lnAction === 'skip') {
                     $lnAddress = '';
                     $nofferPosted = [];
                     $nwc = '';
+                    $strikeKey = '';
                 }
 
                 // Validate separately so the operator gets a message naming the
                 // field they got wrong, rather than chainFromLists' generic one.
                 if ($lnAddress !== '' && !StoreLnAddresses::isValid($lnAddress)) {
-                    throw new Exception('Lightning addresses look like myname@strike.me. Check the spelling and try again.');
+                    throw new Exception('Lightning addresses look like myname@wallet.com. Check the spelling and try again.');
                 }
                 foreach ($nofferPosted as $nofferRow) {
                     if (!ClinkNoffer::isValid($nofferRow)) {
@@ -585,6 +589,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if ($nwc !== '' && !str_starts_with($nwc, StoreLnAddresses::KEEP_REF_PREFIX)
                         && !NwcUri::isValid($nwc)) {
                     throw new Exception('That NWC connection string doesn\'t look right. It should start with nostr+walletconnect:// — copy the whole string from your wallet.');
+                }
+                require_once __DIR__ . '/includes/strike/client.php';
+                if ($strikeKey !== '' && !str_starts_with($strikeKey, StoreLnAddresses::KEEP_REF_PREFIX)
+                        && !StrikeClient::isValidKey($strikeKey)) {
+                    throw new Exception('That Strike API key doesn\'t look right. Copy the whole key from the Strike dashboard (it\'s one long block of letters and numbers).');
                 }
 
                 // Environment gate: the CLINK client can't sign Nostr
@@ -639,12 +648,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $nwcList = $storedNwc;
                 }
 
-                // Address first, then NWC, noffer as final fallback — the
-                // order Invoice::create walks the chain at payment time.
+                // Strike API key: resolve a keep:<id> ref back to the stored
+                // key. No environment gate — the Strike client is plain HTTPS
+                // + JSON, no bignum math involved.
+                [$strikeList, ] = StoreLnAddresses::resolveKeepRefs(
+                    $storeId, $strikeKey !== '' ? [$strikeKey] : [], StoreLnAddresses::TYPE_STRIKE
+                );
+
+                // Strike first, then address, NWC, noffer as final fallback —
+                // the order Invoice::create walks the chain at payment time.
                 $chain = StoreLnAddresses::chainFromLists(
                     $lnAddress !== '' ? [$lnAddress] : [],
                     $noffers,
-                    $nwcList
+                    $nwcList,
+                    $strikeList
                 );
                 // Same LUD-21 gate as the admin auto-cashout card: a new
                 // address whose host can't confirm a verify URL (or can't be
@@ -812,64 +829,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $step = SetupFlow::nextStep('mints', $flowSteps) ?? 'cron';
                 break;
 
-            case 'discount':
-                // WordPress-only screen (there is no WooCommerce checkout to
-                // discount anywhere else). The tail-post guard lets any
-                // completed install POST this step, so re-check the mode
-                // server-side instead of trusting the sequence alone.
-                if (!Urls::isWordPress()) {
-                    $step = SetupFlow::nextStep('discount', $flowSteps) ?? 'cron';
-                    break;
-                }
-                if (!isset($_POST['btc_discount_percent'])) {
-                    // Landing without the field — fall through to render.
-                    break;
-                }
-                $discountPercent = SetupFlow::parseDiscountPercent(
-                    (string)$_POST['btc_discount_percent']
-                );
-                if ($discountPercent === null) {
-                    throw new Exception('The discount needs to be a whole number between 0 and 100.');
-                }
-                // Site-wide, not per-store: the discount attaches to the
-                // WooCommerce checkout (one per WordPress site), which is also
-                // why the add_store flow never shows this screen. The ELEX
-                // plugin install + rule happen on the completion screen, where
-                // WooCommerce's presence is already being checked.
-                Config::set('wp_btc_discount_percent', $discountPercent);
-                $step = SetupFlow::nextStep('discount', $flowSteps) ?? 'cron';
-                break;
-
             case 'cron':
                 $step = 'done';
                 break;
-
-            case 'done':
-                // The completion screen's "Replace it with BareBits" button,
-                // for installs that reach the screen with a real BTCPay
-                // Server configured but no consent on record (e.g. the wizard
-                // ran before that server was connected, or the terms screen
-                // predates the consent checkbox). Recording consent here lets
-                // the render below re-run the WooCommerce wiring, which now
-                // proceeds with the takeover.
-                if (!empty($_POST['btcpay_override']) && Urls::isWordPress()
-                        && setupLoadBtcpayIntegration()) {
-                    cashupay_record_btcpay_override_consent();
-                }
-                break;
-        }
-
-        // WordPress runs the full cron.php task set through WP-cron (see
-        // wordpress/cron.php), so the manual-crontab screen is only needed on
-        // hosts where that mechanism can't work. A live self-test proves the
-        // loopback path (rewrite rule → cron.php → key auth) right now; on
-        // success the screen is skipped. Any failure — blocked self-requests,
-        // timeout — keeps the screen with the manual instructions, and the
-        // dashboard's cron staleness warning remains the runtime safety net.
-        if ($step === 'cron' && Urls::isWordPress()
-                && function_exists('cashupay_wp_cron_selftest')
-                && cashupay_wp_cron_selftest()) {
-            $step = SetupFlow::nextStep('cron', $flowSteps) ?? 'done';
         }
     } catch (Exception $e) {
         $error = $e->getMessage();
@@ -930,7 +892,7 @@ function renderUrlModeDetectionScript(): void { ?>
             const detailsEl = document.getElementById('url-mode-details');
 
             const baseUrl = <?= json_encode(Urls::siteBase()) ?>;
-            const setupUrl = <?= json_encode(Urls::setup()) ?>;
+            const setupUrl = <?= json_encode(setupSelfUrl()) ?>;
 
             // Probe each routing style. The /health probe tells
             // "clean" (pretty URLs via the front-controller
@@ -1423,7 +1385,7 @@ function renderUrlModeDetectionScript(): void { ?>
             $renderStoreId = $_SESSION['setup_store_id'] ?? null;
             $renderOnchain = SetupFlow::onchainState($renderStoreId);
             $renderSteps = SetupFlow::stepSequence(
-                $mode, Urls::isWordPress(), $renderOnchain['configured'], $securityScreenNeeded, $isDesktop
+                $mode, $renderOnchain['configured'], $securityScreenNeeded, $isDesktop, $externalCron, $passwordPreseeded
             );
             $displayIndex = array_search($step, $renderSteps, true);
             $totalSteps = count($renderSteps);
@@ -1435,7 +1397,7 @@ function renderUrlModeDetectionScript(): void { ?>
             $backStep = SetupFlow::backStep($step, $renderSteps);
             $backUrl = $backStep === null
                 ? null
-                : Urls::setup() . '?step=' . urlencode($backStep)
+                : setupSelfUrl() . '?step=' . urlencode($backStep)
                     . ($mode === 'add_store' ? '&mode=add_store' : '');
             ?>
             <h1><?= $mode === 'add_store' ? 'Add New Store' : 'BareBits Setup' ?></h1>
@@ -1477,22 +1439,13 @@ function renderUrlModeDetectionScript(): void { ?>
                 // trailing zeros are trimmed so "1" renders as "1%" and a
                 // fractional rate like 1.5 renders as "1.5%".
                 $devFeeDisplay = rtrim(rtrim(number_format((float) CASHUPAY_DEV_FEE_PERCENT, 2), '0'), '.');
-                // WordPress mode: if the BTCPay WooCommerce plugin is already
-                // pointed at a real BTCPay Server, completing this wizard
-                // will replace that connection — warn up front and require an
-                // extra consent checkbox (validated by the POST handler).
-                $btcpayTakeoverUrl = null;
-                if (Urls::isWordPress() && setupLoadBtcpayIntegration()
-                        && cashupay_btcpay_takeover_state() === 'needs_consent') {
-                    $btcpayTakeoverUrl = (string) get_option('btcpay_gf_url', '');
-                }
                 ?>
                 <h2 style="margin-bottom: 1rem;">🤝 Let's agree on a few things</h2>
                 <p style="margin-bottom: 0.75rem;">
                     Almost ready to roll! First, a quick read-through. 👀
                 </p>
                 <p style="margin-bottom: 1.5rem;">
-                    Tick all <?= $btcpayTakeoverUrl !== null ? 'four' : 'three' ?> boxes and we'll get you set up.
+                    Tick all three boxes and we'll get you set up.
                 </p>
 
                 <form method="post">
@@ -1502,8 +1455,10 @@ function renderUrlModeDetectionScript(): void { ?>
                         <input type="checkbox" id="terms_legal" name="terms_legal" required>
                         <label for="terms_legal">
                             I promise not to use this software for anything
-                            illegal, and I'm good with the terms of the
-                            <a href="https://github.com/BareBits/cashupayserver/blob/main/LICENSE.md" target="_blank" rel="noopener" style="color: #63b3ed;">license</a>.
+                            illegal, and I agree with the terms of the
+                            <a href="https://github.com/BareBits/cashupayserver/blob/main/LICENSE.md" target="_blank" rel="noopener" style="color: #63b3ed;">license</a>
+                            and
+                            <a href="https://github.com/BareBits/cashupayserver/blob/main/USE_POLICY.md" target="_blank" rel="noopener" style="color: #63b3ed;">use policy</a>.
                         </label>
                     </div>
 
@@ -1522,31 +1477,10 @@ function renderUrlModeDetectionScript(): void { ?>
                         </label>
                     </div>
 
-                    <?php if ($btcpayTakeoverUrl !== null): ?>
-                    <div class="warning" style="margin: 1.5rem 0;">
-                        <strong>⚠️ Existing BTCPay Server detected</strong>
-                        <code style="display: block; margin: 0.5rem 0; word-break: break-all;"><?= htmlspecialchars($btcpayTakeoverUrl) ?></code>
-                        <p style="margin: 0.5rem 0 0; font-size: 0.9rem;">
-                            Your WooCommerce checkout currently pays through this
-                            BTCPay Server. Completing this setup will disconnect
-                            it and replace <strong>all</strong> BTCPay plugin
-                            settings with BareBits defaults. Your previous
-                            settings will not be saved.
-                        </p>
-                    </div>
-
-                    <div class="checkbox-group" style="margin: 1.5rem 0;">
-                        <input type="checkbox" id="btcpay_override_consent" name="btcpay_override_consent" required>
-                        <label for="btcpay_override_consent">
-                            I understand my existing BTCPay Server settings will be replaced.
-                        </label>
-                    </div>
-                    <?php endif; ?>
-
                     <button type="submit" class="btn" style="width: 100%;">Continue →</button>
                 </form>
 
-                <?php if (!Urls::isWordPress() && !$securityScreenNeeded) {
+                <?php if (!$securityScreenNeeded) {
                     // The security screen normally hosts the URL-mode probe;
                     // with that screen skipped (data directory outside the web
                     // root) it runs silently from here instead.
@@ -1734,8 +1668,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                         Note: These automated checks are supplemental. You should verify manually that the database file cannot be downloaded.
                     </p>
 
-                    <!-- URL Mode Detection (standalone only) -->
-                    <?php if (!Urls::isWordPress()): ?>
+                    <!-- URL Mode Detection -->
                     <h4 style="margin-top: 1.5rem; margin-bottom: 0.5rem;">Server URL Detection</h4>
                     <div id="url-mode-detection">
                         <div id="url-mode-loading" class="security-check">
@@ -1750,7 +1683,6 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                             </div>
                         </div>
                     </div>
-                    <?php endif; ?>
 
                     <form method="post">
                         <input type="hidden" name="step" value="security">
@@ -1857,7 +1789,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                         runSecurityTest();
                     })();
                     </script>
-                    <?php if (!Urls::isWordPress()) { renderUrlModeDetectionScript(); } ?>
+                    <?php renderUrlModeDetectionScript(); ?>
                 <?php endif; ?>
 
             <?php elseif ($step === 'password'): ?>
@@ -2010,7 +1942,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                     </div>
                 <?php endif; ?>
 
-                <form id="onchain-form" method="POST" action="<?= htmlspecialchars(Urls::setup()) ?>">
+                <form id="onchain-form" method="POST" action="<?= htmlspecialchars(setupSelfUrl()) ?>">
                     <input type="hidden" name="step" value="onchain">
                     <input type="hidden" name="onchain_action" value="save">
                     <input type="hidden" name="onchain_address_mode" id="onchain_address_mode" value="<?= htmlspecialchars($ocSavedMode) ?>">
@@ -2077,7 +2009,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                     </button>
                 </form>
 
-                <form method="POST" action="<?= htmlspecialchars(Urls::setup()) ?>" style="margin-top: 0.75rem;">
+                <form method="POST" action="<?= htmlspecialchars(setupSelfUrl()) ?>" style="margin-top: 0.75rem;">
                     <input type="hidden" name="step" value="onchain">
                     <input type="hidden" name="onchain_action" value="skip">
                     <?php if ($mode === 'add_store'): ?>
@@ -2094,7 +2026,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
 
                 <script>
                 (function () {
-                    var setupUrl = <?= json_encode(Urls::setup()) ?>;
+                    var setupUrl = <?= json_encode(setupSelfUrl()) ?>;
                     var validateBtn = document.getElementById('onchain-validate-btn');
                     var saveBtn = document.getElementById('onchain-save-btn');
                     var box = document.getElementById('onchain-validation');
@@ -2271,7 +2203,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                     that tiny risk.
                 </p>
 
-                <form method="POST" action="<?= htmlspecialchars(Urls::setup()) ?>">
+                <form method="POST" action="<?= htmlspecialchars(setupSelfUrl()) ?>">
                     <input type="hidden" name="step" value="zeroconf">
                     <?php if ($mode === 'add_store'): ?>
                         <input type="hidden" name="mode" value="add_store">
@@ -2294,6 +2226,10 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                 // the browser.
                 $lnExistingNwcRef = '';
                 $lnExistingNwcLabel = '';
+                // A stored Strike API key prefills the same way — masked label
+                // + keep:<id> ref; the key itself never reaches the browser.
+                $lnExistingStrikeRef = '';
+                $lnExistingStrikeLabel = '';
                 foreach ($renderStoreId ? StoreLnAddresses::listForStore($renderStoreId) : [] as $lnRow) {
                     if ($lnRow['type'] === StoreLnAddresses::TYPE_NOFFER) {
                         $lnExistingNoffers[] = $lnRow['address'];
@@ -2301,6 +2237,11 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                         if ($lnExistingNwcRef === '') {
                             $lnExistingNwcRef = StoreLnAddresses::KEEP_REF_PREFIX . $lnRow['id'];
                             $lnExistingNwcLabel = StoreLnAddresses::displayValue($lnRow['type'], $lnRow['address']);
+                        }
+                    } elseif ($lnRow['type'] === StoreLnAddresses::TYPE_STRIKE) {
+                        if ($lnExistingStrikeRef === '') {
+                            $lnExistingStrikeRef = StoreLnAddresses::KEEP_REF_PREFIX . $lnRow['id'];
+                            $lnExistingStrikeLabel = StoreLnAddresses::displayValue($lnRow['type'], $lnRow['address']);
                         }
                     } elseif ($lnExistingAddress === '') {
                         $lnExistingAddress = $lnRow['address'];
@@ -2323,6 +2264,11 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                 // stored connection round-trips.
                 $lnNwcValue = trim((string)($_POST['nwc_keep_ref'] ?? $lnExistingNwcRef));
                 $lnNwcShowsSaved = $lnNwcValue !== '' && str_starts_with($lnNwcValue, StoreLnAddresses::KEEP_REF_PREFIX);
+                // Same invariant for the Strike API key: a POSTed key is never
+                // echoed back into the re-rendered form — only the opaque keep
+                // ref of a stored key round-trips.
+                $lnStrikeValue = trim((string)($_POST['strike_keep_ref'] ?? $lnExistingStrikeRef));
+                $lnStrikeShowsSaved = $lnStrikeValue !== '' && str_starts_with($lnStrikeValue, StoreLnAddresses::KEEP_REF_PREFIX);
                 ?>
                 <h2 style="margin-bottom: 1rem;">⚡ Lightning payments</h2>
                 <p style="margin-bottom: 0.75rem;">
@@ -2333,7 +2279,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                     We'd really suggest turning it on! BareBits supports several types of lightning wallet backends. When invoices are generated for your customers, BareBits will try each option in sequence until it can successfully generate an invoice. <strong>Only one method is needed for lightning payments to work</strong>, you can use multiple methods if you want.
                 </p>
 
-                <form method="POST" action="<?= htmlspecialchars(Urls::setup()) ?>">
+                <form method="POST" action="<?= htmlspecialchars(setupSelfUrl()) ?>">
                     <input type="hidden" name="step" value="lightning">
                     <input type="hidden" name="lightning_action" value="save">
                     <?php if ($mode === 'add_store'): ?>
@@ -2345,17 +2291,28 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                          path, so it stays visible by default while remaining
                          collapsible. -->
                     <details class="form-group" id="lnurl-section" open>
-                        <summary style="cursor: pointer; font-weight: 500; margin-bottom: 0.5rem;">Method 1: LNURL/lightning address eg myname@strike.me</summary>
+                        <summary style="cursor: pointer; font-weight: 500; margin-bottom: 0.5rem;">Method 1: LNURL/lightning address eg myname@wallet.com</summary>
                         <input type="text" id="lightning_address" name="lightning_address" aria-label="LNURL/lightning address"
                                style="font-family: monospace; font-size: 0.9rem; margin-bottom: 0.5rem;"
                                value="<?= htmlspecialchars($_POST['lightning_address'] ?? $lnExistingAddress) ?>"
-                               placeholder="myname@strike.me">
+                               placeholder="myname@wallet.com">
+                        <div id="strike-address-warning" class="warning" style="display: none; margin-bottom: 0.5rem;">
+                            ⚠️ Strike lightning addresses (&hellip;@strike.me) can't be used
+                            here &mdash; they don't fully support payment verification
+                            (LUD-21), so payments to them could never be confirmed at
+                            checkout. Use the
+                            <a href="#strike-section" id="strike-address-warning-link" style="color: #63b3ed;">Strike API method below</a>
+                            instead.
+                        </div>
                         <div id="ln-help-box" style="background: rgba(0,0,0,0.2); padding: 1rem; border-radius: 8px; font-size: 0.9rem; color: #a0aec0;">
                             <p style="margin-bottom: 0.75rem;">
-                                Don't have a lightning address? You can get one for free
-                                (and enable instant fiat/USD conversion) in 100+
-                                countries at
-                                <a href="https://strike.me" target="_blank" rel="noopener noreferrer" style="color: #63b3ed;">strike.me</a>.
+                                Have a Strike account (or want a free one with instant
+                                fiat/USD conversion, available in 100+ countries at
+                                <a href="https://strike.me" target="_blank" rel="noopener noreferrer" style="color: #63b3ed;">strike.me</a>)?
+                                Don't enter your &hellip;@strike.me address here &mdash;
+                                Strike addresses don't support LUD-21 payment
+                                verification. Use the <strong>Strike API</strong> method
+                                below instead.
                             </p>
                             <p style="margin-bottom: 0.75rem;">
                                 Don't want to use strike? Want full self-custody? You can
@@ -2396,6 +2353,70 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                         </div>
                     </details>
 
+                    <!-- Collapsed by default (like the NWC/noffer sections
+                         below); open only when a key is already saved. Sits
+                         right beneath the LNURL section because it's the
+                         Strike-account alternative to a @strike.me address —
+                         but at payment time it is the FIRST method tried. -->
+                    <details class="form-group" id="strike-section"<?= $lnStrikeShowsSaved ? ' open' : '' ?>>
+                        <summary style="cursor: pointer; font-weight: 500; margin-bottom: 0.5rem;">Method 2: Strike API</summary>
+                        <p style="margin-bottom: 0.5rem; font-size: 0.9rem;">
+                            Take Lightning payments straight into your
+                            <a href="https://strike.me" target="_blank" rel="noopener noreferrer" style="color: #63b3ed;">Strike</a>
+                            account. Strike lightning addresses can't be used in the
+                            LNURL box above, but a Strike API key works fully &mdash;
+                            and when one is configured it's the <strong>first</strong>
+                            method tried when generating invoices.
+                        </p>
+                        <div style="background: rgba(0,0,0,0.2); padding: 1rem; border-radius: 8px; font-size: 0.9rem; color: #a0aec0; margin-bottom: 0.5rem;">
+                            <p style="margin-bottom: 0.5rem;">To create a key:</p>
+                            <ol style="margin: 0 0 0.5rem 1.25rem; padding: 0;">
+                                <li>Open the
+                                    <a href="https://dashboard.strike.me/" target="_blank" rel="noopener noreferrer" style="color: #63b3ed;">Strike dashboard</a>
+                                    (opens in a new tab), log in, and go to the
+                                    <strong>API Keys</strong> section.</li>
+                                <li>Create a new key with <em>only</em> these three scopes:
+                                    <strong>Create invoices</strong>
+                                    (<code>partner.invoice.create</code>),
+                                    <strong>Generate invoice quotes</strong>
+                                    (<code>partner.invoice.quote.generate</code>) and
+                                    <strong>Read invoices</strong>
+                                    (<code>partner.invoice.read</code>).</li>
+                                <li>Copy the key and paste it below.</li>
+                            </ol>
+                            <p style="margin: 0;">
+                                With just those scopes the key can create and verify
+                                invoices but <strong>cannot spend or withdraw funds</strong>
+                                from your account. When you continue, the key is tested
+                                with a 1-sat test invoice (it's never paid).
+                            </p>
+                        </div>
+                        <?php if ($lnStrikeShowsSaved): ?>
+                            <!-- A key is stored. It never reaches the browser: the
+                                 hidden keep ref keeps it on save, pasting a new key
+                                 replaces it, and the checkbox removes it. -->
+                            <input type="hidden" name="strike_keep_ref" value="<?= htmlspecialchars($lnStrikeValue) ?>">
+                            <input type="text" readonly
+                                   style="font-family: monospace; font-size: 0.9rem; opacity: 0.7; margin-bottom: 0.5rem;"
+                                   value="<?= htmlspecialchars($lnExistingStrikeLabel !== '' ? $lnExistingStrikeLabel : 'Saved Strike API key') ?>">
+                            <label style="display:block; font-size: 0.85rem; margin-bottom: 0.5rem;">
+                                <input type="checkbox" name="strike_clear" value="1">
+                                Remove this saved key
+                            </label>
+                            <input type="text" id="strike_api_key" name="strike_api_key" aria-label="Strike API key"
+                                   autocomplete="off" spellcheck="false"
+                                   style="font-family: monospace; font-size: 0.9rem;"
+                                   value=""
+                                   placeholder="paste a new API key to replace">
+                        <?php else: ?>
+                            <input type="text" id="strike_api_key" name="strike_api_key" aria-label="Strike API key"
+                                   autocomplete="off" spellcheck="false"
+                                   style="font-family: monospace; font-size: 0.9rem;"
+                                   value=""
+                                   placeholder="paste your Strike API key">
+                        <?php endif; ?>
+                    </details>
+
                     <!-- Collapsed by default; open only when the section already
                          shows stored content (the saved-connection label here, a
                          rendered noffer value below — including the POST echo
@@ -2403,7 +2424,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                          stays visible). An environment warning alone doesn't
                          force a section open. -->
                     <details class="form-group" id="nwc-section"<?= $lnNwcShowsSaved ? ' open' : '' ?>>
-                        <summary style="cursor: pointer; font-weight: 500; margin-bottom: 0.5rem;">Method 2: Nostr Wallet Connect (NWC) (Electrum)</summary>
+                        <summary style="cursor: pointer; font-weight: 500; margin-bottom: 0.5rem;">Method 3: Nostr Wallet Connect (NWC) (Electrum)</summary>
                         <div class="warning" style="margin-bottom: 0.5rem;">
                             ⚠️ Your wallet must be ONLINE to receive lightning payments
                         </div>
@@ -2466,7 +2487,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                     }
                     ?>
                     <details class="form-group" id="noffer-section"<?= $lnNofferValues !== [] ? ' open' : '' ?>>
-                        <summary style="cursor: pointer; font-weight: 500; margin-bottom: 0.5rem;">Method 3: noffer (CLINK) (Electrum)</summary>
+                        <summary style="cursor: pointer; font-weight: 500; margin-bottom: 0.5rem;">Method 4: noffer (CLINK) (Electrum)</summary>
                         <div class="warning" style="margin-bottom: 0.5rem;">
                             ⚠️ Your wallet must be ONLINE to receive lightning payments
                         </div>
@@ -2530,9 +2551,31 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                         row.focus();
                     });
                 })();
+                (function () {
+                    // Strike lightning addresses don't support LUD-21, so the
+                    // save would be refused anyway — warn while typing and
+                    // point at the Strike API section instead of letting the
+                    // operator find out from the server error.
+                    var input = document.getElementById('lightning_address');
+                    var warning = document.getElementById('strike-address-warning');
+                    if (!input || !warning) { return; }
+                    function update() {
+                        var isStrike = /@strike\.me$/i.test(input.value.trim());
+                        warning.style.display = isStrike ? '' : 'none';
+                    }
+                    input.addEventListener('input', update);
+                    update();
+                    var link = document.getElementById('strike-address-warning-link');
+                    var strikeSection = document.getElementById('strike-section');
+                    if (link && strikeSection) {
+                        link.addEventListener('click', function () {
+                            strikeSection.open = true;
+                        });
+                    }
+                })();
                 </script>
 
-                <form method="POST" action="<?= htmlspecialchars(Urls::setup()) ?>" style="margin-top: 0.5rem;">
+                <form method="POST" action="<?= htmlspecialchars(setupSelfUrl()) ?>" style="margin-top: 0.5rem;">
                     <input type="hidden" name="step" value="lightning">
                     <input type="hidden" name="lightning_action" value="skip">
                     <?php if ($mode === 'add_store'): ?>
@@ -2574,7 +2617,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                     </div>
                 <?php endif; ?>
 
-                <form method="POST" action="<?= htmlspecialchars(Urls::setup()) ?>">
+                <form method="POST" action="<?= htmlspecialchars(setupSelfUrl()) ?>">
                     <input type="hidden" name="step" value="swaps">
                     <?php if ($mode === 'add_store'): ?>
                         <input type="hidden" name="mode" value="add_store">
@@ -2628,7 +2671,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                     </div>
                 <?php endif; ?>
 
-                <form method="POST" action="<?= htmlspecialchars(Urls::setup()) ?>" id="mints-form">
+                <form method="POST" action="<?= htmlspecialchars(setupSelfUrl()) ?>" id="mints-form">
                     <input type="hidden" name="step" value="mints">
                     <input type="hidden" name="mints_enabled" value="1">
                     <input type="hidden" name="mint_url" id="mint_url" value="<?= htmlspecialchars($_POST['mint_url'] ?? '') ?>">
@@ -2690,7 +2733,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                     <button type="submit" class="btn" style="width: 100%;" id="mints-continue-btn" disabled>Continue</button>
                 </form>
 
-                <form method="POST" action="<?= htmlspecialchars(Urls::setup()) ?>" style="margin-top: 0.5rem;">
+                <form method="POST" action="<?= htmlspecialchars(setupSelfUrl()) ?>" style="margin-top: 0.5rem;">
                     <input type="hidden" name="step" value="mints">
                     <input type="hidden" name="mints_enabled" value="0">
                     <?php if ($mode === 'add_store'): ?>
@@ -2738,41 +2781,6 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                     Go to BareBits Admin
                 </a>
 
-            <?php elseif ($step === 'discount'): ?>
-                <!-- Screen: Bitcoin checkout discount (WordPress mode only).
-                     Saves a site-wide percentage; the completion screen
-                     installs the ELEX Discount Per Payment Method plugin and
-                     creates the rule once WooCommerce wiring is confirmed. -->
-                <?php $discountSaved = (int) Config::get('wp_btc_discount_percent', 0); ?>
-                <h2 style="margin-bottom: 1rem;">🏷️ Offer a discount to customers paying in Bitcoin?</h2>
-                <p style="margin-bottom: 1.5rem;">
-                    Many merchants offer discounts to Bitcoin customers as BTC
-                    payments save them significantly on fees charged by
-                    traditional payment processors. BareBits only charges 1%,
-                    we suggest splitting the difference to incentivize your
-                    customers to pay with BTC. This is completely optional and
-                    you can change your mind at any time
-                </p>
-
-                <form method="POST" action="<?= htmlspecialchars(Urls::setup()) ?>">
-                    <input type="hidden" name="step" value="discount">
-                    <div class="form-group">
-                        <label for="btc_discount_percent">Discount for Bitcoin payments (%)</label>
-                        <input type="number" id="btc_discount_percent" name="btc_discount_percent"
-                               min="0" max="100" step="1" inputmode="numeric"
-                               value="<?= $discountSaved ?>">
-                    </div>
-
-                    <p style="color: #a0aec0; font-size: 0.85rem; margin-bottom: 1.5rem;">
-                        If you choose a discount, the free
-                        <a href="https://wordpress.org/plugins/elex-discount-per-payment-method/"
-                           target="_blank" rel="noopener" style="color: #63b3ed;">Elex Discount Per Payment Method</a>
-                        will automatically be installed
-                    </p>
-
-                    <button type="submit" class="btn" style="width: 100%;">Continue →</button>
-                </form>
-
             <?php elseif ($step === 'cron'): ?>
                 <!-- Screen: cron reminder -->
                 <?php
@@ -2802,7 +2810,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                 </p>
                 <pre style="background: rgba(0,0,0,0.3); padding: 0.75rem; border-radius: 6px; font-size: 0.8rem; user-select: all;"><?= htmlspecialchars($cronSchedule['line']) ?></pre>
 
-                <form method="POST" action="<?= htmlspecialchars(Urls::setup()) ?>" style="margin-top: 1.5rem;">
+                <form method="POST" action="<?= htmlspecialchars(setupSelfUrl()) ?>" style="margin-top: 1.5rem;">
                     <input type="hidden" name="step" value="cron">
                     <button type="submit" class="btn" style="width: 100%;">Continue</button>
                 </form>
@@ -2815,12 +2823,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                     BareBits is ready to accept payments. ✅
                 </div>
 
-                <?php if (Urls::isWordPress() && (int)Config::get('wp_cron_selftest_ok_at', 0) > 0): ?>
-                <p style="margin-bottom: 1.25rem; font-size: 0.9rem; color: #a0aec0;">
-                    ⏰ Background jobs are handled automatically through
-                    WordPress &mdash; no crontab entry needed.
-                </p>
-                <?php elseif ($isDesktop): ?>
+                <?php if ($isDesktop): ?>
                 <p style="margin-bottom: 1.25rem; font-size: 0.9rem; color: #a0aec0;">
                     ⏰ Background jobs run automatically while the desktop
                     launcher is open &mdash; nothing to set up.
@@ -2876,230 +2879,88 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                 <?php endif; ?>
 
                 <?php
+                // Managed installs with a provisioned return URL hand the
+                // operator straight back to the orchestrator (the WordPress
+                // plugin's onboarding page), which collects credentials and
+                // wires the shop itself — the manual connect-your-e-commerce
+                // instructions below would only mislead. target="_top" breaks
+                // out of the orchestrator's embedding iframe; the URL is pure
+                // provisioned data and nothing here ever requests it.
+                $managedReturn = ManagedInstall::isManaged() ? ManagedInstall::returnUrl() : '';
+                ?>
+                <?php if ($managedReturn !== ''): ?>
+
+                <a id="managed-return-link" href="<?= htmlspecialchars($managedReturn) ?>" target="_top"
+                   class="btn" style="width: 100%; text-align: center; display: block;">
+                    Finish &mdash; return to WordPress
+                </a>
+                <p style="color: #a0aec0; font-size: 0.85rem; margin-top: 0.75rem; text-align: center;">
+                    Your shop finishes connecting automatically on the next screen.
+                </p>
+                <div id="managed-return-waiting" class="warning" style="display: none; margin-top: 0.75rem;">
+                    WordPress is briefly updating itself (maintenance mode) &mdash;
+                    continuing automatically as soon as it's back, usually under a
+                    minute. Clicking the button again goes there right away.
+                </div>
+                <script>
+                // WordPress auto-updates (wp-cron: core/plugin/translation
+                // updates) put the WHOLE WordPress site behind its
+                // "Briefly unavailable for scheduled maintenance" screen —
+                // every wp URL answers 503 until the update finishes. This
+                // server is not WordPress, so THIS screen keeps working;
+                // navigating to the return URL at that exact moment would
+                // dump the merchant on the maintenance screen mid-setup,
+                // which reads as "the install broke". WordPress checks its
+                // .maintenance flag before any plugin loads, so the plugin
+                // cannot intercept it over there — the handoff has to wait
+                // it out from here: probe the WordPress origin first and
+                // only navigate once it answers. 503 is the ONLY status
+                // that waits; anything else (including errors a broken
+                // probe might fabricate) falls through to plain navigation
+                // — this guard may delay the merchant, never trap them.
+                // Without JavaScript the link works exactly as before.
+                (function () {
+                    const link = document.getElementById('managed-return-link');
+                    const waitingNote = document.getElementById('managed-return-waiting');
+                    // The return URL minus its query: admin-post.php with no
+                    // action is a cheap no-op that still answers 503 while
+                    // WordPress is in maintenance mode. Probing the full
+                    // return URL would run the credential collection once
+                    // per probe for nothing.
+                    const probeUrl = link.href.split('?')[0];
+                    let waiting = false;
+                    const go = function () { window.top.location.href = link.href; };
+                    const probe = function () {
+                        fetch(probeUrl, { credentials: 'same-origin', cache: 'no-store' })
+                            .then(function (res) {
+                                if (res.status === 503) {
+                                    waitingNote.style.display = 'block';
+                                    setTimeout(probe, 5000);
+                                } else {
+                                    go();
+                                }
+                            })
+                            .catch(go);
+                    };
+                    link.addEventListener('click', function (e) {
+                        // A second click while waiting is the manual
+                        // override: let the browser follow the link.
+                        if (waiting) {
+                            return;
+                        }
+                        e.preventDefault();
+                        waiting = true;
+                        probe();
+                    });
+                })();
+                </script>
+
+                <?php else: ?>
+
+                <?php
                 $baseUrl = Urls::siteBase();
                 ?>
 
-                <?php if (Urls::isWordPress()): ?>
-                <!-- WooCommerce integration (WordPress mode).
-                     Run from the plugin, BareBits owns the whole WooCommerce
-                     hookup: we install the BTCPay gateway plugin if needed,
-                     point it at our Greenfield API, register the webhook and
-                     enable the gateway at checkout — no manual steps. The
-                     "server URL / connect your e-commerce" sections below are
-                     therefore hidden in WordPress mode. -->
-                <?php
-                $btcpayHelperLoaded = setupLoadBtcpayIntegration();
-                if (!$btcpayHelperLoaded) {
-                    error_log('CashuPayServer: btcpay-integration.php not found; '
-                        . 'skipping the WooCommerce section of the setup completion screen.');
-                }
-
-                $storeId = $_SESSION['setup_store_id'] ?? null;
-                $wooStatus = null;
-                $wooReady = false;
-                // Read the wizard's saved discount up front: the gateway
-                // wiring advertises it in the checkout title, and the ELEX
-                // follow-through below installs the matching discount rule.
-                $discountPercent = (int) Config::get('wp_btc_discount_percent', 0);
-
-                if ($btcpayHelperLoaded && $storeId) {
-                    $apiKey = Auth::getOrCreateInternalApiKey($storeId);
-                    if ($apiKey) {
-                        // Idempotent: installs/activates the gateway plugin if
-                        // needed, then configures + enables it. Safe to re-run
-                        // on refresh.
-                        $wooStatus = cashupay_ensure_woocommerce_integration($storeId, $apiKey, $discountPercent);
-                        $wooReady = ($wooStatus['status'] ?? '') === 'ready';
-                    }
-                }
-
-                // Bitcoin-discount follow-through (the wizard's discount
-                // screen only saved a percentage). Gated on the gateway wiring
-                // being ready so a discount plugin is never installed on a
-                // site whose checkout we couldn't configure — including the
-                // existing-real-BTCPay case, which stays entirely untouched.
-                // Same dual-layout lookup as the BTCPay helper above.
-                $elexStatus = null;
-                if ($wooReady && $discountPercent > 0) {
-                    $elexHelper = null;
-                    foreach ([
-                        __DIR__ . '/wordpress/elex-discount.php',
-                        __DIR__ . '/elex-discount.php',
-                    ] as $candidate) {
-                        if (is_file($candidate)) {
-                            $elexHelper = $candidate;
-                            break;
-                        }
-                    }
-                    if ($elexHelper !== null) {
-                        require_once $elexHelper;
-                        // Idempotent: activates/installs only when missing and
-                        // never overwrites an existing rule for the gateway.
-                        $elexStatus = cashupay_ensure_elex_discount($discountPercent);
-                    } else {
-                        error_log('CashuPayServer: elex-discount.php not found; '
-                            . 'skipping the Bitcoin-discount section of the setup completion screen.');
-                    }
-                }
-                // Still pending while a reload could complete it (WooCommerce
-                // or the ELEX plugin missing); settled once the rule is live,
-                // the merchant declined a discount, or the session no longer
-                // knows the store (nothing left to retry with).
-                $elexPending = $discountPercent > 0 && $storeId
-                    && ($elexStatus === null
-                        || !in_array($elexStatus['status'], ['ready', 'skipped'], true));
-                ?>
-
-                <?php if ($wooReady): ?>
-                    <div class="success" style="margin-bottom: 1rem;">
-                        ✅ WooCommerce is wired up — BareBits is set as a payment method and enabled at checkout.
-                    </div>
-                    <?php if (!empty($wooStatus['replaced_url'])): ?>
-                    <div class="warning" style="margin-bottom: 1.5rem;">
-                        <strong>ℹ️ Previous BTCPay Server connection replaced</strong>
-                        <p style="margin: 0.5rem 0 0; font-size: 0.9rem;">
-                            As confirmed, WooCommerce now pays through BareBits instead of
-                            <code style="word-break: break-all;"><?= htmlspecialchars($wooStatus['replaced_url']) ?></code>,
-                            and all BTCPay plugin settings were reset to BareBits defaults.
-                        </p>
-                    </div>
-                    <?php endif; ?>
-                    <?php if (!empty($wooStatus['auto_installed'])): ?>
-                    <div class="warning" style="margin-bottom: 1.5rem;">
-                        <strong>ℹ️ We installed a plugin for you</strong>
-                        <p style="margin: 0.5rem 0 0; font-size: 0.9rem;">
-                            The <strong>BTCPay Server</strong> plugin has been
-                            automatically installed &mdash; this is what lets
-                            WooCommerce talk to the BareBits plugin. So if you see
-                            a new plugin in your plugin list, that's why. Keep it
-                            enabled! 🙏
-                        </p>
-                    </div>
-                    <?php endif; ?>
-                <?php elseif ($wooStatus !== null && $wooStatus['status'] === 'existing_btcpay'): ?>
-                    <div style="background: rgba(0,0,0,0.2); padding: 1.5rem; border-radius: 8px; margin-bottom: 1.5rem;">
-                        <h3 style="margin-bottom: 0.75rem;">WooCommerce Integration</h3>
-                        <div class="warning">
-                            <strong>⚠️ Existing BTCPay Server detected:</strong>
-                            <code style="display: block; margin-top: 0.5rem; word-break: break-all;"><?= htmlspecialchars($wooStatus['current_url'] ?? '') ?></code>
-                        </div>
-                        <p style="color: #a0aec0; font-size: 0.9rem; margin: 0.75rem 0;">
-                            Your WooCommerce checkout currently pays through this BTCPay Server.
-                            Replacing it points WooCommerce at BareBits instead and resets
-                            <strong>all</strong> BTCPay plugin settings to BareBits defaults —
-                            your previous settings will not be saved. To keep the existing
-                            connection, skip this step.
-                        </p>
-                        <form method="post" style="margin: 0;">
-                            <input type="hidden" name="step" value="done">
-                            <input type="hidden" name="btcpay_override" value="1">
-                            <div class="btn-group">
-                                <button type="submit" class="btn" style="text-align: center;">Replace it with BareBits</button>
-                                <!-- target="_top": the wizard can run inside the wp-admin
-                                     iframe, and wp-admin links must not nest inside it. -->
-                                <a href="<?= admin_url('admin.php?page=cashupay') ?>" target="_top" class="btn btn-secondary" style="text-align: center;">Keep it &amp; Skip</a>
-                            </div>
-                        </form>
-                    </div>
-                <?php elseif ($wooStatus !== null && $wooStatus['status'] === 'needs_woocommerce'): ?>
-                    <div style="background: rgba(0,0,0,0.2); padding: 1.5rem; border-radius: 8px; margin-bottom: 1.5rem;">
-                        <h3 style="margin-bottom: 0.75rem;">WooCommerce Integration</h3>
-                        <p style="color: #a0aec0; font-size: 0.9rem; margin-bottom: 1rem;">
-                            WooCommerce isn't active yet. Install and activate WooCommerce, then reload this page and BareBits will finish wiring up payments for you.
-                        </p>
-                        <a href="<?= admin_url('plugin-install.php?s=woocommerce&tab=search&type=term') ?>" target="_top" class="btn btn-secondary" style="display: inline-block;">
-                            Install WooCommerce
-                        </a>
-                    </div>
-                <?php elseif ($wooStatus !== null && $wooStatus['status'] === 'needs_plugin'): ?>
-                    <div style="background: rgba(0,0,0,0.2); padding: 1.5rem; border-radius: 8px; margin-bottom: 1.5rem;">
-                        <h3 style="margin-bottom: 0.75rem;">WooCommerce Integration</h3>
-                        <p style="color: #a0aec0; font-size: 0.9rem; margin-bottom: 0.75rem;">
-                            BareBits needs the <strong>"BTCPay Server for WooCommerce"</strong> plugin to take payments in WooCommerce. We couldn't install it automatically on this host, so please add it by hand:
-                        </p>
-                        <ol style="color: #a0aec0; font-size: 0.9rem; margin: 0 0 1rem 1.25rem; padding: 0;">
-                            <li>Go to Plugins &rarr; Add New in WordPress</li>
-                            <li>Search for "BTCPay Server for WooCommerce"</li>
-                            <li>Install and activate the plugin</li>
-                            <li>Reload this page &mdash; BareBits will finish the setup automatically</li>
-                        </ol>
-                        <a href="<?= admin_url('plugin-install.php?s=btcpay+greenfield+woocommerce&tab=search&type=term') ?>" target="_top" class="btn btn-secondary" style="display: inline-block;">
-                            Install BTCPay Plugin
-                        </a>
-                    </div>
-                <?php elseif ($wooStatus !== null && $wooStatus['status'] === 'error'): ?>
-                    <div style="background: rgba(0,0,0,0.2); padding: 1.5rem; border-radius: 8px; margin-bottom: 1.5rem;">
-                        <h3 style="margin-bottom: 0.75rem;">WooCommerce Integration</h3>
-                        <div class="warning">
-                            <strong>Couldn't finish automatic setup:</strong>
-                            <?= htmlspecialchars($wooStatus['message'] ?? '') ?>
-                        </div>
-                        <a href="<?= admin_url('admin.php?page=wc-settings&tab=checkout&section=btcpay_greenfield') ?>" target="_top" class="btn btn-secondary" style="display: inline-block; margin-top: 0.75rem;">
-                            Go to BTCPay Settings
-                        </a>
-                    </div>
-                <?php endif; ?>
-
-                <?php if ($discountPercent > 0 && $elexStatus !== null): ?>
-                    <?php if ($elexStatus['status'] === 'ready' && ($elexStatus['rule'] ?? '') === 'added'): ?>
-                        <div class="success" style="margin-bottom: 1rem;">
-                            ✅ Your <?= (int)$discountPercent ?>% Bitcoin discount is live at checkout.
-                            You can change or remove it any time under
-                            WooCommerce &rarr; Settings &rarr; ELEX Discount Per Payment Method.
-                        </div>
-                        <?php if (!empty($elexStatus['auto_installed'])): ?>
-                        <div class="warning" style="margin-bottom: 1.5rem;">
-                            <strong>ℹ️ We installed a plugin for you</strong>
-                            <p style="margin: 0.5rem 0 0; font-size: 0.9rem;">
-                                The <strong>ELEX Discount Per Payment Method</strong>
-                                plugin has been automatically installed &mdash; it's
-                                what applies your Bitcoin discount at checkout. Keep
-                                it enabled! 🙏
-                            </p>
-                        </div>
-                        <?php endif; ?>
-                    <?php elseif ($elexStatus['status'] === 'ready'): ?>
-                        <div class="warning" style="margin-bottom: 1.5rem;">
-                            <strong>⚠️ Existing Bitcoin discount rule found</strong>
-                            <p style="margin: 0.5rem 0 0; font-size: 0.9rem;">
-                                The ELEX Discount Per Payment Method plugin already
-                                has a discount rule for the BareBits payment method,
-                                so we left it as it was instead of applying your
-                                <?= (int)$discountPercent ?>% choice.
-                            </p>
-                            <a href="<?= admin_url('admin.php?page=wc-settings&tab=elex-discount-per-payment-method') ?>" target="_top" class="btn btn-secondary" style="display: inline-block; margin-top: 0.75rem;">
-                                Review Discount Rules
-                            </a>
-                        </div>
-                    <?php elseif ($elexStatus['status'] === 'needs_plugin'): ?>
-                        <div style="background: rgba(0,0,0,0.2); padding: 1.5rem; border-radius: 8px; margin-bottom: 1.5rem;">
-                            <h3 style="margin-bottom: 0.75rem;">Bitcoin Discount</h3>
-                            <p style="color: #a0aec0; font-size: 0.9rem; margin-bottom: 0.75rem;">
-                                You chose a <?= (int)$discountPercent ?>% discount for Bitcoin payments, but we couldn't install the <strong>ELEX Discount Per Payment Method</strong> plugin automatically on this host, so please add it by hand:
-                            </p>
-                            <ol style="color: #a0aec0; font-size: 0.9rem; margin: 0 0 1rem 1.25rem; padding: 0;">
-                                <li>Go to Plugins &rarr; Add New in WordPress</li>
-                                <li>Search for "ELEX Discount Per Payment Method"</li>
-                                <li>Install and activate the plugin</li>
-                                <li>Reload this page &mdash; BareBits will create the discount rule automatically</li>
-                            </ol>
-                            <a href="<?= admin_url('plugin-install.php?s=elex+discount+per+payment+method&tab=search&type=term') ?>" target="_top" class="btn btn-secondary" style="display: inline-block;">
-                                Install ELEX Plugin
-                            </a>
-                        </div>
-                    <?php else: ?>
-                        <div style="background: rgba(0,0,0,0.2); padding: 1.5rem; border-radius: 8px; margin-bottom: 1.5rem;">
-                            <h3 style="margin-bottom: 0.75rem;">Bitcoin Discount</h3>
-                            <div class="warning">
-                                <strong>Couldn't finish setting up your Bitcoin discount:</strong>
-                                <?= htmlspecialchars($elexStatus['message'] ?? '') ?>
-                            </div>
-                        </div>
-                    <?php endif; ?>
-                <?php endif; ?>
-                <?php endif; ?>
-
-                <?php if (!Urls::isWordPress()): ?>
                 <!-- Server URL (already detected in Step 1) -->
                 <?php
                 $serverUrl = Urls::server();
@@ -3136,7 +2997,10 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                         'permissions[]' => 'btcpay.store.canviewinvoices',
                         'strict' => 'true'
                     ]) . '&permissions[]=btcpay.store.cancreateinvoice&permissions[]=btcpay.store.webhooks.canmodifywebhooks';
-                    $pairingUrl = $serverUrl . '/api-keys/authorize?' . $pairingParams;
+                    // The real file, not the pretty /api-keys/authorize rewrite:
+                    // rewrite-hostile hosts 404 the extension-less spelling, and
+                    // authorize.php executes anywhere this very page is being served.
+                    $pairingUrl = $serverUrl . '/api-keys/authorize.php?' . $pairingParams;
                     ?>
                     <a id="test-pairing-link" href="<?= htmlspecialchars($pairingUrl) ?>" class="btn btn-secondary" style="display: inline-block; font-size: 0.9rem; padding: 0.5rem 1rem;">
                         Test Pairing Flow
@@ -3164,28 +3028,16 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                         </div>
                     </div>
                 </details>
-                <?php endif; ?>
 
-                <a href="<?= Urls::isWordPress() ? admin_url('admin.php?page=cashupay') : Urls::admin() ?>"<?= Urls::isWordPress() ? ' target="_top"' : '' ?> class="btn" style="width: 100%; text-align: center; display: block;">
+                <a href="<?= Urls::admin() ?>" class="btn" style="width: 100%; text-align: center; display: block;">
                     Go to BareBits Admin
                 </a>
-                <?php if (Urls::isWordPress()): ?>
-                <a href="<?= admin_url() ?>" target="_top" class="btn btn-secondary" style="width: 100%; text-align: center; display: block; margin-top: 0.5rem;">
-                    Back to WordPress Dashboard
-                </a>
-                <?php endif; ?>
+
+                <?php endif; // managed return vs. manual connect ?>
 
                 <?php
-                // Clear temporary session data. In WordPress mode, keep the
-                // session around if the WooCommerce hookup or the Bitcoin
-                // discount didn't complete (the merchant may need to install
-                // WooCommerce / the gateway plugin / the ELEX plugin and
-                // reload to let the auto-wiring finish — which needs the store
-                // id still in session).
-                if (!Urls::isWordPress()
-                    || ((isset($wooReady) && $wooReady) && empty($elexPending))) {
-                    unset($_SESSION['setup_store_id'], $_SESSION['setup_store_mode'], $_SESSION['setup_generated_seed']);
-                }
+                // Clear temporary session data.
+                unset($_SESSION['setup_store_id'], $_SESSION['setup_store_mode'], $_SESSION['setup_generated_seed']);
                 ?>
             <?php endif; ?>
 
@@ -3257,7 +3109,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
     var mintCountryCache = {};
 
     var FLAG_BASE = <?= json_encode(Urls::assets('img/flags/')) ?>;
-    var SETUP_URL = <?= json_encode(Urls::setup()) ?>;
+    var SETUP_URL = <?= json_encode(setupSelfUrl()) ?>;
 
     function normalizeMintUrl(u) {
         return String(u || '').replace(/\/+$/, '');

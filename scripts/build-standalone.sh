@@ -1,12 +1,12 @@
 #!/bin/bash
-# Build standalone CashuPayServer distribution zip
+# Build standalone BareBits distribution zip
 
 set -e
 
 cd "$(dirname "$0")/.."
 
-BUILD_DIR="build/cashupayserver"
-rm -rf build/cashupayserver build/cashupayserver.zip
+BUILD_DIR="build/barebits"
+rm -rf build/barebits build/barebits.zip
 
 mkdir -p "$BUILD_DIR"
 
@@ -37,10 +37,13 @@ cp -r api-keys/ "$BUILD_DIR/api-keys/"
 # itself) were previously omitted — a from-zip install had no working updater.
 # scripts/verify-plugin-build.php enforces this against router.php's requires.
 cp admin.php setup.php api.php payment.php receive.php cron.php router.php index.php \
-   recover.php health.php pay.php product-image.php update.php "$BUILD_DIR/"
+   recover.php health.php pay.php product-image.php update.php provision.php sso.php "$BUILD_DIR/"
 # Operator config template (the real user_config.php is gitignored dev-local and
 # is preserved across updates by includes/updater.php's keep-list).
 cp user_config.example.php "$BUILD_DIR/"
+# License terms travel with the artifact (the wordpress/ GPL carve-out does not
+# apply here — the server zip contains no wordpress/ code).
+cp LICENSE.md USE_POLICY.md "$BUILD_DIR/"
 cp .htaccess manifest.json favicon.ico "$BUILD_DIR/"
 cp -r images/ "$BUILD_DIR/images/"
 
@@ -71,6 +74,6 @@ HTACCESS_SHA256="$(sha256sum "$BUILD_DIR/.htaccess" | awk '{print $1}')"
 } > "$BUILD_DIR/BUILD_INFO"
 
 # Create zip
-cd build && zip -r cashupayserver.zip cashupayserver/ && cd ..
+cd build && zip -r barebits.zip barebits/ && cd ..
 
-echo "Standalone build: build/cashupayserver.zip"
+echo "Standalone build: build/barebits.zip"

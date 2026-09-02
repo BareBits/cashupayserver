@@ -13,7 +13,7 @@
  *     403s the data directory; walking a desktop user through Apache/nginx
  *     hardening only confuses them.
  *
- * Detection is two-layered. The launcher (CashuPayServer.bat) sets
+ * Detection is two-layered. The launcher (BareBits.bat) sets
  * CASHUPAY_DESKTOP=1, which is explicit and works on any OS — that also makes
  * it the test hook. As a fallback, the package's on-disk shape is recognised
  * directly, so a merchant who starts php -S by hand from inside the package

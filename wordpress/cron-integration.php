@@ -1,86 +1,121 @@
 <?php
 /**
- * CashuPay WordPress Cron Integration
+ * BareBits plugin — WP-cron pinger for an alongside install.
  *
- * Drives the FULL cron.php task set (webhook drain, on-chain polling, fee
- * settlement, swap lifecycle, cleanups, ...) through WP-cron, so a WordPress
- * install works without the operator wiring a system crontab entry.
+ * A BareBits server installed by this plugin declared CASHUPAY_EXTERNAL_CRON
+ * at install time: its setup wizard skipped the crontab screen because WE
+ * promised to tick its cron endpoint. This file keeps that promise — an
+ * every-minute WP-cron event fires an authenticated HTTP request to the
+ * install's cron.php, which drives the server's full background task set
+ * (webhook drain, on-chain polling, sweeps, its own auto-updater, …).
  *
- * The every-minute `cashupay_poll_quotes` event (scheduled on activation,
- * self-healed below) fires an authenticated loopback request to the plugin's
- * cron endpoint. Going over HTTP — rather than including cron.php in-process —
- * keeps all of cron.php's machinery intact (overlap flock, per-task
- * throttles, `last_external_cron_at` stamping) and, crucially, keeps its
- * `exit` paths (lock bounce, not-configured guard) from aborting the wp-cron
- * request and killing other plugins' scheduled events.
+ * Pure HTTP: the cron key travels in the X-CRON-KEY header so it stays out
+ * of access logs, and no BareBits code runs inside WordPress. Servers this
+ * plugin did not install run their own cron and get no pinger.
  *
- * Because the loopback carries the real cron key it counts as an EXTERNAL
- * cron run: the dashboard's "set up cron" staleness warning clears only while
- * this actually works, and page-load internal triggers drop to their cheaper
- * essentials-only mode. On loopback-hostile hosts (blocked self-requests,
- * basic-auth staging) every call fails, the warning stays visible, and the
- * inline quote-poll fallback keeps Lightning settlement working — exactly the
- * pre-existing behaviour.
+ * The heartbeat is owed to the INSTALL, not to whatever server happens to be
+ * connected: it keeps ticking the install's own URL through "Start over" and
+ * after the install is reconnected in URL mode — the install has no crontab
+ * of its own (the plugin promised it one at provision time), and it keeps
+ * running with real money either way. License: GPLv2 or later.
  */
 
 if (!defined('ABSPATH')) {
     exit;
 }
 
-add_action('cashupay_poll_quotes', 'cashupay_cron_poll');
-add_action('init', 'cashupay_ensure_cron_scheduled');
+add_action('cashupay_cron_tick', 'cashupay_cron_tick');
+add_action('init', 'cashupay_cron_reschedule');
+add_filter('cron_schedules', 'cashupay_register_cron_interval');
 
-// When a loopback attempt fails, don't burn ~15s of every minute's wp-cron
-// request timing out against a host that blocks self-requests — retry the
-// loopback on this cadence and run the inline fallback in between.
-const CASHUPAY_CRON_LOOPBACK_RETRY_SECONDS = 600;
+// When a ping fails (host blocks self-requests, install broken), don't burn
+// ~15s of every minute's wp-cron request timing out — back off to this
+// cadence until a ping succeeds again.
+const CASHUPAY_CRON_BACKOFF_SECONDS = 600;
 
 /**
- * Self-heal the WP-cron schedule. Activation is the only other place the
- * event gets registered, so a cron-cleaner plugin (or WordPress's known
- * cron-array write race) losing the event would otherwise silence all
- * background work until the plugin is re-activated. wp_next_scheduled reads
- * the already-loaded cron option, so this is cheap enough for init.
+ * Whether this site owes the alongside install a cron heartbeat: an install
+ * record exists and the provisioning handshake handed us its cron key. NOT
+ * gated on the current mode — the key is unrecoverable (the handshake is
+ * one-time), and the install needs its heartbeat even mid-"Start over" or
+ * after being reconnected by URL.
  */
-function cashupay_ensure_cron_scheduled(): void {
-    if (!wp_next_scheduled('cashupay_poll_quotes')) {
-        wp_schedule_event(time(), 'every_minute', 'cashupay_poll_quotes');
+function cashupay_cron_needed(): bool {
+    return cashupay_install_url() !== ''
+        && (string) get_option('cashupay_cron_key', '') !== '';
+}
+
+function cashupay_register_cron_interval(array $schedules): array {
+    if (!isset($schedules['every_minute'])) {
+        $schedules['every_minute'] = [
+            'interval' => 60,
+            'display' => 'Every minute',
+        ];
     }
+    return $schedules;
 }
 
 /**
- * Fire an authenticated request to the plugin's cron endpoint. The key
- * travels in the X-CRON-KEY header (cron.php's preferred channel) so it stays
- * out of webserver access logs.
- *
- * Returns true when the endpoint answered 200. A client-side timeout returns
- * false even though the run usually still completes server-side (cron.php
- * calls ignore_user_abort) — callers treat false as "fall back / keep the
- * manual instructions", which is the safe direction.
+ * Self-heal the schedule (WordPress's cron-array write race and cron-cleaner
+ * plugins both lose events). wp_next_scheduled reads the already-loaded cron
+ * option, so this is cheap enough for init. Also the activation hook's body.
  */
-function cashupay_fire_cron_endpoint(int $timeoutSeconds, array $queryArgs = []): bool {
-    require_once CASHUPAY_PLUGIN_DIR . '/includes/database.php';
-    require_once CASHUPAY_PLUGIN_DIR . '/includes/config.php';
-    require_once CASHUPAY_PLUGIN_DIR . '/includes/urls.php';
+function cashupay_cron_reschedule(): void {
+    if (!cashupay_cron_needed()) {
+        return;
+    }
+    if (!wp_next_scheduled('cashupay_cron_tick')) {
+        // First run a minute out, not now: this is (re)scheduled in the same
+        // request that just proved the endpoint synchronously (credential
+        // collection), and an immediately-due event would pile a full cron
+        // chain onto the merchant's very next page load — the onboarding
+        // page itself — which on tight per-site worker pools (Local WP) is
+        // the starvation pattern. Cron work has waited this long; one more
+        // minute costs nothing.
+        wp_schedule_event(time() + 60, 'every_minute', 'cashupay_cron_tick');
+    }
+}
 
-    if (!Database::isInitialized() || !Config::isSetupComplete()) {
+function cashupay_cron_unschedule(): void {
+    $timestamp = wp_next_scheduled('cashupay_cron_tick');
+    if ($timestamp) {
+        wp_unschedule_event($timestamp, 'cashupay_cron_tick');
+    }
+    delete_option('cashupay_cron_backoff_until');
+    delete_option('cashupay_cron_last_ok');
+}
+
+/**
+ * Fire one authenticated request at the install's cron endpoint. Returns
+ * true when cron.php itself answered — it always returns JSON with a 'mode'
+ * field (full / essentials / lock-bounce / ping alike); a 200 carrying
+ * anything else means some other page answered and must read as failure.
+ * Every success stamps cashupay_cron_last_ok, which the wp-admin
+ * stale-heartbeat warning (admin-menu.php) reads.
+ *
+ * $ping asks for cron.php's reachability-ping mode (?ping=1): routing and
+ * key are proven but no tasks run. Interactive callers (onboarding's
+ * synchronous heartbeat proof, with the merchant's page blocked on the
+ * answer) use it so the install's first-ever full pass — updater check,
+ * IP-geo download, mint syncs, minutes of worker time on a tight pool —
+ * never runs inside their request. A server that predates the flag ignores
+ * it and does a full run: same JSON shape, same success signal. The
+ * scheduled tick keeps full runs — that IS the heartbeat.
+ */
+function cashupay_fire_cron_endpoint(int $timeoutSeconds, bool $ping = false): bool {
+    // Always the install's own URL — never the connected server, which may
+    // be a different host entirely after a reconnect.
+    $server = cashupay_install_url();
+    $cronKey = (string) get_option('cashupay_cron_key', '');
+    if ($server === '' || $cronKey === '') {
         return false;
     }
-    $cronKey = Config::get('cron_key');
-    if (!$cronKey) {
-        return false;
-    }
-
-    $url = Urls::cron();
-    if ($queryArgs !== []) {
-        $url = add_query_arg($queryArgs, $url);
-    }
-    $response = wp_remote_get($url, [
+    $response = wp_remote_get($server . '/cron.php' . ($ping ? '?ping=1' : ''), [
         'timeout' => $timeoutSeconds,
         'redirection' => 2,
-        // Self-request: mirrors Background::trigger, which also skips peer
-        // verification for local/self-signed HTTPS.
-        'sslverify' => false,
+        // Same-origin self-request; mirrors WordPress core's own loopbacks,
+        // which skip peer verification for local/self-signed HTTPS.
+        'sslverify' => !cashupay_is_same_host_url($server),
         'headers' => ['X-CRON-KEY' => $cronKey],
     ]);
     if (is_wp_error($response)) {
@@ -89,61 +124,26 @@ function cashupay_fire_cron_endpoint(int $timeoutSeconds, array $queryArgs = [])
     if ((int) wp_remote_retrieve_response_code($response) !== 200) {
         return false;
     }
-    // cron.php always answers JSON carrying a 'mode' field (full /
-    // essentials-only / swaps-only runs and the lock-bounce 'skipped'
-    // response alike). A 200 with anything else means some other page
-    // answered — e.g. a plain-permalink install where /cashupay/cron falls
-    // through to the front page — and must read as failure, or the wizard
-    // would skip the manual instructions on a host where WP-cron cannot
-    // actually reach cron.php.
     $body = json_decode((string) wp_remote_retrieve_body($response), true);
-    return is_array($body) && array_key_exists('mode', $body);
-}
-
-/**
- * Quick loopback reachability check for the setup wizard: proves WP-cron's
- * request path (rewrite rule → cron.php → key auth) works on this host
- * without paying for a full task run. `only=swaps` is cron.php's slim
- * fast-lane mode — near-instant on a fresh install, unlike a full first run
- * (which downloads the trusted-mints list and geo database and could outlive
- * the probe timeout, reading as a false negative).
- *
- * Success is stamped in config so the wizard's completion screen can say
- * that WordPress cron has taken over.
- */
-function cashupay_wp_cron_selftest(): bool {
-    $ok = cashupay_fire_cron_endpoint(8, ['only' => 'swaps']);
-    if ($ok) {
-        Config::set('wp_cron_selftest_ok_at', time());
+    if (!is_array($body) || !array_key_exists('mode', $body)) {
+        return false;
     }
-    return $ok;
+    update_option('cashupay_cron_last_ok', time(), false);
+    return true;
 }
 
-/**
- * The every-minute WP-cron callback: run the complete cron.php task set via
- * loopback; fall back to the original inline quote poll when the loopback
- * fails, so Lightning settlement never regresses on hosts where self-requests
- * don't work.
- */
-function cashupay_cron_poll(): void {
+/** The every-minute WP-cron callback. */
+function cashupay_cron_tick(): void {
+    if (!cashupay_cron_needed()) {
+        return;
+    }
     $now = time();
-    $retryAt = (int) get_option('cashupay_cron_loopback_retry_at', 0);
-    if ($now >= $retryAt) {
-        if (cashupay_fire_cron_endpoint(15)) {
-            return;
-        }
-        update_option(
-            'cashupay_cron_loopback_retry_at',
-            $now + CASHUPAY_CRON_LOOPBACK_RETRY_SECONDS,
-            false
-        );
+    if ($now < (int) get_option('cashupay_cron_backoff_until', 0)) {
+        return;
     }
-
-    require_once CASHUPAY_PLUGIN_DIR . '/includes/database.php';
-    require_once CASHUPAY_PLUGIN_DIR . '/includes/config.php';
-    require_once CASHUPAY_PLUGIN_DIR . '/includes/invoice.php';
-
-    if (Database::isInitialized() && Config::isSetupComplete()) {
-        Invoice::pollPendingQuotes();
+    if (cashupay_fire_cron_endpoint(15)) {
+        delete_option('cashupay_cron_backoff_until');
+        return;
     }
+    update_option('cashupay_cron_backoff_until', $now + CASHUPAY_CRON_BACKOFF_SECONDS, false);
 }

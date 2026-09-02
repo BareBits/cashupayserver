@@ -19,6 +19,9 @@ declare(strict_types=1);
 require __DIR__ . '/harness.php';
 
 define('ABSPATH', sys_get_temp_dir() . '/');
+// The helper file registers its retry endpoint on template_redirect at
+// include time; the decision function under test stays pure.
+function add_action($hook, $cb) {}
 require_once dirname(__DIR__, 2) . '/wordpress/btcpay-integration.php';
 
 const OURS = 'https://shop.example/cashupay';
@@ -41,6 +44,10 @@ assert_eq('none', cashupay_btcpay_takeover_decision('  ' . OURS . '  ', OURS, ''
 
 assert_eq('needs_consent', cashupay_btcpay_takeover_decision(REAL, OURS, ''),
     'a real BTCPay Server without consent must block the wiring');
+// An unconfigured plugin has no URL of its own; the empty string must not act
+// as a match-everything prefix that would call a real server "ours".
+assert_eq('needs_consent', cashupay_btcpay_takeover_decision(REAL, '', ''),
+    'an unconfigured plugin must never consider a real server ours');
 assert_eq('needs_consent', cashupay_btcpay_takeover_decision(REAL . '/cashupay', OURS, ''),
     'a foreign host is real even when its path ends in /cashupay — only a prefix of OUR url is ours');
 

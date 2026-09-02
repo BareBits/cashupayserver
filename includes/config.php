@@ -8,7 +8,7 @@
 require_once __DIR__ . '/database.php';
 
 // Version
-define('CASHUPAY_VERSION', '1.3.1');
+define('CASHUPAY_VERSION', '1.4');
 
 // Development fee — the mandatory BareBits fee assessed on incoming payments,
 // settled on the periodic fee settlement cron tick. Defined here (rather than
@@ -190,6 +190,19 @@ class Config {
      * Get base URL for the application
      */
     public static function getBaseUrl(): string {
+        // Deployment-time pin (user_config.php), written by installers that
+        // know the served URL up front — e.g. the WordPress companion
+        // plugin's "install BareBits alongside" flow. A true pin, like
+        // CASHUPAY_DATA_DIR: it beats the database value AND auto-detection,
+        // so nothing an admin-UI action ever writes can silently defeat the
+        // deployment's declared URL — whoever controls user_config.php
+        // outranks the UI. It never trusts the Host header and stays correct
+        // behind routing setups where SCRIPT_NAME doesn't reflect the public
+        // path.
+        if (defined('CASHUPAY_BASE_URL') && CASHUPAY_BASE_URL !== '') {
+            return rtrim((string)CASHUPAY_BASE_URL, '/');
+        }
+
         $baseUrl = self::get('base_url');
         if ($baseUrl) {
             return rtrim($baseUrl, '/');
@@ -326,6 +339,24 @@ class Config {
     }
 
     /**
+     * Whether the payment-complete screen offers the payer email/newsletter
+     * capture form (and its send_receipt endpoint accepts POSTs). The
+     * explicit setting (config key payer_email_capture_enabled, saved from
+     * the admin notifications card) wins; unset falls back to a
+     * deployment-shaped default — ON for standalone installs, OFF for
+     * managed single-shop installs, where the shop platform (WooCommerce)
+     * owns customer emails and a second capture form would be noise.
+     */
+    public static function isPayerEmailCaptureEnabled(): bool {
+        $explicit = self::get('payer_email_capture_enabled');
+        if ($explicit !== null && $explicit !== '') {
+            return $explicit === true || $explicit === 1 || $explicit === '1';
+        }
+        require_once __DIR__ . '/managed.php';
+        return !ManagedInstall::isManaged();
+    }
+
+    /**
      * Currencies that may be offered as a default display/input currency in
      * addition to the mint's native unit.
      */
@@ -352,6 +383,30 @@ class Config {
         return $store !== null
             && !empty($store['mint_url'])
             && !empty($store['seed_phrase']);
+    }
+
+    /**
+     * Whether the store has at least one payment rail an invoice could offer:
+     * a Cashu mint (isStoreConfigured above), an on-chain destination (xpub or
+     * static address, whichever the address mode names), or a Lightning
+     * destination (Strike / LNURL address / NWC / noffer). Mirrors the rails
+     * gate at the top of Invoice::create.
+     *
+     * This — not isStoreConfigured, which only reflects the mint rail — is
+     * the check for "can this store take payments": the wizard's "run without
+     * mints" answer leaves mint_url/seed_phrase NULL on a store that is
+     * nevertheless fully operational over its other rails.
+     */
+    public static function storeHasPaymentRail(string $storeId): bool {
+        if (self::isStoreConfigured($storeId)) {
+            return true;
+        }
+        require_once __DIR__ . '/setup_flow.php';
+        if (SetupFlow::onchainState($storeId)['configured']) {
+            return true;
+        }
+        require_once __DIR__ . '/store_ln_addresses.php';
+        return StoreLnAddresses::addressesForStore($storeId) !== [];
     }
 
     /**

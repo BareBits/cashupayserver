@@ -17,7 +17,10 @@ pytestmark = pytest.mark.ui
 XSS_PAYLOAD = "<img src=x onerror=\"window.__xss_fired = true\">label"
 
 
-def test_api_key_label_is_html_escaped(configured: ConfiguredPayserver, page) -> None:
+def test_api_key_label_is_html_escaped(shared_configured: ConfiguredPayserver, page) -> None:
+    # Store-pinned throughout (explicit store_id in the DB insert and the
+    # loadStoreApiKeys() call), so the module's shared server is safe here.
+    configured = shared_configured
     # Register an API key whose label is a stored-XSS payload. Use a direct
     # DB write to bypass any future server-side label sanitization — we want
     # to assert the *renderer* is safe, not just the input filter.

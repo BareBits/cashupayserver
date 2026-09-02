@@ -169,9 +169,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
     } elseif ($action === 'deny') {
         if ($redirect) {
-            // Redirect with error
+            // Denials go back to the requester with ?error=access_denied —
+            // through the same wait-out-maintenance page as approvals
+            // (renderGetRedirect), not a blind Location header: the target
+            // site can be behind WordPress's maintenance 503 right now, and
+            // while a lost denial destroys no data, dumping the merchant on
+            // the maintenance screen still reads as "the pairing broke".
             $separator = str_contains($redirect, '?') ? '&' : '?';
-            header('Location: ' . $redirect . $separator . 'error=access_denied');
+            renderGetRedirect($redirect . $separator . 'error=access_denied', $applicationName);
             exit;
         } else {
             header('Location: ' . Urls::admin());
@@ -180,15 +185,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 }
 
-// Get stores for selection (only fully configured stores)
+// Get stores for selection. Every store is listed: a store can be
+// Lightning-only or on-chain-only (the wizard's "run without mints" answer
+// leaves mint_url/seed_phrase NULL) and still take payments, so filtering on
+// the mint columns here wrongly told merchants with such stores "No stores
+// found" and blocked pairing entirely. A store with no payment rail at all
+// is still selectable — pair first, add a rail after — but gets flagged in
+// the chooser so the admin knows checkouts will fail until one is added.
 $stores = [];
 if (Auth::isLoggedIn()) {
-    $stores = Database::fetchAll(
-        "SELECT id, name FROM stores
-         WHERE mint_url IS NOT NULL AND mint_url != ''
-           AND seed_phrase IS NOT NULL AND seed_phrase != ''
-         ORDER BY name"
-    );
+    $stores = Database::fetchAll("SELECT id, name FROM stores ORDER BY name");
+    foreach ($stores as &$storeRow) {
+        $storeRow['hasPaymentRail'] = Config::storeHasPaymentRail($storeRow['id']);
+    }
+    unset($storeRow);
 }
 
 // Permission descriptions for UI
@@ -201,6 +211,92 @@ $permissionDescriptions = [
     'btcpay.store.canmodifystoresettings' => 'Modify store settings',
     'btcpay.store.cancreatenonapprovedpullpayments' => 'Create pull payments',
 ];
+
+/**
+ * Render a GET redirect that waits out a 503 on the target before
+ * navigating — the deny-path sibling of renderPostRedirect's guarded
+ * auto-submit (see the comment in there for the why). The visible link is
+ * the no-JS fallback and the manual override.
+ */
+function renderGetRedirect(string $url, string $appName): void {
+    ?>
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <title>Returning to <?= htmlspecialchars($appName) ?>...</title>
+        <style>
+            body {
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+                background: #0f0f23;
+                color: #fff;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                min-height: 100vh;
+                margin: 0;
+            }
+            .container {
+                text-align: center;
+                padding: 2rem;
+            }
+            .spinner {
+                width: 40px;
+                height: 40px;
+                border: 3px solid rgba(255,255,255,0.2);
+                border-top-color: #f7931a;
+                border-radius: 50%;
+                animation: spin 1s linear infinite;
+                margin: 0 auto 1rem;
+            }
+            @keyframes spin {
+                to { transform: rotate(360deg); }
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="spinner"></div>
+            <p>Returning to <?= htmlspecialchars($appName) ?>...</p>
+            <div id="redirect-waiting" style="display: none; background: rgba(246, 173, 85, 0.15); border: 1px solid rgba(246, 173, 85, 0.4); border-radius: 8px; padding: 0.75rem 1rem; margin-top: 1rem; font-size: 0.9rem; color: #f6ad55;">
+                <?= htmlspecialchars($appName) ?>'s site is briefly unavailable (maintenance mode) &mdash;
+                continuing automatically as soon as it's back, usually under a minute.
+                The link below goes there right away.
+            </div>
+            <p style="margin-top: 1rem;">
+                <a id="redirect-link" href="<?= htmlspecialchars($url) ?>" style="color: #f7931a;">
+                    Continue to <?= htmlspecialchars($appName) ?>
+                </a>
+            </p>
+        </div>
+        <script>
+        (function () {
+            const link = document.getElementById('redirect-link');
+            const note = document.getElementById('redirect-waiting');
+            const probeUrl = link.href.split('?')[0];
+            let manual = false;
+            link.addEventListener('click', function () { manual = true; });
+            const go = function () { if (!manual) { window.location.href = link.href; } };
+            const probe = function () {
+                if (manual) { return; }
+                fetch(probeUrl, { cache: 'no-store' })
+                    .then(function (res) {
+                        if (res.status === 503) {
+                            note.style.display = 'block';
+                            setTimeout(probe, 5000);
+                        } else {
+                            go();
+                        }
+                    })
+                    .catch(go);
+            };
+            probe();
+        })();
+        </script>
+    </body>
+    </html>
+    <?php
+}
 
 /**
  * Render a POST redirect form
@@ -246,17 +342,63 @@ function renderPostRedirect(string $url, array $data, string $appName): void {
         <div class="container">
             <div class="spinner"></div>
             <p>Redirecting to <?= htmlspecialchars($appName) ?>...</p>
+            <div id="redirect-waiting" style="display: none; background: rgba(246, 173, 85, 0.15); border: 1px solid rgba(246, 173, 85, 0.4); border-radius: 8px; padding: 0.75rem 1rem; margin-top: 1rem; font-size: 0.9rem; color: #f6ad55;">
+                <?= htmlspecialchars($appName) ?>'s site is briefly unavailable (maintenance mode) &mdash;
+                continuing automatically as soon as it's back, usually under a minute.
+                The button below goes there right away.
+            </div>
+            <form id="redirect-form" method="POST" action="<?= htmlspecialchars($url) ?>">
+                <input type="hidden" name="apiKey" value="<?= htmlspecialchars($data['apiKey']) ?>">
+                <input type="hidden" name="userId" value="<?= htmlspecialchars($data['userId']) ?>">
+                <input type="hidden" name="storeId" value="<?= htmlspecialchars($data['storeId']) ?>">
+                <?php foreach ($data['permissions'] as $perm): ?>
+                <input type="hidden" name="permissions[]" value="<?= htmlspecialchars($perm) ?>">
+                <?php endforeach; ?>
+                <!-- Also the no-JS fallback: without scripting nothing auto-submits,
+                     and this used to be a dead end with an invisible form. -->
+                <button type="submit" style="margin-top: 1rem; background: none; border: 1px solid rgba(255,255,255,0.3); border-radius: 8px; color: #fff; padding: 0.5rem 1rem; cursor: pointer;">
+                    Continue to <?= htmlspecialchars($appName) ?>
+                </button>
+            </form>
         </div>
-        <form id="redirect-form" method="POST" action="<?= htmlspecialchars($url) ?>">
-            <input type="hidden" name="apiKey" value="<?= htmlspecialchars($data['apiKey']) ?>">
-            <input type="hidden" name="userId" value="<?= htmlspecialchars($data['userId']) ?>">
-            <input type="hidden" name="storeId" value="<?= htmlspecialchars($data['storeId']) ?>">
-            <?php foreach ($data['permissions'] as $perm): ?>
-            <input type="hidden" name="permissions[]" value="<?= htmlspecialchars($perm) ?>">
-            <?php endforeach; ?>
-        </form>
         <script>
-            document.getElementById('redirect-form').submit();
+        // The redirect target (for the WordPress plugin: admin-post.php) can
+        // be behind WordPress's maintenance screen at this very moment —
+        // auto-updates 503 the whole WP site for up to a minute. Submitting
+        // into that swallows the freshly minted key and strands the merchant
+        // on the maintenance screen. Same cure as the setup wizard's
+        // return-to-WordPress handoff: probe the target's base URL first and
+        // only submit once it answers. 503 is the ONLY status that waits;
+        // anything else — including the failure a CROSS-ORIGIN probe throws
+        // when the shop is on another origin (no CORS headers on its answer)
+        // — falls through to the immediate submit this page always did, so
+        // the guard may delay the merchant, never trap them. Clicking the
+        // button is the manual override.
+        (function () {
+            const form = document.getElementById('redirect-form');
+            const note = document.getElementById('redirect-waiting');
+            // The action minus its query: for the WordPress plugin that is a
+            // bare admin-post.php, a cheap no-op that still answers 503 in
+            // maintenance mode. Probing the full URL would run the callback.
+            const probeUrl = form.action.split('?')[0];
+            let manual = false;
+            form.addEventListener('submit', function () { manual = true; });
+            const go = function () { if (!manual) { form.submit(); } };
+            const probe = function () {
+                if (manual) { return; }
+                fetch(probeUrl, { cache: 'no-store' })
+                    .then(function (res) {
+                        if (res.status === 503) {
+                            note.style.display = 'block';
+                            setTimeout(probe, 5000);
+                        } else {
+                            go();
+                        }
+                    })
+                    .catch(go);
+            };
+            probe();
+        })();
         </script>
     </body>
     </html>
@@ -564,12 +706,33 @@ $baseUrl = Config::getBaseUrl();
                         <select id="store_id" name="store_id" required>
                             <option value="">-- Select a store --</option>
                             <?php foreach ($stores as $store): ?>
-                                <option value="<?= htmlspecialchars($store['id']) ?>">
-                                    <?= htmlspecialchars($store['name']) ?>
+                                <option value="<?= htmlspecialchars($store['id']) ?>"
+                                        data-has-rail="<?= $store['hasPaymentRail'] ? '1' : '0' ?>">
+                                    <?= htmlspecialchars($store['name']) ?><?= $store['hasPaymentRail'] ? '' : ' (no payment methods yet)' ?>
                                 </option>
                             <?php endforeach; ?>
                         </select>
+                        <div id="no-rail-warning" class="warning" style="display: none; margin-top: 0.75rem;">
+                            This store has no payment methods configured yet, so
+                            checkouts will fail until one is added. You can pair
+                            now and add a Cashu mint, Lightning destination, or
+                            on-chain wallet in the
+                            <a href="<?= Urls::admin() ?>">dashboard</a> afterwards.
+                        </div>
                     </div>
+                    <script>
+                    (function () {
+                        const select = document.getElementById('store_id');
+                        const warning = document.getElementById('no-rail-warning');
+                        function syncWarning() {
+                            const opt = select.options[select.selectedIndex];
+                            const railless = opt && opt.getAttribute('data-has-rail') === '0';
+                            warning.style.display = railless ? 'block' : 'none';
+                        }
+                        select.addEventListener('change', syncWarning);
+                        syncWarning();
+                    })();
+                    </script>
 
                     <?php if (!empty($permissions)): ?>
                         <div class="permissions-list">

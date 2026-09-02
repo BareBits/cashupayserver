@@ -55,11 +55,11 @@ def _chain_rows(payserver, store_id: str) -> list[sqlite3.Row]:
 
 
 def test_noffer_added_to_chain_and_persisted(
-    configured_with_lnurlp: ConfiguredPayserver,
+    shared_configured_with_lnurlp: ConfiguredPayserver,
 ) -> None:
     # The chain includes a plain lnaddress, which the save-time LUD-21
     # gate probes — the lnurlp-backed stack resolves it on the mock host.
-    configured = configured_with_lnurlp
+    configured = shared_configured_with_lnurlp
     admin = configured.admin
     store_id = configured.store_id
 
@@ -84,9 +84,9 @@ def test_noffer_added_to_chain_and_persisted(
     assert rows[1]["address"] == "fallback@example.test"
 
 
-def test_invalid_noffer_rejected(configured: ConfiguredPayserver) -> None:
-    admin = configured.admin
-    store_id = configured.store_id
+def test_invalid_noffer_rejected(shared_configured: ConfiguredPayserver) -> None:
+    admin = shared_configured.admin
+    store_id = shared_configured.store_id
 
     # A noffer-shaped but undecodable string fails validation. (Auto-detection
     # only classifies a value as a noffer when it fully decodes, so a broken one

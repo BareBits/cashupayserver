@@ -1,20 +1,26 @@
-"""WordPress fixture for testing the CashuPay plugin.
+"""WordPress fixture for testing the BareBits (cashupay) plugin.
 
 Uses wp-cli + the static PHP binary to stand up a fresh SQLite-backed WP
-install per test, with the plugin tree symlinked from the repo so any
-local change is exercised. Same `php -S` mechanic as the standalone
-payserver fixture — front controller through a tiny wrapper that
-defines CASHUPAY_DATA_DIR from the env.
+install per test, with the GPL plugin copied from wordpress/ so any local
+change is exercised. Serving is backend-selectable (CASHUPAY_TEST_BACKEND,
+see tests/fixtures/webserver.py): php -S through a tiny front-controller
+wrapper (default), or real Apache / nginx containers. The `emulate_rewrites`
+host-shape flag maps per backend — under php -S it toggles the wrapper's
+.htaccess emulation snippet, under Apache it toggles AllowOverride (the real
+unpacked .htaccess does the work), under nginx it picks a site config with or
+without the /barebits rules and PATH_INFO support.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import shutil
-import signal
 import sqlite3
 import subprocess
 import time
 import urllib.request
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,7 +28,7 @@ from typing import Iterator
 
 import requests
 
-from . import binaries, ports
+from . import binaries, ports, webserver
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 TESTS_DIR = REPO_ROOT / "tests"
@@ -62,39 +68,63 @@ BTCPAY_WC_URL = (
 BTCPAY_WC_SHA256 = "b06a4da4835d984ddd870c3bfafb6fc4c524fe0ef988f22cd1575a8a7b77d236"
 BTCPAY_WC_CACHE = BIN_DIR / f"btcpay-greenfield-{BTCPAY_WC_VERSION}"
 
-# ELEX Discount Per Payment Method — the free plugin the onboarding wizard's
-# Bitcoin-discount step auto-installs. Tests stage it pre-installed (NOT
-# active) so cashupay_ensure_elex_discount exercises its activate+configure
-# path without a live wordpress.org download mid-test.
-ELEX_DPP_VERSION = "1.3.2"
-ELEX_DPP_URL = (
-    f"https://downloads.wordpress.org/plugin/elex-discount-per-payment-method.{ELEX_DPP_VERSION}.zip"
-)
-ELEX_DPP_SHA256 = "dbce21758f7bf76968880ed5e0750b73aa6621a8c944d2a13441fef47535dfd1"
-ELEX_DPP_CACHE = BIN_DIR / f"elex-discount-per-payment-method-{ELEX_DPP_VERSION}"
-
-
 @dataclass
 class WordPressHandle:
-    process: subprocess.Popen[bytes]
+    server: webserver.ManagedServer
     port: int
     wp_root: Path
     data_dir: Path
     workdir: Path
     php_exe: Path
     wp_cli_phar: Path
+    # Set when the install came from (or built) the WooCommerce golden
+    # template: the pre-created virtual product's id. None on plain installs.
+    woo_product_id: int | None = None
+
+    @property
+    def process(self) -> subprocess.Popen[bytes] | None:
+        """Back-compat accessor: the php -S Popen, None on container backends."""
+        return self.server.popen
 
     @property
     def url(self) -> str:
         return f"http://127.0.0.1:{self.port}"
 
     @property
-    def cashupay_admin_url(self) -> str:
-        return f"{self.url}/wp-content/plugins/cashupay/admin.php"
+    def barebits_dir(self) -> Path:
+        """Where the plugin's install-alongside flow puts the BareBits server
+        (ABSPATH/barebits, i.e. inside the served docroot)."""
+        return self.wp_root / "barebits"
+
+    @property
+    def barebits_url(self) -> str:
+        return f"{self.url}/barebits"
+
+    @property
+    def barebits_gateway_url(self) -> str:
+        """The btcpay_gf_url the WooCommerce wiring writes for the alongside
+        install: api.php's query-transport BASE, so every URL the BTCPay
+        gateway builds by concatenation lands directly on api.php — one
+        loopback deep on every host (see cashupay_gateway_base_url)."""
+        return f"{self.barebits_url}/api.php?cashupay_path="
+
+    @property
+    def barebits_data_dir(self) -> Path:
+        """The data dir the installer prefers: outside the docroot, a sibling
+        of ABSPATH, namespaced per site so co-hosted WordPress installs can
+        never share one wallet database (dirname(wp_root)/barebits-data-<12
+        hex of sha256(ABSPATH)>; ABSPATH carries WP's trailing slash)."""
+        digest = hashlib.sha256(f"{self.wp_root}/".encode()).hexdigest()[:12]
+        return self.workdir / f"barebits-data-{digest}"
 
     @property
     def db_path(self) -> Path:
-        return self.data_dir / "cashupay.sqlite"
+        """The BareBits SQLite DB of an alongside install (preferred outside-
+        docroot location first, then the in-install fallback)."""
+        outside = self.barebits_data_dir / "cashupay.sqlite"
+        if outside.exists():
+            return outside
+        return self.barebits_dir / "data" / "cashupay.sqlite"
 
     @contextmanager
     def db(self) -> Iterator[sqlite3.Connection]:
@@ -115,7 +145,6 @@ class WordPressHandle:
             *args,
         ]
         env = os.environ.copy()
-        env["CASHUPAY_DATA_DIR"] = str(self.data_dir)
         # Generous ceiling (plugin installs legitimately take a while) that
         # still fails loudly instead of eating the whole CI job cap when a WP
         # boot deadlocks — seen when a wiped btcpay_gf_version made the BTCPay
@@ -228,62 +257,24 @@ def _ensure_cached_plugin(cache_dir: Path, url: str, sha256: str, slug: str) -> 
 
 # ---------- plugin tree assembly ----------
 
-# Mirrors what scripts/build-wordpress-plugin.sh produces but via symlinks
-# so source edits are reflected without rebuilding.
-# Top-level repo entries to symlink as subdirs/files of the plugin.
-_PLUGIN_SUBPATHS = (
-    "includes",
-    "admin.php",
-    "setup.php",
-    "api.php",
-    "payment.php",
-    "receive.php",
-    "cron.php",
-    "router.php",
-    "api-keys",
-    "assets",
-    "images",
-    "favicon.ico",
-    "manifest.json",
-)
-
 
 def _assemble_plugin(plugin_dir: Path) -> None:
-    """Mirror docker/Dockerfile.wordpress's plugin layout: all wordpress/*.php
-    files live flat at the plugin root, with shared backend folders symlinked
-    next to them.
-
-    PHP files at the plugin root are *copies* (not symlinks) so __DIR__ resolves
-    to the plugin directory at runtime; everything else is symlinked so source
-    edits show up live."""
+    """Copy the GPL plugin (wordpress/ in the repo) into wp-content/plugins/
+    cashupay. Plain copies rather than symlinks: WordPress's activation-hook
+    bookkeeping keys off realpath(__FILE__), so a symlinked plugin dir breaks
+    register_activation_hook. The plugin is a handful of small files, so a
+    per-test copy is cheap; it mirrors scripts/build-wordpress-plugin.sh
+    exactly (no server code, no vendor/)."""
+    src_root = REPO_ROOT / "wordpress"
     plugin_dir.mkdir(parents=True, exist_ok=True)
-
-    # 1. Copy every wordpress/*.php to the plugin root so __DIR__ resolution
-    #    points at the plugin directory and `require __DIR__ . '/bootstrap.php'`
-    #    in cashupay.php finds bootstrap.php beside it.
-    for src in (REPO_ROOT / "wordpress").glob("*.php"):
+    for src in list(src_root.glob("*.php")) + [src_root / "readme.txt"]:
         dst = plugin_dir / src.name
         if not dst.exists():
             shutil.copy(src, dst)
-
-    # 2. Symlink the shared backend directories / single-file assets.
-    for rel in _PLUGIN_SUBPATHS:
-        src = REPO_ROOT / rel
-        if not src.exists():
-            continue
-        dst = plugin_dir / rel
-        if dst.is_symlink() or dst.exists():
-            continue
-        os.symlink(src, dst)
-
-    # 3. cashu-wallet-php: only the two runtime files (matches Dockerfile).
-    cashu_dir = plugin_dir / "cashu-wallet-php"
-    cashu_dir.mkdir(exist_ok=True)
-    for fname in ("CashuWallet.php", "bip39-english.txt"):
-        src = REPO_ROOT / "cashu-wallet-php" / fname
-        dst = cashu_dir / fname
-        if src.exists() and not dst.exists():
-            os.symlink(src, dst)
+    assets_src = src_root / "assets"
+    assets_dst = plugin_dir / "assets"
+    if assets_src.is_dir() and not assets_dst.exists():
+        shutil.copytree(assets_src, assets_dst)
 
 
 # ---------- built plugin zip (the shipped artifact) ----------
@@ -313,20 +304,19 @@ def ensure_wp_plugin_zip() -> Path:
     env["PHP_BIN"] = str(php_exe)
     print(f"[wp] building plugin zip via {script.name} ...")
     subprocess.run(["bash", str(script)], cwd=str(REPO_ROOT), env=env, check=True)
-    zip_path = REPO_ROOT / "build" / "wordpress_plugin.zip"
+    zip_path = REPO_ROOT / "build" / "barebits_wordpress_plugin.zip"
     if not zip_path.is_file():
-        raise RuntimeError("build-wordpress-plugin.sh did not produce build/wordpress_plugin.zip")
+        raise RuntimeError("build-wordpress-plugin.sh did not produce build/barebits_wordpress_plugin.zip")
     return zip_path
 
 
 # ---------- fixture ----------
 
 ROUTER_WRAPPER_TEMPLATE = """<?php
-$dataDir = getenv('CASHUPAY_DATA_DIR');
-if ($dataDir !== false && $dataDir !== '' && !defined('CASHUPAY_DATA_DIR')) {{
-    define('CASHUPAY_DATA_DIR', $dataDir);
-}}
 // WordPress front controller — fall through to wp's index.php on misses.
+// (The release-server constants the plugin's installer reads live in
+// wp-config.php — the same place a real operator puts them — so they apply
+// identically on every backend, not just under this php -S wrapper.)
 //
 // Paths resolve against the WordPress docroot, NOT __DIR__: this router lives
 // in the workdir alongside the install, so __DIR__ would never match a real WP
@@ -342,31 +332,151 @@ if (substr($uri, -4) === '.php' && file_exists($file)) {{
     require $file;
     return true;
 }}
-require {wp_index!r};
+{barebits_rewrites}require {wp_index!r};
+"""
+
+# The BareBits server the plugin installed alongside WordPress lives at
+# /barebits inside this docroot. Apache would apply ITS .htaccess there; a
+# router script gets no .htaccess, so this block emulates the rewrites the
+# stack depends on: the Greenfield API (the WooCommerce gateway calls
+# {btcpay_gf_url}/api/v1/... on the bare base URL), the extensionless pairing
+# endpoint, and PATH_INFO-style routing (Apache's AcceptPathInfo — the
+# BareBits admin canonicalizes to /barebits/admin.php/<view>). Everything else
+# under /barebits is real files (served above) or the app's own router.php
+# URLs. Omitted entirely for the "hostile host" fixture (emulate_rewrites=
+# False): an nginx-style server that executes *.php files but applies no
+# rewrite rules at all, on which the setup wizard must still complete.
+BAREBITS_REWRITES_SNIPPET = """\
+if (preg_match('#^(/barebits/[^/]+\\.php)(/.*)$#', $uri, $m)
+        && is_file($docRoot . $m[1])) {
+    $_SERVER['PATH_INFO'] = $m[2];
+    $_SERVER['SCRIPT_NAME'] = $m[1];
+    require $docRoot . $m[1];
+    return true;
+}
+if (preg_match('#^/barebits(/api/v1/.*)$#', $uri, $m)
+        && is_file($docRoot . '/barebits/api.php')) {
+    $_SERVER['PATH_INFO'] = $m[1];
+    $_SERVER['SCRIPT_NAME'] = '/barebits/api.php';
+    require $docRoot . '/barebits/api.php';
+    return true;
+}
+if ($uri === '/barebits/api-keys/authorize'
+        && is_file($docRoot . '/barebits/api-keys/authorize.php')) {
+    $_SERVER['SCRIPT_NAME'] = '/barebits/api-keys/authorize.php';
+    require $docRoot . '/barebits/api-keys/authorize.php';
+    return true;
+}
 """
 
 
-def start_wordpress(workdir: Path, *, install_cashupay: bool = True) -> WordPressHandle:
+def start_wordpress(
+    workdir: Path,
+    *,
+    install_cashupay: bool = True,
+    release_api_base: str | None = None,
+    release_channel: str | None = None,
+    emulate_rewrites: bool = True,
+    php_workers: int | None = None,
+    with_woocommerce: bool = False,
+    _from_template: bool = True,
+) -> WordPressHandle:
     """Stand up a fresh SQLite-backed WordPress install.
 
-    install_cashupay=True (default) assembles the cashupay plugin from live
-    source via symlinks and activates it — what every existing WP test wants.
-    install_cashupay=False brings WordPress up with NO cashupay plugin, so a
-    test can install the real built zip itself (`wp plugin install <zip>`) and
-    exercise the shipped artifact rather than the symlink tree.
+    install_cashupay=True (default) copies the GPL plugin from wordpress/ and
+    activates it — what every WP test wants. install_cashupay=False brings
+    WordPress up with NO cashupay plugin, so a test can install the real built
+    zip itself (`wp plugin install <zip>`) and exercise the shipped artifact.
+
+    release_api_base points the plugin's "install BareBits alongside" flow at
+    a local fixture release server instead of api.github.com; release_channel
+    pins the plugin's release channel the way a wp-config.php constant would
+    ('testing' makes it read the fixture's /releases listing).
+
+    emulate_rewrites=False serves /barebits WITHOUT the Apache-.htaccess
+    rewrite emulation — a "hostile host" (think nginx with a plain WordPress
+    config) that executes real *.php files but routes everything else into
+    WordPress. The setup wizard must survive such hosts.
+
+    php_workers pins PHP_CLI_SERVER_WORKERS for this instance (default 6, see
+    below) — a small value emulates hosts with tight per-site PHP pools
+    (Local WP), where nested same-site loopback requests starve into
+    timeouts.
+
+    with_woocommerce=True yields an install that already carries WooCommerce +
+    the BTCPay gateway + the configured BTC store and one virtual product
+    (`install_woocommerce`'s end state); the product id is on
+    `handle.woo_product_id`.
+
+    Golden templates: the first install of each DB-affecting shape (bare /
+    plugin / plugin+woocommerce) per pytest session is kept as a golden tree,
+    and later installs of that shape are file-copies of it — skipping
+    `wp core install` and plugin activations entirely. Safe because every
+    URL-bearing value WordPress persists is overridden at runtime by the
+    WP_HOME/WP_SITEURL constants in the per-clone wp-config.php (regenerated
+    with the clone's own port), and release_api_base/release_channel/
+    emulate_rewrites/php_workers are all serve-time parameters, not DB state.
+    Set CASHUPAY_WP_NO_TEMPLATE=1 to force the old fresh-install-per-test
+    behaviour.
     """
     php_exe = binaries.ensure(binaries.PHP)["php"]
     wp_cli_phar = binaries.ensure_file(binaries.WP_CLI)
 
     workdir.mkdir(parents=True, exist_ok=True)
     wp_root = workdir / "wp"
-    data_dir = workdir / "data"
-    data_dir.mkdir(parents=True, exist_ok=True)
+    # The dir the plugin's installer prefers for the BareBits data dir is a
+    # sibling of the docroot, namespaced per site (dirname(ABSPATH)/
+    # barebits-data-<12 hex of sha256(ABSPATH)>) — that's inside this
+    # per-test workdir, so it needs no pre-creation and stays isolated.
+    data_dir = workdir / (
+        "barebits-data-" + hashlib.sha256(f"{wp_root}/".encode()).hexdigest()[:12]
+    )
+
+    use_template = (
+        _from_template
+        and not os.environ.get("CASHUPAY_WP_NO_TEMPLATE")
+        and not wp_root.exists()
+    )
+    woo_product_id: int | None = None
+    if use_template:
+        golden_wp, meta = _ensure_golden_install(
+            install_cashupay=install_cashupay, with_woocommerce=with_woocommerce
+        )
+        # cp -a: preserves the symlinked wp.org plugins and is much faster
+        # than shutil.copytree on WP core's thousands of small files. The
+        # suite is Linux-only (tests/README.md).
+        subprocess.run(
+            ["cp", "-a", str(golden_wp), str(wp_root)], check=True, timeout=120
+        )
+        woo_product_id = meta.get("product_id")
 
     # 1. Copy WP core into wp_root (fresh per test; isolated).
-    core = _ensure_wp_core()
-    if not wp_root.exists():
-        shutil.copytree(core, wp_root)
+    if not use_template:
+        core = _ensure_wp_core()
+        if not wp_root.exists():
+            shutil.copytree(core, wp_root)
+
+    # 1b. The standard WordPress .htaccess block, which every real Apache WP
+    #     install has. wp-cli's `rewrite --hard` cannot write it (CLI SAPI ⇒
+    #     got_mod_rewrite() false), and without it pretty-permalink routes
+    #     (/wp-json/... — the WooCommerce Store API) 404 on the apache
+    #     backend. Inert under php -S (the wrapper never reads .htaccess) and
+    #     under the hostile AllowOverride None shape; /barebits/* keeps its
+    #     own .htaccess, which takes per-directory precedence.
+    wp_htaccess = wp_root / ".htaccess"
+    if not wp_htaccess.exists():
+        wp_htaccess.write_text(
+            "# BEGIN WordPress\n"
+            "<IfModule mod_rewrite.c>\n"
+            "RewriteEngine On\n"
+            "RewriteBase /\n"
+            "RewriteRule ^index\\.php$ - [L]\n"
+            "RewriteCond %{REQUEST_FILENAME} !-f\n"
+            "RewriteCond %{REQUEST_FILENAME} !-d\n"
+            "RewriteRule . /index.php [L]\n"
+            "</IfModule>\n"
+            "# END WordPress\n"
+        )
 
     # 2. SQLite drop-in.
     sqlite_plugin = _ensure_sqlite_plugin()
@@ -382,11 +492,21 @@ def start_wordpress(workdir: Path, *, install_cashupay: bool = True) -> WordPres
     if install_cashupay:
         _assemble_plugin(wp_root / "wp-content" / "plugins" / "cashupay")
 
-    # 4. wp-config.php with SQLite config + WP_HOME.
+    # 4. wp-config.php with SQLite config + WP_HOME (+ the release-server
+    #    constants the plugin's installer reads, when the caller provides them).
+    #    A template clone force-overwrites the golden's config: the clone's own
+    #    port and release constants live here, and the WP_HOME/WP_SITEURL
+    #    constants are what make the golden's DB-stored URLs irrelevant.
     port = ports.allocate(1)[0]
     config = wp_root / "wp-config.php"
-    if not config.exists():
-        config.write_text(_wp_config_php(port=port, data_dir=data_dir))
+    if use_template or not config.exists():
+        config.write_text(
+            _wp_config_php(
+                port=port,
+                release_api_base=release_api_base,
+                release_channel=release_channel,
+            )
+        )
 
     # 5. Router wrapper.
     router_wrapper = workdir / "wp-router.php"
@@ -394,39 +514,27 @@ def start_wordpress(workdir: Path, *, install_cashupay: bool = True) -> WordPres
         ROUTER_WRAPPER_TEMPLATE.format(
             wp_root=str(wp_root),
             wp_index=str(wp_root / "index.php"),
+            barebits_rewrites=BAREBITS_REWRITES_SNIPPET if emulate_rewrites else "",
         )
     )
 
-    # 6. wp core install (uses the static PHP via wp-cli).
-    install_env = os.environ.copy()
-    install_env["CASHUPAY_DATA_DIR"] = str(data_dir)
-    subprocess.run(
-        [
-            str(php_exe), str(wp_cli_phar),
-            f"--path={wp_root}",
-            "--allow-root",
-            "core", "install",
-            f"--url=http://127.0.0.1:{port}",
-            f"--title={WP_SITE_TITLE}",
-            f"--admin_user={WP_ADMIN_USER}",
-            f"--admin_password={WP_ADMIN_PASSWORD}",
-            f"--admin_email={WP_ADMIN_EMAIL}",
-            "--skip-email",
-        ],
-        env=install_env,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-
-    # 7. Activate cashupay plugin (unless the caller installs the zip itself).
-    if install_cashupay:
+    # 6. wp core install (uses the static PHP via wp-cli). A template clone
+    #    carries the golden's installed DB, so both install and activation
+    #    are already done.
+    if not use_template:
+        install_env = os.environ.copy()
         subprocess.run(
             [
                 str(php_exe), str(wp_cli_phar),
                 f"--path={wp_root}",
                 "--allow-root",
-                "plugin", "activate", "cashupay",
+                "core", "install",
+                f"--url=http://127.0.0.1:{port}",
+                f"--title={WP_SITE_TITLE}",
+                f"--admin_user={WP_ADMIN_USER}",
+                f"--admin_password={WP_ADMIN_PASSWORD}",
+                f"--admin_email={WP_ADMIN_EMAIL}",
+                "--skip-email",
             ],
             env=install_env,
             check=True,
@@ -434,60 +542,203 @@ def start_wordpress(workdir: Path, *, install_cashupay: bool = True) -> WordPres
             text=True,
         )
 
-    # 8. Spin php -S.
+        # 7. Activate cashupay plugin (unless the caller installs the zip
+        #    itself).
+        if install_cashupay:
+            subprocess.run(
+                [
+                    str(php_exe), str(wp_cli_phar),
+                    f"--path={wp_root}",
+                    "--allow-root",
+                    "plugin", "activate", "cashupay",
+                ],
+                env=install_env,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+    # 8. Serve the tree on the active backend.
     env = os.environ.copy()
-    env["CASHUPAY_DATA_DIR"] = str(data_dir)
-    # SafeHttp blocks loopback/RFC1918 destinations by default; the
-    # webhook sink in this test runs on 127.0.0.1, so let the WP-served
-    # cashupay plugin opt in.
+    # SafeHttp blocks loopback/RFC1918 destinations by default; the webhook
+    # sink and the alongside BareBits install both live on 127.0.0.1, so the
+    # served stack opts in.
     env.setdefault("CASHUPAY_ALLOW_PRIVATE_ENDPOINTS", "1")
-    # Fork multiple worker processes for the built-in server. A single-threaded
-    # `php -S` deadlocks on any same-server loopback request, and a real
-    # WooCommerce checkout makes two: the BTCPay gateway calls the cashupay
-    # Greenfield API to create the invoice *during* the checkout request, and
-    # the cashupay webhook cron POSTs back to WooCommerce's wc-api endpoint
-    # *during* the cron request. Production (Apache/php-fpm) is multi-process;
-    # this mirrors that. Confirmed honored by the pinned static PHP 8.3 build.
-    env.setdefault("PHP_CLI_SERVER_WORKERS", "6")
-    log = (workdir / "wp-server.log").open("ab")
-    proc = subprocess.Popen(
-        [
-            str(php_exe),
-            "-S", f"127.0.0.1:{port}",
-            "-t", str(wp_root),
-            str(router_wrapper),
-        ],
+    if release_api_base:
+        env["CASHUPAY_RELEASE_API_BASE"] = release_api_base
+    if release_channel:
+        env["CASHUPAY_RELEASE_CHANNEL"] = release_channel
+    # A multi-worker pool on every backend. A single-threaded server deadlocks
+    # on any same-server loopback request, and this stack makes several: the
+    # BTCPay gateway calls the BareBits Greenfield API (same host) during
+    # checkout, BareBits' webhook cron POSTs back to WooCommerce's wc-api
+    # endpoint during the cron request, and the plugin's WP-cron pinger GETs
+    # the alongside install's cron.php. Maps to PHP_CLI_SERVER_WORKERS under
+    # php -S, prefork MaxRequestWorkers under Apache, pm.max_children under
+    # FPM; a small value emulates hosts with tight per-site pools (Local WP).
+    workers = php_workers if php_workers is not None else 6
+
+    server = webserver.start_php_site(
+        port=port,
+        docroot=wp_root,
+        workdir=workdir,
         env=env,
-        cwd=str(wp_root),
-        stdout=log,
-        stderr=subprocess.STDOUT,
+        role="wordpress",
+        log_path=workdir / "wp-server.log",
+        workers=workers,
+        phps_router=router_wrapper,
+        phps_cwd=wp_root,
+        phps_binary=str(php_exe),
+        # Host-shape mapping: friendly Apache honours the real .htaccess the
+        # install-alongside flow unpacks at wp_root/barebits/.htaccess; the
+        # hostile host is AllowOverride None.
+        apache_allow_override=emulate_rewrites,
+        nginx_site_conf=_wp_nginx_site(
+            port=port, wp_root=wp_root, friendly=emulate_rewrites
+        ),
     )
 
     handle = WordPressHandle(
-        process=proc,
+        server=server,
         port=port,
         wp_root=wp_root,
         data_dir=data_dir,
         workdir=workdir,
         php_exe=php_exe,
         wp_cli_phar=wp_cli_phar,
+        woo_product_id=woo_product_id,
     )
     try:
         handle.wait_ready()
+        if with_woocommerce and woo_product_id is None:
+            # Non-template path (golden build itself, or templates disabled):
+            # install WooCommerce for real on the now-running site.
+            info = install_woocommerce(handle)
+            handle.woo_product_id = info["product_id"]
     except Exception:
         stop_wordpress(handle)
         raise
     return handle
 
 
+# ---------- golden templates (one real install per shape per session) ----------
+#
+# Cache key is the install's DB-affecting shape only. release_api_base /
+# release_channel are wp-config constants (rewritten per clone), and
+# emulate_rewrites / php_workers only shape serving — none of them touch the
+# installed tree or the SQLite DB.
+_GOLDEN_CACHE: dict[str, tuple[Path, dict]] = {}
+
+
+def _golden_template_key(*, install_cashupay: bool, with_woocommerce: bool) -> str:
+    if with_woocommerce:
+        return "woo"
+    return "plugin" if install_cashupay else "bare"
+
+
+def _ensure_golden_install(
+    *, install_cashupay: bool, with_woocommerce: bool
+) -> tuple[Path, dict]:
+    """Build (once per session) and return (golden wp_root, meta) for the
+    requested shape. The golden is produced by the exact same code path a
+    templateless install takes — server booted, wizard-equivalent wp-cli
+    install run, plugins activated, then stopped — so clones inherit a state
+    byte-identical to what each test used to build for itself."""
+    key = _golden_template_key(
+        install_cashupay=install_cashupay, with_woocommerce=with_woocommerce
+    )
+    if key in _GOLDEN_CACHE:
+        return _GOLDEN_CACHE[key]
+
+    workdir = TESTS_DIR / ".tmp" / f"wp-golden-{key}-{uuid.uuid4().hex[:8]}"
+    print(f"[wp] building golden '{key}' WordPress template (once per session) ...")
+    handle = start_wordpress(
+        workdir,
+        install_cashupay=install_cashupay or with_woocommerce,
+        with_woocommerce=with_woocommerce,
+        _from_template=False,
+    )
+    try:
+        meta: dict = {}
+        if handle.woo_product_id is not None:
+            meta["product_id"] = handle.woo_product_id
+    finally:
+        stop_wordpress(handle)
+    # Serve-time leftovers (router wrapper, server log) stay outside wp/ and
+    # are never cloned; the golden's wp-config.php is overwritten per clone.
+    (workdir / "template-meta.json").write_text(json.dumps({"key": key, **meta}))
+    _GOLDEN_CACHE[key] = (handle.wp_root, meta)
+    return _GOLDEN_CACHE[key]
+
+
 def stop_wordpress(handle: WordPressHandle) -> None:
-    if handle.process.poll() is None:
-        handle.process.send_signal(signal.SIGTERM)
-        try:
-            handle.process.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            handle.process.kill()
-            handle.process.wait()
+    handle.server.stop(grace_s=10.0)
+
+
+# ---------- nginx site config (container backend) ----------
+
+def _wp_nginx_site(*, port: int, wp_root: Path, friendly: bool) -> str:
+    """The WordPress server block for the nginx backend.
+
+    friendly=True models the canonical well-configured host: WP front
+    controller, PATH_INFO-capable PHP location, and the /barebits rules the
+    install's own .htaccess would provide under Apache. friendly=False is the
+    genuinely rewrite-hostile host — a stock WP nginx config whose plain
+    `\\.php$` location executes real files with no PATH_INFO and routes
+    everything else into WordPress (the fixture's `emulate_rewrites=False`
+    contract).
+    """
+    barebits_rules = """
+    # What the BareBits install's .htaccess provides under Apache: the
+    # extensionless pairing endpoint and the Greenfield API on the bare base.
+    location = /barebits/api-keys/authorize {
+        rewrite ^ /barebits/api-keys/authorize.php last;
+    }
+    location ^~ /barebits/api/v1/ {
+        rewrite ^/barebits(/api/v1/.*)$ /barebits/api.php$1 last;
+    }
+""" if friendly else ""
+
+    if friendly:
+        php_location = """
+    location ~ [^/]\\.php(/|$) {
+        fastcgi_split_path_info ^(.+?\\.php)(/.*)$;
+        set $wp_path_info $fastcgi_path_info;
+        try_files $fastcgi_script_name =404;
+        include fastcgi_params;
+        # Debian's fastcgi_params rewrites HTTP_HOST to $host (port dropped);
+        # WordPress then canonical-redirects to WP_HOME's ported URL forever.
+        fastcgi_param HTTP_HOST $http_host if_not_empty;
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        fastcgi_param PATH_INFO $wp_path_info;
+        fastcgi_pass unix:%(sock)s;
+    }
+""" % {"sock": webserver.FPM_SOCKET}
+    else:
+        php_location = """
+    # Stock shape: no fastcgi_split_path_info, so /barebits/api.php/api/v1/...
+    # never matches — only real .php files execute, everything else lands in
+    # WordPress. This is what the same-origin api.php transport exists for.
+    location ~ \\.php$ {
+        try_files $uri =404;
+        include fastcgi_params;
+        fastcgi_param HTTP_HOST $http_host if_not_empty;
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        fastcgi_pass unix:%(sock)s;
+    }
+""" % {"sock": webserver.FPM_SOCKET}
+
+    return f"""server {{
+    listen 127.0.0.1:{port};
+    server_name _;
+    root {wp_root};
+    index index.php;
+{barebits_rules}
+    location / {{
+        try_files $uri $uri/ /index.php?$args;
+    }}
+{php_location}}}
+"""
 
 
 # ---------- WooCommerce + BTCPay gateway on top of a running WP ----------
@@ -528,6 +779,11 @@ def install_woocommerce(handle: WordPressHandle) -> dict:
     handle.wp_cli("plugin", "activate", "woocommerce")
     handle.wp_cli("plugin", "activate", "btcpay-greenfield-for-woocommerce")
 
+    # WooCommerce's activation leaves a redirect transient that hijacks the
+    # NEXT wp-admin page render into its own onboarding wizard — which would
+    # swallow the BareBits onboarding page a test loads right after this.
+    handle.wp_cli("transient", "delete", "_wc_activation_redirect", check=False)
+
     # Store config: everything that would otherwise make a headless Store API
     # checkout demand extra input or hide the storefront. wp-cli reports a
     # no-op `option update` (value already equal to the default) as a failure,
@@ -544,6 +800,21 @@ def install_woocommerce(handle: WordPressHandle) -> dict:
         "woocommerce_coming_soon": "no",
         # Skip the onboarding wizard so the REST endpoints behave normally.
         "woocommerce_task_list_hidden": "yes",
+        # Pin order storage to the legacy posts table, and drop the
+        # "newly installed" flag WC's deferred HPOS-for-new-shops job keys
+        # off. Without the pin that job flips HPOS on minutes after install
+        # (fresh per-test installs never lived long enough to see it; golden
+        # clones boot with it overdue), and the HPOS order table's DECIMAL
+        # column round-trips through SQLite as a REAL: the drop-in
+        # stringifies it the way PHP prints floats ("1.5E-5" for 0.00001500)
+        # and WC's wc_format_decimal strips the exponent char on hydration —
+        # a 1.50000000 total off a 1500-sat order. The plugin's wiring now
+        # pins storage the same way on real SQLite shops
+        # (cashupay_pin_order_storage_for_sqlite); the pin here keeps every
+        # UNWIRED fixture usable, and test_wp_hpos_checkout.py un-pins it to
+        # prove the plugin-side steering end to end.
+        "woocommerce_custom_orders_table_enabled": "no",
+        "woocommerce_newly_installed": "no",
     }.items():
         handle.wp_cli("option", "update", key, value, check=False)
     handle.wp_cli(
@@ -571,24 +842,43 @@ def install_woocommerce(handle: WordPressHandle) -> dict:
     return {"product_id": product_id}
 
 
-def stage_elex_discount_plugin(handle: WordPressHandle) -> None:
-    """Place the ELEX Discount Per Payment Method plugin in wp-content/plugins
-    WITHOUT activating it.
+def use_classic_checkout(handle: WordPressHandle) -> None:
+    """Switch the shop's checkout page from the WooCommerce checkout block
+    (the 9.x default) to the classic [woocommerce_checkout] shortcode.
 
-    This is the state cashupay_ensure_elex_discount finds on a host where the
-    plugin is present but dormant: it must take the activate+configure path,
-    and the test avoids depending on a live wordpress.org download (the
-    fresh-install path is byte-identical from activation onward)."""
-    src = _ensure_cached_plugin(
-        ELEX_DPP_CACHE, ELEX_DPP_URL, ELEX_DPP_SHA256, "elex-discount-per-payment-method"
+    WooCommerce keys its classic-vs-blocks behaviour off the checkout page's
+    content, so rewriting the page is the same switch a merchant makes in the
+    editor. Used by the classic-checkout discount tests — the two checkouts
+    take entirely different code paths to the payment-method-driven fee."""
+    page_id = handle.wp_cli(
+        "option", "get", "woocommerce_checkout_page_id"
+    ).stdout.strip().splitlines()[-1]
+    handle.wp_cli(
+        "post", "update", page_id, "--post_content=[woocommerce_checkout]"
     )
-    dst = handle.wp_root / "wp-content" / "plugins" / src.name
-    if not dst.exists():
-        os.symlink(src, dst)
 
 
-def _wp_config_php(*, port: int, data_dir: Path) -> str:
+def _wp_config_php(
+    *,
+    port: int,
+    release_api_base: str | None = None,
+    release_channel: str | None = None,
+) -> str:
+    release_defines = ""
+    if release_api_base:
+        release_defines += (
+            "// Point the plugin's release downloader at the test's fixture release\n"
+            "// server instead of api.github.com (see wordpress/installer.php).\n"
+            f"define('CASHUPAY_RELEASE_API_BASE', '{release_api_base}');\n"
+        )
+    if release_channel:
+        release_defines += (
+            "// Release channel override — the same wp-config.php constant a site\n"
+            "// operator would use to opt into the testing channel.\n"
+            f"define('CASHUPAY_RELEASE_CHANNEL', '{release_channel}');\n"
+        )
     return f"""<?php
+{release_defines}
 // SQLite drop-in expects these even though they're unused.
 define('DB_NAME', 'wordpress');
 define('DB_USER', '');
@@ -615,12 +905,6 @@ define('NONCE_SALT',       '{_rand_key()}');
 define('WP_HOME',    'http://127.0.0.1:{port}');
 define('WP_SITEURL', 'http://127.0.0.1:{port}');
 define('WP_DEBUG', false);
-
-// Force CashuPay data dir to the test's isolated location. (Guard against
-// the env var also setting it via the router wrapper.)
-if (!defined('CASHUPAY_DATA_DIR')) {{
-    define('CASHUPAY_DATA_DIR', '{data_dir}');
-}}
 
 if (!defined('ABSPATH')) {{
     define('ABSPATH', __DIR__ . '/');

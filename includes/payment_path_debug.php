@@ -63,6 +63,11 @@ class PaymentPathDebug
                 // URI — it embeds the wallet secret).
                 return self::withDest('Nostr Wallet Connect (NIP-47)', $dest);
 
+            case 'strike':
+                // ln_destination is the masked key label (never the API key —
+                // it is the account credential).
+                return self::withDest('Strike API', $dest);
+
             case 'swap':
                 $provider = trim((string)$swapProvider);
                 return $provider !== ''

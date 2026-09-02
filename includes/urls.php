@@ -2,39 +2,18 @@
 /**
  * CashuPayServer - Centralized URL Helper
  *
- * All URL generation logic in one place. Handles both WordPress
- * and standalone mode without scattered conditionals.
+ * All URL generation logic in one place, driven by the configured base URL
+ * and URL routing mode.
  */
 
 class Urls {
-    /** @var string|null Plugin file path for WordPress plugins_url() */
-    private static ?string $pluginFile = null;
-
     /**
-     * Initialize with WordPress plugin file path.
-     * Call this from wordpress/bootstrap.php.
-     */
-    public static function init(string $pluginFile): void {
-        self::$pluginFile = $pluginFile;
-    }
-
-    /**
-     * Check if running in WordPress mode
-     */
-    public static function isWordPress(): bool {
-        return defined('CASHUPAY_WORDPRESS') && CASHUPAY_WORDPRESS;
-    }
-
-    /**
-     * Human-readable label for a URL routing mode (standalone only).
+     * Human-readable label for a URL routing mode.
      *
      * Centralised so the admin settings card and the setup summary render the
      * same wording. Falls back to the current configured mode when none given.
      */
     public static function urlModeLabel(?string $mode = null): string {
-        if (self::isWordPress()) {
-            return 'WordPress routing';
-        }
         $mode = $mode ?? Config::getUrlMode();
         switch ($mode) {
             case 'clean':  return 'Clean URLs';
@@ -48,14 +27,10 @@ class Urls {
      * This is the URL e-commerce plugins should use as "BTCPay Server URL".
      */
     public static function server(): string {
-        if (self::isWordPress()) {
-            return site_url('/cashupay');
-        }
-
-        // Standalone: only router mode needs the /router.php front-controller
-        // prefix. In both clean (rewrite-to-router.php) and direct (.htaccess
-        // rewrites /api/v1 straight to api.php) modes the API is reachable at
-        // the bare base URL.
+        // Only router mode needs the /router.php front-controller prefix. In
+        // both clean (rewrite-to-router.php) and direct (.htaccess rewrites
+        // /api/v1 straight to api.php) modes the API is reachable at the bare
+        // base URL.
         $base = rtrim(Config::getBaseUrl(), '/');
         $mode = Config::getUrlMode();
 
@@ -66,9 +41,6 @@ class Urls {
      * Get the admin dashboard URL
      */
     public static function admin(): string {
-        if (self::isWordPress()) {
-            return site_url('/cashupay-admin/');
-        }
         // Clean mode serves the SPA at the extension-less /admin route (the
         // front-controller rewrite forwards it to router.php -> admin.php).
         // Absolute so it is a valid redirect target from index.php. Direct and
@@ -89,9 +61,6 @@ class Urls {
      * by server(), payment(), cron(), and receive().
      */
     public static function setup(): string {
-        if (self::isWordPress()) {
-            return site_url('/cashupay-setup/');
-        }
         $base = rtrim(Config::getBaseUrl(), '/');
         $mode = Config::getUrlMode();
         if ($mode === 'clean')  return $base . '/setup';
@@ -106,11 +75,6 @@ class Urls {
      * @return string Base URL for assets
      */
     public static function assets(string $subpath = ''): string {
-        if (self::isWordPress()) {
-            // Use the plugin file if set, otherwise fallback to constant
-            $pluginFile = self::$pluginFile ?? (defined('CASHUPAY_PLUGIN_DIR') ? CASHUPAY_PLUGIN_DIR . '/cashupay.php' : __FILE__);
-            return plugins_url('assets/' . $subpath, $pluginFile);
-        }
         // Absolute (base-rooted) URL rather than a page-relative 'assets/...'.
         // With path-based admin routing the SPA is served at sub-paths like
         // /admin/dashboard and /admin/stats, where a relative 'assets/...'
@@ -127,10 +91,6 @@ class Urls {
      * @return string Full URL to the image
      */
     public static function images(string $subpath = ''): string {
-        if (self::isWordPress()) {
-            $pluginFile = self::$pluginFile ?? (defined('CASHUPAY_PLUGIN_DIR') ? CASHUPAY_PLUGIN_DIR . '/cashupay.php' : __FILE__);
-            return plugins_url('images/' . $subpath, $pluginFile);
-        }
         // Base-rooted ABSOLUTE URL, not a page-relative 'images/...'. In clean
         // mode the payment page is served at the sub-path /payment/{id}, where a
         // relative 'images/payment-methods/foo.svg' resolves to
@@ -153,11 +113,6 @@ class Urls {
      * @return string Payment page URL
      */
     public static function payment(string $invoiceId = ''): string {
-        if (self::isWordPress()) {
-            $url = site_url('/cashupay/payment/');
-            return $invoiceId ? $url . $invoiceId : $url;
-        }
-
         $base = rtrim(Config::getBaseUrl(), '/');
         // Clean mode uses the pretty /payment/{id} route (router.php maps the
         // path tail into $_GET['id']); other modes hit payment.php directly.
@@ -176,9 +131,6 @@ class Urls {
      * param so it works without any URL rewrites.
      */
     public static function selfServe(string $storeId): string {
-        if (self::isWordPress()) {
-            return site_url('/cashupay/pay/' . rawurlencode($storeId));
-        }
         $base = rtrim(Config::getBaseUrl(), '/');
         $mode = Config::getUrlMode();
         if ($mode === 'clean')  return $base . '/pay/' . rawurlencode($storeId);
@@ -222,9 +174,6 @@ class Urls {
      * Get the cron/background task URL
      */
     public static function cron(): string {
-        if (self::isWordPress()) {
-            return site_url('/cashupay/cron');
-        }
         return rtrim(Config::getBaseUrl(), '/') . '/cron.php';
     }
 
@@ -232,9 +181,6 @@ class Urls {
      * Get the receive endpoint URL (NUT-18 payment requests)
      */
     public static function receive(): string {
-        if (self::isWordPress()) {
-            return site_url('/cashupay/receive');
-        }
         return rtrim(Config::getBaseUrl(), '/') . '/receive.php';
     }
 
@@ -253,18 +199,35 @@ class Urls {
             'pairingTest' => self::pairingTest(),
             'cron' => self::cron(),
             'receive' => self::receive(),
-            'isWordPress' => self::isWordPress(),
         ]);
     }
 
     /**
+     * Whether the admin SPA may emit path-style view URLs
+     * (/admin/<view>, /admin.php/<view>) for this request, as opposed to the
+     * query form (admin.php?view=<view>) that works on every host.
+     *
+     * Path URLs are only used where the host provably routes them: clean
+     * mode's front controller was verified by the setup wizard's probe, and a
+     * request that itself ARRIVED carrying PATH_INFO proves the serving host
+     * forwards path tails to admin.php. A bare admin.php request in any other
+     * mode must get query URLs: PATH_INFO-hostile hosts (a stock nginx
+     * WordPress config — Local WP, most managed nginx — or php -S) execute
+     * only real *.php URLs, and a path-style URL there falls through the web
+     * server into the surrounding site's 404 page with no way back into the
+     * admin.
+     *
+     * Pure (no Config/global reads) so tests/php can pin the matrix; the live
+     * caller is admin.php's view-routing block.
+     */
+    public static function adminUsesPathUrls(?string $pathInfo, string $urlMode): bool {
+        return $urlMode === 'clean' || ($pathInfo !== null && $pathInfo !== '');
+    }
+
+    /**
      * Get site base URL (for security tests and redirects)
-     * In WordPress, uses site_url(). In standalone, uses Config::getBaseUrl().
      */
     public static function siteBase(): string {
-        if (self::isWordPress()) {
-            return rtrim(site_url(), '/');
-        }
         return rtrim(Config::getBaseUrl(), '/');
     }
 }

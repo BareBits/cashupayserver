@@ -45,23 +45,14 @@ class Auth {
      * Check if a user is logged in (any role).
      */
     public static function isLoggedIn(): bool {
-        if (defined('CASHUPAY_WORDPRESS') && CASHUPAY_WORDPRESS) {
-            return function_exists('current_user_can')
-                && current_user_can('manage_options');
-        }
         self::initSession();
         return !empty($_SESSION['user_id']);
     }
 
     /**
      * Check if the current session is an admin.
-     * In WordPress mode every authenticated WP admin is treated as admin.
      */
     public static function isAdmin(): bool {
-        if (defined('CASHUPAY_WORDPRESS') && CASHUPAY_WORDPRESS) {
-            return function_exists('current_user_can')
-                && current_user_can('manage_options');
-        }
         self::initSession();
         return ($_SESSION['user_role'] ?? null) === self::ROLE_ADMIN;
     }
@@ -81,12 +72,9 @@ class Auth {
 
     /**
      * Return the current logged-in user's row (id/username/role), or null
-     * if no session / WordPress mode. Does NOT return password_hash.
+     * if no session. Does NOT return password_hash.
      */
     public static function currentUser(): ?array {
-        if (defined('CASHUPAY_WORDPRESS') && CASHUPAY_WORDPRESS) {
-            return null;
-        }
         self::initSession();
         $userId = $_SESSION['user_id'] ?? null;
         if (!$userId) {
@@ -98,30 +86,13 @@ class Auth {
     /**
      * Re-verify the acting admin's own password, for actions sensitive enough
      * that a hijacked session alone must not be sufficient (currently: reading
-     * a store's wallet recovery phrase).
-     *
-     * The credential differs by deployment. Standalone installs check the
-     * BareBits `users` row. Under WordPress there is no such row at all —
-     * currentUser() returns null by design, because the WordPress admin *is*
-     * the admin — so the WP user's own password is what gets checked. Callers
-     * must still gate on requireAdmin() first; this only adds the second
-     * factor.
+     * a store's wallet recovery phrase). Callers must still gate on
+     * requireAdmin() first; this only adds the second factor.
      */
     public static function verifyCurrentUserPassword(string $password): bool {
         if ($password === '') {
             return false;
         }
-        if (defined('CASHUPAY_WORDPRESS') && CASHUPAY_WORDPRESS) {
-            if (!function_exists('wp_get_current_user') || !function_exists('wp_check_password')) {
-                return false;
-            }
-            $wpUser = wp_get_current_user();
-            if (!$wpUser || empty($wpUser->ID)) {
-                return false;
-            }
-            return (bool) wp_check_password($password, $wpUser->user_pass, $wpUser->ID);
-        }
-
         $self = self::currentUser();
         if (!$self) {
             return false;
@@ -134,19 +105,9 @@ class Auth {
     }
 
     /**
-     * A stable identifier for whoever is acting, for audit logging. Returns the
-     * WordPress login under WordPress and the BareBits user id otherwise.
+     * A stable identifier for whoever is acting, for audit logging.
      */
     public static function currentActorLabel(): string {
-        if (defined('CASHUPAY_WORDPRESS') && CASHUPAY_WORDPRESS) {
-            if (function_exists('wp_get_current_user')) {
-                $wpUser = wp_get_current_user();
-                if ($wpUser && !empty($wpUser->ID)) {
-                    return 'wp:' . ($wpUser->user_login ?: (string) $wpUser->ID);
-                }
-            }
-            return 'wp:unknown';
-        }
         $self = self::currentUser();
         return $self['id'] ?? 'unknown';
     }
@@ -604,10 +565,38 @@ class Auth {
     // =========================================================================
 
     /**
+     * The raw Authorization header, wherever the SAPI put it.
+     *
+     * Apache never exports Authorization into the CGI-style environment for
+     * non-Basic schemes: under mod_php $_SERVER['HTTP_AUTHORIZATION'] is
+     * simply unset (verified against stock php:8.3-apache), and FastCGI
+     * strips it per RFC 3875 unless CGIPassAuth is on. Without this fallback
+     * every `Authorization: token …` API call 401s on Apache. Same technique
+     * as the WordPress api-bridge (wordpress/api-bridge.php).
+     */
+    public static function authorizationHeader(): string {
+        $header = $_SERVER['HTTP_AUTHORIZATION']
+            ?? $_SERVER['REDIRECT_HTTP_AUTHORIZATION']
+            ?? '';
+        if ($header === '' && function_exists('apache_request_headers')) {
+            $headers = apache_request_headers();
+            if (is_array($headers)) {
+                foreach ($headers as $name => $value) {
+                    if (strcasecmp((string) $name, 'Authorization') === 0 && is_string($value)) {
+                        $header = $value;
+                        break;
+                    }
+                }
+            }
+        }
+        return is_string($header) ? $header : '';
+    }
+
+    /**
      * Validate API request and return store ID
      */
     public static function validateApiRequest(): ?array {
-        $authHeader = $_SERVER['HTTP_AUTHORIZATION'] ?? '';
+        $authHeader = self::authorizationHeader();
 
         // BTCPay format: "token API_KEY"
         if (preg_match('/^token\s+(.+)$/i', $authHeader, $matches)) {

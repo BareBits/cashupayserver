@@ -4,10 +4,10 @@ name: Release
 #
 # Replaces the old moving-tag "channel" release model. Each release carries
 # four assets:
-#   - cashupayserver-<tag>.zip          the standalone app (auto-updater downloads this)
-#   - cashupayserver-windows-<tag>.zip  the Windows desktop package (portable POS)
-#   - wordpress_plugin-<tag>.zip        the WordPress plugin (humans / WP install this)
-#   - BUILD_INFO                        stable-named metadata the updater reads first
+#   - barebits-<tag>.zip                     the standalone app (auto-updater downloads this)
+#   - barebits-windows-<tag>.zip             the Windows desktop package (portable POS)
+#   - barebits_wordpress_plugin-<tag>.zip    the WordPress plugin (humans / WP install this)
+#   - BUILD_INFO                             stable-named metadata the updater reads first
 #
 # The release version comes from the tag; scripts/verify-release-version.sh
 # fails the build if the in-tree version strings disagree, so a tag can never
@@ -113,7 +113,7 @@ jobs:
 
       - name: Verify standalone layout
         run: |
-          php scripts/verify-plugin-build.php build/cashupayserver \
+          php scripts/verify-plugin-build.php build/barebits \
             setup.php \
             admin.php \
             api.php \
@@ -123,37 +123,54 @@ jobs:
             pay.php \
             product-image.php \
             update.php \
+            provision.php \
+            sso.php \
             recover.php \
-            includes/database.php
+            includes/database.php \
+            LICENSE.md \
+            USE_POLICY.md
 
       - name: Build WordPress plugin
+        env:
+          # A testing-channel plugin must install a testing-channel server
+          # (see the channel stamp in build-wordpress-plugin.sh).
+          CASHUPAY_PLUGIN_CHANNEL: ${{ steps.classify.outputs.prerelease == 'true' && 'testing' || 'stable' }}
         run: ./scripts/build-wordpress-plugin.sh
 
       - name: Verify WordPress plugin layout
+        # The plugin is GPL WordPress glue only — verify no BareBits server
+        # code (includes/, vendor/, entry points) leaks into the zip.
         run: |
           php scripts/verify-plugin-build.php build/cashupay \
             cashupay.php \
             uninstall.php \
-            bootstrap.php \
-            rewrite-rules.php \
+            state.php \
+            installer.php \
+            onboarding.php \
             admin-menu.php \
             cron-integration.php \
-            activation.php \
             btcpay-integration.php \
-            setup.php \
-            admin.php \
-            api.php \
-            pay.php \
-            includes/database.php \
-            assets/img/barebits-gateway-logo.png
+            payment-discount.php \
+            gateway-guard.php \
+            readme.txt \
+            license.txt \
+            assets/img/barebits-gateway-logo.png \
+            assets/js/discount-classic.js \
+            assets/js/discount-blocks.js
+          for leaked in includes vendor setup.php admin.php api.php cron.php payment.php; do
+            if [ -e "build/cashupay/$leaked" ]; then
+              echo "BareBits server code leaked into the GPL plugin build: $leaked" >&2
+              exit 1
+            fi
+          done
 
       - name: Build Windows desktop zip
         run: ./scripts/build-windows-desktop.sh
 
       - name: Verify Windows desktop layout
         run: |
-          php scripts/verify-plugin-build.php build/CashuPayServer \
-            CashuPayServer.bat \
+          php scripts/verify-plugin-build.php build/BareBits \
+            BareBits.bat \
             desktop-helper.php \
             cron-runner.php \
             README.txt \
@@ -169,15 +186,22 @@ jobs:
 
       - name: Version-stamp the release assets
         # Rename the fixed build outputs to version-stamped asset names. The
-        # ZIP internals are untouched: cashupayserver.zip still extracts to
-        # cashupayserver/ (the updater hardcodes that), wordpress_plugin.zip
-        # still contains cashupay/ (the WP plugin slug), and the Windows zip
-        # still extracts to CashuPayServer/.
+        # ZIP internals are untouched: barebits.zip extracts to barebits/
+        # (the updater hardcodes that), barebits_wordpress_plugin.zip
+        # contains cashupay/ (the WP plugin slug), and the Windows zip
+        # extracts to BareBits/.
         run: |
           tag="$TAG"
-          cp build/cashupayserver.zip "build/cashupayserver-${tag}.zip"
-          cp build/wordpress_plugin.zip "build/wordpress_plugin-${tag}.zip"
-          cp build/cashupayserver-windows.zip "build/cashupayserver-windows-${tag}.zip"
+          cp build/barebits.zip "build/barebits-${tag}.zip"
+          cp build/barebits_wordpress_plugin.zip "build/barebits_wordpress_plugin-${tag}.zip"
+          cp build/barebits-windows.zip "build/barebits-windows-${tag}.zip"
+          # Checksums for everything we publish. The WordPress plugin's
+          # "install BareBits alongside" flow verifies its downloaded
+          # standalone zip against this file.
+          (cd build && sha256sum \
+            "barebits-${tag}.zip" \
+            "barebits_wordpress_plugin-${tag}.zip" \
+            "barebits-windows-${tag}.zip" > SHA256SUMS)
 
       - name: Upload release assets for later jobs
         uses: actions/upload-artifact@v4
@@ -186,10 +210,11 @@ jobs:
           if-no-files-found: error
           retention-days: 3
           path: |
-            build/cashupayserver-${{ env.TAG }}.zip
-            build/wordpress_plugin-${{ env.TAG }}.zip
-            build/cashupayserver-windows-${{ env.TAG }}.zip
-            build/cashupayserver/BUILD_INFO
+            build/barebits-${{ env.TAG }}.zip
+            build/barebits_wordpress_plugin-${{ env.TAG }}.zip
+            build/barebits-windows-${{ env.TAG }}.zip
+            build/SHA256SUMS
+            build/barebits/BUILD_INFO
 
   # Boot the Windows desktop package on real Windows before publishing. The
   # scenarios live in scripts/windows-smoke.ps1 (shared with the PR-time
@@ -217,7 +242,7 @@ jobs:
 
       - name: Run Windows desktop smoke
         shell: pwsh
-        run: ./scripts/windows-smoke.ps1 -Zip "build/cashupayserver-windows-$env:TAG.zip"
+        run: ./scripts/windows-smoke.ps1 -Zip "build/barebits-windows-$env:TAG.zip"
 
   publish:
     needs: [build, windows-smoke]
@@ -243,19 +268,26 @@ jobs:
           # was built. Pin it to the built commit. Ignored when the tag
           # already exists (the tag-push path).
           target_commitish: ${{ github.sha }}
-          name: "CashuPayServer ${{ env.TAG }}"
+          name: "BareBits ${{ env.TAG }}"
+          # Prerelease (testing-channel) bodies lead with an instability
+          # warning pointing at the stable channel; on stable releases the
+          # expression yields an empty line, which GitHub's renderer trims.
           body: |
-            CashuPayServer ${{ env.TAG }}, built from ${{ github.sha }}.
+            ${{ needs.build.outputs.prerelease == 'true' && 'Warning: This is a testing release and may be unstable or insecure, use the [latest main](https://github.com/BareBits/cashupayserver/releases/latest) release instead' || '' }}
+
+            BareBits ${{ env.TAG }}, built from ${{ github.sha }}.
 
             Assets:
-            - `cashupayserver-${{ env.TAG }}.zip` — standalone server (the auto-updater pulls this)
-            - `cashupayserver-windows-${{ env.TAG }}.zip` — Windows desktop package (portable point-of-sale; see README.txt inside)
-            - `wordpress_plugin-${{ env.TAG }}.zip` — WordPress plugin
+            - `barebits-${{ env.TAG }}.zip` — standalone server (the auto-updater pulls this)
+            - `barebits-windows-${{ env.TAG }}.zip` — Windows desktop package (portable point-of-sale; see README.txt inside)
+            - `barebits_wordpress_plugin-${{ env.TAG }}.zip` — WordPress plugin
+            - `SHA256SUMS` — checksums of the zips above
             - `BUILD_INFO` — build metadata
           prerelease: ${{ needs.build.outputs.prerelease }}
           make_latest: ${{ needs.build.outputs.make_latest }}
           files: |
-            build/cashupayserver-${{ env.TAG }}.zip
-            build/wordpress_plugin-${{ env.TAG }}.zip
-            build/cashupayserver-windows-${{ env.TAG }}.zip
-            build/cashupayserver/BUILD_INFO
+            build/barebits-${{ env.TAG }}.zip
+            build/barebits_wordpress_plugin-${{ env.TAG }}.zip
+            build/barebits-windows-${{ env.TAG }}.zip
+            build/SHA256SUMS
+            build/barebits/BUILD_INFO

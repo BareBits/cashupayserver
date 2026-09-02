@@ -83,9 +83,11 @@ def _encode_noffer(pubkey: str, relay_url: str) -> str:
     return out
 
 
-@pytest.fixture
+@pytest.fixture(scope="module")
 def rejecting_noffer() -> Iterator[str]:
-    """A live noffer service that rejects every amount with NIP-69 code 5."""
+    """A live noffer service that rejects every amount with NIP-69 code 5.
+    Module-scoped: the mock (phrity/websocket server loop) is stateless across
+    connections and each test wires it to its own store."""
     merchant_sk = generate_privkey()
     proc, port = _start_php_mock("mock_clink_relay.php", "MOCK_CLINK_PORT", {
         "MOCK_CLINK_MERCHANT_SK": merchant_sk,
@@ -163,8 +165,9 @@ def _invoice_id_from_redirect(r: requests.Response) -> str:
 
 
 def test_noffer_amount_rejection_falls_back_to_onchain_under_strict_swaps(
-    configured: ConfiguredPayserver, rejecting_noffer: str
+    shared_configured: ConfiguredPayserver, rejecting_noffer: str
 ) -> None:
+    configured = shared_configured
     payserver = configured.handle
     try:
         # Store: rejecting noffer + strict-mode swaps (regtest network → no
@@ -217,8 +220,9 @@ def test_noffer_amount_rejection_falls_back_to_onchain_under_strict_swaps(
 
 
 def test_noffer_amount_rejection_still_tries_next_lightning_destination(
-    configured: ConfiguredPayserver, rejecting_noffer: str
+    shared_configured: ConfiguredPayserver, rejecting_noffer: str
 ) -> None:
+    configured = shared_configured
     wallet_sk = generate_privkey()
     client_sk = generate_privkey()
     proc, port = _start_php_mock("mock_nwc_wallet.php", "MOCK_NWC_PORT", {

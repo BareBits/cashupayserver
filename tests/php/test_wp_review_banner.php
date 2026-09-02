@@ -2,28 +2,22 @@
 /**
  * WordPress "leave us a review" banner (wordpress/admin-menu.php).
  *
- * Once setup is complete the admin_notices hook renders the review banner in
- * place of the "Configure BareBits" notice. Dismissal is site-wide via a WP
- * option: each dismissal hides it for 30 days, and after three dismissals it
- * is hidden permanently. The WordPress API surface the file touches
- * (options, nonces, capabilities, JSON responders) is stubbed below; the
- * option store is a plain array so the test can time-travel dismissed_at.
+ * Once the plugin is wired to a BareBits server the admin_notices hook
+ * renders the review banner in place of the "Configure BareBits" notice.
+ * Dismissal is site-wide via a WP option: each dismissal hides it for 30
+ * days, and after three dismissals it is hidden permanently. The plugin is
+ * pure WordPress now (no BareBits internals), so the whole API surface it
+ * touches (options, nonces, capabilities, JSON responders) is stubbed below;
+ * the option store is a plain array so the test can time-travel dismissed_at
+ * and flip the configured state.
  */
 declare(strict_types=1);
 require __DIR__ . '/harness.php';
-$dataDir = fresh_db();
-require_once dirname(__DIR__, 2) . '/includes/config.php';
 
 // --- minimal WordPress stubs -------------------------------------------------
 define('ABSPATH', '/tmp/');
 define('DAY_IN_SECONDS', 86400);
-define('CASHUPAY_PLUGIN_DIR', dirname(__DIR__, 2));
-// WordPress mode so Urls::setup() (configure-notice branch) uses the site_url
-// stub instead of standalone base-URL config.
-define('CASHUPAY_WORDPRESS', true);
-function site_url($path = '') { return 'http://wp.test' . $path; }
 function admin_url($path = '') { return 'http://wp.test/wp-admin/' . $path; }
-require_once dirname(__DIR__, 2) . '/includes/urls.php';
 
 $GLOBALS['wp_options'] = [];
 $GLOBALS['wp_can_manage'] = true;
@@ -49,8 +43,23 @@ function wp_send_json_error($data = null, $code = 200) {
 }
 function esc_attr($s) { return htmlspecialchars((string)$s, ENT_QUOTES); }
 function esc_url($s) { return htmlspecialchars((string)$s, ENT_QUOTES); }
+function esc_html($s) { return htmlspecialchars((string)$s, ENT_QUOTES); }
 
+// state.php supplies cashupay_is_configured() (options-driven); admin-menu.php
+// only calls cashupay_take_flash() (onboarding.php) inside cashupay_admin_page,
+// which these tests never render — so onboarding.php stays out.
+require dirname(__DIR__, 2) . '/wordpress/state.php';
 require dirname(__DIR__, 2) . '/wordpress/admin-menu.php';
+
+/** Mark the plugin wired to a server, or tear that back down. */
+function set_configured(bool $configured): void {
+    if ($configured) {
+        $GLOBALS['wp_options']['cashupay_server_url'] = 'https://pay.test';
+        $GLOBALS['wp_options']['cashupay_wired_at'] = time();
+    } else {
+        unset($GLOBALS['wp_options']['cashupay_server_url'], $GLOBALS['wp_options']['cashupay_wired_at']);
+    }
+}
 
 function render_notice(): string {
     ob_start();
@@ -58,13 +67,15 @@ function render_notice(): string {
     return (string)ob_get_clean();
 }
 
-// --- setup complete: review banner renders, configure notice does not -------
+set_configured(true);
+
+// --- configured: review banner renders, configure notice does not ------------
 $html = render_notice();
 assert_true(str_contains($html, 'Enjoying having control of your money with'), 'review banner copy rendered');
 assert_true(str_contains($html, 'https://wordpress.org/plugins/search/barebits/'), 'review link points at wordpress.org');
 assert_true(str_contains($html, 'Leave us a review!'), 'review link text rendered');
 assert_true(str_contains($html, 'is-dismissible'), 'banner is dismissible');
-assert_false(str_contains($html, 'Configure BareBits'), 'configure notice not shown once setup is complete');
+assert_false(str_contains($html, 'Configure BareBits'), 'configure notice not shown once wired');
 
 // --- non-admins never see it -------------------------------------------------
 $GLOBALS['wp_can_manage'] = false;
@@ -120,10 +131,22 @@ assert_eq(403, $GLOBALS['wp_json_response']['code'] ?? null, 'capability failure
 assert_eq([], get_option(CASHUPAY_REVIEW_OPTION), 'capability failure leaves state untouched');
 $GLOBALS['wp_can_manage'] = true;
 
-// --- setup incomplete: configure notice instead of review banner -------------
-Config::set('setup_complete', false);
+// --- not yet wired: configure notice instead of review banner ----------------
+set_configured(false);
 $html = render_notice();
-assert_true(str_contains($html, 'Configure BareBits'), 'configure notice shown while setup incomplete');
-assert_false(str_contains($html, 'Leave us a review!'), 'review banner not shown while setup incomplete');
+assert_true(str_contains($html, 'Configure BareBits'), 'configure notice shown while not yet wired');
+assert_false(str_contains($html, 'Leave us a review!'), 'review banner not shown while not yet wired');
+
+// A server URL alone is not "configured" — the WooCommerce wiring must have
+// completed too, or a half-finished onboarding would hide its own nudge.
+$GLOBALS['wp_options']['cashupay_server_url'] = 'https://pay.test';
+assert_true(str_contains(render_notice(), 'Configure BareBits'), 'a URL without cashupay_wired_at still nudges');
+set_configured(false);
+
+// On the plugin's own page the notice would double the onboarding flow it sits
+// above, so it suppresses itself there.
+$_GET['page'] = 'cashupay';
+assert_eq('', render_notice(), 'no configure notice on the plugin page itself');
+unset($_GET['page']);
 
 echo "test_wp_review_banner: ok\n";

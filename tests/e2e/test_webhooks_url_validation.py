@@ -22,19 +22,19 @@ from conftest import ConfiguredPayserver
     ],
 )
 def test_create_webhook_rejects_non_http_scheme(
-    configured: ConfiguredPayserver, bad_url: str,
+    shared_configured: ConfiguredPayserver, bad_url: str,
 ) -> None:
     with pytest.raises(RuntimeError) as exc:
-        configured.greenfield.create_webhook(configured.store_id, bad_url, secret="x")
+        shared_configured.greenfield.create_webhook(shared_configured.store_id, bad_url, secret="x")
     # Greenfield client raises with the HTTP status in the message; a rejected
     # URL is a 4xx validation error, never a 2xx.
     assert "-> 4" in str(exc.value), str(exc.value)
 
 
 def test_create_webhook_accepts_https(
-    configured: ConfiguredPayserver,
+    shared_configured: ConfiguredPayserver,
 ) -> None:
-    wh = configured.greenfield.create_webhook(
-        configured.store_id, "https://example.com/hook", secret="x"
+    wh = shared_configured.greenfield.create_webhook(
+        shared_configured.store_id, "https://example.com/hook", secret="x"
     )
     assert wh["url"] == "https://example.com/hook"

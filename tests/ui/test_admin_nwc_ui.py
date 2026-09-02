@@ -25,8 +25,11 @@ from fixtures.nwc_wallet import NwcStack, start_nwc_stack, stop_nwc_stack
 pytestmark = pytest.mark.ui
 
 
-@pytest.fixture
+@pytest.fixture(scope="module")
 def nwc_stack(lnd_mint: LndHandle, channels: None) -> Iterator[NwcStack]:
+    """Module-scoped: generic infrastructure (each test wires its own store
+    to it); the save-time probe is keyed per invoice, so wallet/relay state
+    can't leak between tests."""
     workdir = SESSION_TMP / f"nwc-admin-ui-{int(time.time())}"
     workdir.mkdir(parents=True, exist_ok=True)
     stack = start_nwc_stack(
@@ -71,10 +74,25 @@ def _save_cashout_and_wait(page) -> None:
 
 def _open_lightning_payments(page, configured: ConfiguredPayserver) -> None:
     page.set_default_timeout(20000)
+    # Pin the admin UI to THIS test's store before any app script runs: on a
+    # shared server multiple stores exist and the UI otherwise defaults to the
+    # first one. `currentStoreId` is initialised from localStorage at script
+    # parse, so an init script (which runs on every navigation, including a
+    # post-login reload) is the race-free way to select the store.
+    page.add_init_script(
+        f"try {{ localStorage.setItem('selectedStoreId', {configured.store_id!r}); }} catch (e) {{}}"
+    )
     page.goto(f"{configured.handle.url}/admin")
     page.fill("#password-input", configured.admin_password)
     page.click("#password-submit")
     page.wait_for_selector("#app", state="visible")
+    # The header selector echoes the pinned store once the dashboard payload
+    # lands — this both proves the pin took and gates on that first load.
+    page.wait_for_function(
+        "sid => document.getElementById('store-select')"
+        " && document.getElementById('store-select').value === sid",
+        arg=configured.store_id,
+    )
     page.locator('.nav-item[data-view="stores"]').click()
     # The lists live in the always-visible "Lightning payments" card now — no
     # cashout-mode column click needed to reveal them.
@@ -89,8 +107,9 @@ def _open_lightning_payments(page, configured: ConfiguredPayserver) -> None:
 
 
 def test_add_save_masked_rerender_and_remove(
-    configured: ConfiguredPayserver, nwc_stack: NwcStack, page
+    shared_configured: ConfiguredPayserver, nwc_stack: NwcStack, page
 ) -> None:
+    configured = shared_configured
     uri = nwc_stack.wallet.connection_uri()
     secret = uri.split("secret=", 1)[1].split("&", 1)[0]
     store_id = configured.store_id
@@ -139,10 +158,11 @@ def test_add_save_masked_rerender_and_remove(
 
 
 def test_malformed_paste_is_rejected_client_side(
-    configured: ConfiguredPayserver, page
+    shared_configured: ConfiguredPayserver, page
 ) -> None:
     """A malformed NWC paste is caught by the client shape check with a message
     that does not echo the paste (it may carry a secret)."""
+    configured = shared_configured
     _open_lightning_payments(page, configured)
     page.click("#btn-add-nwc")
     bogus_secret = "cd" * 32

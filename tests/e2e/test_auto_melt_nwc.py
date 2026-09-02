@@ -26,6 +26,7 @@ from typing import Iterator
 import pytest
 
 from conftest import ConfiguredPayserver, SESSION_TMP
+from fixtures import backend
 from fixtures.api_client import AdminClient
 from fixtures.lnd import LndHandle
 from fixtures.nwc_wallet import NwcStack, start_nwc_stack, stop_nwc_stack
@@ -119,23 +120,22 @@ def test_auto_melt_drains_balance_to_nwc(
         configured.admin, configured.store_id, nwc_drain_stack.wallet.connection_uri()
     )
 
-    # 3. Trigger cron: checkAutoMelt() asks the wallet for a bolt11 over the
-    #    relay and the mint melts ecash to pay it.
-    r = configured.handle.trigger_cron()
-    assert r.status_code == 200, r.text
-    body_text = r.text.strip()
-    try:
-        cron_body = r.json()
-    except Exception:
-        import json as _json
-
-        idx = body_text.find("{")
-        cron_body = _json.loads(body_text[idx:]) if idx >= 0 else {}
-    auto_melt_result = cron_body.get("tasks", {}).get("auto_melt")
-    assert auto_melt_result and auto_melt_result != "skipped", (
-        f"auto_melt task didn't run; body={body_text[:600]!r}"
-    )
+    # 3. Cron fires checkAutoMelt(): it asks the wallet for a bolt11 over the
+    #    relay and the mint melts ecash to pay it. Only pin the task result on
+    #    php -S, where no opportunistic background cron can race the trigger.
+    if backend.is_phps():
+        auto_melt_result = configured.handle.trigger_cron_json().get("tasks", {}).get(
+            "auto_melt"
+        )
+        assert auto_melt_result and auto_melt_result != "skipped", (
+            f"auto_melt task didn't run; result={auto_melt_result!r}"
+        )
 
     # 4. The mint balance drained — proof the NWC melt actually settled.
+    configured.handle.drive_cron_until(
+        lambda: _store_balance(configured) < 500,
+        timeout_s=60,
+        label="NWC auto-melt drains the balance",
+    )
     remaining = _store_balance(configured)
     assert remaining < 500, f"store balance not drained via NWC: {remaining}"

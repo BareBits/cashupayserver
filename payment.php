@@ -14,6 +14,7 @@ require_once __DIR__ . '/includes/background.php';
 require_once __DIR__ . '/includes/urls.php';
 require_once __DIR__ . '/includes/cart.php';
 require_once __DIR__ . '/includes/auth.php';
+require_once __DIR__ . '/includes/managed.php';
 require_once __DIR__ . '/includes/payment_path_debug.php';
 require_once __DIR__ . '/includes/offline_cashu.php';
 
@@ -169,10 +170,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'send_
     require_once __DIR__ . '/includes/notification_sender.php';
     header('Content-Type: application/json');
 
-    // WordPress installs don't render the email/newsletter form (WooCommerce
-    // owns customer emails there), so reject the endpoint outright rather
-    // than trusting the client not to POST.
-    if (Urls::isWordPress()) {
+    // Deployments with payer email capture off (managed single-shop installs
+    // by default — the shop owns customer emails) don't render the form, so
+    // reject the endpoint outright rather than trusting the client not to
+    // POST.
+    if (!Config::isPayerEmailCaptureEnabled()) {
         cashupay_status(404);
         echo json_encode(['error' => 'Not available.']);
         exit;
@@ -259,26 +261,27 @@ $redirectUrl = $checkoutConfig['redirectURL'] ?? null;
 if ($redirectUrl !== null && $redirectUrl !== '') {
     $redirectUrl = Security::sanitizeUrl((string)$redirectUrl);
 }
-// Payer-safe redirect (WordPress mode): invoices created from the embedded
-// admin's "Request payment" modal used to store the admin SPA's own URL as
-// checkout.redirectURL (a return-to-admin convenience for the merchant). The
-// payment page is customer-facing, and /cashupay-admin, /cashupay-setup and
-// /wp-admin are all gated behind manage_options — a payer clicking "Return
-// to Shop" / "Continue to Store" on such an invoice landed on WordPress's
-// Access-denied error page. Rewrite admin-surface targets to the shop's
-// front page. Render-time (not create-time) so invoices already carrying an
-// admin URL are covered too.
-if ($redirectUrl !== null && Urls::isWordPress()) {
-    $adminSurfaces = [site_url('/cashupay-admin'), site_url('/cashupay-setup'), admin_url()];
-    foreach ($adminSurfaces as $surface) {
-        // Boundary-checked prefix match, so an unrelated page that merely
-        // starts with the same string (e.g. /cashupay-admin-guide) survives.
-        $surface = rtrim($surface, '/');
-        if ($redirectUrl === $surface
-                || (strpos($redirectUrl, $surface) === 0
-                    && in_array($redirectUrl[strlen($surface)], ['/', '?', '#'], true))) {
-            $redirectUrl = home_url('/');
-            break;
+// Managed installs: payer-facing exits prefer the shop's front page. An
+// invoice with no redirect gets the provisioned shop URL, and a redirect
+// pointing at the BareBits admin/setup surfaces (invoices created from the
+// embedded admin's "Request payment" modal historically stored the admin
+// SPA's own URL) is rewritten there too — those surfaces are login-gated
+// and payer-hostile. Boundary-checked prefix match, so an unrelated page
+// that merely starts with the same string survives. Render-time (not
+// create-time) so invoices already carrying an admin URL are covered.
+$managedShopUrl = ManagedInstall::shopUrl();
+if ($managedShopUrl !== '') {
+    if ($redirectUrl === null || $redirectUrl === '') {
+        $redirectUrl = $managedShopUrl;
+    } else {
+        $adminBase = rtrim(Config::getBaseUrl(), '/');
+        foreach ([$adminBase . '/admin', $adminBase . '/setup'] as $surface) {
+            $next = $redirectUrl[strlen($surface)] ?? '';
+            if (strpos($redirectUrl, $surface) === 0
+                    && in_array($next, ['', '/', '?', '#', '.'], true)) {
+                $redirectUrl = $managedShopUrl;
+                break;
+            }
         }
     }
 }
@@ -290,30 +293,33 @@ $redirectAuto = $checkoutConfig['redirectAutomatically'] ?? true;
 $invoiceMetadata = $invoice['metadata'] ? json_decode($invoice['metadata'], true) : null;
 $invoiceNote = is_array($invoiceMetadata) ? trim((string)($invoiceMetadata['itemDesc'] ?? '')) : '';
 
-// WooCommerce-backed invoices (created by the BTCPay gateway plugin) carry
-// metadata.orderId. For those, the expired screen offers a retry link that
-// bounces through /cashupay/retry/{invoiceId} to WooCommerce's order-pay
-// page, where clicking "Pay" makes the gateway mint a fresh invoice for the
-// same order. Standalone invoices (admin wizard, self-serve /pay) have no
-// order to re-pay, so they keep the plain Return-to-Shop exit.
-$wooRetryUrl = null;
-if (Urls::isWordPress() && is_array($invoiceMetadata) && !empty($invoiceMetadata['orderId'])) {
-    $wooRetryUrl = site_url('/cashupay/retry/' . rawurlencode((string)$invoice['id']));
+// E-commerce invoices (metadata.orderId) get a retry link on the expired
+// screen when the deployment provisioned a shop-side retry endpoint
+// (CASHUPAY_RETRY_URL_TEMPLATE — the WordPress plugin's endpoint bounces the
+// customer to WooCommerce's order-pay page, where clicking "Pay" makes the
+// gateway mint a fresh invoice for the same order). Invoices with no order
+// to re-pay keep the plain Return-to-Shop exit.
+$retryUrl = null;
+$retryTemplate = ManagedInstall::retryUrlTemplate();
+if ($retryTemplate !== '' && is_array($invoiceMetadata) && !empty($invoiceMetadata['orderId'])) {
+    $retryUrl = str_replace('{invoiceId}', rawurlencode((string)$invoice['id']), $retryTemplate);
 }
+
+// Whether the payer email/newsletter capture form exists at all on this
+// deployment (managed single-shop installs default it off — the shop owns
+// customer emails). Gates the form, the newsletter default, and receipts.
+$emailCaptureEnabled = Config::isPayerEmailCaptureEnabled();
 
 // Decide whether to render the payer-receipt form. The check is composed of
 // site-wide master switch + per-type toggle + SMTP. When false, the success
-// modal shows a "screenshot this page" fallback instead. WordPress installs
-// never render the email/newsletter form at all — WooCommerce owns customer
-// emails and order confirmations there — so they always get the fallback.
+// modal shows a "screenshot this page" fallback instead.
 require_once __DIR__ . '/includes/notification_sender.php';
-$emailFormOffered = !Urls::isWordPress();
-$payerReceiptOffered = $emailFormOffered && NotificationSender::isPayerReceiptOffered();
+$payerReceiptOffered = $emailCaptureEnabled && NotificationSender::isPayerReceiptOffered();
 
 // Resolve the newsletter checkbox's initial state for this store (per-store
 // override → site-wide default). The email/newsletter capture form is shown
 // regardless of whether receipts are offered.
-$newsletterDefaultChecked = $emailFormOffered && Config::getNewsletterDefaultChecked($invoice['store_id']);
+$newsletterDefaultChecked = $emailCaptureEnabled && Config::getNewsletterDefaultChecked($invoice['store_id']);
 
 // An on-chain payment was seen in the mempool but hasn't confirmed yet. This
 // drives the unified detected/complete screen: same layout as the settled
@@ -356,18 +362,16 @@ if ($invoice['amount_sats'] && $requestCurrency !== 'SAT' && $requestCurrency !=
 $baseUrl = Config::getBaseUrl();
 
 // Admin-only payment-path debug labels. Double-gated: the site-wide toggle
-// (default OFF) AND a logged-in admin session. In standalone mode we only probe
-// the session when the admin session cookie is already present, so anonymous
-// payers never receive a Set-Cookie from this public page; WordPress mode keys
-// off current_user_can() and needs no PHP session. When on, gather the extra
+// (default OFF) AND a logged-in admin session. We only probe the session when
+// the admin session cookie is already present, so anonymous payers never
+// receive a Set-Cookie from this public page. When on, gather the extra
 // context the labels need (store on-chain mode + swap provider) so the helper
 // stays a pure string builder. $pathDebug stays false for everyone else.
 $pathDebug = false;
 $pathDebugOnchainMode = null;
 $pathDebugSwapProvider = null;
 $pathDebugCashuMintUrl = null;
-$pathDebugMayBeAdmin = (defined('CASHUPAY_WORDPRESS') && CASHUPAY_WORDPRESS)
-    || isset($_COOKIE['cashupay_session']);
+$pathDebugMayBeAdmin = isset($_COOKIE['cashupay_session']);
 if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
     if (Auth::isAdmin()) {
         $pathDebug = true;
@@ -1153,6 +1157,7 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                     'nwc' => 'NWC wallet',
                     'noffer' => 'Noffer (Nostr offer)',
                     'lnurl' => 'Lightning address',
+                    'strike' => 'Strike API',
                     'swap' => 'Lightning (submarine swap)',
                 ];
                 if ($receiveErrors !== []): ?>
@@ -1376,7 +1381,7 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                     <div><span class="label">Note:</span><span class="invoice-note-value"><?= htmlspecialchars($invoiceNote) ?></span></div>
                     <?php endif; ?>
                 </div>
-                <?php if ($emailFormOffered): ?>
+                <?php if ($emailCaptureEnabled): ?>
                 <form class="receipt-form" id="receipt-form" data-receipt-offered="<?= $payerReceiptOffered ? '1' : '0' ?>" novalidate>
                     <div class="receipt-prompt">
                         <?= $payerReceiptOffered ? 'Email me a payment confirmation' : 'Leave your email' ?>
@@ -1412,8 +1417,8 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                 <p style="color: var(--text-secondary); margin-top: 1rem;">
                     This invoice has expired. Please request a new one.
                 </p>
-                <?php if ($wooRetryUrl): ?>
-                    <a href="<?= htmlspecialchars($wooRetryUrl) ?>" class="btn <?= $invoice['status'] === 'Invalid' ? 'hidden' : '' ?>" style="margin-top: 1.5rem;" id="retry-btn">
+                <?php if ($retryUrl): ?>
+                    <a href="<?= htmlspecialchars($retryUrl) ?>" class="btn <?= $invoice['status'] === 'Invalid' ? 'hidden' : '' ?>" style="margin-top: 1.5rem;" id="retry-btn">
                         Request a new invoice
                     </a>
                     <?php if ($redirectUrl): ?>

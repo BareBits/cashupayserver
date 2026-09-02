@@ -102,7 +102,8 @@ class Database {
             // that migration ran — getInstance() will then trigger runMigrations()
             // on existing installs that haven't yet picked it up. All migrations
             // are idempotent, so a fire is safe.
-            $hasLatestMigration = $hasConfig && self::tableExists(self::$instance, 'admin_event_log');
+            $hasLatestMigration = $hasConfig
+                && self::columnExists(self::$instance, 'melts', 'strike_invoice_id');
             // The auto-withdraw → auto-cashout rename is a data-only migration
             // (config key + notification event labels) with no schema artifact
             // to mark it done, so probe for the legacy config key directly. The
@@ -138,6 +139,12 @@ class Database {
         $dir = self::getDataDir();
         if (!is_dir($dir)) {
             self::createDataDirectory($dir);
+        } else {
+            // A pre-created dir (Docker entrypoint's mkdir -p, an operator's
+            // mkdir, the test fixtures) never went through createDataDirectory,
+            // so it has no deny-all .htaccess — on Apache the SQLite file would
+            // be downloadable. Idempotent, so run it on every connect.
+            self::ensureDataDirectoryProtections($dir);
         }
 
         $pdo = new PDO('sqlite:' . self::getDbPath());
@@ -159,9 +166,20 @@ class Database {
             throw new Exception("Failed to create data directory: $dir");
         }
 
+        self::ensureDataDirectoryProtections($dir);
+    }
+
+    /**
+     * Write the web-facing protection files into the data directory when they
+     * are missing: a deny-all .htaccess (Apache) and a 403 index.php. Only
+     * absent files are written, so an operator-customized .htaccess is never
+     * overwritten.
+     */
+    public static function ensureDataDirectoryProtections(string $dir): void {
         // Create .htaccess for Apache protection
         $htaccess = $dir . '/.htaccess';
-        $htaccessContent = <<<'HTACCESS'
+        if (!file_exists($htaccess)) {
+            $htaccessContent = <<<'HTACCESS'
 # Deny all access to this directory
 <IfModule mod_authz_core.c>
     Require all denied
@@ -171,11 +189,14 @@ class Database {
     Deny from all
 </IfModule>
 HTACCESS;
-        file_put_contents($htaccess, $htaccessContent);
+            file_put_contents($htaccess, $htaccessContent);
+        }
 
         // Create index.php as additional protection
         $indexPhp = $dir . '/index.php';
-        file_put_contents($indexPhp, "<?php http_response_code(403); exit('Forbidden');");
+        if (!file_exists($indexPhp)) {
+            file_put_contents($indexPhp, "<?php http_response_code(403); exit('Forbidden');");
+        }
     }
 
     /**
@@ -1638,8 +1659,7 @@ HTACCESS;
             $pdo->exec("ALTER TABLE invoices ADD COLUMN receive_errors TEXT DEFAULT NULL");
         }
 
-        // Admin event log for endpoint failures (see AdminLog). This is the
-        // "latest" migration marker (see getInstance), so it stays last.
+        // Admin event log for endpoint failures (see AdminLog).
         if (!self::tableExists($pdo, 'admin_event_log')) {
             $pdo->exec("
                 CREATE TABLE admin_event_log (
@@ -1654,6 +1674,33 @@ HTACCESS;
                 );
             ");
             $pdo->exec("CREATE INDEX idx_admin_event_log_ts ON admin_event_log(timestamp DESC);");
+        }
+
+        // Strike API receive rail (payment_rail='strike'): the customer pays a
+        // BOLT11 quoted from a Strike invoice we created with the merchant's
+        // API key. strike_invoice_id is what the settlement polls read back
+        // (GET /invoices/{id} until state=PAID). Like nwc_uri, strike_api_key
+        // is secret-bearing (it's the account credential) and must never ride
+        // an API/browser payload (see Invoice::formatForApi); it is persisted
+        // per-invoice so pending invoices stay verifiable even if the operator
+        // later replaces the key in store_ln_addresses.
+        foreach ([
+            'strike_invoice_id' => 'TEXT DEFAULT NULL',
+            'strike_api_key' => 'TEXT DEFAULT NULL',
+        ] as $col => $decl) {
+            if (!self::columnExists($pdo, 'invoices', $col)) {
+                $pdo->exec("ALTER TABLE invoices ADD COLUMN {$col} {$decl}");
+            }
+        }
+
+        // Strike cashout reconciliation: a melt to a Strike-typed destination
+        // pays a bolt11 quoted from a Strike invoice created in the merchant's
+        // account; recording that invoice's id lets the merchant match the
+        // incoming payment in their Strike dashboard (the receive side already
+        // records invoices.strike_invoice_id). melts.strike_invoice_id is the
+        // "latest" migration marker (see getInstance), so this stays last.
+        if (!self::columnExists($pdo, 'melts', 'strike_invoice_id')) {
+            $pdo->exec("ALTER TABLE melts ADD COLUMN strike_invoice_id TEXT DEFAULT NULL");
         }
     }
 

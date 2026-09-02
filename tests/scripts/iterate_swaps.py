@@ -50,6 +50,7 @@ TESTS_DIR = REPO_ROOT / "tests"
 if str(TESTS_DIR) not in sys.path:
     sys.path.insert(0, str(TESTS_DIR))
 
+from fixtures import backend  # noqa: E402
 from fixtures.boltz_regtest import (  # noqa: E402
     BoltzRegtestHandle,
     _check_docker_available,
@@ -259,7 +260,9 @@ def setup_payserver_with_stores(workdir: Path, vpub: str, mint_url: str,
         cur = conn.cursor()
         kvs = [
             ("setup_complete", json.dumps(True)),
-            ("url_mode", json.dumps("direct")),
+            # Backend-appropriate url_mode (fixtures.backend): 'direct' under
+            # php -S, 'clean' under the container backends' front controllers.
+            ("url_mode", json.dumps(backend.default_url_mode())),
             # swaps_boltz_regtest_url is still a live config key (dev/test
             # knob); the enable/provider/strict settings moved to per-store
             # columns seeded in the store rows below.

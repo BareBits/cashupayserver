@@ -14,6 +14,15 @@ the most recent commit touching that file governs. Recipients should consult
 `git log` to determine which license applies to the version of any file they
 hold.
 
+**Exception — the WordPress companion plugin.** Everything under the
+`wordpress/` directory is the BareBits WordPress companion plugin. It is
+licensed under the GNU General Public License, version 2 or later (the full
+text ships as `wordpress/license.txt`), and is NOT covered by Section 1 or
+Section 2 of this file. The plugin is WordPress-side glue only: it contains no
+BareBits server code, and the BareBits server (everything outside `wordpress/`)
+contains no WordPress code and is reached by the plugin purely over its HTTP
+API. The two are separate programs distributed as separate archives.
+
 ---
 
 ## 1. MIT LICENSE (applies to commits at or prior to `5812584`)

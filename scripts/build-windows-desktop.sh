@@ -1,12 +1,12 @@
 #!/bin/bash
 # Build the Windows desktop distribution zip.
 #
-# Bundles the standalone app (build/cashupayserver, built by
+# Bundles the standalone app (build/barebits, built by
 # build-standalone.sh) with an official windows.php.net PHP runtime and the
 # windows/ launcher assets into a portable, double-clickable package:
 #
-#   CashuPayServer/
-#     CashuPayServer.bat     launcher (server + browser + background tasks)
+#   BareBits/
+#     BareBits.bat           launcher (server + browser + background tasks)
 #     desktop-helper.php     browser opener + cron ticker (see windows/)
 #     cron-runner.php        CLI cron invocation
 #     README.txt             merchant instructions
@@ -36,12 +36,12 @@ PHP_WIN_URLS=(
     "https://downloads.php.net/~windows/releases/archives/${PHP_WIN_ZIP}"
 )
 
-STAGE="build/CashuPayServer"
-OUT="build/cashupayserver-windows.zip"
+STAGE="build/BareBits"
+OUT="build/barebits-windows.zip"
 CACHE="build/cache"
 
 # The app payload is the standalone build; make it if it isn't there yet.
-if [ ! -d build/cashupayserver ]; then
+if [ ! -d build/barebits ]; then
     ./scripts/build-standalone.sh
 fi
 
@@ -100,14 +100,14 @@ fi
 cp "$CACHE/vc_redist.x64.exe" "$STAGE/vc_redist.x64.exe"
 
 # --- 4. App + launcher assets -----------------------------------------------
-cp -r build/cashupayserver "$STAGE/app"
+cp -r build/barebits "$STAGE/app"
 cp windows/desktop-helper.php windows/cron-runner.php "$STAGE/"
 cp windows/php.ini.template windows/render-ini.php "$STAGE/php/"
 
 # Batch files and merchant-facing text must be CRLF (cmd.exe mis-parses
 # LF-only labels; notepad on older Windows shows LF files as one line).
 # Normalize first so this stays correct however git checked the files out.
-for pair in "windows/CashuPayServer.bat:CashuPayServer.bat" \
+for pair in "windows/BareBits.bat:BareBits.bat" \
             "windows/README-windows.txt:README.txt"; do
     src="${pair%%:*}"; dst="${pair##*:}"
     sed -e 's/\r$//' -e 's/$/\r/' "$src" > "$STAGE/$dst"
@@ -115,7 +115,7 @@ done
 
 # Verify the normalization actually held: an LF-only line in a .bat makes
 # cmd.exe mis-parse labels silently, so fail the build rather than ship it.
-for f in "$STAGE/CashuPayServer.bat" "$STAGE/README.txt"; do
+for f in "$STAGE/BareBits.bat" "$STAGE/README.txt"; do
     if ! awk '!/\r$/ { exit 1 }' "$f"; then
         echo "ERROR: $f contains a line without a CRLF ending" >&2
         exit 1
@@ -123,6 +123,6 @@ for f in "$STAGE/CashuPayServer.bat" "$STAGE/README.txt"; do
 done
 
 # --- 5. Zip -----------------------------------------------------------------
-(cd build && zip -q -r cashupayserver-windows.zip CashuPayServer/)
+(cd build && zip -q -r barebits-windows.zip BareBits/)
 
 echo "Windows desktop build: $OUT"

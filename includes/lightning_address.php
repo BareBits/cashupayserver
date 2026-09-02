@@ -348,7 +348,8 @@ class LightningAddress {
                             $networkFeeSats,
                             $usedAddress,
                             $meltResult['preimage'] ?? null,
-                            null
+                            null,
+                            $meltResult['strike_invoice_id'] ?? null
                         );
 
                         $results[] = [
@@ -659,6 +660,11 @@ class LightningAddress {
      *               payer), then melt to that one-shot invoice. The cashu melt
      *               preimage is the proof of payment, so noffer withdrawal needs
      *               no kind-21001 receipt — that's only for the receive side.
+     *   strike    → create a BTC invoice in the merchant's Strike account via
+     *               the API key and melt to its quoted BOLT11 — the receive-
+     *               only scopes suffice (funds flow INTO the account). The
+     *               cashu melt preimage is the proof of payment, so no Strike
+     *               read-back is needed on this side.
      *
      * Returns the same shape as meltToAddress/meltToBolt11. Throws on failure
      * (the chain-walking callers catch per-attempt and fall through).
@@ -679,6 +685,19 @@ class LightningAddress {
             // against the mint's melt quote before proofs are spent.
             $made = NwcClient::makeInvoice($value, $amountSats, $comment);
             return self::meltToBolt11($storeId, $made['bolt11'], $amountSats);
+        }
+        if ($type === StoreLnAddresses::TYPE_STRIKE) {
+            // createInvoiceWithQuote verifies the quote is sat-exact for
+            // $amountSats; meltToBolt11's expectedAmount bound re-checks
+            // against the mint's melt quote before proofs are spent.
+            require_once __DIR__ . '/strike/client.php';
+            $made = StrikeClient::createInvoiceWithQuote($value, $amountSats, $comment);
+            $result = self::meltToBolt11($storeId, $made['bolt11'], $amountSats);
+            // Ride Strike's invoice id along so cashout call sites can log
+            // it (melts.strike_invoice_id) for reconciliation in the
+            // merchant's Strike dashboard.
+            $result['strike_invoice_id'] = $made['invoice_id'];
+            return $result;
         }
         return self::meltToAddress($storeId, $value, $amountSats, $comment);
     }

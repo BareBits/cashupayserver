@@ -1,29 +1,20 @@
 <?php
 /**
- * HTTP status helper.
+ * HTTP status helper — the single seam every endpoint sets a non-200 through.
  *
- * Standalone, http_response_code() is all that is needed. Under WordPress it
- * is not sufficient: WordPress queues a literal status line
- * ("HTTP/1.1 200 OK") via status_header() during its send_headers phase,
- * before it hands the request to the plugin. http_response_code() updates
- * PHP's internal response code but does NOT replace that already-queued header
- * line, so the 200 is what actually reaches the client.
- *
- * The practical damage is worst in the admin panel, whose JavaScript branches
- * on `response.ok`: with every error arriving as 200 it read failures —
- * rejected CSRF tokens, wrong passwords, validation errors — as successes.
- *
- * status_header() re-emits the status line with replace=true, which does
- * override the queued one. Call this instead of http_response_code() anywhere
- * a non-200 has to reach the client.
+ * Historically this branched to WordPress's status_header() when core could
+ * run inside the WordPress process (WP queues a literal "HTTP/1.1 200 OK"
+ * status line during send_headers that http_response_code() alone does not
+ * replace, so errors reached clients as 200s). Since the GPL split the server
+ * never runs with WordPress loaded — the companion plugin reaches it purely
+ * over HTTP, and its API bridge re-emits the replayed response's status on
+ * the WordPress side itself — so plain http_response_code() is sufficient
+ * and core stays entirely free of WordPress API references (a licensing
+ * boundary, see LICENSE.md).
  */
 
 if (!function_exists('cashupay_status')) {
     function cashupay_status(int $code): void {
-        // Only defined once WordPress has loaded; absent standalone.
-        if (function_exists('status_header')) {
-            status_header($code);
-        }
         http_response_code($code);
     }
 }

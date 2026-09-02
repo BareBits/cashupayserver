@@ -1,8 +1,8 @@
 <?php
 /**
- * CashuPayServer Windows desktop — background helper.
+ * BareBits Windows desktop — background helper.
  *
- * Launched minimized by CashuPayServer.bat alongside the web server. Does
+ * Launched minimized by BareBits.bat alongside the web server. Does
  * three things, then gets out of the way:
  *
  *   1. Waits for the local web server to accept connections.

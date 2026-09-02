@@ -1,6 +1,6 @@
 """Onboarding wizard in Windows-desktop mode.
 
-The desktop package's launcher (windows/CashuPayServer.bat) sets
+The desktop package's launcher (windows/BareBits.bat) sets
 CASHUPAY_DESKTOP=1 for every process it starts. In that mode the wizard must
 drop two screens that don't apply to a localhost-only package with its own
 cron ticker:

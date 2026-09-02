@@ -1,0 +1,183 @@
+name: Webserver smoke
+
+# Fast (<10 min) proof that the serving layer works on real webservers:
+#  - apache-smoke builds and boots the production Docker image (php:8.3-apache
+#    + the in-repo .htaccess) — the first and only CI exercise of that image —
+#    then runs scripts/webserver-smoke.sh (routing/deny/header curl checks)
+#    and scripts/desktop-smoke.php in its server shape (full wizard → admin →
+#    API key → Greenfield API), plus an authenticated /health check.
+#  - nginx-smoke serves the repo tree with the canonical docker/nginx-site.conf
+#    through the tests' nginx+php-fpm image and runs the same two scripts.
+# The full e2e suite runs against these backends locally only
+# (tests/scripts/run-tests.sh with no --backend flag); CI keeps the suite on
+# php -S (tests.yml).
+
+on:
+  pull_request:
+    paths:
+      - ".htaccess"
+      - "router.php"
+      - "index.php"
+      - "setup.php"
+      - "health.php"
+      - "api.php"
+      - "admin.php"
+      - "includes/setup_flow.php"
+      - "includes/database.php"
+      - "includes/auth.php"
+      - "includes/desktop.php"
+      - "docker/**"
+      - "tests/docker/**"
+      - "scripts/webserver-smoke.sh"
+      - "scripts/desktop-smoke.php"
+      - "scripts/verify-plugin-build.php"
+      - ".github/workflows/webserver-smoke.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: webserver-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  apache-smoke:
+    name: Apache (production image)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Use HTTPS for SSH-form submodule URLs
+        run: git config --global url."https://github.com/".insteadOf "git@github.com:"
+
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build production image
+        run: docker build -f docker/Dockerfile.production -t barebits-prod .
+
+      - name: Run container
+        run: |
+          docker run -d --name app -p 8080:80 \
+            -e CRON_INTERVAL_SECONDS=0 \
+            -e CASHUPAY_AUTO_UPDATE_ENABLED=0 \
+            barebits-prod
+          for i in $(seq 1 30); do
+            status=$(docker inspect -f '{{.State.Health.Status}}' app)
+            [ "$status" = healthy ] && exit 0
+            sleep 2
+          done
+          echo "container never became healthy" >&2
+          docker logs app
+          exit 1
+
+      - name: Webserver smoke (curl assertions)
+        run: bash scripts/webserver-smoke.sh http://127.0.0.1:8080
+
+      - name: Set up PHP (for the wizard driver)
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.3"
+          extensions: curl, json, mbstring
+          coverage: none
+
+      - name: Wizard driver, server shape
+        run: php scripts/desktop-smoke.php http://127.0.0.1:8080 server
+
+      - name: Authenticated /health (200 path)
+        # Runs after the wizard: Database::initialize seeds cron_key during
+        # setup, and /health is gated on it. The unauthenticated probe in the
+        # smoke proved routing (403 JSON); this proves the full cron-context
+        # bootstrap behind the key gate.
+        run: |
+          key=$(docker exec app php -r '
+            define("CASHUPAY_DATA_DIR", "/var/www/html/data");
+            require "/var/www/html/includes/database.php";
+            $row = Database::fetchOne("SELECT value FROM config WHERE key = ?", ["cron_key"]);
+            $raw = $row["value"] ?? "";
+            $decoded = json_decode($raw, true);
+            echo is_string($decoded) ? $decoded : $raw;
+          ')
+          test -n "$key"
+          code=$(curl -s -o /tmp/health.json -w '%{http_code}' "http://127.0.0.1:8080/health?key=$key")
+          cat /tmp/health.json; echo
+          test "$code" = "200"
+          grep -q '"ok":true' /tmp/health.json
+
+      - name: Container logs on failure
+        if: failure()
+        run: docker logs app
+
+  nginx-smoke:
+    name: nginx (canonical config)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Use HTTPS for SSH-form submodule URLs
+        run: git config --global url."https://github.com/".insteadOf "git@github.com:"
+
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install composer dependencies
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.3"
+          extensions: curl, json, gmp, mbstring, sqlite3
+          coverage: none
+      - run: composer install --no-dev --no-progress --optimize-autoloader --ignore-platform-reqs
+
+      - name: Build nginx test image
+        run: docker build -f tests/docker/Dockerfile.nginx-test -t barebits-nginx tests/docker/
+
+      - name: Render canonical config and run container
+        # Same substitution contract as tests/fixtures/webserver.py: the three
+        # "# TEST-SUBST:" anchors in docker/nginx-site.conf. The app tree is
+        # mounted at its own path (the repo's identical-path convention).
+        run: |
+          mkdir -p /tmp/nginx-conf
+          sed -e "s|^.*# TEST-SUBST: listen$|    listen 8081;|" \
+              -e "s|^.*# TEST-SUBST: root$|    root $GITHUB_WORKSPACE;|" \
+              -e "s|^.*# TEST-SUBST: fastcgi_pass$|        fastcgi_pass unix:/tmp/fpm/fpm.sock;|" \
+              docker/nginx-site.conf > /tmp/nginx-conf/site.conf
+          # Only directive lines may carry a leftover anchor — the file's
+          # header comment legitimately mentions TEST-SUBST.
+          if grep "TEST-SUBST" /tmp/nginx-conf/site.conf | grep -vqE '^\s*#'; then
+            echo "TEST-SUBST anchors were not all substituted" >&2; exit 1
+          fi
+          cat > /tmp/nginx-conf/fpm-pool.conf <<'EOF'
+          [www]
+          listen = /tmp/fpm/fpm.sock
+          clear_env = no
+          catch_workers_output = yes
+          pm = static
+          pm.max_children = 4
+          EOF
+          docker run -d --name app --network host \
+            --user "$(id -u):$(id -g)" \
+            --tmpfs /tmp:exec,mode=1777 \
+            -v "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" \
+            -v /tmp/nginx-conf/site.conf:/etc/nginx/test-sites/site.conf:ro \
+            -v /tmp/nginx-conf/fpm-pool.conf:/usr/local/etc/php-fpm.d/zz-test.conf:ro \
+            -e CASHUPAY_UPDATER_DISABLED=1 \
+            barebits-nginx
+          for i in $(seq 1 30); do
+            curl -fs -o /dev/null "http://127.0.0.1:8081/setup.php" && exit 0
+            sleep 1
+          done
+          echo "nginx container never answered" >&2
+          docker logs app
+          exit 1
+
+      - name: Webserver smoke (curl assertions)
+        run: bash scripts/webserver-smoke.sh http://127.0.0.1:8081 --nginx
+
+      - name: Wizard driver, server shape
+        run: php scripts/desktop-smoke.php http://127.0.0.1:8081 server
+
+      - name: Container logs on failure
+        if: failure()
+        run: docker logs app

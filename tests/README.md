@@ -27,7 +27,98 @@ This will:
 2. Create `tests/.venv/` and install Python deps from `requirements.txt`.
 3. Download + verify bitcoind and LND into `tests/bin/` if not already cached.
 4. Install Playwright's Chromium browser into `tests/bin/playwright-browsers/`.
-5. Run `pytest`.
+5. Run `pytest` — once per serving backend (php -S, Apache, nginx; see below).
+
+## Serving backends
+
+The app under test is served by one of three backends, selected with
+`CASHUPAY_TEST_BACKEND` (see `fixtures/webserver.py`):
+
+| backend  | what serves the app | needs |
+|----------|---------------------|-------|
+| `phps`   | `php -S` + router wrapper (the default for a bare `pytest`) | nothing |
+| `apache` | `php:8.3-apache` (mod_php) container, real `.htaccess` semantics | `sudo -n docker` |
+| `nginx`  | nginx + php-fpm container, the canonical `docker/nginx-site.conf` | `sudo -n docker` |
+
+- `./scripts/run-tests.sh` with **no** `--backend` flag runs the full suite on
+  **all three** sequentially (the local full-coverage run, ~3h). Pass
+  `--backend=phps|apache|nginx` for a single pass — CI pins `--backend=phps`
+  for the full suite, covers the standalone server on real webservers with
+  the fast `webserver-smoke` workflow, and runs the WooCommerce checkout
+  tier (plugin zip install → wiring → guest + browser checkout → Lightning
+  settle) on real Apache and nginx in the `wp-checkout` job of `tests.yml`.
+- Containers run with `--network=host`, as your uid, with the repo bind-mounted
+  at its own path, so URLs, data dirs, and sqlite access behave exactly as
+  under `php -S`. Test images build once (content-hash tagged) on first use.
+- Version drift caveat: the host-side pinned PHP is the static-cli 8.3.31
+  build (`fixtures/binaries.py`); `php:8.3-apache` / `php:8.3-fpm` float
+  within 8.3.x and are different builds — which is exactly the production
+  reality the container backends exist to exercise.
+- Backend-conditional test logic lives in `fixtures/backend.py`
+  (`is_phps()`, `default_url_mode()`, ...). Under Apache/nginx the app's
+  opportunistic background cron really runs, so prefer outcome-polling
+  (`PayserverHandle.drive_cron_until`) over "nothing happened yet" assertions.
+
+## Shared servers vs. fresh installs
+
+Two families of payserver fixtures exist (`conftest.py`):
+
+- **`shared_configured`** (plus `shared_configured_with_lnurlp` /
+  `shared_configured_with_strike`, and `shared_server` for read-only tests):
+  ONE payserver boots per test module and each test gets its own store —
+  created through the add_store wizard, so it has its own wallet seed (no
+  mint collisions) — plus its own API key. Same `ConfiguredPayserver`
+  interface as `configured`; the per-test store's unique name is
+  `.store_name`. This is the default for new tests: it skips a server boot
+  and a 9-step wizard walk per test.
+- **`configured` / `payserver`**: a fresh install per test. Required when a
+  test mutates server-global state: admin password or users, global config
+  rows (SMTP, updater, cron_key, update channel), failed logins (global
+  lockout counter), the global API rate limiter, process restarts, unscoped
+  sqlite writes, or the setup wizard itself.
+
+Playwright note: the admin SPA auto-selects `stores[0]` unless
+`localStorage.selectedStoreId` is set, so UI tests on a shared server must
+pin their own store (see `add_init_script(...selectedStoreId...)` uses).
+
+## WordPress golden templates
+
+The WP tier used to run `wp core install` (+ plugin activations, + the whole
+WooCommerce/BTCPay install for checkout tests) per test. Now the first install
+of each DB-affecting shape per session — `bare` (no cashupay plugin), `plugin`
+(cashupay active), `woo` (plugin + WooCommerce + BTC store + one product) — is
+kept as a golden tree under `tests/.tmp/wp-golden-*`, and every later test
+gets a `cp -a` clone of it (`fixtures/wordpress.py`).
+
+Safe because the only per-instance state is serve-time: each clone gets a
+fresh `wp-config.php` (own port, salts, release-server constants) whose
+`WP_HOME`/`WP_SITEURL` constants override every URL the golden's DB stores,
+plus its own router wrapper/vhost. `emulate_rewrites`, `php_workers`,
+`release_api_base`, `release_channel` never touch the tree or DB, so all
+fixture variants share the same three goldens. Escape hatch:
+`CASHUPAY_WP_NO_TEMPLATE=1` restores the per-test real install; the template
+contract itself is pinned by `wordpress/test_wp_template_clone.py`.
+
+## Workdir cleanup
+
+A test that passes deletes its workdir in teardown; failures keep theirs for
+postmortem, and a fully green session removes the shared stack dir too (the
+`wp-golden-*` template dirs are removed with it). Set
+`CASHUPAY_KEEP_WORKDIRS=1` to keep everything. `run-tests.sh` also checks
+free disk/RAM before each pytest pass and refuses to start below 4G disk /
+2G available RAM (warns below 10G / 4G) — `CASHUPAY_SKIP_PREFLIGHT=1`
+bypasses. Every run ends with pytest's `--durations` ranking of the slowest
+tests and fixture setups, so future speedup work starts from data. At session start, orphaned
+fixture processes from previously killed runs (anything with `tests/.tmp` in
+its cmdline) are swept — set `CASHUPAY_NO_STALE_SWEEP=1` when deliberately
+running two suites concurrently from this checkout.
+
+## CI sharding
+
+`pytest --split-group=M/N` runs the Mth of N deterministic file-level shards
+(`fixtures/partition.py`; whole files stay together because of the
+module-scoped shared servers). CI runs 3 shards in parallel; the shard count
+lives in `.github/workflows/tests.yml` (matrix AND --split-group must match).
 
 ## Layout
 

@@ -22,6 +22,7 @@ require_once __DIR__ . '/includes/updater.php';
 require_once __DIR__ . '/includes/offline_cashu.php';
 require_once __DIR__ . '/includes/products.php';
 require_once __DIR__ . '/includes/cart.php';
+require_once __DIR__ . '/includes/managed.php';
 
 use Cashu\ProofState;
 
@@ -216,6 +217,11 @@ if (isset($_GET['api'])) {
             foreach ($stores as &$store) {
                 $store['internalApiKey'] = Auth::getOrCreateInternalApiKey($store['id']);
                 $store['isConfigured'] = Config::isStoreConfigured($store['id']);
+                // isConfigured only reflects the mint rail; the store selector
+                // needs "can this store take payments at all" so a
+                // Lightning-only or on-chain-only store isn't labeled
+                // "(not configured)".
+                $store['hasPaymentRail'] = Config::storeHasPaymentRail($store['id']);
                 $store = Config::redactStoreSecrets($store);
             }
             unset($store);
@@ -286,7 +292,10 @@ if (isset($_GET['api'])) {
                 // keep:<id> ref. On save, the UI posts the ref back and the
                 // server resolves it to the stored value — the raw URI never
                 // round-trips through the browser.
-                if ($r['type'] === StoreLnAddresses::TYPE_NWC) {
+                if ($r['type'] === StoreLnAddresses::TYPE_NWC
+                        || $r['type'] === StoreLnAddresses::TYPE_STRIKE) {
+                    // Strike API keys are the account credential and get the
+                    // same masked-label + keep-ref treatment.
                     return [
                         'address' => StoreLnAddresses::displayValue($r['type'], $r['address']),
                         'type' => $r['type'],
@@ -565,8 +574,8 @@ if (isset($_GET['api'])) {
                 'available' => Updater::getAvailableUpdate(),
                 // In-flight / last manual ("Update now") run, polled by the UI.
                 'manual_run' => Config::get('updater_manual_run'),
-                // Why a manual update can't run here (WordPress / dev kill
-                // switch), or null if it can. Drives the button's enabled state.
+                // Why a manual update can't run here (dev kill switch), or
+                // null if it can. Drives the button's enabled state.
                 'manual_blocked' => Updater::manualUpdateBlockedReason(),
             ]);
             break;
@@ -1863,10 +1872,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $storeId = $_POST['store_id'] ?? '';
                 $secretsRaw = $_POST['secrets'] ?? '[]';
                 $secrets = json_decode($secretsRaw, true);
-                if ($secrets === null && json_last_error() !== JSON_ERROR_NONE) {
-                    // JSON parse failed - likely WordPress magic quotes escaping
-                    $secrets = json_decode(stripslashes($secretsRaw), true);
-                }
 
                 if (empty($storeId)) {
                     throw new Exception('Store ID required');
@@ -2320,10 +2325,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 // callers may still send a single auto-detected addresses[] /
                 // address; honour that by classifying each entry by shape
                 // ('noffer1…' vs nostr+walletconnect://… vs local@host).
-                if (isset($_POST['ln_addresses']) || isset($_POST['noffers']) || isset($_POST['nwc'])) {
+                if (isset($_POST['ln_addresses']) || isset($_POST['noffers'])
+                        || isset($_POST['nwc']) || isset($_POST['strike'])) {
                     $lnList = $_POST['ln_addresses'] ?? [];
                     $nofferList = $_POST['noffers'] ?? [];
                     $nwcList = $_POST['nwc'] ?? [];
+                    $strikeList = $_POST['strike'] ?? [];
                     if (!is_array($lnList)) {
                         $lnList = [(string)$lnList];
                     }
@@ -2333,13 +2340,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     if (!is_array($nwcList)) {
                         $nwcList = [(string)$nwcList];
                     }
-                    // NWC entries arrive either as full connection URIs (new)
-                    // or opaque keep:<row-id> refs (kept) — the browser never
-                    // holds the stored secret-bearing URIs. Resolve refs to
-                    // the stored values before validation; kept entries also
-                    // skip the save-time probe in probeAndGateChain.
+                    if (!is_array($strikeList)) {
+                        $strikeList = [(string)$strikeList];
+                    }
+                    // NWC and Strike entries arrive either as full secrets
+                    // (new) or opaque keep:<row-id> refs (kept) — the browser
+                    // never holds the stored secret-bearing values. Resolve
+                    // refs to the stored values before validation; kept
+                    // entries also skip the save-time probe in
+                    // probeAndGateChain.
                     [$nwcList, ] = StoreLnAddresses::resolveKeepRefs($storeId, $nwcList);
-                    $destinations = StoreLnAddresses::chainFromLists($lnList, $nofferList, $nwcList);
+                    [$strikeList, ] = StoreLnAddresses::resolveKeepRefs(
+                        $storeId, $strikeList, StoreLnAddresses::TYPE_STRIKE
+                    );
+                    $destinations = StoreLnAddresses::chainFromLists($lnList, $nofferList, $nwcList, $strikeList);
                 } else {
                     // Legacy single auto-detected chain.
                     $rawAddresses = $_POST['addresses'] ?? null;
@@ -2530,10 +2544,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
                 // Per-store newsletter checkbox default. Tri-state: '' = inherit
                 // the site-wide default (stored NULL); '1'/'0' = force checked/
-                // unchecked. See Config::getNewsletterDefaultChecked(). WordPress
-                // installs hide the selector (the payment page never shows the
-                // newsletter checkbox there), so the stored value must survive a
-                // save that carries no newsletter field.
+                // unchecked. See Config::getNewsletterDefaultChecked().
                 $newsletterDefault = (string)($_POST['newsletter_default_checked'] ?? '');
                 $newsletterDefaultVal = ($newsletterDefault === '1' || $newsletterDefault === '0')
                     ? (int)$newsletterDefault
@@ -2549,10 +2560,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'smtp_encryption' => $smtp['encryption'] !== '' ? $smtp['encryption'] : null,
                     'smtp_from_address' => $smtp['from_address'] !== '' ? $smtp['from_address'] : null,
                     'smtp_from_name' => $smtp['from_name'] !== '' ? $smtp['from_name'] : null,
+                    'newsletter_default_checked' => $newsletterDefaultVal,
                 ];
-                if (!Urls::isWordPress()) {
-                    $update['newsletter_default_checked'] = $newsletterDefaultVal;
-                }
                 // Password: preserve on blank, overwrite on new value, wipe on clear.
                 if ($smtp['password_clear']) {
                     $update['smtp_password'] = null;
@@ -2577,6 +2586,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'enabled' => Config::get('notifications_enabled', false) === true,
                 'invoicePaidEnabled' => Config::get('notifications_invoice_paid_enabled', false) === true,
                 'autoCashoutEnabled' => Config::get('notifications_auto_cashout_enabled', false) === true,
+                // Effective value: explicit payer_email_capture_enabled config
+                // wins, else ON standalone / OFF on managed installs (the shop
+                // platform owns customer emails).
+                'payerEmailCaptureEnabled' => Config::isPayerEmailCaptureEnabled(),
                 'payerReceiptEnabled' => Config::get('notifications_payer_receipt_enabled', false) === true,
                 // Site-wide default for the payment-screen newsletter checkbox.
                 // Independent of receipt sending — email/newsletter capture works
@@ -2604,6 +2617,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $enabled = ($_POST['enabled'] ?? '0') === '1';
                 $invoicePaidEnabled = ($_POST['invoice_paid_enabled'] ?? '0') === '1';
                 $autoCashoutEnabled = ($_POST['auto_cashout_enabled'] ?? '0') === '1';
+                $payerEmailCaptureEnabled = ($_POST['payer_email_capture_enabled'] ?? '0') === '1';
                 $payerReceiptEnabled = ($_POST['payer_receipt_enabled'] ?? '0') === '1';
                 $newsletterDefaultChecked = ($_POST['newsletter_default_checked'] ?? '0') === '1';
                 $toEmail = trim((string)($_POST['to_email'] ?? ''));
@@ -2619,13 +2633,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 Config::set('notifications_enabled', $enabled);
                 Config::set('notifications_invoice_paid_enabled', $invoicePaidEnabled);
                 Config::set('notifications_auto_cashout_enabled', $autoCashoutEnabled);
-                // WordPress installs hide the payer-receipt and newsletter
-                // toggles (the payment page never renders the email form there),
-                // so a save must not clobber their stored values with defaults.
-                if (!Urls::isWordPress()) {
-                    Config::set('notifications_payer_receipt_enabled', $payerReceiptEnabled);
-                    Config::set('newsletter_default_checked', $newsletterDefaultChecked);
-                }
+                // Explicit boolean: once saved, it overrides the managed/
+                // standalone default in Config::isPayerEmailCaptureEnabled().
+                Config::set('payer_email_capture_enabled', $payerEmailCaptureEnabled);
+                Config::set('notifications_payer_receipt_enabled', $payerReceiptEnabled);
+                Config::set('newsletter_default_checked', $newsletterDefaultChecked);
                 Config::set('notifications_to_email', $toEmail);
 
                 Config::set('smtp_host', $smtp['host']);
@@ -3689,10 +3701,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if (!$storeId) {
                     throw new Exception('Store ID required');
                 }
-                // Auth::verifyCurrentUserPassword handles both deployments:
-                // the BareBits users row standalone, the WordPress user's own
-                // password under WordPress (where there is no BareBits row and
-                // Auth::currentUser() is null by design).
                 if (!Auth::verifyCurrentUserPassword((string)($_POST['password'] ?? ''))) {
                     cashupay_status(401);
                     echo json_encode(['error' => 'Password is incorrect']);
@@ -3756,15 +3764,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
 // Serve the SPA HTML
 $baseUrl = Config::getBaseUrl();
-$isWp = Urls::isWordPress();
 $isLoggedIn = Auth::isLoggedIn();
-$currentUser = Auth::currentUser();   // null when WordPress mode or not logged in
+$currentUser = Auth::currentUser();   // null when not logged in
+$isManaged = ManagedInstall::isManaged();
 $currentRole = $currentUser['role'] ?? ($isLoggedIn ? Auth::ROLE_ADMIN : null);
 $currentUsername = $currentUser['username'] ?? ($isLoggedIn ? 'admin' : '');
 // Mechanism 2: surface the file-based reset on the lock screen when the trigger
-// file is present and nobody is signed in. Standalone mode only (WordPress
-// manages its own accounts).
-$fileResetRequested = !$isLoggedIn && !$isWp && Auth::fileResetRequested();
+// file is present and nobody is signed in.
+$fileResetRequested = !$isLoggedIn && Auth::fileResetRequested();
 
 // -----------------------------------------------------------------------------
 // SPA view routing
@@ -3773,46 +3780,58 @@ $fileResetRequested = !$isLoggedIn && !$isWp && Auth::fileResetRequested();
 // parsed here so a refresh restores the operator's current page instead of
 // always dropping them back on the dashboard.
 //
-// Sources for the view slug:
-//   - Standalone (direct, router, or PATH_INFO mode): $_SERVER['PATH_INFO']
-//   - WordPress: a query var captured by the cashupay-admin rewrite rule
+// The view slug comes from $_SERVER['PATH_INFO'] (clean mode's front
+// controller, router mode, Apache AcceptPathInfo) or, on hosts that route
+// neither, from the ?view= query parameter — the form every host serves.
 //
-// Unknown or empty view → 302 to <base>/dashboard so /admin canonicalizes to
-// /admin/dashboard and bookmarks of removed views still resolve sensibly.
+// Whether URLs GENERATED for this session are path-style or query-style is
+// decided by Urls::adminUsesPathUrls(): path URLs only where the host
+// provably routes them (clean mode, or this very request arrived with a
+// PATH_INFO tail). Everywhere else — notably the WordPress-alongside install
+// on a stock nginx host (Local WP), where /barebits/admin.php/dashboard
+// falls through the web server into WordPress's themed 404 — views ride
+// admin.php?view=… instead.
+//
+// Unknown or empty view: with path URLs, 302 to <base>/dashboard so /admin
+// canonicalizes to /admin/dashboard and bookmarks of removed views still
+// resolve sensibly; with query URLs, serve the dashboard directly (a
+// path-style redirect is exactly what such hosts cannot serve).
 // -----------------------------------------------------------------------------
 const ADMIN_VIEWS = ['dashboard', 'invoices', 'customers', 'stores', 'products', 'settings', 'stats', 'log'];
 
-if ($isWp) {
-    $rawAdminView = (string)get_query_var('cashupay_admin_view');
-} else {
-    $rawAdminView = trim((string)($_SERVER['PATH_INFO'] ?? ''), '/');
+$adminUsesPathUrls = Urls::adminUsesPathUrls($_SERVER['PATH_INFO'] ?? null, Config::getUrlMode());
+
+$rawAdminView = trim((string)($_SERVER['PATH_INFO'] ?? ''), '/');
+if ($rawAdminView === '' && isset($_GET['view'])) {
+    $rawAdminView = (string)$_GET['view'];
 }
 
 // Compute the base path the JS uses to build view URLs and to call back into
-// admin.php for ?api=... requests. In standalone mode it's REQUEST_URI minus
-// the PATH_INFO tail and any query string; in WordPress mode the rewrite
-// owns the URL shape, so we use the canonical admin URL.
-if ($isWp) {
+// admin.php for ?api=... requests: REQUEST_URI minus the PATH_INFO tail and
+// any query string.
+$reqPath = parse_url((string)($_SERVER['REQUEST_URI'] ?? ''), PHP_URL_PATH) ?: '';
+$pi = (string)($_SERVER['PATH_INFO'] ?? '');
+if ($pi !== '' && $pi !== '/' && substr($reqPath, -strlen($pi)) === $pi) {
+    $reqPath = substr($reqPath, 0, -strlen($pi));
+}
+$adminBasePath = rtrim($reqPath, '/');
+if ($adminBasePath === '') {
+    // Fallback if REQUEST_URI was unexpectedly empty.
     $adminBasePath = rtrim(Urls::admin(), '/');
-} else {
-    $reqPath = parse_url((string)($_SERVER['REQUEST_URI'] ?? ''), PHP_URL_PATH) ?: '';
-    $pi = (string)($_SERVER['PATH_INFO'] ?? '');
-    if ($pi !== '' && $pi !== '/' && substr($reqPath, -strlen($pi)) === $pi) {
-        $reqPath = substr($reqPath, 0, -strlen($pi));
-    }
-    $adminBasePath = rtrim($reqPath, '/');
-    if ($adminBasePath === '') {
-        // Fallback if REQUEST_URI was unexpectedly empty.
-        $adminBasePath = rtrim(Urls::admin(), '/');
-    }
 }
 
-// Canonicalize: unknown or empty view → /admin/dashboard, preserving query.
+// Canonicalize: unknown or empty view → /admin/dashboard, preserving query —
+// but only where path URLs provably route (see above). Query-URL hosts serve
+// the dashboard directly: the request's own query string is already in place,
+// and the client canonicalizes the visible URL via history.replaceState.
 if (!in_array($rawAdminView, ADMIN_VIEWS, true)) {
-    $reqQuery = parse_url((string)($_SERVER['REQUEST_URI'] ?? ''), PHP_URL_QUERY);
-    $location = $adminBasePath . '/dashboard' . ($reqQuery ? '?' . $reqQuery : '');
-    header('Location: ' . $location);
-    exit;
+    if ($adminUsesPathUrls) {
+        $reqQuery = parse_url((string)($_SERVER['REQUEST_URI'] ?? ''), PHP_URL_QUERY);
+        $location = $adminBasePath . '/dashboard' . ($reqQuery ? '?' . $reqQuery : '');
+        header('Location: ' . $location);
+        exit;
+    }
+    $rawAdminView = 'dashboard';
 }
 
 $adminView = $rawAdminView;
@@ -3833,7 +3852,7 @@ header('Cache-Control: no-cache, must-revalidate');
     <meta name="apple-mobile-web-app-title" content="BareBits">
     <meta name="csrf-token" content="<?= htmlspecialchars(Auth::generateCsrfToken()) ?>">
     <title>BareBits Admin</title>
-    <?php if (!$isWp): ?><link rel="manifest" href="<?= htmlspecialchars(Config::getBaseUrl()) ?>/manifest.json"><?php endif; ?>
+    <link rel="manifest" href="<?= htmlspecialchars(Config::getBaseUrl()) ?>/manifest.json">
     <link rel="apple-touch-icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect fill='%230f0f23' width='100' height='100' rx='20'/><text x='50' y='70' font-size='60' text-anchor='middle'>⚡</text></svg>">
     <style>
         * {
@@ -4252,15 +4271,11 @@ header('Cache-Control: no-cache, must-revalidate');
             display: none !important;
         }
 
-        /* WordPress plugin mode: hides elements WordPress makes redundant
-           (Products/Customers tabs — the shop plugin owns that data; the
-           store selector — plugin installs run a single store). Kept in the
-           DOM so the JS that references them needs no null guards, with
-           !important so the role-based un-hide and the per-view
-           style.display toggles can't bring them back. */
-        .wp-hidden {
-            display: none !important;
-        }
+        /* Managed single-shop installs (ManagedInstall::isManaged) hide the
+           surfaces the shop platform owns and the account plumbing (login is
+           automatic via SSO). Server-rendered on purpose: a class the merchant
+           could untoggle in DevTools only hides UI, never capability. */
+        .managed-hidden { display: none !important; }
 
         /* Balance Card */
         .balance-card {
@@ -5209,12 +5224,10 @@ header('Cache-Control: no-cache, must-revalidate');
             <input type="password" id="password-input" placeholder="Password"
                    autocomplete="current-password">
             <button class="btn btn-full" id="password-submit">Unlock</button>
-            <?php if (!$isWp): ?>
             <button class="btn-link" id="forgot-password-link" type="button"
                     style="background:none;border:0;color:var(--text-secondary);text-decoration:underline;cursor:pointer;margin-top:0.75rem;font-size:0.85rem;">
                 Forgot password?
             </button>
-            <?php endif; ?>
         </div>
 
         <?php if ($fileResetRequested): ?>
@@ -5242,7 +5255,7 @@ header('Cache-Control: no-cache, must-revalidate');
                     <img class="header-logo" src="<?= htmlspecialchars(Urls::assets('img/barebits-logo.svg')) ?>" alt="BareBits">
                     <span id="header-text">Dashboard</span>
                 </div>
-                <div class="header-store-selector<?= $isWp ? ' wp-hidden' : '' ?>" id="header-store-selector">
+                <div class="header-store-selector<?= $isManaged ? ' managed-hidden' : '' ?>" id="header-store-selector">
                     <span class="store-selector-label">Selected Store:</span>
                     <select id="store-select">
                         <option value="">Loading stores...</option>
@@ -5256,8 +5269,7 @@ header('Cache-Control: no-cache, must-revalidate');
                         <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path>
                     </svg>
                 </button>
-                <?php if (!Urls::isWordPress()): ?>
-                <div class="user-menu" id="user-menu">
+                <div class="user-menu<?= $isManaged ? ' managed-hidden' : '' ?>" id="user-menu">
                     <button class="icon-btn" id="user-btn" title="Account">
                         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                             <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path>
@@ -5269,7 +5281,6 @@ header('Cache-Control: no-cache, must-revalidate');
                         <button class="user-menu-item" id="user-menu-logout" role="menuitem">Log out</button>
                     </div>
                 </div>
-                <?php endif; ?>
             </div>
         </header>
 
@@ -5555,8 +5566,34 @@ header('Cache-Control: no-cache, must-revalidate');
                             ?>
                             <p class="form-help" style="margin-top:0;">
                                 Lightning payment paths are tried in the following order &mdash;
-                                you can use multiple paths: LNURL/lightning address, NWC, noffer.
+                                you can use multiple paths: Strike API, LNURL/lightning address,
+                                NWC, noffer.
                             </p>
+
+                            <div class="form-group" id="auto-melt-strike-group">
+                                <label class="form-label">Strike API keys (priority order)</label>
+                                <p class="form-help">
+                                    Take Lightning payments straight into your
+                                    <a href="https://strike.me" target="_blank" rel="noopener noreferrer" style="color: var(--accent);">Strike</a>
+                                    account. Strike lightning addresses (&hellip;@strike.me)
+                                    don&rsquo;t support LUD-21 payment verification and can&rsquo;t
+                                    be used in the Lightning Addresses list below &mdash; an API key
+                                    works fully, and is tried <em>first</em> when generating
+                                    invoices. Create a key in the
+                                    <a href="https://dashboard.strike.me/" target="_blank" rel="noopener noreferrer" style="color: var(--accent);">Strike dashboard</a>
+                                    (API Keys section) with <em>only</em> the
+                                    <strong>create invoices</strong>, <strong>generate invoice
+                                    quotes</strong> and <strong>read invoices</strong> scopes
+                                    &mdash; such a key cannot spend or withdraw funds. New keys are
+                                    tested with a 1-sat test invoice when you save (it&rsquo;s never
+                                    paid). Saved keys show only a masked label; the key stays on
+                                    the server.
+                                </p>
+                                <div id="auto-melt-strike-list"></div>
+                                <button type="button" class="btn btn-secondary" id="btn-add-strike" style="margin-top: 0.5rem;">
+                                    + Add Strike API key
+                                </button>
+                            </div>
 
                             <div class="form-group" id="auto-melt-address-group">
                                 <label class="form-label">Lightning Addresses (priority order)</label>
@@ -6047,15 +6084,11 @@ header('Cache-Control: no-cache, must-revalidate');
                             </p>
                             <div class="form-group">
                                 <label class="form-label" for="store-seed-password">
-                                    <?= Urls::isWordPress()
-                                        ? 'Confirm your WordPress password'
-                                        : 'Confirm your password' ?>
+                                    Confirm your password
                                 </label>
                                 <input type="password" class="form-input" id="store-seed-password"
                                        autocomplete="current-password"
-                                       placeholder="<?= Urls::isWordPress()
-                                           ? 'Your WordPress password'
-                                           : 'Your admin password' ?>">
+                                       placeholder="Your admin password">
                             </div>
                             <div id="store-seed-error" class="hidden" style="margin-bottom:0.5rem; color: var(--error); font-size: 0.85rem;"></div>
                             <div id="store-seed-output" class="hidden" style="margin-bottom: 0.75rem;">
@@ -6144,9 +6177,6 @@ header('Cache-Control: no-cache, must-revalidate');
                                 <p class="form-help">If blank, the site-wide notification address from Settings is used.</p>
                             </div>
 
-                            <?php if (!$isWp): ?>
-                            <!-- Hidden in WordPress installs: the payment page never
-                                 shows the newsletter checkbox there. -->
                             <div class="form-group" style="margin-top: 1rem;">
                                 <label class="form-label">Newsletter checkbox default</label>
                                 <select class="form-input" id="store-newsletter-default">
@@ -6159,14 +6189,8 @@ header('Cache-Control: no-cache, must-revalidate');
                                     payment page.
                                 </p>
                             </div>
-                            <?php endif; ?>
 
-                            <?php if ($isWp): ?>
-                            <div style="margin-top: 1rem; background: rgba(247,147,26,0.15); border: 1px solid rgba(247,147,26,0.4); padding: 0.6rem; border-radius: 6px; font-size: 0.85rem;">
-                                Installed in plugin mode &mdash; configure your e-mail settings in WordPress directly.
-                            </div>
-                            <?php endif; ?>
-                            <div class="toggle-container" style="margin-top: 1rem;<?= $isWp ? ' opacity: 0.5; pointer-events: none;' : '' ?>">
+                            <div class="toggle-container" style="margin-top: 1rem;">
                                 <span>Use a custom SMTP server for this store</span>
                                 <label class="toggle">
                                     <input type="checkbox" id="store-smtp-override-enabled">
@@ -6174,7 +6198,7 @@ header('Cache-Control: no-cache, must-revalidate');
                                 </label>
                             </div>
 
-                            <div id="store-smtp-fields" class="hidden" style="margin-top: 0.75rem; padding: 0.75rem; background: rgba(0,0,0,0.2); border-radius: 8px;<?= $isWp ? ' opacity: 0.5; pointer-events: none;' : '' ?>">
+                            <div id="store-smtp-fields" class="hidden" style="margin-top: 0.75rem; padding: 0.75rem; background: rgba(0,0,0,0.2); border-radius: 8px;">
                                 <p class="form-help" style="margin-top: 0;">
                                     Any field left blank falls back to the global SMTP settings, then to
                                     <code>user_config.php</code>.
@@ -6383,7 +6407,9 @@ header('Cache-Control: no-cache, must-revalidate');
                     <div class="empty-state">
                         <div class="empty-state-icon">🏪</div>
                         <p>No store selected</p>
-                        <button class="btn" id="btn-create-store" style="margin-top: 1rem;">Create Store</button>
+                        <!-- Managed installs run exactly one shop-provisioned store,
+                             so adding stores from the menu is hidden there. -->
+                        <button class="btn<?= $isManaged ? ' managed-hidden' : '' ?>" id="btn-create-store" style="margin-top: 1rem;">Create Store</button>
                     </div>
                 </div>
             </div>
@@ -6530,10 +6556,21 @@ header('Cache-Control: no-cache, must-revalidate');
                                     <span class="toggle-slider"></span>
                                 </label>
                             </div>
-                            <?php if (!$isWp): ?>
-                            <!-- WordPress installs never render the payment-page
-                                 email/newsletter form (WooCommerce owns customer
-                                 emails), so both toggles below would be dead there. -->
+                            <div class="toggle-container" style="margin-top: 0.5rem;">
+                                <span>Offer payers an email / newsletter form on the payment page</span>
+                                <label class="toggle">
+                                    <input type="checkbox" id="notifications-payer-email-capture">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
+                            <p class="form-help" style="margin-top: 0.5rem;">
+                                When off, the payment-complete screen shows no email capture
+                                and receipt emails are never offered. Managed shop installs
+                                default this off &mdash; the shop owns customer emails.
+                            </p>
+                            <!-- The two toggles below only matter while the email capture
+                                 above is on; JS greys them out when it is off. -->
+                            <div id="payer-email-capture-dependent">
                             <div class="toggle-container" style="margin-top: 0.5rem;">
                                 <span>Offer payer receipt on payment page</span>
                                 <label class="toggle">
@@ -6545,6 +6582,7 @@ header('Cache-Control: no-cache, must-revalidate');
                                 When enabled, after an invoice is paid the customer can
                                 optionally enter an email address to receive a payment
                                 confirmation. Receipts are queued to the same SMTP server.
+                                Requires the email/newsletter form above.
                             </p>
                             <div class="toggle-container" style="margin-top: 0.75rem;">
                                 <span>Newsletter checkbox checked by default</span>
@@ -6559,15 +6597,10 @@ header('Cache-Control: no-cache, must-revalidate');
                                 shown regardless of whether receipts are enabled. Individual
                                 stores can override this default in their store settings.
                             </p>
-                            <?php endif; ?>
+                            </div>
                         </div>
 
-                        <?php if ($isWp): ?>
-                        <div style="margin-top: 1rem; background: rgba(247,147,26,0.15); border: 1px solid rgba(247,147,26,0.4); padding: 0.6rem; border-radius: 6px; font-size: 0.85rem;">
-                            Installed in plugin mode &mdash; configure your e-mail settings in WordPress directly.
-                        </div>
-                        <?php endif; ?>
-                        <div style="margin-top: 1rem; padding: 0.75rem; background: rgba(0,0,0,0.2); border-radius: 8px;<?= $isWp ? ' opacity: 0.5; pointer-events: none;' : '' ?>">
+                        <div style="margin-top: 1rem; padding: 0.75rem; background: rgba(0,0,0,0.2); border-radius: 8px;">
                             <div style="font-weight: 500; margin-bottom: 0.5rem;">SMTP server</div>
                             <p class="form-help" style="margin-top: 0;">
                                 Outgoing mail server. Any field left blank falls back to
@@ -6641,7 +6674,6 @@ header('Cache-Control: no-cache, must-revalidate');
                         <p class="form-help" id="notifications-pending" style="margin-top: 0.5rem;"></p>
                     </div>
                 </div>
-                <?php if (!Urls::isWordPress()): ?>
                 <div class="card collapsible" data-admin-only="true">
                     <div class="card-header">
                         <div class="card-title">Server URL</div>
@@ -6727,12 +6759,11 @@ header('Cache-Control: no-cache, must-revalidate');
                     Auto-update — channel selector + last-update info + rollback.
                     The isolated update.php endpoint (nudged by Task 12 in
                     cron.php, and by the optional dedicated cron line) fetches
-                    the latest cashupayserver.zip built by CI for the chosen
+                    the latest barebits-<tag>.zip built by CI for the chosen
                     channel and overlays it on the install. data/ and
                     user_config.php are preserved. .htaccess is only overwritten
                     if untouched. After applying, it probes health.php and
-                    auto-rolls-back any build that fails to boot. Skipped
-                    entirely in WordPress mode.
+                    auto-rolls-back any build that fails to boot.
                 -->
                 <div class="card collapsible" data-admin-only="true" id="card-auto-update">
                     <div class="card-header">
@@ -6791,11 +6822,10 @@ header('Cache-Control: no-cache, must-revalidate');
                         </div>
                     </div>
                 </div>
-                <?php endif; ?>
 
-                <!-- My Account card: own password + logout, available to every logged-in user -->
-                <?php if (!Urls::isWordPress()): ?>
-                <div class="card collapsible" id="card-my-account">
+                <!-- My Account card: own password + logout, available to every logged-in user.
+                     Managed installs hide it: login is automatic via SSO from the shop admin. -->
+                <div class="card collapsible<?= $isManaged ? ' managed-hidden' : '' ?>" id="card-my-account">
                     <div class="card-header">
                         <div class="card-title">My Account</div>
                     </div>
@@ -6821,14 +6851,14 @@ header('Cache-Control: no-cache, must-revalidate');
                             </p>
                             <button class="btn btn-secondary btn-full" id="btn-save-recovery-email">Save recovery email</button>
                         </div>
-                        <button class="btn btn-danger btn-full" id="btn-logout">
+                        <button class="btn btn-danger btn-full<?= $isManaged ? ' managed-hidden' : '' ?>" id="btn-logout">
                             Logout
                         </button>
                     </div>
                 </div>
 
-                <!-- Users card: admin-only -->
-                <div class="card collapsible hidden" id="card-users" data-admin-only="true">
+                <!-- Users card: admin-only. Managed installs hide it (SSO owns accounts). -->
+                <div class="card collapsible hidden<?= $isManaged ? ' managed-hidden' : '' ?>" id="card-users" data-admin-only="true">
                     <div class="card-header">
                         <div class="card-title">Users</div>
                         <button class="btn" id="btn-add-user" style="padding: 0.25rem 0.75rem; font-size: 0.85rem;">Add user</button>
@@ -6837,18 +6867,6 @@ header('Cache-Control: no-cache, must-revalidate');
                         <div id="users-list"></div>
                     </div>
                 </div>
-                <?php else: ?>
-                <div class="card collapsible">
-                    <div class="card-header">
-                        <div class="card-title">Account</div>
-                    </div>
-                    <div class="card-body">
-                        <button class="btn btn-danger btn-full" id="btn-logout">
-                            Logout
-                        </button>
-                    </div>
-                </div>
-                <?php endif; ?>
 
                 <!-- Stuck Funds card: admin-only.
                      Hidden when no store has any sats stranded in a mint with
@@ -7133,7 +7151,7 @@ header('Cache-Control: no-cache, must-revalidate');
                 </svg>
                 Store
             </button>
-            <button class="nav-item hidden<?= $isWp ? ' wp-hidden' : '' ?>" data-view="products" data-admin-only="true" id="nav-products">
+            <button class="nav-item hidden<?= $isManaged ? ' managed-hidden' : '' ?>" data-view="products" data-admin-only="true" id="nav-products">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                     <path d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4"></path>
                 </svg>
@@ -7147,7 +7165,7 @@ header('Cache-Control: no-cache, must-revalidate');
                 </svg>
                 Stats
             </button>
-            <button class="nav-item hidden<?= $isWp ? ' wp-hidden' : '' ?>" data-view="customers" data-admin-only="true" id="nav-customers">
+            <button class="nav-item hidden<?= $isManaged ? ' managed-hidden' : '' ?>" data-view="customers" data-admin-only="true" id="nav-customers">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                     <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path>
                     <circle cx="9" cy="7" r="4"></circle>
@@ -7562,8 +7580,6 @@ header('Cache-Control: no-cache, must-revalidate');
     <script src="<?= htmlspecialchars(Urls::assets('js/')) ?>animated-qr.js?v=4"></script>
     <script src="<?= htmlspecialchars(Urls::assets('js/')) ?>chart.min.js"></script>
     <script>
-        // WordPress mode - skip lock screen
-        const isWordPressMode = <?= Urls::isWordPress() ? 'true' : 'false' ?>;
         // PHP session state, used to skip the password prompt on reload when
         // the server still considers us logged in.
         const phpLoggedIn = <?= $isLoggedIn ? 'true' : 'false' ?>;
@@ -7574,20 +7590,24 @@ header('Cache-Control: no-cache, must-revalidate');
             role:     <?= json_encode($currentRole) ?>,
             email:    <?= json_encode($currentUser['email'] ?? null) ?>,
         };
-        // Path-based SPA routing: adminBasePath is the URL prefix the user
-        // reached the admin under (no trailing slash, no view tail). All view
-        // URLs and ?api=... fetches build off this so the same code works
-        // under direct, router, and WordPress modes — and under PATH_INFO
-        // where relative URLs would otherwise resolve incorrectly.
+        // SPA routing: adminBasePath is the URL prefix the user reached the
+        // admin under (no trailing slash, no view tail). All view URLs and
+        // ?api=... fetches build off this so the same code works under
+        // direct and router modes — and under PATH_INFO where relative URLs
+        // would otherwise resolve incorrectly. adminUsesPathUrls picks the
+        // view-URL shape: path-style (/admin/invoices) where the host
+        // provably routes it, query-style (admin.php?view=invoices)
+        // everywhere else — see the server-side routing block above.
         const adminBasePath = <?= json_encode($adminBasePath) ?>;
+        const adminUsesPathUrls = <?= json_encode($adminUsesPathUrls) ?>;
         const adminUrl = adminBasePath;
         const setupUrl = <?= json_encode(Urls::setup()) ?>;
-        // Public site root (WordPress mode) — where payer-facing redirect
-        // links (the payment page's "Continue to Store" / "Return to Shop"
-        // buttons) should land. The admin SPA's own URL is gated behind
-        // manage_options, so it must never be handed to a payer. Null in
-        // standalone mode, where there is no public shop to return to.
-        const shopHomeUrl = <?= json_encode(Urls::isWordPress() ? home_url('/') : null) ?>;
+        // Public shop front page (managed installs) — where payer-facing
+        // redirect links for admin-created invoices should land. The admin
+        // SPA's own URL is login-gated, so it must never be handed to a
+        // payer. Null in standalone mode, where there is no public shop to
+        // return to.
+        const shopHomeUrl = <?= json_encode(ManagedInstall::shopUrl() ?: null) ?>;
         // Where to point "get a free lightning address" links (Strike). Operator
         // override via CASHUPAY_STRIKE_URL in user_config.php; defaults to strike.me.
         const strikeUrl = <?= json_encode(defined('CASHUPAY_STRIKE_URL') ? CASHUPAY_STRIKE_URL : 'http://strike.me') ?>;
@@ -7598,7 +7618,6 @@ header('Cache-Control: no-cache, must-revalidate');
 
         // URL mode config (embedded from PHP)
         const urlModeConfig = {
-            isWordPress: <?= json_encode(Urls::isWordPress()) ?>,
             currentMode: <?= json_encode(Config::getUrlMode()) ?>,
             baseUrl: <?= json_encode(Urls::siteBase()) ?>
         };
@@ -7682,11 +7701,6 @@ header('Cache-Control: no-cache, must-revalidate');
 
         // Check authentication state
         function checkAuth() {
-            if (isWordPressMode) {
-                showApp();
-                return;
-            }
-
             if (phpLoggedIn) {
                 showApp();
             } else {
@@ -7999,6 +8013,8 @@ header('Cache-Control: no-cache, must-revalidate');
             if (btnAddNoffer) btnAddNoffer.addEventListener('click', addNofferRow);
             const btnAddNwc = document.getElementById('btn-add-nwc');
             if (btnAddNwc) btnAddNwc.addEventListener('click', addNwcRow);
+            const btnAddStrike = document.getElementById('btn-add-strike');
+            if (btnAddStrike) btnAddStrike.addEventListener('click', addStrikeRow);
             // Live-update LN-address vs swap-mode hint pane when the operator
             // changes the dropdown, even before they save.
             const autoMeltModeSel = document.getElementById('auto-melt-mode-override');
@@ -8027,6 +8043,8 @@ header('Cache-Control: no-cache, must-revalidate');
             if (storeTestBtn) storeTestBtn.addEventListener('click', sendStoreTestNotification);
             const saveNotifsBtn = document.getElementById('btn-save-notifications');
             if (saveNotifsBtn) saveNotifsBtn.addEventListener('click', saveNotificationSettings);
+            const payerCaptureToggle = document.getElementById('notifications-payer-email-capture');
+            if (payerCaptureToggle) payerCaptureToggle.addEventListener('change', updatePayerCaptureDependents);
             const saveDevBtn = document.getElementById('btn-save-developer');
             if (saveDevBtn) saveDevBtn.addEventListener('click', saveDeveloperSettings);
             const testNotifsBtn = document.getElementById('btn-send-test-notification');
@@ -8073,7 +8091,7 @@ header('Cache-Control: no-cache, must-revalidate');
             if (dismissCronBtn) dismissCronBtn.addEventListener('click', dismissCronStaleBanner);
             document.getElementById('btn-logout').addEventListener('click', logout);
 
-            // My Account + Users (standalone only — WordPress uses WP for user management)
+            // My Account + Users
             const btnChangePass = document.getElementById('btn-change-own-password');
             if (btnChangePass) {
                 btnChangePass.addEventListener('click', () => openModal('modal-change-password'));
@@ -8286,9 +8304,16 @@ header('Cache-Control: no-cache, must-revalidate');
         // Build a URL for a view, preserving the invoices ?status filter when
         // navigating between invoices states. Other views drop the query
         // string — none of them currently carry URL-resident state.
+        // Path-style only where the host provably routes it; otherwise the
+        // ?view= query form, which every host serves (see adminUsesPathUrls).
         function urlForView(view, query) {
-            let url = adminBasePath + '/' + view;
-            if (query) url += '?' + query;
+            if (adminUsesPathUrls) {
+                let url = adminBasePath + '/' + view;
+                if (query) url += '?' + query;
+                return url;
+            }
+            let url = adminBasePath + '?view=' + encodeURIComponent(view);
+            if (query) url += '&' + query;
             return url;
         }
 
@@ -8308,9 +8333,12 @@ header('Cache-Control: no-cache, must-revalidate');
         // Browser Back/Forward should navigate between admin views without a
         // full page reload — derive the target view from the new URL.
         window.addEventListener('popstate', () => {
+            // Query-form URLs carry the view in ?view=; path-form URLs carry
+            // it as the last non-empty path segment. Check the query first —
+            // it is only ever present on query-form URLs.
+            const qsView = new URLSearchParams(window.location.search).get('view');
             const path = window.location.pathname;
-            // The view slug is the last non-empty path segment.
-            const seg = path.split('/').filter(Boolean).pop() || 'dashboard';
+            const seg = qsView || path.split('/').filter(Boolean).pop() || 'dashboard';
             const view = ADMIN_VIEWS.includes(seg) ? seg : 'dashboard';
             switchView(view, { replace: true });
         });
@@ -8327,7 +8355,7 @@ header('Cache-Control: no-cache, must-revalidate');
 
         // Header user dropdown: shows the current username, opens/closes on
         // user-btn click, closes on outside click or Escape, hosts the
-        // Logout entry. No-op in WordPress mode (the markup is omitted).
+        // Logout entry.
         function setupUserMenu() {
             const btn = document.getElementById('user-btn');
             if (!btn) return;
@@ -8601,7 +8629,7 @@ header('Cache-Control: no-cache, must-revalidate');
                 stores.forEach(store => {
                     const opt = document.createElement('option');
                     opt.value = store.id;
-                    opt.textContent = store.name + (store.isConfigured ? '' : ' (not configured)');
+                    opt.textContent = store.name + (store.hasPaymentRail ? '' : ' (not configured)');
                     select.appendChild(opt);
                 });
             }
@@ -9323,10 +9351,13 @@ header('Cache-Control: no-cache, must-revalidate');
                     ? `${base} <span class="inv-fee-badge" title="Paid by redirecting a customer invoice straight to the fee destination (no wallet melt).">redirect</span>`
                     : base;
             };
+            // Strike cashouts carry the Strike invoice id created for the
+            // payout, so the merchant can match the incoming payment in
+            // their Strike dashboard.
             const rows = data.rows.map(row => `
                 <tr>
                     <td>${new Date(row.created_at * 1000).toLocaleString()}</td>
-                    <td class="truncate" title="${escapeHtml(row.destination || '')}">${escapeHtml(row.destination || '')}</td>
+                    <td class="truncate" title="${escapeHtml(row.destination || '')}">${escapeHtml(row.destination || '')}${row.strike_invoice_id ? ` <span class="inv-mono">${renderCopyMono(row.strike_invoice_id, 'Strike invoice ID')}</span>` : ''}</td>
                     ${showType ? `<td>${typeCell(row)}</td>` : ''}
                     <td style="text-align:right">${formatStatsAmount(row.amount_sats)}</td>
                     <td style="text-align:right">${formatStatsAmount(row.network_fee_sats)}</td>
@@ -9749,6 +9780,7 @@ header('Cache-Control: no-cache, must-revalidate');
         function renderPaymentMethod(rail, mintUrl) {
             const map = {
                 mint:    { icon: '⚡', label: 'Lightning (cashu)' },
+                strike:  { icon: '⚡', label: 'Lightning (Strike)' },
                 onchain: { icon: '🔗', label: 'On-chain' },
                 swap:    { icon: '🔄', label: 'Swap' },
                 cashu:   { icon: '🥜', label: 'Cashu' },
@@ -9831,11 +9863,19 @@ header('Cache-Control: no-cache, must-revalidate');
                 const emailCell = inv.customerEmail
                     ? `<span class="inv-mono">${escapeHtml(inv.customerEmail)}</span>${inv.newsletterOptIn ? ' <span title="Subscribed to newsletter" style="color: var(--success, #48bb78);">✓</span>' : ''}`
                     : '<span style="color: var(--text-secondary);">—</span>';
+                // Strike receives carry Strike's own invoice id next to the
+                // masked destination label — the id the operator can look up
+                // in their Strike dashboard to reconcile the payment.
+                const strikeIdPart = inv.strikeInvoiceId
+                    ? ` ${renderCopyMono(inv.strikeInvoiceId, 'Strike invoice ID')}`
+                    : '';
                 const destCell = inv.destination
                     ? `<span class="inv-mono">${inv.destinationIsLightning
                         ? renderCopyMono(inv.destination, 'Lightning destination')
-                        : renderMonoLink('address', inv.destination, network)}</span>`
-                    : '<span style="color: var(--text-secondary);">—</span>';
+                        : renderMonoLink('address', inv.destination, network)}${strikeIdPart}</span>`
+                    : (inv.strikeInvoiceId
+                        ? `<span class="inv-mono">${renderCopyMono(inv.strikeInvoiceId, 'Strike invoice ID')}</span>`
+                        : '<span style="color: var(--text-secondary);">—</span>');
                 const txidCell = inv.txid
                     ? `<span class="inv-mono">${inv.txidIsLightning
                         ? renderCopyMono(inv.txid, 'Lightning invoice (bolt11)')
@@ -10471,9 +10511,9 @@ header('Cache-Control: no-cache, must-revalidate');
                     amount: amount,
                     currency: currency,
                     checkout: {
-                        // WordPress mode: payers land on the shop's front
-                        // page — this admin's URL is manage_options-gated and
-                        // shows them an Access-denied page. Standalone keeps
+                        // Managed installs: payers land on the shop's front
+                        // page — this admin's URL is login-gated and would
+                        // only show them the lock screen. Standalone keeps
                         // the return-to-admin convenience (no shop exists).
                         redirectURL: shopHomeUrl || window.location.href.split('?')[0],
                         redirectAutomatically: true
@@ -10867,6 +10907,7 @@ header('Cache-Control: no-cache, must-revalidate');
             syncLnAddressesFromInputs();
             syncNoffersFromInputs();
             syncNwcFromInputs();
+            syncStrikeFromInputs();
             const lnAddresses = awLnAddresses
                 .map(a => (a.address || '').trim())
                 .filter(a => a.length > 0);
@@ -10878,10 +10919,25 @@ header('Cache-Control: no-cache, must-revalidate');
             const nwcEntries = awNwc
                 .map(a => a.ref ? a.ref : (a.uri || '').trim())
                 .filter(a => a.length > 0);
+            // Strike entries post the same way: keep:<id> refs or raw keys.
+            const strikeEntries = awStrike
+                .map(a => a.ref ? a.ref : (a.key || '').trim())
+                .filter(a => a.length > 0);
 
             // Validate each section against its own type before saving so bad
             // data surfaces inline rather than failing silently on the server.
+            for (const s of strikeEntries) {
+                if (s.startsWith('keep:')) continue; // saved row reference
+                if (!isStrikeKeyValue(s)) {
+                    // Don't echo the paste back — even a malformed key paste
+                    // may be (most of) the real credential.
+                    return awError('lightning-payments-error', 'That Strike API entry doesn\'t look like a valid key (one unbroken block of letters and numbers, copied from the Strike dashboard).');
+                }
+            }
             for (const a of lnAddresses) {
+                if (isStrikeLnAddress(a)) {
+                    return awError('lightning-payments-error', `"${a}" is a Strike lightning address — those don't support LUD-21 payment verification. Use the Strike API keys section above instead.`);
+                }
                 if (isNofferValue(a)) {
                     const nofferGated = !!document.getElementById('auto-melt-noffer-group')?.dataset.envError;
                     return awError('lightning-payments-error', nofferGated
@@ -10929,6 +10985,9 @@ header('Cache-Control: no-cache, must-revalidate');
                 for (const w of nwcEntries) {
                     body += `&nwc%5B%5D=${encodeURIComponent(w)}`;
                 }
+                for (const s of strikeEntries) {
+                    body += `&strike%5B%5D=${encodeURIComponent(s)}`;
+                }
 
                 const response = await postWithCsrf(adminUrl, body);
 
@@ -10962,15 +11021,15 @@ header('Cache-Control: no-cache, must-revalidate');
                             lud21Support: (r.lud21Support === null || r.lud21Support === undefined)
                                 ? null : Number(r.lud21Support),
                         }));
-                        awLnAddresses = mapped.filter(a => a.type !== 'noffer' && a.type !== 'nwc');
+                        awLnAddresses = mapped.filter(a => a.type !== 'noffer' && a.type !== 'nwc' && a.type !== 'strike');
                         awNoffers = mapped.filter(a => a.type === 'noffer');
                         if (dashboardData && dashboardData.autoMelt) {
-                            // nwc rows are cached from loadDashboard() only —
-                            // the save response has their masked label but not
-                            // the keep-ref, and a ref-less row would rerender
-                            // as an editable (bogus) URI input.
+                            // nwc/strike rows are cached from loadDashboard()
+                            // only — the save response has their masked label
+                            // but not the keep-ref, and a ref-less row would
+                            // rerender as an editable (bogus) secret input.
                             dashboardData.autoMelt.addresses = mapped
-                                .filter(a => a.type !== 'nwc')
+                                .filter(a => a.type !== 'nwc' && a.type !== 'strike')
                                 .map(a => ({ ...a }));
                         }
                         renderLnAddressRows();
@@ -11006,12 +11065,14 @@ header('Cache-Control: no-cache, must-revalidate');
                 syncLnAddressesFromInputs();
                 syncNoffersFromInputs();
                 syncNwcFromInputs();
+                syncStrikeFromInputs();
                 const haveDestinations =
                     awLnAddresses.some(a => (a.address || '').trim().length > 0)
                     || awNoffers.some(a => (a.address || '').trim().length > 0)
-                    || awNwc.some(a => a.ref || (a.uri || '').trim().length > 0);
+                    || awNwc.some(a => a.ref || (a.uri || '').trim().length > 0)
+                    || awStrike.some(a => a.ref || (a.key || '').trim().length > 0);
                 if (enabled === '1' && !haveDestinations) {
-                    return awError('aw-store-error', 'Add at least one lightning address, NWC connection, or noffer in the Lightning payments section to withdraw to.');
+                    return awError('aw-store-error', 'Add at least one Strike API key, lightning address, NWC connection, or noffer in the Lightning payments section to withdraw to.');
                 }
             } else if (modeOverride === '1') {
                 if (!storeHasOnchain()) {
@@ -11179,6 +11240,11 @@ header('Cache-Control: no-cache, must-revalidate');
         // which embeds the wallet secret; shown read-only) or new rows
         // ({uri, ref:null} — an editable input the operator pastes into).
         let awNwc = [];
+        // Strike API keys, own section above the lightning addresses (they
+        // lead the chain at invoice time). Same kept/new row shapes as awNwc:
+        // {label, ref:'keep:<id>'} for saved keys (the server never sends the
+        // raw key) or {key, ref:null} for a freshly pasted one.
+        let awStrike = [];
 
         // A destination is a CLINK noffer if it's a bech32 'noffer1…' string
         // (optionally lightning:-prefixed), otherwise it's a Lightning address.
@@ -11191,6 +11257,20 @@ header('Cache-Control: no-cache, must-revalidate');
         // fully re-validates (and probes) on save.
         function isNwcValue(v) {
             return /^nostr\+walletconnect:(\/\/)?[0-9a-f]{64}\?/i.test(String(v || '').trim());
+        }
+
+        // Cheap client-side shape check for a Strike API key (one unbroken
+        // alphanumeric token); the server fully re-validates (and probes with
+        // a 1-sat test invoice) on save.
+        function isStrikeKeyValue(v) {
+            return /^[A-Za-z0-9]{16,256}$/.test(String(v || '').trim());
+        }
+
+        // A @strike.me lightning address can never work as an LNURL
+        // destination (no LUD-21 verify) — the Strike API section is the
+        // supported path.
+        function isStrikeLnAddress(v) {
+            return /@strike\.me$/i.test(String(v || '').trim());
         }
 
         function setLnAddressRowsFromData() {
@@ -11206,15 +11286,18 @@ header('Cache-Control: no-cache, must-revalidate');
                     ? null : Number(a.lud21Support),
                 ref: a.ref || null,
             }));
-            awLnAddresses = mapped.filter(a => a.type !== 'noffer' && a.type !== 'nwc');
+            awLnAddresses = mapped.filter(a => a.type !== 'noffer' && a.type !== 'nwc' && a.type !== 'strike');
             awNoffers = mapped.filter(a => a.type === 'noffer');
-            // Stored nwc rows arrive masked: address is the display label and
-            // ref the opaque keep:<id> the save posts back.
+            // Stored nwc/strike rows arrive masked: address is the display
+            // label and ref the opaque keep:<id> the save posts back.
             awNwc = mapped.filter(a => a.type === 'nwc')
                 .map(a => ({ label: a.address, uri: '', ref: a.ref }));
+            awStrike = mapped.filter(a => a.type === 'strike')
+                .map(a => ({ label: a.address, key: '', ref: a.ref }));
             renderLnAddressRows();
             renderNofferRows();
             renderNwcRows();
+            renderStrikeRows();
         }
 
         // Read the current input values back into awLnAddresses (preserving the
@@ -11305,8 +11388,20 @@ header('Cache-Control: no-cache, must-revalidate');
                         awLnAddresses[i].lud21Support = null;
                         awLnAddresses[i].type = isNofferValue(input.value) ? 'noffer' : 'lnaddress';
                     }
-                    const hintEl = row.querySelector('.ln-address-hint');
-                    if (hintEl) hintEl.style.display = 'none';
+                    const hintEl = row.nextElementSibling;
+                    if (!hintEl || !hintEl.classList.contains('ln-address-hint')) return;
+                    // Live warning for @strike.me — those addresses can never
+                    // pass the LUD-21 save gate; the Strike API section is the
+                    // supported path.
+                    if (isStrikeLnAddress(input.value)) {
+                        hintEl.textContent = 'Strike lightning addresses don\'t support LUD-21 '
+                            + 'payment verification and can\'t be used here — use the '
+                            + 'Strike API keys section above instead.';
+                        hintEl.style.color = 'var(--warning, #b07b00)';
+                        hintEl.style.display = '';
+                    } else {
+                        hintEl.style.display = 'none';
+                    }
                 });
                 row.appendChild(input);
 
@@ -11344,6 +11439,11 @@ header('Cache-Control: no-cache, must-revalidate');
                         + 'invoices as “unpaid”. There is no risk to funds from this, but it '
                         + 'does mean an order may show unpaid when it was, in fact, paid.';
                     hintEl.style.color = 'var(--success, #2d7a3a)';
+                } else if (isStrikeLnAddress(entry.address)) {
+                    hintEl.textContent = 'Strike lightning addresses don\'t support LUD-21 '
+                        + 'payment verification and can\'t be used here — use the '
+                        + 'Strike API keys section above instead.';
+                    hintEl.style.color = 'var(--warning, #b07b00)';
                 } else {
                     const hint = lud21HintFor(entry.lud21Support);
                     if (hint) {
@@ -11550,6 +11650,105 @@ header('Cache-Control: no-cache, must-revalidate');
             });
         }
 
+        function syncStrikeFromInputs() {
+            const list = document.getElementById('auto-melt-strike-list');
+            if (!list) return;
+            const next = [];
+            list.querySelectorAll('[data-strike-entry]').forEach((el) => {
+                if (el.dataset.strikeRef) {
+                    next.push({ label: el.dataset.strikeLabel || '', key: '', ref: el.dataset.strikeRef });
+                } else {
+                    const inp = el.querySelector('input.strike-input');
+                    next.push({ label: '', key: inp ? inp.value : '', ref: null });
+                }
+            });
+            awStrike = next;
+        }
+
+        function addStrikeRow() {
+            syncStrikeFromInputs();
+            awStrike.push({ label: '', key: '', ref: null });
+            renderStrikeRows();
+            const list = document.getElementById('auto-melt-strike-list');
+            if (list) {
+                const inputs = list.querySelectorAll('input.strike-input');
+                if (inputs.length) inputs[inputs.length - 1].focus();
+            }
+        }
+
+        function removeStrikeRow(index) {
+            syncStrikeFromInputs();
+            awStrike.splice(index, 1);
+            renderStrikeRows();
+        }
+
+        function moveStrikeRow(index, delta) {
+            syncStrikeFromInputs();
+            const target = index + delta;
+            if (target < 0 || target >= awStrike.length) return;
+            const tmp = awStrike[index];
+            awStrike[index] = awStrike[target];
+            awStrike[target] = tmp;
+            renderStrikeRows();
+        }
+
+        function renderStrikeRows() {
+            const list = document.getElementById('auto-melt-strike-list');
+            if (!list) return;
+            list.innerHTML = '';
+            awStrike.forEach((entry, i) => {
+                const row = document.createElement('div');
+                row.className = 'strike-row';
+                row.setAttribute('data-strike-entry', '1');
+                if (entry.ref) {
+                    row.dataset.strikeRef = entry.ref;
+                    row.dataset.strikeLabel = entry.label || '';
+                }
+                row.style.cssText = 'display:flex; align-items:center; gap:0.4rem; margin-bottom:0.4rem;';
+
+                const prio = document.createElement('span');
+                prio.textContent = (i + 1) + '.';
+                prio.style.cssText = 'min-width:1.4rem; text-align:right; opacity:0.7; font-size:0.85rem;';
+                row.appendChild(prio);
+
+                if (entry.ref) {
+                    const label = document.createElement('span');
+                    label.className = 'strike-saved-label';
+                    label.textContent = entry.label || 'Strike API key';
+                    label.title = 'Saved Strike API key — the key stays on the server. Remove and re-add to change it.';
+                    label.style.cssText = 'flex:1; padding:0.45rem 0.6rem; border:1px dashed var(--border, #ccc); border-radius:6px; opacity:0.85; font-size:0.9rem;';
+                    row.appendChild(label);
+                } else {
+                    const input = document.createElement('input');
+                    input.type = 'text';
+                    input.className = 'form-input strike-input';
+                    input.placeholder = 'paste your Strike API key';
+                    input.autocomplete = 'off';
+                    input.spellcheck = false;
+                    input.value = entry.key || '';
+                    input.style.flex = '1';
+                    row.appendChild(input);
+                }
+
+                const mkBtn = (label, title, handler, disabled) => {
+                    const b = document.createElement('button');
+                    b.type = 'button';
+                    b.className = 'btn btn-secondary';
+                    b.textContent = label;
+                    b.title = title;
+                    b.style.cssText = 'padding:0.3rem 0.55rem; line-height:1;';
+                    if (disabled) { b.disabled = true; b.style.opacity = '0.4'; }
+                    else b.addEventListener('click', handler);
+                    return b;
+                };
+                row.appendChild(mkBtn('↑', 'Move up', () => moveStrikeRow(i, -1), i === 0));
+                row.appendChild(mkBtn('↓', 'Move down', () => moveStrikeRow(i, 1), i === awStrike.length - 1));
+                row.appendChild(mkBtn('✕', 'Remove', () => removeStrikeRow(i), false));
+
+                list.appendChild(row);
+            });
+        }
+
         // Kept for callers that refresh the chain display after a mode change.
         // Preserve any unsaved edits already typed into the rows before redrawing.
         function renderLud21Warning() {
@@ -11614,8 +11813,6 @@ header('Cache-Control: no-cache, must-revalidate');
             const email = document.getElementById('store-notification-email').value.trim();
             const passwordCleared = document.getElementById('store-smtp-password-clear').checked;
             const passwordTyped = document.getElementById('store-smtp-password').value !== '';
-            // Absent in WordPress installs (the payment page never shows the
-            // newsletter checkbox there); the backend keeps the stored value.
             const storeNewsletterEl = document.getElementById('store-newsletter-default');
             const params = new URLSearchParams({
                 action: 'save_store_notifications',
@@ -11731,12 +11928,15 @@ header('Cache-Control: no-cache, must-revalidate');
                 document.getElementById('notifications-enabled').checked = !!data.enabled;
                 document.getElementById('notifications-invoice-paid').checked = !!data.invoicePaidEnabled;
                 document.getElementById('notifications-auto-cashout').checked = !!data.autoCashoutEnabled;
-                // Both are absent in WordPress installs, where the payment page
-                // never renders the email/newsletter form.
+                // Effective server-side value (explicit config, or the
+                // managed/standalone default when never saved).
+                const payerCaptureEl = document.getElementById('notifications-payer-email-capture');
+                if (payerCaptureEl) payerCaptureEl.checked = !!data.payerEmailCaptureEnabled;
                 const payerReceiptEl = document.getElementById('notifications-payer-receipt');
                 if (payerReceiptEl) payerReceiptEl.checked = !!data.payerReceiptEnabled;
                 const newsletterDefaultEl = document.getElementById('notifications-newsletter-default');
                 if (newsletterDefaultEl) newsletterDefaultEl.checked = !!data.newsletterDefaultChecked;
+                updatePayerCaptureDependents();
                 document.getElementById('notifications-to-email').value = data.toEmail || '';
                 document.getElementById('notifications-smtp-warning').classList.toggle('hidden', !!data.smtpConfigured);
                 // Global SMTP server fields. Password is write-only: it's never
@@ -11763,12 +11963,24 @@ header('Cache-Control: no-cache, must-revalidate');
             }
         }
 
+        // Receipt + newsletter toggles are dead while payer email capture is
+        // off (the payment page never renders the form) — grey them out so
+        // the dependency is visible, but keep their stored values intact.
+        function updatePayerCaptureDependents() {
+            const captureEl = document.getElementById('notifications-payer-email-capture');
+            const depEl = document.getElementById('payer-email-capture-dependent');
+            if (!captureEl || !depEl) return;
+            const on = captureEl.checked;
+            depEl.style.opacity = on ? '' : '0.5';
+            depEl.style.pointerEvents = on ? '' : 'none';
+        }
+
         async function saveNotificationSettings() {
             const enabled = document.getElementById('notifications-enabled').checked ? '1' : '0';
             const invoicePaid = document.getElementById('notifications-invoice-paid').checked ? '1' : '0';
             const autoCashout = document.getElementById('notifications-auto-cashout').checked ? '1' : '0';
-            // Absent in WordPress installs; the backend ignores these fields
-            // there, so the sent value is only a placeholder.
+            const payerCaptureEl = document.getElementById('notifications-payer-email-capture');
+            const payerEmailCapture = payerCaptureEl && payerCaptureEl.checked ? '1' : '0';
             const payerReceiptEl = document.getElementById('notifications-payer-receipt');
             const payerReceipt = payerReceiptEl && payerReceiptEl.checked ? '1' : '0';
             const newsletterDefaultEl = document.getElementById('notifications-newsletter-default');
@@ -11777,7 +11989,9 @@ header('Cache-Control: no-cache, must-revalidate');
             const params = new URLSearchParams({
                 action: 'save_notifications_settings',
                 enabled, invoice_paid_enabled: invoicePaid,
-                auto_cashout_enabled: autoCashout, payer_receipt_enabled: payerReceipt,
+                auto_cashout_enabled: autoCashout,
+                payer_email_capture_enabled: payerEmailCapture,
+                payer_receipt_enabled: payerReceipt,
                 newsletter_default_checked: newsletterDefault,
                 to_email: toEmail,
                 smtp_host: document.getElementById('smtp-host').value.trim(),
@@ -12352,8 +12566,6 @@ header('Cache-Control: no-cache, must-revalidate');
         }
 
         async function detectAndSaveUrlMode() {
-            if (urlModeConfig.isWordPress) return;
-
             const statusEl = document.getElementById('url-mode-detect-status');
             const labelEl = document.getElementById('url-mode-current-label');
             if (statusEl) {
@@ -12796,7 +13008,10 @@ header('Cache-Control: no-cache, must-revalidate');
                 'permissions[]': 'btcpay.store.cancreateinvoice',
                 strict: 'true'
             });
-            const pairingUrl = serverUrl + '/api-keys/authorize?' + pairingParams.toString();
+            // The real file, not the pretty /api-keys/authorize rewrite:
+            // rewrite-hostile hosts 404 the extension-less spelling, and
+            // authorize.php executes anywhere this admin itself is served.
+            const pairingUrl = serverUrl + '/api-keys/authorize.php?' + pairingParams.toString();
 
             // All references to the store-scoped values (id/name) are placed
             // into data-* attributes; click handlers are wired up below. That
@@ -13579,9 +13794,7 @@ header('Cache-Control: no-cache, must-revalidate');
                 case 'error':
                     return { busy: false, done: 'failed', text: 'The update could not be applied' + (run.message ? (': ' + run.message) : '.'), color: '#ef4444' };
                 case 'blocked':
-                    return { busy: false, done: 'blocked', text: run.reason === 'wordpress'
-                        ? 'Updates here are managed by WordPress.'
-                        : 'Updates are disabled in this environment.', color: 'var(--text-secondary)' };
+                    return { busy: false, done: 'blocked', text: 'Updates are disabled in this environment.', color: 'var(--text-secondary)' };
                 default:
                     return null;
             }
@@ -13660,9 +13873,7 @@ header('Cache-Control: no-cache, must-revalidate');
                 if (data && data.manual_blocked && !view) {
                     if (cardProg) {
                         cardProg.classList.remove('hidden');
-                        cardProg.textContent = data.manual_blocked === 'wordpress'
-                            ? 'Updates here are managed by WordPress.'
-                            : 'Updates are disabled in this environment (dev/test).';
+                        cardProg.textContent = 'Updates are disabled in this environment (dev/test).';
                         cardProg.style.color = 'var(--text-secondary)';
                     }
                 }
@@ -13694,8 +13905,7 @@ header('Cache-Control: no-cache, must-revalidate');
                 const data = await r.json();
                 if (!data || !data.success) {
                     const reason = data && data.error;
-                    const msg = reason === 'wordpress' ? 'Updates here are managed by WordPress.'
-                        : reason === 'disabled' ? 'Updates are disabled in this environment (dev/test).'
+                    const msg = reason === 'disabled' ? 'Updates are disabled in this environment (dev/test).'
                         : reason === 'no_cron_key' ? 'Set up the cron job first — the updater needs the cron key.'
                         : 'Could not start the update.';
                     showToast(msg, 'error');

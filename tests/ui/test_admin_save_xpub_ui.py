@@ -59,7 +59,7 @@ _MAINNET = (
 FRESH_TPUB = _xpub_to_tpub(_MAINNET)
 
 
-def test_save_new_xpub_replacing_existing(configured: ConfiguredPayserver, page) -> None:
+def test_save_new_xpub_replacing_existing(shared_configured: ConfiguredPayserver, page) -> None:
     """Reproduces the user's exact scenario:
 
     1. Store already has an on-chain xpub configured (iterate.py does this
@@ -74,6 +74,7 @@ def test_save_new_xpub_replacing_existing(configured: ConfiguredPayserver, page)
     We capture console + network + toast + DB state to surface where it
     actually breaks.
     """
+    configured = shared_configured
     # --- step 0: seed the store with an initial xpub via the same DB-write
     # path iterate.py uses, so dashboardData.onchain.enabled is true at click
     # time (the precondition for the bug).
@@ -131,6 +132,11 @@ def test_save_new_xpub_replacing_existing(configured: ConfiguredPayserver, page)
     page.fill("#password-input", configured.admin_password)
     page.click("#password-submit")
     page.wait_for_selector("#app", state="visible")
+
+    # Pin the header selector to this test's own store — the shared server
+    # auto-selects its first store, but the xpub was seeded into (and must be
+    # saved back to) the per-test store.
+    page.select_option("#store-select", configured.store_id)
 
     # Click the Stores nav item — that's the view holding the on-chain card.
     page.locator('.nav-item[data-view="stores"]').click()

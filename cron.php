@@ -79,6 +79,25 @@ if ($isInternal) {
     }
 }
 
+// Reachability ping: answer right after authentication, before the last-run
+// stamp, the overlap lock, and every task. Orchestrators that drive this
+// endpoint on the operator's behalf (the WordPress plugin's onboarding) need
+// a synchronous "can I reach cron.php with this key?" probe while the
+// operator is watching — and the full task set is exactly what must NOT run
+// inside that interactive request: a first-ever full pass (updater check,
+// IP-geo download, mint syncs) can hold a PHP worker for minutes, which on
+// tight per-site pools starves the very page the operator is waiting on. A
+// ping proves routing + key and nothing else; it deliberately skips the
+// last_external_cron_at stamp, because it is not a task run and must not
+// mask a scheduler that never actually ticks. Servers that predate this
+// block ignore the parameter and answer with a full run — the same JSON
+// shape — so callers sending it degrade gracefully against them.
+if (($_GET['ping'] ?? '') === '1') {
+    header('Content-Type: application/json');
+    echo json_encode(['mode' => 'ping', 'ok' => true]);
+    exit;
+}
+
 // Stamp the last *external* cron run so the dashboard can warn admins when
 // the operator's environment isn't actually invoking cron.php on a schedule.
 // Internal self-requests do not count, otherwise opportunistic admin/checkout
@@ -210,6 +229,19 @@ if (!$swapOnly) {
         $results['tasks']['poll_nwc'] = 'success';
     } catch (\Throwable $e) {
         $results['tasks']['poll_nwc'] = 'error: ' . $e->getMessage();
+    }
+}
+
+// Task 1a''': Poll Strike-rail invoices via the Strike API. Reliable
+// (stored-state read-back of the Strike invoice, like the NWC lookup above) —
+// settles a Strike invoice whose customer paid and closed the tab before the
+// page poll caught it.
+if (!$swapOnly) {
+    try {
+        Invoice::pollPendingStrike();
+        $results['tasks']['poll_strike'] = 'success';
+    } catch (\Throwable $e) {
+        $results['tasks']['poll_strike'] = 'error: ' . $e->getMessage();
     }
 }
 
@@ -567,7 +599,7 @@ if (!$swapOnly && !$skipNonEssential) try {
     $results['tasks']['ipgeo'] = 'error: ' . $e->getMessage();
 }
 
-// Task 12: Auto-update trigger. Daily, no-op in WordPress mode. Skipped on
+// Task 12: Auto-update trigger. Daily. Skipped on
 // internal background self-requests so checkout traffic doesn't trigger
 // a download — only the dedicated cron tick nudges the updater.
 //
@@ -594,7 +626,7 @@ if (!$isInternal && !$swapOnly) {
 // of the auto-update opt-in — the banner has to nudge operators who have NOT
 // enabled auto-update. This only compares the remote channel's COMMIT_SHA to
 // the local one; it never downloads or applies anything. Self-throttled to a
-// daily check and a no-op in WordPress / test-disabled environments.
+// daily check and a no-op in test-disabled environments.
 if (!$isInternal && !$swapOnly && !$skipNonEssential) {
     try {
         $av = Updater::checkForUpdate();

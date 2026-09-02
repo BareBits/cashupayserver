@@ -75,9 +75,13 @@ if (preg_match('#^/api/v1/#', $uri)) {
 }
 
 // -----------------------------------------------------------------------------
-// API Key Authorization: /api-keys/authorize
+// API Key Authorization: /api-keys/authorize, and its real-file .php form.
+// The WordPress plugin always targets authorize.php (rewrite-hostile hosts
+// 404 the extension-less spelling), and the root-level $allowedFiles pass
+// below matches basename() only — without this, a router-mode deployment
+// (PHP built-in server, nginx front controller) would 404 the .php form.
 // -----------------------------------------------------------------------------
-if (preg_match('#^/api-keys/authorize$#', $uri)) {
+if (preg_match('#^/api-keys/authorize(?:\.php)?$#', $uri)) {
     require __DIR__ . '/api-keys/authorize.php';
     exit;
 }
@@ -89,6 +93,20 @@ if (preg_match('#^/payment(?:/(.+))?$#', $uri, $matches)) {
     if (!empty($matches[1])) {
         $_GET['id'] = $matches[1];
     }
+    require __DIR__ . '/payment.php';
+    exit;
+}
+
+// -----------------------------------------------------------------------------
+// BTCPay-compatible invoice URL: /i/{invoiceId}. BTCPay API clients (the
+// WooCommerce Greenfield gateway among them) build this link themselves off
+// the configured server URL when re-opening an existing invoice; BareBits'
+// checkout page is payment.php, so serve it there. The .htaccess catch-all
+// and the nginx @router front controller both forward /i/* here; the query
+// transport (api.php?cashupay_path=/i/{id}) answers with a redirect instead.
+// -----------------------------------------------------------------------------
+if (preg_match('#^/i/([^/]+)$#', $uri, $matches)) {
+    $_GET['id'] = rawurldecode($matches[1]);
     require __DIR__ . '/payment.php';
     exit;
 }
@@ -161,6 +179,23 @@ if (preg_match('#^/health$#', $uri)) {
 }
 
 // -----------------------------------------------------------------------------
+// Provision: /provision — one-time credential handshake for orchestrated
+// installs (see provision.php). Routable so it works in every URL mode.
+// -----------------------------------------------------------------------------
+if (preg_match('#^/provision$#', $uri)) {
+    require __DIR__ . '/provision.php';
+    exit;
+}
+
+// -----------------------------------------------------------------------------
+// SSO: /sso — login-token handoff for managed installs (see sso.php).
+// -----------------------------------------------------------------------------
+if (preg_match('#^/sso$#', $uri)) {
+    require __DIR__ . '/sso.php';
+    exit;
+}
+
+// -----------------------------------------------------------------------------
 // Product image: /product-image — serves uploaded product images (public).
 // -----------------------------------------------------------------------------
 if (preg_match('#^/product-image$#', $uri)) {
@@ -214,7 +249,7 @@ if ($uri === '/' || $uri === '') {
 // Direct .php file access (for backwards compatibility)
 // Only allow specific public files
 // -----------------------------------------------------------------------------
-$allowedFiles = ['index.php', 'admin.php', 'setup.php', 'payment.php', 'pay.php', 'api.php', 'cron.php', 'receive.php', 'recover.php', 'update.php', 'health.php', 'product-image.php'];
+$allowedFiles = ['index.php', 'admin.php', 'setup.php', 'payment.php', 'pay.php', 'api.php', 'cron.php', 'receive.php', 'recover.php', 'update.php', 'health.php', 'product-image.php', 'provision.php', 'sso.php'];
 $requestedFile = basename($uri);
 
 if (in_array($requestedFile, $allowedFiles)) {

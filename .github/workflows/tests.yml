@@ -11,16 +11,25 @@ concurrency:
 
 jobs:
   e2e-and-ui:
-    name: E2E + UI
+    name: E2E + UI (shard ${{ matrix.shard }}/3)
     runs-on: ubuntu-22.04
-    # The full e2e+ui+wordpress suite runs serially (session-scoped bitcoind/
-    # lnd/mint/channels rule out xdist), taking ~40m and growing. 40m left no
-    # headroom — runs were cancelled mid-suite at ~96%. 60m gives room until
-    # sharding becomes worthwhile.
-    timeout-minutes: 60
-    # Depend on the artifact build so the WordPress install E2E can exercise the
-    # EXACT zip CI publishes (composer vendor/, flattened plugin layout) rather
-    # than the symlink tree the other WP tests assemble from live source.
+    # The suite runs serially within a shard (session-scoped bitcoind/lnd/
+    # mint/channels rule out xdist), sharded 3 ways across runners via the
+    # deterministic file-level partitioner (--split-group, see
+    # tests/fixtures/partition.py). Each shard boots its own full stack, so
+    # shards share no RAM/disk budget. Pre-sharding the single serial run was
+    # ~59m of pytest against a 75m ceiling; a shard should stay well under
+    # 45m even as the suite grows — if one starts brushing this limit,
+    # rebalance by bumping the shard count in the matrix AND in the
+    # --split-group denominator below (they must match).
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    # Depend on the artifact build so the WordPress E2E tier can exercise the
+    # EXACT zips CI publishes: the GPL plugin zip, and the standalone server
+    # zip its "install BareBits alongside" flow downloads and unpacks.
     needs: build-artifacts
 
     steps:
@@ -91,25 +100,134 @@ jobs:
           path: build
 
       - name: Run test suite
+        # --backend=phps: CI runs the full suite on the php -S backend only.
+        # The Apache/nginx passes (run-tests.sh with no --backend runs all
+        # three) are the local full-coverage run; CI's webserver coverage is
+        # the fast webserver-smoke workflow (standalone server) plus the
+        # wp-checkout job below (the WooCommerce checkout tier on real
+        # Apache and nginx).
         run: |
-          ./tests/scripts/run-tests.sh -v
+          ./tests/scripts/run-tests.sh --backend=phps -v --split-group=${{ matrix.shard }}/3
         env:
           PYTHONUNBUFFERED: "1"
-          # test_wp_plugin_zip_install consumes this exact artifact instead of
-          # rebuilding the zip (the E2E job has no Node/composer). If unset, the
-          # test builds the zip itself — the path a local dev run takes.
-          CASHUPAY_WP_PLUGIN_ZIP: ${{ github.workspace }}/build/wordpress_plugin.zip
+          # The WP tests consume these exact artifacts instead of rebuilding
+          # them (the E2E job has no Node/composer). If unset, the fixtures
+          # build them locally — the path a dev run takes.
+          CASHUPAY_WP_PLUGIN_ZIP: ${{ github.workspace }}/build/barebits_wordpress_plugin.zip
+          CASHUPAY_STANDALONE_ZIP: ${{ github.workspace }}/build/barebits.zip
 
       - name: Upload test logs on failure
         if: failure() || cancelled()
         uses: actions/upload-artifact@v4
         with:
-          name: test-logs
+          name: test-logs-shard-${{ matrix.shard }}
           path: |
             tests/.tmp/**/*.log
             tests/.tmp/**/*.sqlite
           retention-days: 7
           if-no-files-found: ignore
+          # tests/.tmp is a dot-directory; without this the globs silently
+          # match nothing ("No files were found") and failures ship no logs.
+          include-hidden-files: true
+
+  wp-checkout:
+    name: WP checkout (${{ matrix.backend }})
+    runs-on: ubuntu-22.04
+    # The WooCommerce checkout tier on REAL web servers. PR #147's checkout
+    # bugs survived CI precisely because the WP tier only ever ran on php -S
+    # here while apache/nginx coverage stopped at the standalone smoke — this
+    # job closes that gap with the merchant-critical slice: plugin zip
+    # install, wiring, guest checkout, payment, webhook settle (Store API and
+    # real-browser buyer), on both container backends. The full WP tier on
+    # all backends remains the local run-tests.sh (no --backend) pass.
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [apache, nginx]
+    needs: build-artifacts
+
+    steps:
+      - name: Use HTTPS for SSH-form submodule URLs
+        run: |
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
+
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Python
+        id: setup-python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache binary downloads (bitcoind, lnd, static PHP)
+        uses: actions/cache@v4
+        with:
+          path: |
+            tests/bin
+          key: bins-${{ runner.os }}-${{ hashFiles('tests/fixtures/binaries.py') }}
+          restore-keys: |
+            bins-${{ runner.os }}-
+
+      - name: Cache nutshell venv
+        uses: actions/cache@v4
+        with:
+          path: tests/.venv-nutshell
+          key: nutshell-${{ runner.os }}-py${{ steps.setup-python.outputs.python-version }}-${{ hashFiles('tests/fixtures/nutshell.py') }}
+
+      - name: Cache test runner venv
+        uses: actions/cache@v4
+        with:
+          path: tests/.venv
+          key: venv-${{ runner.os }}-py${{ steps.setup-python.outputs.python-version }}-${{ hashFiles('tests/requirements.txt') }}
+
+      - name: Install Playwright system dependencies
+        # The buyer browser journey runs here too, so the backend jobs need
+        # Chromium's libs exactly like the e2e shards (see the note there on
+        # rebuilding a venv whose cached interpreter is gone).
+        run: |
+          if ! tests/.venv/bin/python3 --version >/dev/null 2>&1; then
+            rm -rf tests/.venv
+          fi
+          python3 -m venv tests/.venv
+          source tests/.venv/bin/activate
+          pip install --quiet -r tests/requirements.txt
+          sudo $(which playwright) install-deps chromium
+
+      - name: Download built artifacts (for the plugin-install E2E)
+        uses: actions/download-artifact@v4
+        with:
+          name: build-artifacts
+          path: build
+
+      - name: Run WP checkout tier
+        run: |
+          ./tests/scripts/run-tests.sh --backend=${{ matrix.backend }} -v \
+            wordpress/test_wp_plugin_zip_install.py \
+            wordpress/test_wp_woocommerce_checkout.py \
+            wordpress/test_wp_hostile_checkout.py \
+            wordpress/test_wp_hpos_checkout.py \
+            wordpress/test_wp_buyer_browser_checkout.py \
+            wordpress/test_wp_classic_checkout.py
+        env:
+          PYTHONUNBUFFERED: "1"
+          CASHUPAY_WP_PLUGIN_ZIP: ${{ github.workspace }}/build/barebits_wordpress_plugin.zip
+          CASHUPAY_STANDALONE_ZIP: ${{ github.workspace }}/build/barebits.zip
+
+      - name: Upload test logs on failure
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs-wp-${{ matrix.backend }}
+          path: |
+            tests/.tmp/**/*.log
+            tests/.tmp/**/*.sqlite
+          retention-days: 7
+          if-no-files-found: ignore
+          include-hidden-files: true
 
   build-artifacts:
     name: Build artifacts
@@ -140,33 +258,38 @@ jobs:
 
       # Both artifacts are built on every push/PR, not just on the release
       # branches, because a broken build is otherwise only discovered when a
-      # release is cut. The WordPress zip in particular shipped for a while
-      # with wordpress/*.php in a subdirectory, which broke every
-      # `__DIR__ . '/sibling.php'` require in the plugin entry point — the zip
-      # could not activate at all, and no job ever built it to notice.
+      # release is cut.
       - name: Build WordPress plugin
         run: ./scripts/build-wordpress-plugin.sh
 
       - name: Verify WordPress plugin layout
         # Fails if any literal __DIR__- or CASHUPAY_PLUGIN_DIR-relative require
         # in the built tree does not resolve, or if an expected file is missing
-        # from the plugin root.
+        # from the plugin root. Also asserts no BareBits server code leaks
+        # into the GPL-only plugin zip.
         run: |
           php scripts/verify-plugin-build.php build/cashupay \
             cashupay.php \
             uninstall.php \
-            bootstrap.php \
-            rewrite-rules.php \
+            state.php \
+            installer.php \
+            onboarding.php \
             admin-menu.php \
             cron-integration.php \
-            activation.php \
             btcpay-integration.php \
-            setup.php \
-            admin.php \
-            api.php \
-            pay.php \
-            includes/database.php \
-            assets/img/barebits-gateway-logo.png
+            payment-discount.php \
+            gateway-guard.php \
+            readme.txt \
+            license.txt \
+            assets/img/barebits-gateway-logo.png \
+            assets/js/discount-classic.js \
+            assets/js/discount-blocks.js
+          for leaked in includes vendor setup.php admin.php api.php cron.php payment.php; do
+            if [ -e "build/cashupay/$leaked" ]; then
+              echo "BareBits server code leaked into the GPL plugin build: $leaked" >&2
+              exit 1
+            fi
+          done
 
       - name: Build standalone zip
         env:
@@ -180,7 +303,7 @@ jobs:
         # health.php, pay.php and product-image.php were all missing until this
         # check was added.
         run: |
-          php scripts/verify-plugin-build.php build/cashupayserver \
+          php scripts/verify-plugin-build.php build/barebits \
             setup.php \
             admin.php \
             api.php \
@@ -190,15 +313,19 @@ jobs:
             pay.php \
             product-image.php \
             update.php \
+            provision.php \
+            sso.php \
             recover.php \
-            includes/database.php
+            includes/database.php \
+            LICENSE.md \
+            USE_POLICY.md
 
       - name: Upload built artifacts
         uses: actions/upload-artifact@v4
         with:
           name: build-artifacts
           path: |
-            build/wordpress_plugin.zip
-            build/cashupayserver.zip
+            build/barebits_wordpress_plugin.zip
+            build/barebits.zip
           retention-days: 7
           if-no-files-found: error

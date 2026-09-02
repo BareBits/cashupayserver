@@ -25,27 +25,27 @@ def _cron_key(handle: PayserverHandle) -> str:
     return str(row[0]).strip('"')
 
 
-def test_health_requires_cron_key(configured: ConfiguredPayserver) -> None:
-    r = requests.get(f"{configured.handle.url}/health.php", timeout=10)
+def test_health_requires_cron_key(shared_configured: ConfiguredPayserver) -> None:
+    r = requests.get(f"{shared_configured.handle.url}/health.php", timeout=10)
     assert r.status_code == 403, r.text
     assert r.json()["ok"] is False
 
 
-def test_health_rejects_wrong_key(configured: ConfiguredPayserver) -> None:
+def test_health_rejects_wrong_key(shared_configured: ConfiguredPayserver) -> None:
     r = requests.get(
-        f"{configured.handle.url}/health.php",
+        f"{shared_configured.handle.url}/health.php",
         params={"key": "nope"},
         timeout=10,
     )
     assert r.status_code == 403, r.text
 
 
-def test_health_ok_when_app_boots(configured: ConfiguredPayserver) -> None:
+def test_health_ok_when_app_boots(shared_configured: ConfiguredPayserver) -> None:
     """With the real cron key, the full bootstrap loads and the DB is
     reachable, so the probe reports healthy."""
-    key = _cron_key(configured.handle)
+    key = _cron_key(shared_configured.handle)
     r = requests.get(
-        f"{configured.handle.url}/health.php",
+        f"{shared_configured.handle.url}/health.php",
         params={"key": key},
         timeout=15,
     )

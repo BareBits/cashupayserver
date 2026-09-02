@@ -1,0 +1,38 @@
+# Apache (mod_php) test image for the e2e suite's `apache` backend.
+#
+# Contains ONLY the runtime — PHP + extensions + Apache modules. The app
+# source, workdirs, and all per-instance config are bind-mounted by
+# tests/fixtures/webserver.py, so editing PHP source never invalidates this
+# image. Containers run as the host uid (--user) on the host network; run/pid/
+# log dirs live on the /tmp tmpfs so an arbitrary uid can write them.
+#
+# Version-drift caveat: the suite's host-side PHP is the pinned static-cli
+# 8.3.31 build (tests/fixtures/binaries.py); php:8.3-apache floats within
+# 8.3.x and is a different build with a different extension set. That drift is
+# exactly the production reality the apache backend exists to exercise.
+#
+# No opcache on purpose: php -S has none, and the updater/plugin-install tests
+# overwrite PHP files mid-run.
+FROM php:8.3-apache
+
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends libgmp-dev libzip-dev; \
+    docker-php-ext-install -j"$(nproc)" gmp bcmath zip; \
+    apt-get clean; \
+    rm -rf /var/lib/apt/lists/*
+
+# Modules the in-repo .htaccess relies on (mirrors docker/Dockerfile.production).
+RUN a2enmod rewrite headers expires deflate
+
+# Debian's envvars hardcodes run/pid/log locations under /var/{run,log}; point
+# them at /tmp so a non-root --user container can write them (tmpfs at runtime).
+RUN sed -ri \
+        -e 's#^export APACHE_RUN_DIR=.*#export APACHE_RUN_DIR=/tmp/apache2#' \
+        -e 's#^export APACHE_PID_FILE=.*#export APACHE_PID_FILE=/tmp/apache2/apache2.pid#' \
+        -e 's#^export APACHE_LOG_DIR=.*#export APACHE_LOG_DIR=/tmp/apache2#' \
+        /etc/apache2/envvars
+
+# ports.conf and sites-enabled/000-default.conf are mounted per instance by the
+# fixture (per-test Listen port, DocumentRoot, AllowOverride).
+CMD ["sh", "-c", "mkdir -p /tmp/apache2 && exec apache2-foreground"]
