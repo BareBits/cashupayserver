@@ -79,6 +79,34 @@ def test_maintenance_mode_waits_out_the_submit(wordpress, page) -> None:
     assert wp.wp_cli("option", "get", "cashupay_mode").stdout.strip() == "install"
 
 
+def test_password_reveal_retries_through_maintenance(wordpress, page) -> None:
+    """The chooser's reconnect hint reveals the saved admin password over
+    admin-ajax. During a WordPress maintenance window that call answers 503
+    (as HTML) and used to fail silently — the button did nothing. It must
+    show it's waiting and deliver the password once WordPress is back."""
+    wp = wordpress
+    # Fake a surviving alongside-install record so the chooser renders the
+    # reconnect hint with the reveal button.
+    wp.wp_cli("option", "update", "cashupay_install_dir", str(wp.wp_root / "barebits"))
+    wp.wp_cli("option", "update", "cashupay_install_url", f"{wp.url}/barebits")
+    wp.wp_cli("option", "update", "cashupay_admin_password", "guard-test-password")
+    _login_and_open_onboarding(page, wp)
+    page.wait_for_selector("#cashupay-reveal-password")
+
+    flag = wp.wp_root / ".maintenance"
+    flag.write_text("<?php $upgrading = time(); ?>")
+    try:
+        page.click("#cashupay-reveal-password")
+        page.wait_for_selector("#cashupay-reveal-password:has-text('Waiting for WordPress')")
+    finally:
+        flag.unlink()
+
+    # The next retry (≤5s out) gets through and reveals the password.
+    page.wait_for_selector(
+        "#cashupay-admin-password:has-text('guard-test-password')", timeout=15_000
+    )
+
+
 def test_url_mode_requires_a_url(wordpress, page) -> None:
     """URL mode keeps (and strengthens) the validation: an empty URL field
     never leaves the browser, and the field is live again after switching

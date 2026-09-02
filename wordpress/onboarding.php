@@ -617,17 +617,37 @@ function cashupay_render_step_choose(): void {
                 const body = new URLSearchParams();
                 body.set('action', 'cashupay_reveal_password');
                 body.set('nonce', btn.dataset.nonce);
-                fetch(ajaxurl, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                    body: body.toString(),
-                    credentials: 'same-origin'
-                }).then(r => r.json()).then(res => {
-                    if (res && res.success && res.data) {
-                        document.getElementById('cashupay-admin-password').textContent = res.data;
-                        btn.remove();
-                    }
-                });
+                // A 503 is WordPress's own maintenance screen (an auto-update
+                // in progress) — retry until it's back instead of failing
+                // silently; anything else falls through as before.
+                const attempt = function () {
+                    fetch(ajaxurl, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                        body: body.toString(),
+                        credentials: 'same-origin'
+                    }).then(function (r) {
+                        if (r.status === 503) {
+                            btn.disabled = true;
+                            btn.textContent = 'Waiting for WordPress…';
+                            setTimeout(attempt, 5000);
+                            return null;
+                        }
+                        return r.json();
+                    }).then(function (res) {
+                        if (res && res.success && res.data) {
+                            document.getElementById('cashupay-admin-password').textContent = res.data;
+                            btn.remove();
+                        } else if (res) {
+                            btn.disabled = false;
+                            btn.textContent = 'Reveal';
+                        }
+                    }).catch(function () {
+                        btn.disabled = false;
+                        btn.textContent = 'Reveal';
+                    });
+                };
+                attempt();
             });
             </script>
         </div>

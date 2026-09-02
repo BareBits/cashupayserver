@@ -55,6 +55,8 @@ function cashupay_take_flash(): ?array { return null; }
 // Likewise the discount settings block (payment-discount.php, the whole
 // WooCommerce surface): the Connection page under test only *calls* it.
 function cashupay_render_discount_settings(): void { echo 'DISCOUNT-SETTINGS'; }
+// And the wait-out-maintenance form gate (onboarding.php as well).
+function cashupay_render_maintenance_guard(): void { echo 'MAINTENANCE-GUARD'; }
 
 require dirname(__DIR__, 2) . '/wordpress/state.php';
 require dirname(__DIR__, 2) . '/wordpress/admin-menu.php';
