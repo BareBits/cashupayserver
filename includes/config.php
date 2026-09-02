@@ -8,7 +8,7 @@
 require_once __DIR__ . '/database.php';
 
 // Version
-define('CASHUPAY_VERSION', '1.4');
+define('CASHUPAY_VERSION', '1.4.1');
 
 // Development fee — the mandatory BareBits fee assessed on incoming payments,
 // settled on the periodic fee settlement cron tick. Defined here (rather than
