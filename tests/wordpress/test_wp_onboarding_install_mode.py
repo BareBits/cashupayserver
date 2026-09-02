@@ -216,6 +216,9 @@ def test_install_mode_end_to_end(wordpress_install_mode, mint, backup_mint) -> N
     ).text
     assert "WooCommerce is connected" in conn
     assert "Installed alongside WordPress" in conn
+    # The Connection page's forms (discount save, re-run wiring) carry the
+    # same wait-out-WP-maintenance guard as the onboarding forms.
+    assert 'id="cashupay-maintenance-waiting"' in conn
     nonce = re.search(r'id="cashupay-reveal-password"\s+data-nonce="([^"]+)"', conn).group(1)
     reveal = s.post(
         f"{wp.url}/wp-admin/admin-ajax.php",

@@ -43,6 +43,7 @@ Only the WordPress-side wiring is removed. A BareBits server installed alongside
 * The Bitcoin checkout discount is now applied by this plugin itself instead of the third-party ELEX plugin, and works on the block-based checkout as well as the classic one. The percentage (decimals allowed) is editable on the BareBits Connection page and in the gateway's WooCommerce settings, and the payment method's title always advertises the current value.
 * Pairing with an existing BareBits server no longer shows "page not found" on servers whose host ignores rewrite rules: the plugin now always opens the authorization page by its real file name (/api-keys/authorize.php).
 * The install-alongside server checks now show directly on the onboarding chooser, below the two options, instead of on a separate page afterwards. When a check fails, the install option is disabled with the reason in view.
+* Onboarding and Connection-page actions, the pairing approval's return to this site, and the password reveal now wait out WordPress's brief maintenance windows (auto-updates) instead of landing on the "briefly unavailable" screen with the action lost.
 
 = 1.3.1 =
 * The plugin no longer bundles the BareBits server. Onboarding now connects an existing server by URL or installs the latest stable release alongside WordPress.
