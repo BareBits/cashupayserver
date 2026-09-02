@@ -386,6 +386,30 @@ class Config {
     }
 
     /**
+     * Whether the store has at least one payment rail an invoice could offer:
+     * a Cashu mint (isStoreConfigured above), an on-chain destination (xpub or
+     * static address, whichever the address mode names), or a Lightning
+     * destination (Strike / LNURL address / NWC / noffer). Mirrors the rails
+     * gate at the top of Invoice::create.
+     *
+     * This — not isStoreConfigured, which only reflects the mint rail — is
+     * the check for "can this store take payments": the wizard's "run without
+     * mints" answer leaves mint_url/seed_phrase NULL on a store that is
+     * nevertheless fully operational over its other rails.
+     */
+    public static function storeHasPaymentRail(string $storeId): bool {
+        if (self::isStoreConfigured($storeId)) {
+            return true;
+        }
+        require_once __DIR__ . '/setup_flow.php';
+        if (SetupFlow::onchainState($storeId)['configured']) {
+            return true;
+        }
+        require_once __DIR__ . '/store_ln_addresses.php';
+        return StoreLnAddresses::addressesForStore($storeId) !== [];
+    }
+
+    /**
      * Update store settings
      *
      * Changing mint_url through this method implicitly marks

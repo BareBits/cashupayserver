@@ -185,15 +185,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 }
 
-// Get stores for selection (only fully configured stores)
+// Get stores for selection. Every store is listed: a store can be
+// Lightning-only or on-chain-only (the wizard's "run without mints" answer
+// leaves mint_url/seed_phrase NULL) and still take payments, so filtering on
+// the mint columns here wrongly told merchants with such stores "No stores
+// found" and blocked pairing entirely. A store with no payment rail at all
+// is still selectable — pair first, add a rail after — but gets flagged in
+// the chooser so the admin knows checkouts will fail until one is added.
 $stores = [];
 if (Auth::isLoggedIn()) {
-    $stores = Database::fetchAll(
-        "SELECT id, name FROM stores
-         WHERE mint_url IS NOT NULL AND mint_url != ''
-           AND seed_phrase IS NOT NULL AND seed_phrase != ''
-         ORDER BY name"
-    );
+    $stores = Database::fetchAll("SELECT id, name FROM stores ORDER BY name");
+    foreach ($stores as &$storeRow) {
+        $storeRow['hasPaymentRail'] = Config::storeHasPaymentRail($storeRow['id']);
+    }
+    unset($storeRow);
 }
 
 // Permission descriptions for UI
@@ -701,12 +706,33 @@ $baseUrl = Config::getBaseUrl();
                         <select id="store_id" name="store_id" required>
                             <option value="">-- Select a store --</option>
                             <?php foreach ($stores as $store): ?>
-                                <option value="<?= htmlspecialchars($store['id']) ?>">
-                                    <?= htmlspecialchars($store['name']) ?>
+                                <option value="<?= htmlspecialchars($store['id']) ?>"
+                                        data-has-rail="<?= $store['hasPaymentRail'] ? '1' : '0' ?>">
+                                    <?= htmlspecialchars($store['name']) ?><?= $store['hasPaymentRail'] ? '' : ' (no payment methods yet)' ?>
                                 </option>
                             <?php endforeach; ?>
                         </select>
+                        <div id="no-rail-warning" class="warning" style="display: none; margin-top: 0.75rem;">
+                            This store has no payment methods configured yet, so
+                            checkouts will fail until one is added. You can pair
+                            now and add a Cashu mint, Lightning destination, or
+                            on-chain wallet in the
+                            <a href="<?= Urls::admin() ?>">dashboard</a> afterwards.
+                        </div>
                     </div>
+                    <script>
+                    (function () {
+                        const select = document.getElementById('store_id');
+                        const warning = document.getElementById('no-rail-warning');
+                        function syncWarning() {
+                            const opt = select.options[select.selectedIndex];
+                            const railless = opt && opt.getAttribute('data-has-rail') === '0';
+                            warning.style.display = railless ? 'block' : 'none';
+                        }
+                        select.addEventListener('change', syncWarning);
+                        syncWarning();
+                    })();
+                    </script>
 
                     <?php if (!empty($permissions)): ?>
                         <div class="permissions-list">

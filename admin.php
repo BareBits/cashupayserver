@@ -217,6 +217,11 @@ if (isset($_GET['api'])) {
             foreach ($stores as &$store) {
                 $store['internalApiKey'] = Auth::getOrCreateInternalApiKey($store['id']);
                 $store['isConfigured'] = Config::isStoreConfigured($store['id']);
+                // isConfigured only reflects the mint rail; the store selector
+                // needs "can this store take payments at all" so a
+                // Lightning-only or on-chain-only store isn't labeled
+                // "(not configured)".
+                $store['hasPaymentRail'] = Config::storeHasPaymentRail($store['id']);
                 $store = Config::redactStoreSecrets($store);
             }
             unset($store);
@@ -8624,7 +8629,7 @@ header('Cache-Control: no-cache, must-revalidate');
                 stores.forEach(store => {
                     const opt = document.createElement('option');
                     opt.value = store.id;
-                    opt.textContent = store.name + (store.isConfigured ? '' : ' (not configured)');
+                    opt.textContent = store.name + (store.hasPaymentRail ? '' : ' (not configured)');
                     select.appendChild(opt);
                 });
             }
