@@ -47,6 +47,38 @@ def test_stale_url_text_does_not_block_install_mode(wordpress, page) -> None:
     assert wp.wp_cli("option", "get", "cashupay_mode").stdout.strip() == "install"
 
 
+def test_maintenance_mode_waits_out_the_submit(wordpress, page) -> None:
+    """WordPress auto-updates put the whole site behind the .maintenance 503
+    screen for up to a minute. A merchant who clicks an onboarding button
+    during that window must NOT land on the maintenance screen with their
+    choice unsaved — the guard probes first, shows the waiting note, and
+    submits the original choice automatically once WordPress answers again
+    (the same wait-it-out the setup wizard's return handoff does)."""
+    wp = wordpress
+    _login_and_open_onboarding(page, wp)
+    page.check("#cashupay-mode-install")
+
+    # The real thing WordPress core writes: a fresh $upgrading stamp (an
+    # empty file would read as >10 minutes old and not trigger maintenance).
+    flag = wp.wp_root / ".maintenance"
+    flag.write_text("<?php $upgrading = time(); ?>")
+    try:
+        page.click("#submit")
+        page.wait_for_selector("#cashupay-maintenance-waiting", state="visible")
+        # Still on the chooser: the POST was held back, not swallowed by the
+        # maintenance screen.
+        assert page.is_visible("#cashupay-mode-install")
+    finally:
+        flag.unlink()
+
+    # The next re-probe (≤5s out) finds WordPress back and submits the held
+    # choice — the merchant clicks nothing.
+    page.wait_for_selector(
+        "h2:has-text('Install BareBits alongside WordPress')", timeout=15_000
+    )
+    assert wp.wp_cli("option", "get", "cashupay_mode").stdout.strip() == "install"
+
+
 def test_url_mode_requires_a_url(wordpress, page) -> None:
     """URL mode keeps (and strengthens) the validation: an empty URL field
     never leaves the browser, and the field is live again after switching
