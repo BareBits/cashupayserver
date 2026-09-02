@@ -34,7 +34,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 TESTS_DIR = REPO_ROOT / "tests"
 BIN_DIR = TESTS_DIR / "bin"
 
-WP_VERSION = "6.6.2"
+WP_VERSION = "7.1"
 WP_TARBALL_URL = f"https://wordpress.org/wordpress-{WP_VERSION}.tar.gz"
 WP_TARBALL_SHA256 = ""  # populated lazily via wp.org checksums; see _wp_core_path
 WP_TARBALL_CACHE = BIN_DIR / f"wordpress-{WP_VERSION}"
@@ -52,10 +52,11 @@ WP_ADMIN_EMAIL = "admin@example.test"
 WP_SITE_TITLE = "CashuPay Test"
 
 # WooCommerce + the real BTCPay Greenfield gateway plugin, pinned for a
-# deterministic end-to-end checkout. WooCommerce 9.6.2 is the newest release
-# that still lists "Requires at least: 6.6" (11.x needs WP 6.9, newer than the
-# 6.6.2 core this fixture installs). The BTCPay plugin verifies the exact same
-# `sha256=` HMAC BareBits emits, so no protocol shim is needed.
+# deterministic end-to-end checkout. WooCommerce stays pinned at 9.6.2
+# (Requires at least: 6.6) even on the 7.1 core — bumping it is its own
+# shake-out (checkout flows, HPOS goldens) and is deliberately decoupled from
+# core bumps. The BTCPay plugin verifies the exact same `sha256=` HMAC
+# BareBits emits, so no protocol shim is needed.
 WOOCOMMERCE_VERSION = "9.6.2"
 WOOCOMMERCE_URL = f"https://downloads.wordpress.org/plugin/woocommerce.{WOOCOMMERCE_VERSION}.zip"
 WOOCOMMERCE_SHA256 = "d801efe9ffc3fdcf1495dc9662a08c9373ff1eee44b1838de649cf758ccbcd13"
@@ -67,6 +68,13 @@ BTCPAY_WC_URL = (
 )
 BTCPAY_WC_SHA256 = "b06a4da4835d984ddd870c3bfafb6fc4c524fe0ef988f22cd1575a8a7b77d236"
 BTCPAY_WC_CACHE = BIN_DIR / f"btcpay-greenfield-{BTCPAY_WC_VERSION}"
+
+# WordPress.org's Plugin Check (PCP) — the checks the plugin directory runs
+# on submission. Pinned per version (the un-versioned "latest" zip churns).
+PLUGIN_CHECK_VERSION = "2.1.0"
+PLUGIN_CHECK_URL = f"https://downloads.wordpress.org/plugin/plugin-check.{PLUGIN_CHECK_VERSION}.zip"
+PLUGIN_CHECK_SHA256 = "6ff4bd2145f3befcf907df158cc466b1649dafed5686de8369907403c3013fc4"
+PLUGIN_CHECK_CACHE = BIN_DIR / f"plugin-check-{PLUGIN_CHECK_VERSION}"
 
 @dataclass
 class WordPressHandle:
@@ -236,12 +244,16 @@ def _ensure_sqlite_plugin() -> Path:
     return extracted
 
 
-def _ensure_cached_plugin(cache_dir: Path, url: str, sha256: str, slug: str) -> Path:
+def _ensure_cached_plugin(
+    cache_dir: Path, url: str, sha256: str, slug: str, main_file_name: str | None = None
+) -> Path:
     """Download + extract a wp.org plugin zip once. Returns the extracted plugin
     directory (cache_dir/<slug>), whose basename matches the plugin slug so
-    `wp plugin activate <slug>` works. Idempotent across runs and tests."""
+    `wp plugin activate <slug>` works. Idempotent across runs and tests.
+    main_file_name overrides the {slug}.php convention for plugins whose main
+    file is named differently (plugin-check ships plugin.php)."""
     extracted = cache_dir / slug
-    main_file = extracted / f"{slug}.php"
+    main_file = extracted / (main_file_name or f"{slug}.php")
     if main_file.is_file():
         return extracted
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -253,6 +265,19 @@ def _ensure_cached_plugin(cache_dir: Path, url: str, sha256: str, slug: str) -> 
     if not main_file.is_file():
         raise RuntimeError(f"{slug} extracted but {main_file.name} missing at {extracted}")
     return extracted
+
+
+def install_plugin_check(wp: "WordPressHandle") -> None:
+    """Copy the pinned Plugin Check plugin into a WP install and activate it,
+    making `wp plugin check <slug>` available on that install's wp-cli."""
+    extracted = _ensure_cached_plugin(
+        PLUGIN_CHECK_CACHE, PLUGIN_CHECK_URL, PLUGIN_CHECK_SHA256,
+        "plugin-check", main_file_name="plugin.php",
+    )
+    dest = wp.wp_root / "wp-content" / "plugins" / "plugin-check"
+    if not dest.exists():
+        shutil.copytree(extracted, dest)
+    wp.wp_cli("plugin", "activate", "plugin-check")
 
 
 # ---------- plugin tree assembly ----------
@@ -289,24 +314,37 @@ def ensure_wp_plugin_zip() -> Path:
     scripts/build-wordpress-plugin.sh, using the pinned static PHP for composer.
     A local build additionally needs Node/npm for the mint-discovery bundle.
     """
-    env_zip = os.environ.get("CASHUPAY_WP_PLUGIN_ZIP")
+    return _ensure_plugin_zip("CASHUPAY_WP_PLUGIN_ZIP", "barebits_wordpress_plugin.zip")
+
+
+def ensure_wp_plugin_wporg_zip() -> Path:
+    """The wordpress.org variant of the plugin zip (no installer.php — the
+    directory's guidelines forbid fetching executable code). Same contract as
+    ensure_wp_plugin_zip: CI passes the prebuilt artifact via
+    CASHUPAY_WP_PLUGIN_WPORG_ZIP, local runs build it (the build script
+    produces both variants in one run)."""
+    return _ensure_plugin_zip("CASHUPAY_WP_PLUGIN_WPORG_ZIP", "barebits_wordpress_plugin_wporg.zip")
+
+
+def _ensure_plugin_zip(env_var: str, zip_name: str) -> Path:
+    env_zip = os.environ.get(env_var)
     if env_zip:
         p = Path(env_zip)
         if p.is_file():
             return p
         raise RuntimeError(
-            f"CASHUPAY_WP_PLUGIN_ZIP={env_zip!r} but that file does not exist"
+            f"{env_var}={env_zip!r} but that file does not exist"
         )
 
+    zip_path = REPO_ROOT / "build" / zip_name
     php_exe = binaries.ensure(binaries.PHP)["php"]
     script = REPO_ROOT / "scripts" / "build-wordpress-plugin.sh"
     env = os.environ.copy()
     env["PHP_BIN"] = str(php_exe)
-    print(f"[wp] building plugin zip via {script.name} ...")
+    print(f"[wp] building plugin zips via {script.name} ...")
     subprocess.run(["bash", str(script)], cwd=str(REPO_ROOT), env=env, check=True)
-    zip_path = REPO_ROOT / "build" / "barebits_wordpress_plugin.zip"
     if not zip_path.is_file():
-        raise RuntimeError("build-wordpress-plugin.sh did not produce build/barebits_wordpress_plugin.zip")
+        raise RuntimeError(f"build-wordpress-plugin.sh did not produce build/{zip_name}")
     return zip_path
 
 

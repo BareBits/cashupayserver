@@ -105,7 +105,7 @@ function cashupay_onboarding_step(): string {
 
 function cashupay_require_admin_post(string $nonceAction): void {
     if (!current_user_can('manage_options')) {
-        wp_die(__('Sorry, you are not allowed to do that.'), 403);
+        wp_die(esc_html__('Sorry, you are not allowed to do that.', 'cashupay'), 403);
     }
     check_admin_referer($nonceAction);
 }
@@ -114,9 +114,11 @@ function cashupay_require_admin_post(string $nonceAction): void {
 function cashupay_handle_choose_mode(): void {
     cashupay_require_admin_post('cashupay_choose_mode');
 
-    $mode = sanitize_key($_POST['cashupay_mode'] ?? '');
+    // Nonce verified above in cashupay_require_admin_post().
+    // phpcs:disable WordPress.Security.NonceVerification.Missing
+    $mode = sanitize_key(wp_unslash($_POST['cashupay_mode'] ?? ''));
     if ($mode === 'url') {
-        $url = rtrim(trim((string) ($_POST['cashupay_server_url'] ?? '')), '/');
+        $url = rtrim(trim(sanitize_text_field(wp_unslash((string) ($_POST['cashupay_server_url'] ?? '')))), '/');
         $probe = cashupay_probe_server($url);
         if (empty($probe['ok'])) {
             cashupay_flash('error', $probe['message']);
@@ -129,10 +131,17 @@ function cashupay_handle_choose_mode(): void {
         update_option('cashupay_mode', 'url');
         update_option('cashupay_server_url', $url);
     } elseif ($mode === 'install') {
+        if (!cashupay_installer_available()) {
+            cashupay_flash('error', 'This build of the plugin cannot install BareBits alongside '
+                . 'WordPress — connect a BareBits server you run yourself by URL instead.');
+            wp_safe_redirect(cashupay_onboarding_url());
+            exit;
+        }
         // Save the folder name BEFORE the preflight so the writable-location
         // check resolves the merchant's Advanced choice, not the default —
         // the chooser's table only ever showed the saved/default target.
-        $dirname = sanitize_file_name((string) ($_POST['cashupay_install_dirname'] ?? ''));
+        $dirname = sanitize_file_name(wp_unslash((string) ($_POST['cashupay_install_dirname'] ?? '')));
+        // phpcs:enable
         update_option('cashupay_install_dirname', $dirname, false);
         $failed = cashupay_install_preflight_failure();
         if ($failed !== null) {
@@ -152,6 +161,13 @@ function cashupay_handle_choose_mode(): void {
 /** Install mode: download + unpack + configure the BareBits release. */
 function cashupay_handle_run_install(): void {
     cashupay_require_admin_post('cashupay_run_install');
+
+    if (!cashupay_installer_available()) {
+        cashupay_flash('error', 'This build of the plugin cannot install BareBits alongside '
+            . 'WordPress — connect a BareBits server you run yourself by URL instead.');
+        wp_safe_redirect(cashupay_onboarding_url());
+        exit;
+    }
 
     // Conditions can regress between the chooser (which gated on the same
     // checks) and this click — a permissions change, a removed extension.
@@ -205,6 +221,12 @@ function cashupay_handle_run_install(): void {
  * wizard's own return link (cashupay_handle_provision_return).
  */
 function cashupay_collect_provision_and_store(): void {
+    if (!cashupay_installer_available()) {
+        cashupay_flash('error', 'This build of the plugin cannot finish an install-alongside '
+            . 'setup. Install the full BareBits plugin from the GitHub releases to continue, '
+            . 'or use "Start over" and connect the server by URL.');
+        return;
+    }
     $result = cashupay_collect_provision();
     if ($result['status'] === 'pending') {
         cashupay_flash('warning', 'BareBits setup is not finished yet — complete the wizard, then try again.');
@@ -257,7 +279,7 @@ function cashupay_handle_collect_provision(): void {
  */
 function cashupay_handle_provision_return(): void {
     if (!current_user_can('manage_options')) {
-        wp_die(__('Sorry, you are not allowed to do that.'), 403);
+        wp_die(esc_html__('Sorry, you are not allowed to do that.', 'cashupay'), 403);
     }
     // Nothing left to collect (already collected, or not in install mode):
     // just land on the onboarding page at whatever step it is on. Covers a
@@ -316,6 +338,11 @@ function cashupay_handle_start_pairing(): void {
     // runs — the whole app is served as .php files — and it builds its
     // self-post URL from its own request path, so the entire approval flow
     // stays on the .php form.
+    // Deliberately wp_redirect, not wp_safe_redirect: the approval page lives
+    // on the merchant's own BareBits server — an external host by design,
+    // which the safe-redirect allowlist would refuse. The URL is built from
+    // the stored server URL the merchant configured and probed.
+    // phpcs:ignore WordPress.Security.SafeRedirect.wp_redirect_wp_redirect
     wp_redirect($server . '/api-keys/authorize.php?' . implode('&', $query));
     exit;
 }
@@ -326,15 +353,21 @@ function cashupay_handle_start_pairing(): void {
  * verified against the server before anything is stored.
  */
 function cashupay_handle_pairing_callback(): void {
+    // No WordPress nonce on purpose (see the action registration above): the
+    // POST arrives cross-site from the BareBits approval page, which cannot
+    // mint one. The single-use, time-boxed state token below — compared with
+    // hash_equals — is the authentication, and the pairing result is verified
+    // against the server before anything is stored.
+    // phpcs:disable WordPress.Security.NonceVerification.Missing, WordPress.Security.NonceVerification.Recommended
     $expected = get_option('cashupay_pairing_expected');
     delete_option('cashupay_pairing_expected'); // single use, success or not
 
-    $state = (string) ($_GET['state'] ?? '');
+    $state = sanitize_text_field(wp_unslash((string) ($_GET['state'] ?? '')));
     if (!is_array($expected)
             || $state === ''
             || !hash_equals((string) ($expected['state'] ?? ''), $state)
             || (time() - (int) ($expected['at'] ?? 0)) > CASHUPAY_PAIRING_WINDOW_SECONDS) {
-        wp_die('This pairing link is no longer valid. Start the pairing again from the BareBits page in wp-admin.', 403);
+        wp_die(esc_html__('This pairing link is no longer valid. Start the pairing again from the BareBits page in wp-admin.', 'cashupay'), 403);
     }
 
     if (isset($_GET['error']) || empty($_POST['apiKey']) || empty($_POST['storeId'])) {
@@ -343,8 +376,9 @@ function cashupay_handle_pairing_callback(): void {
         exit;
     }
 
-    $apiKey = (string) wp_unslash($_POST['apiKey']);
-    $storeId = (string) wp_unslash($_POST['storeId']);
+    $apiKey = sanitize_text_field(wp_unslash((string) $_POST['apiKey']));
+    $storeId = sanitize_text_field(wp_unslash((string) $_POST['storeId']));
+    // phpcs:enable
 
     // Prove the pair is real against the server before trusting it: listing
     // the store's webhooks needs both a valid key and access to that store.
@@ -369,8 +403,10 @@ function cashupay_handle_pairing_callback(): void {
 function cashupay_handle_finish(): void {
     cashupay_require_admin_post('cashupay_finish');
 
+    // Nonce verified above in cashupay_require_admin_post().
+    // phpcs:disable WordPress.Security.NonceVerification.Missing
     if (isset($_POST['cashupay_discount_percent'])) {
-        $percent = cashupay_parse_discount_percent((string) wp_unslash($_POST['cashupay_discount_percent']));
+        $percent = cashupay_parse_discount_percent(sanitize_text_field(wp_unslash((string) $_POST['cashupay_discount_percent'])));
         if ($percent === null) {
             cashupay_flash('error', 'The discount must be a number between 0 and 100 (up to two decimal places).');
             wp_safe_redirect(cashupay_onboarding_url());
@@ -382,6 +418,7 @@ function cashupay_handle_finish(): void {
     if (!empty($_POST['cashupay_btcpay_override_consent'])) {
         cashupay_record_btcpay_override_consent();
     }
+    // phpcs:enable
 
     $storeId = (string) get_option('cashupay_store_id', '');
     $apiKey = (string) get_option('cashupay_api_key', '');
@@ -471,13 +508,24 @@ function cashupay_render_onboarding(): void {
     <div class="wrap" style="max-width: 720px;">
         <h1>BareBits</h1>
         <?php if ($flash): ?>
-            <div class="notice notice-<?= esc_attr($flash['kind'] === 'error' ? 'error' : ($flash['kind'] === 'warning' ? 'warning' : 'success')) ?>"><p><?= esc_html($flash['message']) ?></p></div>
+            <div class="notice notice-<?php echo esc_attr($flash['kind'] === 'error' ? 'error' : ($flash['kind'] === 'warning' ? 'warning' : 'success')) ?>"><p><?php echo esc_html($flash['message']); ?></p></div>
         <?php endif; ?>
         <?php
         switch ($step) {
             case 'choose':    cashupay_render_step_choose(); break;
-            case 'install':   cashupay_render_step_install(); break;
-            case 'provision': cashupay_render_step_provision(); break;
+            // Install-mode steps degrade when this build ships no installer
+            // (the wordpress.org distribution): a site can land here mid-flow
+            // after swapping plugin builds, and must get an exit, not a fatal.
+            case 'install':
+                cashupay_installer_available()
+                    ? cashupay_render_step_install()
+                    : cashupay_render_step_install_unavailable();
+                break;
+            case 'provision':
+                cashupay_installer_available()
+                    ? cashupay_render_step_provision()
+                    : cashupay_render_step_install_unavailable();
+                break;
             case 'pair':      cashupay_render_step_pair(); break;
             case 'wire':      cashupay_render_step_wire(); break;
         }
@@ -518,7 +566,7 @@ function cashupay_render_maintenance_guard(): void {
         const note = document.getElementById('cashupay-maintenance-waiting');
         // admin-post.php with no action is a cheap no-op that still answers
         // 503 while WordPress is in maintenance mode.
-        const probeUrl = <?= wp_json_encode(admin_url('admin-post.php')) ?>;
+        const probeUrl = <?php echo wp_json_encode(admin_url('admin-post.php')); ?>;
         document.querySelectorAll('form').forEach(function (form) {
             if ((form.getAttribute('action') || '').indexOf('admin-post.php') === -1) {
                 return;
@@ -571,9 +619,9 @@ function cashupay_render_preflight_table(array $checks): void {
         <tbody>
         <?php foreach ($checks as $label => $check): ?>
             <tr>
-                <td><?= $check['ok'] ? '✅' : '❌' ?></td>
-                <td><?= esc_html($label) ?></td>
-                <td class="description"><?= esc_html($check['detail']) ?></td>
+                <td><?php echo esc_html($check['ok'] ? '✅' : '❌'); ?></td>
+                <td><?php echo esc_html($label); ?></td>
+                <td class="description"><?php echo esc_html($check['detail']); ?></td>
             </tr>
         <?php endforeach; ?>
         </tbody>
@@ -588,28 +636,37 @@ function cashupay_render_step_choose(): void {
     // password revealable — pairing needs it, and the merchant never chose
     // one.
     $existingInstall = cashupay_install_url();
+    // The install-alongside option only exists in builds that ship the
+    // installer (the GitHub distribution) — the wordpress.org build renders
+    // the URL-connect form alone.
+    $installerAvailable = cashupay_installer_available();
     // The server checks that used to live on their own page after picking
     // "install alongside" — surfaced below the choices instead, so the
     // merchant sees whether this host qualifies while still choosing and
     // the separate checks page is gone from the flow. All checks are local
     // and cheap (extensions, writability): no HTTP, safe on every render.
-    $checks = cashupay_install_preflight();
-    $installOk = true;
+    $checks = $installerAvailable ? cashupay_install_preflight() : [];
+    $installOk = $installerAvailable;
     foreach ($checks as $check) {
         $installOk = $installOk && $check['ok'];
     }
     ?>
-    <p>Accept Bitcoin (on-chain and Lightning) in WooCommerce. Where should your BareBits server live?</p>
+    <?php if ($installerAvailable): ?>
+        <p>Accept Bitcoin (on-chain and Lightning) in WooCommerce. Where should your BareBits server live?</p>
+    <?php else: ?>
+        <p>Accept Bitcoin (on-chain and Lightning) in WooCommerce by connecting this shop to your
+           self-hosted BareBits server.</p>
+    <?php endif; ?>
     <?php if ($existingInstall !== ''): ?>
         <div class="notice notice-info inline" style="margin: 0 0 1em;">
             <p>
                 A BareBits server installed earlier by this plugin is still running at
-                <code><?= esc_html($existingInstall) ?></code> (its data and funds are untouched).
+                <code><?php echo esc_html($existingInstall); ?></code> (its data and funds are untouched).
                 To reconnect it, pick "I already run a BareBits server" below — the address is
                 prefilled — and sign in with its saved admin password when asked:
                 <code id="cashupay-admin-password">••••••••••••</code>
                 <button type="button" class="button button-small" id="cashupay-reveal-password"
-                        data-nonce="<?= esc_attr(wp_create_nonce('cashupay_reveal_password')) ?>">Reveal</button>
+                        data-nonce="<?php echo esc_attr(wp_create_nonce('cashupay_reveal_password')); ?>">Reveal</button>
             </p>
             <script>
             document.getElementById('cashupay-reveal-password').addEventListener('click', function () {
@@ -652,7 +709,7 @@ function cashupay_render_step_choose(): void {
             </script>
         </div>
     <?php endif; ?>
-    <form method="post" action="<?= esc_url(admin_url('admin-post.php')) ?>">
+    <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>">
         <?php wp_nonce_field('cashupay_choose_mode'); ?>
         <input type="hidden" name="action" value="cashupay_choose_mode">
         <table class="form-table" role="presentation">
@@ -662,9 +719,10 @@ function cashupay_render_step_choose(): void {
                     <label for="cashupay-mode-url"><strong>I already run a BareBits server</strong></label>
                     <p class="description">Connect this shop to an existing server by URL.</p>
                     <input type="url" name="cashupay_server_url" id="cashupay-server-url" class="regular-text"
-                           placeholder="https://pay.example.com" value="<?= esc_attr($existingInstall) ?>">
+                           placeholder="https://pay.example.com" value="<?php echo esc_attr($existingInstall); ?>">
                 </td>
             </tr>
+            <?php if ($installerAvailable): ?>
             <tr>
                 <td style="vertical-align: top;"><input type="radio" name="cashupay_mode" value="install" id="cashupay-mode-install" <?php disabled(!$installOk); ?>></td>
                 <td>
@@ -676,16 +734,19 @@ function cashupay_render_step_choose(): void {
                     <details>
                         <summary>Advanced: folder name</summary>
                         <input type="text" name="cashupay_install_dirname" class="regular-text" placeholder="barebits"
-                               value="<?= esc_attr((string) get_option('cashupay_install_dirname', '')) ?>">
-                        <p class="description">Folder under your site the server is installed into (default <code>barebits</code>, served at <?= esc_html(site_url('/barebits')) ?>).</p>
+                               value="<?php echo esc_attr((string) get_option('cashupay_install_dirname', '')); ?>">
+                        <p class="description">Folder under your site the server is installed into (default <code>barebits</code>, served at <?php echo esc_html(site_url('/barebits')); ?>).</p>
                     </details>
                 </td>
             </tr>
+            <?php endif; ?>
         </table>
-        <h2 style="font-size: 1.1em;">Server checks for installing alongside</h2>
-        <?php cashupay_render_preflight_table($checks); ?>
-        <?php if (!$installOk): ?>
-            <p><strong>Fix the failed checks above, then reload this page.</strong> If your host cannot pass them, you can still run BareBits on another host and connect it by URL with the first option.</p>
+        <?php if ($installerAvailable): ?>
+            <h2 style="font-size: 1.1em;">Server checks for installing alongside</h2>
+            <?php cashupay_render_preflight_table($checks); ?>
+            <?php if (!$installOk): ?>
+                <p><strong>Fix the failed checks above, then reload this page.</strong> If your host cannot pass them, you can still run BareBits on another host and connect it by URL with the first option.</p>
+            <?php endif; ?>
         <?php endif; ?>
         <?php submit_button('Continue'); ?>
     </form>
@@ -716,6 +777,26 @@ function cashupay_render_step_choose(): void {
     <?php
 }
 
+/**
+ * Rendered in place of the install/provision steps when the site is in
+ * install mode but THIS build ships no installer — a mid-onboarding swap to
+ * the wordpress.org build. The merchant gets the two real exits instead of a
+ * fatal: the full plugin from GitHub, or a reset into URL mode.
+ */
+function cashupay_render_step_install_unavailable(): void {
+    ?>
+    <h2>Install BareBits alongside WordPress</h2>
+    <div class="notice notice-warning inline" style="margin: 0 0 1em;">
+        <p>Onboarding was started in install-alongside mode, but this build of the plugin cannot
+           manage that installation (the wordpress.org edition connects to a server you run
+           yourself). To continue the install-alongside setup, replace this plugin with the full
+           BareBits plugin from the
+           <a href="https://github.com/BareBits/cashupayserver/releases" target="_blank" rel="noopener noreferrer">GitHub releases</a>.
+           Or click "Start over" below and connect a BareBits server by URL.</p>
+    </div>
+    <?php
+}
+
 function cashupay_render_step_install(): void {
     // The chooser already showed — and its POST handler gated on — the full
     // server checks, so this page is just the "download now" confirmation.
@@ -730,11 +811,11 @@ function cashupay_render_step_install(): void {
     ?>
     <h2>Install BareBits alongside WordPress</h2>
     <?php if ($allOk): $target = cashupay_resolve_install_target((string) get_option('cashupay_install_dirname', '')); ?>
-        <form method="post" action="<?= esc_url(admin_url('admin-post.php')) ?>" style="margin-top: 1em;">
+        <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>" style="margin-top: 1em;">
             <?php wp_nonce_field('cashupay_run_install'); ?>
             <input type="hidden" name="action" value="cashupay_run_install">
             <p>This downloads the latest stable release (a few MB) and installs it
-               <?php if (!empty($target['url'])): ?> to <code><?= esc_html($target['url']) ?></code><?php endif; ?>.
+               <?php if (!empty($target['url'])): ?> to <code><?php echo esc_html($target['url']) ?></code><?php endif; ?>.
                It can take a minute on slow hosts.</p>
             <?php submit_button('Download and install BareBits'); ?>
         </form>
@@ -798,7 +879,7 @@ function cashupay_render_step_provision(): void {
          plugin's did. -->
     <div id="cashupay-wizard-shell">
         <button type="button" class="button" id="cashupay-wizard-exit">Exit full screen</button>
-        <iframe src="<?= esc_url($setupUrl) ?>" title="BareBits setup"
+        <iframe src="<?php echo esc_url($setupUrl); ?>" title="BareBits setup"
                 style="width: 100%; height: 70vh; border: 1px solid #c3c4c7; border-radius: 4px; background: #fff;"></iframe>
     </div>
     <script>
@@ -822,7 +903,7 @@ function cashupay_render_step_provision(): void {
         setExpanded(!collapsed);
     })();
     </script>
-    <form method="post" action="<?= esc_url(admin_url('admin-post.php')) ?>" style="margin-top: 1em;">
+    <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>" style="margin-top: 1em;">
         <?php wp_nonce_field('cashupay_collect_provision'); ?>
         <input type="hidden" name="action" value="cashupay_collect_provision">
         <p class="description">Finished the wizard but still seeing this page? Continue manually:</p>
@@ -834,8 +915,8 @@ function cashupay_render_step_provision(): void {
 function cashupay_render_step_pair(): void {
     ?>
     <h2>Pair with your BareBits server</h2>
-    <p>Connected to <code><?= esc_html(cashupay_server_url()) ?></code>. Next, authorize this shop: you'll be sent to your server to sign in and approve an API key, then brought straight back.</p>
-    <form method="post" action="<?= esc_url(admin_url('admin-post.php')) ?>">
+    <p>Connected to <code><?php echo esc_html(cashupay_server_url()); ?></code>. Next, authorize this shop: you'll be sent to your server to sign in and approve an API key, then brought straight back.</p>
+    <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>">
         <?php wp_nonce_field('cashupay_start_pairing'); ?>
         <input type="hidden" name="action" value="cashupay_start_pairing">
         <?php submit_button('Pair with BareBits'); ?>
@@ -849,14 +930,14 @@ function cashupay_render_step_wire(): void {
     $saved = get_option('cashupay_discount_percent', null);
     ?>
     <h2>Last step: connect WooCommerce</h2>
-    <form method="post" action="<?= esc_url(admin_url('admin-post.php')) ?>">
+    <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>">
         <?php wp_nonce_field('cashupay_finish'); ?>
         <input type="hidden" name="action" value="cashupay_finish">
         <?php if ($hasWoo): ?>
             <p><label for="cashupay-discount">Offer customers a discount for paying with Bitcoin (Bitcoin payments have no card fees or chargebacks):</label></p>
             <p>
                 <input type="number" min="0" max="100" step="0.01" id="cashupay-discount"
-                       name="cashupay_discount_percent" value="<?= esc_attr($saved === null ? '0' : (string) $saved) ?>" style="width: 6em;"> %
+                       name="cashupay_discount_percent" value="<?php echo esc_attr($saved === null ? '0' : (string) $saved); ?>" style="width: 6em;"> %
                 <span class="description">0 = no discount. Applied automatically at checkout when the customer pays with BareBits, and advertised in the payment method's title.</span>
             </p>
         <?php else: ?>
@@ -866,7 +947,7 @@ function cashupay_render_step_wire(): void {
             <p style="border-left: 4px solid #d63638; padding-left: 8px;">
                 <label>
                     <input type="checkbox" name="cashupay_btcpay_override_consent" value="1">
-                    A BTCPay Server is already connected (<code><?= esc_html((string) get_option('btcpay_gf_url', '')) ?></code>).
+                    A BTCPay Server is already connected (<code><?php echo esc_html((string) get_option('btcpay_gf_url', '')); ?></code>).
                     Replace that connection and all its gateway settings with BareBits.
                 </label>
             </p>
@@ -879,7 +960,7 @@ function cashupay_render_step_wire(): void {
 
 function cashupay_render_reset_form(): void {
     ?>
-    <form method="post" action="<?= esc_url(admin_url('admin-post.php')) ?>" style="margin-top: 2em;">
+    <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>" style="margin-top: 2em;">
         <?php wp_nonce_field('cashupay_reset_onboarding'); ?>
         <input type="hidden" name="action" value="cashupay_reset_onboarding">
         <button type="submit" class="button-link" style="color: #b32d2e;"

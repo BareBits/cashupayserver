@@ -34,6 +34,7 @@ function esc_attr($s) { return htmlspecialchars((string)$s, ENT_QUOTES); }
 function esc_url($s) { return htmlspecialchars((string)$s, ENT_QUOTES); }
 function esc_html($s) { return htmlspecialchars((string)$s, ENT_QUOTES); }
 
+require __DIR__ . '/wp_compat_stubs.php';
 require dirname(__DIR__, 2) . '/wordpress/state.php';
 require dirname(__DIR__, 2) . '/wordpress/admin-menu.php';
 

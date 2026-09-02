@@ -95,7 +95,7 @@ function cashupay_admin_page(): void {
             border: 0;
         }
     </style>
-    <iframe id="cashupay-admin-frame" src="<?= esc_url($src) ?>" title="BareBits"></iframe>
+    <iframe id="cashupay-admin-frame" src="<?php echo esc_url($src); ?>" title="BareBits"></iframe>
     <?php
 }
 
@@ -113,20 +113,20 @@ function cashupay_connection_page(): void {
     <div class="wrap" style="max-width: 720px;">
         <h1>BareBits</h1>
         <?php if ($flash): ?>
-            <div class="notice notice-<?= esc_attr($flash['kind'] === 'error' ? 'error' : ($flash['kind'] === 'warning' ? 'warning' : 'success')) ?>"><p><?= esc_html($flash['message']) ?></p></div>
+            <div class="notice notice-<?php echo esc_attr($flash['kind'] === 'error' ? 'error' : ($flash['kind'] === 'warning' ? 'warning' : 'success')) ?>"><p><?php echo esc_html($flash['message']); ?></p></div>
         <?php endif; ?>
         <p>✅ WooCommerce is connected to your BareBits server.</p>
         <table class="widefat striped" style="max-width: 680px;">
             <tbody>
-                <tr><td>Server</td><td><a href="<?= esc_url($server) ?>" target="_blank" rel="noopener"><?= esc_html($server) ?></a></td></tr>
-                <tr><td>Store ID</td><td><code><?= esc_html((string) get_option('cashupay_store_id', '')) ?></code></td></tr>
-                <tr><td>Mode</td><td><?= $mode === 'install' ? 'Installed alongside WordPress' : 'Existing server (connected by URL)' ?></td></tr>
+                <tr><td>Server</td><td><a href="<?php echo esc_url($server) ?>" target="_blank" rel="noopener"><?php echo esc_html($server); ?></a></td></tr>
+                <tr><td>Store ID</td><td><code><?php echo esc_html((string) get_option('cashupay_store_id', '')); ?></code></td></tr>
+                <tr><td>Mode</td><td><?php echo esc_html($mode === 'install' ? 'Installed alongside WordPress' : 'Existing server (connected by URL)'); ?></td></tr>
                 <?php if ($mode === 'install'): ?>
-                    <tr><td>Install directory</td><td><code><?= esc_html((string) get_option('cashupay_install_dir', '')) ?></code></td></tr>
+                    <tr><td>Install directory</td><td><code><?php echo esc_html((string) get_option('cashupay_install_dir', '')); ?></code></td></tr>
                     <tr>
                         <td>Data directory</td>
                         <td>
-                            <code><?= esc_html((string) get_option('cashupay_install_data_dir', '')) ?></code>
+                            <code><?php echo esc_html((string) get_option('cashupay_install_data_dir', '')); ?></code>
                             <p class="description">Holds the wallet database — real money. It is never deleted by this plugin; back up your recovery phrase.</p>
                         </td>
                     </tr>
@@ -137,7 +137,7 @@ function cashupay_connection_page(): void {
                         <td>
                             <code id="cashupay-admin-password">••••••••••••</code>
                             <button type="button" class="button button-small" id="cashupay-reveal-password"
-                                    data-nonce="<?= esc_attr(wp_create_nonce('cashupay_reveal_password')) ?>">Reveal</button>
+                                    data-nonce="<?php echo esc_attr(wp_create_nonce('cashupay_reveal_password')); ?>">Reveal</button>
                             <p class="description">Sign-in from here is automatic; BareBits asks for this password only for
                             sensitive actions (revealing a wallet recovery phrase), and it lets you sign in directly if this
                             plugin is ever removed.</p>
@@ -187,10 +187,10 @@ function cashupay_connection_page(): void {
             </tbody>
         </table>
         <p style="margin-top: 1em;">
-            <a href="<?= esc_url($server . '/admin.php') ?>" target="_blank" rel="noopener" class="button button-primary">Open the BareBits admin<?= $mode === 'install' ? ' in a new tab' : '' ?></a>
+            <a href="<?php echo esc_url($server . '/admin.php') ?>" target="_blank" rel="noopener" class="button button-primary">Open the BareBits admin<?php echo esc_html($mode === 'install' ? ' in a new tab' : ''); ?></a>
         </p>
         <?php cashupay_render_discount_settings(); ?>
-        <form method="post" action="<?= esc_url(admin_url('admin-post.php')) ?>" style="margin-top: 1em;">
+        <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>" style="margin-top: 1em;">
             <?php wp_nonce_field('cashupay_finish'); ?>
             <input type="hidden" name="action" value="cashupay_finish">
             <p class="description">If the WooCommerce gateway or webhook got misconfigured, re-run the wiring:</p>
@@ -217,8 +217,10 @@ function cashupay_admin_notice(): void {
     cashupay_cron_stale_notice();
 
     if (!cashupay_is_configured()) {
-        // Not on the plugin's own page — it already renders the flow.
-        if (($_GET['page'] ?? '') === 'cashupay') {
+        // Not on the plugin's own page — it already renders the flow. A
+        // read-only render decision on an admin pageview; no nonce applies.
+        // phpcs:ignore WordPress.Security.NonceVerification.Recommended
+        if (sanitize_key(wp_unslash($_GET['page'] ?? '')) === 'cashupay') {
             return;
         }
         echo '<div class="notice notice-info"><p>';

@@ -83,6 +83,7 @@ function wp_next_scheduled($hook) { return $GLOBALS['next_scheduled']; }
 function wp_unschedule_event($ts, $hook) { $GLOBALS['unscheduled'][] = $hook; $GLOBALS['next_scheduled'] = false; return true; }
 function site_url($path = '') { return 'http://wp.test' . $path; }
 function __($s) { return $s; }
+function esc_html__($s, $domain = 'default') { return htmlspecialchars((string)$s, ENT_QUOTES); }
 
 register_shutdown_function(function () {
     echo "\nSTATE:" . json_encode([

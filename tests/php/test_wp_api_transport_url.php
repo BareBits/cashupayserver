@@ -44,6 +44,7 @@ function wp_remote_request($url, $args = []) {
 }
 function wp_remote_get($url, $args = []) { return wp_remote_request($url, $args); }
 
+require __DIR__ . '/wp_compat_stubs.php';
 require dirname(__DIR__, 2) . '/wordpress/state.php';
 
 $install = 'http://wp.test/barebits';

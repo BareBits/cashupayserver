@@ -48,6 +48,7 @@ function esc_html($s) { return htmlspecialchars((string)$s, ENT_QUOTES); }
 // state.php supplies cashupay_is_configured() (options-driven); admin-menu.php
 // only calls cashupay_take_flash() (onboarding.php) inside cashupay_admin_page,
 // which these tests never render — so onboarding.php stays out.
+require __DIR__ . '/wp_compat_stubs.php';
 require dirname(__DIR__, 2) . '/wordpress/state.php';
 require dirname(__DIR__, 2) . '/wordpress/admin-menu.php';
 

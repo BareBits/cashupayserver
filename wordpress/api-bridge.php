@@ -45,7 +45,7 @@ function cashupay_api_bridge_path(string $requestPath, string $installUrl): ?str
     if ($installUrl === '') {
         return null;
     }
-    $installPath = rtrim((string) parse_url($installUrl, PHP_URL_PATH), '/');
+    $installPath = rtrim((string) wp_parse_url($installUrl, PHP_URL_PATH), '/');
     if ($installPath === '' || !str_starts_with($requestPath, $installPath . '/')) {
         return null;
     }
@@ -64,7 +64,7 @@ function cashupay_api_bridge_path(string $requestPath, string $installUrl): ?str
 function cashupay_api_bridge_authorization(): string {
     foreach (['HTTP_AUTHORIZATION', 'REDIRECT_HTTP_AUTHORIZATION'] as $key) {
         if (!empty($_SERVER[$key])) {
-            return (string) $_SERVER[$key];
+            return sanitize_text_field(wp_unslash((string) $_SERVER[$key]));
         }
     }
     if (function_exists('apache_request_headers')) {
@@ -83,7 +83,7 @@ function cashupay_api_bridge_authorization(): string {
  * routes, canonicalizes, or 404s the request.
  */
 function cashupay_maybe_bridge_api_request(): void {
-    $requestPath = (string) parse_url((string) ($_SERVER['REQUEST_URI'] ?? ''), PHP_URL_PATH);
+    $requestPath = (string) wp_parse_url(sanitize_text_field(wp_unslash((string) ($_SERVER['REQUEST_URI'] ?? ''))), PHP_URL_PATH);
     // Cheap pre-check before touching options on every request.
     if (strpos($requestPath, '/v1/') === false) {
         return;
@@ -102,19 +102,24 @@ function cashupay_maybe_bridge_api_request(): void {
     }
 
     $target = $installUrl . '/api.php?cashupay_path=' . rawurlencode($apiPath);
+    // Forwarded verbatim: this is the raw query string of an API request being
+    // replayed against the same-origin install; sanitizing could corrupt
+    // legitimate parameters. It is only ever a URL component of a server-side
+    // HTTP request, never output.
+    // phpcs:ignore WordPress.Security.ValidatedSanitizedInput.MissingUnslash,WordPress.Security.ValidatedSanitizedInput.InputNotSanitized
     $query = (string) ($_SERVER['QUERY_STRING'] ?? '');
     if ($query !== '') {
         $target .= '&' . $query;
     }
 
-    $method = strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET'));
+    $method = strtoupper(sanitize_key(wp_unslash((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET'))));
     $headers = [];
     $authorization = cashupay_api_bridge_authorization();
     if ($authorization !== '') {
         $headers['Authorization'] = $authorization;
     }
     if (!empty($_SERVER['CONTENT_TYPE'])) {
-        $headers['Content-Type'] = (string) $_SERVER['CONTENT_TYPE'];
+        $headers['Content-Type'] = sanitize_text_field(wp_unslash((string) $_SERVER['CONTENT_TYPE']));
     }
 
     $args = [
@@ -147,6 +152,10 @@ function cashupay_maybe_bridge_api_request(): void {
         $contentType = (string) end($contentType);
     }
     header('Content-Type: ' . (is_string($contentType) && $contentType !== '' ? $contentType : 'application/json'));
+    // Raw proxy passthrough: the install's API response body is relayed
+    // byte-for-byte under its own Content-Type (JSON); it is never rendered
+    // as this site's HTML, and escaping would corrupt the API payload.
+    // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped
     echo wp_remote_retrieve_body($response);
     exit;
 }

@@ -7,6 +7,8 @@ name: Release
 #   - barebits-<tag>.zip                     the standalone app (auto-updater downloads this)
 #   - barebits-windows-<tag>.zip             the Windows desktop package (portable POS)
 #   - barebits_wordpress_plugin-<tag>.zip    the WordPress plugin (humans / WP install this)
+#   - barebits_wordpress_plugin_wporg-<tag>.zip  the wordpress.org submission variant
+#                                            (no installer.php — URL-connect only)
 #   - BUILD_INFO                             stable-named metadata the updater reads first
 #
 # The release version comes from the tag; scripts/verify-release-version.sh
@@ -164,6 +166,33 @@ jobs:
             fi
           done
 
+      - name: Verify WordPress plugin layout (wordpress.org variant)
+        # Same layout, minus installer.php: the wordpress.org directory's
+        # guidelines forbid plugins fetching executable code, so the variant
+        # must never ship the install-alongside downloader.
+        run: |
+          php scripts/verify-plugin-build.php build/wporg/cashupay \
+            cashupay.php \
+            uninstall.php \
+            state.php \
+            onboarding.php \
+            admin-menu.php \
+            cron-integration.php \
+            btcpay-integration.php \
+            payment-discount.php \
+            gateway-guard.php \
+            readme.txt \
+            license.txt \
+            assets/img/barebits-gateway-logo.png \
+            assets/js/discount-classic.js \
+            assets/js/discount-blocks.js
+          for leaked in installer.php includes vendor setup.php admin.php api.php cron.php payment.php; do
+            if [ -e "build/wporg/cashupay/$leaked" ]; then
+              echo "forbidden file in the wordpress.org plugin build: $leaked" >&2
+              exit 1
+            fi
+          done
+
       - name: Build Windows desktop zip
         run: ./scripts/build-windows-desktop.sh
 
@@ -194,6 +223,7 @@ jobs:
           tag="$TAG"
           cp build/barebits.zip "build/barebits-${tag}.zip"
           cp build/barebits_wordpress_plugin.zip "build/barebits_wordpress_plugin-${tag}.zip"
+          cp build/barebits_wordpress_plugin_wporg.zip "build/barebits_wordpress_plugin_wporg-${tag}.zip"
           cp build/barebits-windows.zip "build/barebits-windows-${tag}.zip"
           # Checksums for everything we publish. The WordPress plugin's
           # "install BareBits alongside" flow verifies its downloaded
@@ -201,6 +231,7 @@ jobs:
           (cd build && sha256sum \
             "barebits-${tag}.zip" \
             "barebits_wordpress_plugin-${tag}.zip" \
+            "barebits_wordpress_plugin_wporg-${tag}.zip" \
             "barebits-windows-${tag}.zip" > SHA256SUMS)
 
       - name: Upload release assets for later jobs
@@ -212,6 +243,7 @@ jobs:
           path: |
             build/barebits-${{ env.TAG }}.zip
             build/barebits_wordpress_plugin-${{ env.TAG }}.zip
+            build/barebits_wordpress_plugin_wporg-${{ env.TAG }}.zip
             build/barebits-windows-${{ env.TAG }}.zip
             build/SHA256SUMS
             build/barebits/BUILD_INFO
@@ -281,6 +313,7 @@ jobs:
             - `barebits-${{ env.TAG }}.zip` — standalone server (the auto-updater pulls this)
             - `barebits-windows-${{ env.TAG }}.zip` — Windows desktop package (portable point-of-sale; see README.txt inside)
             - `barebits_wordpress_plugin-${{ env.TAG }}.zip` — WordPress plugin
+            - `barebits_wordpress_plugin_wporg-${{ env.TAG }}.zip` — WordPress plugin, wordpress.org submission variant (connect-by-URL only)
             - `SHA256SUMS` — checksums of the zips above
             - `BUILD_INFO` — build metadata
           prerelease: ${{ needs.build.outputs.prerelease }}
@@ -288,6 +321,7 @@ jobs:
           files: |
             build/barebits-${{ env.TAG }}.zip
             build/barebits_wordpress_plugin-${{ env.TAG }}.zip
+            build/barebits_wordpress_plugin_wporg-${{ env.TAG }}.zip
             build/barebits-windows-${{ env.TAG }}.zip
             build/SHA256SUMS
             build/barebits/BUILD_INFO
