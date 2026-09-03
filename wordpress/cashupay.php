@@ -9,7 +9,7 @@
  * Author: BareBits
  * License: GPLv2 or later
  * License URI: https://www.gnu.org/licenses/gpl-2.0.html
- * Text Domain: cashupay
+ * Text Domain: barebits-lightning-payments-via-bitcoin
  *
  * This plugin is deliberately thin: it contains only WordPress-specific glue
  * (onboarding UI, installing/configuring the BTCPay for WooCommerce gateway,

@@ -48,7 +48,14 @@ def _install_and_check(wp: WordPressHandle, zip_path: Path) -> list[tuple[str, s
     assert res.returncode == 0, f"plugin install failed:\n{res.stdout}\n{res.stderr}"
     install_plugin_check(wp)
 
-    res = wp.wp_cli("plugin", "check", "cashupay", check=False)
+    # --slug: the wordpress.org uploader checks against the slug it derives
+    # from the Plugin Name, not the install folder (which stays `cashupay/`).
+    # Without the override, Plugin Check falls back to the folder name and the
+    # textdomain_mismatch warning the uploader emits never reproduces locally.
+    res = wp.wp_cli(
+        "plugin", "check", "cashupay",
+        "--slug=barebits-lightning-payments-via-bitcoin", check=False,
+    )
     assert res.returncode == 0, f"wp plugin check failed to run:\n{res.stdout}\n{res.stderr}"
 
     rows: list[tuple[str, str, str]] = []

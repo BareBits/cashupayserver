@@ -105,7 +105,7 @@ function cashupay_onboarding_step(): string {
 
 function cashupay_require_admin_post(string $nonceAction): void {
     if (!current_user_can('manage_options')) {
-        wp_die(esc_html__('Sorry, you are not allowed to do that.', 'cashupay'), 403);
+        wp_die(esc_html__('Sorry, you are not allowed to do that.', 'barebits-lightning-payments-via-bitcoin'), 403);
     }
     check_admin_referer($nonceAction);
 }
@@ -279,7 +279,7 @@ function cashupay_handle_collect_provision(): void {
  */
 function cashupay_handle_provision_return(): void {
     if (!current_user_can('manage_options')) {
-        wp_die(esc_html__('Sorry, you are not allowed to do that.', 'cashupay'), 403);
+        wp_die(esc_html__('Sorry, you are not allowed to do that.', 'barebits-lightning-payments-via-bitcoin'), 403);
     }
     // Nothing left to collect (already collected, or not in install mode):
     // just land on the onboarding page at whatever step it is on. Covers a
@@ -367,7 +367,7 @@ function cashupay_handle_pairing_callback(): void {
             || $state === ''
             || !hash_equals((string) ($expected['state'] ?? ''), $state)
             || (time() - (int) ($expected['at'] ?? 0)) > CASHUPAY_PAIRING_WINDOW_SECONDS) {
-        wp_die(esc_html__('This pairing link is no longer valid. Start the pairing again from the BareBits page in wp-admin.', 'cashupay'), 403);
+        wp_die(esc_html__('This pairing link is no longer valid. Start the pairing again from the BareBits page in wp-admin.', 'barebits-lightning-payments-via-bitcoin'), 403);
     }
 
     if (isset($_GET['error']) || empty($_POST['apiKey']) || empty($_POST['storeId'])) {
