@@ -12,8 +12,10 @@
  *   password   Admin password
  *   store      Store name
  *   onchain    On-chain destination — xpub (preferred) or single address
- *   zeroconf   Zero-conf vs 1-confirmation (skipped when onchain was skipped)
- *   lightning  LNURL/Lightning address + CLINK noffer
+ *   lightning  LNURL/Lightning address + CLINK noffer + Strike API key
+ *   zeroconf   Zero-conf vs 1-confirmation (skipped when the store has no
+ *              on-chain receive source — neither an xpub/static destination
+ *              nor Strike on-chain minting)
  *   swaps      Submarine swaps on/off
  *   mints      Cashu mints on/off; auto-picks a main + backup when on
  *   cron       Reminder to install the cron entry (skipped on the desktop
@@ -238,12 +240,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         exit;
     }
 
-    // The screen sequence depends on whether an on-chain destination exists,
-    // which the `onchain` handler may be about to change. Resolved again after
-    // each handler runs so the advance lands on the right screen.
+    // The screen sequence depends on whether any on-chain receive source
+    // exists (xpub/static destination or Strike on-chain minting), which the
+    // `onchain` and `lightning` handlers may be about to change. Resolved
+    // again after each handler runs so the advance lands on the right screen.
     $storeIdForFlow = $_SESSION['setup_store_id'] ?? null;
     $flowSteps = SetupFlow::stepSequence(
-        $mode, SetupFlow::onchainState($storeIdForFlow)['configured'],
+        $mode, SetupFlow::zeroConfApplicable($storeIdForFlow),
         $securityScreenNeeded, $isDesktop, $externalCron, $passwordPreseeded
     );
     // Set by the mints handler when it mints a fresh wallet seed. add_store
@@ -374,11 +377,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
                 $_SESSION['setup_store_id'] = $storeId;
                 $_SESSION['setup_store_mode'] = $storeMode;
-                // Re-resolve: a brand new store has no on-chain rail, but one
-                // reached by going Back may already have one, which decides
-                // whether the zero-conf screen is in the sequence.
+                // Re-resolve: a brand new store has no on-chain receive
+                // source, but one reached by going Back may already have one,
+                // which decides whether the zero-conf screen is in the
+                // sequence.
                 $flowSteps = SetupFlow::stepSequence(
-                    $mode, SetupFlow::onchainState($storeId)['configured'],
+                    $mode, SetupFlow::zeroConfApplicable($storeId),
                     $securityScreenNeeded, $isDesktop, $externalCron, $passwordPreseeded
                 );
                 $step = SetupFlow::nextStep('store', $flowSteps) ?? 'onchain';
@@ -392,9 +396,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $onchainAction = $_POST['onchain_action'] ?? '';
 
                 if ($onchainAction === 'skip') {
-                    // Nothing saved; the zero-conf screen drops out of the
-                    // sequence because there is no on-chain rail to time.
-                    $flowSteps = SetupFlow::stepSequence($mode, false, $securityScreenNeeded, $isDesktop, $externalCron, $passwordPreseeded);
+                    // Nothing saved. Re-resolve rather than hardcoding false:
+                    // a store revisited via Back may already have a receive
+                    // source (a previously saved xpub, or Strike on-chain
+                    // enabled on the lightning screen), which keeps zeroconf
+                    // in the sequence.
+                    $flowSteps = SetupFlow::stepSequence($mode, SetupFlow::zeroConfApplicable($storeId), $securityScreenNeeded, $isDesktop, $externalCron, $passwordPreseeded);
                     $step = SetupFlow::nextStep('onchain', $flowSteps) ?? 'lightning';
                     break;
                 }
@@ -505,7 +512,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 }
 
                 $flowSteps = SetupFlow::stepSequence($mode, true, $securityScreenNeeded, $isDesktop, $externalCron, $passwordPreseeded);
-                $step = SetupFlow::nextStep('onchain', $flowSteps) ?? 'zeroconf';
+                $step = SetupFlow::nextStep('onchain', $flowSteps) ?? 'lightning';
                 break;
 
             case 'zeroconf':
@@ -521,7 +528,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 Config::updateStore($storeId, [
                     'onchain_min_confs' => $zeroConf ? 0 : 1,
                 ]);
-                $step = SetupFlow::nextStep('zeroconf', $flowSteps) ?? 'lightning';
+                $step = SetupFlow::nextStep('zeroconf', $flowSteps) ?? 'swaps';
                 break;
 
             case 'lightning':
@@ -564,11 +571,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $strikeKey = trim($_POST['strike_keep_ref'] ?? '');
                 }
 
+                // Strike on-chain option: invoice addresses are minted in the
+                // merchant's Strike account (fallback: the store's own
+                // xpub/static address). Gated below behind a receive-request
+                // scope probe before it is persisted.
+                $strikeOnchainWanted = ($_POST['strike_onchain'] ?? '') === '1';
+
                 if ($lnAction === 'skip') {
                     $lnAddress = '';
                     $nofferPosted = [];
                     $nwc = '';
                     $strikeKey = '';
+                    $strikeOnchainWanted = false;
                 }
 
                 // Validate separately so the operator gets a message naming the
@@ -671,11 +685,46 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 // for this store passes through, so revisiting the screen
                 // never locks the operator out.
                 $gated = StoreLnAddresses::probeAndGateChain($storeId, $chain);
+
+                // Strike on-chain gate, BEFORE anything is persisted so a
+                // refusal leaves both the chain and the flag untouched (see
+                // OnchainConfig::gateStrikeOnchainEnable for the rules).
+                require_once __DIR__ . '/includes/onchain/config.php';
+                if ($strikeOnchainWanted) {
+                    $finalStrikeKeys = [];
+                    foreach ($gated['entries'] as $gatedEntry) {
+                        if (($gatedEntry['type'] ?? '') === StoreLnAddresses::TYPE_STRIKE) {
+                            $finalStrikeKeys[] = (string)$gatedEntry['address'];
+                        }
+                    }
+                    $storedStrikeKeys = [];
+                    foreach (StoreLnAddresses::listForStore($storeId) as $lnRow) {
+                        if ($lnRow['type'] === StoreLnAddresses::TYPE_STRIKE) {
+                            $storedStrikeKeys[$lnRow['address']] = true;
+                        }
+                    }
+                    OnchainConfig::gateStrikeOnchainEnable(
+                        $storeId,
+                        $finalStrikeKeys,
+                        $storedStrikeKeys,
+                        OnchainConfig::strikeEnabledForStore($storeId)
+                    );
+                }
+
                 StoreLnAddresses::replaceForStore($storeId, $gated['entries']);
+                OnchainConfig::setStrikeEnabled($storeId, $strikeOnchainWanted ? 1 : 0);
                 // Auto-cashout mode isn't decided here: which rail sweeps the
                 // mint balance depends on the swaps and mints answers still to
                 // come. setupResolveAutoCashout() settles it at the end.
 
+                // Re-resolve: the Strike on-chain answer just saved decides
+                // whether the zeroconf screen (next in the sequence) applies —
+                // a Strike-only store gains it here, and unticking the option
+                // on a store with no xpub/static address drops it again.
+                $flowSteps = SetupFlow::stepSequence(
+                    $mode, SetupFlow::zeroConfApplicable($storeId),
+                    $securityScreenNeeded, $isDesktop, $externalCron, $passwordPreseeded
+                );
                 $step = SetupFlow::nextStep('lightning', $flowSteps) ?? 'swaps';
                 break;
 
@@ -1380,12 +1429,17 @@ function renderUrlModeDetectionScript(): void { ?>
             <div class="logo">&#9889;</div>
             <?php
             // Render-time view of the sequence. The zero-conf screen is only
-            // part of it once the store actually has an on-chain destination,
+            // part of it once the store actually has an on-chain receive
+            // source (xpub/static destination or Strike on-chain minting),
             // so the counter never promises a screen that won't appear.
             $renderStoreId = $_SESSION['setup_store_id'] ?? null;
+            // Destination-only state (the swaps screen needs hasXpub); the
+            // sequence itself gates zeroconf on zeroConfApplicable, which
+            // additionally counts Strike on-chain minting.
             $renderOnchain = SetupFlow::onchainState($renderStoreId);
             $renderSteps = SetupFlow::stepSequence(
-                $mode, $renderOnchain['configured'], $securityScreenNeeded, $isDesktop, $externalCron, $passwordPreseeded
+                $mode, SetupFlow::zeroConfApplicable($renderStoreId),
+                $securityScreenNeeded, $isDesktop, $externalCron, $passwordPreseeded
             );
             $displayIndex = array_search($step, $renderSteps, true);
             $totalSteps = count($renderSteps);
@@ -2269,6 +2323,12 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                 // ref of a stored key round-trips.
                 $lnStrikeValue = trim((string)($_POST['strike_keep_ref'] ?? $lnExistingStrikeRef));
                 $lnStrikeShowsSaved = $lnStrikeValue !== '' && str_starts_with($lnStrikeValue, StoreLnAddresses::KEEP_REF_PREFIX);
+                // Strike on-chain checkbox: reflect the POSTed state on a
+                // re-render after a failed save, else the stored flag.
+                require_once __DIR__ . '/includes/onchain/config.php';
+                $lnStrikeOnchainChecked = isset($_POST['lightning_action'])
+                    ? (($_POST['strike_onchain'] ?? '') === '1')
+                    : ($renderStoreId !== null && OnchainConfig::strikeEnabledForStore($renderStoreId));
                 ?>
                 <h2 style="margin-bottom: 1rem;">⚡ Lightning payments</h2>
                 <p style="margin-bottom: 0.75rem;">
@@ -2381,7 +2441,12 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                                     <strong>Generate invoice quotes</strong>
                                     (<code>partner.invoice.quote.generate</code>) and
                                     <strong>Read invoices</strong>
-                                    (<code>partner.invoice.read</code>).</li>
+                                    (<code>partner.invoice.read</code>).
+                                    Add a fourth scope, <strong>Create receive
+                                    requests</strong>
+                                    (<code>partner.receive-request.create</code>),
+                                    only if you also tick the on-chain checkbox
+                                    below.</li>
                                 <li>Copy the key and paste it below.</li>
                             </ol>
                             <p style="margin: 0;">
@@ -2415,6 +2480,18 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                                    value=""
                                    placeholder="paste your Strike API key">
                         <?php endif; ?>
+                        <label style="display:block; font-size: 0.9rem; margin-top: 0.75rem;">
+                            <input type="checkbox" name="strike_onchain" value="1"<?= $lnStrikeOnchainChecked ? ' checked' : '' ?>>
+                            Also accept on-chain payments via Strike
+                        </label>
+                        <p style="margin: 0.35rem 0 0 1.5rem; font-size: 0.8rem; color: #a0aec0;">
+                            Each invoice's Bitcoin address is then created in your
+                            Strike account (with your on-chain wallet as fallback if
+                            Strike is unreachable). The key additionally needs the
+                            <strong>Create receive requests</strong> scope
+                            (<code>partner.receive-request.create</code>) — it is
+                            tested when you continue.
+                        </p>
                     </details>
 
                     <!-- Collapsed by default; open only when the section already

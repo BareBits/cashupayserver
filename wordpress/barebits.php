@@ -3,7 +3,7 @@
  * Plugin Name: BareBits - Lightning Payments via Bitcoin
  * Plugin URI: https://github.com/BareBits/cashupayserver
  * Description: Accept Bitcoin payments (on-chain and lightning) in WooCommerce through a BareBits server — connect an existing one or install one alongside WordPress. No approval process, no middlemen.
- * Version: 1.4.2
+ * Version: 1.5
  * Requires at least: 6.0
  * Requires PHP: 8.0
  * Author: BareBits
@@ -22,8 +22,8 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
-define('CASHUPAY_PLUGIN_DIR', __DIR__);
-define('CASHUPAY_PLUGIN_FILE', __FILE__);
+define('BAREBITS_PLUGIN_DIR', __DIR__);
+define('BAREBITS_PLUGIN_FILE', __FILE__);
 
 require_once __DIR__ . '/state.php';
 require_once __DIR__ . '/api-bridge.php';
@@ -43,15 +43,15 @@ require_once __DIR__ . '/admin-menu.php';
 require_once __DIR__ . '/cron-integration.php';
 require_once __DIR__ . '/gateway-guard.php';
 
-register_activation_hook(__FILE__, 'cashupay_activate');
-register_deactivation_hook(__FILE__, 'cashupay_deactivate');
+register_activation_hook(__FILE__, 'barebits_activate');
+register_deactivation_hook(__FILE__, 'barebits_deactivate');
 
 /**
  * Activation: register the every-minute interval and, when an alongside
  * install is already wired (re-activation), restart its cron pinger.
  */
-function cashupay_activate(): void {
-    cashupay_cron_reschedule();
+function barebits_activate(): void {
+    barebits_cron_reschedule();
 }
 
 /**
@@ -59,6 +59,6 @@ function cashupay_activate(): void {
  * data) is deliberately untouched — deactivating the WordPress glue must
  * never take the payment server down.
  */
-function cashupay_deactivate(): void {
-    cashupay_cron_unschedule();
+function barebits_deactivate(): void {
+    barebits_cron_unschedule();
 }
