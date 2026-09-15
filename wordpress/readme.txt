@@ -34,10 +34,29 @@ To wallets you control: your own Lightning address, your own on-chain wallet (xp
 
 Only the WordPress-side wiring is removed. A BareBits server installed alongside WordPress keeps running, and its data directory (which holds wallet keys) is never deleted by this plugin. The record of where that server lives — including its saved admin password, which is your only way into its dashboard — also survives, so reinstalling the plugin later offers to reconnect it.
 
+== External services ==
+
+This plugin talks to the following services. None of them receive data on behalf of BareBits: the server you connect is your own, and BareBits (Zaphaus LLC) operates no hosted service and receives nothing from your site.
+
+= Your own BareBits server =
+
+Everything this plugin does at runtime is communication with the BareBits server that you host yourself and connect during onboarding, at the URL you enter (often the same host as WordPress): the embedded setup wizard, dashboard single-sign-on, a WP-cron pinger that triggers the server's background tasks, and the checkout API bridge the payment pages ride. Requests carry the keys the two sides exchanged when you paired them (API key, cron key, sign-on key) and the WooCommerce order data needed to take payment (amounts, currency, order IDs, invoice status). This traffic goes only to your own server — no third party is involved and nothing reaches BareBits.
+
+The BareBits server software is governed by its Terms of Use (https://github.com/BareBits/cashupayserver/blob/main/USE_POLICY.md) and Privacy Policy (https://github.com/BareBits/cashupayserver/blob/main/PRIVACY.md), which you accept in its setup wizard. The Privacy Policy also documents, in plain language, every external service the server itself contacts to process payments (exchange-rate providers, Bitcoin network services, and the payment counterparties you configure) and what each one receives.
+
+= wordpress.org plugin directory =
+
+During onboarding the plugin installs and activates the "BTCPay for WooCommerce" gateway plugin from the wordpress.org plugin directory using WordPress's own plugin installer, which makes your site contact api.wordpress.org and downloads.wordpress.org (as any dashboard plugin install does). WordPress.org privacy policy: https://wordpress.org/about/privacy/
+
+= GitHub (full plugin build only) =
+
+The full plugin build distributed on the project's GitHub releases page can additionally install a BareBits server alongside WordPress. That flow fetches release metadata from api.github.com and downloads the release archive and its checksums from github.com. The build distributed on wordpress.org does not include this component and never contacts GitHub. GitHub terms of service: https://docs.github.com/en/site-policy/github-terms/github-terms-of-service — privacy statement: https://docs.github.com/en/site-policy/privacy-policies/github-general-privacy-statement
+
 == Changelog ==
 
 = 1.5 =
 * All admin styling and scripts now load as enqueued asset files, every admin action carries explicit capability and nonce checks, request input is sanitized on read and output escaped on print, and plugin-owned names use the barebits prefix throughout — per wordpress.org plugin review feedback.
+* The readme now documents every external service the plugin communicates with (your own BareBits server, the wordpress.org plugin directory, and — in the full build — GitHub), and the BareBits server project gained a plain-language Privacy Policy (PRIVACY.md) covering every external service the server itself contacts, linked from its setup wizard's terms step.
 * Server-side (for installs updating the companion BareBits server): on-chain receive through a Strike account, a confirmation-policy step for every on-chain source, and a fix for background payment polling that could miss payments made after the customer closed the payment page.
 
 = 1.4.2 =

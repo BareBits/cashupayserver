@@ -411,6 +411,12 @@ def test_terms_gate_requires_all_three_checkboxes(payserver: PayserverHandle) ->
     assert "github.com/BareBits/cashupayserver/blob/main/LICENSE.md" in landing, (
         "the license must link to the LICENSE file on GitHub"
     )
+    assert "github.com/BareBits/cashupayserver/blob/main/USE_POLICY.md" in landing, (
+        "the terms box must link to the use policy on GitHub"
+    )
+    assert "github.com/BareBits/cashupayserver/blob/main/PRIVACY.md" in landing, (
+        "the terms box must link to the privacy policy on GitHub"
+    )
     # The mandatory fee acknowledgement shows the configured dev fee (1%).
     assert "1% fee is assessed on all incoming payments" in landing, (
         "the fee acknowledgement must state the incoming-payment fee"

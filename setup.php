@@ -1510,9 +1510,11 @@ function renderUrlModeDetectionScript(): void { ?>
                         <label for="terms_legal">
                             I promise not to use this software for anything
                             illegal, and I agree with the terms of the
-                            <a href="https://github.com/BareBits/cashupayserver/blob/main/LICENSE.md" target="_blank" rel="noopener" style="color: #63b3ed;">license</a>
-                            and
-                            <a href="https://github.com/BareBits/cashupayserver/blob/main/USE_POLICY.md" target="_blank" rel="noopener" style="color: #63b3ed;">use policy</a>.
+                            <a href="https://github.com/BareBits/cashupayserver/blob/main/LICENSE.md" target="_blank" rel="noopener" style="color: #63b3ed;">license</a>,
+                            the
+                            <a href="https://github.com/BareBits/cashupayserver/blob/main/USE_POLICY.md" target="_blank" rel="noopener" style="color: #63b3ed;">use policy</a>,
+                            and the
+                            <a href="https://github.com/BareBits/cashupayserver/blob/main/PRIVACY.md" target="_blank" rel="noopener" style="color: #63b3ed;">privacy policy</a>.
                         </label>
                     </div>
 
