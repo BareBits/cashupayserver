@@ -21,15 +21,27 @@ server.
 ## 1. The only data flow to BareBits: the development fee
 
 The software collects a 1% development fee on incoming payments (disclosed and agreed to
-during setup). Accrued fees are periodically paid out as a Lightning payment to our Lightning
-address (`fees@getbarebits.com`, resolved at `getbarebits.com`). When such a payout happens,
-our Lightning-address host necessarily learns:
+during setup). Fees reach us in one of two ways: your server periodically pays out accrued
+fees as a Lightning payment to our Lightning address (`fees@getbarebits.com`, resolved at
+`getbarebits.com`), or — occasionally, when an owed fee covers a whole invoice — a customer
+payment is redirected to a fee invoice directly. In both cases it is **your server** that
+fetches the fee invoice from our Lightning-address host over HTTPS, so that host necessarily
+learns:
 
-- your server's IP address,
+- your **server's** IP address (from the invoice fetch — see the note below on what
+  Lightning payments themselves reveal),
 - the fee amount and the time of payment,
-- a deployment label sent as the payment comment (`Deployment: <id>`). Unless your installer
-  or hosting provider explicitly configured a deployment ID, this label is the literal word
-  `ANONYMOUS` — it is **not** a generated fingerprint of your installation.
+- on periodic settlements only, a deployment label sent as the payment comment
+  (`Deployment: <id>`). Unless your installer or hosting provider explicitly configured a
+  deployment ID, this label is the literal word `ANONYMOUS` — it is **not** a generated
+  fingerprint of your installation. Redirected customer payments carry no such label.
+
+**What about the payer of a fee invoice?** Lightning payments are onion-routed: the
+recipient of a payment learns which node forwarded the final hop, not who initiated the
+payment or from what IP address. So when a fee is paid by your mint melting ecash, or by a
+redirected customer payment, we do not learn the payer's IP address or identity — not your
+customer's, and not your server's — from the payment itself. The only IP we see is your
+server's, from the HTTPS invoice fetch described above; your customers never connect to us.
 
 No order data, customer data, store configuration, wallet keys, addresses, or revenue
 figures other than the fee amount itself are included. This is everything we receive from a
@@ -50,6 +62,18 @@ you are paying to. Your chosen mint acts as a custodian and necessarily sees you
 address, every payment amount, payment timing, and the payout destinations of your melt
 operations. This happens at invoice creation, during background payment polling, and on
 withdrawals/auto-cashout.
+
+**What the mint learns about your customers:** the mint issues the Lightning invoice each
+customer pays, so it observes every sale — amount, time, and whether it was paid — and can
+therefore reconstruct your store's sales pattern. It does not, however, learn who your
+customers are: quote requests contain only the amount and unit (no order description,
+customer name, or order metadata), customers' browsers never contact the mint (all
+interaction goes through your server), and a Lightning payment does not reveal the payer's
+IP address or identity to its recipient (payments are onion-routed; the recipient sees only
+the final forwarding hop). When a customer pays with a Cashu token directly (offline
+payments), your server — not the customer — submits the token to the mint for verification
+and redemption. Independently of your store, the customer's *own* wallet or wallet service
+may of course know what they paid for; that is between them and their wallet provider.
 
 ### Nostr relays (wallet connections and CLINK offers)
 
@@ -168,19 +192,12 @@ other data is ever sent to DB-IP, and the software never geolocates your custome
 ## 4. Connections made from web browsers
 
 Some connections originate in a browser (yours or your customer's) rather than from your
-server, so the *browser's* IP address and user agent are what the service sees:
+server, so the *browser's* IP address and user agent are what the service sees. All
+JavaScript, stylesheets, fonts, and images are served from your own server — no CDN is in
+the path of any page, and in particular QR codes are rendered entirely by locally-served
+code, so no third party can observe payment pages or tamper with what a QR encodes. The
+remaining browser-side connections are:
 
-- **QR-code library (jsDelivr):** the payment page, the payment-request page, and the admin
-  dashboard load a QR-rendering script from the [jsDelivr](https://www.jsdelivr.com) CDN
-  ([Terms](https://www.jsdelivr.com/terms) ·
-  [Privacy](https://www.jsdelivr.com/terms/privacy-policy)). Every visitor's browser —
-  including your customers' — requests this file, exposing their IP address and user agent to
-  the CDN, as with any CDN-hosted asset.
-- **Admin QR module (Skypack):** the admin dashboard additionally loads an animated-QR module
-  from the [Skypack](https://www.skypack.dev) CDN
-  ([Terms](https://www.skypack.dev/legal/tos) ·
-  [Privacy](https://www.skypack.dev/legal/privacy-policy)). Only the admin's browser does
-  this, never customers'.
 - **Mint discovery (admin only, on demand):** when you open the mint-discovery browser in the
   admin or setup wizard, **your browser** connects read-only to four public Nostr relays
   (`relay.damus.io`, `relay.8333.space`, `nos.lol`, `relay.primal.net`) to fetch mint
@@ -198,7 +215,8 @@ server, so the *browser's* IP address and user agent are what the service sees:
 
 - No analytics, tracking pixels, tag managers, telemetry, or error/crash reporting — to us or
   to anyone else.
-- No web fonts or third-party stylesheets; no customer geolocation.
+- No third-party CDNs: every script, stylesheet, font, and image is served by your own
+  server. No customer geolocation.
 - Customer IP addresses are not sent to any geolocation or reputation service.
 - The diagnostics report in the admin is generated locally as a download for you to inspect
   and share manually if you seek support; nothing is uploaded automatically.

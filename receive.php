@@ -643,7 +643,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Payment Request - <?= htmlspecialchars($formattedAmount) ?></title>
-    <script src="https://cdn.jsdelivr.net/npm/qrious@4.0.2/dist/qrious.min.js"></script>
+    <script src="<?= htmlspecialchars(Urls::assets('js/')) ?>qrcode-generator.js"></script>
+    <script src="<?= htmlspecialchars(Urls::assets('js/')) ?>qr-shim.js"></script>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body {

@@ -340,8 +340,9 @@ class Security {
         // Referrer policy
         header('Referrer-Policy: strict-origin-when-cross-origin');
 
-        // Content Security Policy (adjust as needed)
-        header("Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self'");
+        // Content Security Policy (adjust as needed). No CDN entries: all
+        // scripts are served locally (see assets/js/qr-shim.js).
+        header("Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self'");
     }
 
     // Simple file-based cache for rate limiting
