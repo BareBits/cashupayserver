@@ -10,6 +10,7 @@ import sqlite3
 
 import pytest
 
+from fixtures.browser import open_manual_mints
 from fixtures.nutshell import MintHandle
 from fixtures.payserver import PayserverHandle
 
@@ -101,8 +102,7 @@ def test_setup_wizard_completes_in_browser(
 
     # mints: skip auto-discovery (no Nostr relays reachable from the test
     # sandbox) and enter the two local mints by hand.
-    page.wait_for_selector("#mint-manual-toggle")
-    page.click("#mint-manual-toggle")
+    open_manual_mints(page)
     page.fill("#mint_url_manual", mint.url)
     page.fill("#backup_mint_url_manual", backup_mint.url)
     page.click("#mints-continue-btn")
