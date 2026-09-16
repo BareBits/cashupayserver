@@ -7727,14 +7727,11 @@ header('Cache-Control: no-cache, must-revalidate');
     </div>
 
     <script src="<?= htmlspecialchars(Urls::assets('js/')) ?>mint-discovery.bundle.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/qrious@4.0.2/dist/qrious.min.js"></script>
-    <script type="module">
-        // Import bc-ur library as ES module
-        import { UR, UREncoder } from 'https://cdn.skypack.dev/@gandlaf21/bc-ur@1.1.12';
-
-        // Expose to global scope for AnimatedQR class
-        window.bcur = { UR, UREncoder };
-    </script>
+    <script src="<?= htmlspecialchars(Urls::assets('js/')) ?>qrcode-generator.js"></script>
+    <script src="<?= htmlspecialchars(Urls::assets('js/')) ?>qr-shim.js"></script>
+    <!-- Self-contained @gandlaf21/bc-ur bundle exposing window.bcur for
+         AnimatedQR (scripts/build-bcur-bundle.sh regenerates it). -->
+    <script src="<?= htmlspecialchars(Urls::assets('js/')) ?>bc-ur.bundle.js"></script>
     <script src="<?= htmlspecialchars(Urls::assets('js/')) ?>animated-qr.js?v=4"></script>
     <script src="<?= htmlspecialchars(Urls::assets('js/')) ?>chart.min.js"></script>
     <script>

@@ -105,6 +105,9 @@ def _walk_wizard_in_iframe(page) -> None:
     assert frame.locator(
         "label[for='terms_legal'] a[href='https://github.com/BareBits/cashupayserver/blob/main/USE_POLICY.md']"
     ).count() == 1, "use policy must link to USE_POLICY.md on GitHub"
+    assert frame.locator(
+        "label[for='terms_legal'] a[href='https://github.com/BareBits/cashupayserver/blob/main/PRIVACY.md']"
+    ).count() == 1, "privacy policy must link to PRIVACY.md on GitHub"
     for box in ("#terms_legal", "#terms_warranty", "#terms_fee"):
         frame.locator(box).check()
     frame.locator("button[type=submit]:has-text('Continue')").click()

@@ -43,7 +43,7 @@ cp admin.php setup.php api.php payment.php receive.php cron.php router.php index
 cp user_config.example.php "$BUILD_DIR/"
 # License terms travel with the artifact (the wordpress/ GPL carve-out does not
 # apply here — the server zip contains no wordpress/ code).
-cp LICENSE.md USE_POLICY.md "$BUILD_DIR/"
+cp LICENSE.md USE_POLICY.md PRIVACY.md "$BUILD_DIR/"
 cp .htaccess manifest.json favicon.ico "$BUILD_DIR/"
 cp -r images/ "$BUILD_DIR/images/"
 
