@@ -109,6 +109,20 @@ def _assert_readme_sane(zip_path: Path, wp: WordPressHandle) -> None:
     assert [int(x) for x in tested.split(".")] >= [int(x) for x in core.split(".")[:2]], (
         f"readme 'Tested up to: {tested}' is older than the WP core this suite runs ({core})"
     )
+    # wordpress.org review gate (2026-09 submission feedback): external
+    # services must be documented, with terms/privacy links the reviewer can
+    # follow. Both zips ship the same readme, so both must carry the section.
+    with zipfile.ZipFile(zip_path) as zf:
+        readme = zf.read("barebits/readme.txt").decode()
+    assert "== External services ==" in readme, "readme lost its External services section"
+    for required_link in (
+        "https://github.com/BareBits/cashupayserver/blob/main/USE_POLICY.md",
+        "https://github.com/BareBits/cashupayserver/blob/main/PRIVACY.md",
+        "https://wordpress.org/about/privacy/",
+    ):
+        assert required_link in readme, (
+            f"readme's External services section lost the {required_link} link"
+        )
 
 
 def test_no_inline_scripts_or_styles() -> None:

@@ -33,6 +33,7 @@ BareBits supports a number of payment types, risk/trust levels, and capabilities
 - **Receipts** E-mail receipts to your customers (optional) and collect their e-mail addresses for your newsletter
  - **Offline** payments powered by Cashu tokens (optional), melded to lightning when back online.
 - **Open source** - Read every line of code. Fork it, audit it yourself. Dual-licensed MIT (pre-2026-05-30) and Modified MIT (post-2026-05-30). See [LICENSE.md](LICENSE.md) and [USE_POLICY.md](USE_POLICY.md).
+- **Private** - No telemetry, no analytics, no phone-home. [PRIVACY.md](PRIVACY.md) documents every external service the server can contact and exactly what each one sees.
 
 
 ## ⚠️ AS-IS SOFTWARE ⚠️

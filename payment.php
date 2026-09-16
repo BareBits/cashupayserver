@@ -1454,7 +1454,8 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
 
     <div class="copy-toast" id="copy-toast">Copied to clipboard!</div>
 
-    <script src="https://cdn.jsdelivr.net/npm/qrious@4.0.2/dist/qrious.min.js"></script>
+    <script src="<?= htmlspecialchars(Urls::assets('js/')) ?>qrcode-generator.js"></script>
+    <script src="<?= htmlspecialchars(Urls::assets('js/')) ?>qr-shim.js"></script>
     <script>
         const invoice = <?= json_encode($invoice['bolt11']) ?>;
         const onchainAddress = <?= json_encode($invoice['onchain_address'] ?? null) ?>;
