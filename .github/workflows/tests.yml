@@ -99,6 +99,16 @@ jobs:
           name: build-artifacts
           path: build
 
+      - name: Ensure subversion is installed
+        # test_wporg_svn_deploy.py drives scripts/deploy-wporg-svn.sh against
+        # a local file:// repository; without svn/svnadmin it would skip
+        # silently and the release-time SVN deploy would go untested.
+        run: |
+          command -v svn >/dev/null && command -v svnadmin >/dev/null || {
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends subversion
+          }
+
       - name: Run test suite
         # --backend=phps: CI runs the full suite on the php -S backend only.
         # The Apache/nginx passes (run-tests.sh with no --backend runs all

@@ -325,3 +325,40 @@ jobs:
             build/barebits-windows-${{ env.TAG }}.zip
             build/SHA256SUMS
             build/barebits/BUILD_INFO
+
+  # Mirror stable releases to the wordpress.org plugin directory. Runs only
+  # after the GitHub release is published, and only for stable tags — the
+  # directory has no prerelease concept, so testing-channel releases must
+  # never reach it (scripts/deploy-wporg-svn.sh re-enforces this on the tag
+  # itself). Deploys the exact wporg zip published above: trunk + directory
+  # assets + tags/<version>. Re-runs are safe: an already-tagged version is
+  # skipped without touching SVN.
+  wporg-svn:
+    needs: [build, publish]
+    if: needs.build.outputs.prerelease == 'false'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+
+    steps:
+      - name: Checkout (deploy script + directory assets)
+        uses: actions/checkout@v4
+
+      - name: Download release assets
+        uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: build
+
+      - name: Ensure subversion is installed
+        run: |
+          command -v svn >/dev/null || {
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends subversion
+          }
+
+      - name: Deploy to wordpress.org SVN
+        env:
+          WPORG_SVN_PASSWORD: ${{ secrets.WORDPRESS_SVN_PWD }}
+        run: ./scripts/deploy-wporg-svn.sh "build/barebits_wordpress_plugin_wporg-$TAG.zip" "$TAG"
