@@ -4,13 +4,15 @@ Tags: bitcoin, lightning, payments, woocommerce, btcpay
 Requires at least: 6.0
 Tested up to: 7.1
 Requires PHP: 8.0
-Stable tag: 1.5.2
+Stable tag: 1.5.3
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
 Accept Bitcoin (on-chain and Lightning) in WooCommerce through a BareBits server. No approval process, no middlemen. Low 1% fee.
 
 == Description ==
+
+Accept Bitcoin (on-chain and Lightning) in WooCommerce through a BareBits server. No approval process, no middlemen. Low 1% fee.
 
 BareBits lets your WooCommerce shop accept Bitcoin — on-chain and over the Lightning Network — with funds going straight to wallets you control. No payment processor account, no approval process, no chargebacks.
 
@@ -70,6 +72,9 @@ During onboarding the plugin installs and activates the "BTCPay for WooCommerce"
 The full plugin build distributed on the project's GitHub releases page can additionally install a BareBits server alongside WordPress. That flow fetches release metadata from api.github.com and downloads the release archive and its checksums from github.com. The build distributed on wordpress.org does not include this component and never contacts GitHub. GitHub terms of service: https://docs.github.com/en/site-policy/github-terms/github-terms-of-service — privacy statement: https://docs.github.com/en/site-policy/privacy-policies/github-general-privacy-statement
 
 == Changelog ==
+
+= 1.5.3 =
+* The plugin page's Description now opens with the essentials the tagline already stated: no approval process, no middlemen, low 1% fee.
 
 = 1.5.2 =
 * First release distributed through the wordpress.org plugin directory: stable releases now publish there automatically, and the directory page gained its art (banner, icon, screenshots) plus this readme's Installation and Screenshots sections.
