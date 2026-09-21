@@ -8,7 +8,7 @@ Stable tag: 1.5.1
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
-Accept Bitcoin (on-chain and Lightning) in WooCommerce through a BareBits server. No approval process, no middlemen.
+Accept Bitcoin (on-chain and Lightning) in WooCommerce through a BareBits server. No approval process, no middlemen. Low 1% fee.
 
 == Description ==
 
@@ -19,6 +19,15 @@ This plugin is the WordPress-side glue: during onboarding you connect your self-
 The plugin then installs and configures the "BTCPay for WooCommerce" gateway plugin, points it at your BareBits server, registers the payment webhook, and can apply an automatic checkout discount for Bitcoin payments — on both the classic and the block-based checkout, with the percentage advertised in the payment method's title.
 
 The BareBits server itself is a separate, self-hosted application (https://github.com/BareBits/cashupayserver) with its own license. This plugin contains no BareBits server code and talks to it purely over its HTTP API.
+
+== Installation ==
+
+1. Install and activate WooCommerce, if it isn't active already.
+2. Install and activate this plugin, then open **BareBits** in the wp-admin menu — onboarding starts there.
+3. Enter the URL of your self-hosted BareBits server and approve the pairing request on the server's dashboard.
+4. Finish onboarding: the plugin installs and configures the "BTCPay for WooCommerce" gateway plugin, registers the payment webhook, and enables Bitcoin at checkout. Optionally, set a percentage discount for customers paying with Bitcoin.
+
+Don't have a BareBits server yet? Any host that can run WordPress can run one — see https://github.com/BareBits/cashupayserver. (The plugin's full build, distributed on the project's GitHub releases page, can also install a server alongside WordPress for you.)
 
 == Frequently Asked Questions ==
 
@@ -33,6 +42,14 @@ To wallets you control: your own Lightning address, your own on-chain wallet (xp
 = What happens if I uninstall this plugin? =
 
 Only the WordPress-side wiring is removed. A BareBits server installed alongside WordPress keeps running, and its data directory (which holds wallet keys) is never deleted by this plugin. The record of where that server lives — including its saved admin password, which is your only way into its dashboard — also survives, so reinstalling the plugin later offers to reconnect it.
+
+== Screenshots ==
+
+1. Point of sale on the BareBits server dashboard — build an invoice from the product catalog.
+2. Or create a simple invoice from just an amount.
+3. The customer payment page: Lightning and on-chain, payable with any Bitcoin or Cashu wallet.
+4. Payment complete.
+5. Every invoice in one list — filter by store and status, export as CSV.
 
 == External services ==
 
