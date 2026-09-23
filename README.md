@@ -15,30 +15,31 @@ Accept Bitcoin payments (lightning and on-chain) without running a full BTCPay S
 
 ## What is BareBits?
 
-BareBits is a PHP-based Bitcoin Lightning payment gateway that implements BTCPay Server's Greenfield API. Any e-commerce software that works with BTCPay Server can work with BareBits. This include WooCommerce, Shopify, Magneto, Drupal, and more! It can also send invoices, manage products, and create self-serve invoices for your customers.
+BareBits makes it EASY for merchants to accept Bitcoin. Technically speaking, it is a PHP-based Bitcoin Lightning payment gateway that implements BTCPay Server's Greenfield API. This means that any e-commerce software that works with BTCPay Server can work with BareBits inlcuding WooCommerce, Shopify, Magneto, Drupal, and more! It can also send invoices, manage products, and create self-serve invoices for your customers (use as a donation page or tip jar).
 
 BareBits supports a number of payment types, risk/trust levels, and capabilities including:
  
 
 ### Key Features
 - **Any PHP hosting** - Works on $3/month shared hosting.
-- **No KYC or approval process** - Just download and run!
+- **No application or approval process** - Just download and run!
+- **Self-custody** - A fully self-custody solution, or add Cashu mint or Strike support for increased convenience. 
 - **E-commerce integration** - Plugin for WooCommerce. On magneto, shopify, or another platform? Use the BTCPay plugin and point it to your BareBits URL.
 - **On-chain payments** to an off-server wallet using xpub addresses or even a single address
-- **Lightning payments** to an LNURL lightning address and/or a cashu mint (no need to manage liquidity). No LNURL? Don't want to rely on a cashu mint? You can use submarine swaps so your customer's can pay in lightning but you receive the funds on-chain. Your customer pays the swap fee. Noffers/CLINK are also supported, so you can direct lightning payments to an off-server wallet ([Electrum](https://electrum.org/) is suggested). Nostr Wallet Connect (NWC/NIP-47) is supported too. Multiple wallets and connection types are supported so payments gracefully fall back to whichever wallet is online + has sufficient inbound liquidity.
-- **Self-custody** - A fully self-custody solution, or add Cashu mint support for increased convenience
+- **Lightning payments** to your off-server wallet via LNURL lightning address, CLINK noffer, or NWC (nostr wallet connect), or Strike API. Also supports using a cashu mint (no need to manage liquidity). We suggest ([Electrum](https://electrum.org/) for self-custody setups). Multiple wallets and connection types are supported so payments gracefully fall back to whichever wallet is online + has sufficient inbound liquidity.
+- **Submarine swaps** - If your lightning destination is offline or lacks sufficient inbound liquidity, you can still accept lightning payments via submarine swaps (Boltz and Zeus). Your customer's can pay in lightning but you receive the funds on-chain. Your customer pays the swap fee.
 - **Multiple stores** - Each store can have it's own invoice settings, cashout addresses, etc.
 - **User management** - Admin users can modify store settings and products and withdraw funds, regular users can only take payments.
 - **Product management** - Add commonly-used products to your store to make invoicing fast and clear
 - **Receipts** E-mail receipts to your customers (optional) and collect their e-mail addresses for your newsletter
- - **Offline** payments powered by Cashu tokens (optional), melded to lightning when back online.
-- **Open source** - Read every line of code. Fork it, audit it yourself. Dual-licensed MIT (pre-2026-05-30) and Modified MIT (post-2026-05-30). See [LICENSE.md](LICENSE.md) and [USE_POLICY.md](USE_POLICY.md).
 - **Private** - No telemetry, no analytics, no phone-home. [PRIVACY.md](PRIVACY.md) documents every external service the server can contact and exactly what each one sees.
+ - **Offline** payments powered by Cashu tokens (optional), melded to lightning when back online. You choose which mints to trust tokens from.
+- **Open source** - Read every line of code. Fork it, audit it yourself, and modify it to your liking. Dual-licensed MIT (pre-2026-05-30) and Modified MIT (post-2026-05-30). See [LICENSE.md](LICENSE.md) and [USE_POLICY.md](USE_POLICY.md).
 
 
 ## ⚠️ AS-IS SOFTWARE ⚠️
 
-Do NOT use with amounts you cannot afford to lose. Use the suggested default pattern of having funds go to a cold wallet to limit risk. You wouldn't want your funds sitting on a web server anyway. For maximum sovereignty, choose settings that enable lightning payments to an off-server wallet. If you do not have a lightning wallet configured, a Cashu mint (if explicitly enabled) takes custody of smaller lightning payments until automatic withdrawal thresholds are reached. 
+Do NOT use with amounts you cannot afford to lose. Use the suggested default pattern of having funds go to an offline wallet to limit risk. You wouldn't want your funds sitting on a web server anyway. If you do not have a lightning wallet configured, a Cashu mint (if explicitly enabled) takes custody of smaller lightning payments until automatic withdrawal thresholds are reached. 
 
 **You are responsible for your own funds. The developers are not liable for any losses.** **This software is produced AS-IS without any warranty**
 
@@ -48,10 +49,10 @@ BareBits sits between custodial payment gateways and full self-hosting:
 
 | Solution | Pros | Cons |
 |----------|------|------|
-| Custodial gateways like [OpenNode](https://opennode.com)| Easy setup | KYC, can freeze funds, geographic restrictions |
+| Custodial gateways like [OpenNode](https://opennode.com)| Easy setup | Must apply for access, can freeze funds, geographic restrictions |
 | [BTCPay Server](https://btcpayserver.org/) | Full sovereignty | Needs VPS ($20+/mo), Docker, ongoing maintenance |
 | [Bitcart](https://bitcart.ai/) | Full sovereignty, limited lightning support with no liquidity management | Needs smaller VPS ($10+/mo), Docker, ongoing maintenance |
-| **BareBits** | Simple, cheap hosting. No KYC, trust mint with funds until withdrawal, or go full self-custody | Relies on block explorers for on-chain payment confirmations |
+| **BareBits** | Simple, cheap hosting. No application process, trust mint with funds until withdrawal, or go full self-custody | Relies on block explorers for on-chain payment confirmations |
 
 ### Screenshots
 
@@ -62,22 +63,29 @@ BareBits sits between custodial payment gateways and full self-hosting:
   <img src="docs/screenshots/payment-success.png" alt="Payment complete" width="180">
 </p>
 
-## Suggested Configurations
-BareBits is robust payment software that can direct payments to you via many methods depending on your security and speed needs. Below are several suggested setups. No matter which setup you choose, on-chain payments will ALWAYS go to your on-chain wallet. Lightning payments can take several paths depending on your needs.
+## Installation Methods
+<p align="center">
+  <img src="docs/screenshots/Installation methods infographic_shrunk.png" alt="Installation methods graphic" width="180">
+</p>
+
+**Run a WooCommerce store?** - Just install our wordpress plugin from the [latest release](https://github.com/BareBits/cashupayserver/releases/latest). It will install BareBits alongside woocommerce automatically. 
+Magneto & all other e-commerce installations -- Install BareBits standalone using the web method, then download the [BTCPay Plugin for your platform](https://docs.btcpayserver.org/FAQ/Integrations/#what-e-commerce-integrations-are-available) and point it at your BareBits URL.
+
+## Suggested Payment Configurations
+BareBits is robust payment software that can direct payments to you via many methods depending on your security and speed needs. Below are several suggested setups. No matter which setup you choose, on-chain payments will ALWAYS go to your on-chain wallet (unless you have a Strike account enabled, in which case, payments go to your Strike account). Lightning payments can take several paths depending on your needs.
 
 ### Dead simple setup with automatic USD conversion
 - Get an account at [strike.me](https://strike.me) and enable USD conversion in settings. Strike works in over 100 countries and native fiat currencies.
-- In the [Strike dashboard](https://dashboard.strike.me/), create an API key with only the **create invoices**, **generate invoice quotes** and **read invoices** scopes, and paste it into the "Strike API" section of the setup wizard (or the store's Lightning payments settings). A key with just those scopes can create and verify invoices but cannot spend funds from your account.
-- Note: a Strike *lightning address* (…@strike.me) can NOT be used in the LNURL box — Strike addresses don't support LUD-21 payment verification, so BareBits could never confirm a payment against one. The API key method above works fully and is tried first when generating invoices.
-- You can still grab an on-chain address from the receive tab (or use static-address mode).
-- Note: Strike is a custodial exchange that holds onto funds for you, which means there is risk they may take them. Don't keep significant funds on exchanges.
-- Note: Strike does not work with all kinds of merchants.
+- In the [Strike dashboard](https://dashboard.strike.me/), create an API key with only the **create invoices**, **generate invoice quotes**, **create receive requests**, and **read invoices** scopes, and paste it into the "Strike API" section of the setup wizard (or the store's Lightning payments settings). A key with just those scopes can create and verify invoices but cannot spend funds from your account.
+- Note: a Strike *lightning address* (…@strike.me) can NOT be used in the LNURL box — Strike addresses don't support LUD-21 payment verification, so BareBits could never confirm a payment against one. The API key method above works fully.
+- ⚠️ Strike is a custodial exchange that holds onto funds for you, which means there is risk they may take or lose them. Don't keep significant funds on exchanges.
+- ⚠️ Strike does not work with all kinds of merchants
   
 ### Full self-custody setup (suggested, no USD conversion):
-- Run an [Electrum](https://electrum.org/) wallet on your desktop computer and enable the [automatic liquidity management plugin](https://github.com/BareBits/electrum_liquidity). Keep $100 or so in the wallet to keep liquidity flowing smoothly. You can start with zero and build up gradually as payments arrive. See [How to get an LNURL or CLINK Noffer](#how-to-get-an-lnurl-or-clink-noffer). Find your xpub in the "wallet information" section.
+- Run an [Electrum](https://electrum.org/) wallet on your desktop computer and enable the [automatic liquidity management plugin](https://github.com/BareBits/electrum_liquidity). Keep $100 or so in the wallet to keep liquidity flowing smoothly. You can start with zero and build up gradually as payments arrive. See "How to get an LNURL, NWC connection, or CLINK Noffer". Find your xpub in the "wallet information" section.
 - Enable submarine swaps as a fallback in case your desktop is offline or doesn't have sufficient inbound liquidity.
 - Suggestion: leave "strict mode" disabled. If your electrum wallet is unavailable AND a payment would be uneconomical to do a submarine swap for, lightning payments will land in a cashu mint (custodial) and be automatically withdrawn to your Electrum wallet once you have sufficient inbound liquidity OR will be withdrawn on-chain once it's economically reasonable.
-- Need USD or other fiat currency? Use an exchange to convert your funds.
+- Need USD or other fiat currency? See [our suggestions](https://getbarebits.com/help/Understanding%20Bitcoin/fiat%20conversion%20options/) for exchanges.
 
 ### On-chain Absolutist
 Don't want to mess around with LNURLs or CLINK noffers? Just want everything to go to your cold on-chain wallet? No problem!
@@ -85,17 +93,14 @@ Don't want to mess around with LNURLs or CLINK noffers? Just want everything to 
 - Want your customers to be able to pay with lightning? Enable submarine swaps: your customers pay in lightning, you get funds on-chain
 - Suggested: allow fallback to mint (strict mode disabled, the default) so smaller lightning payments are workable. Submarine swap providers won't let you make swaps < around $25. Funds will be temporarily stored in the cashu mint, then forwarded to you on-chain when fees permit.
 
-
 ## Installation
 
-### Standalone (Any PHP Hosting)
+### Web Install (Any PHP Hosting)
 
 1. **Download** the latest `barebits-v*.zip` from the [latest GitHub release](https://github.com/BareBits/cashupayserver/releases/latest)
 2. **Extract** the zip file
 3. **Upload** to your web hosting via FTP or file manager
 4. **Open** the URL in your browser (e.g., `https://yourdomain.com/barebits/`)
-5. **Follow** the setup wizard to configure your mint and password
-6. **Customize** your store settings to your heart's content!
 
 ### Windows desktop (point-of-sale, no hosting needed)
 
@@ -123,8 +128,8 @@ Have WooCommerce? Install the **BareBits** plugin in WordPress — grab the plug
 ## Payment Flow
 
 Generally speaking, BareBits tries to offer both on-chain and lightning as payment options to all customers. On-chain payments are always enabled, lightning payments are enabled depending on configuration. Here's what that decision tree looks like:
-- Is the customer paying on-chain? Send directly to merchant xpub wallet or on-chain address
-- Does the merchant have a working LNURL, NWC connection, or CLINK Noffer? Present a lightning invoice
+- Is the customer paying on-chain? Send directly to merchant xpub wallet, chain address, or Strike account
+- Does the merchant have a working LNURL, NWC connection, or CLINK Noffer? Present a lightning invoice using those methods.
 - If submarine swaps are NOT enabled and a cashu mint is NOT enabled, do not present a lightning invoice.
 - If submarine swaps ARE enabled AND the invoice amount falls within the swap provider's min/max limits, present a lightning invoice that settles directly to the merchant's on-chain wallet. When several providers are configured, the preferred (first reachable) provider is used unless another is cheaper by more than the auto-select threshold (`swaps_auto_select_threshold_pct`, default 10%).
 - If submarine swaps are NOT enabled, or no provider can serve the amount, display a lightning invoice that sends payment to the cashu mint — unless strict mode is on, in which case no lightning invoice is presented. Funds are later automatically emptied from the mint to the merchant's lightning or on-chain wallet. Empty to on-chain wallet only occurs by auto-cashout once it's worth it (auto-cashout caps the swap fee at 1% of the amount by default).
@@ -132,10 +137,12 @@ Generally speaking, BareBits tries to offer both on-chain and lightning as payme
 
 ## Fee Payments and Structure
 
-The BareBits software charges a 1% fee for usage. If you are a web developer, you can sell this service to your clients and charge an additional fee on top. Fees are paid in a number of ways.
+The BareBits software charges a 1% fee for usage. If you are a web developer, you can sell this service to your clients and charge an additional fee on top. Fees are paid in two ways, both of which are clearly shown in the invoices and stats tabs in your BareBits installation.
 
- - When any invoice is generated where the invoice amount is < the fee due, the payment will be automatically redirected to the fee destination.
+ - When any invoice is generated where the invoice amount is < the fee due, the payment will be automatically redirected to the fee destination. For example, if you owe 1000 sats in fees and a customer pays a 500 sat invoice, that payment will be sent directly to BareBits developers.
  - If any funds are in the cashu mint and a fee is due, those funds will be used to pay the fee
+
+This "payment redirection" method of paying fees ensures that BareBits developers never have access to your funds or your customer's private information.
 
 ## Submarine Swaps (LN → on-chain, optional)
 
@@ -160,7 +167,7 @@ on the checkout page.
 **Cons**
 
 - **Per-invoice fees.** Boltz currently charges ~0.5% + the lockup miner fee.
-  Stats dashboard tracks both as a "Swap fees" line item. This means it's not adviseable for smaller invoice amounts.
+  Stats dashboard tracks both as a "Swap fees" line item. This means it's not advisable for smaller invoice amounts.
 - **Min/max amount limits.** Boltz mainnet currently enforces 10,000 sats min
   and 5,000,000 sats max per swap; invoices outside this range can't use the
   swap rail.
@@ -174,16 +181,6 @@ on the checkout page.
   cashu mint (if enabled). You can enable "strict mode" in settings to disable the fallback
   and reject the invoice instead — useful for operators who want to eliminate
   the mint entirely from their payment flow.
-
-**Enabling**
-
-1. Go to *Settings* → *Submarine Swaps*. Toggle the master switch on, configure
-   the provider preference order (`zeus,boltz` recommended; first reachable
-   wins), and decide whether to allow mint fallback.
-2. Each store that should use swaps needs an on-chain xpub configured under
-   *Bitcoin* in that store's settings.
-3. (Optional) Per-store override: a store can force swaps on or off
-   independently of the site default.
 
 ## Requirements
 
@@ -207,28 +204,28 @@ If you want your customers to be able to pay natively via lightning (lowest fees
 ### CLINK Noffers (suggested) (self-custody)
 CLINK Noffers enable you to generate lightning invoices on the fly from a desktop wallet that is left running online. This means you maintain full self-custody over your funds! You will need to manage your liquidity (make sure you have room for incoming payments), but this can be automated fairly easily. BareBits will automatically fall back to submarine swaps, cashu mints, etc if there is no liquidity available or the wallet is offline, so it's not a big deal.
 
-Suggested setup: [Electrum wallet](https://electrum.org/) with the [CLINK plugin](https://github.com/BareBits/electrum_clink) and [Liquidity management plugin](https://github.com/BareBits/electrum_clink). Once the CLINK plugin is installed, go to the settings and generate an noffer to add to your store settings page. You only need to generate a single noffer.
+Suggested setup: [Electrum wallet](https://electrum.org/) with the [CLINK plugin](https://github.com/BareBits/electrum_clink) and [Liquidity management plugin](https://github.com/BareBits/electrum_clink). Once the CLINK plugin is installed, go to the settings and generate an noffer to add to your store settings page. You only need to generate a single noffer, but we suggest generating two noffers across two relays so that payments keep flowing even if your relay goes offline.
 
-The default settings on these plugins should work, just be sure to set the liquidity management plugin to run in automatic mode.
+The default settings on these plugins should work, just be sure to set the liquidity management plugin to run in automatic mode. 
 
 ### Nostr Wallet Connect (self-custody, works with many wallets)
 [NWC (NIP-47)](https://nwc.dev/) lets BareBits ask your own lightning wallet to create invoices and check whether they were paid — nothing more. Many wallets can issue a connection string (Alby Hub, Coinos, lnbits, and others): create a connection, then paste the `nostr+walletconnect://...` string into your store's NWC section (or the setup wizard). The connection is tested with a 1-sat test invoice when you save (the test invoice is never paid and simply expires).
 
 **Use a receive-only connection.** BareBits only ever calls `make_invoice` and `lookup_invoice`, but if your wallet lets you scope permissions, grant only those two — a connection that can also *pay* would let anyone who compromises your server spend from your wallet. BareBits warns you at save time if it can detect that the connection has spend permissions. The connection secret is stored server-side and never shown again in the admin UI.
 
-### LNURL Providers (simplest, instant USD conversion)
+### LNURL aka Lightning Address Providers (simplest, instant USD conversion)
 Many centralized exchanges like [Strike](https://strike.me) offer LNURLs out of the box and can offer instant USD conversion. Note that these exchanges are custodial: they hold onto funds for you. This introduces risk of theft, exchange collapse, etc so we do not suggest storing significant funds on them.
 
 | Provider   |      USD Conversion |  Notes |
 |----------|:-------------:|------:|
-| [Strike](https://strike.me) |  ✅ | Use the dedicated **Strike API** method (scope-limited API key), NOT the @strike.me lightning address — Strike addresses don't support LUD-21 verification. Works in most countries, some merchant type restrictions, KYC process |
-| [CoinOS](https://coinos.io) |    ✖️   |  Works in all countries, no restrictions, no KYC, no USD conversion |
-| [Rizful](https://rizful.com/) |  ✖️ |    Works in all countries, no restrictions, no KYC, no USD conversion |
+| [Strike](https://strike.me) |  ✅ | Use the dedicated **Strike API** method (scope-limited API key), NOT the @strike.me lightning address — Strike addresses don't support LUD-21 verification. Works in most countries, some merchant type restrictions, application process |
+| [CoinOS](https://coinos.io) |    ✖️   |  Works in all countries, no restrictions, no application process, no USD conversion |
+| [Rizful](https://rizful.com/) |  ✖️ |    Works in all countries, no restrictions, no application process, no USD conversion |
 
 You can also get your own LNURL by hosting your own lightning node (rather complex, not suggested if you are not technically inclined)
 
 ### BareBits vs CashuPayServer
-BareBits adds a number of enhancements to the original CashuPayServer software including on-chain payments, accepting cashu tokens, offline payments, automatic submarine swaps, automatic updates, security enhancements, LNURL support, user management, product management, a stats menu, and more. BareBits charges a **1% fee** for usage
+BareBits is a fork of [CashuPayServer](https://github.com/jooray/cashupayserver) by Juraj Bednár. BareBits adds a number of enhancements to the original CashuPayServer software including on-chain payments, accepting cashu tokens, offline payments, automatic submarine swaps, automatic updates, security enhancements, LNURL support, CLINK support, NWC support, user management, product management, a stats menu, and more. BareBits charges a **1% fee** for usage
 
 ## Security
 
@@ -473,10 +470,6 @@ Check that the web server can read PHP executables.
 ## Contributing
 
 Contributions are welcome! Please discuss with us first prior to committing and making a PR.
-
-## Forked from CashuPayServer
-
-BareBits is a fork of [CashuPayServer](https://github.com/jooray/cashupayserver) by Juraj Bednár. The original project established the core idea: a PHP-only Bitcoin payment gateway built on Cashu mints, speaking the BTCPay Greenfield API. BareBits preserves that foundation and adds direct on-chain support, multi-user administration, security hardening, an in-app updater, a sustainable revenue model, and a comprehensive test suite — all while keeping the "upload and go" deployment story on any PHP host.
 
 ---
 
