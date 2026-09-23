@@ -316,6 +316,8 @@ jobs:
             - `barebits_wordpress_plugin_wporg-${{ env.TAG }}.zip` — WordPress plugin, wordpress.org submission variant (connect-by-URL only)
             - `SHA256SUMS` — checksums of the zips above
             - `BUILD_INFO` — build metadata
+
+            Wordpress/Woocommerce Users: Use the main wordpress plugin, not the wporg version. The wporg version is a separate copy that is built for the wordpress.org plugin directory and is not meant to be installed directly.
           prerelease: ${{ needs.build.outputs.prerelease }}
           make_latest: ${{ needs.build.outputs.make_latest }}
           files: |
