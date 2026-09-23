@@ -49,7 +49,7 @@ BareBits sits between custodial payment gateways and full self-hosting:
 
 | Solution | Pros | Cons |
 |----------|------|------|
-| Custodial gateways like [OpenNode](https://opennode.com)| Easy setup | Must apply for access, can freeze funds, geographic restrictions |
+| Custodial gateways like [OpenNode](https://opennode.com)| Easy setup | Must apply for access, can freeze funds, geographic restrictions, charges a fee |
 | [BTCPay Server](https://btcpayserver.org/) | Full sovereignty | Needs VPS ($20+/mo), Docker, ongoing maintenance |
 | [Bitcart](https://bitcart.ai/) | Full sovereignty, limited lightning support with no liquidity management | Needs smaller VPS ($10+/mo), Docker, ongoing maintenance |
 | **BareBits** | Simple, cheap hosting. No application process, trust mint with funds until withdrawal, or go full self-custody | Relies on block explorers for on-chain payment confirmations |
