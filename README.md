@@ -65,7 +65,7 @@ BareBits sits between custodial payment gateways and full self-hosting:
 
 ## Installation Methods
 <p align="center">
-  <img src="docs/screenshots/Installation methods infographic_shrunk.png" alt="Installation methods graphic" width="180">
+  <img src="docs/screenshots/Installation methods infographic_shrunk.png" alt="Installation methods graphic">
 </p>
 
 **Run a WooCommerce store?** - Just install our wordpress plugin from the [latest release](https://github.com/BareBits/cashupayserver/releases/latest). It will install BareBits alongside woocommerce automatically. 
