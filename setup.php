@@ -2428,7 +2428,8 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                             account. Strike lightning addresses can't be used in the
                             LNURL box above, but a Strike API key works fully &mdash;
                             and when one is configured it's the <strong>first</strong>
-                            method tried when generating invoices.
+                            method tried when generating invoices (changeable later
+                            in the admin&rsquo;s Lightning payments card).
                         </p>
                         <div style="background: rgba(0,0,0,0.2); padding: 1rem; border-radius: 8px; font-size: 0.9rem; color: #a0aec0; margin-bottom: 0.5rem;">
                             <p style="margin-bottom: 0.5rem;">To create a key:</p>
