@@ -6087,7 +6087,7 @@ header('Cache-Control: no-cache, must-revalidate');
                                 <input type="number" class="form-input" id="onchain-confirm-timeout" min="60" value="86400">
                             </div>
                             <div class="form-group">
-                                <label class="form-label">Provider URL (optional &mdash; leave blank for default mempool.space)</label>
+                                <label class="form-label">Provider URL (optional &mdash; leave blank for default mempool.space with automatic blockstream.info fallback; a custom URL is used exclusively)</label>
                                 <input type="text" class="form-input" id="onchain-provider-url"
                                        placeholder="https://mempool.space/api">
                             </div>
