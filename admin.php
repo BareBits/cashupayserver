@@ -309,9 +309,13 @@ if (isset($_GET['api'])) {
                     'lud21Support' => $r['supports_verify'],
                 ];
             }, $lnAddressRows);
+            require_once __DIR__ . '/includes/rail_order.php';
             $autoMelt = [
                 // Ordered list of {address, lud21Support}; priority = array order.
                 'addresses' => $autoMeltAddresses,
+                // Configurable order the four destination types are tried in
+                // (permutation of strike,lnaddress,nwc,noffer; see RailOrder).
+                'railOrder' => RailOrder::lnOrderFromRow($store),
                 'enabled' => (bool)($store['auto_melt_enabled'] ?? 0),
                 'threshold' => (int)($store['auto_melt_threshold'] ?? 2000),
                 'modeOverride' => $autoMeltUseSwap,
@@ -416,6 +420,9 @@ if (isset($_GET['api'])) {
                 // minted in the merchant's Strike account, xpub/static as
                 // fallback. Only effective with a Strike key + mainnet.
                 'strikeOnchainEnabled' => OnchainConfig::strikeEnabledForStore($storeId),
+                // Which source is tried first for an invoice's address
+                // (permutation of strike,local; see RailOrder).
+                'sourceOrder' => RailOrder::onchainOrderFromRow($store),
                 'strikeKeyConfigured' => (function () use ($storeId): bool {
                     require_once __DIR__ . '/includes/store_ln_addresses.php';
                     foreach (StoreLnAddresses::listForStore($storeId) as $lnRow) {
@@ -2099,6 +2106,30 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
             break;
 
+        case 'save_onchain_source_order':
+            Auth::requireAdmin();
+            // Which source mints an invoice's on-chain address first: 'strike'
+            // (receive request in the merchant's Strike account) or 'local'
+            // (the store's xpub-derived / static address). Whichever is listed
+            // first is tried first; the other stays the fallback. Saves
+            // instantly from the on-chain card's priority control.
+            try {
+                $storeId = $_POST['store_id'] ?? '';
+                if (empty($storeId)) {
+                    throw new Exception('Store ID required');
+                }
+                require_once __DIR__ . '/includes/rail_order.php';
+                RailOrder::setOnchainOrder($storeId, (string)($_POST['source_order'] ?? ''));
+                echo json_encode([
+                    'success' => true,
+                    'sourceOrder' => RailOrder::onchainOrderForStore($storeId),
+                ]);
+            } catch (Throwable $e) {
+                http_response_code(400);
+                echo json_encode(['success' => false, 'error' => $e->getMessage()]);
+            }
+            break;
+
         case 'save_onchain':
             Auth::requireAdmin();
             // Persist a store's on-chain Bitcoin payment configuration.
@@ -2396,11 +2427,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             Auth::requireAdmin();
             require_once __DIR__ . '/includes/lnurl_receive.php';
             require_once __DIR__ . '/includes/store_ln_addresses.php';
+            require_once __DIR__ . '/includes/rail_order.php';
             try {
                 $storeId = $_POST['store_id'] ?? '';
                 if (empty($storeId)) {
                     throw new Exception('Store ID required');
                 }
+
+                // Configurable order the four destination TYPES are tried in
+                // (see RailOrder). Validated up front (strict permutation of
+                // strike,lnaddress,nwc,noffer) so a bad order fails before any
+                // probe runs; persisted only after the chain saves below.
+                // Absent = legacy caller → stored order left untouched.
+                $railOrder = isset($_POST['rail_order'])
+                    ? RailOrder::parseLnOrder((string)$_POST['rail_order'])
+                    : null;
 
                 // Destination chain. Preferred contract: three separate operator
                 // lists kept apart in the UI — ln_addresses[] (tried first),
@@ -2571,12 +2612,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if ($strikeOnchainParam !== null) {
                     OnchainConfig::setStrikeEnabled($storeId, (int)$strikeOnchainParam);
                 }
+                if ($railOrder !== null) {
+                    RailOrder::setLnOrder($storeId, implode(',', $railOrder));
+                }
 
                 echo json_encode([
                     'success' => true,
                     // Per-address LUD-21 results, in priority order.
                     'addresses' => $addressResults,
                     'strikeOnchainEnabled' => OnchainConfig::strikeEnabledForStore($storeId),
+                    // Effective type order after this save (permutation of
+                    // strike,lnaddress,nwc,noffer).
+                    'railOrder' => RailOrder::lnOrderForStore($storeId),
                 ]);
             } catch (Exception $e) {
                 cashupay_status(400);
@@ -5685,11 +5732,17 @@ header('Cache-Control: no-cache, must-revalidate');
                             $nwcEnvError = NwcClient::environmentError();
                             $cashuEnvError = CashuEnv::environmentError();
                             ?>
-                            <p class="form-help" style="margin-top:0;">
-                                Lightning payment paths are tried in the following order &mdash;
-                                you can use multiple paths: Strike API, LNURL/lightning address,
-                                NWC, noffer.
-                            </p>
+                            <div class="form-group" id="ln-rail-order-group">
+                                <label class="form-label">Payment path priority</label>
+                                <p class="form-help" style="margin-top:0;">
+                                    Lightning payment paths are tried in this order when an
+                                    invoice is generated (and when withdrawing) &mdash; you can
+                                    use multiple paths. Use the arrows to reorder. Entries
+                                    inside each path keep their own order from the sections
+                                    below. Saved with the button at the bottom of this card.
+                                </p>
+                                <div id="ln-rail-order-list"></div>
+                            </div>
 
                             <div class="form-group" id="auto-melt-strike-group">
                                 <label class="form-label">Strike API keys (priority order)</label>
@@ -5699,8 +5752,9 @@ header('Cache-Control: no-cache, must-revalidate');
                                     account. Strike lightning addresses (&hellip;@strike.me)
                                     don&rsquo;t support LUD-21 payment verification and can&rsquo;t
                                     be used in the Lightning Addresses list below &mdash; an API key
-                                    works fully, and is tried <em>first</em> when generating
-                                    invoices. Create a key in the
+                                    works fully, and by default is tried <em>first</em> when
+                                    generating invoices (see the payment path priority above).
+                                    Create a key in the
                                     <a href="https://dashboard.strike.me/" target="_blank" rel="noopener noreferrer" style="color: var(--accent);">Strike dashboard</a>
                                     (API Keys section) with <em>only</em> the
                                     <strong>create invoices</strong>, <strong>generate invoice
@@ -5762,8 +5816,9 @@ header('Cache-Control: no-cache, must-revalidate');
                                 <p class="form-help">
                                     Nostr Wallet Connect (NIP-47) lets BareBits request Lightning
                                     invoices straight from your own wallet and confirm payment
-                                    automatically. Tried <em>after</em> the lightning addresses
-                                    above and before noffers. Paste a
+                                    automatically. By default tried <em>after</em> the lightning
+                                    addresses above and before noffers (see the payment path
+                                    priority above). Paste a
                                     <code>nostr+walletconnect://&hellip;</code> string &mdash; ideally a
                                     <strong>receive-only</strong> connection (make_invoice +
                                     lookup_invoice). New connections are tested with a 1-sat test
@@ -5795,9 +5850,10 @@ header('Cache-Control: no-cache, must-revalidate');
                                 <?php endif; ?>
                                 <p class="form-help">
                                     CLINK noffers (NIP-69) request a Lightning invoice over Nostr and
-                                    settle via the merchant&rsquo;s payment receipt. They are tried
-                                    <em>after</em> the lightning addresses and NWC connections above,
-                                    in order, if those can&rsquo;t produce an invoice. Paste a
+                                    settle via the merchant&rsquo;s payment receipt. By default they
+                                    are tried <em>after</em> the lightning addresses and NWC
+                                    connections above (see the payment path priority above), in
+                                    order, if those can&rsquo;t produce an invoice. Paste a
                                     <code>noffer1&hellip;</code> string.
                                 </p>
                                 <div style="margin-bottom:0.75rem; padding:0.6rem 0.8rem; border-radius:8px; background:rgba(245,158,11,0.12); border:1px solid rgba(245,158,11,0.4); font-size:0.82rem;">
@@ -5989,11 +6045,26 @@ header('Cache-Control: no-cache, must-revalidate');
                                 <p class="form-help" id="onchain-strike-help">
                                     Each invoice&rsquo;s Bitcoin address is created in your Strike
                                     account, so on-chain payments land there like your Strike
-                                    Lightning payments do. The xpub / static address below is the
-                                    fallback when Strike is unreachable. Needs a Strike API key
+                                    Lightning payments do. By default the xpub / static address
+                                    below is the fallback when Strike is unreachable (see the
+                                    address source priority). Needs a Strike API key
                                     (Lightning payments card) with the
                                     <strong>create receive requests</strong> scope; mainnet only.
                                 </p>
+                            </div>
+
+                            <!-- Which source mints each invoice's address FIRST when both
+                                 Strike on-chain and a local xpub/static address are set up;
+                                 the other is the fallback. Saves instantly on reorder. -->
+                            <div class="form-group" id="onchain-source-order-group">
+                                <label class="form-label">Address source priority</label>
+                                <p class="form-help">
+                                    When on-chain payments via Strike are enabled alongside an
+                                    xpub / static address, the first source below creates each
+                                    invoice&rsquo;s Bitcoin address; the other is the fallback.
+                                    Use the arrows to reorder &mdash; saves immediately.
+                                </p>
+                                <div id="onchain-source-order-list"></div>
                             </div>
 
                             <div class="form-group">
@@ -6087,7 +6158,7 @@ header('Cache-Control: no-cache, must-revalidate');
                                 <input type="number" class="form-input" id="onchain-confirm-timeout" min="60" value="86400">
                             </div>
                             <div class="form-group">
-                                <label class="form-label">Provider URL (optional &mdash; leave blank for default mempool.space)</label>
+                                <label class="form-label">Provider URL (optional &mdash; leave blank for default mempool.space with automatic blockstream.info fallback; a custom URL is used exclusively)</label>
                                 <input type="text" class="form-input" id="onchain-provider-url"
                                        placeholder="https://mempool.space/api">
                             </div>
@@ -10826,8 +10897,64 @@ header('Cache-Control: no-cache, must-revalidate');
                 strikeHelp.innerHTML = 'Add a Strike API key in the <strong>Lightning payments</strong> '
                     + 'card first — on-chain payments via Strike are minted with that key.';
             }
+            if (Array.isArray(oc.sourceOrder) && oc.sourceOrder.length === 2) {
+                onchainSourceOrder = oc.sourceOrder.slice();
+            }
+            renderOnchainSourceOrder();
             updateOnchainOfferWarning();
             applyOnchainModeVisibility();
+        }
+
+        // ---- On-chain address source priority (strike vs local) ----
+        // Which source mints an invoice's address first; the other is the
+        // fallback. Reordering saves instantly (like the neighboring on-chain
+        // toggles). renderOrderWidget + labels live with the Lightning
+        // priority widget further down.
+        const ONCHAIN_SOURCE_LABELS = {
+            strike: 'Strike account (fresh address per invoice)',
+            local: 'This server (xpub-derived / static address)',
+        };
+        let onchainSourceOrder = ['strike', 'local'];
+
+        function renderOnchainSourceOrder() {
+            const list = document.getElementById('onchain-source-order-list');
+            if (!list) return;
+            renderOrderWidget(list, onchainSourceOrder, ONCHAIN_SOURCE_LABELS,
+                'onchain-source-order', moveOnchainSource);
+        }
+
+        async function moveOnchainSource(index, delta) {
+            const target = index + delta;
+            if (target < 0 || target >= onchainSourceOrder.length) return;
+            if (!currentStoreId) {
+                showToast('No store selected', 'error');
+                return;
+            }
+            const prev = onchainSourceOrder.slice();
+            const tmp = onchainSourceOrder[index];
+            onchainSourceOrder[index] = onchainSourceOrder[target];
+            onchainSourceOrder[target] = tmp;
+            renderOnchainSourceOrder();
+            try {
+                const body = `action=save_onchain_source_order&store_id=${encodeURIComponent(currentStoreId)}`
+                    + `&source_order=${encodeURIComponent(onchainSourceOrder.join(','))}`;
+                const res = await postWithCsrf(adminUrl, body);
+                const data = await res.json();
+                if (res.ok && Array.isArray(data.sourceOrder)) {
+                    onchainSourceOrder = data.sourceOrder.slice();
+                    if (dashboardData?.onchain) dashboardData.onchain.sourceOrder = data.sourceOrder.slice();
+                    renderOnchainSourceOrder();
+                    showToast('On-chain address source priority saved', 'success');
+                } else {
+                    onchainSourceOrder = prev;
+                    renderOnchainSourceOrder();
+                    showToast(data.error || 'Failed to save', 'error');
+                }
+            } catch (e) {
+                onchainSourceOrder = prev;
+                renderOnchainSourceOrder();
+                showToast('Failed to save address source priority', 'error');
+            }
         }
 
         // Show the "some wallets can't pay you" warning whenever on-chain is
@@ -11214,6 +11341,8 @@ header('Cache-Control: no-cache, must-revalidate');
                 if (strikeOnchainEl) {
                     body += `&strike_onchain=${strikeOnchainEl.checked ? '1' : '0'}`;
                 }
+                // Configurable type order (payment path priority widget).
+                body += `&rail_order=${encodeURIComponent(lnRailOrder.join(','))}`;
 
                 const response = await postWithCsrf(adminUrl, body);
 
@@ -11221,6 +11350,12 @@ header('Cache-Control: no-cache, must-revalidate');
 
                 if (response.ok) {
                     showToast('Settings saved!', 'success');
+                    // Re-render the priority widget from the server's effective
+                    // order so the UI reflects exactly what was persisted.
+                    if (Array.isArray(result.railOrder) && result.railOrder.length === 4) {
+                        lnRailOrder = result.railOrder.slice();
+                        renderLnRailOrder();
+                    }
                     // Mirror the saved Strike on-chain flag onto the on-chain
                     // card's toggle (both controls back the same store flag).
                     if (typeof result.strikeOnchainEnabled === 'boolean') {
@@ -11527,6 +11662,10 @@ header('Cache-Control: no-cache, must-revalidate');
                 .map(a => ({ label: a.address, uri: '', ref: a.ref }));
             awStrike = mapped.filter(a => a.type === 'strike')
                 .map(a => ({ label: a.address, key: '', ref: a.ref }));
+            if (am && Array.isArray(am.railOrder) && am.railOrder.length === 4) {
+                lnRailOrder = am.railOrder.slice();
+            }
+            renderLnRailOrder();
             renderLnAddressRows();
             renderNofferRows();
             renderNwcRows();
@@ -11577,6 +11716,72 @@ header('Cache-Control: no-cache, must-revalidate');
             awLnAddresses[index] = awLnAddresses[target];
             awLnAddresses[target] = tmp;
             renderLnAddressRows();
+        }
+
+        // ---- Configurable payment path (destination type) priority ----
+        // Permutation of the four types; index 0 is tried first at invoice
+        // time (and when withdrawing). Rides the Lightning payments save;
+        // the server enforces a full permutation.
+        const LN_RAIL_LABELS = {
+            strike: 'Strike API',
+            lnaddress: 'Lightning address (LNURL)',
+            nwc: 'NWC connection',
+            noffer: 'CLINK noffer',
+        };
+        let lnRailOrder = ['strike', 'lnaddress', 'nwc', 'noffer'];
+
+        // Shared row builder for the small fixed-item priority widgets (the
+        // Lightning type order and the on-chain source order). Rows carry
+        // data-rail for tests; buttons get stable ids "<idPrefix>-up-<key>" /
+        // "<idPrefix>-down-<key>".
+        function renderOrderWidget(listEl, order, labels, idPrefix, onMove) {
+            listEl.innerHTML = '';
+            order.forEach((key, i) => {
+                const row = document.createElement('div');
+                row.className = idPrefix + '-row';
+                row.dataset.rail = key;
+                row.style.cssText = 'display:flex; align-items:center; gap:0.4rem; margin-bottom:0.4rem;';
+                const prio = document.createElement('span');
+                prio.textContent = (i + 1) + '.';
+                prio.style.cssText = 'min-width:1.4rem; text-align:right; opacity:0.7; font-size:0.85rem;';
+                row.appendChild(prio);
+                const label = document.createElement('span');
+                label.textContent = labels[key] || key;
+                label.style.cssText = 'flex:1; font-size:0.9rem;';
+                row.appendChild(label);
+                const mkBtn = (text, title, id, handler, disabled) => {
+                    const b = document.createElement('button');
+                    b.type = 'button';
+                    b.id = id;
+                    b.className = 'btn btn-secondary';
+                    b.textContent = text;
+                    b.title = title;
+                    b.style.cssText = 'padding:0.3rem 0.55rem; line-height:1;';
+                    if (disabled) { b.disabled = true; b.style.opacity = '0.4'; }
+                    else b.addEventListener('click', handler);
+                    return b;
+                };
+                row.appendChild(mkBtn('↑', 'Move up', idPrefix + '-up-' + key,
+                    () => onMove(i, -1), i === 0));
+                row.appendChild(mkBtn('↓', 'Move down', idPrefix + '-down-' + key,
+                    () => onMove(i, 1), i === order.length - 1));
+                listEl.appendChild(row);
+            });
+        }
+
+        function renderLnRailOrder() {
+            const list = document.getElementById('ln-rail-order-list');
+            if (!list) return;
+            renderOrderWidget(list, lnRailOrder, LN_RAIL_LABELS, 'ln-rail-order', moveLnRailOrder);
+        }
+
+        function moveLnRailOrder(index, delta) {
+            const target = index + delta;
+            if (target < 0 || target >= lnRailOrder.length) return;
+            const tmp = lnRailOrder[index];
+            lnRailOrder[index] = lnRailOrder[target];
+            lnRailOrder[target] = tmp;
+            renderLnRailOrder();
         }
 
         // LUD-21 hint text for a single row (null hides it).

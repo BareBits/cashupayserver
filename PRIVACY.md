@@ -1,6 +1,6 @@
 # BareBits Privacy Policy
 
-_Last updated: September 15, 2026_
+_Last updated: September 23, 2026_
 
 BareBits is **self-hosted** payment processing software published by Zaphaus LLC ("BareBits",
 "we"). You download the software and run it on infrastructure you control. We do not operate a
@@ -147,15 +147,22 @@ Stores priced in fiat need a BTC exchange rate. The server queries, in fallback 
 currency code; the provider sees your server's IP address and request timing. Results are
 cached for five minutes. Stores priced in satoshis never trigger these requests.
 
-### Bitcoin block explorer — mempool.space
+### Bitcoin block explorers — mempool.space, blockstream.info
 
 The on-chain rail watches for payments by querying
 [mempool.space](https://mempool.space) ([Terms](https://mempool.space/terms-of-service) ·
 [Privacy](https://mempool.space/privacy-policy)) unless you configure your own explorer or
-node (section 2). mempool.space sees your server's IP address and **the individual receiving
-addresses your store generates** (your extended public key itself is never transmitted —
-addresses are derived locally), queried repeatedly while an invoice is pending. It is also
-used for fee estimates and as a fallback for broadcasting swap-claim transactions.
+node (section 2). When mempool.space is unreachable or returns unusable data, the server
+automatically fails over to [blockstream.info](https://blockstream.info)
+([Terms](https://blockstream.com/terms/) · [Privacy](https://blockstream.com/privacy/)) so
+payment detection keeps working through an explorer outage. Whichever explorer is queried
+sees your server's IP address and **the individual receiving addresses your store generates**
+(your extended public key itself is never transmitted — addresses are derived locally),
+queried repeatedly while an invoice is pending; blockstream.info sees nothing while
+mempool.space is healthy. Both are also used, in the same order, for fee estimates and as a
+fallback for broadcasting swap-claim transactions. Configuring your own explorer or node
+(section 2) disables both built-in explorers entirely — a custom endpoint is used
+exclusively, and its outage never diverts queries to a public explorer.
 
 ### Submarine swap providers — Zeus, Boltz
 

@@ -102,6 +102,13 @@ How it works:
    store can also run Strike-only (no xpub at all) — then a Strike outage
    simply leaves that invoice Lightning-only.
 
+Which source is asked *first* is configurable per store: the **Address
+source priority** control in the On-chain Bitcoin payments card (default:
+Strike first, the local xpub / static address as fallback). Putting the
+local source first means addresses come from your own wallet whenever it
+can produce one, with Strike as the rescue when it can't (for example when
+a static-address store's payment slots are momentarily exhausted).
+
 Requirements: a Strike API key with the additional **Create receive
 requests** scope (`partner.receive-request.create`) — enabling the option
 tests the key with a real 1-sat receive request (never paid) and refuses

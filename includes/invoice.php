@@ -16,6 +16,7 @@ require_once __DIR__ . '/../cashu-wallet-php/CashuWallet.php';
 require_once __DIR__ . '/onchain/payments.php';
 require_once __DIR__ . '/onchain/config.php';
 require_once __DIR__ . '/onchain/address_check.php';
+require_once __DIR__ . '/rail_order.php';
 require_once __DIR__ . '/swap/factory.php';
 require_once __DIR__ . '/swap/config.php';
 require_once __DIR__ . '/swap/quote_fetcher.php';
@@ -392,9 +393,9 @@ class Invoice {
                         // Strike API: create a BTC invoice in the merchant's
                         // Strike account and quote it into a BOLT11. Settlement
                         // is later confirmed by reading the Strike invoice back
-                        // (payment page + cron) until state=PAID. Strike keys
-                        // sort to position 0 in chainFromLists, so this rail is
-                        // tried first whenever a key is configured. Strike caps
+                        // (payment page + cron) until state=PAID. Strike leads
+                        // the chain in the default type order (configurable per
+                        // store — see RailOrder). Strike caps
                         // descriptions at 200 chars, so the memo gets the wider
                         // cap rather than the 100-char CLINK one.
                         $strikeMemo = self::buildInvoiceMemo($store, $metadata, 200);
@@ -722,63 +723,84 @@ class Invoice {
         if ($onchainOffered && $feeOnchain === null) {
             $baseAmountSat = (int)ExchangeRates::convertToSats((string)$amount, $currency, 'sat');
 
-            // ---- Strike on-chain: mint a fresh address in the merchant's
-            // Strike account. Tried before the local xpub/static allocation;
-            // any failure falls back to it (and is only surfaced to the payer
-            // when no fallback produced an address — a working on-chain rail
-            // shouldn't carry a scary banner). Keys walk in priority order,
-            // mirroring the Lightning chain above. ----
+            // ---- Address sources, walked in the store's configured order
+            // (RailOrder::onchainOrderFromRow; default Strike first, local
+            // xpub/static as fallback). 'strike' mints a fresh address in the
+            // merchant's Strike account; 'local' is the xpub-derived / static
+            // allocation. Whichever source first yields an address wins; a
+            // source's failure falls through to the next (and is only surfaced
+            // to the payer when NO source produced an address — a working
+            // on-chain rail shouldn't carry a scary banner). ----
             $strikeOnchainErrors = [];
-            if ($strikeOnchainKeys !== [] && $baseAmountSat > 0) {
-                foreach ($strikeOnchainKeys as $priority => $skey) {
-                    try {
-                        $made = StrikeClient::createOnchainReceiveRequest(
-                            $skey,
-                            $baseAmountSat,
-                            self::directReceiveTimeoutSec('STRIKE_TIMEOUT_SEC')
-                        );
-                        // Never watch (or show a customer) a string we can't
-                        // verify is a mainnet Bitcoin address.
-                        $addrCheck = AddressCheck::validate($made['address'], 'mainnet');
-                        if (!$addrCheck['valid']) {
-                            throw new StrikeException('Strike returned an invalid on-chain address');
-                        }
-                    } catch (Throwable $e) {
-                        error_log(sprintf(
-                            '[strike-onchain] receive request failed store=%s priority=%d dest=%s: %s; falling back',
-                            $storeId, $priority, StrikeClient::maskKey($skey), $e->getMessage()
-                        ));
-                        $strikeOnchainErrors[] = [
-                            'type' => 'strike',
-                            'reason' => StrikeClient::describeFailure($e),
-                        ];
-                        AdminLog::log('strike', 'onchain', $storeId, null,
-                            StrikeClient::maskKey($skey), $e->getMessage());
-                        continue;
-                    }
-                    $onchainAddress = $made['address'];
-                    $onchainIndex = null;
-                    $onchainAmountTweakSats = null;
-                    $onchainAmountSat = $baseAmountSat;
-                    $strikeReceiveRequestId = $made['receive_request_id'];
-                    $onchainCreatedTipHeight = OnchainPayments::currentTipBestEffort($store);
-                    if ($priority > 0) {
-                        error_log("[strike-onchain] using fallback Strike key store={$storeId} priority={$priority}");
-                    }
+            // Local-allocation failure deferred so a later source can still
+            // rescue the rail (relevant in local-first order); thrown at the
+            // end only when nothing produced an address. In the default
+            // Strike-first order local runs last, so this matches the old
+            // throw-immediately behavior exactly.
+            $localAllocationError = null;
+            foreach (RailOrder::onchainOrderFromRow($store) as $onchainSource) {
+                if ($onchainAddress !== null) {
                     break;
                 }
-            }
+                if ($onchainSource === 'strike') {
+                    if ($strikeOnchainKeys === [] || $baseAmountSat <= 0) {
+                        continue;
+                    }
+                    // Keys walk in priority order, mirroring the Lightning
+                    // chain above.
+                    foreach ($strikeOnchainKeys as $priority => $skey) {
+                        try {
+                            $made = StrikeClient::createOnchainReceiveRequest(
+                                $skey,
+                                $baseAmountSat,
+                                self::directReceiveTimeoutSec('STRIKE_TIMEOUT_SEC')
+                            );
+                            // Never watch (or show a customer) a string we can't
+                            // verify is a mainnet Bitcoin address.
+                            $addrCheck = AddressCheck::validate($made['address'], 'mainnet');
+                            if (!$addrCheck['valid']) {
+                                throw new StrikeException('Strike returned an invalid on-chain address');
+                            }
+                        } catch (Throwable $e) {
+                            error_log(sprintf(
+                                '[strike-onchain] receive request failed store=%s priority=%d dest=%s: %s; falling back',
+                                $storeId, $priority, StrikeClient::maskKey($skey), $e->getMessage()
+                            ));
+                            $strikeOnchainErrors[] = [
+                                'type' => 'strike',
+                                'reason' => StrikeClient::describeFailure($e),
+                            ];
+                            AdminLog::log('strike', 'onchain', $storeId, null,
+                                StrikeClient::maskKey($skey), $e->getMessage());
+                            continue;
+                        }
+                        $onchainAddress = $made['address'];
+                        $onchainIndex = null;
+                        $onchainAmountTweakSats = null;
+                        $onchainAmountSat = $baseAmountSat;
+                        $strikeReceiveRequestId = $made['receive_request_id'];
+                        $onchainCreatedTipHeight = OnchainPayments::currentTipBestEffort($store);
+                        if ($priority > 0) {
+                            error_log("[strike-onchain] using fallback Strike key store={$storeId} priority={$priority}");
+                        }
+                        break;
+                    }
+                    continue;
+                }
 
-            if ($onchainAddress === null && $onchainConfigured) {
+                // 'local': the store's xpub-derived / static-address source.
+                if (!$onchainConfigured) {
+                    continue;
+                }
                 try {
                     $allocation = OnchainPayments::allocateAddress($storeId, $baseAmountSat);
-                } catch (RuntimeException $e) {
-                    if ($e->getMessage() === OnchainPayments::ERR_TWEAK_SLOTS_EXHAUSTED) {
-                        throw new RuntimeException(
-                            'All on-chain payment slots are temporarily reserved. Please try again in a few minutes.'
-                        );
-                    }
-                    throw $e;
+                } catch (Throwable $e) {
+                    error_log(sprintf(
+                        '[onchain] local address allocation failed store=%s: %s',
+                        $storeId, $e->getMessage()
+                    ));
+                    $localAllocationError = $e;
+                    continue;
                 }
                 if ($allocation !== null) {
                     $onchainAddress = $allocation['address'];
@@ -788,6 +810,19 @@ class Invoice {
                     $onchainAmountTweakSats = $tweak;
                     $onchainAmountSat = $baseAmountSat + ($tweak !== null ? (int)$tweak : 0);
                 }
+            }
+
+            // Local allocation failed AND no other source rescued the rail:
+            // abort invoice creation as before (payment slots exhausted gets
+            // its operator-actionable message; anything else propagates).
+            if ($onchainAddress === null && $localAllocationError !== null) {
+                if ($localAllocationError instanceof RuntimeException
+                        && $localAllocationError->getMessage() === OnchainPayments::ERR_TWEAK_SLOTS_EXHAUSTED) {
+                    throw new RuntimeException(
+                        'All on-chain payment slots are temporarily reserved. Please try again in a few minutes.'
+                    );
+                }
+                throw $localAllocationError;
             }
 
             // Strike failed AND no local source rescued the rail: tell the

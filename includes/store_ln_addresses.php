@@ -24,6 +24,7 @@ require_once __DIR__ . '/clink/noffer.php';
 require_once __DIR__ . '/nwc/uri.php';
 require_once __DIR__ . '/lnurl_receive.php';
 require_once __DIR__ . '/strike/client.php';
+require_once __DIR__ . '/rail_order.php';
 
 class StoreLnAddresses {
     /** Destination types stored in store_ln_addresses.type. */
@@ -171,9 +172,10 @@ class StoreLnAddresses {
      * Build an ordered, validated destination chain from the separate operator
      * lists kept apart in the admin UI: Strike API keys first, then Lightning
      * addresses, then NWC connections, then CLINK noffers as final fallback.
-     * This is the order Invoice::create walks at runtime (Strike leads the
-     * chain whenever a key is configured; the UI sections may present in a
-     * different visual order).
+     * That grouping is only the STORED order — the order Invoice::create
+     * walks at runtime is the store's configurable type order, applied by
+     * listForStore() at read time (RailOrder; default matches this
+     * grouping). Within a type, this list order is the runtime order.
      *
      * Each value is trimmed and blanks are dropped; each is validated against
      * its declared type (so a noffer pasted into the address list, or an
@@ -359,8 +361,18 @@ class StoreLnAddresses {
 
     /**
      * Full ordered list for a store: [['id'=>int,'address'=>string,
-     * 'type'=>string,'supports_verify'=>?int], ...] sorted by priority
-     * (position ASC).
+     * 'type'=>string,'supports_verify'=>?int], ...] in effective priority
+     * order. When the store has an explicit type order configured
+     * (stores.ln_rail_order — see RailOrder), the stored rows are
+     * stable-sorted by it: types in the configured order, rows of the same
+     * type keeping their stored position order. Sorting here, at read time,
+     * means every chain consumer (Invoice::create, auto-melt,
+     * settle-and-forward, primaryForStore) follows an order change instantly
+     * without rewriting the stored chain. A store with no explicit order
+     * (NULL — every pre-existing store) gets the stored per-row order
+     * verbatim: the exact historical behavior, and the only way a chain
+     * written through the legacy shape-classified API contract can keep a
+     * deliberate cross-type interleaving.
      */
     public static function listForStore(string $storeId): array {
         $rows = Database::fetchAll(
@@ -370,7 +382,7 @@ class StoreLnAddresses {
               ORDER BY position ASC, id ASC",
             [$storeId]
         );
-        return array_map(static function (array $r): array {
+        $rows = array_map(static function (array $r): array {
             return [
                 'id' => (int)$r['id'],
                 'address' => (string)$r['address'],
@@ -378,6 +390,13 @@ class StoreLnAddresses {
                 'supports_verify' => $r['supports_verify'] === null ? null : (int)$r['supports_verify'],
             ];
         }, $rows);
+        $orderCsv = RailOrder::storedLnOrderCsv($storeId);
+        if ($orderCsv !== null) {
+            $rows = RailOrder::sortDestinations(
+                $rows, RailOrder::lnOrderFromRow(['ln_rail_order' => $orderCsv])
+            );
+        }
+        return $rows;
     }
 
     /**
