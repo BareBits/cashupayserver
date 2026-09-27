@@ -69,6 +69,7 @@ BareBits sits between custodial payment gateways and full self-hosting:
 </p>
 
 **Run a WooCommerce store?** - Just install our wordpress plugin from the [latest release](https://github.com/BareBits/cashupayserver/releases/latest). It will install BareBits alongside woocommerce automatically. 
+
 Magneto & all other e-commerce installations -- Install BareBits standalone using the web method, then download the [BTCPay Plugin for your platform](https://docs.btcpayserver.org/FAQ/Integrations/#what-e-commerce-integrations-are-available) and point it at your BareBits URL.
 
 ## Suggested Payment Configurations
