@@ -24,7 +24,7 @@ final class SetupFlow {
      */
     public const STEPS = [
         'terms', 'security', 'password', 'store', 'onchain', 'lightning',
-        'zeroconf', 'swaps', 'mints', 'cron', 'done',
+        'zeroconf', 'swaps', 'mints', 'updates', 'cron', 'done',
     ];
 
     /** The screens add_store mode walks before returning to admin. */
@@ -51,8 +51,12 @@ final class SetupFlow {
     /**
      * Screens that render after setup_complete has been set, and therefore
      * have to survive setup.php's redirect-if-set-up guard.
+     *
+     * updates sits here deliberately: the install is usable without an
+     * answer, and abandoning the wizard on this screen leaves automatic
+     * updates at their safe default (off).
      */
-    public const POST_COMPLETION = ['cron', 'done'];
+    public const POST_COMPLETION = ['updates', 'cron', 'done'];
 
     public static function isKnownStep(string $step): bool {
         return in_array($step, self::STEPS, true) || $step === self::ADD_STORE_COMPLETE;

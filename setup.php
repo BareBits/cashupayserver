@@ -875,7 +875,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 // The install is usable from here; everything after this screen
                 // is advisory, so complete the setup before showing it.
                 Config::set('setup_complete', true);
-                $step = SetupFlow::nextStep('mints', $flowSteps) ?? 'cron';
+                $step = SetupFlow::nextStep('mints', $flowSteps) ?? 'updates';
+                break;
+
+            case 'updates':
+                if (!isset($_POST['auto_update'])) {
+                    // GET landing — fall through to render the form.
+                    break;
+                }
+                // Instance-level opt-in consulted by Updater::isAutoUpdateEnabled.
+                // Both answers write the key: an explicit "Not now" is a decision,
+                // not an unanswered question.
+                Config::set('auto_update_enabled', $_POST['auto_update'] === '1');
+                $step = SetupFlow::nextStep('updates', $flowSteps) ?? 'cron';
                 break;
 
             case 'cron':
@@ -2859,6 +2871,34 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                 <a href="<?= htmlspecialchars($adminReturn) ?>" class="btn" style="width: 100%; text-align: center; display: block;">
                     Go to BareBits Admin
                 </a>
+
+            <?php elseif ($step === 'updates'): ?>
+                <!-- Screen: automatic-updates opt-in. Nothing is pre-selected:
+                     enabling must be an explicit click (auto-update defaults
+                     to off), so this uses the two-button pattern like
+                     zeroconf. Abandoning the wizard here is safe — the
+                     install completed on the mints screen and the default
+                     stays off. -->
+                <h2 style="margin-bottom: 1rem;">🔄 Enable automatic updates?</h2>
+                <p style="margin-bottom: 1.25rem;">
+                    Automatic updates ensure you always have the latest features
+                    and keep your installation secure. We strongly suggest
+                    enabling automatic updates. ✅
+                </p>
+                <p style="margin-bottom: 1.25rem; font-size: 0.9rem; color: #a0aec0;">
+                    If you skip this, updates never apply on their own &mdash;
+                    when one is available you'll see a banner in the admin
+                    dashboard (and get an email, if you set up notifications)
+                    and can apply it with one click. Either way, every update is
+                    health-checked and rolled back automatically if it breaks
+                    anything, and you can change this any time under
+                    Settings &rarr; Auto-update.
+                </p>
+                <form method="POST" action="<?= htmlspecialchars(setupSelfUrl()) ?>">
+                    <input type="hidden" name="step" value="updates">
+                    <button type="submit" name="auto_update" value="1" class="btn" style="width: 100%; margin-bottom: 0.75rem;">Enable automatic updates</button>
+                    <button type="submit" name="auto_update" value="0" class="btn btn-secondary" style="width: 100%;">Not now &mdash; I'll update manually</button>
+                </form>
 
             <?php elseif ($step === 'cron'): ?>
                 <!-- Screen: cron reminder -->

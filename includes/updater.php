@@ -173,23 +173,50 @@ class Updater {
     }
 
     /**
-     * Operator-facing opt-in for the auto-updater. Returns true when:
+     * Operator-facing opt-in for the auto-updater. Returns true when ANY of:
+     *   - DB config key auto_update_enabled is true (admin-UI toggle /
+     *     onboarding wizard), or
      *   - PHP constant CASHUPAY_AUTO_UPDATE_ENABLED is defined and truthy, or
      *   - Env var CASHUPAY_AUTO_UPDATE_ENABLED is non-empty and not "0", or
      *   - Updater::$autoUpdateEnabledOverride is set to true (test hook).
      *
-     * Default (constant undefined, env unset, override null) is false — fresh
-     * installs do not auto-update. Operators who want it must opt in.
+     * Any source can enable; none can veto another (env "0" only means "not
+     * enabled via env"). Default (all unset) is false — fresh installs do not
+     * auto-update. Operators who want it must opt in.
+     * Mirrored by upd_is_enabled() in update.php — keep both in sync.
      */
     public static function isAutoUpdateEnabled(): bool {
         if (self::$autoUpdateEnabledOverride !== null) {
             return self::$autoUpdateEnabledOverride;
+        }
+        if (Config::get('auto_update_enabled', false) === true) {
+            return true;
         }
         if (defined('CASHUPAY_AUTO_UPDATE_ENABLED') && CASHUPAY_AUTO_UPDATE_ENABLED) {
             return true;
         }
         $env = getenv('CASHUPAY_AUTO_UPDATE_ENABLED');
         return ($env !== false && $env !== '' && $env !== '0');
+    }
+
+    /**
+     * Which source opened the auto-update gate, for the admin UI: 'db',
+     * 'constant', 'env', or null when disabled. The UI disables the toggle
+     * when a deployment-level source (constant/env) is forcing it on, since
+     * flipping the DB key off could not close the gate in that case.
+     */
+    public static function autoUpdateEnabledSource(): ?string {
+        if (defined('CASHUPAY_AUTO_UPDATE_ENABLED') && CASHUPAY_AUTO_UPDATE_ENABLED) {
+            return 'constant';
+        }
+        $env = getenv('CASHUPAY_AUTO_UPDATE_ENABLED');
+        if ($env !== false && $env !== '' && $env !== '0') {
+            return 'env';
+        }
+        if (Config::get('auto_update_enabled', false) === true) {
+            return 'db';
+        }
+        return null;
     }
 
     /**
@@ -420,6 +447,43 @@ class Updater {
     public static function getAvailableUpdate(): ?array {
         $v = Config::get('updater_available');
         return is_array($v) ? $v : null;
+    }
+
+    /**
+     * Email the site-wide notification address about an available update,
+     * exactly once per release. Called from cron right after checkForUpdate;
+     * reads the cached verdict, so it also works when the check itself is
+     * throttled or the dev/test kill switch suppressed a live fetch (the
+     * kill switch guards network + filesystem, and this does neither).
+     *
+     * Skipped when auto-update is enabled — the release will apply on its own
+     * shortly, so a "please act" email would only be noise. The once-per-
+     * release marker (updater_notified_sha) is stamped only when a mail was
+     * actually enqueued: if the gates were closed at detection time (master
+     * toggle off, no recipient) and open later, the next tick still notifies.
+     * Returns true when an email was enqueued on this call.
+     */
+    public static function maybeNotifyUpdateAvailable(): bool {
+        $state = self::getAvailableUpdate();
+        if (!is_array($state) || empty($state['available'])) {
+            return false;
+        }
+        $sha = (string)($state['latest_sha'] ?? '');
+        if ($sha === '') {
+            return false;
+        }
+        if (self::isAutoUpdateEnabled()) {
+            return false;
+        }
+        if ((string)Config::get('updater_notified_sha', '') === $sha) {
+            return false;
+        }
+        require_once __DIR__ . '/notification_sender.php';
+        if (!NotificationSender::queueUpdateAvailable($state)) {
+            return false;
+        }
+        Config::set('updater_notified_sha', $sha);
+        return true;
     }
 
     /**

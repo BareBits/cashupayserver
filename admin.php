@@ -590,6 +590,11 @@ if (isset($_GET['api'])) {
                 // Why a manual update can't run here (dev kill switch), or
                 // null if it can. Drives the button's enabled state.
                 'manual_blocked' => Updater::manualUpdateBlockedReason(),
+                // Auto-apply opt-in state for the card's toggle. Source tells
+                // the UI when a deployment-level setting (constant/env) forces
+                // the gate open, so the DB-backed toggle is shown locked.
+                'auto_update_enabled' => Updater::isAutoUpdateEnabled(),
+                'auto_update_source' => Updater::autoUpdateEnabledSource(),
             ]);
             break;
 
@@ -1587,6 +1592,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             // against the newly chosen channel immediately.
             Config::set('updater_last_check', 0);
             echo json_encode(['success' => true, 'channel' => Updater::getChannel()]);
+            break;
+
+        // DB-backed opt-in toggle for automatic updates (Settings →
+        // Auto-update, also set by the onboarding wizard). Turning it off
+        // only closes the DB source — a deployment-level constant/env force
+        // stays authoritative, which the card surfaces via auto_update_source.
+        case 'save_auto_update_enabled':
+            Auth::requireAdmin();
+            Config::set('auto_update_enabled', ($_POST['enabled'] ?? '') === '1');
+            echo json_encode([
+                'success' => true,
+                'auto_update_enabled' => Updater::isAutoUpdateEnabled(),
+                'auto_update_source' => Updater::autoUpdateEnabledSource(),
+            ]);
             break;
 
         case 'rollback_update':
@@ -2707,6 +2726,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'enabled' => Config::get('notifications_enabled', false) === true,
                 'invoicePaidEnabled' => Config::get('notifications_invoice_paid_enabled', false) === true,
                 'autoCashoutEnabled' => Config::get('notifications_auto_cashout_enabled', false) === true,
+                // Unlike the other per-type toggles this one DEFAULTS ON —
+                // update emails are the whole point of enabling notifications
+                // on an install that keeps auto-update off.
+                'updateAvailableEnabled' => Config::get('notifications_update_available_enabled', true) === true,
                 // Effective value: explicit payer_email_capture_enabled config
                 // wins, else ON standalone / OFF on managed installs (the shop
                 // platform owns customer emails).
@@ -2738,6 +2761,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $enabled = ($_POST['enabled'] ?? '0') === '1';
                 $invoicePaidEnabled = ($_POST['invoice_paid_enabled'] ?? '0') === '1';
                 $autoCashoutEnabled = ($_POST['auto_cashout_enabled'] ?? '0') === '1';
+                $updateAvailableEnabled = ($_POST['update_available_enabled'] ?? '0') === '1';
                 $payerEmailCaptureEnabled = ($_POST['payer_email_capture_enabled'] ?? '0') === '1';
                 $payerReceiptEnabled = ($_POST['payer_receipt_enabled'] ?? '0') === '1';
                 $newsletterDefaultChecked = ($_POST['newsletter_default_checked'] ?? '0') === '1';
@@ -2754,6 +2778,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 Config::set('notifications_enabled', $enabled);
                 Config::set('notifications_invoice_paid_enabled', $invoicePaidEnabled);
                 Config::set('notifications_auto_cashout_enabled', $autoCashoutEnabled);
+                Config::set('notifications_update_available_enabled', $updateAvailableEnabled);
                 // Explicit boolean: once saved, it overrides the managed/
                 // standalone default in Config::isPayerEmailCaptureEnabled().
                 Config::set('payer_email_capture_enabled', $payerEmailCaptureEnabled);
@@ -5421,25 +5446,28 @@ header('Cache-Control: no-cache, must-revalidate');
                 <a href="#" class="btn btn-secondary js-goto-invoices" style="padding: 0.25rem 0.75rem; font-size: 0.8rem; flex-shrink: 0;">Open invoices</a>
             </div>
 
+            <!-- Global banner: update available. Shown across ALL admin views
+                 (auto-update is off by default, so the nudge must not be
+                 missable). Non-dismissible by design: an available update may
+                 carry critical security fixes, so it stays until the operator
+                 actually updates. Populated by JS from update_status
+                 `available`. Admin-only. The "Update now" button kicks off the
+                 crash-isolated manual update and the banner switches to a live
+                 progress line. -->
+            <div id="update-available-banner" class="hidden" style="background: rgba(247, 147, 26, 0.12); border: 1px solid rgba(247, 147, 26, 0.4); border-radius: 8px; padding: 0.75rem 1rem; margin-bottom: 1rem; font-size: 0.9rem; display: flex; align-items: flex-start; gap: 0.75rem;" data-admin-only="true">
+                <span style="flex-shrink: 0; font-size: 1.1rem; line-height: 1.2;">&#9888;</span>
+                <span style="flex: 1;">
+                    <strong id="update-available-text">A software update is available.</strong>
+                    <span style="display: block; color: var(--text-secondary); font-size: 0.85rem; margin-top: 0.15rem;">
+                        Updates deliver new features and critical security enhancements. Please don't delay — apply it as soon as you can to keep your server secure.
+                    </span>
+                    <span id="update-available-progress" class="hidden" style="display: block; margin-top: 0.4rem; font-size: 0.85rem;"></span>
+                </span>
+                <button id="btn-update-now-banner" class="btn" style="padding: 0.3rem 0.9rem; font-size: 0.85rem; flex-shrink: 0;">Update now</button>
+            </div>
+
             <!-- Dashboard View -->
             <div class="view active" id="view-dashboard">
-                <!-- Update-available banner. Non-dismissible by design: an
-                     available update may carry critical security fixes, so it
-                     stays until the operator actually updates. Populated by JS
-                     from update_status `available`. Admin-only. The "Update now"
-                     button kicks off the crash-isolated manual update and the
-                     banner switches to a live progress line. -->
-                <div id="update-available-banner" class="hidden" style="background: rgba(247, 147, 26, 0.12); border: 1px solid rgba(247, 147, 26, 0.4); border-radius: 8px; padding: 0.75rem 1rem; margin-bottom: 1rem; font-size: 0.9rem; display: flex; align-items: flex-start; gap: 0.75rem;" data-admin-only="true">
-                    <span style="flex-shrink: 0; font-size: 1.1rem; line-height: 1.2;">&#9888;</span>
-                    <span style="flex: 1;">
-                        <strong id="update-available-text">A software update is available.</strong>
-                        <span style="display: block; color: var(--text-secondary); font-size: 0.85rem; margin-top: 0.15rem;">
-                            Updates deliver new features and critical security enhancements. Please don't delay — apply it as soon as you can to keep your server secure.
-                        </span>
-                        <span id="update-available-progress" class="hidden" style="display: block; margin-top: 0.4rem; font-size: 0.85rem;"></span>
-                    </span>
-                    <button id="btn-update-now-banner" class="btn" style="padding: 0.3rem 0.9rem; font-size: 0.85rem; flex-shrink: 0;">Update now</button>
-                </div>
                 <div id="reliability-banner" class="hidden" style="background: rgba(220, 53, 69, 0.15); border: 1px solid rgba(220, 53, 69, 0.5); border-radius: 8px; padding: 0.75rem 1rem; margin-bottom: 1rem; font-size: 0.9rem; display: flex; align-items: center; gap: 0.75rem;" data-admin-only="true">
                     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="flex-shrink: 0;">
                         <path d="M12 9v4M12 17h.01"></path>
@@ -6715,6 +6743,13 @@ header('Cache-Control: no-cache, must-revalidate');
                                 </label>
                             </div>
                             <div class="toggle-container" style="margin-top: 0.5rem;">
+                                <span>Software update available (sent once per release; skipped when automatic updates are on)</span>
+                                <label class="toggle">
+                                    <input type="checkbox" id="notifications-update-available">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
+                            <div class="toggle-container" style="margin-top: 0.5rem;">
                                 <span>Offer payers an email / newsletter form on the payment page</span>
                                 <label class="toggle">
                                     <input type="checkbox" id="notifications-payer-email-capture">
@@ -6929,12 +6964,27 @@ header('Cache-Control: no-cache, must-revalidate');
                     </div>
                     <div class="card-body">
                         <p style="font-size: 0.85rem; color: var(--text-secondary); margin: 0 0 0.75rem 0;">
-                            Daily check against GitHub. Updates apply automatically, then a health
-                            check verifies the new build boots — a broken update is rolled back on
-                            its own. data/ and user_config.php are preserved. Backups of the last 3
-                            versions are kept under data/updates/backup/.
+                            Daily check against GitHub. Automatic updates are off by default:
+                            when a new build ships you get a banner here (and an email, if
+                            notifications are configured) and apply it with one click. With
+                            automatic updates enabled, new builds apply on their own. Either
+                            way a health check verifies the new build boots — a broken update
+                            is rolled back on its own. data/ and user_config.php are preserved.
+                            Backups of the last 3 versions are kept under data/updates/backup/.
                         </p>
-                        <div class="form-group">
+                        <div class="toggle-container">
+                            <span><strong>Enable automatic updates</strong></span>
+                            <label class="toggle">
+                                <input type="checkbox" id="auto-update-enabled">
+                                <span class="toggle-slider"></span>
+                            </label>
+                        </div>
+                        <p class="form-help hidden" id="auto-update-forced-note" style="margin-top: 0.25rem;">
+                            Automatic updates are forced on for this deployment
+                            (<code>CASHUPAY_AUTO_UPDATE_ENABLED</code> is set in
+                            user_config.php or the environment), so this toggle has no effect.
+                        </p>
+                        <div class="form-group" style="margin-top: 0.75rem;">
                             <label class="form-label">Current version</label>
                             <code id="auto-update-current" style="display: block; background: rgba(0,0,0,0.2); padding: 0.6rem; border-radius: 8px; font-size: 0.85rem; user-select: all;">Loading…</code>
                         </div>
@@ -8234,6 +8284,8 @@ header('Cache-Control: no-cache, must-revalidate');
             if (copyCronSwapsBtn) copyCronSwapsBtn.addEventListener('click', copyCronSwapsUrl);
             const saveChannelBtn = document.getElementById('btn-save-update-channel');
             if (saveChannelBtn) saveChannelBtn.addEventListener('click', saveUpdateChannel);
+            const autoUpdateToggle = document.getElementById('auto-update-enabled');
+            if (autoUpdateToggle) autoUpdateToggle.addEventListener('change', saveAutoUpdateEnabled);
             const rollbackBtn = document.getElementById('btn-rollback-update');
             if (rollbackBtn) rollbackBtn.addEventListener('click', rollbackUpdate);
             const dismissAutoRbBtn = document.getElementById('btn-dismiss-auto-rollback');
@@ -12161,6 +12213,7 @@ header('Cache-Control: no-cache, must-revalidate');
                 document.getElementById('notifications-enabled').checked = !!data.enabled;
                 document.getElementById('notifications-invoice-paid').checked = !!data.invoicePaidEnabled;
                 document.getElementById('notifications-auto-cashout').checked = !!data.autoCashoutEnabled;
+                document.getElementById('notifications-update-available').checked = !!data.updateAvailableEnabled;
                 // Effective server-side value (explicit config, or the
                 // managed/standalone default when never saved).
                 const payerCaptureEl = document.getElementById('notifications-payer-email-capture');
@@ -12212,6 +12265,7 @@ header('Cache-Control: no-cache, must-revalidate');
             const enabled = document.getElementById('notifications-enabled').checked ? '1' : '0';
             const invoicePaid = document.getElementById('notifications-invoice-paid').checked ? '1' : '0';
             const autoCashout = document.getElementById('notifications-auto-cashout').checked ? '1' : '0';
+            const updateAvailable = document.getElementById('notifications-update-available').checked ? '1' : '0';
             const payerCaptureEl = document.getElementById('notifications-payer-email-capture');
             const payerEmailCapture = payerCaptureEl && payerCaptureEl.checked ? '1' : '0';
             const payerReceiptEl = document.getElementById('notifications-payer-receipt');
@@ -12223,6 +12277,7 @@ header('Cache-Control: no-cache, must-revalidate');
                 action: 'save_notifications_settings',
                 enabled, invoice_paid_enabled: invoicePaid,
                 auto_cashout_enabled: autoCashout,
+                update_available_enabled: updateAvailable,
                 payer_email_capture_enabled: payerEmailCapture,
                 payer_receipt_enabled: payerReceipt,
                 newsletter_default_checked: newsletterDefault,
@@ -14239,8 +14294,44 @@ header('Cache-Control: no-cache, must-revalidate');
                 }
                 // Availability line + manual-run progress + Update-now button.
                 applyUpdateState(data);
+                renderAutoUpdateToggle(data);
             } catch (e) {
                 cur.textContent = 'Unable to load update status';
+            }
+        }
+
+        // Opt-in toggle. When a deployment-level source (constant/env) forces
+        // the gate open, the DB toggle can't close it — lock the control and
+        // explain why instead of letting it silently do nothing.
+        function renderAutoUpdateToggle(data) {
+            const toggle = document.getElementById('auto-update-enabled');
+            const note = document.getElementById('auto-update-forced-note');
+            if (!toggle) return;
+            const forced = data.auto_update_source === 'constant' || data.auto_update_source === 'env';
+            toggle.checked = !!data.auto_update_enabled;
+            toggle.disabled = forced;
+            if (note) note.classList.toggle('hidden', !forced);
+        }
+
+        async function saveAutoUpdateEnabled() {
+            const toggle = document.getElementById('auto-update-enabled');
+            if (!toggle) return;
+            const enabled = toggle.checked ? '1' : '0';
+            try {
+                const response = await postWithCsrf(adminUrl, 'action=save_auto_update_enabled&enabled=' + enabled);
+                const result = await response.json();
+                if (response.ok && result.success) {
+                    renderAutoUpdateToggle(result);
+                    showToast(result.auto_update_enabled
+                        ? 'Automatic updates enabled'
+                        : 'Automatic updates disabled', 'success');
+                } else {
+                    toggle.checked = !toggle.checked;
+                    showToast(result.error || 'Failed to save', 'error');
+                }
+            } catch (e) {
+                toggle.checked = !toggle.checked;
+                showToast('Failed to save automatic-update setting', 'error');
             }
         }
 

@@ -63,8 +63,11 @@ def _walk_barebits_wizard(wp: WordPressHandle, mint_url: str, backup_mint_url: s
         backup_mint_url=backup_mint_url,
         mint_unit="sat",
     )
-    # Managed install: the wizard must land on completion, never the crontab
-    # screen — WP-cron owns the heartbeat.
+    # Managed installs still get the auto-update question after mints…
+    assert wizard_heading(body) == "Enable automatic updates?", wizard_heading(body)
+    body = wiz.post(step="updates", auto_update="0")
+    # …then must land on completion, never the crontab screen — WP-cron owns
+    # the heartbeat.
     heading = wizard_heading(body)
     assert "cron" not in heading.lower(), (
         f"cron screen rendered despite CASHUPAY_MANAGED_INSTALL: {heading!r}"
