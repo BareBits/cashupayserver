@@ -85,11 +85,10 @@ RUN php /usr/src/verify-plugin-build.php /usr/src/cashupayserver \
 COPY docker/entrypoint-production.sh /usr/local/bin/cashupay-entrypoint.sh
 RUN chmod +x /usr/local/bin/cashupay-entrypoint.sh
 
-# Auto-update is opt-in in the upstream code (includes/updater.php:64). The
-# Docker image flips it on by default; override with CASHUPAY_AUTO_UPDATE_ENABLED=0
-# at runtime to pin to image tags.
-ENV CASHUPAY_AUTO_UPDATE_ENABLED=1 \
-    CRON_INTERVAL_SECONDS=60 \
+# Auto-update is opt-in, matching the upstream code (Updater::isAutoUpdateEnabled):
+# enable it from the admin UI / onboarding wizard, or force it on for the whole
+# deployment with CASHUPAY_AUTO_UPDATE_ENABLED=1 at runtime.
+ENV CRON_INTERVAL_SECONDS=60 \
     TZ=UTC
 
 EXPOSE 80

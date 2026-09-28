@@ -167,8 +167,12 @@ function upd_setting(string $name) {
     return getenv($name);
 }
 
-/** Operator opt-in — mirrors Updater::isAutoUpdateEnabled(). Default OFF. */
+/** Operator opt-in — mirrors Updater::isAutoUpdateEnabled(). Default OFF.
+ *  Any source can enable: DB toggle (admin UI / onboarding), constant, env. */
 function upd_is_enabled(): bool {
+    if (upd_config_get('auto_update_enabled', false) === true) {
+        return true;
+    }
     if (defined('CASHUPAY_AUTO_UPDATE_ENABLED') && CASHUPAY_AUTO_UPDATE_ENABLED) {
         return true;
     }
@@ -587,8 +591,9 @@ if (is_array($pending) && !empty($pending['sha'])) {
     exit;
 }
 
-// Forward-apply opt-in gate. The auto path requires CASHUPAY_AUTO_UPDATE_ENABLED;
-// a manual click is its own consent and skips it.
+// Forward-apply opt-in gate. The auto path requires the operator opt-in (the
+// admin-UI/onboarding toggle, or the CASHUPAY_AUTO_UPDATE_ENABLED constant/env
+// force); a manual click is its own consent and skips it.
 if (!$manual && !upd_is_enabled()) {
     echo json_encode(['ok' => true, 'skipped' => 'auto_update_disabled']);
     exit;

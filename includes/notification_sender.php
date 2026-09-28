@@ -24,6 +24,7 @@ class NotificationSender {
     public const EVENT_AUTO_CASHOUT_SUCCESS = 'AutoCashoutSuccess';
     public const EVENT_AUTO_CASHOUT_FAILURE = 'AutoCashoutFailure';
     public const EVENT_PAYER_RECEIPT = 'PayerReceipt';
+    public const EVENT_UPDATE_AVAILABLE = 'UpdateAvailable';
 
     // 48-hour window for suppressing identical auto-cashout failure emails.
     private const FAILURE_DEDUPE_WINDOW_SEC = 48 * 60 * 60;
@@ -384,6 +385,50 @@ class NotificationSender {
     }
 
     /**
+     * Queue an "update available" email to the site-wide notification address.
+     * Instance-level (no store): the recipient is notifications_to_email only,
+     * per-store overrides don't apply. Gated on the master switch plus the
+     * per-type toggle — which, unlike the other per-type toggles, DEFAULTS ON:
+     * an operator who enabled email notifications almost certainly wants to
+     * hear about security updates, and the toggle predates none of their
+     * installs (the key is only written once they uncheck it).
+     *
+     * The caller (Updater::maybeNotifyUpdateAvailable) owns once-per-release
+     * dedupe; this method only applies the notification gates. Returns true
+     * if a row was enqueued.
+     */
+    public static function queueUpdateAvailable(array $state): bool {
+        if (Config::get('notifications_enabled', false) !== true) {
+            return false;
+        }
+        if (Config::get('notifications_update_available_enabled', true) !== true) {
+            return false;
+        }
+        $recipient = trim((string)Config::get('notifications_to_email', ''));
+        if ($recipient === '') {
+            return false;
+        }
+
+        $latest = trim((string)($state['latest_version'] ?? '')) ?: '(unknown version)';
+        $current = trim((string)($state['current_version'] ?? '')) ?: '(unknown)';
+        $channel = trim((string)($state['channel'] ?? '')) ?: 'main';
+
+        $subject = "Software update available: {$latest}";
+        $body = "A new version of your payment server is available.\n\n"
+              . "Latest version:   {$latest}\n"
+              . "Current version:  {$current}\n"
+              . "Update channel:   {$channel}\n\n"
+              . "Automatic updates are disabled on this install, so this update\n"
+              . "will NOT apply on its own. Updates deliver new features and\n"
+              . "critical security fixes — please apply it soon: open the admin\n"
+              . "dashboard and click \"Update now\", or enable automatic updates\n"
+              . "under Settings → Auto-update.\n";
+
+        self::enqueue(null, self::EVENT_UPDATE_AVAILABLE, $recipient, $subject, $body, null);
+        return true;
+    }
+
+    /**
      * Drain up to DRAIN_BATCH pending notifications from the queue.
      * Called from cron.php. Returns a small summary suitable for the cron
      * status JSON: ['sent' => N, 'failed' => N].
@@ -590,7 +635,7 @@ class NotificationSender {
     // ------------------------------------------------------------------------
 
     private static function enqueue(
-        string $storeId,
+        ?string $storeId,
         string $eventType,
         string $toEmail,
         string $subject,
