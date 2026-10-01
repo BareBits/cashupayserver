@@ -17,7 +17,7 @@ Accept Bitcoin payments (lightning and on-chain) without running a full BTCPay S
 
 BareBits makes it EASY for merchants to accept Bitcoin. Technically speaking, it is a PHP-based Bitcoin Lightning payment gateway that implements BTCPay Server's Greenfield API. This means that any e-commerce software that works with BTCPay Server can work with BareBits inlcuding WooCommerce, Shopify, Magneto, Drupal, and more! It can also send invoices, manage products, and create self-serve invoices for your customers (use as a donation page or tip jar).
 
-BareBits supports a number of payment types, risk/trust levels, and capabilities including:
+BareBits supports a number of payment types, risk/trust levels, and capabilities depending on your intended use case.
  
 
 ### Key Features
