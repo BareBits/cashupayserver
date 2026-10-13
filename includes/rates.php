@@ -9,9 +9,16 @@
 require_once __DIR__ . '/database.php';
 require_once __DIR__ . '/config.php';
 require_once __DIR__ . '/safe_http.php';
+require_once __DIR__ . '/endpoint_health.php';
 
 /**
- * Price provider interface
+ * Price provider interface.
+ *
+ * getBtcPrice() returns null when the provider cannot quote this CURRENCY
+ * (not in its pair map, or absent from an otherwise-valid response) — that is
+ * a per-currency miss, not a provider outage. Transport failures and malformed
+ * bodies THROW instead, so the caller can put the provider on a short failure
+ * cooldown without penalizing it for currencies it simply doesn't list.
  */
 interface PriceProvider {
     public function getBtcPrice(string $currency): ?float;
@@ -43,12 +50,17 @@ class CoinGeckoProvider implements PriceProvider {
             'allowPrivate' => false,
         ]);
 
-        if ($result['status'] !== 200 || $result['body'] === '') {
-            return null;
+        if ($result['error'] !== '' || $result['status'] !== 200 || $result['body'] === '') {
+            throw new RuntimeException("HTTP {$result['status']}: " . ($result['error'] ?: substr($result['body'], 0, 120)));
         }
 
         $data = json_decode($result['body'], true);
-        return $data['bitcoin'][$currency] ?? null;
+        if (!is_array($data)) {
+            throw new RuntimeException('malformed JSON response');
+        }
+        // Missing key on a valid response = currency not listed, not an outage.
+        $rate = $data['bitcoin'][$currency] ?? null;
+        return is_numeric($rate) ? (float)$rate : null;
     }
 }
 
@@ -90,12 +102,17 @@ class BinanceProvider implements PriceProvider {
             'allowPrivate' => false,
         ]);
 
-        if ($result['status'] !== 200 || $result['body'] === '') {
-            return null;
+        // The symbol comes from our own fixed map, so any HTTP failure here is
+        // a provider problem, not an unknown-currency response.
+        if ($result['error'] !== '' || $result['status'] !== 200 || $result['body'] === '') {
+            throw new RuntimeException("HTTP {$result['status']}: " . ($result['error'] ?: substr($result['body'], 0, 120)));
         }
 
         $data = json_decode($result['body'], true);
-        return isset($data['price']) ? (float)$data['price'] : null;
+        if (!is_array($data)) {
+            throw new RuntimeException('malformed JSON response');
+        }
+        return isset($data['price']) && is_numeric($data['price']) ? (float)$data['price'] : null;
     }
 }
 
@@ -136,14 +153,21 @@ class KrakenProvider implements PriceProvider {
             'allowPrivate' => false,
         ]);
 
-        if ($result['status'] !== 200 || $result['body'] === '') {
-            return null;
+        // The pair comes from our own fixed map, so any HTTP failure here is
+        // a provider problem, not an unknown-currency response.
+        if ($result['error'] !== '' || $result['status'] !== 200 || $result['body'] === '') {
+            throw new RuntimeException("HTTP {$result['status']}: " . ($result['error'] ?: substr($result['body'], 0, 120)));
         }
 
         $data = json_decode($result['body'], true);
+        if (!is_array($data)) {
+            throw new RuntimeException('malformed JSON response');
+        }
 
         if (!empty($data['error'])) {
-            return null;
+            // Kraken's in-band errors (rate limits, service unavailable) are
+            // provider-side failures — the pair itself is from our fixed map.
+            throw new RuntimeException('Kraken error: ' . json_encode($data['error']));
         }
 
         // Kraken returns nested result with pair name as key
@@ -169,9 +193,22 @@ class ExchangeRates {
     private static array $providers = [];
 
     /**
+     * Test seam: when set, getProviders() returns this map instead of the real
+     * network-backed providers. Production code never assigns it (null); tests
+     * use it to drive the fallback/cooldown logic with scripted providers.
+     * Same pattern as OnchainProviderFactory::$testProvider.
+     *
+     * @var array<string, PriceProvider>|null
+     */
+    public static ?array $testProviders = null;
+
+    /**
      * Get provider instances
      */
     private static function getProviders(): array {
+        if (self::$testProviders !== null) {
+            return self::$testProviders;
+        }
         if (empty(self::$providers)) {
             self::$providers = [
                 'coingecko' => new CoinGeckoProvider(),
@@ -221,11 +258,35 @@ class ExchangeRates {
             }
         }
 
+        // Skip providers inside a failure cooldown so a hung/down provider's
+        // 10s timeout is paid once per cooldown window, not on every checkout.
+        $active = array_values(array_filter(
+            $order,
+            fn(PriceProvider $p) => !EndpointHealth::isCoolingDown('rates:' . $p->getName())
+        ));
+        if (empty($active)) {
+            // Every provider is cooling down (full outage). Serve cached data
+            // immediately rather than hammering dead providers on each request;
+            // the cooldown expiry (~2 min) bounds how long we coast on it. Only
+            // when there is no cached rate at all do we try them anyway — a
+            // request that might succeed beats guaranteed unpriceability.
+            $stale = self::getCached($currency, true);
+            if ($stale !== null) {
+                return $stale;
+            }
+            $lastGood = self::getLastGood($currency);
+            if ($lastGood !== null) {
+                return $lastGood;
+            }
+            $active = $order;
+        }
+
         // Try each provider
-        foreach ($order as $provider) {
+        foreach ($active as $provider) {
             try {
                 $rate = $provider->getBtcPrice($currency);
                 if ($rate !== null && self::isSaneRate($rate)) {
+                    EndpointHealth::recordSuccess('rates:' . $provider->getName());
                     self::saveToCache($currency, $rate, $provider->getName());
                     return $rate;
                 }
@@ -236,12 +297,18 @@ class ExchangeRates {
                     // divide-by-zero downstream, so treat it as a failure and
                     // fall through to the next provider.
                     error_log("ExchangeRates: {$provider->getName()} returned insane rate for {$currency}: {$rate}");
+                    EndpointHealth::recordFailure('rates:' . $provider->getName());
                 }
+                // $rate === null: currency not supported by this provider — a
+                // per-currency miss, not an outage; no cooldown.
             } catch (\Throwable $e) {
                 // Catch \Throwable (not just Exception) so a provider-side Error
                 // — e.g. a TypeError from a malformed response — doesn't abort
-                // the whole price lookup and 500 the payment.
+                // the whole price lookup and 500 the payment. Providers throw on
+                // transport failures / malformed bodies, so this is where a sick
+                // provider earns its cooldown.
                 error_log("ExchangeRates: {$provider->getName()} failed for {$currency}: " . $e->getMessage());
+                EndpointHealth::recordFailure('rates:' . $provider->getName());
                 continue;
             }
         }

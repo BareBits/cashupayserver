@@ -308,10 +308,10 @@ final class SwapClaimer {
                 error_log("swap broadcast via {$row['provider']} failed: " . $e->getMessage());
             }
         }
-        // Esplora fallback (does not exist on regtest).
+        // Esplora fallback (does not exist on regtest). Broadcasting is rare
+        // and critical, so every default host is tried — no cooldown skipping.
         require_once __DIR__ . '/../onchain/provider.php';
-        $esploraUrl = EsploraProvider::defaultUrlForNetwork($network);
-        if ($esploraUrl !== null) {
+        foreach (EsploraProvider::defaultUrlsForNetwork($network) ?? [] as $esploraUrl) {
             $url = rtrim($esploraUrl, '/') . '/tx';
             $result = \SafeHttp::request($url, [
                 'method' => 'POST',
@@ -326,7 +326,7 @@ final class SwapClaimer {
             if (self::isAlreadyKnownError($result['body'])) {
                 return $expectedTxid;
             }
-            error_log("swap broadcast via esplora failed: HTTP {$result['status']}: " . substr($result['body'], 0, 200));
+            error_log("swap broadcast via esplora ({$esploraUrl}) failed: HTTP {$result['status']}: " . substr($result['body'], 0, 200));
         }
         throw new RuntimeException('All broadcast paths failed for swap claim');
     }
@@ -368,11 +368,11 @@ final class SwapClaimer {
      */
     public static function estimateClaimFeeSats(string $network, int $vsize): int {
         $rate = null;
-        $esploraUrl = EsploraProvider::defaultUrlForNetwork($network);
-        if ($esploraUrl !== null) {
+        foreach (EsploraProvider::defaultUrlsForNetwork($network) ?? [] as $esploraUrl) {
             $rate = self::fetchFeerateSatPerVb($esploraUrl);
             if ($rate !== null) {
                 self::cacheFeerate($network, $rate); // remember last good
+                break;
             }
         }
         if ($rate === null) {
