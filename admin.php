@@ -3998,7 +3998,6 @@ header('Cache-Control: no-cache, must-revalidate');
     <meta name="apple-mobile-web-app-title" content="BareBits">
     <meta name="csrf-token" content="<?= htmlspecialchars(Auth::generateCsrfToken()) ?>">
     <title>BareBits Admin</title>
-    <link rel="manifest" href="<?= htmlspecialchars(Config::getBaseUrl()) ?>/manifest.json">
     <link rel="apple-touch-icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect fill='%230f0f23' width='100' height='100' rx='20'/><text x='50' y='70' font-size='60' text-anchor='middle'>⚡</text></svg>">
     <style>
         * {
