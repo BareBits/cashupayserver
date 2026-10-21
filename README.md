@@ -215,7 +215,7 @@ The default settings on these plugins should work, just be sure to set the liqui
 
 **Use a receive-only connection.** BareBits only ever calls `make_invoice` and `lookup_invoice`, but if your wallet lets you scope permissions, grant only those two — a connection that can also *pay* would let anyone who compromises your server spend from your wallet. BareBits warns you at save time if it can detect that the connection has spend permissions. The connection secret is stored server-side and never shown again in the admin UI.
 
-### LNURL aka Lightning Address Providers (simplest, instant USD conversion)
+### LNURL aka Lightning Address Providers (simple)
 Many centralized exchanges like [Strike](https://strike.me) offer LNURLs out of the box and can offer instant USD conversion. Note that these exchanges are custodial: they hold onto funds for you. This introduces risk of theft, exchange collapse, etc so we do not suggest storing significant funds on them.
 
 | Provider   |      USD Conversion |  Notes |
