@@ -68,7 +68,7 @@ COPY cashu-wallet-php/bip39-english.txt                            /usr/src/cash
 COPY admin.php setup.php api.php payment.php receive.php cron.php \
      router.php index.php recover.php health.php pay.php \
      product-image.php update.php provision.php sso.php            /usr/src/cashupayserver/
-COPY .htaccess manifest.json favicon.ico                           /usr/src/cashupayserver/
+COPY .htaccess favicon.ico                                         /usr/src/cashupayserver/
 
 # Fail the build if any entry point router.php dispatches to is missing or any
 # literal require doesn't resolve — the same guard tests.yml applies to the
