@@ -71,7 +71,7 @@ you don't set falls back to the in-app defaults or the admin UI.
 | Variable | Default | Notes |
 |----------|---------|-------|
 | `TZ` | `UTC` | Standard Debian tz database name. |
-| `CASHUPAY_AUTO_UPDATE_ENABLED` | `1` | Set to `0` to pin to the image tag (immutable infra). |
+| `CASHUPAY_AUTO_UPDATE_ENABLED` | unset (off) | Set to `1` to force auto-update on for the deployment; normally opt in via the admin UI or onboarding wizard instead. |
 | `CRON_INTERVAL_SECONDS` | `60` | `0` disables the in-container cron loop. |
 | `CASHUPAY_SMTP_*` | unset | See `user_config.example.php` for the full SMTP set. |
 | `CASHUPAY_FREE_TRIAL_*` | unset | Seeded once on first migration; see `user_config.example.php`. |
@@ -114,12 +114,15 @@ automatically.
 
 There are two upgrade paths and they intentionally do not collide:
 
-1. **In-app auto-updater (default).** With
-   `CASHUPAY_AUTO_UPDATE_ENABLED=1`, every cron tick checks the
+1. **In-app auto-updater (opt-in).** Enable it in the admin UI
+   (Settings → Auto-update), during onboarding, or force it on with
+   `CASHUPAY_AUTO_UPDATE_ENABLED=1`. Every cron tick then checks the
    `CASHUPAY_UPDATE_CHANNEL` channel on GitHub. New builds overlay onto
    `/var/www/html`, preserving `data/` and `user_config.php`. No
-   container restart needed.
-2. **Image-tag pinning.** Set `CASHUPAY_AUTO_UPDATE_ENABLED=0` and
+   container restart needed. When auto-update stays off, the daily check
+   still runs and surfaces new releases as an admin banner (and an email,
+   if notifications are configured).
+2. **Image-tag pinning (default).** Leave auto-update off and
    redeploy with a newer image tag when you want to upgrade. The
    entrypoint will **not** overwrite an existing `/var/www/html` volume,
    so you must either:

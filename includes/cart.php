@@ -191,10 +191,15 @@ class Cart {
         ];
     }
 
-    /** Raw line-item rows for an invoice, in insertion order. */
+    /**
+     * Raw line-item rows for an invoice, in insertion order. Ids are random
+     * and every item of one checkout shares the same created_at second, so
+     * rowid (SQLite's insertion counter) is the only stable tiebreaker — an
+     * `id ASC` tiebreak shuffled the receipt (tip before product) at random.
+     */
     public static function getItems(string $invoiceId): array {
         return Database::fetchAll(
-            'SELECT * FROM invoice_items WHERE invoice_id = ? ORDER BY created_at ASC, id ASC',
+            'SELECT * FROM invoice_items WHERE invoice_id = ? ORDER BY created_at ASC, rowid ASC',
             [$invoiceId]
         );
     }

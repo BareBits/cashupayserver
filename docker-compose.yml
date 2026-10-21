@@ -23,7 +23,7 @@ services:
     environment:
       TZ: UTC
       # Uncomment and set as needed:
-      # CASHUPAY_AUTO_UPDATE_ENABLED: "1"    # default 1; "0" pins to image tag
+      # CASHUPAY_AUTO_UPDATE_ENABLED: "1"    # default 0 (opt in via the admin UI, onboarding wizard, or this env var)
       # CRON_INTERVAL_SECONDS: "60"          # "0" disables in-container cron
       # Note: the public base URL is auto-detected from the request Host header
       # (no CASHUPAY_BASE_URL env var) and the update channel is set in the

@@ -41,6 +41,7 @@ class Diagnostics {
      */
     private const SAFE_CONFIG_KEYS = [
         'allow_private_endpoints',
+        'auto_update_enabled',
         'cron_warning_dismissed_at',
         'deployment_id',
         'fee_tracking_start_at',
@@ -57,6 +58,7 @@ class Diagnostics {
         'notifications_invoice_paid_enabled',
         'notifications_auto_cashout_enabled',
         'notifications_payer_receipt_enabled',
+        'notifications_update_available_enabled',
         'setup_complete',
         'update_channel',
         'updater_auto_rollback_dismissed',
@@ -66,6 +68,7 @@ class Diagnostics {
         'updater_last_check',
         'updater_last_rollback',
         'updater_last_update',
+        'updater_notified_sha',
         'updater_pending_verify',
         'url_mode',
     ];
@@ -319,7 +322,7 @@ class Diagnostics {
         $startTs = $this->range !== null ? Stats::rangeStart($this->range) : null;
         [$where, $params] = $this->rangeClause($startTs, 'created_at');
         foreach (Database::fetchAll(
-            "SELECT * FROM invoice_items{$where} ORDER BY created_at ASC", $params) as $r) {
+            "SELECT * FROM invoice_items{$where} ORDER BY created_at ASC, rowid ASC", $params) as $r) {
             $cols = self::ITEM_SAFE_COLS;
             if (!$this->anonymize) $cols = array_merge($cols, self::ITEM_PII_COLS);
             $out = $this->project($r, $cols);

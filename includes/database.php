@@ -103,7 +103,7 @@ class Database {
             // on existing installs that haven't yet picked it up. All migrations
             // are idempotent, so a fire is safe.
             $hasLatestMigration = $hasConfig
-                && self::columnExists(self::$instance, 'invoices', 'onchain_last_polled_at');
+                && self::columnExists(self::$instance, 'stores', 'invoice_first_method');
             // The auto-withdraw → auto-cashout rename is a data-only migration
             // (config key + notification event labels) with no schema artifact
             // to mark it done, so probe for the legacy config key directly. The
@@ -283,6 +283,11 @@ HTACCESS;
             -- (hideStoreName / hideNote) win over these; see Invoice::buildInvoiceMemo.
             hide_store_name_on_invoice INTEGER DEFAULT NULL,
             hide_note_on_invoice INTEGER DEFAULT NULL,
+            -- Payment order on the customer invoice page when an invoice
+            -- offers both on-chain and Lightning: which tab is active (and
+            -- listed first) on load. 'onchain' | 'lightning'; NULL = on-chain
+            -- (the historical default). See Invoice::firstPaymentMethod.
+            invoice_first_method TEXT DEFAULT NULL,
             -- Timestamps
             created_at INTEGER NOT NULL
         );
@@ -1728,11 +1733,31 @@ HTACCESS;
         // customer who paid on-chain and closed the tab ended with an
         // Expired invoice on received funds. The on-chain poller now
         // filters/stamps this column exclusively; last_polled_at stays the
-        // Lightning pollers' throttle. invoices.onchain_last_polled_at is
-        // the "latest" migration marker (see getInstance), so this stays
-        // last.
+        // Lightning pollers' throttle.
         if (!self::columnExists($pdo, 'invoices', 'onchain_last_polled_at')) {
             $pdo->exec("ALTER TABLE invoices ADD COLUMN onchain_last_polled_at INTEGER DEFAULT NULL");
+        }
+
+        // Configurable payment-rail ordering (see RailOrder). ln_rail_order
+        // is the per-store order the Lightning destination TYPES are tried
+        // in (CSV over strike,lnaddress,nwc,noffer); onchain_source_order
+        // is where an invoice's on-chain address is minted first (CSV over
+        // strike,local). NULL = the historical default order, so existing
+        // stores keep their behavior.
+        if (!self::columnExists($pdo, 'stores', 'ln_rail_order')) {
+            $pdo->exec("ALTER TABLE stores ADD COLUMN ln_rail_order TEXT DEFAULT NULL");
+        }
+        if (!self::columnExists($pdo, 'stores', 'onchain_source_order')) {
+            $pdo->exec("ALTER TABLE stores ADD COLUMN onchain_source_order TEXT DEFAULT NULL");
+        }
+
+        // Per-store "Payment order" setting: which method the customer
+        // invoice page shows first when an invoice offers both on-chain and
+        // Lightning. NULL keeps the historical on-chain-first behaviour.
+        // stores.invoice_first_method is the "latest" migration marker (see
+        // getInstance), so this stays last.
+        if (!self::columnExists($pdo, 'stores', 'invoice_first_method')) {
+            $pdo->exec("ALTER TABLE stores ADD COLUMN invoice_first_method TEXT DEFAULT NULL");
         }
     }
 

@@ -621,7 +621,7 @@ if (!$isInternal && !$swapOnly) {
     }
 }
 
-// Task 12c: Refresh the "update available" cache that powers the dashboard
+// Task 12c: Refresh the "update available" cache that powers the admin
 // update banner + the Auto-update card's status line. Deliberately INDEPENDENT
 // of the auto-update opt-in — the banner has to nudge operators who have NOT
 // enabled auto-update. This only compares the remote channel's COMMIT_SHA to
@@ -633,6 +633,17 @@ if (!$isInternal && !$swapOnly && !$skipNonEssential) {
         $results['tasks']['update_check'] = !empty($av['available']) ? 'available' : 'current';
     } catch (Throwable $e) {
         $results['tasks']['update_check'] = 'error: ' . $e->getMessage();
+    }
+    // Task 12e: with auto-update off, email the admin notification address
+    // about a newly-available release (once per release; queued and drained
+    // by Task 13 below, so it can go out on this same tick). Reads the
+    // cached verdict written above.
+    try {
+        if (Updater::maybeNotifyUpdateAvailable()) {
+            $results['tasks']['update_notify'] = 'queued';
+        }
+    } catch (Throwable $e) {
+        $results['tasks']['update_notify'] = 'error: ' . $e->getMessage();
     }
 }
 

@@ -6,6 +6,8 @@
  * and URL routing mode.
  */
 
+require_once __DIR__ . '/desktop.php';
+
 class Urls {
     /**
      * Human-readable label for a URL routing mode.
@@ -121,6 +123,53 @@ class Urls {
         }
         $file = $base . '/payment.php';
         return $invoiceId ? $file . '?id=' . urlencode($invoiceId) : $file;
+    }
+
+    /**
+     * Should the payment page offer a "Share" button for the invoice URL?
+     *
+     * A share link only makes sense when the copied URL could open on someone
+     * else's device. Two cases where it can't:
+     *   - the Windows desktop package: its built-in server listens on
+     *     127.0.0.1 only, so there is no shareable link at all;
+     *   - a base URL whose host is loopback (localhost / 127.0.0.0/8 / ::1):
+     *     any local install, regardless of OS.
+     *
+     * The parameters are test seams; production callers pass nothing and get
+     * the live Desktop detection and configured base URL.
+     */
+    public static function paymentLinkShareable(
+        ?bool $isWindowsDesktop = null, ?string $baseUrl = null
+    ): bool {
+        $isWindowsDesktop = $isWindowsDesktop ?? Desktop::isWindowsDesktop();
+        if ($isWindowsDesktop) {
+            return false;
+        }
+        $baseUrl = $baseUrl ?? Config::getBaseUrl();
+        $host = (string)(parse_url($baseUrl, PHP_URL_HOST) ?? '');
+        if ($host === '') {
+            // No host at all (relative or malformed base URL) — nothing a
+            // third party could resolve, so nothing worth sharing.
+            return false;
+        }
+        return !self::isLoopbackHost($host);
+    }
+
+    /**
+     * Is a URL host (as returned by parse_url()) a loopback / unroutable
+     * address? Covers the localhost name (incl. RFC 6761 *.localhost), the
+     * whole 127.0.0.0/8 IPv4 block, IPv6 ::1 (parse_url keeps the brackets),
+     * and 0.0.0.0, which is listen-shorthand rather than a reachable host.
+     */
+    public static function isLoopbackHost(string $host): bool {
+        $host = strtolower(trim($host, '[]'));
+        if ($host === 'localhost' || str_ends_with($host, '.localhost')) {
+            return true;
+        }
+        if ($host === '::1' || $host === '0.0.0.0') {
+            return true;
+        }
+        return (bool)preg_match('/^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/', $host);
     }
 
     /**

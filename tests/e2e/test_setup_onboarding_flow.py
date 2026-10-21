@@ -62,7 +62,7 @@ def test_full_flow_persists_every_answer(
     # sits after the lightning screen (where the last possible on-chain
     # receive source, Strike on-chain minting, is answered).
     assert _heading(body) == "Lightning payments"
-    assert "of 11" in body
+    assert "of 12" in body
 
     body = w.post(step="lightning", lightning_action="save", lightning_address="merchant@strike.me")
     assert _heading(body) == "Zero-conf payments"
@@ -81,6 +81,10 @@ def test_full_flow_persists_every_answer(
 
     # Decline mints — the mint screen is where setup_complete flips.
     body = w.post(step="mints", mints_enabled="0")
+    assert _heading(body) == "Enable automatic updates?"
+
+    # Decline automatic updates: the choice must persist as an explicit off.
+    body = w.post(step="updates", auto_update="0")
     assert _heading(body) == "Enable cron"
     assert "X-CRON-KEY" in body, "the cron screen should render a ready-made crontab line"
 
@@ -105,7 +109,7 @@ def test_full_flow_persists_every_answer(
 def test_skipping_onchain_removes_the_zeroconf_screen(payserver: PayserverHandle) -> None:
     w = Wizard(payserver)
     body = w.through_store("Skip Onchain")
-    assert "of 10" in body, "without an on-chain rail the wizard is 10 screens, not 11"
+    assert "of 11" in body, "without an on-chain rail the wizard is 11 screens, not 12"
 
     body = w.post(step="onchain", onchain_action="skip")
     assert _heading(body) == "Lightning payments"
@@ -135,7 +139,7 @@ def test_strike_only_store_is_asked_the_zeroconf_question(
     payserver = payserver_with_strike
     w = Wizard(payserver)
     body = w.through_store("Strike Only")
-    assert "of 10" in body, "no on-chain receive source yet, so no zeroconf screen"
+    assert "of 11" in body, "no on-chain receive source yet, so no zeroconf screen"
 
     body = w.post(step="onchain", onchain_action="skip")
     assert _heading(body) == "Lightning payments"
@@ -156,7 +160,7 @@ def test_strike_only_store_is_asked_the_zeroconf_question(
         strike_onchain="1",
     )
     assert _heading(body) == "Zero-conf payments", "Strike on-chain must pull zeroconf in"
-    assert "of 11" in body, "the step counter must count the screen it just gained"
+    assert "of 12" in body, "the step counter must count the screen it just gained"
 
     body = w.post(step="zeroconf", zero_conf="1")
     assert _heading(body) == "Submarine swaps"
@@ -466,8 +470,8 @@ def test_security_screen_skipped_when_data_dir_is_outside_the_webroot() -> None:
         try:
             w = SetupWizard(handle.url)
             body = w.get("terms")
-            assert "of 9" in body, (
-                "skipping the security screen makes the standalone wizard 9 screens"
+            assert "of 10" in body, (
+                "skipping the security screen makes the standalone wizard 10 screens"
             )
 
             body = w.post(step="terms", terms_legal="1", terms_warranty="1", terms_fee="1")

@@ -111,4 +111,48 @@ assert_true(str_contains($html, 'class="method-block " data-method-block="onchai
     'on-chain-only invoice shows on-chain block');
 assert_false(str_contains($html, 'role="tablist"'), 'single method renders no tab bar');
 
+// ---------------------------------------------------------------------------
+// Store "Payment order" = Lightning first (stores.invoice_first_method).
+// ---------------------------------------------------------------------------
+make_store('store_ln_first');
+Database::update('stores', ['invoice_first_method' => 'lightning'], 'id = ?', ['store_ln_first']);
+foreach (['inv_both', 'inv_oc_only'] as $src) {
+    $row = Database::fetchOne("SELECT * FROM invoices WHERE id = ?", [$src]);
+    unset($row['id'], $row['store_id']);
+    Database::insert('invoices', ['id' => $src . '_lnf', 'store_id' => 'store_ln_first'] + $row);
+}
+
+// Both rails: Lightning active, listed first, on-chain still selectable.
+$html = run_payment_page('inv_both_lnf');
+assert_true(str_contains($html, 'class="method-tab active" data-method="lightning"'),
+    'lightning-first store: lightning tab active by default');
+assert_true(str_contains($html, 'class="method-tab " data-method="onchain"'),
+    'lightning-first store: on-chain tab present but inactive');
+assert_true(str_contains($html, 'class="method-block " data-method-block="lightning"'),
+    'lightning-first store: lightning block visible on load');
+assert_true(str_contains($html, 'class="method-block hidden" data-method-block="onchain"'),
+    'lightning-first store: on-chain block starts hidden');
+assert_true(str_contains($html, 'id="payment-methods" data-method="lightning"'),
+    'lightning-first store: brand row keyed to lightning on load');
+$ocTab = strpos($html, 'data-method="onchain" role="tab"');
+$lnTab = strpos($html, 'data-method="lightning" role="tab"');
+assert_true($ocTab !== false && $lnTab !== false && $lnTab < $ocTab,
+    'lightning-first store: lightning tab listed before on-chain');
+
+// On-chain only: the preference can't apply, falls back to on-chain.
+$html = run_payment_page('inv_oc_only_lnf');
+assert_true(str_contains($html, 'class="method-block " data-method-block="onchain"'),
+    'lightning-first store: on-chain-only invoice still shows on-chain block');
+assert_true(str_contains($html, 'id="payment-methods" data-method="onchain"'),
+    'lightning-first store: brand row keyed to on-chain for on-chain-only invoice');
+assert_false(str_contains($html, 'role="tablist"'), 'lightning-first store: single method renders no tab bar');
+
+// An explicit 'onchain' value and a junk value both behave like NULL.
+foreach (['onchain', 'bogus', ''] as $v) {
+    Database::update('stores', ['invoice_first_method' => $v], 'id = ?', ['store_ln_first']);
+    $html = run_payment_page('inv_both_lnf');
+    assert_true(str_contains($html, 'class="method-tab active" data-method="onchain"'),
+        "invoice_first_method=" . var_export($v, true) . " resolves to on-chain first");
+}
+
 echo "test_payment_page_default_method: ok\n";

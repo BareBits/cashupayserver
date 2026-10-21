@@ -42,6 +42,29 @@ putenv('CASHUPAY_AUTO_UPDATE_ENABLED=1');
 assert_eq(true, Updater::isAutoUpdateEnabled(), 'env var opens gate');
 putenv('CASHUPAY_AUTO_UPDATE_ENABLED');  // unset
 
+// DB config key (admin-UI toggle / onboarding wizard) opens the gate too.
+Config::set('auto_update_enabled', true);
+assert_eq(true, Updater::isAutoUpdateEnabled(), 'db toggle opens gate');
+assert_eq('db', Updater::autoUpdateEnabledSource(), 'source reports db');
+Config::set('auto_update_enabled', false);
+assert_eq(false, Updater::isAutoUpdateEnabled(), 'db toggle off closes gate');
+assert_eq(null, Updater::autoUpdateEnabledSource(), 'source null when disabled');
+
+// Env force wins the source report over the DB toggle (the UI uses this to
+// lock the toggle when a deployment-level setting forces the gate open).
+Config::set('auto_update_enabled', true);
+putenv('CASHUPAY_AUTO_UPDATE_ENABLED=1');
+assert_eq('env', Updater::autoUpdateEnabledSource(), 'env force outranks db in source report');
+putenv('CASHUPAY_AUTO_UPDATE_ENABLED');
+Config::set('auto_update_enabled', false);
+
+// Env "0" is only "not enabled via env" — it must not veto the DB toggle.
+Config::set('auto_update_enabled', true);
+putenv('CASHUPAY_AUTO_UPDATE_ENABLED=0');
+assert_eq(true, Updater::isAutoUpdateEnabled(), 'env "0" does not veto db toggle');
+putenv('CASHUPAY_AUTO_UPDATE_ENABLED');
+Config::set('auto_update_enabled', false);
+
 // Env var = "0" is treated as off (matches the existing
 // CASHUPAY_UPDATER_DISABLED convention).
 putenv('CASHUPAY_AUTO_UPDATE_ENABLED=0');

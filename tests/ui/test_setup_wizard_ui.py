@@ -107,6 +107,10 @@ def test_setup_wizard_completes_in_browser(
     page.fill("#backup_mint_url_manual", backup_mint.url)
     page.click("#mints-continue-btn")
 
+    # auto-update opt-in: enable it and check the config write below.
+    page.wait_for_selector("h2:has-text('Enable automatic updates?')")
+    page.click("button:has-text('Enable automatic updates')")
+
     # cron reminder, then completion.
     page.wait_for_selector("h2:has-text('Enable cron')")
     assert "X-CRON-KEY" in page.content(), "the cron screen should show a ready-made crontab line"
@@ -119,6 +123,9 @@ def test_setup_wizard_completes_in_browser(
     assert len(seed_words) == 12, f"expected a 12-word phrase, got {len(seed_words)}"
 
     assert _config_value(payserver, "setup_complete") == "true"
+    assert _config_value(payserver, "auto_update_enabled") == "true", (
+        "enabling automatic updates on the wizard must persist the opt-in"
+    )
     # The swaps step is store-only now: enabling it must write the store flag
     # (asserted below) without flipping any site-wide config key.
     assert _config_value(payserver, "swaps_enabled") is None, (
@@ -163,8 +170,8 @@ def test_setup_wizard_without_onchain_skips_zeroconf(
     page.click("button[type=submit]")
 
     page.wait_for_selector("#onchain-form")
-    assert "of 10" in page.locator(".subtitle").inner_text(), (
-        "without an on-chain rail the wizard should advertise 10 screens, not 11"
+    assert "of 11" in page.locator(".subtitle").inner_text(), (
+        "without an on-chain rail the wizard should advertise 11 screens, not 12"
     )
     page.click("button:has-text('Skip for now')")
 
@@ -220,8 +227,8 @@ def test_outside_webroot_skips_security_screen_but_still_detects_url_mode(
             page.check("#terms_fee")
             page.click("button[type=submit]")
             page.wait_for_selector("#password")
-            assert "of 9" in page.locator(".subtitle").inner_text(), (
-                "skipping the security screen should advertise 9 screens"
+            assert "of 10" in page.locator(".subtitle").inner_text(), (
+                "skipping the security screen should advertise 10 screens"
             )
         finally:
             stop_payserver(handle)
