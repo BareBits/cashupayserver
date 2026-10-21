@@ -152,9 +152,11 @@ if ($invoice === null) {
 
 // Get store name for display. Also pull the invoice-privacy defaults so the
 // cashu (NUT-18) memo honours the same store-name/note hiding the noffer rail
-// applies via Invoice::buildInvoiceMemo.
+// applies via Invoice::buildInvoiceMemo, and the "Payment order" preference
+// that picks the default method tab (Invoice::firstPaymentMethod).
 $store = Database::fetchOne(
-    "SELECT name, hide_store_name_on_invoice, hide_note_on_invoice FROM stores WHERE id = ?",
+    "SELECT name, hide_store_name_on_invoice, hide_note_on_invoice, invoice_first_method
+     FROM stores WHERE id = ?",
     [$invoice['store_id']]
 );
 $storeName = $store['name'] ?? 'Payment';
@@ -1203,21 +1205,28 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                 <?php endif; ?>
 
                 <?php
-                // On-chain is the preferred default when the invoice offers it;
-                // Lightning and Cashu remain selectable via the tabs. Tab order
-                // mirrors the priority so the default tab sits first.
-                $firstMethod = $hasOnchain ? 'onchain' : ($hasLightning ? 'lightning' : 'cashu');
+                // The store's "Payment order" setting picks the default
+                // method when the invoice offers it (on-chain unless the
+                // store chose Lightning first); the other methods remain
+                // selectable via the tabs. Tab order mirrors the preference
+                // so the default tab sits first; Cashu is always last.
+                $firstMethod = Invoice::firstPaymentMethod(
+                    is_array($store) ? $store : [],
+                    $hasOnchain,
+                    $hasLightning,
+                    $hasCashu
+                );
+                $methodTabs = [
+                    'onchain'   => ['offered' => $hasOnchain,   'label' => 'On-chain'],
+                    'lightning' => ['offered' => $hasLightning, 'label' => 'Lightning'],
+                    'cashu'     => ['offered' => $hasCashu,     'label' => 'Cashu'],
+                ];
                 if ($methodCount >= 2): ?>
                 <div class="method-tabs" role="tablist">
-                    <?php if ($hasOnchain): ?>
-                    <button type="button" class="method-tab <?= $firstMethod === 'onchain' ? 'active' : '' ?>" data-method="onchain" role="tab">On-chain</button>
-                    <?php endif; ?>
-                    <?php if ($hasLightning): ?>
-                    <button type="button" class="method-tab <?= $firstMethod === 'lightning' ? 'active' : '' ?>" data-method="lightning" role="tab">Lightning</button>
-                    <?php endif; ?>
-                    <?php if ($hasCashu): ?>
-                    <button type="button" class="method-tab <?= $firstMethod === 'cashu' ? 'active' : '' ?>" data-method="cashu" role="tab">Cashu</button>
-                    <?php endif; ?>
+                    <?php foreach (Invoice::paymentMethodTabOrder(is_array($store) ? $store : []) as $tabMethod):
+                        if (!$methodTabs[$tabMethod]['offered']) { continue; } ?>
+                    <button type="button" class="method-tab <?= $firstMethod === $tabMethod ? 'active' : '' ?>" data-method="<?= $tabMethod ?>" role="tab"><?= $methodTabs[$tabMethod]['label'] ?></button>
+                    <?php endforeach; ?>
                 </div>
                 <?php endif; ?>
 

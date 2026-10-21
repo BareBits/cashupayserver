@@ -5,8 +5,9 @@
   - Auto-cashout column selector renders (store: 2 cols — the "-1"/inherit
     column is gone with the site-wide layer) and selecting a column updates
     the underlying mode control.
-  - Store-settings card order (Lightning payments between Store Info and
-    On-chain Bitcoin payments — the cashout + offline Cashu settings live
+  - Store-settings card order (Payment order right after Store Info, then
+    Lightning payments, then On-chain Bitcoin payments — the cashout +
+    offline Cashu settings live
     inside its Cashu section now; Submarine Swaps under On-chain; API Keys
     near the bottom).
   - Site settings no longer carries the removed site-wide cards (#aw-site,
@@ -61,10 +62,12 @@ def test_store_settings_collapsible_and_order(admin_page):
     # API Keys moved to the bottom (just above Danger Zone).
     assert titles.index("API Keys") > titles.index("Hosting Fee")
     assert titles[-1] == "Danger Zone"
-    # Lightning payments sits right after Store Info; the cashout and offline
-    # Cashu settings live INSIDE it now (Cashu section), so neither is a card
-    # title any more and On-chain follows directly.
-    assert titles.index("Lightning payments") == titles.index("Store Info") + 1
+    # Payment order sits right after Store Info, then Lightning payments; the
+    # cashout and offline Cashu settings live INSIDE the latter now (Cashu
+    # section), so neither is a card title any more and On-chain follows
+    # directly.
+    assert titles.index("Payment order") == titles.index("Store Info") + 1
+    assert titles.index("Lightning payments") == titles.index("Payment order") + 1
     assert titles.index("On-chain Bitcoin payments") == titles.index("Lightning payments") + 1
     assert "Auto-Cashout" not in titles
     assert "Cashu automatic cashout" not in titles
