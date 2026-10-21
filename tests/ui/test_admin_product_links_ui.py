@@ -137,6 +137,12 @@ def test_copy_product_link_prompts_to_enable_selfserve(
         row_db = db.execute(
             "SELECT selfserve_enabled FROM stores WHERE id = ?", (configured.store_id,)
         ).fetchone()
+    # Regression: clicking Copy while self-serve was off used to copy a link to
+    # a disabled store (404). The fix copies the link AND flips self-serve on,
+    # so the shared link resolves. (HTTP resolution of the link, incl. tips, is
+    # covered by tests/e2e/test_selfserve_product_links.py via the plain /pay
+    # form; the admin fixture runs router mode, whose /router.php/pay path only
+    # resolves behind a real front controller, not the test cli-server.)
     assert row_db["selfserve_enabled"] == 1
 
 
@@ -180,4 +186,36 @@ def test_generate_link_for_multiple_products(
         "() => navigator.clipboard.readText().then(t => t.includes('products='))"
     )
     assert page.evaluate("navigator.clipboard.readText()") == link
+    page.evaluate("() => closeModal('modal-cart')")
+
+
+def test_generate_link_warns_when_selfserve_off(
+    shared_configured: ConfiguredPayserver, page
+) -> None:
+    """Link-mode modal surfaces a warning while self-serve is off, and the Copy
+    link button copies the link in-gesture and then offers to enable it."""
+    configured = shared_configured
+    _set_selfserve(configured, False)
+    tag = secrets.token_hex(3)
+    pid = _make_product(configured, f"WarnProd {tag}", "300")
+    page.context.grant_permissions(["clipboard-read", "clipboard-write"])
+
+    _login(configured, page)
+    _goto_products_view(page)
+    page.click("#btn-products-generate-link")
+    page.wait_for_selector("#modal-cart.visible")
+    page.click(f'#cart-catalog div[role="button"]:has-text("WarnProd {tag}")')
+    # Off-state warning is visible.
+    assert page.locator("#cart-link-warning").is_visible()
+
+    # Copy link copies the link AND offers to enable; accept the prompt.
+    page.once("dialog", lambda d: d.accept())
+    page.click("#btn-cart-copy-link")
+    page.wait_for_function(
+        "() => dashboardData && dashboardData.selfserve && dashboardData.selfserve.effective"
+    )
+    clipboard = page.evaluate("navigator.clipboard.readText()")
+    assert f"products={pid}" in clipboard
+    # Enabling cleared the off-state warning.
+    page.wait_for_selector("#cart-link-warning", state="hidden")
     page.evaluate("() => closeModal('modal-cart')")

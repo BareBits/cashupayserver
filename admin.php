@@ -7681,10 +7681,15 @@ header('Cache-Control: no-cache, must-revalidate');
                 </label>
             </div>
             <!-- Link mode: live preview of the shareable self-serve product link. -->
-            <div id="cart-link-footer" style="display:none; gap:0.5rem; margin-top:0.5rem;">
-                <input type="text" class="form-input" id="cart-link-input" readonly
-                       placeholder="Add products to build the link" style="flex:1; font-size:0.8rem;">
-                <button class="btn" id="btn-cart-copy-link" style="width:auto; flex:0 0 auto;" disabled>Copy link</button>
+            <div id="cart-link-footer" style="display:none; flex-direction:column; gap:0.5rem; margin-top:0.5rem;">
+                <div id="cart-link-warning" style="display:none; font-size:0.78rem; color:var(--text-secondary); background:rgba(247,147,26,0.12); border:1px solid rgba(247,147,26,0.3); border-radius:8px; padding:0.5rem 0.7rem;">
+                    ⚠️ Self-serve invoices are off for this store, so this link won't work yet. Copy link will offer to turn them on.
+                </div>
+                <div style="display:flex; gap:0.5rem;">
+                    <input type="text" class="form-input" id="cart-link-input" readonly
+                           placeholder="Add products to build the link" style="flex:1; font-size:0.8rem;">
+                    <button class="btn" id="btn-cart-copy-link" style="width:auto; flex:0 0 auto;" disabled>Copy link</button>
+                </div>
             </div>
             <button class="btn btn-full" id="btn-cart-checkout" style="margin-top:0.5rem;" disabled>Create</button>
             <button class="btn btn-secondary btn-full" style="margin-top: 0.5rem;" onclick="closeModal('modal-cart')">Cancel</button>
@@ -15345,10 +15350,15 @@ header('Cache-Control: no-cache, must-revalidate');
             // Keep the link-mode preview in sync with the cart contents.
             const linkInput = document.getElementById('cart-link-input');
             const copyLinkBtn = document.getElementById('btn-cart-copy-link');
+            const linkWarning = document.getElementById('cart-link-warning');
             if (cartLinkMode && linkInput) {
                 linkInput.value = cartItems.length ? (buildSelfServeProductsUrl(cartItems) || '') : '';
             }
             if (cartLinkMode && copyLinkBtn) copyLinkBtn.disabled = !cartItems.length;
+            if (cartLinkMode && linkWarning) {
+                const ss = dashboardData?.selfserve;
+                linkWarning.style.display = (ss && !ss.effective) ? '' : 'none';
+            }
             if (!cartItems.length) {
                 wrap.innerHTML = '<p style="color:var(--text-secondary); font-size:0.85rem; margin:0;">Cart is empty. Tap a product to add it.</p>';
                 totalEl.textContent = '';
@@ -15430,37 +15440,80 @@ header('Cache-Control: no-cache, must-revalidate');
             return ss.payUrl + (ss.payUrl.includes('?') ? '&' : '?') + 'products=' + spec;
         }
 
-        // Product links only work while self-serve is on for the store. When
-        // it's off, offer to enable it on the spot (keeping any configured
-        // max); refuse outright when the store can't take payments at all.
-        async function ensureSelfServeEnabled() {
-            const ss = dashboardData?.selfserve;
-            if (!ss) { showToast('Store data is still loading — try again in a moment', 'error'); return false; }
-            if (ss.effective) return true;
-            if (!ss.paymentCapable) {
-                showToast('This store has no payment method configured (add a Cashu mint or on-chain address first).', 'error');
-                return false;
+        // Copy text to the clipboard synchronously from within a click gesture.
+        // navigator.clipboard.writeText() needs the page's transient user
+        // activation, which is lost the moment the handler awaits a network
+        // call — so callers MUST invoke this before any await, and the enable
+        // step runs afterwards. Falls back to a hidden-textarea execCommand copy
+        // when the async API rejects (older browsers / revoked permission), so
+        // the link still lands on the clipboard instead of silently leaving
+        // whatever was there before.
+        function copyLinkToClipboard(text, successMsg) {
+            const ok = () => showToast(successMsg || 'Copied!', 'success');
+            const legacy = () => {
+                try {
+                    const ta = document.createElement('textarea');
+                    ta.value = text;
+                    ta.style.position = 'fixed';
+                    ta.style.top = '-9999px';
+                    document.body.appendChild(ta);
+                    ta.focus();
+                    ta.select();
+                    const done = document.execCommand('copy');
+                    document.body.removeChild(ta);
+                    return done;
+                } catch (e) { return false; }
+            };
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(text)
+                    .then(ok)
+                    .catch(() => { legacy() ? ok() : showToast('Could not copy — select the link and copy it manually.', 'error'); });
+                return;
             }
-            if (!confirm('Self-serve invoices are not enabled for this store, so this link would not work.\n\nEnable self-serve invoices now?')) {
-                return false;
-            }
-            try {
-                const maxSats = ss.maxSatsOverride ?? '';
-                const r = await postWithCsrf(adminUrl,
-                    `action=save_store_selfserve&store_id=${encodeURIComponent(currentStoreId)}&enabled=1&max_sats=${encodeURIComponent(maxSats)}`);
-                const d = await r.json();
-                if (!r.ok) { showToast(d.error || 'Failed to enable self-serve invoices', 'error'); return false; }
-                showToast('Self-serve invoices enabled', 'success');
-                await loadDashboard();
-                refreshStoreSelfServeCard();
-                return true;
-            } catch (e) {
-                showToast('Failed to enable self-serve invoices', 'error');
-                return false;
-            }
+            legacy() ? ok() : showToast('Could not copy — select the link and copy it manually.', 'error');
         }
 
-        async function copyProductLink(id) {
+        // Product links only work while self-serve is on for the store. When
+        // it's off, offer to enable it on the spot (keeping any configured max).
+        // Runs AFTER the link is already on the clipboard (see above), so the
+        // network call here can't strip the clipboard gesture. No-op when
+        // self-serve is already effective or the store can't take payments.
+        function offerEnableSelfServe() {
+            const ss = dashboardData?.selfserve;
+            if (!ss || ss.effective || !ss.paymentCapable) return;
+            if (!confirm('Self-serve invoices are not enabled for this store, so this link will not work until you turn them on.\n\nEnable self-serve invoices now?')) {
+                return;
+            }
+            const maxSats = ss.maxSatsOverride ?? '';
+            postWithCsrf(adminUrl,
+                `action=save_store_selfserve&store_id=${encodeURIComponent(currentStoreId)}&enabled=1&max_sats=${encodeURIComponent(maxSats)}`)
+                .then(r => r.json().then(d => ({ ok: r.ok, d })))
+                .then(({ ok, d }) => {
+                    if (!ok) { showToast(d.error || 'Failed to enable self-serve invoices', 'error'); return; }
+                    showToast('Self-serve invoices enabled', 'success');
+                    return loadDashboard().then(() => {
+                        refreshStoreSelfServeCard();
+                        // Re-render the cart link footer warning if the modal is open.
+                        if (document.getElementById('modal-cart').classList.contains('visible')) renderCart();
+                    });
+                })
+                .catch(() => showToast('Failed to enable self-serve invoices', 'error'));
+        }
+
+        // Shared pre-copy guard: refuse to hand out a link that can never work
+        // (store has no payment rail), surface the loading state, else return
+        // the self-serve state so the caller can copy + maybe offer to enable.
+        function selfServeLinkState() {
+            const ss = dashboardData?.selfserve;
+            if (!ss) { showToast('Store data is still loading — try again in a moment', 'error'); return null; }
+            if (!ss.paymentCapable) {
+                showToast('This store has no payment method configured (add a Cashu mint or on-chain address first).', 'error');
+                return null;
+            }
+            return ss;
+        }
+
+        function copyProductLink(id) {
             if (!ensureAdmin('Only admins can manage products.')) return;
             const p = productsAdminCache.find(x => x.id === id);
             if (!p) return;
@@ -15468,26 +15521,23 @@ header('Cache-Control: no-cache, must-revalidate');
                 showToast('This product is disabled — enable it first so the link works.', 'error');
                 return;
             }
-            if (!(await ensureSelfServeEnabled())) return;
+            if (!selfServeLinkState()) return;
             const url = buildSelfServeProductsUrl([{ productId: id, quantity: 1 }]);
             if (!url) { showToast('Could not build the link', 'error'); return; }
-            try {
-                await navigator.clipboard.writeText(url);
-                showToast('Product link copied!', 'success');
-            } catch (e) { showToast('Could not copy link', 'error'); }
+            // Copy first (in-gesture), THEN offer to enable self-serve if off.
+            copyLinkToClipboard(url, 'Product link copied!');
+            offerEnableSelfServe();
         }
 
-        async function copyCartLink() {
+        function copyCartLink() {
             if (!cartItems.length) return;
-            if (!(await ensureSelfServeEnabled())) return;
+            if (!selfServeLinkState()) return;
             const url = buildSelfServeProductsUrl(cartItems);
             if (!url) { showToast('Could not build the link', 'error'); return; }
             const linkInput = document.getElementById('cart-link-input');
             if (linkInput) linkInput.value = url;
-            try {
-                await navigator.clipboard.writeText(url);
-                showToast('Product link copied!', 'success');
-            } catch (e) { showToast('Could not copy link', 'error'); }
+            copyLinkToClipboard(url, 'Product link copied!');
+            offerEnableSelfServe();
         }
 
         // ---- Admin invoice line-item detail ----
