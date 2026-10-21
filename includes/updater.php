@@ -470,27 +470,60 @@ class Updater {
      * Last cached availability verdict, or null if never checked.
      *
      * Self-healing: the verdict is refreshed at most daily, and an update can
-     * land in between (manual click, auto-apply, a hand-copied release). If
-     * the cache still says "available" but its latest_sha IS the SHA we are
-     * now running, the install has caught up — report (and persist) "not
-     * available" instead of advertising the build we're already on for up to
-     * a day. Never flips the other way: a verdict of "current" stays until
-     * the next real check.
+     * land in between (manual click, auto-apply, a hand-copied release). A
+     * verdict is only meaningful for the build it was computed against, so:
+     *
+     *   - If its latest_sha IS the SHA we are now running, the install has
+     *     caught up: report (and persist) "not available". Nothing to refetch.
+     *   - Otherwise, if its current_sha is NOT the SHA we are now running, it
+     *     was computed by a different build (typically the one that just
+     *     applied this update — whose own updater code ran the apply, so the
+     *     new build's post-apply refresh never got a chance). Stop advertising
+     *     whatever it names and zero checked_at so the next checkForUpdate()
+     *     (cron tick, or update_status's on-demand refresh) refetches instead
+     *     of trusting the daily throttle.
+     *
+     * Never flips "current" to "available": that needs a real check.
      */
     public static function getAvailableUpdate(): ?array {
         $v = Config::get('updater_available');
         if (!is_array($v)) {
             return null;
         }
-        if (!empty($v['available'])) {
-            $latestSha = (string)($v['latest_sha'] ?? '');
-            $localSha = self::getLocalCommitSha();
-            if ($latestSha !== '' && $localSha !== '' && $latestSha === $localSha) {
-                $v['available'] = false;
-                $v['current_sha'] = $localSha;
-                $v['current_version'] = (string)(self::getLocalBuildInfo()['VERSION'] ?? '');
-                Config::set('updater_available', $v);
-            }
+        $localSha = self::getLocalCommitSha();
+        if ($localSha === '') {
+            return $v; // dev checkout without BUILD_INFO: nothing to compare against
+        }
+        $latestSha = (string)($v['latest_sha'] ?? '');
+        $verdictSha = (string)($v['current_sha'] ?? '');
+        if (!empty($v['available']) && $latestSha !== '' && $latestSha === $localSha) {
+            $v['available'] = false;
+            $v['current_sha'] = $localSha;
+            $v['current_version'] = (string)(self::getLocalBuildInfo()['VERSION'] ?? '');
+            Config::set('updater_available', $v);
+        } elseif ($verdictSha !== '' && $verdictSha !== $localSha) {
+            $v['available'] = false;
+            $v['current_sha'] = $localSha;
+            $v['current_version'] = (string)(self::getLocalBuildInfo()['VERSION'] ?? '');
+            $v['checked_at'] = 0; // force a refetch on the next check
+            Config::set('updater_available', $v);
+        }
+        return $v;
+    }
+
+    /**
+     * The cached verdict for the admin status endpoint. If getAvailableUpdate()
+     * just invalidated a verdict computed by a different build, run the
+     * (now un-throttled) check right away so the banner is correct on the
+     * first page load after an update rather than after the next cron tick.
+     * A fetch failure re-stamps checked_at, so a flaky GitHub costs one slow
+     * admin request per throttle window, not one per poll. No-op under the
+     * dev/test kill switch (checkForUpdate returns the cache).
+     */
+    public static function getAvailableUpdateRefreshingStale(): ?array {
+        $v = self::getAvailableUpdate();
+        if (is_array($v) && (int)($v['checked_at'] ?? 0) === 0) {
+            return self::checkForUpdate();
         }
         return $v;
     }

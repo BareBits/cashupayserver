@@ -18,13 +18,27 @@ require_once dirname(__DIR__, 2) . '/includes/email_sender.php';
 
 $shaA = 'notifsha-' . str_repeat('a', 31);
 $shaB = 'notifsha-' . str_repeat('b', 31);
+$localSha = 'localsha-' . str_repeat('0', 31);
+
+// Pin the "running build" to the SHA the seeded verdicts are computed against
+// (Updater::getAvailableUpdate() invalidates a verdict from a different
+// build), and keep the test independent of any BUILD_INFO lying around in
+// the dev checkout.
+$installRoot = sys_get_temp_dir() . '/cashupay_notif_' . bin2hex(random_bytes(6));
+mkdir($installRoot, 0700, true);
+file_put_contents($installRoot . '/BUILD_INFO', "COMMIT_SHA=$localSha\nVERSION=1.0-old\n");
+Updater::$installRootOverride = $installRoot;
+register_shutdown_function(static function () use ($installRoot): void {
+    @unlink($installRoot . '/BUILD_INFO');
+    @rmdir($installRoot);
+});
 
 function seed_available(string $sha, string $version): void {
     Config::set('updater_available', [
         'available' => true,
         'channel' => 'main',
         'current_version' => '1.0-old',
-        'current_sha' => 'localsha-' . str_repeat('0', 31),
+        'current_sha' => $GLOBALS['localSha'],
         'latest_version' => $version,
         'latest_sha' => $sha,
         'blocked' => false,

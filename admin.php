@@ -591,7 +591,10 @@ if (isset($_GET['api'])) {
                 // "Update available" verdict for the dashboard banner + card.
                 // Cached daily by cron (Task 12c), independent of the
                 // auto-update opt-in. null until the first cron check runs.
-                'available' => Updater::getAvailableUpdate(),
+                // A verdict left behind by the build that just updated us is
+                // invalidated and refetched inline so the banner is right on
+                // the first page load after an update.
+                'available' => Updater::getAvailableUpdateRefreshingStale(),
                 // In-flight / last manual ("Update now") run, polled by the UI.
                 'manual_run' => Config::get('updater_manual_run'),
                 // Why a manual update can't run here (dev kill switch), or

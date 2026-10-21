@@ -271,6 +271,64 @@ def test_banner_hidden_when_cached_verdict_names_the_running_build(admin_page):
             build_info.write_bytes(previous)
 
 
+def test_banner_hidden_when_cached_verdict_came_from_another_build(admin_page):
+    """Regression (second report): the server was updated 1.6 → 1.6.1 by the
+    1.6 build's updater, whose daily check had cached "1.6 is available"
+    (computed against the 1.5.3 SHA). After the update, latest_sha (1.6) was
+    not the running SHA (1.6.1) so the catch-up rule could not match, and the
+    banner kept saying "version 1.6 is available" next to "Update applied
+    (1.6 → 1.6.1)". A verdict whose current_sha is not the running SHA is now
+    invalidated on read: update_status reports available=false with
+    checked_at=0 (the dev stack's kill switch keeps the on-demand refetch a
+    no-op), and the banner stays hidden."""
+    page, configured = admin_page
+    from fixtures.payserver import REPO_ROOT
+
+    running_sha = "161" + "b" * 37
+    build_info = REPO_ROOT / "BUILD_INFO"
+    previous = build_info.read_bytes() if build_info.exists() else None
+    build_info.write_text(f"COMMIT_SHA={running_sha}\nCHANNEL=main\nVERSION=1.6.1\n")
+    try:
+        _set_config(configured.handle, "updater_available", {
+            "available": True,
+            "channel": "main",
+            "current_version": "1.5.3",
+            "current_sha": "0" * 40,
+            "latest_version": "1.6",
+            "latest_sha": "16" + "a" * 38,
+            "blocked": False,
+            "checked_at": int(time.time()) - 600,
+        })
+
+        page.goto(f"{configured.handle.url}/admin/dashboard", wait_until="networkidle")
+        page.wait_for_timeout(1500)
+
+        assert not page.locator("#update-available-banner").is_visible(), (
+            "a verdict computed by a different build must not be advertised"
+        )
+        status = page.evaluate(
+            """async (base) => {
+                const r = await fetch(base + '/admin?api=update_status', { credentials: 'same-origin' });
+                return await r.json();
+            }""",
+            configured.handle.url,
+        )
+        assert status["available"]["available"] is False, status["available"]
+        assert status["available"]["current_sha"] == running_sha, status["available"]
+        assert status["available"]["current_version"] == "1.6.1", status["available"]
+        assert status["available"]["checked_at"] == 0, status["available"]
+
+        with configured.handle.db() as db:
+            row = db.execute("SELECT value FROM config WHERE key = 'updater_available'").fetchone()
+        stored = json.loads(row["value"])
+        assert stored["available"] is False and stored["checked_at"] == 0, stored
+    finally:
+        if previous is None:
+            build_info.unlink(missing_ok=True)
+        else:
+            build_info.write_bytes(previous)
+
+
 def test_manual_update_refused_in_dev_stack(admin_page):
     """The dev/test stack sets .updater_disabled; the manual-update endpoint
     must refuse with reason 'disabled' instead of overlaying the checkout."""
