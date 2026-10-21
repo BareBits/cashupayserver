@@ -76,14 +76,18 @@ if (!defined('CASHUPAY_FEE_SETTLE_THRESHOLD_SATS')) {
 //                   so settlement is detectable without running an LN node).
 //   - On-chain   -> a fresh address derived from the fee's xpub.
 //
-// All values are env-overridable and default empty, so the on-chain redirect
-// rail stays OFF until a deployer configures an xpub. When a fee has no
-// usable destination for one of the store's offered rails, that fee simply
-// isn't redirect-eligible and the existing cashu-wallet settlement path
-// (cron) keeps collecting it as before.
+// The dev fee ships with a BareBits mainnet zpub baked in (BIP84 / P2WPKH),
+// so the dev fee's on-chain redirect rail is ON by default for mainnet
+// stores. The env override exists purely to support test deployments, the
+// same as CASHUPAY_DEV_FEE_LNURL; production must use the default (see the
+// Modified MIT License, LICENSE.md section 2). The hosting fee's xpub is
+// per-store and defaults empty, so that rail stays OFF until the deployer
+// sets one. When a fee has no usable destination for one of the store's
+// offered rails, that fee simply isn't redirect-eligible on that rail and
+// the existing cashu-wallet settlement path (cron) keeps collecting it.
 //
-// Dev + upstream destinations are global (one payee for the whole
-// deployment); the hosting fee's on-chain xpub is per-store (stores table).
+// Dev destinations are global (one payee for the whole deployment); the
+// hosting fee's on-chain xpub is per-store (stores table).
 // ---------------------------------------------------------------------------
 $ff_env = static function (string $name, string $default): string {
     $v = getenv($name);
@@ -91,8 +95,13 @@ $ff_env = static function (string $name, string $default): string {
 };
 
 // Dev fee on-chain destination (LNURL already exists as CASHUPAY_DEV_FEE_LNURL).
+// MANDATORY default: pointing this at an xpub you control to capture the dev
+// fee is a violation of the Modified MIT License (LICENSE.md, section 2).
 if (!defined('CASHUPAY_DEV_FEE_ONCHAIN_XPUB')) {
-    define('CASHUPAY_DEV_FEE_ONCHAIN_XPUB', $ff_env('CASHUPAY_DEV_FEE_ONCHAIN_XPUB', ''));
+    define('CASHUPAY_DEV_FEE_ONCHAIN_XPUB', $ff_env(
+        'CASHUPAY_DEV_FEE_ONCHAIN_XPUB',
+        'zpub6mg9NbdenqrqfD2BbNqa4EdKS8z2yEBxH2PC4NXmXwnTDfukw3w7JLVMeb81xc9i1N8b7ReB9ia4wLoUyLVrVxaPQbJidU8Yn6Gjd95kQmA'
+    ));
 }
 if (!defined('CASHUPAY_DEV_FEE_ONCHAIN_NETWORK')) {
     define('CASHUPAY_DEV_FEE_ONCHAIN_NETWORK', $ff_env('CASHUPAY_DEV_FEE_ONCHAIN_NETWORK', 'mainnet'));

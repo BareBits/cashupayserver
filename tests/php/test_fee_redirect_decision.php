@@ -37,6 +37,30 @@ assert_eq('host@op.com', $hosting['lnurl'], 'hosting lnurl from store');
 assert_eq('xpubHOST', $hosting['xpub'], 'hosting xpub from store');
 // Dev LNURL comes from the global constant (getbarebits default in tests).
 assert_eq((string)CASHUPAY_DEV_FEE_LNURL, $cands[0]['lnurl'], 'dev lnurl from config');
+// Dev on-chain destination ships baked in: the BareBits mainnet zpub (BIP84).
+// Pin the exact default and its first derived address so a drift in either
+// the constant or the SLIP-32 zpub handling is caught here, not in production.
+require_once dirname(__DIR__, 2) . '/includes/onchain/wallet.php';
+assert_eq(
+    'zpub6mg9NbdenqrqfD2BbNqa4EdKS8z2yEBxH2PC4NXmXwnTDfukw3w7JLVMeb81xc9i1N8b7ReB9ia4wLoUyLVrVxaPQbJidU8Yn6Gjd95kQmA',
+    (string)CASHUPAY_DEV_FEE_ONCHAIN_XPUB,
+    'dev onchain xpub defaults to the BareBits zpub'
+);
+assert_eq('mainnet', $cands[0]['network'], 'dev xpub is a mainnet zpub');
+assert_eq('P2WPKH', $cands[0]['type'], 'dev xpub derives P2WPKH');
+assert_eq(
+    'bc1q586um24k7zr6swxqny5qqgqn8xt43pk4xeeg9g',
+    OnchainWallet::deriveAddress((string)CASHUPAY_DEV_FEE_ONCHAIN_XPUB, 'P2WPKH', 'mainnet', 0),
+    'dev zpub m/0/0 derives the expected bech32 address'
+);
+// With the default in place the dev fee covers BOTH rails on a mainnet store
+// and only lightning on a testnet store (network-matched xpub rule).
+assert_eq(['lightning', 'onchain'],
+    FeeRedirect::coveredRails($cands[0], ['lightning', 'onchain'], 'mainnet'),
+    'dev fee covers both rails by default on mainnet');
+assert_eq(['lightning'],
+    FeeRedirect::coveredRails($cands[0], ['lightning', 'onchain'], 'testnet'),
+    'dev fee covers only lightning on a testnet store');
 
 // ---- coveredRails(): per-rail truth table ----------------------------------
 // The core of the new behaviour: which OFFERED rails a fee can route to itself.
@@ -96,10 +120,11 @@ assert_null(
     'no revenue: no redirect'
 );
 
-// Revenue accrues a dev fee, but the store offers ONLY an on-chain rail and no
-// fee xpub is configured (dev/hosting xpubs all empty by default), so
-// coveredRails is empty for every fee -> no redirect, and crucially no LNURL
-// probe (lightning isn't offered), so this path stays offline.
+// Revenue accrues a dev fee, but the store offers ONLY an on-chain rail on
+// TESTNET. The dev xpub default is a mainnet zpub and the hosting xpub is
+// empty, so coveredRails is empty for every fee -> no redirect, and crucially
+// no LNURL probe (lightning isn't offered) and no address derivation, so this
+// path stays offline.
 Database::insert('invoices', [
     'id' => 'inv_rev', 'store_id' => $sid, 'status' => 'Settled',
     'amount' => '500000', 'currency' => 'sat', 'amount_sats' => 500000,
@@ -107,9 +132,10 @@ Database::insert('invoices', [
 ]);
 $o = DevFee::computeOwed($sid);
 assert_true($o['dev_owed'] >= 3000, 'precondition: dev fee owed exceeds the invoice');
+$testnetRow = ['onchain_network' => 'testnet'] + $storeRow;
 assert_null(
-    FeeRedirect::decide($sid, $storeRow, 3000, ['onchain']),
-    'onchain offered but no fee xpub configured: no redirect'
+    FeeRedirect::decide($sid, $testnetRow, 3000, ['onchain']),
+    'onchain offered on testnet but every fee xpub is mainnet/empty: no redirect'
 );
 
 // Gate: an invoice larger than every owed fee never redirects (would overpay).
