@@ -62,13 +62,22 @@ def _open_lightning_payments(page, configured: ConfiguredPayserver) -> None:
     # zero size, which Playwright treats as hidden — so wait on the
     # always-present Add button.
     page.wait_for_selector("#card-lightning-payments", state="visible")
-    page.wait_for_selector("#btn-add-ln-address", state="visible")
     # Wait for the dashboard payload to land (it re-renders the saved lists);
-    # rows added before that render would be wiped by it.
+    # rows added before that render would be wiped by it. It also applies the
+    # per-section default collapse states, so the expansion below must come
+    # after it or it would be undone.
     page.wait_for_function(
         "() => { const el = document.getElementById('onchain-offer-effective');"
         " return el && el.textContent.trim() && el.textContent.trim() !== '\\u2014'; }"
     )
+    # Sections with no saved entries are collapsed by default; expand them all
+    # so the test can drive the controls directly (the default-state behavior
+    # has its own coverage in test_settings_lightning_sections.py).
+    page.evaluate(
+        "document.querySelectorAll('#card-lightning-payments .subsection.collapsed')"
+        ".forEach(el => el.classList.remove('collapsed'))"
+    )
+    page.wait_for_selector("#btn-add-ln-address", state="visible")
 
 
 def _reset_toast(page) -> None:

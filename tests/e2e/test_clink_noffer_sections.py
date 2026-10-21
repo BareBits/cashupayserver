@@ -183,7 +183,10 @@ def test_add_noffer_via_ui_persists(admin_page, shared_configured: ConfiguredPay
     _goto_stores(page, base)
 
     # The destination sections live in the always-active "Lightning payments"
-    # card now. Add a noffer row and fill it through the dedicated section.
+    # card now, each one a collapsible section that starts collapsed while it
+    # has no saved entries — expand the noffer section through its real
+    # toggle, then add a row and fill it.
+    page.query_selector("#ln-section-noffers .subsection-toggle").click()
     page.query_selector("#btn-add-noffer").click()
     page.fill("#auto-melt-noffer-list input.noffer-input", REFERENCE_NOFFER)
     page.query_selector("#btn-save-lightning-payments").click()
