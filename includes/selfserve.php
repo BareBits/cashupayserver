@@ -217,10 +217,17 @@ final class SelfServe {
             }
             return $raw;
         }
-        // BTC or fiat: allow up to 8 / 2 decimals respectively.
+        // BTC or fiat: allow up to 8 / 2 decimals respectively. The integer
+        // part may be omitted when a fraction is present (".10" is how many
+        // people type ten cents); it is normalized to "0.10" so downstream
+        // consumers (rate conversion, stored invoice amount) always see a
+        // conventional decimal string.
         $maxDecimals = strtoupper($currency) === 'BTC' ? 8 : 2;
-        if (!preg_match('/^\d{1,12}(\.\d{1,' . $maxDecimals . '})?$/', $raw)) {
+        if (!preg_match('/^(\d{1,12}|\d{0,12}\.\d{1,' . $maxDecimals . '})$/', $raw)) {
             throw new SelfServeValidationException('Amount is not a valid number.');
+        }
+        if ($raw[0] === '.') {
+            $raw = '0' . $raw;
         }
         if ((float)$raw <= 0) {
             throw new SelfServeValidationException('Amount must be greater than zero.');

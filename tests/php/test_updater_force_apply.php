@@ -51,12 +51,28 @@ assert_eq('OLD_ADMIN', file_get_contents($root . '/admin.php'), 'install untouch
 @unlink($sentinel);
 
 // --- 4. Forced apply with no blockers applies even though opt-in is OFF ---
+// Seed the banner's cached verdict the way the daily cron check would have
+// left it: "a newer build is available". Applying that build must refresh it.
+Config::set('updater_available', [
+    'available' => true, 'channel' => 'main', 'current_version' => '0.0-old',
+    'current_sha' => str_repeat('0', 40), 'latest_version' => '0.2-new',
+    'latest_sha' => $remoteSha, 'blocked' => false, 'checked_at' => time() - 60, 'error' => null,
+]);
 Config::set('updater_last_check', 0);
 assert_true(Updater::checkAndApply(true), 'forced apply runs with opt-in off');
 assert_eq('NEW_ADMIN', file_get_contents($root . '/admin.php'), 'install overlaid by manual update');
 
 $info = Updater::getLocalBuildInfo();
 assert_eq($remoteSha, $info['COMMIT_SHA'], 'BUILD_INFO advanced');
+
+// The cached "update available" verdict is re-derived against the new local
+// SHA immediately — not left advertising the build we just installed for up
+// to a day (until the next cron check).
+$avail = Config::get('updater_available');
+assert_true(is_array($avail) && $avail['available'] === false, 'apply refreshed the cached verdict to not-available');
+assert_eq($remoteSha, $avail['current_sha'], 'refreshed verdict: current_sha is the applied SHA');
+assert_eq($remoteSha, $avail['latest_sha'], 'refreshed verdict: latest_sha is the applied SHA');
+assert_eq('0.2-new', $avail['current_version'], 'refreshed verdict: current_version is the new version');
 
 // Data preserved, backup + pending-verify marker written just like the auto path.
 assert_eq('preserve_me', file_get_contents($root . '/data/MARKER'), 'data preserved');

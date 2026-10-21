@@ -190,6 +190,87 @@ def test_banner_hidden_when_current(admin_page):
         "banner should stay hidden when the install is current"
 
 
+def test_banner_hidden_when_cached_verdict_names_the_running_build(admin_page):
+    """Regression: the availability verdict is cached for up to a day and the
+    apply path used to leave it alone, so right after updating to 1.6 the
+    banner still read "A software update is available (version 1.6)" while
+    "Update now" answered "You're already on the latest version". The server
+    now self-heals the cached verdict when its latest_sha is the SHA the
+    install is running: update_status reports available=false and the banner
+    stays hidden, with no cron check in between.
+
+    The dev checkout normally has no BUILD_INFO (it is a release artifact), so
+    this test writes one at the docroot for its duration and restores whatever
+    was there before."""
+    page, configured = admin_page
+    from fixtures.payserver import REPO_ROOT
+
+    running_sha = "a1b2c3d4" * 5
+    build_info = REPO_ROOT / "BUILD_INFO"
+    previous = build_info.read_bytes() if build_info.exists() else None
+    build_info.write_text(f"COMMIT_SHA={running_sha}\nCHANNEL=main\nVERSION=1.6\n")
+    try:
+        _set_config(configured.handle, "updater_available", {
+            "available": True,
+            "channel": "main",
+            "current_version": "1.5.3",
+            "current_sha": "0" * 40,
+            "latest_version": "1.6",
+            "latest_sha": running_sha,
+            "blocked": False,
+            "checked_at": int(time.time()) - 3600,  # an hour old: inside the daily window
+        })
+
+        page.goto(f"{configured.handle.url}/admin/dashboard", wait_until="networkidle")
+        page.wait_for_timeout(1500)
+
+        assert not page.locator("#update-available-banner").is_visible(), (
+            "banner must not advertise the build the install is already running"
+        )
+        status = page.evaluate(
+            """async (base) => {
+                const r = await fetch(base + '/admin?api=update_status', { credentials: 'same-origin' });
+                return await r.json();
+            }""",
+            configured.handle.url,
+        )
+        assert status["available"]["available"] is False, status["available"]
+        assert status["available"]["current_sha"] == running_sha, status["available"]
+        assert status["available"]["current_version"] == "1.6", status["available"]
+
+        # The Auto-update card agrees (it reads the same verdict).
+        page.goto(f"{configured.handle.url}/admin/settings", wait_until="networkidle")
+        page.wait_for_timeout(1500)
+        assert "latest version" in page.locator("#auto-update-availability").inner_text().lower()
+
+        # Healed verdict is persisted, so the once-per-release email notifier
+        # (which reads the same key) will not nag about the running build.
+        with configured.handle.db() as db:
+            row = db.execute("SELECT value FROM config WHERE key = 'updater_available'").fetchone()
+        assert json.loads(row["value"])["available"] is False
+
+        # A verdict for a genuinely different SHA is still shown.
+        _set_config(configured.handle, "updater_available", {
+            "available": True,
+            "channel": "main",
+            "latest_version": "9.9.9-test",
+            "latest_sha": "f" * 40,
+            "current_sha": running_sha,
+            "blocked": False,
+            "checked_at": int(time.time()),
+        })
+        page.goto(f"{configured.handle.url}/admin/dashboard", wait_until="networkidle")
+        page.wait_for_timeout(1500)
+        banner = page.locator("#update-available-banner")
+        assert banner.is_visible()
+        assert "9.9.9-test" in banner.inner_text()
+    finally:
+        if previous is None:
+            build_info.unlink(missing_ok=True)
+        else:
+            build_info.write_bytes(previous)
+
+
 def test_manual_update_refused_in_dev_stack(admin_page):
     """The dev/test stack sets .updater_disabled; the manual-update endpoint
     must refuse with reason 'disabled' instead of overlaying the checkout."""

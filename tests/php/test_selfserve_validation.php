@@ -61,6 +61,21 @@ assert_eq('1.50', SelfServe::validateAmount('1.50', 'USD'), 'fiat 2dp ok');
 assert_eq('10', SelfServe::validateAmount('10', 'USD'), 'fiat whole ok');
 assert_rejects(fn() => SelfServe::validateAmount('1.555', 'USD'), 'fiat 3dp rejected');
 assert_rejects(fn() => SelfServe::validateAmount('0', 'USD'), 'fiat zero rejected');
+assert_rejects(fn() => SelfServe::validateAmount('0.00', 'USD'), 'fiat 0.00 rejected');
+
+// A leading-dot fraction (".10" for ten cents) is valid and normalized to a
+// conventional "0.10" so rate conversion and the stored amount see a plain
+// decimal. Regression: this used to be rejected as "not a valid number".
+assert_eq('0.10', SelfServe::validateAmount('.10', 'USD'), 'fiat ".10" accepted and normalized');
+assert_eq('0.5', SelfServe::validateAmount(' .5 ', 'USD'), 'fiat ".5" accepted, trimmed, normalized');
+assert_eq('0.00050000', SelfServe::validateAmount('.00050000', 'BTC'), 'BTC leading-dot 8dp accepted');
+assert_rejects(fn() => SelfServe::validateAmount('.', 'USD'), 'bare dot rejected');
+assert_rejects(fn() => SelfServe::validateAmount('.', 'BTC'), 'bare dot rejected (BTC)');
+assert_rejects(fn() => SelfServe::validateAmount('.555', 'USD'), 'leading-dot 3dp rejected');
+assert_rejects(fn() => SelfServe::validateAmount('.00', 'USD'), 'leading-dot zero rejected');
+assert_rejects(fn() => SelfServe::validateAmount('10.', 'USD'), 'trailing dot rejected');
+assert_rejects(fn() => SelfServe::validateAmount('..10', 'USD'), 'double dot rejected');
+assert_rejects(fn() => SelfServe::validateAmount('.10', 'sat'), 'leading-dot fraction rejected for sats');
 
 // ---- Notes ----
 

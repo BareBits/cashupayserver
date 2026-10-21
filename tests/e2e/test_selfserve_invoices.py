@@ -16,6 +16,9 @@ test_selfserve_validation.php.
 """
 from __future__ import annotations
 
+import json
+import time
+
 import requests
 
 from conftest import ConfiguredPayserver, DEFAULT_ADMIN_PASSWORD
@@ -138,6 +141,67 @@ def test_create_and_redirect_to_payment(shared_configured: ConfiguredPayserver, 
     assert str(row["amount"]) == "1500"
     assert (row["currency"] or "").upper() == "SAT"
     assert "e2e self-serve test" in (row["metadata"] or "")
+
+
+def _seed_usd_rate(shared_configured: ConfiguredPayserver, btc_usd: float) -> None:
+    """Seed ExchangeRates' fresh cache for USD so the fiat path never phones a
+    live price provider (key shape mirrors ExchangeRates::saveToCache)."""
+    now = int(time.time())
+    payload = json.dumps({"rate": btc_usd, "timestamp": now, "provider": "e2e"})
+    with shared_configured.handle.db() as db:
+        db.execute(
+            "INSERT INTO config (key, value, created_at, updated_at) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+            ("rate_usd", payload, now, now),
+        )
+
+
+def test_leading_dot_fiat_amount_accepted(shared_configured: ConfiguredPayserver, browser) -> None:
+    """Regression: typing ".10" (ten cents) into the USD amount field was
+    rejected as "Amount is not a valid number" while "0.10" worked. The
+    leading-dot form must be accepted, normalized to 0.10, converted at the
+    store rate, and land on the payment page like any other amount."""
+    _enable_store_selfserve(shared_configured)
+    _set_store_currency(shared_configured, "USD")
+    _seed_usd_rate(shared_configured, 100_000.0)  # 0.10 USD == 100 sats
+    ctx = browser.new_context(viewport={"width": 480, "height": 900})
+    page = ctx.new_page()
+    try:
+        page.goto(
+            f"{shared_configured.handle.url}/pay/{shared_configured.store_id}", wait_until="networkidle"
+        )
+        page.select_option("#currency", "USD")
+        page.fill("#amount", ".10")
+        page.fill("#notes", "e2e leading-dot amount")
+        page.click("button[type=submit]")
+        page.wait_for_url("**/payment.php?id=*", timeout=15000)
+        assert "not a valid number" not in page.content().lower()
+
+        # The server still rejects the genuinely malformed neighbours of ".10"
+        # (while the store still offers USD).
+        for bad in (".", ".555", "10."):
+            r = requests.post(
+                f"{shared_configured.handle.url}/pay/{shared_configured.store_id}",
+                data={"amount": bad, "currency": "USD", "notes": ""},
+                timeout=15,
+                allow_redirects=False,
+            )
+            assert r.status_code == 200, (bad, r.status_code)
+            assert "not a valid number" in r.text.lower(), (bad, r.text[:300])
+    finally:
+        ctx.close()
+        _set_store_currency(shared_configured, "sat")
+
+    with shared_configured.handle.db() as db:
+        row = db.execute(
+            "SELECT amount, currency, metadata FROM invoices "
+            "WHERE store_id = ? ORDER BY created_at DESC LIMIT 1",
+            (shared_configured.store_id,),
+        ).fetchone()
+    assert row is not None, "an invoice should have been created"
+    assert "e2e leading-dot amount" in (row["metadata"] or "")
+    assert (row["currency"] or "").upper() == "USD"
+    assert str(row["amount"]) in ("0.10", "0.1"), row["amount"]
 
 
 def test_admin_invoices_view_shows_selfserve_link(shared_configured: ConfiguredPayserver, browser) -> None:

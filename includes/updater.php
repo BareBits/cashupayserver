@@ -102,7 +102,11 @@ class Updater {
 
         $localSha = self::getLocalCommitSha();
         if ($localSha !== '' && $localSha === ($remote['COMMIT_SHA'] ?? '')) {
-            // Already current.
+            // Already current. We hold a fresh remote BUILD_INFO, so refresh
+            // the banner's cached verdict for free: a manual "Update now" on
+            // a current install must not leave a stale "update available"
+            // from the daily check sitting next to "you're up to date".
+            self::recordAvailability($channel, $remote);
             return false;
         }
 
@@ -128,7 +132,15 @@ class Updater {
         }
 
         try {
-            return self::applyUpdate($channel, $remote);
+            $applied = self::applyUpdate($channel, $remote);
+            if ($applied) {
+                // The local BUILD_INFO now carries the remote SHA, so the
+                // cached "update available" verdict (refreshed only daily by
+                // cron) would otherwise keep the banner up for a day after
+                // the update. Re-derive it against the new local SHA now.
+                self::recordAvailability($channel, $remote);
+            }
+            return $applied;
         } catch (Throwable $e) {
             self::log('update failed: ' . $e->getMessage());
             return false;
@@ -421,6 +433,17 @@ class Updater {
             return $result;
         }
 
+        return self::recordAvailability($channel, $remote);
+    }
+
+    /**
+     * Derive the availability verdict from a freshly fetched remote BUILD_INFO
+     * against the CURRENT local install, cache it, and return it. Shared by
+     * the daily probe (checkForUpdate) and the apply path (checkAndApply), so
+     * any code that just learned the channel's head can keep the banner's
+     * cache honest without a second fetch.
+     */
+    private static function recordAvailability(string $channel, array $remote): array {
         $remoteSha = (string)($remote['COMMIT_SHA'] ?? '');
         $localSha = self::getLocalCommitSha();
         // A build that already failed a prior health check is parked in
@@ -436,17 +459,40 @@ class Updater {
             'latest_version' => (string)($remote['VERSION'] ?? ''),
             'latest_sha' => $remoteSha,
             'blocked' => $blocked,
-            'checked_at' => $now,
+            'checked_at' => time(),
             'error' => null,
         ];
         Config::set('updater_available', $result);
         return $result;
     }
 
-    /** Last cached availability verdict, or null if never checked. */
+    /**
+     * Last cached availability verdict, or null if never checked.
+     *
+     * Self-healing: the verdict is refreshed at most daily, and an update can
+     * land in between (manual click, auto-apply, a hand-copied release). If
+     * the cache still says "available" but its latest_sha IS the SHA we are
+     * now running, the install has caught up — report (and persist) "not
+     * available" instead of advertising the build we're already on for up to
+     * a day. Never flips the other way: a verdict of "current" stays until
+     * the next real check.
+     */
     public static function getAvailableUpdate(): ?array {
         $v = Config::get('updater_available');
-        return is_array($v) ? $v : null;
+        if (!is_array($v)) {
+            return null;
+        }
+        if (!empty($v['available'])) {
+            $latestSha = (string)($v['latest_sha'] ?? '');
+            $localSha = self::getLocalCommitSha();
+            if ($latestSha !== '' && $localSha !== '' && $latestSha === $localSha) {
+                $v['available'] = false;
+                $v['current_sha'] = $localSha;
+                $v['current_version'] = (string)(self::getLocalBuildInfo()['VERSION'] ?? '');
+                Config::set('updater_available', $v);
+            }
+        }
+        return $v;
     }
 
     /**
