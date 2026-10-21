@@ -1916,6 +1916,32 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
             break;
 
+        case 'save_payment_order':
+            Auth::requireAdmin();
+            // "Payment order" card: which method the customer invoice page
+            // shows first when an invoice offers both on-chain and Lightning.
+            // Instant-save from the radio group. Written via Database::update
+            // directly, keeping the Config::updateStore allowlist tight.
+            try {
+                $storeId = $_POST['store_id'] ?? '';
+                if (empty($storeId)) {
+                    throw new Exception('Store ID required');
+                }
+                if (!Config::getStore($storeId)) {
+                    throw new Exception('Store not found');
+                }
+                $method = strtolower(trim((string)($_POST['first_method'] ?? '')));
+                if (!in_array($method, Invoice::FIRST_METHODS, true)) {
+                    throw new Exception('Invalid payment order value');
+                }
+                Database::update('stores', ['invoice_first_method' => $method], 'id = ?', [$storeId]);
+                echo json_encode(['success' => true, 'firstMethod' => $method]);
+            } catch (Exception $e) {
+                cashupay_status(400);
+                echo json_encode(['error' => $e->getMessage()]);
+            }
+            break;
+
         case 'save_store_privacy':
             Auth::requireAdmin();
             try {
@@ -4885,6 +4911,40 @@ header('Cache-Control: no-cache, must-revalidate');
             margin-top: 0.5rem;
         }
 
+        /* "Payment order" card: two stacked radio rows, instant-save. */
+        .payment-order-options {
+            display: flex;
+            flex-direction: column;
+            gap: 0.5rem;
+        }
+        .payment-order-option {
+            display: flex;
+            align-items: flex-start;
+            gap: 0.65rem;
+            padding: 0.6rem 0.75rem;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            cursor: pointer;
+        }
+        .payment-order-option:has(input:checked) {
+            border-color: var(--accent);
+        }
+        .payment-order-option input[type="radio"] {
+            margin: 0.2rem 0 0 0;
+            accent-color: var(--accent);
+            flex: 0 0 auto;
+        }
+        .payment-order-option-text {
+            display: flex;
+            flex-direction: column;
+            gap: 0.15rem;
+            font-size: 0.9rem;
+        }
+        .payment-order-option-text > span {
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+        }
+
         /* Inline info-tip: a small "i" badge with a popup on hover/focus. */
         .info-tip {
             position: relative;
@@ -5841,6 +5901,37 @@ header('Cache-Control: no-cache, must-revalidate');
                                             style="width:auto; flex:0 0 auto; padding:0.25rem 0.6rem;">Copy</button>
                                 </span>
                             </div>
+                        </div>
+                    </div>
+
+                    <div class="card collapsible" id="card-payment-order">
+                        <div class="card-header">
+                            <div class="card-title">Payment order</div>
+                        </div>
+                        <div class="card-body">
+                            <p style="font-size: 0.85rem; color: var(--text-secondary); margin: 0 0 0.75rem 0;">
+                                Which payment method the invoice page shows first when an invoice
+                                offers both on-chain and Lightning. Customers can still switch
+                                between them. Invoices that offer only one method are unaffected.
+                                Saves as soon as you pick an option.
+                            </p>
+                            <div class="payment-order-options" role="radiogroup" aria-label="Payment order">
+                                <label class="payment-order-option">
+                                    <input type="radio" name="invoice-first-method" id="payment-order-onchain" value="onchain" checked>
+                                    <span class="payment-order-option-text">
+                                        <strong>On-chain first</strong>
+                                        <span>Show the on-chain Bitcoin address by default (current default).</span>
+                                    </span>
+                                </label>
+                                <label class="payment-order-option">
+                                    <input type="radio" name="invoice-first-method" id="payment-order-lightning" value="lightning">
+                                    <span class="payment-order-option-text">
+                                        <strong>Lightning first</strong>
+                                        <span>Show the Lightning invoice by default.</span>
+                                    </span>
+                                </label>
+                            </div>
+                            <div id="payment-order-error" class="hidden" style="margin-top:0.5rem; color: var(--error); font-size: 0.85rem;"></div>
                         </div>
                     </div>
 
@@ -8538,6 +8629,15 @@ header('Cache-Control: no-cache, must-revalidate');
             wireAwSelectors();
             const saveStoreNotifsBtn = document.getElementById('btn-save-store-notifications');
             if (saveStoreNotifsBtn) saveStoreNotifsBtn.addEventListener('click', saveStoreNotifications);
+            // Payment order radios: instant-save on change. The handler
+            // receives the previous value so a refused save can revert.
+            document.querySelectorAll('input[name="invoice-first-method"]').forEach(radio => {
+                radio.addEventListener('change', () => {
+                    if (!radio.checked) return;
+                    const previous = radio.value === 'lightning' ? 'onchain' : 'lightning';
+                    savePaymentOrder(radio.value, previous);
+                });
+            });
             const saveStorePrivacyBtn = document.getElementById('btn-save-store-privacy');
             if (saveStorePrivacyBtn) saveStorePrivacyBtn.addEventListener('click', saveStorePrivacy);
             const storeNotifsToggle = document.getElementById('store-notifications-enabled');
@@ -10071,6 +10171,11 @@ header('Cache-Control: no-cache, must-revalidate');
                     const hn = document.getElementById('store-hide-note');
                     if (hn) hn.checked = !!p.hideNote;
                 }
+
+                // Payment order card: NULL / unknown column value = on-chain
+                // first (the historical default), mirroring
+                // Invoice::preferredFirstMethod on the server.
+                applyPaymentOrder(store.invoice_first_method);
 
                 // Load exchange rate settings from store data
                 document.getElementById('price-provider-primary').value = store.price_provider_primary || 'coingecko';
@@ -12602,6 +12707,43 @@ header('Cache-Control: no-cache, must-revalidate');
                 }
             } catch (e) {
                 showToast('Failed to save notification settings', 'error');
+            }
+        }
+
+        // ---- Payment order card (instant-save radio group) ----------------
+        function applyPaymentOrder(value) {
+            const method = value === 'lightning' ? 'lightning' : 'onchain';
+            const radio = document.getElementById('payment-order-' + method);
+            if (radio) radio.checked = true;
+            clearAwError('payment-order-error');
+        }
+
+        async function savePaymentOrder(method, previous) {
+            if (!currentStoreId) {
+                showToast('No store selected', 'error');
+                applyPaymentOrder(previous);
+                return;
+            }
+            clearAwError('payment-order-error');
+            const params = new URLSearchParams({
+                action: 'save_payment_order',
+                store_id: currentStoreId,
+                first_method: method,
+            });
+            try {
+                const response = await postWithCsrf(adminUrl, params.toString());
+                const result = await response.json();
+                if (response.ok && result.success) {
+                    showToast('Payment order saved', 'success');
+                } else {
+                    // Revert the radio so the UI never claims a preference the
+                    // server refused to persist.
+                    applyPaymentOrder(previous);
+                    awError('payment-order-error', result.error || 'Failed to save payment order');
+                }
+            } catch (e) {
+                applyPaymentOrder(previous);
+                awError('payment-order-error', 'Failed to save payment order');
             }
         }
 

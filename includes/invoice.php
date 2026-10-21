@@ -94,6 +94,58 @@ class Invoice {
         return true;
     }
 
+    // ---- Payment order on the customer invoice page -------------------------
+    // Per-store preference (stores.invoice_first_method) for which method is
+    // active, and listed first, when an invoice offers both on-chain and
+    // Lightning. Cashu is never preferred: it is only shown when the store has
+    // opted into offline acceptance and always sits last.
+
+    public const FIRST_METHOD_ONCHAIN = 'onchain';
+    public const FIRST_METHOD_LIGHTNING = 'lightning';
+    public const FIRST_METHODS = [self::FIRST_METHOD_ONCHAIN, self::FIRST_METHOD_LIGHTNING];
+
+    /**
+     * The store's preferred first method. NULL / '' / any unknown value
+     * resolves to on-chain, the historical default, so rows that predate the
+     * setting (and any value written by hand) are unchanged.
+     */
+    public static function preferredFirstMethod(array $store): string {
+        $v = strtolower(trim((string)($store['invoice_first_method'] ?? '')));
+        return in_array($v, self::FIRST_METHODS, true) ? $v : self::FIRST_METHOD_ONCHAIN;
+    }
+
+    /**
+     * Which method the payment page shows on load for ONE invoice: the store's
+     * preference when that method is offered, else the other of the pair, else
+     * Cashu. Also returns 'cashu' when the invoice offers nothing at all —
+     * the pre-setting rule did the same, and the page keys its brand row off
+     * this value.
+     */
+    public static function firstPaymentMethod(array $store, bool $hasOnchain, bool $hasLightning, bool $hasCashu): string {
+        $order = self::preferredFirstMethod($store) === self::FIRST_METHOD_LIGHTNING
+            ? ['lightning', 'onchain']
+            : ['onchain', 'lightning'];
+        $offered = ['onchain' => $hasOnchain, 'lightning' => $hasLightning];
+        foreach ($order as $method) {
+            if ($offered[$method]) {
+                return $method;
+            }
+        }
+        return 'cashu';
+    }
+
+    /**
+     * Tab order for the payment page: the preferred method first, then the
+     * other of the pair, then Cashu — so the default tab always sits first.
+     *
+     * @return string[]
+     */
+    public static function paymentMethodTabOrder(array $store): array {
+        return self::preferredFirstMethod($store) === self::FIRST_METHOD_LIGHTNING
+            ? ['lightning', 'onchain', 'cashu']
+            : ['onchain', 'lightning', 'cashu'];
+    }
+
     /**
      * Build the payer-facing memo embedded in an invoice — the store name, the
      * order reference (metadata.orderId, set by the WooCommerce gateway), and
