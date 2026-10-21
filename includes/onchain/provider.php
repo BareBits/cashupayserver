@@ -9,6 +9,7 @@
 
 require_once __DIR__ . '/../database.php';
 require_once __DIR__ . '/../safe_http.php';
+require_once __DIR__ . '/../endpoint_health.php';
 
 /**
  * A single transaction output observed paying a given watch address.
@@ -50,25 +51,47 @@ interface BlockchainProvider {
  *   GET /address/{addr}/txs     -> list of txs paying $addr (mempool + confirmed)
  *   GET /blocks/tip/height      -> current chain tip
  *
- * The instance is configured with the base URL of the API (e.g.
- * https://mempool.space/api). Per-network defaults can be obtained via
- * EsploraProvider::defaultUrlForNetwork().
+ * The instance is configured with one or more API base URLs (e.g.
+ * https://mempool.space/api). Every request tries the hosts in order and fails
+ * over on any error — network failure, HTTP error, or a malformed body — so a
+ * single explorer outage (or an explorer serving garbage) does not blind
+ * on-chain payment detection. Failed hosts get a short EndpointHealth cooldown
+ * so subsequent requests skip them instead of re-paying the timeout.
+ * Per-network defaults can be obtained via defaultUrlsForNetwork().
  */
 final class EsploraProvider implements BlockchainProvider {
     private const DEFAULTS = [
-        'mainnet' => 'https://mempool.space/api',
-        'testnet' => 'https://mempool.space/testnet/api',
-        'signet'  => 'https://mempool.space/signet/api',
+        'mainnet' => ['https://mempool.space/api', 'https://blockstream.info/api'],
+        'testnet' => ['https://mempool.space/testnet/api', 'https://blockstream.info/testnet/api'],
+        // blockstream.info has no public signet instance.
+        'signet'  => ['https://mempool.space/signet/api'],
         // No public regtest API exists; users must self-host or use BitcoindRpcProvider.
         'regtest' => null,
     ];
 
+    /** @var string[] */
+    private readonly array $baseUrls;
+
     public function __construct(
-        private readonly string $baseUrl,
+        string|array $baseUrl,
         private readonly int $timeoutSec = 10,
-    ) {}
+    ) {
+        $urls = array_values(array_filter(array_map('trim', (array)$baseUrl), fn($u) => $u !== ''));
+        if (empty($urls)) {
+            throw new InvalidArgumentException('EsploraProvider requires at least one base URL');
+        }
+        $this->baseUrls = $urls;
+    }
 
     public static function defaultUrlForNetwork(string $network): ?string {
+        return self::DEFAULTS[$network][0] ?? null;
+    }
+
+    /**
+     * The full default failover chain for a network, primary first.
+     * @return string[]|null
+     */
+    public static function defaultUrlsForNetwork(string $network): ?array {
         return self::DEFAULTS[$network] ?? null;
     }
 
@@ -162,26 +185,67 @@ final class EsploraProvider implements BlockchainProvider {
     }
 
     public function currentTipHeight(): int {
-        $body = trim($this->httpRaw('/blocks/tip/height'));
-        // Esplora returns the height as a bare decimal string. Reject anything
-        // else: an empty body, a proxy/error HTML page, or whitespace must NOT
-        // collapse to (int)0 — a 0 tip poisons the historical-UTXO filter at
-        // allocation time (a stored created-tip of 0 disables the filter, so a
-        // pre-existing UTXO on a re-used address could wrongly settle an
-        // invoice). Throwing lets currentTipBestEffort() degrade to null
-        // (skip-filter) instead of a false 0.
-        if ($body === '' || !ctype_digit($body)) {
-            throw new RuntimeException('Esplora /blocks/tip/height: non-numeric body: ' . substr($body, 0, 80));
-        }
-        $height = (int)$body;
-        if ($height <= 0) {
-            throw new RuntimeException("Esplora /blocks/tip/height: non-positive height {$height}");
-        }
-        return $height;
+        return $this->fetch('/blocks/tip/height', function (string $raw): int {
+            $body = trim($raw);
+            // Esplora returns the height as a bare decimal string. Reject anything
+            // else: an empty body, a proxy/error HTML page, or whitespace must NOT
+            // collapse to (int)0 — a 0 tip poisons the historical-UTXO filter at
+            // allocation time (a stored created-tip of 0 disables the filter, so a
+            // pre-existing UTXO on a re-used address could wrongly settle an
+            // invoice). Throwing here counts as a host failure, so fetch() fails
+            // over to the next host and only then lets currentTipBestEffort()
+            // degrade to null (skip-filter) instead of a false 0.
+            if ($body === '' || !ctype_digit($body)) {
+                throw new RuntimeException('non-numeric body: ' . substr($body, 0, 80));
+            }
+            $height = (int)$body;
+            if ($height <= 0) {
+                throw new RuntimeException("non-positive height {$height}");
+            }
+            return $height;
+        });
     }
 
-    private function httpRaw(string $path): string {
-        $url = rtrim($this->baseUrl, '/') . $path;
+    /**
+     * Run one Esplora request with host failover. Hosts are tried in
+     * configured order, skipping any inside an EndpointHealth cooldown —
+     * unless ALL of them are cooling down, in which case every host is tried
+     * anyway (a request that might succeed beats a guaranteed failure, and it
+     * keeps single-URL setups completely unaffected by the cooldown).
+     *
+     * $parse validates and converts the raw body; a malformed body (even under
+     * HTTP 200) counts as a host failure and fails over, because an endpoint
+     * serving garbage is as unusable as one that is down. Note the tip and the
+     * tx pages of one poll may therefore come from different hosts; a
+     * one-block tip skew only makes the block-height sanity check treat a
+     * brand-new confirmation as unconfirmed for one poll — the safe direction.
+     */
+    private function fetch(string $path, callable $parse): mixed {
+        $hosts = $this->baseUrls;
+        $active = array_values(array_filter(
+            $hosts,
+            fn($h) => !EndpointHealth::isCoolingDown('esplora:' . $h)
+        ));
+        if (!empty($active)) {
+            $hosts = $active;
+        }
+
+        $errors = [];
+        foreach ($hosts as $base) {
+            try {
+                $value = $parse($this->httpRawFrom($base, $path));
+                EndpointHealth::recordSuccess('esplora:' . $base);
+                return $value;
+            } catch (\Throwable $e) {
+                EndpointHealth::recordFailure('esplora:' . $base);
+                $errors[] = $base . ': ' . $e->getMessage();
+            }
+        }
+        throw new RuntimeException("Esplora {$path} failed on all hosts: " . implode(' | ', $errors));
+    }
+
+    private function httpRawFrom(string $baseUrl, string $path): string {
+        $url = rtrim($baseUrl, '/') . $path;
         // Esplora URL is admin-configured; the operator's allow_private_endpoints
         // opt-in lets them point at a local Bitcoin node.
         $result = \SafeHttp::request($url, [
@@ -193,21 +257,22 @@ final class EsploraProvider implements BlockchainProvider {
             'allowPrivate' => \SafeHttp::privateEndpointsAllowed(),
         ]);
         if ($result['error'] !== '') {
-            throw new RuntimeException("Esplora request failed for {$path}: {$result['error']}");
+            throw new RuntimeException("request failed for {$path}: {$result['error']}");
         }
         if ($result['status'] >= 400) {
-            throw new RuntimeException("Esplora {$path} -> HTTP {$result['status']}: " . substr($result['body'], 0, 200));
+            throw new RuntimeException("{$path} -> HTTP {$result['status']}: " . substr($result['body'], 0, 200));
         }
         return $result['body'];
     }
 
     private function httpJson(string $path): array {
-        $raw = $this->httpRaw($path);
-        $decoded = json_decode($raw, true);
-        if (!is_array($decoded)) {
-            throw new RuntimeException("Esplora {$path}: malformed JSON response");
-        }
-        return $decoded;
+        return $this->fetch($path, function (string $raw) use ($path): array {
+            $decoded = json_decode($raw, true);
+            if (!is_array($decoded)) {
+                throw new RuntimeException("{$path}: malformed JSON response");
+            }
+            return $decoded;
+        });
     }
 }
 
@@ -357,15 +422,20 @@ final class OnchainProviderFactory {
         }
 
         // Default: Esplora HTTP.
-        if (!$url) {
-            $url = EsploraProvider::defaultUrlForNetwork($network);
-            if (!$url) {
-                throw new RuntimeException(
-                    "No default Esplora URL for network '{$network}'. "
-                    . "Set onchain_provider_url in the store config."
-                );
-            }
+        if ($url) {
+            // An operator-configured URL is used exclusively — no built-in
+            // fallback hosts. Someone pointing at their own explorer instance
+            // did so deliberately (usually for privacy); its outage must not
+            // silently leak watched addresses to public explorers.
+            return new EsploraProvider($url);
         }
-        return new EsploraProvider($url);
+        $urls = EsploraProvider::defaultUrlsForNetwork($network);
+        if (!$urls) {
+            throw new RuntimeException(
+                "No default Esplora URL for network '{$network}'. "
+                . "Set onchain_provider_url in the store config."
+            );
+        }
+        return new EsploraProvider($urls);
     }
 }

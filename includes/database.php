@@ -1738,6 +1738,19 @@ HTACCESS;
             $pdo->exec("ALTER TABLE invoices ADD COLUMN onchain_last_polled_at INTEGER DEFAULT NULL");
         }
 
+        // Configurable payment-rail ordering (see RailOrder). ln_rail_order
+        // is the per-store order the Lightning destination TYPES are tried
+        // in (CSV over strike,lnaddress,nwc,noffer); onchain_source_order
+        // is where an invoice's on-chain address is minted first (CSV over
+        // strike,local). NULL = the historical default order, so existing
+        // stores keep their behavior.
+        if (!self::columnExists($pdo, 'stores', 'ln_rail_order')) {
+            $pdo->exec("ALTER TABLE stores ADD COLUMN ln_rail_order TEXT DEFAULT NULL");
+        }
+        if (!self::columnExists($pdo, 'stores', 'onchain_source_order')) {
+            $pdo->exec("ALTER TABLE stores ADD COLUMN onchain_source_order TEXT DEFAULT NULL");
+        }
+
         // Per-store "Payment order" setting: which method the customer
         // invoice page shows first when an invoice offers both on-chain and
         // Lightning. NULL keeps the historical on-chain-first behaviour.
