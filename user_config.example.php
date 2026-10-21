@@ -87,13 +87,15 @@
 //
 // define('CASHUPAY_UPDATE_CHANNEL', 'main');
 
-// CASHUPAY_AUTO_UPDATE_ENABLED — explicit opt-in for the auto-updater.
-// Defaults to false: fresh installs do NOT auto-update. To enable cron-driven
-// updates on this install, set this constant to true (or set the env var of
-// the same name to a non-empty, non-"0" string). The updater respects the
-// CASHUPAY_UPDATE_CHANNEL setting above when fetching.
+// CASHUPAY_AUTO_UPDATE_ENABLED — deployment-level opt-in for the auto-updater.
+// Defaults to false: fresh installs do NOT auto-update. The usual way to opt
+// in is the toggle in the admin UI (Settings → Auto-update) or the onboarding
+// wizard; this constant (or the env var of the same name set to a non-empty,
+// non-"0" string) forces it on for the whole deployment regardless of the UI
+// toggle. Any source can enable; none vetoes another. The updater respects
+// the CASHUPAY_UPDATE_CHANNEL setting above when fetching.
 //
-// Operators who don't want auto-update can leave this alone.
+// Operators who don't want auto-update can leave all of this alone.
 //
 // define('CASHUPAY_AUTO_UPDATE_ENABLED', true);
 
@@ -118,8 +120,8 @@
 //   */15 * * * * curl -fsS -H "X-CRON-KEY: YOUR_CRON_KEY" https://your-domain.com/update.php > /dev/null
 //
 // Find YOUR_CRON_KEY the same place as the main cron line (Settings → Cron).
-// update.php is a no-op unless CASHUPAY_AUTO_UPDATE_ENABLED is set, so it's
-// harmless to add even before you opt in.
+// update.php is a no-op unless auto-update is enabled (UI toggle, constant,
+// or env var), so it's harmless to add even before you opt in.
 //
 // After applying an update, update.php verifies it by fetching health.php
 // (also bundled). If the new build fails to boot, update.php restores the most

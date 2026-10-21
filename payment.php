@@ -675,6 +675,26 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
             background: rgba(255, 255, 255, 0.15);
         }
 
+        /* Share stays compact so "Open in Wallet" + "Copy ..." keep their
+           room when the row holds three buttons; on narrow screens it
+           collapses to just the icon (the aria-label keeps it accessible). */
+        .btn-row .btn-share {
+            /* .btn sets width:100%; without width:auto the auto flex-basis
+               resolves to the full row and crushes the other buttons. */
+            flex: 0 0 auto;
+            width: auto;
+        }
+        @media (max-width: 519px) {
+            .btn-share .btn-share-label {
+                display: none;
+            }
+        }
+        @media (max-width: 380px) {
+            .btn-row .btn-share {
+                padding: 0.9rem 0.6rem;
+            }
+        }
+
         /* Admin-only payment-path debug label (next to each Copy button). */
         .debug-path {
             margin-top: 0.6rem;
@@ -1092,6 +1112,12 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                 }
             }
             $methodCount = ($hasLightning ? 1 : 0) + ($hasOnchain ? 1 : 0) + ($hasCashu ? 1 : 0);
+            // "Share" copies the canonical invoice URL (configured base URL +
+            // URL mode), not location.href — the viewer may have the page open
+            // via an internal hostname. Hidden when the link couldn't work on
+            // another device (Windows desktop package, loopback base URL).
+            $shareUrl = Urls::payment($invoice['id']);
+            $showShare = Urls::paymentLinkShareable();
             ?>
             <div id="payment-pending" class="<?= $invoice['status'] !== 'New' ? 'hidden' : '' ?>">
                 <div class="amount"><?= htmlspecialchars($displayAmount) ?></div>
@@ -1215,6 +1241,18 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                             </svg>
                             Copy Invoice
                         </button>
+                        <?php if ($showShare): ?>
+                        <button type="button" class="btn btn-secondary btn-share" data-share-url="<?= htmlspecialchars($shareUrl) ?>" aria-label="Copy share link">
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <circle cx="18" cy="5" r="3"></circle>
+                                <circle cx="6" cy="12" r="3"></circle>
+                                <circle cx="18" cy="19" r="3"></circle>
+                                <line x1="8.59" y1="13.51" x2="15.42" y2="17.49"></line>
+                                <line x1="15.41" y1="6.51" x2="8.59" y2="10.49"></line>
+                            </svg>
+                            <span class="btn-share-label">Share</span>
+                        </button>
+                        <?php endif; ?>
                     </div>
                     <?php if ($pathDebug): ?>
                     <div class="debug-path" title="Admin debug: how this Lightning invoice was sourced">
@@ -1249,6 +1287,18 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                             </svg>
                             Copy Address
                         </button>
+                        <?php if ($showShare): ?>
+                        <button type="button" class="btn btn-secondary btn-share" data-share-url="<?= htmlspecialchars($shareUrl) ?>" aria-label="Copy share link">
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <circle cx="18" cy="5" r="3"></circle>
+                                <circle cx="6" cy="12" r="3"></circle>
+                                <circle cx="18" cy="19" r="3"></circle>
+                                <line x1="8.59" y1="13.51" x2="15.42" y2="17.49"></line>
+                                <line x1="15.41" y1="6.51" x2="8.59" y2="10.49"></line>
+                            </svg>
+                            <span class="btn-share-label">Share</span>
+                        </button>
+                        <?php endif; ?>
                     </div>
                     <?php if ($pathDebug): ?>
                     <div class="debug-path" title="Admin debug: on-chain address derivation mode">
@@ -1265,9 +1315,23 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                     <div class="invoice-input" data-copy="<?= htmlspecialchars($cashuRequest) ?>">
                         <?= htmlspecialchars(substr($cashuRequest, 0, 40) . '…') ?>
                     </div>
-                    <button type="button" class="btn btn-secondary" data-copy="<?= htmlspecialchars($cashuRequest) ?>">
-                        Copy Cashu Request
-                    </button>
+                    <div class="btn-row">
+                        <button type="button" class="btn btn-secondary" data-copy="<?= htmlspecialchars($cashuRequest) ?>">
+                            Copy Cashu Request
+                        </button>
+                        <?php if ($showShare): ?>
+                        <button type="button" class="btn btn-secondary btn-share" data-share-url="<?= htmlspecialchars($shareUrl) ?>" aria-label="Copy share link">
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <circle cx="18" cy="5" r="3"></circle>
+                                <circle cx="6" cy="12" r="3"></circle>
+                                <circle cx="18" cy="19" r="3"></circle>
+                                <line x1="8.59" y1="13.51" x2="15.42" y2="17.49"></line>
+                                <line x1="15.41" y1="6.51" x2="8.59" y2="10.49"></line>
+                            </svg>
+                            <span class="btn-share-label">Share</span>
+                        </button>
+                        <?php endif; ?>
+                    </div>
                     <?php if ($pathDebug): ?>
                     <div class="debug-path" title="Admin debug: Cashu ecash request target mint">
                         <span class="debug-path-tag">path</span>
@@ -1567,10 +1631,11 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
 
         // Copy any string to clipboard. Falls back to a hidden textarea + execCommand
         // if the page isn't a secure context (clipboard API requires HTTPS or localhost).
-        function copyText(value) {
+        function copyText(value, toastMessage) {
             if (!value) return;
             const showToast = () => {
                 const toast = document.getElementById('copy-toast');
+                toast.textContent = toastMessage || 'Copied to clipboard!';
                 toast.classList.add('show');
                 setTimeout(() => toast.classList.remove('show'), 2000);
             };
@@ -1594,6 +1659,10 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
         document.querySelectorAll('[data-copy]').forEach(el => {
             el.addEventListener('click', () => copyText(el.dataset.copy));
             el.style.cursor = 'pointer';
+        });
+        // Share buttons copy the invoice's public URL with their own toast.
+        document.querySelectorAll('[data-share-url]').forEach(el => {
+            el.addEventListener('click', () => copyText(el.dataset.shareUrl, 'Share link copied to your clipboard!'));
         });
         // Backwards-compat alias for any handlers that still reference copyInvoice.
         function copyInvoice() { copyText(invoice); }

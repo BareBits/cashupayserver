@@ -1,14 +1,16 @@
 """Store-settings restructure (store-only settings refactor):
 
-  - New "Lightning payments" card sits between Store Info and the cashout
-    card and carries the LN-address / NWC / noffer priority lists plus the
-    path-order note (Strike API, LNURL/lightning address, NWC, noffer — the
-    order the saved chain is actually walked in).
-  - "Auto-Cashout" is renamed "Cashu automatic cashout"; its column selector
-    has exactly two modes (the "Use global settings" card is gone).
+  - The "Lightning payments" card sits after Store Info and carries the
+    Strike / LN-address / NWC / noffer priority lists plus the path-order
+    note (Strike API, LNURL/lightning address, NWC, noffer — the order the
+    saved chain is actually walked in). Since the collapsible-sections
+    change, the Cashu automatic cashout + offline Cashu settings live inside
+    the same card too, in its trailing "Cashu" section (no separate cards).
+  - The cashout column selector has exactly two modes (the "Use global
+    settings" card is gone).
   - The site-wide settings cards for swaps / self-serve / on-chain default
     (including the #aw-site selector) no longer exist.
-  - The cashout card greys out when the selected store has no Cashu mint
+  - The cashout settings grey out when the selected store has no Cashu mint
     wallet, and server-side when the host can run neither GMP nor BCMath.
 """
 from __future__ import annotations
@@ -64,12 +66,15 @@ def _admin_html(handle: PayserverHandle) -> str:
 def test_lightning_payments_card_order_and_note(mintless_payserver) -> None:
     page = _admin_html(mintless_payserver)
 
-    # New card exists, above the renamed cashout card.
+    # The card exists; the cashout settings live inside it as the trailing
+    # "Cashu" section (the separate cashout card is gone).
     lp = page.index('id="card-lightning-payments"')
-    cc = page.index('id="card-cashu-cashout"')
-    assert lp < cc
+    cashu_section = page.index('id="ln-section-cashu"')
+    assert lp < cashu_section
+    assert 'id="card-cashu-cashout"' not in page
 
-    # The old title is gone; the new ones render.
+    # The old titles are gone; the new ones render (the cashout heading is a
+    # label inside the Cashu section now).
     assert ">Auto-Cashout<" not in page
     assert ">Lightning payments<" in page
     assert ">Cashu automatic cashout<" in page
@@ -80,9 +85,9 @@ def test_lightning_payments_card_order_and_note(mintless_payserver) -> None:
     assert "Lightning payment paths are tried in this order" in re.sub(r"\s+", " ", page)
     assert ">Payment path priority<" in page
 
-    # The priority widget and the three per-type lists all live in the new
-    # card (all appear after the card opens and before the cashout card
-    # opens).
+    # The priority widget and the per-type lists live in the card, before the
+    # Cashu section; the save button sits between the destination sections
+    # and the Cashu section.
     for group in (
         'id="ln-rail-order-group"',
         'id="auto-melt-address-group"',
@@ -90,7 +95,7 @@ def test_lightning_payments_card_order_and_note(mintless_payserver) -> None:
         'id="auto-melt-noffer-group"',
         'id="btn-save-lightning-payments"',
     ):
-        assert lp < page.index(group) < cc, group
+        assert lp < page.index(group) < cashu_section, group
 
 
 def test_cashout_card_has_two_modes_no_global(mintless_payserver) -> None:
@@ -101,7 +106,7 @@ def test_cashout_card_has_two_modes_no_global(mintless_payserver) -> None:
     assert sorted(modes) == ["0", "1"], modes
     assert "Use global settings" not in page
     assert 'id="auto-melt-mode-default-label"' not in page
-    assert aw_store > page.index('id="card-cashu-cashout"')
+    assert aw_store > page.index('id="ln-section-cashu"')
 
 
 def test_site_wide_cards_removed(mintless_payserver) -> None:

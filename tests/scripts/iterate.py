@@ -549,7 +549,9 @@ def main() -> int:
             page.fill("#mint_url_manual", mint.url)
             page.fill("#backup_mint_url_manual", backup_mint.url)
             page.click("#mints-continue-btn")
-            # setup_complete flips here; cron and done are advisory.
+            # setup_complete flips here; updates, cron and done are advisory.
+            page.wait_for_selector("h2:has-text('Enable automatic updates?')")
+            page.click("button:has-text('Not now')")
             page.wait_for_selector("h2:has-text('Enable cron')")
             page.click("button:has-text('Continue')")
             page.wait_for_selector("h2:has-text(\"You're all set!\")")

@@ -106,7 +106,8 @@ def walk(
     store_name: str = "Matrix Store",
 ) -> SetupWizard:
     """Answer every screen per `choices`. Returns the wizard session, still
-    logged in on the screen after mints, so callers can continue to cron/done."""
+    logged in on the screen after the auto-update question (answered "not
+    now", the default-off choice), so callers can continue to cron/done."""
     w = SetupWizard(payserver.url)
     w.through_store(store_name)
 
@@ -163,6 +164,10 @@ def walk(
         )
     else:
         body = w.post(step="mints", mints_enabled="0")
+    assert wizard_error(body) is None, wizard_error(body)
+
+    # updates: decline automatic updates (the safe default), landing on cron.
+    body = w.post(step="updates", auto_update="0")
     assert wizard_error(body) is None, wizard_error(body)
     return w
 
@@ -463,6 +468,23 @@ def _config(payserver: PayserverHandle, key: str) -> str | None:
         return row[0] if row else None
     finally:
         conn.close()
+
+
+def test_wizard_updates_screen_persists_the_choice(payserver: PayserverHandle) -> None:
+    """The auto-update screen writes the instance-level opt-in both ways: an
+    explicit "Not now" is a decision (stored false), and enabling stores true.
+    walk() already answers it with "0", so re-post the screen to flip it."""
+    walk(payserver, Choices(onchain="skip", lightning="skip", swaps=False, mints=False))
+    assert _config(payserver, "auto_update_enabled") == "false", (
+        "declining automatic updates must persist an explicit false"
+    )
+
+    w2 = SetupWizard(payserver.url)  # POST_COMPLETION screens accept tail posts
+    body = w2.post(step="updates", auto_update="1")
+    assert wizard_error(body) is None, wizard_error(body)
+    assert _config(payserver, "auto_update_enabled") == "true", (
+        "enabling automatic updates must persist true"
+    )
 
 
 def test_first_run_swaps_answer_sets_only_the_store_flag(payserver: PayserverHandle) -> None:

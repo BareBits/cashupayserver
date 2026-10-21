@@ -46,8 +46,8 @@ def test_desktop_flow_skips_security_and_cron(desktop_payserver: PayserverHandle
     assert _heading(body) == "Create your admin password", (
         "desktop mode must go straight from terms to password"
     )
-    # 10 standalone screens minus security and cron.
-    assert "of 8" in body, "the step counter must not promise the dropped screens"
+    # 11 standalone screens minus security and cron.
+    assert "of 9" in body, "the step counter must not promise the dropped screens"
 
     w.post(
         step="password",
@@ -60,12 +60,17 @@ def test_desktop_flow_skips_security_and_cron(desktop_payserver: PayserverHandle
     body = w.post(step="swaps", swaps_enabled="0")
     assert _heading(body) == "Cashu mints"
 
-    # Declining mints flips setup_complete; on desktop the wizard must land on
-    # the completion screen with the background-jobs note, never on the
-    # crontab instructions.
+    # Declining mints flips setup_complete. The auto-update question is asked
+    # on desktop too (the in-place updater works the same there); after it the
+    # wizard must land on the completion screen with the background-jobs note,
+    # never on the crontab instructions.
     body = w.post(step="mints", mints_enabled="0")
+    assert _heading(body) == "Enable automatic updates?", (
+        "desktop mode still asks the auto-update question"
+    )
+    body = w.post(step="updates", auto_update="0")
     assert _heading(body) == "You're all set!", (
-        "desktop mode must skip the cron screen after mints"
+        "desktop mode must skip the cron screen after the auto-update question"
     )
     assert "Background jobs run automatically" in body, (
         "the completion screen must say the launcher handles background jobs"
@@ -93,7 +98,8 @@ def test_server_flow_still_has_both_screens(payserver: PayserverHandle) -> None:
     w.post(step="onchain", onchain_action="skip")
     w.post(step="lightning", lightning_action="skip")
     w.post(step="swaps", swaps_enabled="0")
-    body = w.post(step="mints", mints_enabled="0")
+    w.post(step="mints", mints_enabled="0")
+    body = w.post(step="updates", auto_update="0")
     assert _heading(body) == "Enable cron", "servers still get the cron screen"
     # This Linux rig gets the crontab line, not the Windows schtasks variant.
     assert "crontab" in body

@@ -597,6 +597,11 @@ if (isset($_GET['api'])) {
                 // Why a manual update can't run here (dev kill switch), or
                 // null if it can. Drives the button's enabled state.
                 'manual_blocked' => Updater::manualUpdateBlockedReason(),
+                // Auto-apply opt-in state for the card's toggle. Source tells
+                // the UI when a deployment-level setting (constant/env) forces
+                // the gate open, so the DB-backed toggle is shown locked.
+                'auto_update_enabled' => Updater::isAutoUpdateEnabled(),
+                'auto_update_source' => Updater::autoUpdateEnabledSource(),
             ]);
             break;
 
@@ -1596,6 +1601,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             echo json_encode(['success' => true, 'channel' => Updater::getChannel()]);
             break;
 
+        // DB-backed opt-in toggle for automatic updates (Settings →
+        // Auto-update, also set by the onboarding wizard). Turning it off
+        // only closes the DB source — a deployment-level constant/env force
+        // stays authoritative, which the card surfaces via auto_update_source.
+        case 'save_auto_update_enabled':
+            Auth::requireAdmin();
+            Config::set('auto_update_enabled', ($_POST['enabled'] ?? '') === '1');
+            echo json_encode([
+                'success' => true,
+                'auto_update_enabled' => Updater::isAutoUpdateEnabled(),
+                'auto_update_source' => Updater::autoUpdateEnabledSource(),
+            ]);
+            break;
+
         case 'rollback_update':
             Auth::requireAdmin();
             $ok = Updater::rollbackToMostRecent();
@@ -1796,6 +1815,100 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 echo json_encode([
                     'success' => true,
                     'isConfigured' => Config::isStoreConfigured($storeId),
+                ]);
+            } catch (Exception $e) {
+                cashupay_status(400);
+                echo json_encode(['error' => $e->getMessage()]);
+            }
+            break;
+
+        // Enable a Cashu mint on an existing store that has none (store
+        // settings → Lightning payments → Cashu section). Tests the mint
+        // connection, generates the wallet seed when the store has none —
+        // returned ONCE for backup, like create_store — and keeps an existing
+        // seed so any prior mint balance stays recoverable. Refuses when the
+        // store is already mint-configured: replacing a live mint is a
+        // different (balance-moving) operation this endpoint must not do.
+        case 'enable_store_mint':
+            Auth::requireAdmin();
+            try {
+                $storeId = $_POST['store_id'] ?? '';
+                if (empty($storeId)) {
+                    throw new Exception('Store ID required');
+                }
+                $store = Config::getStore($storeId);
+                if (!$store) {
+                    throw new Exception('Store not found');
+                }
+                require_once __DIR__ . '/includes/cashu_env.php';
+                if (($cashuEnvError = CashuEnv::environmentError()) !== null) {
+                    throw new Exception('Cashu is unavailable on this server. ' . $cashuEnvError);
+                }
+                if (Config::isStoreConfigured($storeId)) {
+                    throw new Exception('This store already has a Cashu mint enabled.');
+                }
+                $mintUrl = rtrim(trim((string)($_POST['mint_url'] ?? '')), '/');
+                if ($mintUrl === '') {
+                    throw new Exception('Mint URL required');
+                }
+                // Same unit set the enable dialog (and setup's mints screen) offers.
+                $mintUnit = strtolower(trim((string)($_POST['mint_unit'] ?? 'sat'))) ?: 'sat';
+                if (!in_array($mintUnit, ['sat', 'usd', 'eur'], true)) {
+                    throw new Exception('Unsupported mint unit');
+                }
+                // Reachability + unit support in one probe, like setup's mints
+                // screen: the keysets listing both proves the mint answers and
+                // says which units it actually offers.
+                require_once __DIR__ . '/cashu-wallet-php/CashuWallet.php';
+                try {
+                    $supportedUnits = \Cashu\Wallet::getSupportedUnits($mintUrl);
+                } catch (Exception $e) {
+                    throw new Exception('Cannot connect to mint: ' . $e->getMessage());
+                }
+                if (empty($supportedUnits) || !isset($supportedUnits[$mintUnit])) {
+                    throw new Exception(
+                        'This mint doesn\'t offer ' . $mintUnit . '. Pick a different mint or unit.'
+                    );
+                }
+                $seedPhrase = $store['seed_phrase'] ?? null;
+                $generatedSeed = null;
+                if (empty($seedPhrase)) {
+                    $seedPhrase = \Cashu\Mnemonic::generate();
+                    // Same guard as create_store: a seed shared between stores
+                    // (however unlikely from a fresh generate) risks lost funds.
+                    $existing = Database::fetchOne(
+                        "SELECT id FROM stores WHERE seed_phrase = ?",
+                        [$seedPhrase]
+                    );
+                    if ($existing) {
+                        throw new Exception('Generated seed phrase collided with an existing store — please try again.');
+                    }
+                    $generatedSeed = $seedPhrase;
+                }
+                // mint_url/mint_unit/seed_phrase are long-standing updateStore
+                // columns; it also stamps primary_mint_source='manual' for us.
+                Config::updateStore($storeId, [
+                    'mint_url' => $mintUrl,
+                    'mint_unit' => $mintUnit,
+                    'seed_phrase' => $seedPhrase,
+                ]);
+
+                // Mintless setup pinned strict-no-mint-fallback FORCE_ON so a
+                // mint couldn't be acquired later without an explicit decision
+                // — this dialog IS that decision, so clear the pin. The mint
+                // stays the lowest-priority path regardless: invoices only
+                // fall back to it after every Lightning destination (Strike,
+                // LNURL, NWC, noffer) and any swap attempt have failed. The
+                // operator can re-pin strict mode in the Submarine Swaps card.
+                require_once __DIR__ . '/includes/swap/config.php';
+                SwapsConfig::setStoreStrictOverride($storeId, SwapsConfig::FORCE_OFF);
+
+                echo json_encode([
+                    'success' => true,
+                    'isConfigured' => Config::isStoreConfigured($storeId),
+                    // null when an existing seed was kept — the UI then skips
+                    // the one-time backup panel.
+                    'seedPhrase' => $generatedSeed,
                 ]);
             } catch (Exception $e) {
                 cashupay_status(400);
@@ -2754,6 +2867,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'enabled' => Config::get('notifications_enabled', false) === true,
                 'invoicePaidEnabled' => Config::get('notifications_invoice_paid_enabled', false) === true,
                 'autoCashoutEnabled' => Config::get('notifications_auto_cashout_enabled', false) === true,
+                // Unlike the other per-type toggles this one DEFAULTS ON —
+                // update emails are the whole point of enabling notifications
+                // on an install that keeps auto-update off.
+                'updateAvailableEnabled' => Config::get('notifications_update_available_enabled', true) === true,
                 // Effective value: explicit payer_email_capture_enabled config
                 // wins, else ON standalone / OFF on managed installs (the shop
                 // platform owns customer emails).
@@ -2785,6 +2902,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $enabled = ($_POST['enabled'] ?? '0') === '1';
                 $invoicePaidEnabled = ($_POST['invoice_paid_enabled'] ?? '0') === '1';
                 $autoCashoutEnabled = ($_POST['auto_cashout_enabled'] ?? '0') === '1';
+                $updateAvailableEnabled = ($_POST['update_available_enabled'] ?? '0') === '1';
                 $payerEmailCaptureEnabled = ($_POST['payer_email_capture_enabled'] ?? '0') === '1';
                 $payerReceiptEnabled = ($_POST['payer_receipt_enabled'] ?? '0') === '1';
                 $newsletterDefaultChecked = ($_POST['newsletter_default_checked'] ?? '0') === '1';
@@ -2801,6 +2919,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 Config::set('notifications_enabled', $enabled);
                 Config::set('notifications_invoice_paid_enabled', $invoicePaidEnabled);
                 Config::set('notifications_auto_cashout_enabled', $autoCashoutEnabled);
+                Config::set('notifications_update_available_enabled', $updateAvailableEnabled);
                 // Explicit boolean: once saved, it overrides the managed/
                 // standalone default in Config::isPayerEmailCaptureEnabled().
                 Config::set('payer_email_capture_enabled', $payerEmailCaptureEnabled);
@@ -4020,7 +4139,6 @@ header('Cache-Control: no-cache, must-revalidate');
     <meta name="apple-mobile-web-app-title" content="BareBits">
     <meta name="csrf-token" content="<?= htmlspecialchars(Auth::generateCsrfToken()) ?>">
     <title>BareBits Admin</title>
-    <link rel="manifest" href="<?= htmlspecialchars(Config::getBaseUrl()) ?>/manifest.json">
     <link rel="apple-touch-icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect fill='%230f0f23' width='100' height='100' rx='20'/><text x='50' y='70' font-size='60' text-anchor='middle'>⚡</text></svg>">
     <style>
         * {
@@ -4580,6 +4698,21 @@ header('Cache-Control: no-cache, must-revalidate');
         }
         .subsection.collapsed > .subsection-body {
             display: none;
+        }
+
+        /* Top-level sections inside the Lightning payments card: slightly
+           more prominent toggle + a separator line between sections. */
+        .subsection.ln-section {
+            border-top: 1px solid var(--border);
+            margin-top: 0.25rem;
+        }
+        .subsection.ln-section > .subsection-toggle {
+            font-size: 0.95rem;
+            color: var(--text-primary, inherit);
+            padding: 0.65rem 0;
+        }
+        .subsection.ln-section > .subsection-body {
+            padding-bottom: 0.5rem;
         }
 
         /* Auto-cashout column selector */
@@ -5468,25 +5601,28 @@ header('Cache-Control: no-cache, must-revalidate');
                 <a href="#" class="btn btn-secondary js-goto-invoices" style="padding: 0.25rem 0.75rem; font-size: 0.8rem; flex-shrink: 0;">Open invoices</a>
             </div>
 
+            <!-- Global banner: update available. Shown across ALL admin views
+                 (auto-update is off by default, so the nudge must not be
+                 missable). Non-dismissible by design: an available update may
+                 carry critical security fixes, so it stays until the operator
+                 actually updates. Populated by JS from update_status
+                 `available`. Admin-only. The "Update now" button kicks off the
+                 crash-isolated manual update and the banner switches to a live
+                 progress line. -->
+            <div id="update-available-banner" class="hidden" style="background: rgba(247, 147, 26, 0.12); border: 1px solid rgba(247, 147, 26, 0.4); border-radius: 8px; padding: 0.75rem 1rem; margin-bottom: 1rem; font-size: 0.9rem; display: flex; align-items: flex-start; gap: 0.75rem;" data-admin-only="true">
+                <span style="flex-shrink: 0; font-size: 1.1rem; line-height: 1.2;">&#9888;</span>
+                <span style="flex: 1;">
+                    <strong id="update-available-text">A software update is available.</strong>
+                    <span style="display: block; color: var(--text-secondary); font-size: 0.85rem; margin-top: 0.15rem;">
+                        Updates deliver new features and critical security enhancements. Please don't delay — apply it as soon as you can to keep your server secure.
+                    </span>
+                    <span id="update-available-progress" class="hidden" style="display: block; margin-top: 0.4rem; font-size: 0.85rem;"></span>
+                </span>
+                <button id="btn-update-now-banner" class="btn" style="padding: 0.3rem 0.9rem; font-size: 0.85rem; flex-shrink: 0;">Update now</button>
+            </div>
+
             <!-- Dashboard View -->
             <div class="view active" id="view-dashboard">
-                <!-- Update-available banner. Non-dismissible by design: an
-                     available update may carry critical security fixes, so it
-                     stays until the operator actually updates. Populated by JS
-                     from update_status `available`. Admin-only. The "Update now"
-                     button kicks off the crash-isolated manual update and the
-                     banner switches to a live progress line. -->
-                <div id="update-available-banner" class="hidden" style="background: rgba(247, 147, 26, 0.12); border: 1px solid rgba(247, 147, 26, 0.4); border-radius: 8px; padding: 0.75rem 1rem; margin-bottom: 1rem; font-size: 0.9rem; display: flex; align-items: flex-start; gap: 0.75rem;" data-admin-only="true">
-                    <span style="flex-shrink: 0; font-size: 1.1rem; line-height: 1.2;">&#9888;</span>
-                    <span style="flex: 1;">
-                        <strong id="update-available-text">A software update is available.</strong>
-                        <span style="display: block; color: var(--text-secondary); font-size: 0.85rem; margin-top: 0.15rem;">
-                            Updates deliver new features and critical security enhancements. Please don't delay — apply it as soon as you can to keep your server secure.
-                        </span>
-                        <span id="update-available-progress" class="hidden" style="display: block; margin-top: 0.4rem; font-size: 0.85rem;"></span>
-                    </span>
-                    <button id="btn-update-now-banner" class="btn" style="padding: 0.3rem 0.9rem; font-size: 0.85rem; flex-shrink: 0;">Update now</button>
-                </div>
                 <div id="reliability-banner" class="hidden" style="background: rgba(220, 53, 69, 0.15); border: 1px solid rgba(220, 53, 69, 0.5); border-radius: 8px; padding: 0.75rem 1rem; margin-bottom: 1rem; font-size: 0.9rem; display: flex; align-items: center; gap: 0.75rem;" data-admin-only="true">
                     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="flex-shrink: 0;">
                         <path d="M12 9v4M12 17h.01"></path>
@@ -5585,7 +5721,8 @@ header('Cache-Control: no-cache, must-revalidate');
                         <div class="card-title">All Invoices</div>
                         <div style="display: flex; gap: 0.5rem;">
                             <button class="btn btn-secondary" id="btn-export-invoices-csv">Export CSV</button>
-                            <button class="btn" id="btn-new-invoice">+ New Invoice</button>
+                            <button class="btn" id="btn-new-invoice-advanced">Create invoice</button>
+                            <button class="btn" id="btn-new-invoice">Create invoice (simple)</button>
                         </div>
                     </div>
                     <div class="inv-filter-row">
@@ -5744,6 +5881,14 @@ header('Cache-Control: no-cache, must-revalidate');
                                 <div id="ln-rail-order-list"></div>
                             </div>
 
+                            <!-- The four payment-path sections (and the Cashu
+                                 section at the end) are collapsible. Markup
+                                 default is collapsed; applyLnSectionDefaults()
+                                 expands each section that has saved entries
+                                 once per store load. -->
+                            <div class="subsection collapsed ln-section" id="ln-section-strike">
+                            <div class="subsection-toggle">Strike API keys</div>
+                            <div class="subsection-body">
                             <div class="form-group" id="auto-melt-strike-group">
                                 <label class="form-label">Strike API keys (priority order)</label>
                                 <p class="form-help">
@@ -5783,7 +5928,12 @@ header('Cache-Control: no-cache, must-revalidate');
                                     On-chain Bitcoin payments card.
                                 </p>
                             </div>
+                            </div><!-- /.subsection-body -->
+                            </div><!-- /#ln-section-strike -->
 
+                            <div class="subsection collapsed ln-section" id="ln-section-addresses">
+                            <div class="subsection-toggle">Lightning addresses</div>
+                            <div class="subsection-body">
                             <div class="form-group" id="auto-melt-address-group">
                                 <label class="form-label">Lightning Addresses (priority order)</label>
                                 <p class="form-help">
@@ -5797,7 +5947,12 @@ header('Cache-Control: no-cache, must-revalidate');
                                     + Add address
                                 </button>
                             </div>
+                            </div><!-- /.subsection-body -->
+                            </div><!-- /#ln-section-addresses -->
 
+                            <div class="subsection collapsed ln-section" id="ln-section-nwc">
+                            <div class="subsection-toggle">NWC connections</div>
+                            <div class="subsection-body">
                             <div class="form-group" id="auto-melt-nwc-group"
                                  <?= $nwcEnvError !== null ? 'data-env-error="1"' : '' ?>>
                                 <label class="form-label">NWC connections (priority order)</label>
@@ -5832,7 +5987,12 @@ header('Cache-Control: no-cache, must-revalidate');
                                     + Add NWC connection
                                 </button>
                             </div>
+                            </div><!-- /.subsection-body -->
+                            </div><!-- /#ln-section-nwc -->
 
+                            <div class="subsection collapsed ln-section" id="ln-section-noffers">
+                            <div class="subsection-toggle">CLINK noffers</div>
+                            <div class="subsection-body">
                             <div class="form-group" id="auto-melt-noffer-group"
                                  <?= $nofferEnvError !== null ? 'data-env-error="1"' : '' ?>>
                                 <label class="form-label">CLINK noffers (priority order)</label>
@@ -5874,19 +6034,17 @@ header('Cache-Control: no-cache, must-revalidate');
                                     + Add noffer
                                 </button>
                             </div>
+                            </div><!-- /.subsection-body -->
+                            </div><!-- /#ln-section-noffers -->
 
                             <div id="lightning-payments-error" class="hidden" style="margin-top:0.75rem; color: var(--error); font-size: 0.85rem;"></div>
                             <button class="btn btn-full" id="btn-save-lightning-payments" style="margin-top: 1rem;">
                                 Save Lightning payments
                             </button>
-                        </div>
-                    </div>
 
-                    <div class="card collapsible" id="card-cashu-cashout">
-                        <div class="card-header">
-                            <div class="card-title">Cashu automatic cashout</div>
-                        </div>
-                        <div class="card-body">
+                            <div class="subsection collapsed ln-section" id="ln-section-cashu">
+                            <div class="subsection-toggle">Cashu</div>
+                            <div class="subsection-body">
                             <?php if ($cashuEnvError !== null): ?>
                                 <div style="margin-bottom:0.75rem; padding:0.6rem 0.8rem; border-radius:8px; background:rgba(245,158,11,0.12); border:1px solid rgba(245,158,11,0.4); font-size:0.82rem;">
                                     &#9888; <strong>Cashu is unavailable on this server.</strong>
@@ -5895,9 +6053,11 @@ header('Cache-Control: no-cache, must-revalidate');
                                 </div>
                             <?php endif; ?>
                             <div id="cashu-cashout-mint-warning" class="hidden" style="margin-bottom:0.75rem; padding:0.6rem 0.8rem; border-radius:8px; background:rgba(245,158,11,0.12); border:1px solid rgba(245,158,11,0.4); font-size:0.82rem;">
-                                &#9888; <strong>Cashu is disabled for this store.</strong>
-                                This store has no Cashu mint wallet configured, so there is no mint
-                                balance to cash out. Add a mint to use automatic cashout.
+                                &#9888; A Cashu Mint is not enabled, enable a cashu mint to access these settings.
+                                <button type="button" class="btn btn-secondary" id="btn-enable-cashu-mint"
+                                        style="display:block; width:auto; margin-top:0.5rem; padding:0.3rem 0.7rem; font-size:0.8rem;">
+                                    Enable a Cashu mint
+                                </button>
                             </div>
                             <!-- Everything below greys out when Cashu can't run: either the
                                  server lacks GMP/BCMath (rendered inert here) or the selected
@@ -5905,6 +6065,7 @@ header('Cache-Control: no-cache, must-revalidate');
                             <div id="cashu-cashout-body"<?= $cashuEnvError !== null
                                 ? ' data-env-error="1" style="opacity: 0.5; pointer-events: none;"'
                                 : '' ?>>
+                            <label class="form-label">Cashu automatic cashout</label>
                             <div id="aw-store" data-aw data-aw-scope="store">
                             <p class="aw-title">auto-cashout settings</p>
                             <?php if ($gmpEnvError !== null): ?>
@@ -5982,7 +6143,19 @@ header('Cache-Control: no-cache, must-revalidate');
                                 Save Settings
                             </button>
                             </div><!-- /#aw-store -->
+
+                            <div id="offline-cashu-section" style="margin-top:1.25rem; padding-top:1rem; border-top:1px solid var(--border);">
+                                <label class="form-label">Offline Cashu acceptance</label>
+                                <p class="form-help" style="margin-bottom: 0.75rem;">
+                                    Keep taking Cashu ecash even when the mint is briefly unreachable. Tokens are
+                                    verified by their built-in signature (NUT-12 DLEQ) and confirmed automatically
+                                    once the mint is back online.
+                                </p>
+                                <div id="offline-cashu-body"><div class="loading"><div class="spinner"></div></div></div>
+                            </div>
                             </div><!-- /#cashu-cashout-body -->
+                            </div><!-- /.subsection-body -->
+                            </div><!-- /#ln-section-cashu -->
                         </div>
                     </div>
 
@@ -6608,20 +6781,6 @@ header('Cache-Control: no-cache, must-revalidate');
 
                     <div class="card collapsible">
                         <div class="card-header">
-                            <div class="card-title">Offline Cashu Acceptance</div>
-                        </div>
-                        <div class="card-body">
-                            <p class="form-help" style="margin-bottom: 0.75rem;">
-                                Keep taking Cashu ecash even when the mint is briefly unreachable. Tokens are
-                                verified by their built-in signature (NUT-12 DLEQ) and confirmed automatically
-                                once the mint is back online.
-                            </p>
-                            <div id="offline-cashu-body"><div class="loading"><div class="spinner"></div></div></div>
-                        </div>
-                    </div>
-
-                    <div class="card collapsible">
-                        <div class="card-header">
                             <div class="card-title">Danger Zone</div>
                         </div>
                         <div class="card-body">
@@ -6669,6 +6828,10 @@ header('Cache-Control: no-cache, must-revalidate');
                         <div id="products-admin-list">
                             <div class="loading"><div class="spinner"></div></div>
                         </div>
+                        <button class="btn btn-secondary" id="btn-products-generate-link"
+                                style="margin-top:0.75rem; width:auto; padding:0.4rem 0.9rem;">
+                            Generate link for multiple products
+                        </button>
                     </div>
                 </div>
             </div>
@@ -6782,6 +6945,13 @@ header('Cache-Control: no-cache, must-revalidate');
                                 <span>Auto-cashout (success &amp; failure)</span>
                                 <label class="toggle">
                                     <input type="checkbox" id="notifications-auto-cashout">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
+                            <div class="toggle-container" style="margin-top: 0.5rem;">
+                                <span>Software update available (sent once per release; skipped when automatic updates are on)</span>
+                                <label class="toggle">
+                                    <input type="checkbox" id="notifications-update-available">
                                     <span class="toggle-slider"></span>
                                 </label>
                             </div>
@@ -7000,12 +7170,27 @@ header('Cache-Control: no-cache, must-revalidate');
                     </div>
                     <div class="card-body">
                         <p style="font-size: 0.85rem; color: var(--text-secondary); margin: 0 0 0.75rem 0;">
-                            Daily check against GitHub. Updates apply automatically, then a health
-                            check verifies the new build boots — a broken update is rolled back on
-                            its own. data/ and user_config.php are preserved. Backups of the last 3
-                            versions are kept under data/updates/backup/.
+                            Daily check against GitHub. Automatic updates are off by default:
+                            when a new build ships you get a banner here (and an email, if
+                            notifications are configured) and apply it with one click. With
+                            automatic updates enabled, new builds apply on their own. Either
+                            way a health check verifies the new build boots — a broken update
+                            is rolled back on its own. data/ and user_config.php are preserved.
+                            Backups of the last 3 versions are kept under data/updates/backup/.
                         </p>
-                        <div class="form-group">
+                        <div class="toggle-container">
+                            <span><strong>Enable automatic updates</strong></span>
+                            <label class="toggle">
+                                <input type="checkbox" id="auto-update-enabled">
+                                <span class="toggle-slider"></span>
+                            </label>
+                        </div>
+                        <p class="form-help hidden" id="auto-update-forced-note" style="margin-top: 0.25rem;">
+                            Automatic updates are forced on for this deployment
+                            (<code>CASHUPAY_AUTO_UPDATE_ENABLED</code> is set in
+                            user_config.php or the environment), so this toggle has no effect.
+                        </p>
+                        <div class="form-group" style="margin-top: 0.75rem;">
                             <label class="form-label">Current version</label>
                             <code id="auto-update-current" style="display: block; background: rgba(0,0,0,0.2); padding: 0.6rem; border-radius: 8px; font-size: 0.85rem; user-select: all;">Loading…</code>
                         </div>
@@ -7508,14 +7693,17 @@ header('Cache-Control: no-cache, must-revalidate');
             </div>
 
             <button class="btn btn-secondary btn-full" style="margin-top: 0.5rem;" onclick="closeModal('modal-request')">Cancel</button>
+            <button class="btn btn-secondary btn-full" style="margin-top: 0.5rem;" id="btn-request-switch-advanced">Switch to advanced</button>
         </div>
     </div>
 
-    <!-- Cart-based request modal: pick products into a cart, then checkout. -->
+    <!-- Cart-based request modal: pick products into a cart, then create the
+         invoice — or, in link mode (opened from the Products view), build a
+         shareable self-serve link pre-populated with the picked products. -->
     <div class="modal-overlay" id="modal-cart">
         <div class="modal" style="max-width: 600px;">
             <div class="modal-handle"></div>
-            <div class="modal-title">Create invoice</div>
+            <div class="modal-title" id="cart-modal-title">Create invoice</div>
 
             <div style="display:flex; gap:0.5rem; margin-bottom:0.5rem;">
                 <input type="text" class="form-input" id="cart-search" placeholder="Search products…" style="flex:1;">
@@ -7548,21 +7736,50 @@ header('Cache-Control: no-cache, must-revalidate');
                 <div id="cart-total" style="font-weight:600; text-align:right; margin-top:0.5rem;"></div>
             </div>
 
-            <input type="text" class="form-input" id="cart-memo" placeholder="Description (optional)" style="margin-top:0.5rem;">
-            <label style="display:flex; align-items:flex-start; gap:0.5rem; cursor:pointer; margin-top:0.5rem;">
-                <input type="checkbox" id="cart-hide-store-name" style="margin-top:0.15rem;">
-                <span style="font-size:0.85rem;">Hide store name on invoice
-                    <span style="display:block; font-size:0.74rem; color:var(--text-secondary);">Keep the store name out of the invoice memo the payer's wallet records.</span>
-                </span>
-            </label>
-            <label style="display:flex; align-items:flex-start; gap:0.5rem; cursor:pointer; margin-top:0.5rem;">
-                <input type="checkbox" id="cart-hide-note" style="margin-top:0.15rem;">
-                <span style="font-size:0.85rem;">Hide note on invoice
-                    <span style="display:block; font-size:0.74rem; color:var(--text-secondary);">Keep the description above out of the invoice memo (still shown on the payment page).</span>
-                </span>
-            </label>
-            <button class="btn btn-full" id="btn-cart-checkout" style="margin-top:0.5rem;" disabled>Checkout</button>
+            <div id="cart-invoice-fields">
+                <input type="text" class="form-input" id="cart-memo" placeholder="Description (optional)" style="margin-top:0.5rem;">
+                <label style="display:flex; align-items:flex-start; gap:0.5rem; cursor:pointer; margin-top:0.5rem;">
+                    <input type="checkbox" id="cart-hide-store-name" style="margin-top:0.15rem;">
+                    <span style="font-size:0.85rem;">Hide store name on invoice
+                        <span style="display:block; font-size:0.74rem; color:var(--text-secondary);">Keep the store name out of the invoice memo the payer's wallet records.</span>
+                    </span>
+                </label>
+                <label style="display:flex; align-items:flex-start; gap:0.5rem; cursor:pointer; margin-top:0.5rem;">
+                    <input type="checkbox" id="cart-hide-note" style="margin-top:0.15rem;">
+                    <span style="font-size:0.85rem;">Hide note on invoice
+                        <span style="display:block; font-size:0.74rem; color:var(--text-secondary);">Keep the description above out of the invoice memo (still shown on the payment page).</span>
+                    </span>
+                </label>
+            </div>
+            <!-- Link mode: live preview of the shareable self-serve product link. -->
+            <div id="cart-link-footer" style="display:none; flex-direction:column; gap:0.5rem; margin-top:0.5rem;">
+                <div id="cart-link-warning" style="display:none; font-size:0.78rem; color:var(--text-secondary); background:rgba(247,147,26,0.12); border:1px solid rgba(247,147,26,0.3); border-radius:8px; padding:0.5rem 0.7rem;">
+                    ⚠️ Self-serve invoices are off for this store, so this link won't work yet. Copy link will offer to turn them on.
+                </div>
+                <div style="display:flex; gap:0.5rem;">
+                    <input type="text" class="form-input" id="cart-link-input" readonly
+                           placeholder="Add products to build the link" style="flex:1; font-size:0.8rem;">
+                    <button class="btn" id="btn-cart-copy-link" style="width:auto; flex:0 0 auto;" disabled>Copy link</button>
+                </div>
+            </div>
+            <button class="btn btn-full" id="btn-cart-checkout" style="margin-top:0.5rem;" disabled>Create</button>
             <button class="btn btn-secondary btn-full" style="margin-top: 0.5rem;" onclick="closeModal('modal-cart')">Cancel</button>
+        </div>
+    </div>
+
+    <!-- Offer to enable self-serve for a product link. An in-app modal (not a
+         native confirm(), which browsers can suppress). z-index sits above the
+         cart modal so it stacks correctly when opened from the link generator. -->
+    <div class="modal-overlay" id="modal-enable-selfserve" style="z-index: 300;">
+        <div class="modal">
+            <div class="modal-handle"></div>
+            <div class="modal-title">Enable self-serve invoices?</div>
+            <p style="color:var(--text-secondary); font-size:0.9rem; margin:0 0 1rem 0;">
+                Self-serve invoices are off for this store, so the link you just
+                copied won't work until you turn them on.
+            </p>
+            <button class="btn btn-full" id="btn-enable-selfserve-confirm">Enable self-serve invoices</button>
+            <button class="btn btn-secondary btn-full" style="margin-top: 0.5rem;" onclick="closeModal('modal-enable-selfserve')">Not now</button>
         </div>
     </div>
 
@@ -7617,6 +7834,57 @@ header('Cache-Control: no-cache, must-revalidate');
             <div class="modal-handle"></div>
             <div class="modal-title" id="store-modal-title">Store Details</div>
             <div id="store-modal-content"></div>
+        </div>
+    </div>
+
+    <!-- Enable a Cashu mint on a store that doesn't have one yet (opened from
+         the greyed-out Cashu section in the Lightning payments card). Two
+         panels: the form, then the one-time recovery-phrase display shown
+         when the save generated a fresh wallet seed. -->
+    <div class="modal-overlay" id="modal-enable-mint">
+        <div class="modal">
+            <div class="modal-handle"></div>
+            <div class="modal-title">Enable a Cashu mint</div>
+            <div id="enable-mint-form">
+                <p class="form-help" style="margin-bottom: 1rem;">
+                    A Cashu mint holds this store's ecash balance between a customer's
+                    payment and your cashout. Pick a mint you trust &mdash; the connection
+                    is tested when you save.
+                </p>
+                <div class="form-group">
+                    <label class="form-label">Mint URL</label>
+                    <div style="display:flex; gap:0.5rem;">
+                        <input type="url" class="form-input" id="enable-mint-url"
+                               placeholder="https://mint.example.com" style="flex:1;">
+                        <button type="button" class="btn btn-secondary" id="btn-enable-mint-discover"
+                                style="width:auto; white-space:nowrap;">Discover</button>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Currency unit</label>
+                    <select class="form-input" id="enable-mint-unit">
+                        <option value="sat">Bitcoin (sats)</option>
+                        <option value="usd">USD</option>
+                        <option value="eur">EUR</option>
+                    </select>
+                    <p class="form-help">The mint must support the unit you pick.</p>
+                </div>
+                <div id="enable-mint-error" class="hidden" style="margin-bottom:0.75rem; color: var(--error); font-size: 0.85rem;"></div>
+                <button class="btn btn-full" id="btn-enable-mint-save">Enable mint</button>
+                <button class="btn btn-secondary btn-full" style="margin-top: 0.5rem;" onclick="closeModal('modal-enable-mint')">Cancel</button>
+            </div>
+            <div id="enable-mint-seed" style="display:none;">
+                <p style="margin-bottom: 0.75rem;">
+                    The mint is enabled and a wallet recovery phrase was generated for this
+                    store. <strong>Write it down and store it safely</strong> &mdash; it is
+                    the only way to recover the store's mint balance if this server's
+                    database is lost. It will not be shown again automatically (it stays
+                    available in the Recovery phrase card below).
+                </p>
+                <div id="enable-mint-seed-value"
+                     style="background: rgba(0,0,0,0.3); border: 1px solid var(--border); border-radius: 8px; padding: 0.75rem; font-family: monospace; font-size: 0.9rem; word-break: break-word; margin-bottom: 0.75rem; user-select: all;"></div>
+                <button class="btn btn-full" id="btn-enable-mint-done">I've saved my recovery phrase</button>
+            </div>
         </div>
     </div>
 
@@ -8139,10 +8407,23 @@ header('Cache-Control: no-cache, must-revalidate');
             const btnReqSimple = document.getElementById('btn-request-simple');
             if (btnReqSimple) btnReqSimple.addEventListener('click', () => openRequestModal());
             document.getElementById('btn-new-invoice').addEventListener('click', () => openRequestModal());
+            const btnNewInvoiceAdv = document.getElementById('btn-new-invoice-advanced');
+            if (btnNewInvoiceAdv) btnNewInvoiceAdv.addEventListener('click', () => openCartModal());
+            const btnSwitchAdvanced = document.getElementById('btn-request-switch-advanced');
+            if (btnSwitchAdvanced) btnSwitchAdvanced.addEventListener('click', () => {
+                closeModal('modal-request');
+                openCartModal();
+            });
 
             // Products admin view + cart modal wiring.
             const btnNewProduct = document.getElementById('btn-new-product');
             if (btnNewProduct) btnNewProduct.addEventListener('click', () => openProductEditModal(null));
+            const btnProductsLink = document.getElementById('btn-products-generate-link');
+            if (btnProductsLink) btnProductsLink.addEventListener('click', () => openCartModal({ linkMode: true }));
+            const btnCartCopyLink = document.getElementById('btn-cart-copy-link');
+            if (btnCartCopyLink) btnCartCopyLink.addEventListener('click', copyCartLink);
+            const btnEnableSelfServe = document.getElementById('btn-enable-selfserve-confirm');
+            if (btnEnableSelfServe) btnEnableSelfServe.addEventListener('click', confirmEnableSelfServe);
             const prodSortSel = document.getElementById('products-default-sort');
             if (prodSortSel) prodSortSel.addEventListener('change', saveProductDefaultSort);
             wireCartModal();
@@ -8305,6 +8586,8 @@ header('Cache-Control: no-cache, must-revalidate');
             if (copyCronSwapsBtn) copyCronSwapsBtn.addEventListener('click', copyCronSwapsUrl);
             const saveChannelBtn = document.getElementById('btn-save-update-channel');
             if (saveChannelBtn) saveChannelBtn.addEventListener('click', saveUpdateChannel);
+            const autoUpdateToggle = document.getElementById('auto-update-enabled');
+            if (autoUpdateToggle) autoUpdateToggle.addEventListener('change', saveAutoUpdateEnabled);
             const rollbackBtn = document.getElementById('btn-rollback-update');
             if (rollbackBtn) rollbackBtn.addEventListener('click', rollbackUpdate);
             const dismissAutoRbBtn = document.getElementById('btn-dismiss-auto-rollback');
@@ -8364,6 +8647,15 @@ header('Cache-Control: no-cache, must-revalidate');
                 if (currentStoreId) {
                     deleteStore(currentStoreId);
                 }
+            });
+
+            // Enable-a-Cashu-mint flow (greyed-out Cashu section → modal).
+            document.getElementById('btn-enable-cashu-mint').addEventListener('click', openEnableMintModal);
+            document.getElementById('btn-enable-mint-discover').addEventListener('click', openEnableMintDiscovery);
+            document.getElementById('btn-enable-mint-save').addEventListener('click', submitEnableMint);
+            document.getElementById('btn-enable-mint-done').addEventListener('click', () => {
+                closeModal('modal-enable-mint');
+                showToast('Cashu mint enabled', 'success');
             });
 
             // Mint reliability + trusted mints wiring (admin-only cards).
@@ -11670,6 +11962,31 @@ header('Cache-Control: no-cache, must-revalidate');
             renderNofferRows();
             renderNwcRows();
             renderStrikeRows();
+            applyLnSectionDefaults();
+        }
+
+        // Default open/closed state of the collapsible sections in the
+        // Lightning payments card: a section starts expanded only when it has
+        // saved entries; the Cashu section only when the store has a mint
+        // wallet AND cashout is actually configured (enabled, or explicitly
+        // set to on-chain). Applied once per store so dashboard refreshes
+        // don't yank a section the operator opened back shut.
+        let lnSectionDefaultsFor = null;
+        function applyLnSectionDefaults() {
+            if (lnSectionDefaultsFor === currentStoreId) return;
+            lnSectionDefaultsFor = currentStoreId;
+            const setCollapsed = (id, collapsed) => {
+                const el = document.getElementById(id);
+                if (el) el.classList.toggle('collapsed', collapsed);
+            };
+            setCollapsed('ln-section-strike', awStrike.length === 0);
+            setCollapsed('ln-section-addresses', awLnAddresses.length === 0);
+            setCollapsed('ln-section-nwc', awNwc.length === 0);
+            setCollapsed('ln-section-noffers', awNoffers.length === 0);
+            const am = dashboardData && dashboardData.autoMelt;
+            const hasMint = !!(dashboardData && dashboardData.storeConfigured);
+            const cashoutConfigured = !!am && (!!am.enabled || String(am.modeOverride) === '1');
+            setCollapsed('ln-section-cashu', !(hasMint && cashoutConfigured));
         }
 
         // Read the current input values back into awLnAddresses (preserving the
@@ -12366,6 +12683,7 @@ header('Cache-Control: no-cache, must-revalidate');
                 document.getElementById('notifications-enabled').checked = !!data.enabled;
                 document.getElementById('notifications-invoice-paid').checked = !!data.invoicePaidEnabled;
                 document.getElementById('notifications-auto-cashout').checked = !!data.autoCashoutEnabled;
+                document.getElementById('notifications-update-available').checked = !!data.updateAvailableEnabled;
                 // Effective server-side value (explicit config, or the
                 // managed/standalone default when never saved).
                 const payerCaptureEl = document.getElementById('notifications-payer-email-capture');
@@ -12417,6 +12735,7 @@ header('Cache-Control: no-cache, must-revalidate');
             const enabled = document.getElementById('notifications-enabled').checked ? '1' : '0';
             const invoicePaid = document.getElementById('notifications-invoice-paid').checked ? '1' : '0';
             const autoCashout = document.getElementById('notifications-auto-cashout').checked ? '1' : '0';
+            const updateAvailable = document.getElementById('notifications-update-available').checked ? '1' : '0';
             const payerCaptureEl = document.getElementById('notifications-payer-email-capture');
             const payerEmailCapture = payerCaptureEl && payerCaptureEl.checked ? '1' : '0';
             const payerReceiptEl = document.getElementById('notifications-payer-receipt');
@@ -12428,6 +12747,7 @@ header('Cache-Control: no-cache, must-revalidate');
                 action: 'save_notifications_settings',
                 enabled, invoice_paid_enabled: invoicePaid,
                 auto_cashout_enabled: autoCashout,
+                update_available_enabled: updateAvailable,
                 payer_email_capture_enabled: payerEmailCapture,
                 payer_receipt_enabled: payerReceipt,
                 newsletter_default_checked: newsletterDefault,
@@ -13104,6 +13424,81 @@ header('Cache-Control: no-cache, must-revalidate');
                 document.getElementById('backup-mint-url').value = url;
             };
             openMintDiscoveryModal();
+        }
+
+        // ---- Enable a Cashu mint on an existing store (Cashu section) ----
+
+        function openEnableMintModal() {
+            if (!currentStoreId) return;
+            document.getElementById('enable-mint-url').value = '';
+            document.getElementById('enable-mint-unit').value = 'sat';
+            const err = document.getElementById('enable-mint-error');
+            err.classList.add('hidden');
+            err.textContent = '';
+            document.getElementById('enable-mint-form').style.display = 'block';
+            document.getElementById('enable-mint-seed').style.display = 'none';
+            openModal('modal-enable-mint');
+        }
+
+        function openEnableMintDiscovery() {
+            discoveryContext = 'enable-mint';
+            discoveryCallback = (url) => {
+                document.getElementById('enable-mint-url').value = url;
+            };
+            openMintDiscoveryModal();
+        }
+
+        async function submitEnableMint() {
+            const errEl = document.getElementById('enable-mint-error');
+            errEl.classList.add('hidden');
+            const mintUrl = document.getElementById('enable-mint-url').value.trim();
+            if (!mintUrl) {
+                errEl.textContent = 'Please enter a mint URL.';
+                errEl.classList.remove('hidden');
+                return;
+            }
+            const btn = document.getElementById('btn-enable-mint-save');
+            btn.disabled = true;
+            btn.textContent = 'Testing mint…';
+            try {
+                const params = new URLSearchParams({
+                    action: 'enable_store_mint',
+                    store_id: currentStoreId,
+                    mint_url: mintUrl,
+                    mint_unit: document.getElementById('enable-mint-unit').value,
+                });
+                const response = await postWithCsrf(adminUrl, params.toString());
+                const result = await response.json();
+                if (!response.ok) throw new Error(result.error || 'Failed to enable mint');
+                if (result.seedPhrase) {
+                    // Fresh wallet seed — show it once for backup before closing.
+                    document.getElementById('enable-mint-form').style.display = 'none';
+                    document.getElementById('enable-mint-seed-value').textContent = result.seedPhrase;
+                    document.getElementById('enable-mint-seed').style.display = 'block';
+                } else {
+                    // The store already had a seed (kept so any prior balance
+                    // stays recoverable) — nothing new to back up.
+                    closeModal('modal-enable-mint');
+                    showToast('Cashu mint enabled', 'success');
+                }
+                await refreshAfterMintEnable();
+            } catch (e) {
+                errEl.textContent = e.message || 'Failed to enable mint';
+                errEl.classList.remove('hidden');
+            } finally {
+                btn.disabled = false;
+                btn.textContent = 'Enable mint';
+            }
+        }
+
+        // Re-pull dashboard data (storeConfigured, balance, mint URL) and
+        // re-render the store settings view so the Cashu section un-greys
+        // without a manual reload.
+        async function refreshAfterMintEnable() {
+            await loadDashboard();
+            if (document.getElementById('view-store-settings').classList.contains('active')) {
+                loadStoreSettings();
+            }
         }
 
         let mintDisclaimerAcknowledged = false;
@@ -14444,8 +14839,44 @@ header('Cache-Control: no-cache, must-revalidate');
                 }
                 // Availability line + manual-run progress + Update-now button.
                 applyUpdateState(data);
+                renderAutoUpdateToggle(data);
             } catch (e) {
                 cur.textContent = 'Unable to load update status';
+            }
+        }
+
+        // Opt-in toggle. When a deployment-level source (constant/env) forces
+        // the gate open, the DB toggle can't close it — lock the control and
+        // explain why instead of letting it silently do nothing.
+        function renderAutoUpdateToggle(data) {
+            const toggle = document.getElementById('auto-update-enabled');
+            const note = document.getElementById('auto-update-forced-note');
+            if (!toggle) return;
+            const forced = data.auto_update_source === 'constant' || data.auto_update_source === 'env';
+            toggle.checked = !!data.auto_update_enabled;
+            toggle.disabled = forced;
+            if (note) note.classList.toggle('hidden', !forced);
+        }
+
+        async function saveAutoUpdateEnabled() {
+            const toggle = document.getElementById('auto-update-enabled');
+            if (!toggle) return;
+            const enabled = toggle.checked ? '1' : '0';
+            try {
+                const response = await postWithCsrf(adminUrl, 'action=save_auto_update_enabled&enabled=' + enabled);
+                const result = await response.json();
+                if (response.ok && result.success) {
+                    renderAutoUpdateToggle(result);
+                    showToast(result.auto_update_enabled
+                        ? 'Automatic updates enabled'
+                        : 'Automatic updates disabled', 'success');
+                } else {
+                    toggle.checked = !toggle.checked;
+                    showToast(result.error || 'Failed to save', 'error');
+                }
+            } catch (e) {
+                toggle.checked = !toggle.checked;
+                showToast('Failed to save automatic-update setting', 'error');
             }
         }
 
@@ -14807,6 +15238,7 @@ header('Cache-Control: no-cache, must-revalidate');
                         <div style="font-weight:600; ${p.enabled ? '' : 'opacity:0.5;'}">${escapeHtml(p.title)}${p.enabled ? '' : ' <span style="font-size:0.7rem;">(disabled)</span>'}</div>
                         <div style="font-size:0.8rem; color:var(--text-secondary);">${escapeHtml(formatMoney(p.price, p.currency))} · ${p.purchaseCount} sold</div>
                     </div>
+                    <button class="btn btn-secondary" style="width:auto; padding:0.3rem 0.7rem;" onclick="copyProductLink('${p.id}')">Copy link</button>
                     <button class="btn btn-secondary" style="width:auto; padding:0.3rem 0.7rem;" onclick="openProductEditModal('${p.id}')">Edit</button>
                     <button class="btn btn-secondary" style="width:auto; padding:0.3rem 0.7rem;" onclick="toggleProductEnabled('${p.id}')">${p.enabled ? 'Disable' : 'Enable'}</button>
                     <button class="btn btn-secondary" style="width:auto; padding:0.3rem 0.7rem; color:#ef4444;" onclick="deleteProduct('${p.id}')">Delete</button>
@@ -14996,10 +15428,12 @@ header('Cache-Control: no-cache, must-revalidate');
         let cartCatalog = [];
         let cartItems = [];   // {productId|null, title, price, currency, quantity, image:{type,value,url}}
         let cartPage = 1;
+        let cartLinkMode = false; // true: building a shareable self-serve link instead of an invoice
         const CART_PAGE_SIZE = 10;
 
-        async function openCartModal() {
+        async function openCartModal(opts) {
             if (!currentStoreId) { showToast('Please select a store first', 'error'); return; }
+            cartLinkMode = !!(opts && opts.linkMode);
             cartItems = [];
             cartPage = 1;
             document.getElementById('cart-search').value = '';
@@ -15012,6 +15446,15 @@ header('Cache-Control: no-cache, must-revalidate');
             if (cartHn) cartHn.checked = !!cartPriv.hideNote;
             const customForm = document.getElementById('cart-custom-form');
             if (customForm) customForm.style.display = 'none';
+            // Link mode reuses the same picker but swaps the invoice-only
+            // pieces (custom lines can't be encoded in a link) for a live
+            // link preview + Copy button.
+            document.getElementById('cart-modal-title').textContent =
+                cartLinkMode ? 'Generate product link' : 'Create invoice';
+            document.getElementById('btn-add-custom-line').style.display = cartLinkMode ? 'none' : '';
+            document.getElementById('cart-invoice-fields').style.display = cartLinkMode ? 'none' : '';
+            document.getElementById('btn-cart-checkout').style.display = cartLinkMode ? 'none' : '';
+            document.getElementById('cart-link-footer').style.display = cartLinkMode ? 'flex' : 'none';
             renderCart();
             document.getElementById('cart-catalog').innerHTML = '<div class="loading"><div class="spinner"></div></div>';
             document.getElementById('modal-cart').classList.add('visible');
@@ -15127,6 +15570,18 @@ header('Cache-Control: no-cache, must-revalidate');
             const wrap = document.getElementById('cart-items');
             const totalEl = document.getElementById('cart-total');
             const checkoutBtn = document.getElementById('btn-cart-checkout');
+            // Keep the link-mode preview in sync with the cart contents.
+            const linkInput = document.getElementById('cart-link-input');
+            const copyLinkBtn = document.getElementById('btn-cart-copy-link');
+            const linkWarning = document.getElementById('cart-link-warning');
+            if (cartLinkMode && linkInput) {
+                linkInput.value = cartItems.length ? (buildSelfServeProductsUrl(cartItems) || '') : '';
+            }
+            if (cartLinkMode && copyLinkBtn) copyLinkBtn.disabled = !cartItems.length;
+            if (cartLinkMode && linkWarning) {
+                const ss = dashboardData?.selfserve;
+                linkWarning.style.display = (ss && !ss.effective) ? '' : 'none';
+            }
             if (!cartItems.length) {
                 wrap.innerHTML = '<p style="color:var(--text-secondary); font-size:0.85rem; margin:0;">Cart is empty. Tap a product to add it.</p>';
                 totalEl.textContent = '';
@@ -15189,6 +15644,138 @@ header('Cache-Control: no-cache, must-revalidate');
                 showToast('Checkout failed', 'error');
                 btn.disabled = false;
             }
+        }
+
+        // ---- Self-serve product links ----
+
+        // Build a public /pay link pre-populated with products: the payUrl for
+        // the current store plus ?products=prod_x:2,prod_y. Product ids and
+        // quantities are URL-safe by construction (prod_<hex> and digits), so
+        // no encoding is needed and the link stays readable.
+        function buildSelfServeProductsUrl(items) {
+            const ss = dashboardData?.selfserve;
+            if (!ss || !ss.payUrl) return null;
+            const spec = items
+                .filter(i => i.productId)
+                .map(i => i.quantity > 1 ? `${i.productId}:${i.quantity}` : i.productId)
+                .join(',');
+            if (!spec) return null;
+            return ss.payUrl + (ss.payUrl.includes('?') ? '&' : '?') + 'products=' + spec;
+        }
+
+        // Copy text to the clipboard synchronously from within a click gesture.
+        // navigator.clipboard.writeText() needs the page's transient user
+        // activation, which is lost the moment the handler awaits a network
+        // call — so callers MUST invoke this before any await, and the enable
+        // step runs afterwards. Falls back to a hidden-textarea execCommand copy
+        // when the async API rejects (older browsers / revoked permission), so
+        // the link still lands on the clipboard instead of silently leaving
+        // whatever was there before.
+        function copyLinkToClipboard(text, successMsg) {
+            const ok = () => showToast(successMsg || 'Copied!', 'success');
+            const legacy = () => {
+                try {
+                    const ta = document.createElement('textarea');
+                    ta.value = text;
+                    ta.style.position = 'fixed';
+                    ta.style.top = '-9999px';
+                    document.body.appendChild(ta);
+                    ta.focus();
+                    ta.select();
+                    const done = document.execCommand('copy');
+                    document.body.removeChild(ta);
+                    return done;
+                } catch (e) { return false; }
+            };
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(text)
+                    .then(ok)
+                    .catch(() => { legacy() ? ok() : showToast('Could not copy — select the link and copy it manually.', 'error'); });
+                return;
+            }
+            legacy() ? ok() : showToast('Could not copy — select the link and copy it manually.', 'error');
+        }
+
+        // Product links only work while self-serve is on for the store. When
+        // it's off, offer to enable it via an in-app modal (NOT a native
+        // confirm(), which browsers silently suppress after repeated dialogs —
+        // the offer would then never appear). Called AFTER the link is already
+        // on the clipboard. No-op when self-serve is already effective or the
+        // store can't take payments (enabling wouldn't make it effective).
+        // Remembers which store the offer is for, so accepting enables the
+        // right store even if the selection changes while the modal is open.
+        let pendingSelfServeStoreId = null;
+        function offerEnableSelfServe() {
+            const ss = dashboardData?.selfserve;
+            if (!ss || ss.effective || !ss.paymentCapable) return;
+            pendingSelfServeStoreId = currentStoreId;
+            document.getElementById('modal-enable-selfserve').classList.add('visible');
+        }
+
+        function confirmEnableSelfServe() {
+            const storeId = pendingSelfServeStoreId || currentStoreId;
+            if (!storeId) { closeModal('modal-enable-selfserve'); return; }
+            const ss = dashboardData?.selfserve;
+            const maxSats = (ss && ss.maxSatsOverride != null) ? ss.maxSatsOverride : '';
+            const btn = document.getElementById('btn-enable-selfserve-confirm');
+            if (btn) btn.disabled = true;
+            postWithCsrf(adminUrl,
+                `action=save_store_selfserve&store_id=${encodeURIComponent(storeId)}&enabled=1&max_sats=${encodeURIComponent(maxSats)}`)
+                .then(r => r.json().then(d => ({ ok: r.ok, d })))
+                .then(({ ok, d }) => {
+                    if (!ok) { showToast(d.error || 'Failed to enable self-serve invoices', 'error'); return; }
+                    showToast('Self-serve invoices enabled', 'success');
+                    return loadDashboard().then(() => {
+                        refreshStoreSelfServeCard();
+                        // Re-render the cart link footer warning if the modal is open.
+                        if (document.getElementById('modal-cart').classList.contains('visible')) renderCart();
+                    });
+                })
+                .catch(() => showToast('Failed to enable self-serve invoices', 'error'))
+                .finally(() => {
+                    if (btn) btn.disabled = false;
+                    closeModal('modal-enable-selfserve');
+                });
+        }
+
+        // Shared pre-copy guard: refuse to hand out a link that can never work
+        // (store has no payment rail), surface the loading state, else return
+        // the self-serve state so the caller can copy + maybe offer to enable.
+        function selfServeLinkState() {
+            const ss = dashboardData?.selfserve;
+            if (!ss) { showToast('Store data is still loading — try again in a moment', 'error'); return null; }
+            if (!ss.paymentCapable) {
+                showToast('This store has no payment method configured (add a Cashu mint or on-chain address first).', 'error');
+                return null;
+            }
+            return ss;
+        }
+
+        function copyProductLink(id) {
+            if (!ensureAdmin('Only admins can manage products.')) return;
+            const p = productsAdminCache.find(x => x.id === id);
+            if (!p) return;
+            if (!p.enabled) {
+                showToast('This product is disabled — enable it first so the link works.', 'error');
+                return;
+            }
+            if (!selfServeLinkState()) return;
+            const url = buildSelfServeProductsUrl([{ productId: id, quantity: 1 }]);
+            if (!url) { showToast('Could not build the link', 'error'); return; }
+            // Copy first (in-gesture), THEN offer to enable self-serve if off.
+            copyLinkToClipboard(url, 'Product link copied!');
+            offerEnableSelfServe();
+        }
+
+        function copyCartLink() {
+            if (!cartItems.length) return;
+            if (!selfServeLinkState()) return;
+            const url = buildSelfServeProductsUrl(cartItems);
+            if (!url) { showToast('Could not build the link', 'error'); return; }
+            const linkInput = document.getElementById('cart-link-input');
+            if (linkInput) linkInput.value = url;
+            copyLinkToClipboard(url, 'Product link copied!');
+            offerEnableSelfServe();
         }
 
         // ---- Admin invoice line-item detail ----

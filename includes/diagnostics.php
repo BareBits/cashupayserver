@@ -41,6 +41,7 @@ class Diagnostics {
      */
     private const SAFE_CONFIG_KEYS = [
         'allow_private_endpoints',
+        'auto_update_enabled',
         'cron_warning_dismissed_at',
         'deployment_id',
         'fee_tracking_start_at',
@@ -57,6 +58,7 @@ class Diagnostics {
         'notifications_invoice_paid_enabled',
         'notifications_auto_cashout_enabled',
         'notifications_payer_receipt_enabled',
+        'notifications_update_available_enabled',
         'setup_complete',
         'update_channel',
         'updater_auto_rollback_dismissed',
@@ -66,6 +68,7 @@ class Diagnostics {
         'updater_last_check',
         'updater_last_rollback',
         'updater_last_update',
+        'updater_notified_sha',
         'updater_pending_verify',
         'url_mode',
     ];

@@ -6,8 +6,9 @@
     column is gone with the site-wide layer) and selecting a column updates
     the underlying mode control.
   - Store-settings card order (Lightning payments between Store Info and
-    Cashu automatic cashout; Submarine Swaps under On-chain; API Keys near
-    the bottom).
+    On-chain Bitcoin payments — the cashout + offline Cashu settings live
+    inside its Cashu section now; Submarine Swaps under On-chain; API Keys
+    near the bottom).
   - Site settings no longer carries the removed site-wide cards (#aw-site,
     swaps, self-serve, on-chain default) but keeps Email Notifications.
   - Stats dashboard charts render (Chart.js loads — regression guard for the
@@ -60,11 +61,14 @@ def test_store_settings_collapsible_and_order(admin_page):
     # API Keys moved to the bottom (just above Danger Zone).
     assert titles.index("API Keys") > titles.index("Hosting Fee")
     assert titles[-1] == "Danger Zone"
-    # Lightning payments (the destination-chain card) sits between Store Info
-    # and the renamed Cashu automatic cashout card.
+    # Lightning payments sits right after Store Info; the cashout and offline
+    # Cashu settings live INSIDE it now (Cashu section), so neither is a card
+    # title any more and On-chain follows directly.
     assert titles.index("Lightning payments") == titles.index("Store Info") + 1
-    assert titles.index("Cashu automatic cashout") == titles.index("Lightning payments") + 1
+    assert titles.index("On-chain Bitcoin payments") == titles.index("Lightning payments") + 1
     assert "Auto-Cashout" not in titles
+    assert "Cashu automatic cashout" not in titles
+    assert "Offline Cashu Acceptance" not in titles
     # Submarine Swaps directly beneath On-chain Bitcoin payments.
     assert titles.index("Submarine Swaps (LN→on-chain)") == titles.index("On-chain Bitcoin payments") + 1
 
@@ -91,6 +95,12 @@ def test_onchain_advanced_collapsed_by_default(admin_page):
 def test_auto_cashout_columns_and_selection(admin_page):
     page, base = admin_page
     _goto(page, base, "stores")
+
+    # The column selector lives in the (default-collapsed) Cashu section of
+    # the Lightning payments card now — expand it to interact.
+    page.evaluate(
+        "document.getElementById('ln-section-cashu').classList.remove('collapsed')"
+    )
 
     cols = page.eval_on_selector_all(
         "#aw-store .aw-col", "els => els.map(e => e.getAttribute('data-aw-mode'))"

@@ -80,6 +80,8 @@ def _walk_wizard_declining_everything(wp: WordPressHandle) -> None:
     wiz.post(step="lightning", lightning_action="skip")
     wiz.post(step="swaps", swaps_enabled="0")
     body = wiz.post(step="mints", mints_enabled="0")
+    assert wizard_heading(body) == "Enable automatic updates?", wizard_heading(body)
+    body = wiz.post(step="updates", auto_update="0")
     heading = wizard_heading(body)
     assert "cron" not in heading.lower(), heading
 

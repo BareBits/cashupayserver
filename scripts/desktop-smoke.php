@@ -4,8 +4,8 @@
  * HTTP surface end to end, the way a merchant's first launch does.
  *
  *   1. A fresh install redirects to the onboarding wizard (200 down the chain).
- *   2. The wizard walks its DESKTOP shape (terms straight to password, an
- *      8-step counter, no cron screen) to completion with mints declined —
+ *   2. The wizard walks its DESKTOP shape (terms straight to password, a
+ *      9-step counter, no cron screen) to completion with mints declined —
  *      no payment rails, so the smoke needs no external services.
  *   3. The admin session works: login, CSRF token, dashboard lists the store.
  *   4. An API key can be minted and authenticates against /api/v1.
@@ -20,8 +20,8 @@
  * against real Apache and nginx containers.
  *
  * The optional shape argument selects which wizard the target shows:
- *   desktop (default)  terms -> password, "of 8", no security or cron screens
- *   server             terms -> security -> password, "of 10" (data dir
+ *   desktop (default)  terms -> password, "of 9", no security or cron screens
+ *   server             terms -> security -> password, "of 11" (data dir
  *                      inside the webroot), cron screen with a crontab line
  *
  * Usage: php desktop-smoke.php <base-url> [desktop|server]   (exit 0 = pass)
@@ -159,8 +159,8 @@ if ($shape === 'desktop') {
     if (heading($body) !== 'Create your admin password') {
         fail("desktop mode must go straight from terms to password, landed on '" . heading($body) . "'", $body);
     }
-    if (strpos($body, 'of 8') === false) {
-        fail('step counter must show the desktop count ("of 8")', $body);
+    if (strpos($body, 'of 9') === false) {
+        fail('step counter must show the desktop count ("of 9")', $body);
     }
 } else {
     if (heading($body) !== 'Quick safety check') {
@@ -168,8 +168,8 @@ if ($shape === 'desktop') {
     }
     // "of 10": full sequence minus zeroconf (no on-chain rail in this walk),
     // with the security screen present (data dir inside the webroot).
-    if (strpos($body, 'of 10') === false) {
-        fail('step counter must show the server count ("of 10")', $body);
+    if (strpos($body, 'of 11') === false) {
+        fail('step counter must show the server count ("of 11")', $body);
     }
     $body = $wpost(['step' => 'security', 'security_acknowledged' => '1']);
     if (heading($body) !== 'Create your admin password') {
@@ -184,10 +184,16 @@ $wpost(['step' => 'onchain', 'onchain_action' => 'skip']);
 $wpost(['step' => 'lightning', 'lightning_action' => 'skip']);
 $wpost(['step' => 'swaps', 'swaps_enabled' => '0']);
 $body = $wpost(['step' => 'mints', 'mints_enabled' => '0']);
+// Both shapes ask the auto-update question after mints; decline it (the
+// safe default) the way a cautious merchant would.
+if (heading($body) !== 'Enable automatic updates?') {
+    fail("declining mints must land on the auto-update screen, landed on '" . heading($body) . "'", $body);
+}
+$body = $wpost(['step' => 'updates', 'auto_update' => '0']);
 
 if ($shape === 'desktop') {
     if (heading($body) !== "You're all set!") {
-        fail("declining mints must land on the completion screen, landed on '" . heading($body) . "'", $body);
+        fail("declining auto-update must land on the completion screen, landed on '" . heading($body) . "'", $body);
     }
     if (strpos($body, 'Background jobs run automatically') === false) {
         fail('completion screen must carry the desktop background-jobs note', $body);
@@ -198,7 +204,7 @@ if ($shape === 'desktop') {
     ok('onboarding wizard completes in its desktop shape (no security or cron screens)');
 } else {
     if (heading($body) !== 'Enable cron') {
-        fail("declining mints must land on the cron screen, landed on '" . heading($body) . "'", $body);
+        fail("declining auto-update must land on the cron screen, landed on '" . heading($body) . "'", $body);
     }
     if (stripos($body, 'crontab') === false) {
         fail('server cron screen must show the crontab instructions', $body);

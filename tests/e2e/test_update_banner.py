@@ -1,9 +1,13 @@
 """Browser e2e for the manual-update banner + Auto-update card status.
 
 Covers the user-facing surface of the manual-update feature:
-  - The dashboard "update available" banner appears (with the version) when the
-    cached availability verdict says a newer build exists, and stays hidden when
-    the install is current.
+  - The "update available" banner appears (with the version) when the cached
+    availability verdict says a newer build exists — on EVERY admin view, not
+    just the dashboard (auto-update is off by default, so the nudge must not
+    be missable) — and stays hidden when the install is current.
+  - The Auto-update card's opt-in toggle persists the DB-backed
+    auto_update_enabled key both ways, and the notifications card's
+    "update available" email checkbox defaults on.
   - The Auto-update settings card reflects the availability verdict and exposes
     an "Update now" button.
   - In the dev/test stack the updater is intentionally disabled (the
@@ -73,6 +77,102 @@ def test_banner_shows_when_update_available(admin_page):
     # The security/urgency wording the user asked for.
     assert "security" in text.lower()
     assert page.locator("#btn-update-now-banner").is_visible()
+
+
+def test_banner_shows_on_every_admin_view(admin_page):
+    """The banner lives above the view containers, so switching to settings,
+    invoices, etc. must keep it on screen — an operator who never opens the
+    dashboard still sees the nudge."""
+    page, configured = admin_page
+    _set_config(configured.handle, "updater_available", {
+        "available": True,
+        "channel": "main",
+        "latest_version": "9.9.9-test",
+        "latest_sha": "f" * 40,
+        "current_version": "0.0-old",
+        "blocked": False,
+        "checked_at": int(time.time()),
+    })
+
+    for view in ("settings", "invoices", "stores"):
+        page.goto(f"{configured.handle.url}/admin/{view}", wait_until="networkidle")
+        page.wait_for_timeout(1500)
+        banner = page.locator("#update-available-banner")
+        assert banner.is_visible(), f"banner should be visible on the {view} view"
+        assert "9.9.9-test" in banner.inner_text(), (
+            f"banner on the {view} view should name the available version"
+        )
+
+
+def test_auto_update_toggle_persists_both_ways(admin_page):
+    """The Auto-update card's opt-in toggle writes the DB-backed
+    auto_update_enabled key that Updater::isAutoUpdateEnabled consults. It
+    starts off (the default), saves on on change, and saves off again."""
+    page, configured = admin_page
+
+    def gate_state():
+        return page.evaluate(
+            """async (base) => {
+                const r = await fetch(base + '/admin?api=update_status', { credentials: 'same-origin' });
+                const d = await r.json();
+                return { enabled: d.auto_update_enabled, source: d.auto_update_source };
+            }""",
+            configured.handle.url,
+        )
+
+    page.goto(f"{configured.handle.url}/admin/settings", wait_until="networkidle")
+    page.wait_for_timeout(1500)
+
+    toggle = page.locator("#auto-update-enabled")
+    slider = page.locator("#auto-update-enabled + .toggle-slider")
+    assert not toggle.is_checked(), "automatic updates must default to off"
+    assert gate_state() == {"enabled": False, "source": None}
+
+    # The <input> is CSS-hidden (opacity 0); the slider is the click target.
+    slider.click()
+    page.wait_for_timeout(800)
+    assert gate_state() == {"enabled": True, "source": "db"}, (
+        "flipping the toggle on must persist the DB opt-in"
+    )
+
+    # Survives a reload (state comes from update_status, not the DOM).
+    page.goto(f"{configured.handle.url}/admin/settings", wait_until="networkidle")
+    page.wait_for_timeout(1500)
+    toggle = page.locator("#auto-update-enabled")
+    assert toggle.is_checked(), "the saved opt-in must be reflected after reload"
+
+    page.locator("#auto-update-enabled + .toggle-slider").click()
+    page.wait_for_timeout(800)
+    assert gate_state() == {"enabled": False, "source": None}, (
+        "flipping the toggle off must close the gate again"
+    )
+
+
+def test_update_email_checkbox_defaults_on(admin_page):
+    """The notifications card's per-type 'update available' checkbox defaults
+    ON (unlike the other per-type toggles) and persists an explicit off."""
+    page, configured = admin_page
+    page.goto(f"{configured.handle.url}/admin/settings", wait_until="networkidle")
+    page.wait_for_timeout(1500)
+
+    box = page.locator("#notifications-update-available")
+    assert box.is_checked(), "the update email checkbox must default to on"
+
+    # CSS-hidden checkbox; the slider is the click target.
+    page.locator("#notifications-update-available + .toggle-slider").click()
+    page.click("#btn-save-notifications")
+    page.wait_for_timeout(800)
+
+    page.goto(f"{configured.handle.url}/admin/settings", wait_until="networkidle")
+    page.wait_for_timeout(1500)
+    assert not page.locator("#notifications-update-available").is_checked(), (
+        "an explicit off must persist"
+    )
+
+    # Leave the store the way we found it.
+    page.locator("#notifications-update-available + .toggle-slider").click()
+    page.click("#btn-save-notifications")
+    page.wait_for_timeout(800)
 
 
 def test_banner_hidden_when_current(admin_page):
