@@ -73,28 +73,6 @@ BareBits sits between custodial payment gateways and full self-hosting:
 
 Magneto & all other e-commerce installations -- Install BareBits standalone using the web method, then download the [BTCPay Plugin for your platform](https://docs.btcpayserver.org/FAQ/Integrations/#what-e-commerce-integrations-are-available) and point it at your BareBits URL.
 
-## Suggested Payment Configurations
-BareBits is robust payment software that can direct payments to you via many methods depending on your security and speed needs. Below are several suggested setups. No matter which setup you choose, on-chain payments will ALWAYS go to your on-chain wallet (unless you have a Strike account enabled, in which case, payments go to your Strike account). Lightning payments can take several paths depending on your needs.
-
-### Dead simple setup with automatic USD conversion
-- Get an account at [strike.me](https://strike.me) and enable USD conversion in settings. Strike works in over 100 countries and native fiat currencies.
-- In the [Strike dashboard](https://dashboard.strike.me/), create an API key with only the **create invoices**, **generate invoice quotes**, **create receive requests**, and **read invoices** scopes, and paste it into the "Strike API" section of the setup wizard (or the store's Lightning payments settings). A key with just those scopes can create and verify invoices but cannot spend funds from your account.
-- Note: a Strike *lightning address* (…@strike.me) can NOT be used in the LNURL box — Strike addresses don't support LUD-21 payment verification, so BareBits could never confirm a payment against one. The API key method above works fully.
-- ⚠️ Strike is a custodial exchange that holds onto funds for you, which means there is risk they may take or lose them. Don't keep significant funds on exchanges.
-- ⚠️ Strike does not work with all kinds of merchants
-  
-### Full self-custody setup (suggested, no USD conversion):
-- Run an [Electrum](https://electrum.org/) wallet on your desktop computer and enable the [automatic liquidity management plugin](https://github.com/BareBits/electrum_liquidity). Keep $100 or so in the wallet to keep liquidity flowing smoothly. You can start with zero and build up gradually as payments arrive. See "How to get an LNURL, NWC connection, or CLINK Noffer". Find your xpub in the "wallet information" section.
-- Enable submarine swaps as a fallback in case your desktop is offline or doesn't have sufficient inbound liquidity.
-- Suggestion: leave "strict mode" disabled. If your electrum wallet is unavailable AND a payment would be uneconomical to do a submarine swap for, lightning payments will land in a cashu mint (custodial) and be automatically withdrawn to your Electrum wallet once you have sufficient inbound liquidity OR will be withdrawn on-chain once it's economically reasonable.
-- Need USD or other fiat currency? See [our suggestions](https://getbarebits.com/help/Understanding%20Bitcoin/fiat%20conversion%20options/) for exchanges.
-
-### On-chain Absolutist
-Don't want to mess around with LNURLs or CLINK noffers? Just want everything to go to your cold on-chain wallet? No problem!
-- Get an xpub or bare address from your wallet, add it to your BareBits store configuration
-- Want your customers to be able to pay with lightning? Enable submarine swaps: your customers pay in lightning, you get funds on-chain
-- Suggested: allow fallback to mint (strict mode disabled, the default) so smaller lightning payments are workable. Submarine swap providers won't let you make swaps < around $25. Funds will be temporarily stored in the cashu mint, then forwarded to you on-chain when fees permit.
-
 ## Installation
 
 ### Web Install (Any PHP Hosting)
@@ -125,7 +103,29 @@ BareBits integrates with most ecommerce platforms including woocommerce, magneto
 2. When asked to input your BTCPayServer URL, input your store API URL instead. You can find this URL in the store settings
 
 #### WooCommerce
-Have WooCommerce? Install the **BareBits** plugin in WordPress — grab the plugin zip from the [latest GitHub release](https://github.com/BareBits/cashupayserver/releases/latest) and upload it via Plugins → Add New (or install it from the WordPress plugin directory once listed). During onboarding, either connect an existing BareBits server by URL, or let the plugin install BareBits alongside your WordPress site automatically. Easy peasy!
+Have WooCommerce? Install the **BareBits** plugin in WordPress — grab the plugin zip from the [latest GitHub release](https://github.com/BareBits/cashupayserver/releases/latest) and upload it via Plugins → Add New. During onboarding, either connect an existing BareBits server by URL, or let the plugin install BareBits alongside your WordPress site automatically. Easy peasy!
+
+## Suggested Payment Configurations
+BareBits is robust payment software that can direct payments to you via many methods depending on your security and speed needs. Below are several suggested setups. No matter which setup you choose, on-chain payments will ALWAYS go to your on-chain wallet (unless you have a Strike account enabled, in which case, payments go to your Strike account). Lightning payments can take several paths depending on your needs.
+
+### Dead simple setup with automatic USD conversion
+- Get an account at [strike.me](https://strike.me) and enable USD conversion in settings. Strike works in over 100 countries and native fiat currencies.
+- In the [Strike dashboard](https://dashboard.strike.me/), create an API key with only the **create invoices**, **generate invoice quotes**, **create receive requests**, and **read invoices** scopes, and paste it into the "Strike API" section of the setup wizard (or the store's Lightning payments settings). A key with just those scopes can create and verify invoices but cannot spend funds from your account.
+- Note: a Strike *lightning address* (…@strike.me) can NOT be used in the LNURL box — Strike addresses don't support LUD-21 payment verification, so BareBits could never confirm a payment against one. The API key method above works fully.
+- ⚠️ Strike is a custodial exchange that holds onto funds for you, which means there is risk they may take or lose them. Don't keep significant funds on exchanges.
+- ⚠️ Strike does not work with all kinds of merchants
+  
+### Full self-custody setup (suggested, no USD conversion):
+- Run an [Electrum](https://electrum.org/) wallet on your desktop computer and enable the [automatic liquidity management plugin](https://github.com/BareBits/electrum_liquidity). Keep $100 or so in the wallet to keep liquidity flowing smoothly. You can start with zero and build up gradually as payments arrive. See "How to get an LNURL, NWC connection, or CLINK Noffer". Find your xpub in the "wallet information" section.
+- Enable submarine swaps as a fallback in case your desktop is offline or doesn't have sufficient inbound liquidity.
+- Suggestion: leave "strict mode" disabled. If your electrum wallet is unavailable AND a payment would be uneconomical to do a submarine swap for, lightning payments will land in a cashu mint (custodial) and be automatically withdrawn to your Electrum wallet once you have sufficient inbound liquidity OR will be withdrawn on-chain once it's economically reasonable.
+- Need USD or other fiat currency? See [our suggestions](https://getbarebits.com/help/Understanding%20Bitcoin/fiat%20conversion%20options/) for exchanges.
+
+### On-chain Absolutist
+Don't want to mess around with LNURLs or CLINK noffers? Just want everything to go to your cold on-chain wallet? No problem!
+- Get an xpub or bare address from your wallet, add it to your BareBits store configuration
+- Want your customers to be able to pay with lightning? Enable submarine swaps: your customers pay in lightning, you get funds on-chain
+- Suggested: allow fallback to mint (strict mode disabled, the default) so smaller lightning payments are workable. Submarine swap providers won't let you make swaps < around $25. Funds will be temporarily stored in the cashu mint, then forwarded to you on-chain when fees permit.
 
 ## Payment Flow
 
