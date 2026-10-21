@@ -21,18 +21,19 @@ BareBits supports a number of payment types, risk/trust levels, and capabilities
  
 
 ### Key Features
-- **Any PHP hosting** - Works on $3/month shared hosting.
+- **Any PHP hosting** - Works on $3/month shared hosting. 
 - **No application or approval process** - Just download and run!
-- **Self-custody** - A fully self-custody solution, or add Cashu mint or Strike support for increased convenience. 
+- **Self-custody** - A fully self-custody solution, or add Cashu mint or Strike support for increased convenience.
+- **Multiple stores** - Each store can have it's own invoice settings, cashout addresses, etc.
+- **Tip Jar** - Let customers make their own payments using a shared link. Links can be generic (any amount) or for specific products.
 - **E-commerce integration** - Plugin for WooCommerce. On magneto, shopify, or another platform? Use the BTCPay plugin and point it to your BareBits URL.
 - **On-chain payments** to an off-server wallet using xpub addresses or even a single address
 - **Lightning payments** to your off-server wallet via LNURL lightning address, CLINK noffer, or NWC (nostr wallet connect), or Strike API. Also supports using a cashu mint (no need to manage liquidity). We suggest ([Electrum](https://electrum.org/) for self-custody setups). Multiple wallets and connection types are supported so payments gracefully fall back to whichever wallet is online + has sufficient inbound liquidity.
-- **Submarine swaps** - If your lightning destination is offline or lacks sufficient inbound liquidity, you can still accept lightning payments via submarine swaps (Boltz and Zeus). Your customer's can pay in lightning but you receive the funds on-chain. Your customer pays the swap fee.
-- **Multiple stores** - Each store can have it's own invoice settings, cashout addresses, etc.
 - **User management** - Admin users can modify store settings and products and withdraw funds, regular users can only take payments.
 - **Product management** - Add commonly-used products to your store to make invoicing fast and clear
 - **Receipts** E-mail receipts to your customers (optional) and collect their e-mail addresses for your newsletter
 - **Private** - No telemetry, no analytics, no phone-home. [PRIVACY.md](PRIVACY.md) documents every external service the server can contact and exactly what each one sees.
+- **Submarine swaps** - If your lightning destination is offline or lacks sufficient inbound liquidity, you can still accept lightning payments via submarine swaps (Boltz and Zeus). Your customer's can pay in lightning but you receive the funds on-chain. Your customer pays the swap fee.
  - **Offline** payments powered by Cashu tokens (optional), melded to lightning when back online. You choose which mints to trust tokens from.
 - **Open source** - Read every line of code. Fork it, audit it yourself, and modify it to your liking. Dual-licensed MIT (pre-2026-05-30) and Modified MIT (post-2026-05-30). See [LICENSE.md](LICENSE.md) and [USE_POLICY.md](USE_POLICY.md).
 
