@@ -121,18 +121,22 @@ def test_copy_product_link_prompts_to_enable_selfserve(
     _login(configured, page)
     _goto_products_view(page)
     row = page.locator("#products-admin-list > div", has_text=title)
-    # Self-serve is off: accepting the confirm enables it and copies the link.
-    page.once("dialog", lambda d: d.accept())
+    # Self-serve is off: clicking Copy copies the link in-gesture AND opens the
+    # in-app enable modal (an app modal, NOT a native confirm() the browser can
+    # suppress). Accepting it turns self-serve on.
     row.get_by_role("button", name="Copy link").click()
-    page.wait_for_function(
-        "() => dashboardData && dashboardData.selfserve && dashboardData.selfserve.effective"
-    )
+    page.wait_for_selector("#modal-enable-selfserve.visible")
     page.wait_for_function(
         "() => navigator.clipboard.readText().then(t => t.includes('products='))"
     )
     clipboard = page.evaluate("navigator.clipboard.readText()")
     assert f"products={pid}" in clipboard
     assert "/pay" in clipboard
+    page.click("#btn-enable-selfserve-confirm")
+    page.wait_for_function(
+        "() => dashboardData && dashboardData.selfserve && dashboardData.selfserve.effective"
+    )
+    page.wait_for_selector("#modal-enable-selfserve", state="hidden")
     with configured.handle.db() as db:
         row_db = db.execute(
             "SELECT selfserve_enabled FROM stores WHERE id = ?", (configured.store_id,)
@@ -208,14 +212,19 @@ def test_generate_link_warns_when_selfserve_off(
     # Off-state warning is visible.
     assert page.locator("#cart-link-warning").is_visible()
 
-    # Copy link copies the link AND offers to enable; accept the prompt.
-    page.once("dialog", lambda d: d.accept())
+    # Copy link copies the link AND opens the in-app enable modal (not a native
+    # confirm the browser can suppress). It stacks above the still-open cart
+    # modal; accepting enables self-serve.
     page.click("#btn-cart-copy-link")
+    page.wait_for_selector("#modal-enable-selfserve.visible")
+    assert page.locator("#modal-cart").evaluate("el => el.classList.contains('visible')")
+    clipboard = page.evaluate("navigator.clipboard.readText()")
+    assert f"products={pid}" in clipboard
+    page.click("#btn-enable-selfserve-confirm")
     page.wait_for_function(
         "() => dashboardData && dashboardData.selfserve && dashboardData.selfserve.effective"
     )
-    clipboard = page.evaluate("navigator.clipboard.readText()")
-    assert f"products={pid}" in clipboard
-    # Enabling cleared the off-state warning.
+    page.wait_for_selector("#modal-enable-selfserve", state="hidden")
+    # Enabling cleared the off-state warning in the still-open cart modal.
     page.wait_for_selector("#cart-link-warning", state="hidden")
     page.evaluate("() => closeModal('modal-cart')")

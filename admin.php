@@ -7696,6 +7696,22 @@ header('Cache-Control: no-cache, must-revalidate');
         </div>
     </div>
 
+    <!-- Offer to enable self-serve for a product link. An in-app modal (not a
+         native confirm(), which browsers can suppress). z-index sits above the
+         cart modal so it stacks correctly when opened from the link generator. -->
+    <div class="modal-overlay" id="modal-enable-selfserve" style="z-index: 300;">
+        <div class="modal">
+            <div class="modal-handle"></div>
+            <div class="modal-title">Enable self-serve invoices?</div>
+            <p style="color:var(--text-secondary); font-size:0.9rem; margin:0 0 1rem 0;">
+                Self-serve invoices are off for this store, so the link you just
+                copied won't work until you turn them on.
+            </p>
+            <button class="btn btn-full" id="btn-enable-selfserve-confirm">Enable self-serve invoices</button>
+            <button class="btn btn-secondary btn-full" style="margin-top: 0.5rem;" onclick="closeModal('modal-enable-selfserve')">Not now</button>
+        </div>
+    </div>
+
     <!-- Product create/edit (admin) -->
     <div class="modal-overlay" id="modal-product-edit">
         <div class="modal">
@@ -8335,6 +8351,8 @@ header('Cache-Control: no-cache, must-revalidate');
             if (btnProductsLink) btnProductsLink.addEventListener('click', () => openCartModal({ linkMode: true }));
             const btnCartCopyLink = document.getElementById('btn-cart-copy-link');
             if (btnCartCopyLink) btnCartCopyLink.addEventListener('click', copyCartLink);
+            const btnEnableSelfServe = document.getElementById('btn-enable-selfserve-confirm');
+            if (btnEnableSelfServe) btnEnableSelfServe.addEventListener('click', confirmEnableSelfServe);
             const prodSortSel = document.getElementById('products-default-sort');
             if (prodSortSel) prodSortSel.addEventListener('change', saveProductDefaultSort);
             wireCartModal();
@@ -15474,19 +15492,30 @@ header('Cache-Control: no-cache, must-revalidate');
         }
 
         // Product links only work while self-serve is on for the store. When
-        // it's off, offer to enable it on the spot (keeping any configured max).
-        // Runs AFTER the link is already on the clipboard (see above), so the
-        // network call here can't strip the clipboard gesture. No-op when
-        // self-serve is already effective or the store can't take payments.
+        // it's off, offer to enable it via an in-app modal (NOT a native
+        // confirm(), which browsers silently suppress after repeated dialogs —
+        // the offer would then never appear). Called AFTER the link is already
+        // on the clipboard. No-op when self-serve is already effective or the
+        // store can't take payments (enabling wouldn't make it effective).
+        // Remembers which store the offer is for, so accepting enables the
+        // right store even if the selection changes while the modal is open.
+        let pendingSelfServeStoreId = null;
         function offerEnableSelfServe() {
             const ss = dashboardData?.selfserve;
             if (!ss || ss.effective || !ss.paymentCapable) return;
-            if (!confirm('Self-serve invoices are not enabled for this store, so this link will not work until you turn them on.\n\nEnable self-serve invoices now?')) {
-                return;
-            }
-            const maxSats = ss.maxSatsOverride ?? '';
+            pendingSelfServeStoreId = currentStoreId;
+            document.getElementById('modal-enable-selfserve').classList.add('visible');
+        }
+
+        function confirmEnableSelfServe() {
+            const storeId = pendingSelfServeStoreId || currentStoreId;
+            if (!storeId) { closeModal('modal-enable-selfserve'); return; }
+            const ss = dashboardData?.selfserve;
+            const maxSats = (ss && ss.maxSatsOverride != null) ? ss.maxSatsOverride : '';
+            const btn = document.getElementById('btn-enable-selfserve-confirm');
+            if (btn) btn.disabled = true;
             postWithCsrf(adminUrl,
-                `action=save_store_selfserve&store_id=${encodeURIComponent(currentStoreId)}&enabled=1&max_sats=${encodeURIComponent(maxSats)}`)
+                `action=save_store_selfserve&store_id=${encodeURIComponent(storeId)}&enabled=1&max_sats=${encodeURIComponent(maxSats)}`)
                 .then(r => r.json().then(d => ({ ok: r.ok, d })))
                 .then(({ ok, d }) => {
                     if (!ok) { showToast(d.error || 'Failed to enable self-serve invoices', 'error'); return; }
@@ -15497,7 +15526,11 @@ header('Cache-Control: no-cache, must-revalidate');
                         if (document.getElementById('modal-cart').classList.contains('visible')) renderCart();
                     });
                 })
-                .catch(() => showToast('Failed to enable self-serve invoices', 'error'));
+                .catch(() => showToast('Failed to enable self-serve invoices', 'error'))
+                .finally(() => {
+                    if (btn) btn.disabled = false;
+                    closeModal('modal-enable-selfserve');
+                });
         }
 
         // Shared pre-copy guard: refuse to hand out a link that can never work
