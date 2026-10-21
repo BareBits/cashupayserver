@@ -56,6 +56,62 @@ $storeName = $store['name'] ?? 'Payment';
 $allowedCurrencies = SelfServe::allowedCurrencies($storeId);
 $maxSats = SelfServe::effectiveMaxSats($storeId);
 
+// ---------------------------------------------------------------------------
+// Product mode: a ?products=prod_x:2,prod_y link pre-populates a fixed order
+// (products + quantities chosen by the merchant). The customer can only add an
+// optional tip and pay. Missing/disabled products are dropped with a notice;
+// a malformed parameter or a link with nothing left 404s like a bad store.
+// ---------------------------------------------------------------------------
+$productMode = isset($_GET['products']) && trim((string)$_GET['products']) !== '';
+$linkItems = [];        // [['product' => row, 'quantity' => int], ...]
+$droppedCount = 0;
+$pricedLines = [];      // Cart::priceItems lines, for display
+$subtotalSats = 0;
+$pricingError = null;   // rates unavailable etc. — page renders but can't price
+$tipCurrency = SelfServe::defaultCurrency($storeId);
+$tipRateSatsPerUnit = null; // client-side tip preview only; server recomputes
+
+/** Map link items to the Cart::priceItems/checkout input shape. */
+function selfserve_cart_items(array $linkItems): array {
+    return array_map(
+        fn($li) => ['product_id' => $li['product']['id'], 'quantity' => $li['quantity']],
+        $linkItems
+    );
+}
+
+if ($productMode) {
+    require_once __DIR__ . '/includes/cart.php';
+    require_once __DIR__ . '/includes/products.php';
+    try {
+        $parsed = SelfServe::parseProductsParam($storeId, (string)$_GET['products']);
+    } catch (SelfServeValidationException $e) {
+        selfserve_not_found();
+    }
+    $linkItems = $parsed['items'];
+    $droppedCount = $parsed['dropped'];
+    if (empty($linkItems)) {
+        selfserve_not_found();
+    }
+    try {
+        $priced = Cart::priceItems($storeId, selfserve_cart_items($linkItems));
+        $pricedLines = $priced['lines'];
+        $subtotalSats = $priced['totalSats'];
+        if (strtolower($tipCurrency) !== 'sat') {
+            // Sats per 1 unit of the store currency, with the store's exchange
+            // fee — matches how a custom fiat tip will be priced at submit.
+            $tipRateSatsPerUnit = ExchangeRates::convertToMintUnit(
+                '1', $tipCurrency, 'sat',
+                (float)($store['exchange_fee_percent'] ?? 0),
+                $store['price_provider_primary'] ?? 'coingecko',
+                $store['price_provider_secondary'] ?? 'binance'
+            );
+        }
+    } catch (Throwable $e) {
+        error_log('[selfserve] product pricing failed for store ' . $storeId . ': ' . $e->getMessage());
+        $pricingError = 'Could not get an exchange rate right now. Please try again shortly.';
+    }
+}
+
 // Values echoed back into the form so a validation error doesn't wipe what the
 // customer typed.
 $formAmount = '';
@@ -63,9 +119,58 @@ $formAmount = '';
 // stores). Always one of $allowedCurrencies.
 $formCurrency = SelfServe::defaultCurrency($storeId);
 $formNotes = '';
+$formTipMode = '';
+$formTipPercent = '';
+$formTipAmount = '';
 $error = null;
 
-if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && $productMode) {
+    $formNotes      = (string)($_POST['notes'] ?? '');
+    $formTipMode    = (string)($_POST['tip_mode'] ?? '');
+    $formTipPercent = (string)($_POST['tip_percent'] ?? '');
+    $formTipAmount  = (string)($_POST['tip_amount'] ?? '');
+
+    try {
+        // Same unauthenticated-creation rate limit as the simple form below.
+        $ip = Security::getClientIp();
+        if (!Security::checkRateLimit('selfserve_create', $ip, 10)) {
+            throw new SelfServeValidationException('Too many requests. Please wait a minute and try again.');
+        }
+
+        $notes = SelfServe::validateNotes($formNotes);
+        if ($pricingError !== null) {
+            throw new SelfServeValidationException($pricingError);
+        }
+
+        $items = selfserve_cart_items($linkItems);
+        $tipLine = SelfServe::buildTipLine($storeId, $formTipMode, $formTipPercent, $formTipAmount, $subtotalSats);
+        if ($tipLine !== null) {
+            $items[] = $tipLine;
+        }
+
+        // The per-store self-serve maximum applies to the full total, tip
+        // included. Re-price with the tip line so a fiat tip uses the same
+        // conversion the invoice will.
+        $totalSats = $tipLine === null ? $subtotalSats : Cart::priceItems($storeId, $items)['totalSats'];
+        SelfServe::assertWithinMax($storeId, $totalSats);
+
+        // Cart::checkout creates the invoice + persists the invoice_items
+        // snapshots (products and the tip line), exactly like the admin cart.
+        $memo = $notes !== '' ? $notes : count($linkItems) . ' item(s)';
+        $result = Cart::checkout($storeId, $items, $memo);
+
+        header('Location: ' . Urls::payment($result['invoiceId']));
+        exit;
+    } catch (SelfServeValidationException $e) {
+        $error = $e->getMessage();
+    } catch (Throwable $e) {
+        // Never leak internal detail to the public page.
+        error_log('[selfserve] product invoice creation failed for store ' . $storeId . ': ' . $e->getMessage());
+        $error = 'Could not create the invoice right now. Please try again later.';
+    }
+}
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && !$productMode) {
     $formAmount   = (string)($_POST['amount'] ?? '');
     $formCurrency = (string)($_POST['currency'] ?? SelfServe::defaultCurrency($storeId));
     $formNotes    = (string)($_POST['notes'] ?? '');
@@ -202,18 +307,202 @@ $hasFiat = count($allowedCurrencies) > 1;
             margin-bottom: 1.1rem;
             text-align: left;
         }
+        .notice {
+            background: rgba(247, 147, 26, 0.12);
+            color: #fbd38d;
+            border: 1px solid rgba(247, 147, 26, 0.35);
+            border-radius: 12px;
+            padding: 0.7rem 1rem;
+            font-size: 0.85rem;
+            margin-bottom: 1.1rem;
+            text-align: left;
+        }
+        .items {
+            background: rgba(0, 0, 0, 0.25);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-radius: 12px;
+            padding: 0.4rem 0.9rem;
+            margin-bottom: 1.1rem;
+            text-align: left;
+        }
+        .item-row {
+            display: flex;
+            align-items: center;
+            gap: 0.6rem;
+            padding: 0.55rem 0;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+            font-size: 0.9rem;
+        }
+        .item-img {
+            width: 36px; height: 36px; border-radius: 8px; flex-shrink: 0;
+            display: flex; align-items: center; justify-content: center;
+            background: rgba(0, 0, 0, 0.3); overflow: hidden; font-size: 1.25rem;
+        }
+        .item-img img { width: 100%; height: 100%; object-fit: cover; }
+        .item-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+        .item-qty { color: var(--text-secondary); font-size: 0.8rem; }
+        .item-amount { text-align: right; white-space: nowrap; }
+        .item-fiat { display: block; color: var(--text-secondary); font-size: 0.75rem; }
+        .subtotal-row {
+            display: flex; justify-content: space-between; padding: 0.6rem 0 0.35rem;
+            font-size: 0.9rem; color: var(--text-secondary);
+        }
+        .total-row {
+            display: flex; justify-content: space-between; align-items: baseline;
+            font-weight: 600; font-size: 1rem; margin-bottom: 1.1rem; text-align: left;
+        }
+        .tip-row { display: flex; gap: 0.4rem; flex-wrap: wrap; }
+        .tip-btn {
+            flex: 1 1 auto;
+            background: rgba(0, 0, 0, 0.3);
+            border: 1px solid rgba(255, 255, 255, 0.12);
+            border-radius: 10px;
+            color: var(--text-primary);
+            padding: 0.5rem 0.6rem;
+            font-size: 0.85rem;
+            cursor: pointer;
+            transition: border-color 0.2s, background 0.2s;
+        }
+        .tip-btn.active {
+            border-color: var(--accent);
+            background: rgba(247, 147, 26, 0.18);
+        }
     </style>
 </head>
 <body>
     <div class="card">
         <div class="logo">⚡</div>
         <div class="merchant-name"><?= htmlspecialchars($storeName) ?></div>
-        <div class="subtitle">Enter an amount to generate a payment</div>
+        <div class="subtitle"><?= $productMode ? 'Review your order and pay' : 'Enter an amount to generate a payment' ?></div>
 
         <?php if ($error !== null): ?>
             <div class="error"><?= htmlspecialchars($error) ?></div>
         <?php endif; ?>
 
+        <?php if ($productMode && $droppedCount > 0): ?>
+            <div class="notice">Some items in this link are no longer available.</div>
+        <?php endif; ?>
+
+        <?php if ($productMode && $pricingError !== null): ?>
+            <?php if ($error === null): ?>
+                <div class="error"><?= htmlspecialchars($pricingError) ?></div>
+            <?php endif; ?>
+            <a class="btn" href="" style="display:block; text-decoration:none;">Try again</a>
+        <?php elseif ($productMode): ?>
+        <!-- POSTs back to the same URL (incl. ?products=…) so the order is
+             re-resolved and re-priced server-side on submit. -->
+        <form method="POST" autocomplete="off">
+            <div class="items">
+                <?php foreach ($pricedLines as $ln): ?>
+                    <div class="item-row">
+                        <div class="item-img"><?php
+                            if ($ln['image_type'] === 'upload' && $ln['image_value']) {
+                                echo '<img src="' . htmlspecialchars(Product::imageUrl((string)$ln['image_value'])) . '" alt="">';
+                            } else {
+                                echo htmlspecialchars(($ln['image_type'] === 'emoji' && $ln['image_value']) ? $ln['image_value'] : "\u{1F4E6}");
+                            }
+                        ?></div>
+                        <div class="item-title">
+                            <?= htmlspecialchars($ln['title']) ?>
+                            <span class="item-qty">&times;<?= (int)$ln['quantity'] ?></span>
+                        </div>
+                        <div class="item-amount">
+                            <?= number_format((int)$ln['amount_sats']) ?> sats
+                            <?php if ($ln['display_amount'] !== null && strtolower((string)$ln['display_currency']) !== 'sat'): ?>
+                                <span class="item-fiat">&asymp; <?= htmlspecialchars(number_format((float)$ln['display_amount'], 2)) ?> <?= htmlspecialchars(strtoupper((string)$ln['display_currency'])) ?></span>
+                            <?php endif; ?>
+                        </div>
+                    </div>
+                <?php endforeach; ?>
+                <div class="subtotal-row">
+                    <span>Subtotal</span>
+                    <span><?= number_format($subtotalSats) ?> sats</span>
+                </div>
+            </div>
+
+            <div class="form-group">
+                <label class="form-label">Add a tip <span style="opacity:0.6;">(optional)</span></label>
+                <div class="tip-row">
+                    <button type="button" class="tip-btn" data-tip-mode="none">No tip</button>
+                    <?php foreach (SelfServe::TIP_PERCENT_PRESETS as $pct): ?>
+                        <button type="button" class="tip-btn" data-tip-mode="percent" data-tip-percent="<?= (int)$pct ?>"><?= (int)$pct ?>%</button>
+                    <?php endforeach; ?>
+                    <button type="button" class="tip-btn" data-tip-mode="custom">Custom</button>
+                </div>
+                <div class="amount-row" id="tip-custom-row" style="display:none; margin-top:0.5rem;">
+                    <input type="text" inputmode="decimal" class="form-input" id="tip-amount" name="tip_amount"
+                           value="<?= htmlspecialchars($formTipAmount) ?>" placeholder="0">
+                    <span class="form-input" style="display:flex;align-items:center;color:var(--text-secondary);">
+                        <?= strtolower($tipCurrency) === 'sat' ? 'SATS' : htmlspecialchars(strtoupper($tipCurrency)) ?>
+                    </span>
+                </div>
+                <input type="hidden" name="tip_mode" id="tip-mode" value="<?= htmlspecialchars($formTipMode) ?>">
+                <input type="hidden" name="tip_percent" id="tip-percent" value="<?= htmlspecialchars($formTipPercent) ?>">
+            </div>
+
+            <div class="form-group">
+                <label class="form-label" for="notes">Note <span style="opacity:0.6;">(optional)</span></label>
+                <input type="text" class="form-input" id="notes" name="notes"
+                       maxlength="<?= SelfServe::NOTES_MAX_LEN ?>"
+                       value="<?= htmlspecialchars($formNotes) ?>" placeholder="What's this payment for?">
+            </div>
+
+            <div class="total-row">
+                <span>Total</span>
+                <span id="ss-total"><?= number_format($subtotalSats) ?> sats</span>
+            </div>
+
+            <button type="submit" class="btn">Continue to payment</button>
+        </form>
+        <script>
+        (function() {
+            var SUBTOTAL = <?= (int)$subtotalSats ?>;
+            // Sats per 1 unit of the store currency (null when the store prices
+            // in sats). Client-side tip PREVIEW only — the server re-prices the
+            // tip with live rates on submit.
+            var TIP_RATE = <?= $tipRateSatsPerUnit !== null ? (int)$tipRateSatsPerUnit : 'null' ?>;
+            var modeEl = document.getElementById('tip-mode');
+            var pctEl = document.getElementById('tip-percent');
+            var amtEl = document.getElementById('tip-amount');
+            var customRow = document.getElementById('tip-custom-row');
+            var totalEl = document.getElementById('ss-total');
+            var btns = Array.prototype.slice.call(document.querySelectorAll('.tip-btn'));
+            function fmt(n) { return n.toLocaleString() + ' sats'; }
+            function tipSats() {
+                if (modeEl.value === 'percent') {
+                    return Math.round(SUBTOTAL * (parseInt(pctEl.value, 10) || 0) / 100);
+                }
+                if (modeEl.value === 'custom') {
+                    var v = parseFloat(amtEl.value);
+                    if (!isFinite(v) || v <= 0) return 0;
+                    return Math.round(TIP_RATE === null ? v : v * TIP_RATE);
+                }
+                return 0;
+            }
+            function update() {
+                var mode = modeEl.value || 'none';
+                btns.forEach(function(b) {
+                    var on = b.dataset.tipMode === mode
+                        && (mode !== 'percent' || b.dataset.tipPercent === pctEl.value);
+                    b.classList.toggle('active', on);
+                });
+                customRow.style.display = mode === 'custom' ? 'flex' : 'none';
+                var t = tipSats();
+                totalEl.textContent = fmt(SUBTOTAL + t) + (t > 0 ? ' (incl. ' + fmt(t) + ' tip)' : '');
+            }
+            btns.forEach(function(b) {
+                b.addEventListener('click', function() {
+                    modeEl.value = b.dataset.tipMode === 'none' ? '' : b.dataset.tipMode;
+                    pctEl.value = b.dataset.tipPercent || '';
+                    update();
+                    if (b.dataset.tipMode === 'custom') amtEl.focus();
+                });
+            });
+            amtEl.addEventListener('input', update);
+            update();
+        })();
+        </script>
+        <?php else: ?>
         <form method="POST" autocomplete="off">
             <div class="form-group">
                 <label class="form-label" for="amount">Amount</label>
@@ -247,6 +536,7 @@ $hasFiat = count($allowedCurrencies) > 1;
 
             <button type="submit" class="btn">Continue to payment</button>
         </form>
+        <?php endif; ?>
     </div>
 </body>
 </html>

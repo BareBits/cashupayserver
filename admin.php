@@ -5674,7 +5674,8 @@ header('Cache-Control: no-cache, must-revalidate');
                         <div class="card-title">All Invoices</div>
                         <div style="display: flex; gap: 0.5rem;">
                             <button class="btn btn-secondary" id="btn-export-invoices-csv">Export CSV</button>
-                            <button class="btn" id="btn-new-invoice">+ New Invoice</button>
+                            <button class="btn" id="btn-new-invoice-advanced">Create invoice</button>
+                            <button class="btn" id="btn-new-invoice">Create invoice (simple)</button>
                         </div>
                     </div>
                     <div class="inv-filter-row">
@@ -6756,6 +6757,10 @@ header('Cache-Control: no-cache, must-revalidate');
                         <div id="products-admin-list">
                             <div class="loading"><div class="spinner"></div></div>
                         </div>
+                        <button class="btn btn-secondary" id="btn-products-generate-link"
+                                style="margin-top:0.75rem; width:auto; padding:0.4rem 0.9rem;">
+                            Generate link for multiple products
+                        </button>
                     </div>
                 </div>
             </div>
@@ -7617,14 +7622,17 @@ header('Cache-Control: no-cache, must-revalidate');
             </div>
 
             <button class="btn btn-secondary btn-full" style="margin-top: 0.5rem;" onclick="closeModal('modal-request')">Cancel</button>
+            <button class="btn btn-secondary btn-full" style="margin-top: 0.5rem;" id="btn-request-switch-advanced">Switch to advanced</button>
         </div>
     </div>
 
-    <!-- Cart-based request modal: pick products into a cart, then checkout. -->
+    <!-- Cart-based request modal: pick products into a cart, then create the
+         invoice — or, in link mode (opened from the Products view), build a
+         shareable self-serve link pre-populated with the picked products. -->
     <div class="modal-overlay" id="modal-cart">
         <div class="modal" style="max-width: 600px;">
             <div class="modal-handle"></div>
-            <div class="modal-title">Create invoice</div>
+            <div class="modal-title" id="cart-modal-title">Create invoice</div>
 
             <div style="display:flex; gap:0.5rem; margin-bottom:0.5rem;">
                 <input type="text" class="form-input" id="cart-search" placeholder="Search products…" style="flex:1;">
@@ -7657,20 +7665,28 @@ header('Cache-Control: no-cache, must-revalidate');
                 <div id="cart-total" style="font-weight:600; text-align:right; margin-top:0.5rem;"></div>
             </div>
 
-            <input type="text" class="form-input" id="cart-memo" placeholder="Description (optional)" style="margin-top:0.5rem;">
-            <label style="display:flex; align-items:flex-start; gap:0.5rem; cursor:pointer; margin-top:0.5rem;">
-                <input type="checkbox" id="cart-hide-store-name" style="margin-top:0.15rem;">
-                <span style="font-size:0.85rem;">Hide store name on invoice
-                    <span style="display:block; font-size:0.74rem; color:var(--text-secondary);">Keep the store name out of the invoice memo the payer's wallet records.</span>
-                </span>
-            </label>
-            <label style="display:flex; align-items:flex-start; gap:0.5rem; cursor:pointer; margin-top:0.5rem;">
-                <input type="checkbox" id="cart-hide-note" style="margin-top:0.15rem;">
-                <span style="font-size:0.85rem;">Hide note on invoice
-                    <span style="display:block; font-size:0.74rem; color:var(--text-secondary);">Keep the description above out of the invoice memo (still shown on the payment page).</span>
-                </span>
-            </label>
-            <button class="btn btn-full" id="btn-cart-checkout" style="margin-top:0.5rem;" disabled>Checkout</button>
+            <div id="cart-invoice-fields">
+                <input type="text" class="form-input" id="cart-memo" placeholder="Description (optional)" style="margin-top:0.5rem;">
+                <label style="display:flex; align-items:flex-start; gap:0.5rem; cursor:pointer; margin-top:0.5rem;">
+                    <input type="checkbox" id="cart-hide-store-name" style="margin-top:0.15rem;">
+                    <span style="font-size:0.85rem;">Hide store name on invoice
+                        <span style="display:block; font-size:0.74rem; color:var(--text-secondary);">Keep the store name out of the invoice memo the payer's wallet records.</span>
+                    </span>
+                </label>
+                <label style="display:flex; align-items:flex-start; gap:0.5rem; cursor:pointer; margin-top:0.5rem;">
+                    <input type="checkbox" id="cart-hide-note" style="margin-top:0.15rem;">
+                    <span style="font-size:0.85rem;">Hide note on invoice
+                        <span style="display:block; font-size:0.74rem; color:var(--text-secondary);">Keep the description above out of the invoice memo (still shown on the payment page).</span>
+                    </span>
+                </label>
+            </div>
+            <!-- Link mode: live preview of the shareable self-serve product link. -->
+            <div id="cart-link-footer" style="display:none; gap:0.5rem; margin-top:0.5rem;">
+                <input type="text" class="form-input" id="cart-link-input" readonly
+                       placeholder="Add products to build the link" style="flex:1; font-size:0.8rem;">
+                <button class="btn" id="btn-cart-copy-link" style="width:auto; flex:0 0 auto;" disabled>Copy link</button>
+            </div>
+            <button class="btn btn-full" id="btn-cart-checkout" style="margin-top:0.5rem;" disabled>Create</button>
             <button class="btn btn-secondary btn-full" style="margin-top: 0.5rem;" onclick="closeModal('modal-cart')">Cancel</button>
         </div>
     </div>
@@ -8299,10 +8315,21 @@ header('Cache-Control: no-cache, must-revalidate');
             const btnReqSimple = document.getElementById('btn-request-simple');
             if (btnReqSimple) btnReqSimple.addEventListener('click', () => openRequestModal());
             document.getElementById('btn-new-invoice').addEventListener('click', () => openRequestModal());
+            const btnNewInvoiceAdv = document.getElementById('btn-new-invoice-advanced');
+            if (btnNewInvoiceAdv) btnNewInvoiceAdv.addEventListener('click', () => openCartModal());
+            const btnSwitchAdvanced = document.getElementById('btn-request-switch-advanced');
+            if (btnSwitchAdvanced) btnSwitchAdvanced.addEventListener('click', () => {
+                closeModal('modal-request');
+                openCartModal();
+            });
 
             // Products admin view + cart modal wiring.
             const btnNewProduct = document.getElementById('btn-new-product');
             if (btnNewProduct) btnNewProduct.addEventListener('click', () => openProductEditModal(null));
+            const btnProductsLink = document.getElementById('btn-products-generate-link');
+            if (btnProductsLink) btnProductsLink.addEventListener('click', () => openCartModal({ linkMode: true }));
+            const btnCartCopyLink = document.getElementById('btn-cart-copy-link');
+            if (btnCartCopyLink) btnCartCopyLink.addEventListener('click', copyCartLink);
             const prodSortSel = document.getElementById('products-default-sort');
             if (prodSortSel) prodSortSel.addEventListener('change', saveProductDefaultSort);
             wireCartModal();
@@ -14983,6 +15010,7 @@ header('Cache-Control: no-cache, must-revalidate');
                         <div style="font-weight:600; ${p.enabled ? '' : 'opacity:0.5;'}">${escapeHtml(p.title)}${p.enabled ? '' : ' <span style="font-size:0.7rem;">(disabled)</span>'}</div>
                         <div style="font-size:0.8rem; color:var(--text-secondary);">${escapeHtml(formatMoney(p.price, p.currency))} · ${p.purchaseCount} sold</div>
                     </div>
+                    <button class="btn btn-secondary" style="width:auto; padding:0.3rem 0.7rem;" onclick="copyProductLink('${p.id}')">Copy link</button>
                     <button class="btn btn-secondary" style="width:auto; padding:0.3rem 0.7rem;" onclick="openProductEditModal('${p.id}')">Edit</button>
                     <button class="btn btn-secondary" style="width:auto; padding:0.3rem 0.7rem;" onclick="toggleProductEnabled('${p.id}')">${p.enabled ? 'Disable' : 'Enable'}</button>
                     <button class="btn btn-secondary" style="width:auto; padding:0.3rem 0.7rem; color:#ef4444;" onclick="deleteProduct('${p.id}')">Delete</button>
@@ -15172,10 +15200,12 @@ header('Cache-Control: no-cache, must-revalidate');
         let cartCatalog = [];
         let cartItems = [];   // {productId|null, title, price, currency, quantity, image:{type,value,url}}
         let cartPage = 1;
+        let cartLinkMode = false; // true: building a shareable self-serve link instead of an invoice
         const CART_PAGE_SIZE = 10;
 
-        async function openCartModal() {
+        async function openCartModal(opts) {
             if (!currentStoreId) { showToast('Please select a store first', 'error'); return; }
+            cartLinkMode = !!(opts && opts.linkMode);
             cartItems = [];
             cartPage = 1;
             document.getElementById('cart-search').value = '';
@@ -15188,6 +15218,15 @@ header('Cache-Control: no-cache, must-revalidate');
             if (cartHn) cartHn.checked = !!cartPriv.hideNote;
             const customForm = document.getElementById('cart-custom-form');
             if (customForm) customForm.style.display = 'none';
+            // Link mode reuses the same picker but swaps the invoice-only
+            // pieces (custom lines can't be encoded in a link) for a live
+            // link preview + Copy button.
+            document.getElementById('cart-modal-title').textContent =
+                cartLinkMode ? 'Generate product link' : 'Create invoice';
+            document.getElementById('btn-add-custom-line').style.display = cartLinkMode ? 'none' : '';
+            document.getElementById('cart-invoice-fields').style.display = cartLinkMode ? 'none' : '';
+            document.getElementById('btn-cart-checkout').style.display = cartLinkMode ? 'none' : '';
+            document.getElementById('cart-link-footer').style.display = cartLinkMode ? 'flex' : 'none';
             renderCart();
             document.getElementById('cart-catalog').innerHTML = '<div class="loading"><div class="spinner"></div></div>';
             document.getElementById('modal-cart').classList.add('visible');
@@ -15303,6 +15342,13 @@ header('Cache-Control: no-cache, must-revalidate');
             const wrap = document.getElementById('cart-items');
             const totalEl = document.getElementById('cart-total');
             const checkoutBtn = document.getElementById('btn-cart-checkout');
+            // Keep the link-mode preview in sync with the cart contents.
+            const linkInput = document.getElementById('cart-link-input');
+            const copyLinkBtn = document.getElementById('btn-cart-copy-link');
+            if (cartLinkMode && linkInput) {
+                linkInput.value = cartItems.length ? (buildSelfServeProductsUrl(cartItems) || '') : '';
+            }
+            if (cartLinkMode && copyLinkBtn) copyLinkBtn.disabled = !cartItems.length;
             if (!cartItems.length) {
                 wrap.innerHTML = '<p style="color:var(--text-secondary); font-size:0.85rem; margin:0;">Cart is empty. Tap a product to add it.</p>';
                 totalEl.textContent = '';
@@ -15365,6 +15411,83 @@ header('Cache-Control: no-cache, must-revalidate');
                 showToast('Checkout failed', 'error');
                 btn.disabled = false;
             }
+        }
+
+        // ---- Self-serve product links ----
+
+        // Build a public /pay link pre-populated with products: the payUrl for
+        // the current store plus ?products=prod_x:2,prod_y. Product ids and
+        // quantities are URL-safe by construction (prod_<hex> and digits), so
+        // no encoding is needed and the link stays readable.
+        function buildSelfServeProductsUrl(items) {
+            const ss = dashboardData?.selfserve;
+            if (!ss || !ss.payUrl) return null;
+            const spec = items
+                .filter(i => i.productId)
+                .map(i => i.quantity > 1 ? `${i.productId}:${i.quantity}` : i.productId)
+                .join(',');
+            if (!spec) return null;
+            return ss.payUrl + (ss.payUrl.includes('?') ? '&' : '?') + 'products=' + spec;
+        }
+
+        // Product links only work while self-serve is on for the store. When
+        // it's off, offer to enable it on the spot (keeping any configured
+        // max); refuse outright when the store can't take payments at all.
+        async function ensureSelfServeEnabled() {
+            const ss = dashboardData?.selfserve;
+            if (!ss) { showToast('Store data is still loading — try again in a moment', 'error'); return false; }
+            if (ss.effective) return true;
+            if (!ss.paymentCapable) {
+                showToast('This store has no payment method configured (add a Cashu mint or on-chain address first).', 'error');
+                return false;
+            }
+            if (!confirm('Self-serve invoices are not enabled for this store, so this link would not work.\n\nEnable self-serve invoices now?')) {
+                return false;
+            }
+            try {
+                const maxSats = ss.maxSatsOverride ?? '';
+                const r = await postWithCsrf(adminUrl,
+                    `action=save_store_selfserve&store_id=${encodeURIComponent(currentStoreId)}&enabled=1&max_sats=${encodeURIComponent(maxSats)}`);
+                const d = await r.json();
+                if (!r.ok) { showToast(d.error || 'Failed to enable self-serve invoices', 'error'); return false; }
+                showToast('Self-serve invoices enabled', 'success');
+                await loadDashboard();
+                refreshStoreSelfServeCard();
+                return true;
+            } catch (e) {
+                showToast('Failed to enable self-serve invoices', 'error');
+                return false;
+            }
+        }
+
+        async function copyProductLink(id) {
+            if (!ensureAdmin('Only admins can manage products.')) return;
+            const p = productsAdminCache.find(x => x.id === id);
+            if (!p) return;
+            if (!p.enabled) {
+                showToast('This product is disabled — enable it first so the link works.', 'error');
+                return;
+            }
+            if (!(await ensureSelfServeEnabled())) return;
+            const url = buildSelfServeProductsUrl([{ productId: id, quantity: 1 }]);
+            if (!url) { showToast('Could not build the link', 'error'); return; }
+            try {
+                await navigator.clipboard.writeText(url);
+                showToast('Product link copied!', 'success');
+            } catch (e) { showToast('Could not copy link', 'error'); }
+        }
+
+        async function copyCartLink() {
+            if (!cartItems.length) return;
+            if (!(await ensureSelfServeEnabled())) return;
+            const url = buildSelfServeProductsUrl(cartItems);
+            if (!url) { showToast('Could not build the link', 'error'); return; }
+            const linkInput = document.getElementById('cart-link-input');
+            if (linkInput) linkInput.value = url;
+            try {
+                await navigator.clipboard.writeText(url);
+                showToast('Product link copied!', 'success');
+            } catch (e) { showToast('Could not copy link', 'error'); }
         }
 
         // ---- Admin invoice line-item detail ----
