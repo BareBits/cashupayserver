@@ -7,23 +7,19 @@
 
 # BareBits
 
-Accept Bitcoin payments (lightning and on-chain) without running a full BTCPay Server instance. No Docker, no VPS, no command line. Just upload and go. **Works on all "shared" web hosting, if it can host WordPress, it can host BareBits**. Low 1% fee. Ready to install? Use our [latest release](https://github.com/BareBits/cashupayserver/releases/latest) or [have us install it for you](https://getbarebits.com) for a 2% fee.
+BareBits makes it EASY for merchants to accept Bitcoin (lightning and on-chain) without running a full BTCPay Server instance. No Docker, no VPS, no command line. Just upload and go. **Works on all "shared" web hosting, if it can host WordPress, it can host BareBits**. Low 1% fee. Ready to install? Use our [latest release](https://github.com/BareBits/cashupayserver/releases/latest) or [have us install it for you](https://getbarebits.com) for a 2% fee. See [installation](#Installation).
 
-**Are you a web developer? Re-sell this software to your customers at a custom fee rate.** Your customers pay a x% fee, payments go directly to your lightning address/LNURL. Just modify the appropriate settings in the store settings ("hosting fee")
+BareBits can create invoices, receive payments, and be used as a point-of-sale system or be connected it to your e-commerce site. Technically speaking, it is a PHP-based Bitcoin Lightning payment gateway that implements BTCPay Server's Greenfield API. This means that any e-commerce software that works with BTCPay Server can work with BareBits including WooCommerce, Shopify, Magneto, Drupal, and more! BareBits supports a number of payment types, risk/trust levels, and capabilities depending on your intended use case.
+
+**Are you a web developer? Re-sell this software to your customers at a custom fee rate.** Your customers pay a x% fee, payments go directly to your lightning address. Just modify the appropriate settings in the store settings ("hosting fee")
 
 ---
-
-## What is BareBits?
-
-BareBits makes it EASY for merchants to accept Bitcoin. You can create invoices, receive payments, use it as a point-of-sale system, and connect it to your e-commerce site. Technically speaking, it is a PHP-based Bitcoin Lightning payment gateway that implements BTCPay Server's Greenfield API. This means that any e-commerce software that works with BTCPay Server can work with BareBits including WooCommerce, Shopify, Magneto, Drupal, and more! 
-
-BareBits supports a number of payment types, risk/trust levels, and capabilities depending on your intended use case.
- 
 
 ### Key Features
 - **Any PHP hosting** - Works on $3/month shared hosting. 
 - **No application or approval process** - Just download and run!
-- **Self-custody** - A fully self-custody solution, or add Cashu mint or Strike support for increased convenience.
+- **Self-custody** - A fully self-custody solution, or add Cashu mint for convenience.
+- **Fiat conversion** via Strike gives you access to instant fiat conversion in 100+ countries
 - **Multiple stores** - Each store can have it's own invoice settings, cashout addresses, etc.
 - **Tip Jar** - Let customers make their own payments using a shared link. Links can be generic (any amount) or for specific products.
 - **E-commerce integration** - Plugin for WooCommerce. On magneto, shopify, or another platform? Use the BTCPay plugin and point it to your BareBits URL.
@@ -40,9 +36,7 @@ BareBits supports a number of payment types, risk/trust levels, and capabilities
 
 ## ⚠️ AS-IS SOFTWARE ⚠️
 
-Do NOT use with amounts you cannot afford to lose. Use the suggested default pattern of having funds go to an offline wallet to limit risk. You wouldn't want your funds sitting on a web server anyway. If you do not have a lightning wallet configured, a Cashu mint (if explicitly enabled) takes custody of smaller lightning payments until automatic withdrawal thresholds are reached. 
-
-**You are responsible for your own funds. The developers are not liable for any losses.** **This software is produced AS-IS without any warranty**
+Like any software, this software may contain unforeseen bugs or issues. BareBits is designed to not have access to any funds by default (it sends them to your off-server wallet). You wouldn't want your funds sitting on a web server anyway. If you do not have a lightning wallet configured, a Cashu mint (if explicitly enabled) takes custody of smaller lightning payments until automatic withdrawal thresholds are reached. 
 
 ### Trade-offs
 
