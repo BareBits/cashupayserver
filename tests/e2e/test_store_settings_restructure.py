@@ -79,14 +79,17 @@ def test_lightning_payments_card_order_and_note(mintless_payserver) -> None:
     assert ">Lightning payments<" in page
     assert ">Cashu automatic cashout<" in page
 
-    # Path-order note states the real order (Strike → LNURL → NWC → noffer).
-    # The note wraps across source lines, so compare whitespace-normalized.
-    assert "Lightning payment paths are tried in the following order" in page
-    assert "Strike API, LNURL/lightning address, NWC, noffer" in re.sub(r"\s+", " ", page)
+    # The fixed path-order note was replaced by the configurable "payment
+    # path priority" widget (see test_rail_order.py for its behavior). The
+    # note wraps across source lines, so compare whitespace-normalized.
+    assert "Lightning payment paths are tried in this order" in re.sub(r"\s+", " ", page)
+    assert ">Payment path priority<" in page
 
-    # The priority lists live in the card, before the Cashu section; the save
-    # button sits between the destination sections and the Cashu section.
+    # The priority widget and the per-type lists live in the card, before the
+    # Cashu section; the save button sits between the destination sections
+    # and the Cashu section.
     for group in (
+        'id="ln-rail-order-group"',
         'id="auto-melt-address-group"',
         'id="auto-melt-nwc-group"',
         'id="auto-melt-noffer-group"',
