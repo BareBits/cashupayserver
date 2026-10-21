@@ -322,7 +322,7 @@ class Diagnostics {
         $startTs = $this->range !== null ? Stats::rangeStart($this->range) : null;
         [$where, $params] = $this->rangeClause($startTs, 'created_at');
         foreach (Database::fetchAll(
-            "SELECT * FROM invoice_items{$where} ORDER BY created_at ASC", $params) as $r) {
+            "SELECT * FROM invoice_items{$where} ORDER BY created_at ASC, rowid ASC", $params) as $r) {
             $cols = self::ITEM_SAFE_COLS;
             if (!$this->anonymize) $cols = array_merge($cols, self::ITEM_PII_COLS);
             $out = $this->project($r, $cols);

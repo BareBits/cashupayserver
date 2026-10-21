@@ -136,6 +136,12 @@ def _walk_wizard_in_iframe(page) -> None:
     frame.locator("h2:has-text('Cashu mints')").wait_for()
     frame.locator("button:has-text('No thanks, run without mints')").click()
 
+    # Automatic updates are opt-in everywhere (incl. managed installs): the
+    # wizard asks once, after the mints screen. Decline — the merchant can
+    # enable them later from the Auto-update card.
+    frame.locator("h2:has-text('Enable automatic updates?')").wait_for()
+    frame.locator("button[name='auto_update'][value='0']").click()
+
     # Managed install: completion directly — never the crontab screen
     # (WP-cron owns the heartbeat).
     frame.locator("h2:has-text(\"You're all set\")").wait_for()

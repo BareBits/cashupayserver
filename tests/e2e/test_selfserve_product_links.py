@@ -142,7 +142,7 @@ def test_create_with_percent_tip_via_browser(
         ).fetchone()
         items = db.execute(
             "SELECT product_id, title, quantity, amount_sats FROM invoice_items "
-            "WHERE invoice_id = ? ORDER BY created_at ASC, id ASC",
+            "WHERE invoice_id = ? ORDER BY created_at ASC, rowid ASC",
             (invoice_id,),
         ).fetchall()
     assert inv is not None
@@ -179,7 +179,7 @@ def test_create_with_custom_tip_via_post(shared_configured: ConfiguredPayserver)
         ).fetchone()
         items = db.execute(
             "SELECT title, amount_sats FROM invoice_items WHERE invoice_id = ? "
-            "ORDER BY created_at ASC, id ASC",
+            "ORDER BY created_at ASC, rowid ASC",
             (invoice_id,),
         ).fetchall()
     assert inv is not None and str(inv["amount"]) == "950"
