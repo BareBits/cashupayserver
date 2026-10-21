@@ -46,12 +46,20 @@ assert_false((bool)$res['blocked'], 'not blocked');
 $cached = Updater::getAvailableUpdate();
 assert_true(is_array($cached) && $cached['available'] === true, 'verdict cached');
 
-// --- 2. Caching / self-throttle: a non-forced call returns the cache even if
-// the install has since advanced past the remote SHA. ---
+// --- 2. Caching / self-throttle: a non-forced call does NOT refetch within
+// the daily window — but the cached verdict self-heals when the install has
+// since advanced to exactly the SHA it advertises (the "banner says 1.6 is
+// available right after updating to 1.6" bug). ---
+$checkedAt = (int)$res['checked_at'];
 file_put_contents($fixture['installRoot'] . '/BUILD_INFO',
     "COMMIT_SHA=$remoteSha\nVERSION=0.2-new\n");
 $res2 = Updater::checkForUpdate(false); // within the daily window → cached
-assert_true($res2['available'], 'non-forced call served stale cache (still available)');
+assert_eq($checkedAt, (int)$res2['checked_at'], 'non-forced call did not refetch (checked_at unchanged)');
+assert_false($res2['available'], 'cached verdict self-heals: local now == advertised SHA → not available');
+assert_eq($remoteSha, $res2['current_sha'], 'self-healed verdict reports the new local SHA');
+assert_eq('0.2-new', $res2['current_version'], 'self-healed verdict reports the new local version');
+$persisted = Config::get('updater_available');
+assert_true(is_array($persisted) && $persisted['available'] === false, 'self-healed verdict is persisted');
 
 // Forced re-check now sees local == remote → not available.
 $res3 = Updater::checkForUpdate(true);
