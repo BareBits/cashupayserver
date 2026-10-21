@@ -1815,6 +1815,100 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
             break;
 
+        // Enable a Cashu mint on an existing store that has none (store
+        // settings → Lightning payments → Cashu section). Tests the mint
+        // connection, generates the wallet seed when the store has none —
+        // returned ONCE for backup, like create_store — and keeps an existing
+        // seed so any prior mint balance stays recoverable. Refuses when the
+        // store is already mint-configured: replacing a live mint is a
+        // different (balance-moving) operation this endpoint must not do.
+        case 'enable_store_mint':
+            Auth::requireAdmin();
+            try {
+                $storeId = $_POST['store_id'] ?? '';
+                if (empty($storeId)) {
+                    throw new Exception('Store ID required');
+                }
+                $store = Config::getStore($storeId);
+                if (!$store) {
+                    throw new Exception('Store not found');
+                }
+                require_once __DIR__ . '/includes/cashu_env.php';
+                if (($cashuEnvError = CashuEnv::environmentError()) !== null) {
+                    throw new Exception('Cashu is unavailable on this server. ' . $cashuEnvError);
+                }
+                if (Config::isStoreConfigured($storeId)) {
+                    throw new Exception('This store already has a Cashu mint enabled.');
+                }
+                $mintUrl = rtrim(trim((string)($_POST['mint_url'] ?? '')), '/');
+                if ($mintUrl === '') {
+                    throw new Exception('Mint URL required');
+                }
+                // Same unit set the enable dialog (and setup's mints screen) offers.
+                $mintUnit = strtolower(trim((string)($_POST['mint_unit'] ?? 'sat'))) ?: 'sat';
+                if (!in_array($mintUnit, ['sat', 'usd', 'eur'], true)) {
+                    throw new Exception('Unsupported mint unit');
+                }
+                // Reachability + unit support in one probe, like setup's mints
+                // screen: the keysets listing both proves the mint answers and
+                // says which units it actually offers.
+                require_once __DIR__ . '/cashu-wallet-php/CashuWallet.php';
+                try {
+                    $supportedUnits = \Cashu\Wallet::getSupportedUnits($mintUrl);
+                } catch (Exception $e) {
+                    throw new Exception('Cannot connect to mint: ' . $e->getMessage());
+                }
+                if (empty($supportedUnits) || !isset($supportedUnits[$mintUnit])) {
+                    throw new Exception(
+                        'This mint doesn\'t offer ' . $mintUnit . '. Pick a different mint or unit.'
+                    );
+                }
+                $seedPhrase = $store['seed_phrase'] ?? null;
+                $generatedSeed = null;
+                if (empty($seedPhrase)) {
+                    $seedPhrase = \Cashu\Mnemonic::generate();
+                    // Same guard as create_store: a seed shared between stores
+                    // (however unlikely from a fresh generate) risks lost funds.
+                    $existing = Database::fetchOne(
+                        "SELECT id FROM stores WHERE seed_phrase = ?",
+                        [$seedPhrase]
+                    );
+                    if ($existing) {
+                        throw new Exception('Generated seed phrase collided with an existing store — please try again.');
+                    }
+                    $generatedSeed = $seedPhrase;
+                }
+                // mint_url/mint_unit/seed_phrase are long-standing updateStore
+                // columns; it also stamps primary_mint_source='manual' for us.
+                Config::updateStore($storeId, [
+                    'mint_url' => $mintUrl,
+                    'mint_unit' => $mintUnit,
+                    'seed_phrase' => $seedPhrase,
+                ]);
+
+                // Mintless setup pinned strict-no-mint-fallback FORCE_ON so a
+                // mint couldn't be acquired later without an explicit decision
+                // — this dialog IS that decision, so clear the pin. The mint
+                // stays the lowest-priority path regardless: invoices only
+                // fall back to it after every Lightning destination (Strike,
+                // LNURL, NWC, noffer) and any swap attempt have failed. The
+                // operator can re-pin strict mode in the Submarine Swaps card.
+                require_once __DIR__ . '/includes/swap/config.php';
+                SwapsConfig::setStoreStrictOverride($storeId, SwapsConfig::FORCE_OFF);
+
+                echo json_encode([
+                    'success' => true,
+                    'isConfigured' => Config::isStoreConfigured($storeId),
+                    // null when an existing seed was kept — the UI then skips
+                    // the one-time backup panel.
+                    'seedPhrase' => $generatedSeed,
+                ]);
+            } catch (Exception $e) {
+                cashupay_status(400);
+                echo json_encode(['error' => $e->getMessage()]);
+            }
+            break;
+
         case 'save_store_privacy':
             Auth::requireAdmin();
             try {
@@ -4559,6 +4653,21 @@ header('Cache-Control: no-cache, must-revalidate');
             display: none;
         }
 
+        /* Top-level sections inside the Lightning payments card: slightly
+           more prominent toggle + a separator line between sections. */
+        .subsection.ln-section {
+            border-top: 1px solid var(--border);
+            margin-top: 0.25rem;
+        }
+        .subsection.ln-section > .subsection-toggle {
+            font-size: 0.95rem;
+            color: var(--text-primary, inherit);
+            padding: 0.65rem 0;
+        }
+        .subsection.ln-section > .subsection-body {
+            padding-bottom: 0.5rem;
+        }
+
         /* Auto-cashout column selector */
         .aw-title {
             font-weight: 600;
@@ -5718,6 +5827,14 @@ header('Cache-Control: no-cache, must-revalidate');
                                 NWC, noffer.
                             </p>
 
+                            <!-- The four payment-path sections (and the Cashu
+                                 section at the end) are collapsible. Markup
+                                 default is collapsed; applyLnSectionDefaults()
+                                 expands each section that has saved entries
+                                 once per store load. -->
+                            <div class="subsection collapsed ln-section" id="ln-section-strike">
+                            <div class="subsection-toggle">Strike API keys</div>
+                            <div class="subsection-body">
                             <div class="form-group" id="auto-melt-strike-group">
                                 <label class="form-label">Strike API keys (priority order)</label>
                                 <p class="form-help">
@@ -5756,7 +5873,12 @@ header('Cache-Control: no-cache, must-revalidate');
                                     On-chain Bitcoin payments card.
                                 </p>
                             </div>
+                            </div><!-- /.subsection-body -->
+                            </div><!-- /#ln-section-strike -->
 
+                            <div class="subsection collapsed ln-section" id="ln-section-addresses">
+                            <div class="subsection-toggle">Lightning addresses</div>
+                            <div class="subsection-body">
                             <div class="form-group" id="auto-melt-address-group">
                                 <label class="form-label">Lightning Addresses (priority order)</label>
                                 <p class="form-help">
@@ -5770,7 +5892,12 @@ header('Cache-Control: no-cache, must-revalidate');
                                     + Add address
                                 </button>
                             </div>
+                            </div><!-- /.subsection-body -->
+                            </div><!-- /#ln-section-addresses -->
 
+                            <div class="subsection collapsed ln-section" id="ln-section-nwc">
+                            <div class="subsection-toggle">NWC connections</div>
+                            <div class="subsection-body">
                             <div class="form-group" id="auto-melt-nwc-group"
                                  <?= $nwcEnvError !== null ? 'data-env-error="1"' : '' ?>>
                                 <label class="form-label">NWC connections (priority order)</label>
@@ -5804,7 +5931,12 @@ header('Cache-Control: no-cache, must-revalidate');
                                     + Add NWC connection
                                 </button>
                             </div>
+                            </div><!-- /.subsection-body -->
+                            </div><!-- /#ln-section-nwc -->
 
+                            <div class="subsection collapsed ln-section" id="ln-section-noffers">
+                            <div class="subsection-toggle">CLINK noffers</div>
+                            <div class="subsection-body">
                             <div class="form-group" id="auto-melt-noffer-group"
                                  <?= $nofferEnvError !== null ? 'data-env-error="1"' : '' ?>>
                                 <label class="form-label">CLINK noffers (priority order)</label>
@@ -5845,19 +5977,17 @@ header('Cache-Control: no-cache, must-revalidate');
                                     + Add noffer
                                 </button>
                             </div>
+                            </div><!-- /.subsection-body -->
+                            </div><!-- /#ln-section-noffers -->
 
                             <div id="lightning-payments-error" class="hidden" style="margin-top:0.75rem; color: var(--error); font-size: 0.85rem;"></div>
                             <button class="btn btn-full" id="btn-save-lightning-payments" style="margin-top: 1rem;">
                                 Save Lightning payments
                             </button>
-                        </div>
-                    </div>
 
-                    <div class="card collapsible" id="card-cashu-cashout">
-                        <div class="card-header">
-                            <div class="card-title">Cashu automatic cashout</div>
-                        </div>
-                        <div class="card-body">
+                            <div class="subsection collapsed ln-section" id="ln-section-cashu">
+                            <div class="subsection-toggle">Cashu</div>
+                            <div class="subsection-body">
                             <?php if ($cashuEnvError !== null): ?>
                                 <div style="margin-bottom:0.75rem; padding:0.6rem 0.8rem; border-radius:8px; background:rgba(245,158,11,0.12); border:1px solid rgba(245,158,11,0.4); font-size:0.82rem;">
                                     &#9888; <strong>Cashu is unavailable on this server.</strong>
@@ -5866,9 +5996,11 @@ header('Cache-Control: no-cache, must-revalidate');
                                 </div>
                             <?php endif; ?>
                             <div id="cashu-cashout-mint-warning" class="hidden" style="margin-bottom:0.75rem; padding:0.6rem 0.8rem; border-radius:8px; background:rgba(245,158,11,0.12); border:1px solid rgba(245,158,11,0.4); font-size:0.82rem;">
-                                &#9888; <strong>Cashu is disabled for this store.</strong>
-                                This store has no Cashu mint wallet configured, so there is no mint
-                                balance to cash out. Add a mint to use automatic cashout.
+                                &#9888; A Cashu Mint is not enabled, enable a cashu mint to access these settings.
+                                <button type="button" class="btn btn-secondary" id="btn-enable-cashu-mint"
+                                        style="display:block; width:auto; margin-top:0.5rem; padding:0.3rem 0.7rem; font-size:0.8rem;">
+                                    Enable a Cashu mint
+                                </button>
                             </div>
                             <!-- Everything below greys out when Cashu can't run: either the
                                  server lacks GMP/BCMath (rendered inert here) or the selected
@@ -5876,6 +6008,7 @@ header('Cache-Control: no-cache, must-revalidate');
                             <div id="cashu-cashout-body"<?= $cashuEnvError !== null
                                 ? ' data-env-error="1" style="opacity: 0.5; pointer-events: none;"'
                                 : '' ?>>
+                            <label class="form-label">Cashu automatic cashout</label>
                             <div id="aw-store" data-aw data-aw-scope="store">
                             <p class="aw-title">auto-cashout settings</p>
                             <?php if ($gmpEnvError !== null): ?>
@@ -5953,7 +6086,19 @@ header('Cache-Control: no-cache, must-revalidate');
                                 Save Settings
                             </button>
                             </div><!-- /#aw-store -->
+
+                            <div id="offline-cashu-section" style="margin-top:1.25rem; padding-top:1rem; border-top:1px solid var(--border);">
+                                <label class="form-label">Offline Cashu acceptance</label>
+                                <p class="form-help" style="margin-bottom: 0.75rem;">
+                                    Keep taking Cashu ecash even when the mint is briefly unreachable. Tokens are
+                                    verified by their built-in signature (NUT-12 DLEQ) and confirmed automatically
+                                    once the mint is back online.
+                                </p>
+                                <div id="offline-cashu-body"><div class="loading"><div class="spinner"></div></div></div>
+                            </div>
                             </div><!-- /#cashu-cashout-body -->
+                            </div><!-- /.subsection-body -->
+                            </div><!-- /#ln-section-cashu -->
                         </div>
                     </div>
 
@@ -6559,20 +6704,6 @@ header('Cache-Control: no-cache, must-revalidate');
                         </div>
                         <div id="store-api-keys">
                             <div class="loading"><div class="spinner"></div></div>
-                        </div>
-                    </div>
-
-                    <div class="card collapsible">
-                        <div class="card-header">
-                            <div class="card-title">Offline Cashu Acceptance</div>
-                        </div>
-                        <div class="card-body">
-                            <p class="form-help" style="margin-bottom: 0.75rem;">
-                                Keep taking Cashu ecash even when the mint is briefly unreachable. Tokens are
-                                verified by their built-in signature (NUT-12 DLEQ) and confirmed automatically
-                                once the mint is back online.
-                            </p>
-                            <div id="offline-cashu-body"><div class="loading"><div class="spinner"></div></div></div>
                         </div>
                     </div>
 
@@ -7598,6 +7729,57 @@ header('Cache-Control: no-cache, must-revalidate');
         </div>
     </div>
 
+    <!-- Enable a Cashu mint on a store that doesn't have one yet (opened from
+         the greyed-out Cashu section in the Lightning payments card). Two
+         panels: the form, then the one-time recovery-phrase display shown
+         when the save generated a fresh wallet seed. -->
+    <div class="modal-overlay" id="modal-enable-mint">
+        <div class="modal">
+            <div class="modal-handle"></div>
+            <div class="modal-title">Enable a Cashu mint</div>
+            <div id="enable-mint-form">
+                <p class="form-help" style="margin-bottom: 1rem;">
+                    A Cashu mint holds this store's ecash balance between a customer's
+                    payment and your cashout. Pick a mint you trust &mdash; the connection
+                    is tested when you save.
+                </p>
+                <div class="form-group">
+                    <label class="form-label">Mint URL</label>
+                    <div style="display:flex; gap:0.5rem;">
+                        <input type="url" class="form-input" id="enable-mint-url"
+                               placeholder="https://mint.example.com" style="flex:1;">
+                        <button type="button" class="btn btn-secondary" id="btn-enable-mint-discover"
+                                style="width:auto; white-space:nowrap;">Discover</button>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Currency unit</label>
+                    <select class="form-input" id="enable-mint-unit">
+                        <option value="sat">Bitcoin (sats)</option>
+                        <option value="usd">USD</option>
+                        <option value="eur">EUR</option>
+                    </select>
+                    <p class="form-help">The mint must support the unit you pick.</p>
+                </div>
+                <div id="enable-mint-error" class="hidden" style="margin-bottom:0.75rem; color: var(--error); font-size: 0.85rem;"></div>
+                <button class="btn btn-full" id="btn-enable-mint-save">Enable mint</button>
+                <button class="btn btn-secondary btn-full" style="margin-top: 0.5rem;" onclick="closeModal('modal-enable-mint')">Cancel</button>
+            </div>
+            <div id="enable-mint-seed" style="display:none;">
+                <p style="margin-bottom: 0.75rem;">
+                    The mint is enabled and a wallet recovery phrase was generated for this
+                    store. <strong>Write it down and store it safely</strong> &mdash; it is
+                    the only way to recover the store's mint balance if this server's
+                    database is lost. It will not be shown again automatically (it stays
+                    available in the Recovery phrase card below).
+                </p>
+                <div id="enable-mint-seed-value"
+                     style="background: rgba(0,0,0,0.3); border: 1px solid var(--border); border-radius: 8px; padding: 0.75rem; font-family: monospace; font-size: 0.9rem; word-break: break-word; margin-bottom: 0.75rem; user-select: all;"></div>
+                <button class="btn btn-full" id="btn-enable-mint-done">I've saved my recovery phrase</button>
+            </div>
+        </div>
+    </div>
+
     <!-- Mint Diagnostic modal -->
     <div class="modal-overlay" id="modal-mint-diagnostic">
         <div class="modal" style="max-width: 720px;">
@@ -8344,6 +8526,15 @@ header('Cache-Control: no-cache, must-revalidate');
                 if (currentStoreId) {
                     deleteStore(currentStoreId);
                 }
+            });
+
+            // Enable-a-Cashu-mint flow (greyed-out Cashu section → modal).
+            document.getElementById('btn-enable-cashu-mint').addEventListener('click', openEnableMintModal);
+            document.getElementById('btn-enable-mint-discover').addEventListener('click', openEnableMintDiscovery);
+            document.getElementById('btn-enable-mint-save').addEventListener('click', submitEnableMint);
+            document.getElementById('btn-enable-mint-done').addEventListener('click', () => {
+                closeModal('modal-enable-mint');
+                showToast('Cashu mint enabled', 'success');
             });
 
             // Mint reliability + trusted mints wiring (admin-only cards).
@@ -11582,6 +11773,31 @@ header('Cache-Control: no-cache, must-revalidate');
             renderNofferRows();
             renderNwcRows();
             renderStrikeRows();
+            applyLnSectionDefaults();
+        }
+
+        // Default open/closed state of the collapsible sections in the
+        // Lightning payments card: a section starts expanded only when it has
+        // saved entries; the Cashu section only when the store has a mint
+        // wallet AND cashout is actually configured (enabled, or explicitly
+        // set to on-chain). Applied once per store so dashboard refreshes
+        // don't yank a section the operator opened back shut.
+        let lnSectionDefaultsFor = null;
+        function applyLnSectionDefaults() {
+            if (lnSectionDefaultsFor === currentStoreId) return;
+            lnSectionDefaultsFor = currentStoreId;
+            const setCollapsed = (id, collapsed) => {
+                const el = document.getElementById(id);
+                if (el) el.classList.toggle('collapsed', collapsed);
+            };
+            setCollapsed('ln-section-strike', awStrike.length === 0);
+            setCollapsed('ln-section-addresses', awLnAddresses.length === 0);
+            setCollapsed('ln-section-nwc', awNwc.length === 0);
+            setCollapsed('ln-section-noffers', awNoffers.length === 0);
+            const am = dashboardData && dashboardData.autoMelt;
+            const hasMint = !!(dashboardData && dashboardData.storeConfigured);
+            const cashoutConfigured = !!am && (!!am.enabled || String(am.modeOverride) === '1');
+            setCollapsed('ln-section-cashu', !(hasMint && cashoutConfigured));
         }
 
         // Read the current input values back into awLnAddresses (preserving the
@@ -12953,6 +13169,81 @@ header('Cache-Control: no-cache, must-revalidate');
                 document.getElementById('backup-mint-url').value = url;
             };
             openMintDiscoveryModal();
+        }
+
+        // ---- Enable a Cashu mint on an existing store (Cashu section) ----
+
+        function openEnableMintModal() {
+            if (!currentStoreId) return;
+            document.getElementById('enable-mint-url').value = '';
+            document.getElementById('enable-mint-unit').value = 'sat';
+            const err = document.getElementById('enable-mint-error');
+            err.classList.add('hidden');
+            err.textContent = '';
+            document.getElementById('enable-mint-form').style.display = 'block';
+            document.getElementById('enable-mint-seed').style.display = 'none';
+            openModal('modal-enable-mint');
+        }
+
+        function openEnableMintDiscovery() {
+            discoveryContext = 'enable-mint';
+            discoveryCallback = (url) => {
+                document.getElementById('enable-mint-url').value = url;
+            };
+            openMintDiscoveryModal();
+        }
+
+        async function submitEnableMint() {
+            const errEl = document.getElementById('enable-mint-error');
+            errEl.classList.add('hidden');
+            const mintUrl = document.getElementById('enable-mint-url').value.trim();
+            if (!mintUrl) {
+                errEl.textContent = 'Please enter a mint URL.';
+                errEl.classList.remove('hidden');
+                return;
+            }
+            const btn = document.getElementById('btn-enable-mint-save');
+            btn.disabled = true;
+            btn.textContent = 'Testing mint…';
+            try {
+                const params = new URLSearchParams({
+                    action: 'enable_store_mint',
+                    store_id: currentStoreId,
+                    mint_url: mintUrl,
+                    mint_unit: document.getElementById('enable-mint-unit').value,
+                });
+                const response = await postWithCsrf(adminUrl, params.toString());
+                const result = await response.json();
+                if (!response.ok) throw new Error(result.error || 'Failed to enable mint');
+                if (result.seedPhrase) {
+                    // Fresh wallet seed — show it once for backup before closing.
+                    document.getElementById('enable-mint-form').style.display = 'none';
+                    document.getElementById('enable-mint-seed-value').textContent = result.seedPhrase;
+                    document.getElementById('enable-mint-seed').style.display = 'block';
+                } else {
+                    // The store already had a seed (kept so any prior balance
+                    // stays recoverable) — nothing new to back up.
+                    closeModal('modal-enable-mint');
+                    showToast('Cashu mint enabled', 'success');
+                }
+                await refreshAfterMintEnable();
+            } catch (e) {
+                errEl.textContent = e.message || 'Failed to enable mint';
+                errEl.classList.remove('hidden');
+            } finally {
+                btn.disabled = false;
+                btn.textContent = 'Enable mint';
+            }
+        }
+
+        // Re-pull dashboard data (storeConfigured, balance, mint URL) and
+        // re-render the store settings view so the Cashu section un-greys
+        // without a manual reload.
+        async function refreshAfterMintEnable() {
+            await loadDashboard();
+            if (document.getElementById('view-store-settings').classList.contains('active')) {
+                loadStoreSettings();
+            }
         }
 
         let mintDisclaimerAcknowledged = false;
