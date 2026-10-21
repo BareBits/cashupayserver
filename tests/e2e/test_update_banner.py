@@ -329,6 +329,128 @@ def test_banner_hidden_when_cached_verdict_came_from_another_build(admin_page):
             build_info.write_bytes(previous)
 
 
+def _update_status(page, base):
+    return page.evaluate(
+        """async (base) => {
+            const r = await fetch(base + '/admin?api=update_status', { credentials: 'same-origin' });
+            return await r.json();
+        }""",
+        base,
+    )
+
+
+def test_update_applied_outcome_retires_once_the_page_runs_the_new_build(admin_page):
+    """Regression (third report): after updating 1.6.1 → 1.6.2 and reloading,
+    the banner still read "Software update — Updates deliver new features and
+    critical security enhancements. Please don't delay… Update applied
+    (1.6.1 → 1.6.2). Reload the page to use the new version." for up to ten
+    minutes (the manual_run record's display window).
+
+    Two things fixed here:
+      - The urgency blurb only shows while an update is actually available,
+        never under a progress line or an outcome.
+      - The "Update applied — reload" outcome is retired as soon as the page
+        itself is served by the applied build (its render-time BUILD_INFO SHA
+        equals updater_last_update.to_sha; VERSION fallback without a
+        BUILD_INFO). Before that reload it must still show, or the operator
+        never learns the update landed.
+    The BUILD_INFO at the docroot is what admin.php reads at render time, so
+    the test swaps it to model "old page" vs "reloaded page"."""
+    page, configured = admin_page
+    from fixtures.payserver import REPO_ROOT
+
+    base = configured.handle.url
+    old_sha = "0161" + "a" * 36
+    new_sha = "0162" + "b" * 36
+    build_info = REPO_ROOT / "BUILD_INFO"
+    previous = build_info.read_bytes() if build_info.exists() else None
+
+    def seed_outcome(to_sha: str, to_version: str) -> None:
+        now = int(time.time())
+        _set_config(configured.handle, "updater_available", {
+            "available": False, "channel": "main", "checked_at": now,
+            "current_sha": to_sha, "latest_sha": to_sha,
+        })
+        _set_config(configured.handle, "updater_last_update", {
+            "from_version": "1.6.1", "to_version": to_version,
+            "from_sha": old_sha, "to_sha": to_sha, "channel": "main", "applied_at": now - 30,
+        })
+        _set_config(configured.handle, "updater_manual_run", {
+            "state": "success", "started_at": now - 60, "finished_at": now - 30,
+            "from_version": "1.6.1", "to_version": to_version,
+        })
+
+    try:
+        # --- 1. Old page (rendered by the pre-update build): outcome shown,
+        # urgency blurb hidden, headline is the neutral "Software update".
+        build_info.write_text(f"COMMIT_SHA={old_sha}\nCHANNEL=main\nVERSION=1.6.1\n")
+        seed_outcome(new_sha, "1.6.2")
+        page.goto(f"{base}/admin/dashboard", wait_until="networkidle")
+        page.wait_for_timeout(1500)
+        banner = page.locator("#update-available-banner")
+        assert banner.is_visible(), "the outcome must be shown until the operator reloads"
+        text = banner.inner_text()
+        assert "update applied" in text.lower() and "1.6.1 → 1.6.2" in text, text
+        assert "reload the page" in text.lower(), text
+        assert "software update" in text.lower(), text
+        assert "security" not in text.lower(), "urgency blurb must not show when nothing is available"
+        assert "is available" not in text.lower(), text
+        assert not page.locator("#update-available-urgency").is_visible()
+
+        # --- 2. Reloaded page (rendered by the applied build): nothing to show.
+        build_info.write_text(f"COMMIT_SHA={new_sha}\nCHANNEL=main\nVERSION=1.6.2\n")
+        page.goto(f"{base}/admin/dashboard", wait_until="networkidle")
+        page.wait_for_timeout(1500)
+        assert not page.locator("#update-available-banner").is_visible(), (
+            "'Update applied — reload' must retire once the page runs the new build"
+        )
+        # The settings card's progress line is retired too (in the dev stack
+        # it then shows the "disabled in this environment" note instead).
+        page.goto(f"{base}/admin/settings", wait_until="networkidle")
+        page.wait_for_timeout(1500)
+        card_prog = page.locator("#auto-update-progress")
+        if card_prog.is_visible():
+            assert "update applied" not in card_prog.inner_text().lower(), card_prog.inner_text()
+            assert "reload" not in card_prog.inner_text().lower(), card_prog.inner_text()
+        assert "latest version" in page.locator("#auto-update-availability").inner_text().lower()
+
+        # --- 3. No BUILD_INFO (dev checkout): VERSION fallback.
+        build_info.unlink()
+        running_version = _update_status(page, base)["current_version"]
+        seed_outcome("", running_version)  # applied build == the one serving the page
+        page.goto(f"{base}/admin/dashboard", wait_until="networkidle")
+        page.wait_for_timeout(1500)
+        assert not page.locator("#update-available-banner").is_visible(), (
+            "version fallback: outcome for the running version is retired"
+        )
+        seed_outcome("", "9.9.9-test")  # applied build is not the one serving the page
+        page.goto(f"{base}/admin/dashboard", wait_until="networkidle")
+        page.wait_for_timeout(1500)
+        banner = page.locator("#update-available-banner")
+        assert banner.is_visible()
+        assert "1.6.1 → 9.9.9-test" in banner.inner_text()
+        assert "security" not in banner.inner_text().lower()
+
+        # --- 4. An available update still shows the urgency blurb.
+        _set_config(configured.handle, "updater_available", {
+            "available": True, "channel": "main", "latest_version": "9.9.9-test",
+            "latest_sha": "f" * 40, "checked_at": int(time.time()),
+        })
+        page.goto(f"{base}/admin/dashboard", wait_until="networkidle")
+        page.wait_for_timeout(1500)
+        banner = page.locator("#update-available-banner")
+        assert banner.is_visible()
+        assert "security" in banner.inner_text().lower()
+        assert page.locator("#update-available-urgency").is_visible()
+    finally:
+        if previous is None:
+            build_info.unlink(missing_ok=True)
+        else:
+            build_info.write_bytes(previous)
+        with configured.handle.db() as db:
+            db.execute("DELETE FROM config WHERE key IN ('updater_manual_run', 'updater_last_update')")
+
+
 def test_manual_update_refused_in_dev_stack(admin_page):
     """The dev/test stack sets .updater_disabled; the manual-update endpoint
     must refuse with reason 'disabled' instead of overlaying the checkout."""

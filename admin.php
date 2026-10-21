@@ -5676,7 +5676,7 @@ header('Cache-Control: no-cache, must-revalidate');
                 <span style="flex-shrink: 0; font-size: 1.1rem; line-height: 1.2;">&#9888;</span>
                 <span style="flex: 1;">
                     <strong id="update-available-text">A software update is available.</strong>
-                    <span style="display: block; color: var(--text-secondary); font-size: 0.85rem; margin-top: 0.15rem;">
+                    <span id="update-available-urgency" style="display: block; color: var(--text-secondary); font-size: 0.85rem; margin-top: 0.15rem;">
                         Updates deliver new features and critical security enhancements. Please don't delay — apply it as soon as you can to keep your server secure.
                     </span>
                     <span id="update-available-progress" class="hidden" style="display: block; margin-top: 0.4rem; font-size: 0.85rem;"></span>
@@ -14739,6 +14739,30 @@ header('Cache-Control: no-cache, must-revalidate');
         let manualUpdatePollTimer = null;
         let manualUpdatePollDeadline = 0;
 
+        // Identity of the build that RENDERED this page (read at render time,
+        // so it is the old build's until the operator reloads after an update
+        // — update_status, by contrast, is answered by whatever build is on
+        // disk, which is already the new one the moment the overlay lands).
+        // Used to retire the "Update applied — reload the page" outcome once
+        // the reload has actually happened. SHA when a BUILD_INFO exists
+        // (release installs), VERSION as the fallback (dev checkouts).
+        <?php $pageBuild = Updater::getLocalBuildInfo(); ?>
+        const PAGE_BUILD_SHA = <?= json_encode((string)($pageBuild['COMMIT_SHA'] ?? '')) ?>;
+        const PAGE_BUILD_VERSION = <?= json_encode((string)($pageBuild['VERSION'] ?? CASHUPAY_VERSION)) ?>;
+
+        // True when this page is already being served by the build the last
+        // update installed — i.e. the operator has reloaded since it applied.
+        function pageRunsAppliedBuild(run, data) {
+            const last = data && data.last_update ? data.last_update : null;
+            const toSha = last && last.to_sha ? String(last.to_sha) : '';
+            if (toSha && PAGE_BUILD_SHA) {
+                return toSha === PAGE_BUILD_SHA;
+            }
+            const toVersion = (run && run.to_version) ? String(run.to_version)
+                : (last && last.to_version ? String(last.to_version) : '');
+            return toVersion !== '' && toVersion === PAGE_BUILD_VERSION;
+        }
+
         // A manual_run record is only "active" (worth surfacing) for a few
         // minutes, so a stale record from an old session doesn't pin the
         // banner open or show a phantom "Updating…".
@@ -14750,8 +14774,17 @@ header('Cache-Control: no-cache, must-revalidate');
         }
 
         // Map a manual_run state to a user-facing {text, color, busy, done}.
-        function manualRunView(run) {
+        // `data` is the full update_status payload (optional) — needed to tell
+        // whether a "reload the page" outcome has already been acted on.
+        function manualRunView(run, data) {
             if (!run || !manualRunRecent(run)) return null;
+            if ((run.state === 'success' || run.state === 'applied_unverified') && pageRunsAppliedBuild(run, data)) {
+                // The reload happened: this page IS the new build. Telling the
+                // operator to reload again (under a "Software update" banner
+                // with the urgency blurb) is exactly the "still says update"
+                // confusion we're avoiding. Nothing left to surface.
+                return null;
+            }
             switch (run.state) {
                 case 'running':
                     return { busy: true, text: 'Updating… downloading and verifying the new build. This can take a minute — keep this page open.', color: 'var(--text-secondary)' };
@@ -14784,13 +14817,14 @@ header('Cache-Control: no-cache, must-revalidate');
         function applyUpdateState(data) {
             const avail = data && data.available && data.available.available === true;
             const run = data ? data.manual_run : null;
-            const view = manualRunView(run);
+            const view = manualRunView(run, data);
             const busy = !!(view && view.busy);
 
             // --- Dashboard banner ---
             const banner = document.getElementById('update-available-banner');
             if (banner) {
                 const txt = document.getElementById('update-available-text');
+                const urgency = document.getElementById('update-available-urgency');
                 const prog = document.getElementById('update-available-progress');
                 const btn = document.getElementById('btn-update-now-banner');
                 // Show while an update is available OR while a manual run is
@@ -14800,6 +14834,12 @@ header('Cache-Control: no-cache, must-revalidate');
                     if (txt) {
                         const lv = (data.available && data.available.latest_version) ? (' (version ' + data.available.latest_version + ')') : '';
                         txt.textContent = avail ? ('A software update is available' + lv + '.') : 'Software update';
+                    }
+                    // The "apply it as soon as you can" nudge only makes sense
+                    // while something is actually available to apply — not
+                    // under a progress line or an "Update applied" outcome.
+                    if (urgency) {
+                        urgency.classList.toggle('hidden', !avail);
                     }
                     if (prog) {
                         if (view) {
@@ -14915,7 +14955,7 @@ header('Cache-Control: no-cache, must-revalidate');
                     showToast('Still working… reload in a minute to check the result.', 'error');
                     return;
                 }
-                const view = manualRunView(run);
+                const view = manualRunView(run, data);
                 if (view && view.done === 'success') {
                     showToast('Update applied — reload the page.', 'success');
                 } else if (view && view.done === 'failed') {
