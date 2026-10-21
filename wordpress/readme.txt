@@ -4,7 +4,7 @@ Tags: bitcoin, lightning, payments, woocommerce, btcpay
 Requires at least: 6.0
 Tested up to: 7.1
 Requires PHP: 8.0
-Stable tag: 1.6.1
+Stable tag: 1.6.2
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -72,6 +72,9 @@ During onboarding the plugin installs and activates the "BTCPay for WooCommerce"
 The full plugin build distributed on the project's GitHub releases page can additionally install a BareBits server alongside WordPress. That flow fetches release metadata from api.github.com and downloads the release archive and its checksums from github.com. The build distributed on wordpress.org does not include this component and never contacts GitHub. GitHub terms of service: https://docs.github.com/en/site-policy/github-terms/github-terms-of-service — privacy statement: https://docs.github.com/en/site-policy/privacy-policies/github-general-privacy-statement
 
 == Changelog ==
+
+= 1.6.2 =
+* Server-side (for installs updating the companion BareBits server): the admin "update available" banner now also clears when the stale verdict was left behind by the build that performed the update (1.6 → 1.6.1 kept advertising 1.6).
 
 = 1.6.1 =
 * Server-side (for installs updating the companion BareBits server): the admin "update available" banner no longer keeps advertising the release you just installed; the self-serve pay page accepts fiat amounts typed without a leading zero (".10").
