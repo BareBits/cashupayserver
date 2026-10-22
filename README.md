@@ -5,8 +5,6 @@
   </picture>
 </p>
 
-# BareBits
-
 BareBits makes it EASY for merchants to accept Bitcoin (lightning and on-chain) without running a full BTCPay Server instance. No Docker, no VPS, no command line. Just upload and go. **Works on all "shared" web hosting, if it can host WordPress, it can host BareBits**. Low 1% fee. Ready to install? Use our [latest release](https://github.com/BareBits/cashupayserver/releases/latest) or [have us install it for you](https://getbarebits.com) for a 2% fee. See [installation](#Installation).
 
 BareBits can create invoices, receive payments, and be used as a point-of-sale system or be connected it to your e-commerce site. Technically speaking, it is a PHP-based Bitcoin Lightning payment gateway that implements BTCPay Server's Greenfield API. This means that any e-commerce software that works with BTCPay Server can work with BareBits including WooCommerce, Shopify, Magneto, Drupal, and more! BareBits supports a number of payment types, risk/trust levels, and capabilities depending on your intended use case.
