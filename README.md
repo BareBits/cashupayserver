@@ -5,7 +5,7 @@
   </picture>
 </p>
 
-BareBits makes it EASY for merchants to accept Bitcoin (lightning and on-chain) without running a full BTCPay Server instance. No Docker, no VPS, no command line. Just upload and go. **Works on all "shared" web hosting, if it can host WordPress, it can host BareBits**. Low 1% fee. Ready to install? Use our [latest release](https://github.com/BareBits/cashupayserver/releases/latest) or [have us install it for you](https://getbarebits.com) for a 2% fee. See [installation](#Installation).
+BareBits makes it EASY for merchants to accept Bitcoin (lightning and on-chain) without running a full BTCPay Server instance. No Docker, no VPS, no command line. Just upload and go. **Works on all "shared" web hosting, if it can host WordPress, it can host BareBits**. Low 1% fee. Ready to install? Use our [latest release](https://github.com/BareBits/cashupayserver/releases/latest) or [have us install it for you](https://getbarebits.com) for a 2% fee. See [installation](#Installation) and [FAQ](#FAQ)
 
 BareBits can create invoices, receive payments, and be used as a point-of-sale system or be connected it to your e-commerce site. Technically speaking, it is a PHP-based Bitcoin Lightning payment gateway that implements BTCPay Server's Greenfield API. This means that any e-commerce software that works with BTCPay Server can work with BareBits including WooCommerce, Shopify, Magneto, Drupal, and more! BareBits supports a number of payment types, risk/trust levels, and capabilities depending on your intended use case.
 
@@ -175,6 +175,32 @@ on the checkout page.
   cashu mint (if enabled). You can enable "strict mode" in settings to disable the fallback
   and reject the invoice instead — useful for operators who want to eliminate
   the mint entirely from their payment flow.
+
+
+## FAQ
+
+#### Are funds stored on the server?
+
+No, funds are directed to your off-server wallet. The only time the server has any access to funds is if you enable a Cashu mint, which will be periodically swept to your wallet.
+
+#### What if I want my funds in USD or other native currency, not BTC?
+
+BareBits integrates with [Strike](https://strike.me) so your funds can be instantly converted to USD. Your customer pays in BTC, you receive the currency of your choice. If you don't want to use Strike, you can periodically sell your BTC [using a centralized or decentralized exchange](https://getbarebits.com/help/Understanding%20Bitcoin/fiat%20conversion%20options/). 
+
+#### Can I have multiple stores in a single installation, like if I want to help onboard another merchant?
+
+Absolutely! You can create multiple stores and can create non-admin accounts (so they can take payments but not modify settings). You can even charge a fee ("hosting fee" in store settings) for your help. Each store has its own settings so they can use separate wallets, payment preferences, etc.
+
+#### Which wallets do you suggest? What if my wallet is offline or doesn't have enough inbound liquidity?
+
+Any on-chain wallet will work for on-chain payments. Lightning wallets will work for lightning payments if they have NWC, NOFFER, or an LNURL function. We suggest Electrum, see [Suggested Payment Configurations](#Suggested Payment Configurations)
+
+If your wallet is offline, on-chain payments continue functioning as normal. Lightning payments require an online wallet, so if your wallet is offline, BareBits gracefully falls back to the next lightning payment option until all are exhausted and if none work, it will skip showing a lightning payment QR code to your customer. You can customize this fallback order. Options include: NWC wallets, CLINK wallets, Strike API wallets, and LNURL wallets. If none of those work, and submarine swaps are enabled, your customer can pay via LN but you receive the funds on-chain. If submarine swaps are not possible (for example it does not meet the minimum transaction size) or disabled, and a cashu mint IS enabled, funds will go to your cashu mint. 
+
+#### What happens if BareBits shuts down?
+
+There is no dependency on BareBits infrastructure whatsoever since this is a self-hosted software. If BareBits disappears, your software will continue to work. We have no access to or control over your server or funds.
+
 
 ## Requirements
 
