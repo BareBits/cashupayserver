@@ -12,11 +12,9 @@ Accept Bitcoin (on-chain and Lightning) in WooCommerce through a BareBits server
 
 == Description ==
 
-Accept Bitcoin (on-chain and Lightning) in WooCommerce through a BareBits server. No approval process, no middlemen. Low 1% fee.
+BareBits makes it easy for your WooCommerce shop accept Bitcoin — on-chain and over the Lightning Network — with funds going straight to wallets you control. No payment processor account, no approval process, no chargebacks. Low 1% fee.
 
-BareBits lets your WooCommerce shop accept Bitcoin — on-chain and over the Lightning Network — with funds going straight to wallets you control. No payment processor account, no approval process, no chargebacks.
-
-This plugin is the WordPress-side glue: during onboarding you connect your self-hosted BareBits server by entering its URL. (The plugin's full build, distributed on the project's GitHub releases page, can additionally install a BareBits server alongside WordPress for you.)
+This plugin connects your WooCommerce installation to your BareBits server, which can run on any web hosting account (no VPS required). During plugin installation, you connect to your self-hosted BareBits server by entering its URL. (The plugin's full build, distributed on the project's GitHub releases page, can additionally install a BareBits server alongside WordPress for you automatically see https://github.com/BareBits/cashupayserver )
 
 The plugin then installs and configures the "BTCPay for WooCommerce" gateway plugin, points it at your BareBits server, registers the payment webhook, and can apply an automatic checkout discount for Bitcoin payments — on both the classic and the block-based checkout, with the percentage advertised in the payment method's title.
 
@@ -37,9 +35,13 @@ Don't have a BareBits server yet? Any host that can run WordPress can run one �
 
 Yes — a BareBits server you host yourself, which is the point: your money never touches anyone else's infrastructure. Any host that can run WordPress can run BareBits, even shared hosting; set it up once and connect it here by URL. (The full plugin build from the project's GitHub releases can also install it next to your existing site for you.)
 
+= Can I convert the BTC to my local currency? =
+
+Yes, using any crypto exchange. BareBits is compatible with Strike which can do instant conversion and is available in 100+ countries.
+
 = Where does the money go? =
 
-To wallets you control: your own Lightning address, your own on-chain wallet (xpub), or a Cashu mint of your choosing. The BareBits admin walks you through it.
+To wallets you control: your own Lightning wallet, your own on-chain wallet (xpub), or a Cashu mint of your choosing. The BareBits admin walks you through it. Lightning funds can be directed to your wallet via: CLINK noffer, NWC, or LNURL (lightning address). We suggest Electrum wallet.
 
 = What happens if I uninstall this plugin? =
 
@@ -55,7 +57,7 @@ Only the WordPress-side wiring is removed. A BareBits server installed alongside
 
 == External services ==
 
-This plugin talks to the following services. None of them receive data on behalf of BareBits: the server you connect is your own, and BareBits (Zaphaus LLC) operates no hosted service and receives nothing from your site.
+This plugin talks to the following services. None of them receive data on behalf of BareBits: the server you connect is your own, and BareBits operates no hosted service and receives nothing from your site.
 
 = Your own BareBits server =
 
