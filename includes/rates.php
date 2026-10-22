@@ -44,6 +44,7 @@ class CoinGeckoProvider implements PriceProvider {
         ]);
 
         $result = \SafeHttp::request($url, [
+            'maxBytes' => 256 * 1024,
             'timeout' => 10,
             'userAgent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
             'headers' => ['Accept: application/json'],
@@ -97,6 +98,7 @@ class BinanceProvider implements PriceProvider {
         $url = self::API_URL . '?symbol=' . $symbol;
 
         $result = \SafeHttp::request($url, [
+            'maxBytes' => 256 * 1024,
             'timeout' => 10,
             'headers' => ['Accept: application/json'],
             'allowPrivate' => false,
@@ -148,6 +150,7 @@ class KrakenProvider implements PriceProvider {
         $url = self::API_URL . '?pair=' . $pair;
 
         $result = \SafeHttp::request($url, [
+            'maxBytes' => 256 * 1024,
             'timeout' => 10,
             'headers' => ['Accept: application/json'],
             'allowPrivate' => false,

@@ -23,8 +23,51 @@ require_once __DIR__ . '/includes/offline_cashu.php';
 require_once __DIR__ . '/includes/products.php';
 require_once __DIR__ . '/includes/cart.php';
 require_once __DIR__ . '/includes/managed.php';
+require_once __DIR__ . '/includes/locks.php';
+require_once __DIR__ . '/includes/transfer.php';
+require_once __DIR__ . '/includes/store_safety.php';
 
 use Cashu\ProofState;
+
+/**
+ * Settle the ledger row for a token we have just seen redeemed.
+ *
+ * The export screen watches the mint and turns green the moment the recipient
+ * cashes a token in; whoever observes the redemption is in the best position
+ * to record it, so the matching pending export is completed here and then —
+ * not minutes later by the cron reconcile. A bookkeeping failure must not
+ * turn a successful redemption into an error on the operator's screen.
+ */
+function cashupay_settle_redeemed_transfer(string $storeId, array $secrets): void {
+    try {
+        $row = Transfer::findPendingBySecrets($storeId, $secrets);
+        if ($row !== null) {
+            Transfer::complete((string)$row['id'], 'Cashed in by the recipient');
+        }
+    } catch (Throwable $e) {
+        error_log('CashuPayServer: could not settle redeemed transfer: ' . $e->getMessage());
+    }
+}
+
+/**
+ * A store's backup mints with what each one's wallet namespace holds, so funds
+ * settled by failover into a backup are visible where the mint is listed.
+ */
+function cashupay_backup_mint_rows(string $storeId): array {
+    $rows = Config::getStoreBackupMints($storeId);
+    foreach ($rows as &$row) {
+        try {
+            $held = StoreSafety::namespaceHoldings((string)$row['mint_url'], (string)($row['unit'] ?? 'sat'));
+            $row['balance'] = $held['balance'];
+            $row['exported'] = $held['exported'];
+        } catch (Throwable $e) {
+            $row['balance'] = null;
+            $row['exported'] = null;
+        }
+    }
+    unset($row);
+    return $rows;
+}
 
 // Check setup
 if (!Database::isInitialized() || !Config::isSetupComplete()) {
@@ -44,18 +87,22 @@ if (Auth::isLoggedIn() && Background::shouldSync()) {
  * H5: Check if data directory is protected from HTTP access
  */
 function checkDataDirectoryProtection(): ?string {
-    $baseUrl = Config::getBaseUrl();
-    $testUrl = rtrim($baseUrl, '/') . '/data/cashupay.sqlite';
+    // Self-request: same origin rules as Background::trigger() (pinned
+    // base_url, else the request's host pinned to the address it arrived
+    // on; no redirects; TLS verified off-loopback) so a forged Host header
+    // cannot point this probe at a third party.
+    $target = Background::selfRequest('/data/cashupay.sqlite');
+    if ($target === null) {
+        return null;
+    }
 
     $ch = curl_init();
-    curl_setopt_array($ch, [
-        CURLOPT_URL => $testUrl,
+    curl_setopt_array($ch, $target['options'] + [
+        CURLOPT_URL => $target['url'],
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_NOBODY => true,
         CURLOPT_TIMEOUT => 3,
         CURLOPT_CONNECTTIMEOUT => 2,
-        CURLOPT_FOLLOWLOCATION => false,
-        CURLOPT_SSL_VERIFYPEER => false,
     ]);
 
     curl_exec($ch);
@@ -515,6 +562,17 @@ if (isset($_GET['api'])) {
                     ];
                 })(),
                 'cronStaleWarning' => Background::cronStaleWarning(),
+                // Money the store handed out in tokens nobody has cashed in
+                // yet, the per-account (primary + backup mint) breakdown so
+                // failover-settled funds are never invisible, and the recent
+                // token exports (no tokens or secrets in this payload; the
+                // token is fetched explicitly via transfer_token).
+                'exportedBalance' => $storeConfigured ? Invoice::getExportedBalance($storeId) : 0,
+                'accountBalances' => $storeConfigured ? Invoice::getAccountBalances($storeId) : [],
+                'recentExports' => array_map(
+                    [Transfer::class, 'formatForApi'],
+                    Transfer::getByStore($storeId, 10)
+                ),
             ]);
             break;
 
@@ -982,21 +1040,26 @@ if (isset($_GET['api'])) {
                 // Mint is reachable - get proofs and check states
                 $proofs = Invoice::getUnspentProofs($storeId);
                 $wallet = Invoice::getWalletInstance($storeId);
+                $store = Config::getStore($storeId);
 
-                // Check proof states at mint (same as export_token)
+                // Check proof states at mint (same as export_token). The reply
+                // is validated (complete, in order) — a short or empty answer
+                // is an error, never "spendable".
                 if (!empty($proofs)) {
                     try {
-                        $states = $wallet->checkProofState($proofs);
+                        $states = StoreSafety::checkStatesByY(
+                            $store['mint_url'] ?? Config::getStoreMintUrl($storeId),
+                            array_map(fn($p) => $p->Y, $proofs)
+                        );
                         $validProofs = [];
                         $spentSecrets = [];
 
-                        foreach ($states as $i => $state) {
-                            // Normalize case - mints may return lowercase states
-                            $mintState = strtoupper($state['state'] ?? ProofState::UNSPENT);
+                        foreach ($proofs as $proof) {
+                            $mintState = $states[$proof->Y] ?? '';
                             if ($mintState === ProofState::UNSPENT) {
-                                $validProofs[] = $proofs[$i];
+                                $validProofs[] = $proof;
                             } elseif ($mintState === ProofState::SPENT) {
-                                $spentSecrets[] = $proofs[$i]->secret;
+                                $spentSecrets[] = $proof->secret;
                             }
                             // Skip PENDING proofs (same as export_token)
                         }
@@ -1007,7 +1070,7 @@ if (isset($_GET['api'])) {
                         }
 
                         $proofs = $validProofs;
-                    } catch (\Cashu\CashuException $e) {
+                    } catch (\Exception $e) {
                         // If checkstate fails, fall back to local balance
                         $mintReachable = false;
                         error_log("CashuPayServer: export_info checkProofState failed: " . $e->getMessage());
@@ -1029,6 +1092,43 @@ if (isset($_GET['api'])) {
                 'available' => $offlineBalance,
                 'mintUnit' => Config::getStoreMintUnit($storeId),
                 'mintUnreachable' => true
+            ]);
+            break;
+
+        case 'scan_stranded_funds':
+            // Funds left in wallet namespaces no store uses any more (a past
+            // mint/unit change). Local scan, no mint contact.
+            Auth::requireAdmin();
+            try {
+                echo json_encode(['stranded' => Invoice::scanStrandedNamespaces()]);
+            } catch (\Throwable $e) {
+                cashupay_status(500);
+                echo json_encode(['error' => $e->getMessage()]);
+            }
+            break;
+
+        case 'get_backup_mints':
+            // The store-details modal fetches this over GET (?api=); the POST
+            // action of the same name serves the older callers.
+            $storeId = $_GET['store_id'] ?? '';
+            if ($storeId === '') {
+                cashupay_status(400);
+                echo json_encode(['error' => 'Store ID required']);
+                break;
+            }
+            echo json_encode(cashupay_backup_mint_rows((string)$storeId));
+            break;
+
+        case 'list_transfers':
+            Auth::requireAdmin();
+            $storeId = $_GET['store_id'] ?? '';
+            if ($storeId === '') {
+                cashupay_status(400);
+                echo json_encode(['error' => 'Store ID required']);
+                break;
+            }
+            echo json_encode([
+                'transfers' => array_map([Transfer::class, 'formatForApi'], Transfer::getByStore($storeId, 50)),
             ]);
             break;
 
@@ -1257,16 +1357,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $password = $_POST['password'] ?? '';
         $clientIp = Security::getClientIp();
 
-        // Check if locked out
-        if (Security::isLockedOut($clientIp)) {
-            $remaining = Security::getLockoutRemaining($clientIp);
+        // The attempt is reserved (check + increment under a lock) BEFORE
+        // the password is verified, so N parallel guesses cost N attempts
+        // and the global sign-in budget bounds address rotation. 'locked'
+        // means no password check happened at all.
+        $loginResult = Auth::attemptLogin($username, $password, $clientIp);
+        if ($loginResult === 'locked') {
+            $remaining = Security::getLockoutRemaining($clientIp, true);
             cashupay_status(429);
             echo json_encode(['error' => "Too many failed attempts. Try again in {$remaining} seconds."]);
             exit;
         }
 
-        if ($username !== '' && Auth::login($username, $password)) {
-            Security::clearLoginAttempts($clientIp);
+        if ($loginResult === 'ok') {
             $user = Auth::currentUser();
 
             // C1: Trigger background sync on login
@@ -1290,7 +1393,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 ],
             ]);
         } else {
-            Security::recordFailedLogin($clientIp);
+            // Already counted by attemptLogin's reservation.
             cashupay_status(401);
             echo json_encode(['error' => 'Invalid username or password']);
         }
@@ -1770,9 +1873,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if (isset($_POST['mint_unit'])) {
                     $updates['mint_unit'] = $_POST['mint_unit'];
                 }
-                if (isset($_POST['seed_phrase'])) {
-                    $updates['seed_phrase'] = $_POST['seed_phrase'];
-                }
+                // No seed_phrase branch: the recovery phrase is never
+                // replaceable in place (Config::updateStore refuses it too).
                 if (isset($_POST['exchange_fee_percent'])) {
                     $updates['exchange_fee_percent'] = (float)$_POST['exchange_fee_percent'];
                 }
@@ -1813,7 +1915,71 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $updates['hosting_fee_destination'] = $dest === '' ? null : $dest;
                 }
 
-                Config::updateStore($storeId, $updates);
+                // Changing the mint URL or unit points the store at a new
+                // wallet namespace (hash(mint_url, unit)); the funds at the
+                // current mint stay in the DB but leave every balance and
+                // withdrawal path of this store. Two gates:
+                //   1. while anything is still in flight at the current mint
+                //      (open quotes, pending melts, undelivered webhooks,
+                //      exported tokens, in-flight swaps) the change is blocked
+                //      outright — unless the old mint stays on the backup
+                //      list, where recovery keeps visiting it;
+                //   2. a funded namespace needs the operator's explicit
+                //      confirm_stranding=1 (the funds stay recoverable under
+                //      "Recover funds from a previous mint").
+                $currentMint = rtrim((string)($store['mint_url'] ?? ''), '/');
+                $currentUnit = strtolower((string)($store['mint_unit'] ?? 'sat'));
+                $mintChanged = array_key_exists('mint_url', $updates)
+                    && rtrim((string)$updates['mint_url'], '/') !== $currentMint;
+                $unitChanged = array_key_exists('mint_unit', $updates)
+                    && strtolower((string)$updates['mint_unit']) !== $currentUnit;
+                $confirmStranding = isset($_POST['confirm_stranding']) && $_POST['confirm_stranding'] === '1';
+                $wouldStrand = ($mintChanged || $unitChanged) && $currentMint !== ''
+                    && StoreSafety::namespaceHasData($currentMint, $currentUnit);
+                $oldMintRetained = StoreSafety::isMintRetainedAsBackup($storeId, $currentMint, $currentUnit);
+
+                if (($mintChanged || $unitChanged) && $currentMint !== '' && !$oldMintRetained) {
+                    $blockers = StoreSafety::storeChangeBlockers($storeId);
+                    if (!empty($blockers)) {
+                        cashupay_status(409);
+                        echo json_encode([
+                            'error' => 'mint_change_blocked',
+                            'blockers' => $blockers,
+                            'message' => 'This store still has payments or transfers in progress: '
+                                . implode('; ', $blockers)
+                                . '. Switching mints now would leave them with nowhere to go. '
+                                . 'Wait until they finish (or keep the current mint as a backup), then try again.',
+                        ]);
+                        break;
+                    }
+                }
+
+                if ($wouldStrand && !$confirmStranding) {
+                    $strandedBalance = 0;
+                    $balanceUnknown = false;
+                    try {
+                        $strandedBalance = Invoice::getBalance($storeId);
+                    } catch (\Throwable $e) {
+                        $balanceUnknown = true;
+                    }
+                    cashupay_status(409);
+                    echo json_encode([
+                        'error' => 'mint_change_strands_funds',
+                        'balance' => max(0, $strandedBalance),
+                        'balanceUnknown' => $balanceUnknown,
+                        'unit' => $currentUnit,
+                        'currentMint' => $currentMint,
+                        'currentUnit' => $currentUnit,
+                        'newMint' => array_key_exists('mint_url', $updates) ? $updates['mint_url'] : $currentMint,
+                        'newUnit' => array_key_exists('mint_unit', $updates) ? $updates['mint_unit'] : $currentUnit,
+                        'message' => 'Changing this store\'s mint or unit will make its current balance invisible and '
+                            . 'unspendable through this store. Withdraw or export the balance first, or confirm to '
+                            . 'change anyway (the funds stay recoverable under "Recover funds from a previous mint").',
+                    ]);
+                    break;
+                }
+
+                Config::updateStore($storeId, $updates, $wouldStrand && $confirmStranding);
 
                 echo json_encode([
                     'success' => true,
@@ -1854,6 +2020,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if ($mintUrl === '') {
                     throw new Exception('Mint URL required');
                 }
+                $mintUrl = Config::validateMintUrl($mintUrl); // http(s) only, no userinfo
                 // Same unit set the enable dialog (and setup's mints screen) offers.
                 $mintUnit = strtolower(trim((string)($_POST['mint_unit'] ?? 'sat'))) ?: 'sat';
                 if (!in_array($mintUnit, ['sat', 'usd', 'eur'], true)) {
@@ -2043,47 +2210,52 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     break;
                 }
 
-                // Check database state first using library storage (quick check)
-                $wallet = Invoice::getWalletInstance($storeId);
-                $spentProofs = $wallet->getStorage()->getProofs(ProofState::SPENT);
-                $spentSecrets = array_column($spentProofs, 'secret');
-                $spentCount = count(array_intersect($secrets, $spentSecrets));
+                if (!is_array($secrets)) {
+                    throw new Exception('Secrets must be a JSON array');
+                }
+                $secrets = array_values(array_unique(array_filter(array_map('strval', $secrets), 'strlen')));
 
-                if ($spentCount == count($secrets)) {
-                    // All spent in database
+                // The token's ecash lives in the namespace of the mint that
+                // issued it — not necessarily the current primary (a past
+                // mint change, a failover settle). Look it up and ask THAT
+                // mint; the primary would answer UNSPENT for Ys it never saw.
+                $account = Invoice::namespaceHoldingSecrets($storeId, $secrets);
+                $storage = StoreSafety::storage($account['mint_url'], $account['unit']);
+
+                // Check database state first (quick check, no mint contact)
+                $spentCount = 0;
+                foreach ($storage->getProofsStatesBySecrets($secrets) as $state) {
+                    if ($state === ProofState::SPENT) {
+                        $spentCount++;
+                    }
+                }
+                if ($spentCount === count($secrets)) {
+                    // All spent in database: settle the matching export, if any.
+                    cashupay_settle_redeemed_transfer($storeId, $secrets);
                     echo json_encode(['spent' => true, 'source' => 'db']);
                     break;
                 }
 
-                // Check at mint for real-time status
-                $Ys = [];
-                foreach ($secrets as $secret) {
-                    $Y = \Cashu\Crypto::hashToCurve($secret);
-                    $Ys[] = bin2hex(\Cashu\Secp256k1::compressPoint($Y));
-                }
-
-                $store = Config::getStore($storeId);
-                $client = new \Cashu\MintClient($store['mint_url']);
+                // Check at mint for real-time status. "All spent" is a claim
+                // that the recipient redeemed the token, so it must be proved
+                // for every proof: an empty, short or re-ordered reply is an
+                // error, never a confirmation.
+                $Ys = array_map(fn($s) => \Cashu\Crypto::computeY($s), $secrets);
+                $client = new \Cashu\MintClient($account['mint_url']);
                 $response = $client->post('checkstate', ['Ys' => $Ys]);
-
-
-                $allSpent = true;
-                foreach ($response['states'] ?? [] as $state) {
-                    // Normalize case - mints may return lowercase states
-                    $mintState = strtoupper($state['state'] ?? ProofState::UNSPENT);
-                    if ($mintState !== ProofState::SPENT) {
-                        $allSpent = false;
-                        break;
-                    }
-                }
+                $allSpent = Invoice::proofStatesAllSpent($Ys, $response);
 
                 // If all spent at mint but not in DB, update DB
-                if ($allSpent && $spentCount < count($secrets)) {
-                    Invoice::markProofsSpent($storeId, $secrets);
+                if ($allSpent) {
+                    StoreSafety::transitionProofStates(
+                        $account['mint_url'], $account['unit'], $secrets, ProofState::SPENT,
+                        [StoreSafety::exportedState(), ProofState::PENDING, ProofState::UNSPENT]
+                    );
+                    cashupay_settle_redeemed_transfer($storeId, $secrets);
                 }
 
                 echo json_encode(['spent' => $allSpent, 'source' => 'mint']);
-            } catch (Exception $e) {
+            } catch (\Throwable $e) {
                 error_log("CashuPayServer: check_proofs_spent error: " . $e->getMessage());
                 echo json_encode(['spent' => false, 'error' => $e->getMessage()]);
             }
@@ -3223,6 +3395,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         case 'manual_melt':
             Auth::requireAdmin();
+            // A melt can outlive a tight max_execution_time while the mint
+            // pays the invoice; being cut off mid-melt is how a payment's
+            // outcome gets lost.
+            @set_time_limit(0);
+            $fundsLock = null;
             try {
                 $storeId = $_POST['store_id'] ?? '';
                 $destination = $_POST['address'] ?? '';
@@ -3239,6 +3416,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if (empty($destination)) {
                     throw new Exception('Destination (Lightning address or BOLT-11 invoice) required');
                 }
+
+                // Per-store funds lock shared with export, reclaim, the cron
+                // auto-cashout and the fee melt: never select the same proofs
+                // twice (double-click, two tabs, operator vs cron).
+                $fundsLock = cashupay_acquire_lock('funds_' . $storeId);
+                if (!$fundsLock) {
+                    cashupay_status(409);
+                    echo json_encode(['error' => 'Another withdrawal or export is in progress. Try again in a moment.']);
+                    break;
+                }
+                // A withdrawal the mint is still settling must resolve first:
+                // a retry fetches a fresh invoice and would pay twice.
+                LightningAddress::assertNoPendingWithdrawal($storeId);
 
                 $isBolt11 = LightningAddress::isBolt11Invoice($destination);
                 $isLightningAddress = !$isBolt11 && strpos($destination, '@') !== false;
@@ -3335,6 +3525,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     ? 'Mint returned error: ' . $e->getMessage()
                     : $e->getMessage();
                 echo json_encode(['error' => $errorMsg]);
+            } finally {
+                cashupay_release_lock($fundsLock);
             }
             break;
 
@@ -3419,9 +3611,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             // Flow:
             // 1. Get proofs from local storage
             // 2. Try greedy selection (no mint needed if exact change available)
-            // 3. If no exact change, try mint swap (if reachable)
+            // 3. If no exact change, swap the SMALLEST covering input set at the
+            //    mint (if reachable) — never the whole balance
             // 4. If mint unreachable, ask user to confirm larger amount
-            // 5. Serialize and return token
+            // 5. Record the export in the transfers ledger, reserve the proofs
+            //    as EXPORTED, and only then return the token
+            //
+            // The whole thing runs under the store's funds lock (shared with
+            // withdraw / reclaim / the cron cashout and fee melt): two exports,
+            // or an export racing a withdrawal, can never hand out the same
+            // proofs. A swap can take a while at a slow mint; being cut off
+            // mid-way is how a token's proofs get lost.
+            @set_time_limit(0);
+            $fundsLock = null;
             try {
                 require_once __DIR__ . '/cashu-wallet-php/CashuWallet.php';
 
@@ -3439,16 +3641,27 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     throw new Exception('Amount required');
                 }
 
-                // Resolve any pending proofs first
+                $fundsLock = cashupay_acquire_lock('funds_' . $storeId);
+                if (!$fundsLock) {
+                    cashupay_status(409);
+                    echo json_encode(['error' => 'Another withdrawal or export is in progress. Try again in a moment.']);
+                    break;
+                }
+
+                // Reconcile PENDING proofs first (SPENT transition only — an
+                // exported-but-unredeemed token is never put back on sale).
                 Invoice::checkPendingProofs($storeId);
 
-                // 1. Get proofs from local storage (offline-first)
+                // 1. Get proofs from local storage (offline-first; inputs an
+                //    unfinished melt/swap journal owns are already excluded)
                 $proofs = Invoice::getUnspentProofs($storeId);
                 $balance = \Cashu\Wallet::sumProofs($proofs);
 
+                $store = Config::getStore($storeId);
+                $mintUrl = rtrim((string)$store['mint_url'], '/');
+                $mintUnit = strtolower((string)($store['mint_unit'] ?? 'sat'));
+
                 if ($balance < $amount) {
-                    $store = Config::getStore($storeId);
-                    $mintUnit = $store['mint_unit'] ?? 'sat';
                     throw new Exception("Insufficient balance. Have: {$balance} {$mintUnit}, Need: {$amount} {$mintUnit}");
                 }
 
@@ -3468,22 +3681,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     try {
                         $wallet = Invoice::getWalletInstance($storeId);
 
-                        // Check proof states at mint first (filter out spent/pending)
+                        // Check proof states at mint first (filter out spent/pending).
+                        // The reply is validated: short / re-ordered → error.
                         if (!empty($proofs)) {
-                            $states = $wallet->checkProofState($proofs);
+                            $states = StoreSafety::checkStatesByY($mintUrl, array_map(fn($p) => $p->Y, $proofs));
                             $validProofs = [];
                             $spentSecrets = [];
-
-                            foreach ($states as $i => $state) {
-                                $mintState = strtoupper($state['state'] ?? ProofState::UNSPENT);
+                            foreach ($proofs as $proof) {
+                                $mintState = $states[$proof->Y] ?? '';
                                 if ($mintState === ProofState::SPENT) {
-                                    $spentSecrets[] = $proofs[$i]->secret;
+                                    $spentSecrets[] = $proof->secret;
                                 } elseif ($mintState === ProofState::UNSPENT) {
-                                    $validProofs[] = $proofs[$i];
+                                    $validProofs[] = $proof;
                                 }
                                 // Skip PENDING proofs
                             }
-
                             if (!empty($spentSecrets)) {
                                 Invoice::markProofsSpent($storeId, $spentSecrets);
                             }
@@ -3491,16 +3703,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                             $balance = \Cashu\Wallet::sumProofs($proofs);
                         }
 
-                        $fee = $wallet->calculateFee($proofs);
-
-                        if ($balance >= $amount + $fee) {
-                            $result = $wallet->split($proofs, $amount);
-                            $sendProofs = $result['send'];
-                            $mintUsed = true;
-                        } else {
-                            $mintUnit = $wallet->getUnit();
+                        // Smallest input set that covers the amount plus its own
+                        // NUT-02 input fee — swapping the whole balance put every
+                        // proof of the store into one journaled swap (and paid
+                        // the input fee on all of them).
+                        try {
+                            $inputs = StoreSafety::selectProofsWithFees($wallet, $proofs, $amount);
+                        } catch (\Cashu\InsufficientBalanceException $ie) {
+                            $fee = $wallet->calculateFee($proofs);
                             throw new Exception("Insufficient balance. Have: {$balance} {$mintUnit}, Need: " . ($amount + $fee) . " {$mintUnit}");
                         }
+                        $result = $wallet->split($inputs, $amount);
+                        $sendProofs = $result['send'];
+                        $mintUsed = true;
 
                     } catch (Exception $e) {
                         // Check if mint is unreachable
@@ -3551,15 +3766,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $amount = $selectedSum; // Update to actual amount
                 }
 
-                // 5. Serialize and return token
+                // 5. Serialize
                 if (empty($sendProofs)) {
                     throw new Exception("Export failed: no proofs available");
                 }
-
-                // Get store config for serialization
-                $store = Config::getStore($storeId);
-                $mintUrl = $store['mint_url'];
-                $mintUnit = $store['mint_unit'] ?? 'sat';
 
                 // Use wallet serialization if available, otherwise manual
                 if ($wallet && $mintUsed) {
@@ -3578,14 +3788,30 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         : \Cashu\TokenSerializer::serializeV3($mintUrl, $sendProofs, $mintUnit);
                 }
 
-                // Mark sent proofs as PENDING for claim tracking
+                // Record the export BEFORE anything is disclosed, then reserve
+                // the proofs as EXPORTED (never PENDING: that state belongs to
+                // in-flight melts, and recovery used to return exported proofs
+                // to the balance when the mint reported them unredeemed). If
+                // the reservation fails — another path spent one of them in
+                // the meantime — the ledger row is failed and nothing goes out.
                 $sentSecrets = array_map(fn($p) => $p->secret, $sendProofs);
-                Invoice::markProofsPending($storeId, $sentSecrets);
+                $exportAmount = \Cashu\Wallet::sumProofs($sendProofs);
+                $transferId = Transfer::open(
+                    $storeId, Transfer::TYPE_TOKEN_EXPORT, $exportAmount, $mintUnit, $sentSecrets, $token, $mintUrl,
+                    $mintUsed ? 'Cashu token export' : 'Cashu token export (offline)'
+                );
+                try {
+                    Invoice::markProofsExported($storeId, $sentSecrets, $mintUrl, $mintUnit);
+                } catch (\Throwable $reserveErr) {
+                    Transfer::fail($transferId, 'Reservation failed: ' . $reserveErr->getMessage());
+                    throw $reserveErr;
+                }
 
                 $response = [
                     'token' => $token,
-                    'amount' => \Cashu\Wallet::sumProofs($sendProofs),
+                    'amount' => $exportAmount,
                     'secrets' => $sentSecrets,
+                    'transfer_id' => $transferId,
                 ];
 
                 if (!$mintUsed) {
@@ -3597,12 +3823,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
                 echo json_encode($response);
 
-            } catch (Exception $e) {
+            } catch (\Throwable $e) {
                 if (Database::getInstance()->inTransaction()) {
                     Database::rollback();
                 }
                 cashupay_status(400);
                 echo json_encode(['error' => $e->getMessage()]);
+            } finally {
+                cashupay_release_lock($fundsLock);
             }
             break;
 
@@ -3613,7 +3841,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 echo json_encode(['error' => 'Store ID required']);
                 break;
             }
-            echo json_encode(Config::getStoreBackupMints($storeId));
+            echo json_encode(cashupay_backup_mint_rows((string)$storeId));
             break;
 
         case 'add_backup_mint':
@@ -3672,15 +3900,278 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             Auth::requireAdmin();
             try {
                 $id = (int)($_POST['id'] ?? 0);
+
+                // Recovery and the balance breakdown only visit the accounts a
+                // store currently lists, so removing a backup mint that still
+                // holds anything strands it: the proofs stay in the database
+                // but nothing looks for them any more.
+                $held = StoreSafety::backupMintHoldings($id);
+                if ($held !== null && !empty($held['reasons'])) {
+                    cashupay_status(409);
+                    echo json_encode([
+                        'error' => 'backup_mint_not_empty',
+                        'reasons' => $held['reasons'],
+                        'message' => 'This backup mint still holds ' . implode(' and ', $held['reasons'])
+                            . '. Removing it now would hide that from this store. Withdraw or export it first.',
+                    ]);
+                    break;
+                }
+
                 Config::removeStoreBackupMint($id);
                 echo json_encode(['success' => true]);
-            } catch (Exception $e) {
+            } catch (\Throwable $e) {
+                cashupay_status(400);
+                echo json_encode(['error' => $e->getMessage()]);
+            }
+            break;
+
+        // ===== Exported tokens: show again / check / take back =====
+        case 'transfer_token':
+            // Re-display a token that was handed out. It is bearer money, so
+            // it stays valid for as long as nobody has cashed it in — a lost
+            // QR code must not mean lost funds.
+            Auth::requireAdmin();
+            try {
+                $row = Transfer::getById((string)($_POST['id'] ?? ''));
+                if (!$row || empty($row['token'])) {
+                    cashupay_status(404);
+                    echo json_encode(['error' => 'No token stored for this export']);
+                    break;
+                }
+                echo json_encode([
+                    'token' => $row['token'],
+                    'amount' => (int)$row['amount'],
+                    'unit' => $row['unit'],
+                    'type' => $row['type'],
+                    'status' => $row['status'],
+                    'secrets' => Transfer::secretsOf($row),
+                    'transfer_id' => (string)$row['id'],
+                ]);
+            } catch (\Throwable $e) {
+                cashupay_status(400);
+                echo json_encode(['error' => $e->getMessage()]);
+            }
+            break;
+
+        case 'check_transfer':
+            // Ask the issuing mint whether this token has been cashed in yet.
+            Auth::requireAdmin();
+            try {
+                $row = Transfer::getById((string)($_POST['id'] ?? ''));
+                if (!$row) {
+                    cashupay_status(404);
+                    echo json_encode(['error' => 'Export not found']);
+                    break;
+                }
+                if (($row['status'] ?? '') !== Transfer::STATUS_PENDING) {
+                    // A finished row is history: re-checking a token the
+                    // operator already took back must not complete it again.
+                    echo json_encode([
+                        'status' => $row['status'],
+                        'message' => 'This export is already ' . $row['status'] . '. Nothing was changed.',
+                    ]);
+                    break;
+                }
+                $secrets = Transfer::secretsOf($row);
+                if (empty($secrets)) {
+                    echo json_encode(['status' => $row['status'], 'message' => 'Nothing to check for this export.']);
+                    break;
+                }
+                $mintUrl = (string)($row['mint_url'] ?? '');
+                $unit = (string)($row['unit'] ?? 'sat');
+                if ($mintUrl === '') {
+                    $account = Invoice::namespaceHoldingSecrets((string)$row['store_id'], $secrets);
+                    $mintUrl = $account['mint_url'];
+                    $unit = $account['unit'];
+                }
+                $states = Invoice::checkProofStatesBySecrets((string)$row['store_id'], $secrets, $mintUrl, $unit);
+                $spent = count(array_filter($states, fn($st) => $st === ProofState::SPENT));
+
+                if ($spent === count($secrets)) {
+                    StoreSafety::transitionProofStates(
+                        $mintUrl, $unit, $secrets, ProofState::SPENT,
+                        [StoreSafety::exportedState(), ProofState::PENDING, ProofState::UNSPENT]
+                    );
+                    Transfer::complete((string)$row['id'], 'Cashed in by the recipient');
+                    echo json_encode([
+                        'status' => Transfer::STATUS_COMPLETED,
+                        'spent' => true,
+                        'message' => 'This token has been cashed in. Marked as completed.',
+                    ]);
+                } elseif ($spent === 0) {
+                    echo json_encode([
+                        'status' => $row['status'],
+                        'spent' => false,
+                        'reclaimable' => true,
+                        'message' => 'Nobody has cashed this in yet. You can show the token again, or take the money back.',
+                    ]);
+                } else {
+                    echo json_encode([
+                        'status' => $row['status'],
+                        'spent' => false,
+                        'message' => "Partly cashed in ({$spent} of " . count($secrets) . "). Leave it for now; it will resolve itself.",
+                    ]);
+                }
+            } catch (\Throwable $e) {
+                cashupay_status(400);
+                echo json_encode(['error' => 'Could not reach the mint to check: ' . $e->getMessage()]);
+            }
+            break;
+
+        case 'reclaim_transfer':
+            // Take back an unclaimed token by swapping its ecash for fresh
+            // ecash, which kills the old token at the mint. Anything less
+            // would leave two valid claims on the same money.
+            Auth::requireAdmin();
+            @set_time_limit(0);
+            $reclaimLock = null;
+            try {
+                $row = Transfer::getById((string)($_POST['id'] ?? ''));
+                if (!$row) {
+                    cashupay_status(404);
+                    echo json_encode(['error' => 'Export not found']);
+                    break;
+                }
+                if ($row['status'] !== Transfer::STATUS_PENDING) {
+                    cashupay_status(409);
+                    echo json_encode(['error' => 'This export is already ' . $row['status'] . '.']);
+                    break;
+                }
+                if ($row['type'] !== Transfer::TYPE_TOKEN_EXPORT) {
+                    cashupay_status(409);
+                    echo json_encode(['error' => 'Only a token exported from a live store balance can be taken back.']);
+                    break;
+                }
+
+                $reclaimLock = cashupay_acquire_lock('funds_' . $row['store_id']);
+                if (!$reclaimLock) {
+                    cashupay_status(409);
+                    echo json_encode(['error' => 'Another withdrawal or export is in progress. Try again in a moment.']);
+                    break;
+                }
+
+                $secrets = Transfer::secretsOf($row);
+                $recovered = Invoice::reclaimExportedProofs((string)$row['store_id'], $secrets);
+                Transfer::markReclaimed((string)$row['id'], 'Taken back by the operator; the token no longer works');
+
+                $charged = (int)$row['amount'] - $recovered;
+                if ($recovered <= 0) {
+                    $message = 'The old token no longer works, so nothing is left outstanding. '
+                        . 'This was too small to be worth moving — the mint\'s charge for it was the whole amount — '
+                        . 'so your balance is unchanged.';
+                } elseif ($charged > 0) {
+                    $message = "{$recovered} {$row['unit']} is back in your balance "
+                        . "(the mint charged {$charged} {$row['unit']} to move it). The old token no longer works.";
+                } else {
+                    $message = "{$recovered} {$row['unit']} is back in your balance. The old token no longer works.";
+                }
+                echo json_encode([
+                    'success' => true,
+                    'amount' => $recovered,
+                    'unit' => $row['unit'],
+                    'message' => $message,
+                ]);
+            } catch (\Throwable $e) {
+                cashupay_status(400);
+                echo json_encode(['error' => $e->getMessage()]);
+            } finally {
+                cashupay_release_lock($reclaimLock);
+            }
+            break;
+
+        // ===== Funds stranded at a previous mint =====
+        case 'export_stranded_funds':
+            // Serialise a stranded namespace's proofs into one recovery token.
+            // The proofs are reserved as EXPORTED first and the export is
+            // recorded in the transfers ledger, so calling this again shows
+            // the SAME token (same export id) and "mark recovered" writes off
+            // exactly these proofs.
+            Auth::requireAdmin();
+            @set_time_limit(0);
+            $strandedLock = null;
+            try {
+                $mintUrl = trim((string)($_POST['mint_url'] ?? ''));
+                $unit = strtolower(trim((string)($_POST['unit'] ?? 'sat')));
+                $storeId = (string)($_POST['store_id'] ?? '');
+                if ($mintUrl === '') {
+                    throw new Exception('Mint URL required');
+                }
+                if (Security::sanitizeUrl($mintUrl) === null) {
+                    throw new Exception('Mint URL must be a valid http(s) URL');
+                }
+                if (!preg_match('/^[a-z0-9]{1,16}$/', $unit)) {
+                    throw new Exception('Invalid unit');
+                }
+                $strandedLock = cashupay_acquire_lock('stranded_' . substr(hash('sha256', rtrim($mintUrl, '/') . '|' . $unit), 0, 16));
+                if (!$strandedLock) {
+                    throw new Exception('Another export of these funds is in progress. Try again in a moment.');
+                }
+                $result = Invoice::exportNamespaceAsToken($mintUrl, $unit, $storeId);
+                echo json_encode(['success' => true] + $result);
+            } catch (\Throwable $e) {
+                cashupay_status(400);
+                echo json_encode(['error' => $e->getMessage()]);
+            } finally {
+                cashupay_release_lock($strandedLock);
+            }
+            break;
+
+        case 'mark_stranded_recovered':
+            // After the recovery token was claimed elsewhere, write off exactly
+            // the proofs of that export. When the old mint can still be
+            // reached, it is asked first and an unclaimed token is refused.
+            Auth::requireAdmin();
+            try {
+                $exportId = (string)($_POST['export_id'] ?? '');
+                $row = Transfer::getById($exportId);
+                if (!$row || $row['type'] !== Transfer::TYPE_STRANDED_EXPORT) {
+                    throw new Exception('Create the recovery token again first, then confirm it was claimed.');
+                }
+                if ($row['status'] !== Transfer::STATUS_PENDING) {
+                    cashupay_status(409);
+                    echo json_encode(['error' => 'This recovery token is already ' . $row['status'] . '.']);
+                    break;
+                }
+                $force = isset($_POST['force']) && $_POST['force'] === '1';
+                $secrets = Transfer::secretsOf($row);
+                $mintReachable = true;
+                $unspent = 0;
+                try {
+                    $states = Invoice::checkProofStatesBySecrets(
+                        (string)$row['store_id'], $secrets, (string)$row['mint_url'], (string)$row['unit']
+                    );
+                    foreach ($states as $st) {
+                        if ($st !== ProofState::SPENT) {
+                            $unspent++;
+                        }
+                    }
+                } catch (\Throwable $e) {
+                    $mintReachable = false;
+                }
+                if ($mintReachable && $unspent > 0 && !$force) {
+                    cashupay_status(409);
+                    echo json_encode([
+                        'error' => 'not_claimed',
+                        'unspent' => $unspent,
+                        'message' => 'The mint says this recovery token has not been cashed in yet ('
+                            . $unspent . ' of ' . count($secrets) . ' proofs still unspent). '
+                            . 'Claim it in a wallet first, or confirm you want to write it off anyway.',
+                    ]);
+                    break;
+                }
+                $n = Invoice::markNamespaceRecovered($exportId);
+                echo json_encode(['success' => true, 'marked' => $n, 'mintReachable' => $mintReachable]);
+            } catch (\Throwable $e) {
                 cashupay_status(400);
                 echo json_encode(['error' => $e->getMessage()]);
             }
             break;
 
         case 'test_mint':
+            // Admin-only: this probe fetches an operator-supplied URL and
+            // echoes the response (or the error text) back, so for any
+            // lesser role it was a server-side request primitive.
+            Auth::requireAdmin();
             try {
                 $mintUrl = $_POST['mint_url'] ?? '';
                 if (empty($mintUrl)) {
@@ -3749,6 +4240,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if (empty($storeId) || $mintUrl === '') {
                     throw new Exception('Store ID and mint URL required');
                 }
+                $mintUrl = Config::validateMintUrl($mintUrl); // http(s) only, no userinfo
                 OfflineCashu::addAllowedMint($storeId, $mintUrl);
                 echo json_encode(['success' => true]);
             } catch (Exception $e) {
@@ -3898,6 +4390,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
 
         case 'test_mint_expiry':
+            // Same outbound-request primitive as test_mint: admin only.
+            Auth::requireAdmin();
             try {
                 require_once __DIR__ . '/includes/mint_helpers.php';
                 $mintUrl = $_POST['mint_url'] ?? '';
@@ -3905,6 +4399,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if (empty($mintUrl)) {
                     throw new Exception('Mint URL required');
                 }
+                $mintUrl = Config::validateMintUrl((string)$mintUrl);
                 $result = MintHelpers::testExpiry($mintUrl, $unit);
                 echo json_encode($result);
             } catch (Exception $e) {
@@ -3983,11 +4478,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
                 // Re-verify the current password to defeat session-hijack
                 // attempts where the attacker doesn't know the current pass.
+                // A hijacked session must not get unlimited guesses either:
+                // reserve a per-address attempt (not the global sign-in
+                // budget — a visitor must not be able to pause everyone's
+                // login through an authenticated prompt) before the check,
+                // and slow a wrong answer down.
+                if (!Security::reserveLoginAttempt(Security::getClientIp())) {
+                    cashupay_status(429);
+                    echo json_encode(['error' => 'Too many attempts. Wait a few minutes and try again.']);
+                    break;
+                }
                 $row = Database::fetchOne(
                     "SELECT password_hash FROM users WHERE id = ?",
                     [$self['id']]
                 );
                 if (!$row || !password_verify($current, $row['password_hash'])) {
+                    usleep(500000);
                     cashupay_status(401);
                     echo json_encode(['error' => 'Current password is incorrect']);
                     break;
@@ -4017,7 +4523,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if (!$storeId) {
                     throw new Exception('Store ID required');
                 }
+                // Per-address attempt reserved BEFORE the password check so a
+                // hijacked session cannot brute-force the admin password here
+                // at full speed; wrong answers are slowed down. The global
+                // sign-in budget is deliberately not spent by this prompt.
+                if (!Security::reserveLoginAttempt(Security::getClientIp())) {
+                    cashupay_status(429);
+                    echo json_encode(['error' => 'Too many attempts. Wait a few minutes and try again.']);
+                    break;
+                }
                 if (!Auth::verifyCurrentUserPassword((string)($_POST['password'] ?? ''))) {
+                    usleep(500000);
                     cashupay_status(401);
                     echo json_encode(['error' => 'Password is incorrect']);
                     break;
@@ -4034,6 +4550,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'CashuPayServer: recovery phrase revealed for store %s by user %s from %s',
                     $storeId, Auth::currentActorLabel(), Security::getClientIp()
                 ));
+                // Operator-visible audit trail, not just the server log.
+                require_once __DIR__ . '/includes/admin_log.php';
+                try {
+                    AdminLog::log(
+                        'security', 'admin', $storeId, null, Auth::currentActorLabel(),
+                        'Recovery phrase revealed from ' . Security::getClientIp()
+                    );
+                } catch (\Throwable $logErr) {
+                    error_log('CashuPayServer: AdminLog write failed: ' . $logErr->getMessage());
+                }
                 echo json_encode([
                     'success' => true,
                     // Empty when this store has no mint wallet (mints declined
@@ -5708,12 +6234,19 @@ header('Cache-Control: no-cache, must-revalidate');
                     <div class="balance-amount" id="balance-amount">---</div>
                     <div class="balance-unit" id="balance-unit">sats</div>
                     <div class="balance-fiat" id="balance-fiat" style="display:none; margin-top:0.5rem; color:#000; font-size:1rem;"></div>
+                    <div class="balance-exported" id="balance-exported" style="display:none; margin-top:0.35rem; color:#000; font-size:0.8rem; opacity:0.8;"></div>
                     <div class="balance-actions">
                         <button class="balance-btn" id="btn-withdraw">
                             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                                 <path d="M12 5v14M5 12l7-7 7 7"></path>
                             </svg>
                             Withdraw
+                        </button>
+                        <button class="balance-btn" id="btn-export" data-admin-only="true">
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12"></path>
+                            </svg>
+                            Export token
                         </button>
                         <button class="balance-btn" id="btn-request">
                             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -5729,6 +6262,16 @@ header('Cache-Control: no-cache, must-revalidate');
                             Create invoice (simple)
                         </button>
                     </div>
+                </div>
+
+                <!-- Tokens this store handed out. Each one can be shown again
+                     (bearer money: valid until cashed in), checked against the
+                     mint, or taken back while nobody has claimed it. -->
+                <div class="card hidden" id="card-recent-exports" data-admin-only="true">
+                    <div class="card-header">
+                        <div class="card-title">Recent exports</div>
+                    </div>
+                    <div id="recent-exports"></div>
                 </div>
 
                 <div class="card view-fill">
@@ -5904,6 +6447,23 @@ header('Cache-Control: no-cache, must-revalidate');
                                             style="width:auto; flex:0 0 auto; padding:0.25rem 0.6rem;">Copy</button>
                                 </span>
                             </div>
+                        </div>
+                    </div>
+
+                    <!-- Funds left in a wallet namespace no store uses any more
+                         (a past mint/unit change). Hidden unless the scan finds
+                         something. -->
+                    <div class="card hidden" id="card-stranded-funds" data-admin-only="true">
+                        <div class="card-header">
+                            <div class="card-title">Recover funds from a previous mint</div>
+                        </div>
+                        <div class="card-body">
+                            <p style="font-size: 0.85rem; color: var(--text-secondary); margin: 0 0 0.75rem 0;">
+                                Ecash is still stored for a mint this store no longer uses. Create a recovery
+                                token, claim it in any Cashu wallet, then mark it recovered. The same token
+                                is shown again until it is claimed.
+                            </p>
+                            <div id="stranded-funds-list"></div>
                         </div>
                     </div>
 
@@ -7728,6 +8288,37 @@ header('Cache-Control: no-cache, must-revalidate');
         </div>
     </div>
 
+    <div class="modal-overlay" id="modal-export">
+        <div class="modal">
+            <div class="modal-handle"></div>
+            <div class="modal-title" id="modal-export-title">Export Cashu Token</div>
+
+            <div id="export-form">
+                <div class="form-group">
+                    <label class="form-label">Amount (<span class="unit-label">SAT</span>)</label>
+                    <div style="display: flex; gap: 0.5rem;">
+                        <input type="number" class="form-input" id="export-amount"
+                               placeholder="0" min="1" step="1" style="flex: 1;" oninput="updateExportButton()">
+                        <button type="button" class="btn btn-secondary" id="btn-send-max" onclick="sendMax()">Max</button>
+                    </div>
+                    <p class="form-help">Available: <span id="export-available">0</span> <span class="unit-label">SAT</span></p>
+                    <p class="form-help">The token is recorded before it is shown: you can show it again, check whether it was cashed in, or take it back from the Recent exports list.</p>
+                </div>
+
+                <button class="btn btn-full" id="btn-confirm-export" onclick="handleExport(null)">Generate Token</button>
+            </div>
+
+            <div id="export-result" style="display: none;">
+                <div class="modal-qr" id="export-qr"></div>
+                <div class="token-display" id="export-token"></div>
+                <p class="form-help" id="export-result-note" style="margin-top: 0.5rem;"></p>
+                <button class="btn btn-full" id="btn-copy-token" onclick="copyToken()">Copy Token</button>
+            </div>
+
+            <button class="btn btn-secondary btn-full" style="margin-top: 0.5rem;" onclick="closeModal('modal-export')">Close</button>
+        </div>
+    </div>
+
     <div class="modal-overlay" id="modal-apikey">
         <div class="modal">
             <div class="modal-handle"></div>
@@ -8496,6 +9087,11 @@ header('Cache-Control: no-cache, must-revalidate');
             document.getElementById('btn-withdraw').addEventListener('click', () => {
                 if (!ensureAdmin('Only admins can withdraw funds.')) return;
                 openModal('modal-withdraw');
+            });
+            const btnExport = document.getElementById('btn-export');
+            if (btnExport) btnExport.addEventListener('click', () => {
+                if (!ensureAdmin('Only admins can export a Cashu token.')) return;
+                openModal('modal-export');
             });
             document.getElementById('btn-request').addEventListener('click', () => openCartModal());
             const btnReqSimple = document.getElementById('btn-request-simple');
@@ -9392,6 +9988,28 @@ header('Cache-Control: no-cache, must-revalidate');
                 // Render recent invoices
                 renderInvoices('recent-invoices', dashboardData.invoices || []);
 
+                // Exported-but-unclaimed value, the per-account breakdown and
+                // the recent exports list (show / check / take back).
+                const exportedEl = document.getElementById('balance-exported');
+                if (exportedEl) {
+                    const parts = [];
+                    if ((dashboardData.exportedBalance || 0) > 0) {
+                        parts.push(`+ ${formatAmount(dashboardData.exportedBalance, mintUnit)} ${unitLabel} in exported tokens not yet cashed in`);
+                    }
+                    (dashboardData.accountBalances || []).forEach(acc => {
+                        if (!acc.primary && (acc.balance > 0 || acc.exported > 0)) {
+                            parts.push(`+ ${formatAmount(acc.balance, acc.unit)} ${String(acc.unit).toUpperCase()} at backup mint ${acc.mint_url}`);
+                        }
+                    });
+                    exportedEl.textContent = parts.join(' · ');
+                    exportedEl.style.display = parts.length ? 'block' : 'none';
+                }
+                const exportAvailableEl = document.getElementById('export-available');
+                if (exportAvailableEl) {
+                    exportAvailableEl.textContent = formatAmount(dashboardData.exportAvailable ?? 0, mintUnit);
+                }
+                renderRecentExports(dashboardData.recentExports || []);
+
                 // Reliability banner / settings cards.
                 updateReliabilityBanner(dashboardData.reliability);
                 updateCronStaleBanner(dashboardData.cronStaleWarning || null);
@@ -10105,6 +10723,7 @@ header('Cache-Control: no-cache, must-revalidate');
                 document.getElementById('store-settings-name').textContent = store.name;
                 document.getElementById('store-settings-id').textContent = store.id;
                 document.getElementById('store-settings-mint').textContent = store.mint_url || '-';
+                loadStrandedFunds();
 
                 // Load auto-melt settings from dashboard data
                 if (dashboardData && dashboardData.autoMelt) {
@@ -10921,7 +11540,7 @@ header('Cache-Control: no-cache, must-revalidate');
                 const result = await response.json();
 
                 // Handle mint unreachable - needs user confirmation for different amount
-                if (result.error === 'mint_unreachable_change_needed') {
+                if (result.error === 'change_needed' || result.error === 'mint_unreachable_change_needed') {
                     const unitLabel = mintUnit.toUpperCase();
                     const requestedDisplay = formatAmount(result.requested, mintUnit);
                     const availableDisplay = formatAmount(result.available, mintUnit);
@@ -11043,6 +11662,229 @@ header('Cache-Control: no-cache, must-revalidate');
             navigator.clipboard.writeText(token).then(() => {
                 showToast('Token copied!', 'success');
             });
+        }
+
+        // ===== Recent exports: show again / check / take back =====
+
+        function renderRecentExports(rows) {
+            const card = document.getElementById('card-recent-exports');
+            const container = document.getElementById('recent-exports');
+            if (!card || !container) return;
+            if (!rows || rows.length === 0 || (phpUser && phpUser.role !== 'admin')) {
+                card.classList.add('hidden');
+                container.innerHTML = '';
+                return;
+            }
+            card.classList.remove('hidden');
+            const label = { pending: 'Not cashed in yet', completed: 'Cashed in', reclaimed: 'Taken back', failed: 'Failed' };
+            container.innerHTML = rows.map(t => {
+                const statusClass = t.status === 'completed' ? 'settled' : (t.status === 'pending' ? 'new' : 'expired');
+                const icon = t.status === 'completed' ? '✓' : (t.status === 'pending' ? '⏳' : '✕');
+                const date = new Date(t.createdTime * 1000).toLocaleString();
+                const kind = t.type === 'stranded_export' ? 'Recovery token' : 'Exported token';
+                const tid = escapeAttr(t.id);
+                const buttons = t.status === 'pending' ? `
+                    <div style="display:flex; gap:0.4rem; flex-wrap:wrap; margin-top:0.4rem;">
+                        <button class="btn btn-secondary export-action" data-export-action="show" data-export-id="${tid}" style="padding:0.25rem 0.6rem; font-size:0.75rem; width:auto;">Show</button>
+                        <button class="btn btn-secondary export-action" data-export-action="check" data-export-id="${tid}" style="padding:0.25rem 0.6rem; font-size:0.75rem; width:auto;">Check</button>
+                        ${t.type === 'token_export' ? `<button class="btn btn-danger export-action" data-export-action="reclaim" data-export-id="${tid}" style="padding:0.25rem 0.6rem; font-size:0.75rem; width:auto;">Take back</button>` : ''}
+                    </div>` : '';
+                return `
+                    <div class="list-item" data-export-row="${tid}">
+                        <div class="list-icon ${statusClass}">${icon}</div>
+                        <div class="list-content">
+                            <div class="list-title">${kind} · ${escapeHtml(formatAmount(t.amount, t.unit))} ${escapeHtml(String(t.unit).toUpperCase())}</div>
+                            <div class="list-subtitle">${escapeHtml(date)}${t.note ? ' · ' + escapeHtml(t.note) : ''}</div>
+                            ${buttons}
+                        </div>
+                        <div class="list-amount">
+                            <div class="list-amount-status ${statusClass}">${escapeHtml(label[t.status] || t.status)}</div>
+                        </div>
+                    </div>`;
+            }).join('');
+            container.querySelectorAll('.export-action').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    const id = btn.dataset.exportId;
+                    switch (btn.dataset.exportAction) {
+                        case 'show': showTransferToken(id); break;
+                        case 'check': checkTransfer(id); break;
+                        case 'reclaim': reclaimTransfer(id); break;
+                    }
+                });
+            });
+        }
+
+        // Render a token (QR + text) in the export modal's result pane.
+        function showExportResultToken(token, note) {
+            openModal('modal-export');
+            document.getElementById('export-form').style.display = 'none';
+            document.getElementById('export-result').style.display = 'block';
+            document.getElementById('export-token').textContent = token;
+            const noteEl = document.getElementById('export-result-note');
+            if (noteEl) noteEl.textContent = note || '';
+            const qrContainer = document.getElementById('export-qr');
+            qrContainer.innerHTML = '';
+            try {
+                if (typeof AnimatedQR !== 'undefined' && AnimatedQR.needsAnimation(token)) {
+                    const animatedQr = new AnimatedQR(qrContainer, {
+                        frameRate: 200, maxFragmentLen: 200, qrSize: 280, errorCorrection: 'M'
+                    });
+                    animatedQr.encode(token);
+                } else if (typeof QRious !== 'undefined') {
+                    const canvas = document.createElement('canvas');
+                    qrContainer.appendChild(canvas);
+                    new QRious({
+                        element: canvas, value: token, size: Math.min(280, window.innerWidth - 80),
+                        backgroundAlpha: 1, foreground: '#000000', background: '#ffffff', level: 'L'
+                    });
+                }
+            } catch (e) {
+                console.error('QR render failed', e);
+            }
+        }
+
+        async function showTransferToken(id) {
+            try {
+                const response = await postWithCsrf(adminUrl, `action=transfer_token&id=${encodeURIComponent(id)}`);
+                const result = await response.json();
+                if (!response.ok || !result.token) {
+                    showToast(result.error || 'Could not load the token', 'error');
+                    return;
+                }
+                showExportResultToken(result.token, 'This is the same token as before. It stays valid until somebody cashes it in.');
+                // Watch for the claim like a fresh export does.
+                exportSecrets = result.secrets || null;
+                if (exportCheckInterval) clearInterval(exportCheckInterval);
+                if (exportSecrets && exportSecrets.length) {
+                    exportCheckInterval = setInterval(checkIfTokenClaimed, 5000);
+                }
+            } catch (e) {
+                showToast('Could not load the token', 'error');
+            }
+        }
+
+        async function checkTransfer(id) {
+            try {
+                const response = await postWithCsrf(adminUrl, `action=check_transfer&id=${encodeURIComponent(id)}`);
+                const result = await response.json();
+                if (!response.ok) {
+                    showToast(result.error || 'Check failed', 'error');
+                    return;
+                }
+                showToast(result.message || result.status, result.status === 'completed' ? 'success' : 'info');
+                if (result.status === 'completed') loadDashboard();
+            } catch (e) {
+                showToast('Check failed', 'error');
+            }
+        }
+
+        async function reclaimTransfer(id) {
+            if (!confirm('Take this token back? The token you handed out will stop working, and its value returns to your balance (minus the mint\'s fee). This only works while nobody has cashed it in.')) return;
+            try {
+                const response = await postWithCsrf(adminUrl, `action=reclaim_transfer&id=${encodeURIComponent(id)}`);
+                const result = await response.json();
+                if (!response.ok) {
+                    showToast(result.error || 'Could not take the token back', 'error');
+                    return;
+                }
+                showToast(result.message || 'Token taken back', 'success');
+                loadDashboard();
+            } catch (e) {
+                showToast('Could not take the token back', 'error');
+            }
+        }
+
+        // ===== Funds stranded at a previous mint (store settings) =====
+
+        async function loadStrandedFunds() {
+            const card = document.getElementById('card-stranded-funds');
+            const list = document.getElementById('stranded-funds-list');
+            if (!card || !list) return;
+            if (!phpUser || phpUser.role !== 'admin') {
+                card.classList.add('hidden');
+                return;
+            }
+            let rows = [];
+            try {
+                const r = await fetch(`${adminUrl}?api=scan_stranded_funds`, { credentials: 'same-origin' });
+                const data = await r.json();
+                rows = Array.isArray(data.stranded) ? data.stranded : [];
+            } catch (e) {
+                rows = [];
+            }
+            if (rows.length === 0) {
+                card.classList.add('hidden');
+                list.innerHTML = '';
+                return;
+            }
+            card.classList.remove('hidden');
+            list.innerHTML = rows.map(ns => {
+                const mint = ns.mint_url || '';
+                const unit = ns.unit || 'sat';
+                const known = !!ns.mint_url;
+                const widAttr = escapeAttr(ns.wallet_id);
+                return `
+                    <div style="display:flex; justify-content:space-between; align-items:center; gap:0.75rem; padding:0.6rem; background: rgba(0,0,0,0.2); border-radius:6px; margin-bottom:0.5rem;" data-stranded-wallet="${widAttr}">
+                        <div style="flex:1; min-width:0;">
+                            <code style="font-size:0.75rem; word-break:break-all;">${known ? escapeHtml(mint) : 'Unknown mint (wallet ' + escapeHtml(ns.wallet_id) + ')'}</code>
+                            <div style="font-size:0.8rem; color: var(--text-secondary); margin-top:0.2rem;">
+                                ${escapeHtml(formatAmount(ns.amount, unit))} ${escapeHtml(String(unit).toUpperCase())} in ${ns.count} proof(s)${ns.export_id ? ' · recovery token created' : ''}
+                            </div>
+                        </div>
+                        <div style="display:flex; flex-direction:column; gap:0.3rem;">
+                            ${known ? `<button class="btn btn-secondary stranded-action" data-stranded-action="export" data-mint-url="${escapeAttr(mint)}" data-unit="${escapeAttr(unit)}" style="padding:0.25rem 0.6rem; font-size:0.75rem; width:auto;">${ns.export_id ? 'Show recovery token' : 'Create recovery token'}</button>` : ''}
+                            ${ns.export_id ? `<button class="btn btn-secondary stranded-action" data-stranded-action="recovered" data-export-id="${escapeAttr(ns.export_id)}" style="padding:0.25rem 0.6rem; font-size:0.75rem; width:auto;">Mark recovered</button>` : ''}
+                        </div>
+                    </div>`;
+            }).join('');
+            list.querySelectorAll('.stranded-action').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    if (btn.dataset.strandedAction === 'export') {
+                        exportStrandedFunds(btn.dataset.mintUrl, btn.dataset.unit);
+                    } else if (btn.dataset.strandedAction === 'recovered') {
+                        markStrandedRecovered(btn.dataset.exportId, false);
+                    }
+                });
+            });
+        }
+
+        async function exportStrandedFunds(mintUrl, unit) {
+            try {
+                const body = `action=export_stranded_funds&mint_url=${encodeURIComponent(mintUrl)}&unit=${encodeURIComponent(unit)}&store_id=${encodeURIComponent(currentStoreId || '')}`;
+                const response = await postWithCsrf(adminUrl, body);
+                const result = await response.json();
+                if (!response.ok || !result.token) {
+                    showToast(result.error || 'Could not create the recovery token', 'error');
+                    return;
+                }
+                showExportResultToken(result.token, `Recovery token for ${formatAmount(result.amount, result.unit)} ${String(result.unit).toUpperCase()} at ${result.mint_url}. Claim it in a Cashu wallet, then press "Mark recovered".`);
+                loadStrandedFunds();
+            } catch (e) {
+                showToast('Could not create the recovery token', 'error');
+            }
+        }
+
+        async function markStrandedRecovered(exportId, force) {
+            try {
+                const body = `action=mark_stranded_recovered&export_id=${encodeURIComponent(exportId)}${force ? '&force=1' : ''}`;
+                const response = await postWithCsrf(adminUrl, body);
+                const result = await response.json();
+                if (response.status === 409 && result.error === 'not_claimed') {
+                    if (confirm(result.message + '\n\nWrite it off anyway?')) {
+                        return markStrandedRecovered(exportId, true);
+                    }
+                    return;
+                }
+                if (!response.ok) {
+                    showToast(result.error || 'Could not mark as recovered', 'error');
+                    return;
+                }
+                showToast('Marked as recovered', 'success');
+                loadStrandedFunds();
+                loadDashboard();
+            } catch (e) {
+                showToast('Could not mark as recovered', 'error');
+            }
         }
 
         // Rebuild the Request modal's currency <select> for a given store.
@@ -14030,6 +14872,7 @@ header('Cache-Control: no-cache, must-revalidate');
                                             <code style="font-size: 0.7rem; word-break: break-all;">${escapeHtml(m.mint_url)}</code>
                                             ${mintDiagnosticIcon(m.mint_url)}
                                             <span style="opacity: 0.6; font-size: 0.75rem; margin-left: 0.5rem;">(${escapeHtml(String(m.unit).toUpperCase())})</span>
+                                            ${(m.balance > 0 || m.exported > 0) ? `<span style="display:block; font-size: 0.72rem; color: var(--warning, #f59e0b); margin-top: 0.2rem;">holds ${escapeHtml(formatAmount(m.balance || 0, m.unit))} ${escapeHtml(String(m.unit).toUpperCase())}${m.exported > 0 ? ` + ${escapeHtml(formatAmount(m.exported, m.unit))} exported` : ''}</span>` : ''}
                                         </div>
                                         <button class="btn btn-danger store-action" data-store-action="remove-backup-mint" data-mint-id="${escapeAttr(m.id)}" data-store-id="${sId}" data-store-name="${sName}" style="padding: 0.2rem 0.4rem; font-size: 0.7rem; margin-left: 0.5rem;">Remove</button>
                                     </div>
@@ -14159,7 +15002,14 @@ header('Cache-Control: no-cache, must-revalidate');
             if (!confirm('Remove this backup mint?')) return;
 
             try {
-                await postWithCsrf(adminUrl, `action=remove_backup_mint&id=${mintId}`);
+                const response = await postWithCsrf(adminUrl, `action=remove_backup_mint&id=${mintId}`);
+                const result = await response.json().catch(() => ({}));
+                if (!response.ok) {
+                    // 409 backup_mint_not_empty: the mint still holds ecash,
+                    // exported tokens or an in-flight transfer.
+                    showToast(result.message || result.error || 'Failed to remove backup mint', 'error');
+                    return;
+                }
                 showToast('Backup mint removed', 'success');
                 showStoreDetails(storeId, storeName);
             } catch (e) {

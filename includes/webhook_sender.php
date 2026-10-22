@@ -294,6 +294,7 @@ class WebhookSender {
      */
     private static function sendRequest(string $url, string $payload, string $signature): array {
         $result = SafeHttp::request($url, [
+            'maxBytes' => 64 * 1024,
             'method' => 'POST',
             'body' => $payload,
             'timeout' => self::TIMEOUT,

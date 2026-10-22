@@ -81,10 +81,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $password = $_POST['password'] ?? '';
         $clientIp = Security::getClientIp();
 
-        if (Security::isLockedOut($clientIp)) {
+        // The attempt is reserved before the password check (atomic
+        // check+increment), so a burst of parallel guesses cannot all slip
+        // under the lockout threshold.
+        $loginResult = Auth::attemptLogin($username, $password, $clientIp);
+        if ($loginResult === 'locked') {
+            cashupay_status(429);
             $error = 'Too many failed attempts. Please try again later.';
-        } elseif ($username !== '' && Auth::login($username, $password)) {
-            Security::clearLoginAttempts($clientIp);
+        } elseif ($loginResult === 'ok') {
             // Redirect back to the same endpoint to render the approval form.
             // Use only the path portion of REQUEST_URI (parse_url strips any
             // attacker-supplied //host or fragment) and rebuild the query
@@ -109,7 +113,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             header('Location: ' . $safePath . '?' . implode('&', $queryParts));
             exit;
         } else {
-            Security::recordFailedLogin($clientIp);
+            // Already counted by attemptLogin's reservation.
             $error = 'Invalid username or password';
         }
     } elseif ($action === 'approve' && Auth::isAdmin()) {

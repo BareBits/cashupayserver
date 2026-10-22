@@ -74,6 +74,14 @@ def wizard_error(body: str) -> str | None:
     return html.unescape(m.group(1).strip()) if m else None
 
 
+def wizard_csrf_token(body: str) -> str | None:
+    """The session's CSRF token as rendered in the wizard's hidden form field
+    (every wizard POST must carry it since the setup CSRF hardening). None when
+    the body is not a wizard screen (a redirect page, an error page)."""
+    m = re.search(r'name="csrf_token"\s+value="([^"]+)"', body)
+    return html.unescape(m.group(1)) if m else None
+
+
 def wizard_heading(body: str) -> str:
     """The <h2> of the screen that was rendered — i.e. where the wizard landed.
 
@@ -123,13 +131,18 @@ class SetupWizard:
         # Priming GET starts the session and initialises the schema. In
         # add_store mode it also clears any store id left over from a previous
         # wizard run, which is what makes add_store add rather than rename.
-        self.s.get(self.url, params={"mode": mode} if mode else None, timeout=30)
+        # It also mints the session's CSRF token, which every POST must carry.
+        r = self.s.get(self.url, params={"mode": mode} if mode else None, timeout=30)
+        self.csrf_token: str | None = wizard_csrf_token(r.text)
 
     def post(self, **data) -> str:
         if self.mode:
             data.setdefault("mode", self.mode)
+        if self.csrf_token and "csrf_token" not in data:
+            data["csrf_token"] = self.csrf_token
         r = self.s.post(self.url, data=data, timeout=60, allow_redirects=False)
         assert r.status_code < 400, f"{data.get('step')} -> {r.status_code}: {r.text[:300]}"
+        self._remember_token(r.text)
         return r.text
 
     def get(self, step: str, **params) -> str:
@@ -137,7 +150,15 @@ class SetupWizard:
             params.setdefault("mode", self.mode)
         r = self.s.get(self.url, params={"step": step, **params}, timeout=15, allow_redirects=False)
         assert r.status_code < 400, f"GET {step} -> {r.status_code}"
+        self._remember_token(r.text)
         return r.text
+
+    def _remember_token(self, body: str) -> None:
+        """The token is per session and stable, but a screen rendered after a
+        session rotation (e.g. login) carries the fresh one."""
+        tok = wizard_csrf_token(body)
+        if tok:
+            self.csrf_token = tok
 
     def login(self, base_url: str, password: str | None = None) -> None:
         """Authenticate the same session against admin. Required before
@@ -195,79 +216,52 @@ def run_setup_wizard(
     s = requests.Session()
     setup = f"{base_url}/setup"
 
-    # Initial GET — triggers session start and schema init.
-    s.get(setup, timeout=10)
+    # Initial GET — triggers session start and schema init, and mints the
+    # session's CSRF token that every wizard POST must carry.
+    primed = s.get(setup, timeout=10)
+    csrf = wizard_csrf_token(primed.text)
+    assert csrf, f"wizard priming GET rendered no csrf_token field: {primed.text[:300]}"
+
+    def post(label: str, timeout: int, **data) -> requests.Response:
+        data["csrf_token"] = csrf
+        r = s.post(setup, data=data, timeout=timeout, allow_redirects=False)
+        _assert_step_ok(r, label)
+        return r
 
     # terms: accept the first-run terms-of-service gate (all three boxes,
     # including the incoming-fee acknowledgement).
-    r = s.post(
-        setup,
-        data={"step": "terms", "terms_legal": "1", "terms_warranty": "1", "terms_fee": "1"},
-        timeout=10,
-        allow_redirects=False,
-    )
-    _assert_step_ok(r, "terms")
+    post("terms", 10, step="terms", terms_legal="1", terms_warranty="1", terms_fee="1")
 
     # security: acknowledge the database-exposure check
-    r = s.post(setup, data={"step": "security", "security_acknowledged": "1"}, timeout=10, allow_redirects=False)
-    _assert_step_ok(r, "security")
+    post("security", 10, step="security", security_acknowledged="1")
 
     # password: admin credentials
-    r = s.post(
-        setup,
-        data={"step": "password", "password": admin_password, "confirm_password": admin_password},
-        timeout=10,
-        allow_redirects=False,
-    )
-    _assert_step_ok(r, "password")
+    post("password", 10, step="password", password=admin_password, confirm_password=admin_password)
 
     # store: name + default display/quote currency
-    r = s.post(
-        setup,
-        data={"step": "store", "store_name": store_name, "default_currency": default_currency},
-        timeout=10,
-        allow_redirects=False,
-    )
-    _assert_step_ok(r, "store")
+    post("store", 10, step="store", store_name=store_name, default_currency=default_currency)
 
     # onchain: skip, so callers needn't supply an xpub. This also drops the
     # zeroconf screen from the sequence.
-    r = s.post(
-        setup,
-        data={"step": "onchain", "onchain_action": "skip"},
-        timeout=15,
-        allow_redirects=False,
-    )
-    _assert_step_ok(r, "onchain (skip)")
+    post("onchain (skip)", 15, step="onchain", onchain_action="skip")
 
     # lightning: skip — no LNURL address or noffer.
-    r = s.post(
-        setup,
-        data={"step": "lightning", "lightning_action": "skip"},
-        timeout=15,
-        allow_redirects=False,
-    )
-    _assert_step_ok(r, "lightning (skip)")
+    post("lightning (skip)", 15, step="lightning", lightning_action="skip")
 
     # swaps: off (they need an xpub, which this path skipped).
-    r = s.post(setup, data={"step": "swaps", "swaps_enabled": "0"}, timeout=15, allow_redirects=False)
-    _assert_step_ok(r, "swaps (off)")
+    post("swaps (off)", 15, step="swaps", swaps_enabled="0")
 
     # mints: main + backup in one submit. Completes setup; the seed phrase is
     # generated server-side here and surfaced on the `done` screen.
-    r = s.post(
-        setup,
-        data={
-            "step": "mints",
-            "mints_enabled": "1",
-            "mint_url": mint_url,
-            "backup_mint_url": backup_mint_url,
-            "mint_unit": mint_unit,
-        },
-        timeout=60,
-        allow_redirects=False,
+    post(
+        "mints",
+        60,
+        step="mints",
+        mints_enabled="1",
+        mint_url=mint_url,
+        backup_mint_url=backup_mint_url,
+        mint_unit=mint_unit,
     )
-    _assert_step_ok(r, "mints")
 
     return SetupResult(
         admin_password=admin_password,
@@ -305,11 +299,15 @@ def run_add_store_wizard(
 
     setup = f"{base_url.rstrip('/')}/setup"
     # Priming GET clears any store id left in the session from a previous
-    # wizard run — what makes add_store add rather than rename.
-    s.get(setup, params={"mode": "add_store"}, timeout=30)
+    # wizard run — what makes add_store add rather than rename — and renders
+    # the session's CSRF token that every wizard POST must carry.
+    primed = s.get(setup, params={"mode": "add_store"}, timeout=30)
+    csrf = wizard_csrf_token(primed.text)
+    assert csrf, f"add_store priming GET rendered no csrf_token field: {primed.text[:300]}"
 
     def post(label: str, timeout: int = 15, **data) -> None:
         data["mode"] = "add_store"
+        data["csrf_token"] = csrf
         r = s.post(setup, data=data, timeout=timeout, allow_redirects=False)
         _assert_step_ok(r, f"add_store {label}")
 

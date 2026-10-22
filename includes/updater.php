@@ -969,17 +969,22 @@ class Updater {
         if (!$cronKey) {
             return;
         }
-        $url = rtrim(Config::getBaseUrl(), '/') . '/update.php';
-        if ($manual) {
-            $url .= '?manual=1';
+        // This request carries the cron key (which also authorises
+        // update.php?manual=1), so it follows the self-request origin rules
+        // in Background::selfRequest(): pinned base_url or the request's
+        // host pinned to the address it arrived on, never a redirect, TLS
+        // verified off-loopback.
+        require_once __DIR__ . '/background.php';
+        $target = Background::selfRequest('/update.php' . ($manual ? '?manual=1' : ''));
+        if ($target === null) {
+            self::log('self-check skipped: no trusted self origin (pin base_url)');
+            return;
         }
-        $ch = curl_init($url);
-        curl_setopt_array($ch, [
+        $ch = curl_init($target['url']);
+        curl_setopt_array($ch, $target['options'] + [
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_TIMEOUT_MS => 200,
             CURLOPT_NOSIGNAL => 1,
-            CURLOPT_SSL_VERIFYPEER => false, // localhost self-request; same as Background::trigger
-            CURLOPT_FOLLOWLOCATION => true,
             CURLOPT_HTTPHEADER => ['X-CRON-KEY: ' . $cronKey],
         ]);
         @curl_exec($ch);
@@ -987,11 +992,37 @@ class Updater {
 
     // ---------------- HTTP ----------------
 
+    /** Largest manifest / release-listing body we will buffer (2 MiB). */
+    private const MAX_MANIFEST_BYTES = 2 * 1024 * 1024;
+    /** Largest release archive we will stream to disk (256 MiB). */
+    private const MAX_ARCHIVE_BYTES = 256 * 1024 * 1024;
+
+    /**
+     * Supply-chain transport rule for release metadata and archives: https
+     * only. The sole exception is the operator's private-endpoints opt-in,
+     * which is what the test rigs (local http release fixture) and LAN
+     * mirrors use.
+     */
+    private static function transportAllowed(string $url): bool {
+        $scheme = strtolower((string)parse_url($url, PHP_URL_SCHEME));
+        if ($scheme === 'https') {
+            return true;
+        }
+        if ($scheme === 'http' && \SafeHttp::privateEndpointsAllowed()) {
+            return true;
+        }
+        self::log("refusing non-https release URL: $url");
+        return false;
+    }
+
     private static function httpGet(string $url): ?string {
         // Release URLs are typically GitHub but the channel can be
         // overridden by the operator. Honor the same allow-private opt-in
         // we use elsewhere so tests can serve releases from a local
         // fixture and self-hosters can mirror releases on their LAN.
+        if (!self::transportAllowed($url)) {
+            return null;
+        }
         $result = \SafeHttp::request($url, [
             'timeout' => 60,
             'connectTimeout' => 10,
@@ -999,9 +1030,15 @@ class Updater {
             'headers' => ['Accept: */*'],
             'followRedirects' => true,
             'maxRedirects' => 5,
+            'maxBytes' => self::MAX_MANIFEST_BYTES,
             'allowPrivate' => \SafeHttp::privateEndpointsAllowed(),
         ]);
         if ($result['error'] !== '' || $result['status'] < 200 || $result['status'] >= 300) {
+            return null;
+        }
+        // Every redirect hop SafeHttp followed was re-validated; still refuse
+        // a chain that downgraded to plain http on the way.
+        if (!self::transportAllowed((string)$result['effectiveUrl'])) {
             return null;
         }
         return $result['body'];
@@ -1015,44 +1052,79 @@ class Updater {
     }
 
     private static function httpDownload(string $url, string $dest): bool {
-        // Release tarballs can be tens of MB, so we stream to disk via
+        // Release archives can be tens of MB, so we stream to disk via
         // CURLOPT_FILE rather than buffer in memory through SafeHttp.
-        // SafeHttp::validateUrl() still vets the host and pins the IP so
-        // a hostile redirect can't pivot to a private address. Same opt-in
-        // as httpGet: tests + LAN mirrors need to allow private destinations.
-        try {
-            $validated = \SafeHttp::validateUrl($url, \SafeHttp::privateEndpointsAllowed());
-        } catch (\Throwable $e) {
-            return false;
-        }
+        //
+        // Redirects are never followed by curl. GitHub serves release assets
+        // through a 302 to objects.githubusercontent.com, so a redirect must
+        // work — but each hop is followed HERE, re-validated by
+        // SafeHttp::validateUrl() (private-range policy + DNS pin, so a
+        // hostile Location cannot pivot to an internal address) and held to
+        // the https-only transport rule. The archive is sha-verified against
+        // the manifest after download, so a wrong file is caught regardless.
+        $allowPrivate = \SafeHttp::privateEndpointsAllowed();
+        $current = $url;
+        for ($hop = 0; $hop <= 5; $hop++) {
+            if (!self::transportAllowed($current)) {
+                return false;
+            }
+            try {
+                $validated = \SafeHttp::validateUrl($current, $allowPrivate);
+            } catch (\Throwable $e) {
+                self::log('download refused: ' . $e->getMessage());
+                return false;
+            }
 
-        $fp = @fopen($dest, 'w');
-        if ($fp === false) return false;
-        $ch = curl_init($url);
-        curl_setopt_array($ch, [
-            CURLOPT_FILE => $fp,
-            CURLOPT_FOLLOWLOCATION => true,
-            // Cap the redirect chain so a misbehaving / hostile mirror can't
-            // bounce us through an unbounded sequence of hops.
-            CURLOPT_MAXREDIRS => 10,
-            CURLOPT_TIMEOUT => 300,
-            CURLOPT_CONNECTTIMEOUT => 10,
-            CURLOPT_USERAGENT => self::HTTP_USER_AGENT,
-            CURLOPT_PROTOCOLS => CURLPROTO_HTTP | CURLPROTO_HTTPS,
-            CURLOPT_REDIR_PROTOCOLS => CURLPROTO_HTTP | CURLPROTO_HTTPS,
-            CURLOPT_SSL_VERIFYPEER => true,
-            CURLOPT_SSL_VERIFYHOST => 2,
-            CURLOPT_RESOLVE => $validated['resolve'],
-        ]);
-        $ok = curl_exec($ch);
-        $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        curl_close($ch);
-        fclose($fp);
-        if (!$ok || $code < 200 || $code >= 300) {
-            @unlink($dest);
-            return false;
+            $fp = @fopen($dest, 'w');
+            if ($fp === false) return false;
+            $location = '';
+            $ch = curl_init($current);
+            curl_setopt_array($ch, [
+                CURLOPT_FILE => $fp,
+                CURLOPT_FOLLOWLOCATION => false,
+                CURLOPT_TIMEOUT => 300,
+                CURLOPT_CONNECTTIMEOUT => 10,
+                CURLOPT_USERAGENT => self::HTTP_USER_AGENT,
+                CURLOPT_PROTOCOLS => CURLPROTO_HTTP | CURLPROTO_HTTPS,
+                CURLOPT_REDIR_PROTOCOLS => CURLPROTO_HTTPS,
+                CURLOPT_SSL_VERIFYPEER => true,
+                CURLOPT_SSL_VERIFYHOST => 2,
+                CURLOPT_RESOLVE => $validated['resolve'],
+                // Hard cap on the archive: a hostile or broken mirror must not
+                // be able to fill the disk. Enforced by curl both from the
+                // Content-Length header and mid-stream.
+                CURLOPT_MAXFILESIZE_LARGE => self::MAX_ARCHIVE_BYTES,
+                CURLOPT_HEADERFUNCTION => function ($_ch, string $header) use (&$location) {
+                    $pos = strpos($header, ':');
+                    if ($pos !== false && strcasecmp(substr($header, 0, $pos), 'Location') === 0) {
+                        $location = trim(substr($header, $pos + 1));
+                    }
+                    return strlen($header);
+                },
+            ]);
+            $ok = curl_exec($ch);
+            $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            curl_close($ch);
+            fclose($fp);
+
+            if ($code >= 300 && $code < 400 && $location !== '') {
+                @unlink($dest);
+                $next = \SafeHttp::resolveRedirectTarget($current, $location);
+                if ($next === null) {
+                    return false;
+                }
+                $current = $next;
+                continue; // next hop is validated at the top of the loop
+            }
+            if (!$ok || $code < 200 || $code >= 300) {
+                @unlink($dest);
+                return false;
+            }
+            return true;
         }
-        return true;
+        @unlink($dest);
+        self::log('download refused: too many redirects');
+        return false;
     }
 
     // ---------------- Filesystem helpers ----------------

@@ -223,6 +223,43 @@ final class SwapAutoMelt {
 
     private static function processStore(array $store): ?array {
         $storeId = $store['id'];
+
+        // Per-store funds lock shared with the dashboard withdraw/export, the
+        // LN auto-cashout rail and the fee melt: two of them must never select
+        // the same proofs. Busy → skip this tick; a withdrawal the mint is
+        // still settling → skip until it resolves (a retry would pay twice).
+        require_once __DIR__ . '/../locks.php';
+        require_once __DIR__ . '/../lightning_address.php';
+        $fundsLock = cashupay_acquire_lock('funds_' . $storeId);
+        if (!$fundsLock) {
+            return [
+                'store_id' => $storeId,
+                'store_name' => $store['name'],
+                'success' => false,
+                'skipped' => 'busy',
+            ];
+        }
+        try {
+            try {
+                LightningAddress::assertNoPendingWithdrawal($storeId);
+            } catch (Exception $pendingErr) {
+                return [
+                    'store_id' => $storeId,
+                    'store_name' => $store['name'],
+                    'success' => false,
+                    'skipped' => 'pending',
+                    'error' => $pendingErr->getMessage(),
+                ];
+            }
+            return self::processStoreLocked($store);
+        } finally {
+            cashupay_release_lock($fundsLock);
+        }
+    }
+
+    /** The sweep pipeline proper; runs with the store's funds lock held. */
+    private static function processStoreLocked(array $store): ?array {
+        $storeId = $store['id'];
         $mintUnit = strtolower($store['mint_unit'] ?? 'sat');
         $isFiatMint = !in_array($mintUnit, ['sat', 'sats', 'msat'], true);
 

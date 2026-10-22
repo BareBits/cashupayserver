@@ -116,18 +116,53 @@ if (isset($_GET['action'])) {
 // Get mode parameter
 $mode = $_GET['mode'] ?? $_POST['mode'] ?? '';
 
+// A database that exists but failed its upgrade (locked / read-only / full
+// disk during the first request after an update) must never look like a
+// fresh install: Database::isInitialized() answers from a direct file probe
+// in that case and the wizard is NOT opened. Render a plain diagnostic
+// instead of the first-run screens — anonymous visitors could otherwise
+// create stores and flip settings on a live shop while it is wedged.
+$dbInitialized = Database::isInitialized();
+if (Database::getMigrationError() !== null) {
+    cashupay_status(503);
+    header('Content-Type: text/html; charset=utf-8');
+    header('Cache-Control: no-store');
+    echo '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>Database upgrade failed</title></head>'
+        . '<body style="font-family: sans-serif; max-width: 40rem; margin: 3rem auto; padding: 0 1rem;">'
+        . '<h1>Database upgrade failed</h1>'
+        . '<p>This BareBits installation has an existing database, but it could not be opened or '
+        . 'upgraded to the current schema, so setup cannot continue. Check that the data directory '
+        . 'and the database file are writable by the web server and that the disk is not full, then reload.</p>'
+        . '<p><strong>Error:</strong> ' . htmlspecialchars((string)Database::getMigrationError()) . '</p>'
+        . '</body></html>';
+    exit;
+}
+
 // setup_complete flips at the end of the `mints` screen so an abandoned
-// browser doesn't leave a half-configured install. The two screens that come
-// after it therefore have to survive the redirect-if-set-up guard.
+// browser doesn't leave a half-configured install. The screens that come
+// after it therefore have to survive the redirect-if-set-up guard — but ONLY
+// for the browser that just completed the wizard (its session still carries
+// the first-run store marker until the `done` screen clears it) or a
+// logged-in user. Anyone else posting `step=updates` to a live install used
+// to flip the auto-update opt-in and be handed the cron screen, which lazily
+// mints and renders the cron key (full cron runs + forced "Update now").
 $postStep = $_SERVER['REQUEST_METHOD'] === 'POST' ? (string)($_POST['step'] ?? '') : '';
 $isTailPost = in_array($postStep, SetupFlow::POST_COMPLETION, true);
-if (Database::isInitialized() && Config::isSetupComplete() && !$isTailPost) {
-    if ($mode !== 'add_store') {
+$setupComplete = $dbInitialized && Config::isSetupComplete();
+if ($setupComplete) {
+    $completingSession = (($_SESSION['setup_store_mode'] ?? null) === 'first_run')
+        && !empty($_SESSION['setup_store_id'])
+        && Config::getStore((string)$_SESSION['setup_store_id']) !== null;
+    if ($isTailPost && $mode !== 'add_store') {
+        if (!$completingSession && !Auth::isLoggedIn()) {
+            header('Location: ' . Urls::admin());
+            exit;
+        }
+    } elseif ($mode !== 'add_store') {
         header('Location: ' . Urls::admin());
         exit;
-    }
-    // Require login for add_store mode
-    if (!Auth::isLoggedIn()) {
+    } elseif (!Auth::isAdmin()) {
+        // add_store creates stores and configures their rails: admin only.
         header('Location: ' . Urls::admin());
         exit;
     }
@@ -188,9 +223,31 @@ if ($mode === 'add_store' && !$stepRequested) {
 $error = null;
 $success = null;
 
+/** Hidden CSRF field for every wizard form (the AJAX calls append the same token). */
+function setupCsrfField(): string {
+    return '<input type="hidden" name="csrf_token" value="' . htmlspecialchars(Auth::generateCsrfToken()) . '">';
+}
+
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    // CSRF: every wizard POST — the screens AND the AJAX helpers — must carry
+    // the session's token. Validated before any handler runs so a cross-site
+    // form can neither advance a half-finished wizard nor, for a logged-in
+    // admin, create/rename stores through add_store. The token is minted on
+    // the GET that rendered the form (Auth::generateCsrfToken is idempotent
+    // per session), so a refused request is recoverable by reloading.
+    $csrfOk = Auth::validateCsrfToken((string)($_POST['csrf_token'] ?? ''));
+    if (!$csrfOk) {
+        cashupay_status(403);
+        if (isset($_POST['action'])) {
+            header('Content-Type: application/json');
+            echo json_encode(['success' => false, 'valid' => false, 'error' => 'Session expired or invalid request. Reload the page and try again.']);
+            exit;
+        }
+        $error = 'Session expired or invalid request. Reload the page and try again.';
+    }
+
     // Handle AJAX action for on-chain xpub validation + preview.
-    if (isset($_POST['action']) && $_POST['action'] === 'validate_xpub') {
+    if ($csrfOk && isset($_POST['action']) && $_POST['action'] === 'validate_xpub') {
         header('Content-Type: application/json');
         // Catch Throwable, not Exception: a host missing the GMP extension
         // throws Error from gmp_init(), and an uncaught one turns this JSON
@@ -228,7 +285,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 
     // Handle AJAX action for saving URL mode
-    if (isset($_POST['action']) && $_POST['action'] === 'save_url_mode') {
+    if ($csrfOk && isset($_POST['action']) && $_POST['action'] === 'save_url_mode') {
         header('Content-Type: application/json');
         $mode = $_POST['mode'] ?? 'router';
         if (in_array($mode, ['clean', 'direct', 'router'])) {
@@ -254,7 +311,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $generatedSeedThisRequest = false;
 
     try {
-        switch ($step) {
+        // A CSRF-refused POST matches no case: the posted screen re-renders
+        // with $error and nothing is written.
+        switch ($csrfOk ? $step : '__csrf_refused') {
             case 'terms':
                 if (empty($_POST['terms_legal']) || empty($_POST['terms_warranty']) || empty($_POST['terms_fee'])) {
                     throw new Exception('Please accept all three terms to continue.');
@@ -780,6 +839,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     if ($backupUrl === '') {
                         throw new Exception('Pick a backup mint to continue.');
                     }
+                    // http(s) only, no userinfo — the library hands the URL
+                    // straight to curl otherwise.
+                    $primaryUrl = Config::validateMintUrl($primaryUrl);
+                    $backupUrl = Config::validateMintUrl($backupUrl);
                     if (strcasecmp($primaryUrl, $backupUrl) === 0) {
                         throw new Exception(
                             'Your backup mint needs to be different from your main one — that\'s the whole point of a backup.'
@@ -994,6 +1057,7 @@ function renderUrlModeDetectionScript(): void { ?>
                     const formData = new FormData();
                     formData.append('action', 'save_url_mode');
                     formData.append('mode', selectedMode);
+                    formData.append('csrf_token', <?= json_encode(Auth::generateCsrfToken()) ?>);
                     await fetch(setupUrl, { method: 'POST', body: formData });
                 } catch (e) {
                     console.error('Failed to save URL mode:', e);
@@ -1516,6 +1580,7 @@ function renderUrlModeDetectionScript(): void { ?>
 
                 <form method="post">
                     <input type="hidden" name="step" value="terms">
+                    <?= setupCsrfField() ?>
 
                     <div class="checkbox-group" style="margin: 1.5rem 0;">
                         <input type="checkbox" id="terms_legal" name="terms_legal" required>
@@ -1754,6 +1819,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
 
                     <form method="post">
                         <input type="hidden" name="step" value="security">
+                        <?= setupCsrfField() ?>
 
                         <div class="checkbox-group" style="margin: 1.5rem 0;">
                             <input type="checkbox" id="security_acknowledged" name="security_acknowledged" required>
@@ -1874,6 +1940,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
 
                 <form method="post">
                     <input type="hidden" name="step" value="password">
+                    <?= setupCsrfField() ?>
 
                     <div class="form-group">
                         <label for="password">Password</label>
@@ -1920,6 +1987,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
 
                 <form method="post">
                     <input type="hidden" name="step" value="store">
+                    <?= setupCsrfField() ?>
                     <?php if ($mode === 'add_store'): ?>
                         <input type="hidden" name="mode" value="add_store">
                     <?php endif; ?>
@@ -2012,6 +2080,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
 
                 <form id="onchain-form" method="POST" action="<?= htmlspecialchars(setupSelfUrl()) ?>">
                     <input type="hidden" name="step" value="onchain">
+                    <?= setupCsrfField() ?>
                     <input type="hidden" name="onchain_action" value="save">
                     <input type="hidden" name="onchain_address_mode" id="onchain_address_mode" value="<?= htmlspecialchars($ocSavedMode) ?>">
                     <input type="hidden" name="onchain_address_type" id="onchain_address_type" value="P2WPKH">
@@ -2079,6 +2148,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
 
                 <form method="POST" action="<?= htmlspecialchars(setupSelfUrl()) ?>" style="margin-top: 0.75rem;">
                     <input type="hidden" name="step" value="onchain">
+                    <?= setupCsrfField() ?>
                     <input type="hidden" name="onchain_action" value="skip">
                     <?php if ($mode === 'add_store'): ?>
                         <input type="hidden" name="mode" value="add_store">
@@ -2204,6 +2274,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                         var network = isTestnet ? testnetSel.value : 'mainnet';
                         var body = new FormData();
                         body.append('action', 'validate_xpub');
+                        body.append('csrf_token', <?= json_encode(Auth::generateCsrfToken()) ?>);
                         body.append('xpub', xpub);
                         body.append('network', network);
                         body.append('address_type', type);
@@ -2273,6 +2344,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
 
                 <form method="POST" action="<?= htmlspecialchars(setupSelfUrl()) ?>">
                     <input type="hidden" name="step" value="zeroconf">
+                    <?= setupCsrfField() ?>
                     <?php if ($mode === 'add_store'): ?>
                         <input type="hidden" name="mode" value="add_store">
                     <?php endif; ?>
@@ -2355,6 +2427,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
 
                 <form method="POST" action="<?= htmlspecialchars(setupSelfUrl()) ?>">
                     <input type="hidden" name="step" value="lightning">
+                    <?= setupCsrfField() ?>
                     <input type="hidden" name="lightning_action" value="save">
                     <?php if ($mode === 'add_store'): ?>
                         <input type="hidden" name="mode" value="add_store">
@@ -2669,6 +2742,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
 
                 <form method="POST" action="<?= htmlspecialchars(setupSelfUrl()) ?>" style="margin-top: 0.5rem;">
                     <input type="hidden" name="step" value="lightning">
+                    <?= setupCsrfField() ?>
                     <input type="hidden" name="lightning_action" value="skip">
                     <?php if ($mode === 'add_store'): ?>
                         <input type="hidden" name="mode" value="add_store">
@@ -2711,6 +2785,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
 
                 <form method="POST" action="<?= htmlspecialchars(setupSelfUrl()) ?>">
                     <input type="hidden" name="step" value="swaps">
+                    <?= setupCsrfField() ?>
                     <?php if ($mode === 'add_store'): ?>
                         <input type="hidden" name="mode" value="add_store">
                     <?php endif; ?>
@@ -2765,6 +2840,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
 
                 <form method="POST" action="<?= htmlspecialchars(setupSelfUrl()) ?>" id="mints-form">
                     <input type="hidden" name="step" value="mints">
+                    <?= setupCsrfField() ?>
                     <input type="hidden" name="mints_enabled" value="1">
                     <input type="hidden" name="mint_url" id="mint_url" value="<?= htmlspecialchars($_POST['mint_url'] ?? '') ?>">
                     <input type="hidden" name="backup_mint_url" id="backup_mint_url" value="<?= htmlspecialchars($_POST['backup_mint_url'] ?? '') ?>">
@@ -2827,6 +2903,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
 
                 <form method="POST" action="<?= htmlspecialchars(setupSelfUrl()) ?>" style="margin-top: 0.5rem;">
                     <input type="hidden" name="step" value="mints">
+                    <?= setupCsrfField() ?>
                     <input type="hidden" name="mints_enabled" value="0">
                     <?php if ($mode === 'add_store'): ?>
                         <input type="hidden" name="mode" value="add_store">
@@ -2897,6 +2974,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                 </p>
                 <form method="POST" action="<?= htmlspecialchars(setupSelfUrl()) ?>">
                     <input type="hidden" name="step" value="updates">
+                    <?= setupCsrfField() ?>
                     <button type="submit" name="auto_update" value="1" class="btn" style="width: 100%; margin-bottom: 0.75rem;">Enable automatic updates</button>
                     <button type="submit" name="auto_update" value="0" class="btn btn-secondary" style="width: 100%;">Not now &mdash; I'll update manually</button>
                 </form>
@@ -2932,6 +3010,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
 
                 <form method="POST" action="<?= htmlspecialchars(setupSelfUrl()) ?>" style="margin-top: 1.5rem;">
                     <input type="hidden" name="step" value="cron">
+                    <?= setupCsrfField() ?>
                     <button type="submit" class="btn" style="width: 100%;">Continue</button>
                 </form>
 

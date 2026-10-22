@@ -18,6 +18,8 @@ require_once __DIR__ . '/swap/auto_melt.php';
 require_once __DIR__ . '/store_ln_addresses.php';
 require_once __DIR__ . '/clink/client.php';
 require_once __DIR__ . '/nwc/client.php';
+require_once __DIR__ . '/locks.php';
+require_once __DIR__ . '/store_safety.php';
 require_once __DIR__ . '/../cashu-wallet-php/CashuWallet.php';
 
 use Cashu\Wallet;
@@ -51,6 +53,56 @@ class LightningAddress {
                 "Melt fee reserve {$feeReserve} exceeds sanity bound {$maxReserve} "
                 . "(payment amount {$amount}); refusing to melt"
             );
+        }
+    }
+
+    /**
+     * The fee a melt actually cost: what went in, minus the change that came
+     * back, minus the invoice amount. Never negative — proof selection
+     * over-covers whenever denominations do not match exactly and the mint
+     * returns that over-coverage as change, so "fee reserve minus change"
+     * went negative and recorded real routing fees as zero.
+     */
+    public static function meltFee(int $inputAmount, int $changeAmount, int $invoiceAmount): int {
+        return max(0, $inputAmount - $changeAmount - $invoiceAmount);
+    }
+
+    /**
+     * Refuse to start a withdrawal while a previous one is still being settled
+     * by the mint.
+     *
+     * A melt the mint answered PENDING leaves its inputs PENDING with a journal
+     * the cron reconciles later. Each retry fetches a fresh invoice (and a
+     * fresh quote), so nothing else stops a second payment from being made out
+     * of the remaining proofs — and when the first one settles, the
+     * destination has been paid twice. A journal whose inputs are UNSPENT
+     * (an UNPAID failure the library kept for bookkeeping) does not block.
+     *
+     * @throws Exception
+     */
+    public static function assertNoPendingWithdrawal(string $storeId): void {
+        foreach (Config::getStoreWalletAccounts($storeId) as $account) {
+            try {
+                $storage = StoreSafety::storage($account['mint_url'], $account['unit']);
+                foreach ($storage->getPendingOperations('melt') as $op) {
+                    $inputs = array_values(array_map('strval', (array)($op['data']['input_secrets'] ?? [])));
+                    if (empty($inputs)) {
+                        continue;
+                    }
+                    foreach ($storage->getProofsStatesBySecrets($inputs) as $state) {
+                        if ($state === ProofState::PENDING) {
+                            throw new Exception(
+                                'A previous withdrawal from this store is still being settled by the mint. '
+                                . 'It is checked automatically; wait for it to finish before starting another one.'
+                            );
+                        }
+                    }
+                }
+            } catch (\PDOException $e) {
+                // A backup namespace that cannot be opened is not a reason to
+                // block the primary; the primary's own storage is always readable.
+                error_log("assertNoPendingWithdrawal: could not read {$account['mint_url']}: " . $e->getMessage());
+            }
         }
     }
 
@@ -138,6 +190,7 @@ class LightningAddress {
             }
 
             $selectedProofs = Wallet::selectProofs($proofs, $totalNeeded);
+            $inputAmount = Wallet::sumProofs($selectedProofs);
 
             try {
                 $result = $wallet->melt($meltQuote->quote, $selectedProofs);
@@ -159,12 +212,13 @@ class LightningAddress {
                 MintReliability::recordWithdrawSuccess($mintUrl, $address, $storeId);
             }
 
+            $changeAmount = Wallet::sumProofs($result['change'] ?? []);
             return [
                 'success' => true,
                 'preimage' => $result['preimage'],
                 'amountPaid' => $meltQuote->amount,
-                'fee' => $meltQuote->feeReserve - Wallet::sumProofs($result['change'] ?? []),
-                'changeAmount' => Wallet::sumProofs($result['change'] ?? []),
+                'fee' => self::meltFee($inputAmount, $changeAmount, $meltQuote->amount),
+                'changeAmount' => $changeAmount,
             ];
         } catch (Exception $e) {
             throw $e;
@@ -252,7 +306,36 @@ class LightningAddress {
             $primaryAddress = StoreLnAddresses::displayValue(
                 $destinations[0]['type'], $destinations[0]['value']
             );
+            // Per-store funds lock shared with the dashboard's withdraw /
+            // export actions and the fee melt: never select the same proofs
+            // as a concurrent operator action. Busy → skip this store this
+            // tick (it is re-tried next tick), never fail it.
+            $fundsLock = cashupay_acquire_lock('funds_' . $store['id']);
+            if (!$fundsLock) {
+                $results[] = [
+                    'store_id' => $store['id'],
+                    'store_name' => $store['name'],
+                    'success' => false,
+                    'skipped' => 'busy',
+                ];
+                continue;
+            }
             try {
+                // A withdrawal the mint is still settling must finish before a
+                // new one is paid out of the remaining proofs (double payment).
+                try {
+                    self::assertNoPendingWithdrawal($store['id']);
+                } catch (Exception $pendingErr) {
+                    $results[] = [
+                        'store_id' => $store['id'],
+                        'store_name' => $store['name'],
+                        'success' => false,
+                        'skipped' => 'pending',
+                        'error' => $pendingErr->getMessage(),
+                    ];
+                    continue;
+                }
+
                 // Check store balance from local storage (offline-first, no mint contact)
                 // This prevents crashes when mint is unreachable
                 $balance = Invoice::getBalance($store['id']);
@@ -406,6 +489,8 @@ class LightningAddress {
                     'success' => false,
                     'error' => $e->getMessage(),
                 ];
+            } finally {
+                cashupay_release_lock($fundsLock);
             }
         }
 
@@ -550,6 +635,16 @@ class LightningAddress {
         // addresses).
         $addressForRecord = null;
 
+        // An amountless invoice cannot be melted (the mint would quote 0 and
+        // the operator would see a raw mint error after a network round trip).
+        // Say so plainly, before any network call.
+        if (self::parseBolt11Amount($bolt11) === 0) {
+            throw new Exception(
+                'This invoice has no amount. Only invoices that specify an amount can be paid — '
+                . 'ask the recipient for an invoice with the amount filled in.'
+            );
+        }
+
         try {
             $wallet = Invoice::getWalletInstance($storeId);
         } catch (Exception $e) {
@@ -602,6 +697,7 @@ class LightningAddress {
 
         // Select proofs
         $selectedProofs = Wallet::selectProofs($proofs, $totalNeeded);
+        $inputAmount = Wallet::sumProofs($selectedProofs);
 
         // Write-ahead hook: fired with the mint melt-quote id right before the
         // proofs are spent, so the caller can persist a pending intent that is
@@ -636,12 +732,13 @@ class LightningAddress {
             MintReliability::recordWithdrawSuccess($mintUrl, null, $storeId);
         }
 
+        $changeAmount = Wallet::sumProofs($result['change'] ?? []);
         return [
             'success' => true,
             'preimage' => $result['preimage'],
             'amountPaid' => $meltQuote->amount,
-            'fee' => $meltQuote->feeReserve - Wallet::sumProofs($result['change'] ?? []),
-            'changeAmount' => Wallet::sumProofs($result['change'] ?? []),
+            'fee' => self::meltFee($inputAmount, $changeAmount, $meltQuote->amount),
+            'changeAmount' => $changeAmount,
         ];
     }
 
