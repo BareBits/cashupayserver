@@ -108,7 +108,7 @@ BareBits is robust payment software that can direct payments to you via many met
 - ⚠️ Strike does not work with all kinds of merchants
   
 ### Full self-custody setup (suggested, no USD conversion):
-- Run an [Electrum](https://electrum.org/) wallet on your desktop computer and enable the [automatic liquidity management plugin](https://github.com/BareBits/electrum_liquidity). Keep $100 or so in the wallet to keep liquidity flowing smoothly. You can start with zero and build up gradually as payments arrive. See "How to get an LNURL, NWC connection, or CLINK Noffer". Find your xpub in the "wallet information" section.
+- Run an [Electrum](https://electrum.org/) wallet on your desktop computer and enable the [automatic liquidity management plugin](https://github.com/BareBits/electrum_liquidity). Keep $100 or so in the wallet to keep liquidity flowing smoothly. You can start with zero and build up gradually as payments arrive. See [How to get an LNURL, NWC connection, or CLINK Noffer](#how-to-get-an-lnurl-nwc-connection-or-clink-noffer). Find your xpub in the "wallet information" section.
 - Enable submarine swaps as a fallback in case your desktop is offline or doesn't have sufficient inbound liquidity.
 - Suggestion: leave "strict mode" disabled. If your electrum wallet is unavailable AND a payment would be uneconomical to do a submarine swap for, lightning payments will land in a cashu mint (custodial) and be automatically withdrawn to your Electrum wallet once you have sufficient inbound liquidity OR will be withdrawn on-chain once it's economically reasonable.
 - Need USD or other fiat currency? See [our suggestions](https://getbarebits.com/help/Understanding%20Bitcoin/fiat%20conversion%20options/) for exchanges.
@@ -219,7 +219,7 @@ if you're building from source (see Development below).
 
 ## How to get an LNURL, NWC connection, or CLINK Noffer
 
-If you want your customers to be able to pay natively via lightning (lowest fees, fastest payments), you will need to generate a lightning invoice for each customer. There are three ways to automate this: LNURLs (lightning address), Nostr Wallet Connect (NWC), and CLINK Noffers. Alternatively, you can use cashu mints and submarine swaps (accept customer payments in LN, automatically send to you on-chain).
+If you want your customers to be able to pay via lightning (lowest fees, fastest payments), you will need to generate a lightning invoice for each customer. There are three ways to automate this: LNURLs (lightning address), Nostr Wallet Connect (NWC), and CLINK Noffers. Alternatively, you can use cashu mints and submarine swaps (accept customer payments in LN, automatically send to you on-chain).
 
 ### CLINK Noffers (suggested) (self-custody)
 CLINK Noffers enable you to generate lightning invoices on the fly from a desktop wallet that is left running online. This means you maintain full self-custody over your funds! You will need to manage your liquidity (make sure you have room for incoming payments), but this can be automated fairly easily. BareBits will automatically fall back to submarine swaps, cashu mints, etc if there is no liquidity available or the wallet is offline, so it's not a big deal.
