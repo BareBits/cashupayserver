@@ -189,7 +189,9 @@ class LightningAddress {
                 throw new Exception("Insufficient balance. Have: {$balance} {$mintUnit}, Need: {$totalNeeded} {$mintUnit}");
             }
 
-            $selectedProofs = Wallet::selectProofs($proofs, $totalNeeded);
+            // Fee-aware selection: on a mint that charges per input the
+            // inputs must also cover their own NUT-02 fee, or melt() refuses.
+            $selectedProofs = $wallet->selectProofsWithFees($proofs, $totalNeeded);
             $inputAmount = Wallet::sumProofs($selectedProofs);
 
             try {
@@ -212,6 +214,7 @@ class LightningAddress {
                 MintReliability::recordWithdrawSuccess($mintUrl, $address, $storeId);
             }
 
+            self::noteChangeRecoveryPending($storeId, $address, $meltQuoteId, $result);
             $changeAmount = Wallet::sumProofs($result['change'] ?? []);
             return [
                 'success' => true,
@@ -219,9 +222,35 @@ class LightningAddress {
                 'amountPaid' => $meltQuote->amount,
                 'fee' => self::meltFee($inputAmount, $changeAmount, $meltQuote->amount),
                 'changeAmount' => $changeAmount,
+                'changeRecoveryPending' => (bool)($result['changeRecoveryPending'] ?? false),
             ];
         } catch (Exception $e) {
             throw $e;
+        }
+    }
+
+    /**
+     * A melt the mint PAID whose change could not be collected yet (the NUT-09
+     * restore or the change unblinding failed after the payment went through)
+     * is still a SUCCESS: the destination was paid. The library keeps the
+     * melt journal and the cron's recoverPendingMelts() collects the change;
+     * until then the fee reported here is overstated by that change. Never
+     * retry the withdrawal for this — it would pay twice.
+     */
+    public static function noteChangeRecoveryPending(string $storeId, ?string $destination, ?string $quoteId, array $result): void {
+        if (empty($result['changeRecoveryPending'])) {
+            return;
+        }
+        $reason = (string)($result['changeRecoveryError'] ?? 'unknown');
+        error_log(sprintf(
+            'CashuPayServer: melt %s for store %s PAID; change collection deferred to cron (%s)',
+            $quoteId ?? '?', $storeId, $reason
+        ));
+        try {
+            AdminLog::log('melt', 'change_pending', $storeId, null, $destination,
+                'Payment went through; the mint\'s change will be collected by the next cron run: ' . $reason);
+        } catch (\Throwable $e) {
+            // best-effort
         }
     }
 
@@ -695,8 +724,8 @@ class LightningAddress {
             throw new Exception("Insufficient balance. Have: {$balance} {$mintUnit}, Need: {$totalNeeded} {$mintUnit}");
         }
 
-        // Select proofs
-        $selectedProofs = Wallet::selectProofs($proofs, $totalNeeded);
+        // Select proofs (covering their own NUT-02 input fee on fee mints)
+        $selectedProofs = $wallet->selectProofsWithFees($proofs, $totalNeeded);
         $inputAmount = Wallet::sumProofs($selectedProofs);
 
         // Write-ahead hook: fired with the mint melt-quote id right before the
@@ -732,6 +761,7 @@ class LightningAddress {
             MintReliability::recordWithdrawSuccess($mintUrl, null, $storeId);
         }
 
+        self::noteChangeRecoveryPending($storeId, $addressForRecord, $meltQuoteId, $result);
         $changeAmount = Wallet::sumProofs($result['change'] ?? []);
         return [
             'success' => true,
@@ -739,6 +769,7 @@ class LightningAddress {
             'amountPaid' => $meltQuote->amount,
             'fee' => self::meltFee($inputAmount, $changeAmount, $meltQuote->amount),
             'changeAmount' => $changeAmount,
+            'changeRecoveryPending' => (bool)($result['changeRecoveryPending'] ?? false),
         ];
     }
 

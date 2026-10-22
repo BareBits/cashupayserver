@@ -145,8 +145,8 @@ $sel = StoreSafety::selectProofsWithFees($wallet, $proofs, 5);
 assert_true(Wallet::sumProofs($sel) >= 5, 'selection covers the amount');
 assert_eq(1, count($sel), 'fewest inputs (greedy largest-first), never the whole set: ' . Wallet::sumProofs($sel));
 assert_true(Wallet::sumProofs($sel) < 63, 'not the whole balance');
-// Fallback path (the app-side two-pass) with a fee-charging keyset: the
-// selection covers amount + its own fee.
+// Fee-charging keyset (library selectProofsWithFees through the StoreSafety
+// wrapper): the selection covers amount + its own fee.
 mock_mint_update_state($mint['dir'], ['fee_ppk' => 1000]); // 1 sat per input
 make_store('s_fee', $mint['url'] . '/');
 Database::update('stores', ['seed_phrase' => 'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about'], 'id = ?', ['s_fee']);

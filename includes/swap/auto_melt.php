@@ -714,7 +714,8 @@ final class SwapAutoMelt {
             if ($balance < $totalNeeded) {
                 throw new Exception("Insufficient balance for sweep melt. Have: {$balance} {$mintUnit}, Need: {$totalNeeded} {$mintUnit}");
             }
-            $selectedProofs = Wallet::selectProofs($proofs, $totalNeeded);
+            // Fee-aware selection: inputs must also cover their own NUT-02 fee.
+            $selectedProofs = $wallet->selectProofsWithFees($proofs, $totalNeeded);
 
             try {
                 $result = $wallet->melt($meltQuote->quote, $selectedProofs);
@@ -730,6 +731,12 @@ final class SwapAutoMelt {
                 self::recordMeltFailure($mintUrl, $bolt11, $storeId, $e, 'melt', $meltQuoteId, $wallet);
                 throw $e;
             }
+            // PAID with the change still to be collected (NUT-09 by the cron's
+            // recoverPendingMelts) is a success: the provider's invoice was
+            // paid, the swap proceeds. Logged, never retried.
+            if ($isPaid) {
+                LightningAddress::noteChangeRecoveryPending($storeId, 'sweep:' . substr($bolt11, 0, 16), $meltQuoteId, $result);
+            }
 
             if ($mintUrl !== null && $mintUrl !== '') {
                 // Use sweep destination (the on-chain address) for stats so
@@ -744,6 +751,7 @@ final class SwapAutoMelt {
                 'preimage' => $result['preimage'] ?? null,
                 'invoice_amount_mint_unit' => $meltQuote->amount,
                 'fee_reserve_mint_unit'   => $meltQuote->feeReserve,
+                'changeRecoveryPending' => (bool)($result['changeRecoveryPending'] ?? false),
             ];
         } catch (Throwable $e) {
             throw $e;

@@ -21,8 +21,8 @@ require_once dirname(__DIR__, 2) . '/includes/store_safety.php';
 use Cashu\Proof;
 use Cashu\WalletStorage;
 
-$seed = 'about about about about about about about about about about about above';
 make_store('s1', 'https://mint-a.example');
+$seed = (string)Database::fetchOne("SELECT seed_phrase FROM stores WHERE id = 's1'")['seed_phrase'];
 
 function store(string $id): array {
     return Database::fetchOne("SELECT * FROM stores WHERE id = ?", [$id]);
@@ -38,7 +38,7 @@ function expect_refused(callable $fn, string $needle, string $label): void {
 }
 
 // --- seed immutability ---------------------------------------------------------
-expect_refused(fn() => Config::updateStore('s1', ['seed_phrase' => 'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about']),
+expect_refused(fn() => Config::updateStore('s1', ['seed_phrase' => 'zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong']),
     'cannot be replaced', 'different seed');
 assert_eq($seed, store('s1')['seed_phrase'], 'seed unchanged after the refusal');
 

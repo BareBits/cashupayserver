@@ -14,12 +14,11 @@
  *   - what a wallet namespace holds, and what blocks a mint change or a
  *     backup-mint removal.
  *
- * Library contract: the wallet library is gaining ProofState::EXPORTED,
- * WalletStorage::transitionProofStates(), getReservedInputSecrets() and
- * Wallet::selectProofsWithFees(). Until they land, every helper below falls
- * back to an equivalent built on the public storage API / the shared SQLite
- * file. Each fallback is marked with a TODO(library) so the follow-up can
- * delete it.
+ * Everything money-moving goes through the wallet library's own primitives
+ * (ProofState::EXPORTED, WalletStorage::transitionProofStates(),
+ * getReservedInputSecrets(), Wallet::selectProofsWithFees(),
+ * Wallet::checkProofState()); the helpers here only add the server's
+ * namespace lookup and plain-language reasons.
  */
 
 require_once __DIR__ . '/database.php';
@@ -31,25 +30,20 @@ use Cashu\WalletStorage;
 use Cashu\ProofState;
 
 class StoreSafety {
-    /**
-     * Proof state for "handed to a third party as a token" — distinct from
-     * PENDING (reserved by an in-flight mint operation) on purpose: the mint
-     * reporting an exported proof UNSPENT only means nobody has redeemed it
-     * yet, so nothing may put it back into the spendable balance on its own.
-     *
-     * TODO(library): replace with ProofState::EXPORTED once the library ships it
-     * (same string value, so stored rows are compatible either way).
-     */
-    const PROOF_STATE_EXPORTED = 'EXPORTED';
-
     /** Swap/sweep attempt statuses that are finished (mirrors SwapPoller). */
     private const SWAP_TERMINAL = [
         'invoice.settled', 'swap.expired', 'transaction.refunded', 'transaction.failed',
         'invoice.expired', 'claim.confirmed', 'error',
     ];
 
+    /**
+     * Proof state for "handed to a third party as a token" — distinct from
+     * PENDING (reserved by an in-flight mint operation) on purpose: the mint
+     * reporting an exported proof UNSPENT only means nobody has redeemed it
+     * yet, so nothing may put it back into the spendable balance on its own.
+     */
     public static function exportedState(): string {
-        return defined('\Cashu\ProofState::EXPORTED') ? \Cashu\ProofState::EXPORTED : self::PROOF_STATE_EXPORTED;
+        return ProofState::EXPORTED;
     }
 
     /**
@@ -57,12 +51,7 @@ class StoreSafety {
      * it (Wallet trims the trailing slash before building its storage).
      */
     public static function walletId(string $mintUrl, string $unit): string {
-        $mintUrl = rtrim($mintUrl, '/');
-        if (method_exists(WalletStorage::class, 'deriveWalletId')) {
-            return WalletStorage::deriveWalletId($mintUrl, $unit);
-        }
-        // TODO(library): drop once deriveWalletId() exists.
-        return substr(hash('sha256', $mintUrl . ':' . $unit), 0, 16);
+        return WalletStorage::deriveWalletId(rtrim($mintUrl, '/'), $unit);
     }
 
     public static function storage(string $mintUrl, string $unit): WalletStorage {
@@ -93,59 +82,18 @@ class StoreSafety {
             return 0;
         }
         $storage = self::storage($mintUrl, $unit);
-        if (method_exists($storage, 'transitionProofStates')) {
-            if ($requireAll) {
-                $states = $storage->getProofsStatesBySecrets($secrets);
-                foreach ($secrets as $s) {
-                    if (!isset($states[$s]) || !in_array($states[$s], $from, true)) {
-                        return 0;
-                    }
-                }
-            }
-            return (int)$storage->transitionProofStates($secrets, $to, $from);
-        }
-
-        // TODO(library): fallback until WalletStorage::transitionProofStates() lands.
-        // The proofs live in the server's own SQLite file, so a CAS UPDATE on
-        // cashu_proofs inside a write transaction is exactly as atomic as the
-        // library's version will be.
-        $walletId = self::walletId($mintUrl, $unit);
-        $own = !Database::inTransaction();
-        if ($own) {
-            Database::beginImmediate();
-        }
-        try {
-            $inSecrets = implode(',', array_fill(0, count($secrets), '?'));
-            $inFrom = implode(',', array_fill(0, count($from), '?'));
-            if ($requireAll) {
-                $rows = Database::fetchAll(
-                    "SELECT secret FROM cashu_proofs
-                     WHERE wallet_id = ? AND secret IN ($inSecrets) AND state IN ($inFrom)",
-                    array_merge([$walletId], $secrets, $from)
-                );
-                if (count($rows) !== count($secrets)) {
-                    if ($own) {
-                        Database::rollback();
-                    }
+        if ($requireAll) {
+            $states = $storage->getProofsStatesBySecrets($secrets);
+            foreach ($secrets as $s) {
+                if (!isset($states[$s]) || !in_array($states[$s], $from, true)) {
                     return 0;
                 }
             }
-            $spentAt = $to === ProofState::SPENT ? time() : null;
-            $changed = Database::query(
-                "UPDATE cashu_proofs SET state = ?, spent_at = ?
-                 WHERE wallet_id = ? AND secret IN ($inSecrets) AND state IN ($inFrom)",
-                array_merge([$to, $spentAt, $walletId], $secrets, $from)
-            )->rowCount();
-            if ($own) {
-                Database::commit();
-            }
-            return (int)$changed;
-        } catch (\Throwable $e) {
-            if ($own) {
-                Database::rollback();
-            }
-            throw $e;
         }
+        // Inputs an unfinished melt/swap journal owns are never moved by the
+        // server: the library's recovery settles them against the mint.
+        $exclude = array_flip(self::reservedInputSecrets($storage));
+        return (int)$storage->transitionProofStates($secrets, $to, $from, $exclude);
     }
 
     /**
@@ -156,54 +104,20 @@ class StoreSafety {
      * @return string[]
      */
     public static function reservedInputSecrets(WalletStorage $storage): array {
-        if (method_exists($storage, 'getReservedInputSecrets')) {
-            return array_values(array_map('strval', $storage->getReservedInputSecrets()));
-        }
-        // TODO(library): fallback until getReservedInputSecrets() lands.
-        $reserved = [];
-        foreach (['melt', 'swap'] as $type) {
-            foreach ($storage->getPendingOperations($type) as $op) {
-                foreach ((array)($op['data']['input_secrets'] ?? []) as $secret) {
-                    $reserved[(string)$secret] = true;
-                }
-            }
-        }
-        return array_keys($reserved);
+        return array_values(array_map('strval', $storage->getReservedInputSecrets()));
     }
 
     /**
      * Select the smallest input set that still covers $amount plus the NUT-02
-     * input fee of the inputs themselves (two-pass: select, add the fee of
-     * what was selected, re-select, until the selection is stable).
+     * input fee of the inputs themselves (the library iterates until the
+     * selection covers its own cost).
      *
      * @param \Cashu\Proof[] $proofs
      * @return \Cashu\Proof[]
      * @throws \Cashu\InsufficientBalanceException
      */
     public static function selectProofsWithFees(Wallet $wallet, array $proofs, int $amount): array {
-        if (method_exists($wallet, 'selectProofsWithFees')) {
-            return $wallet->selectProofsWithFees($proofs, $amount);
-        }
-        // TODO(library): fallback until Wallet::selectProofsWithFees() lands.
-        // Each pass selects for amount + the fee of the previous selection;
-        // once the new selection's fee no longer grows, it covers the amount
-        // and its own fee.
-        $fee = 0;
-        $selected = [];
-        for ($i = 0; $i < 8; $i++) {
-            $selected = Wallet::selectProofs($proofs, $amount + $fee);
-            $newFee = $wallet->calculateFee($selected);
-            if ($newFee <= $fee) {
-                break;
-            }
-            $fee = $newFee;
-        }
-        if (Wallet::sumProofs($selected) - $wallet->calculateFee($selected) < $amount) {
-            throw new \Cashu\InsufficientBalanceException(
-                'Insufficient balance: have ' . Wallet::sumProofs($proofs) . ', need ' . $amount . ' plus fees'
-            );
-        }
-        return $selected;
+        return $wallet->selectProofsWithFees($proofs, $amount);
     }
 
     /**
@@ -251,22 +165,50 @@ class StoreSafety {
     }
 
     /**
-     * Ask a mint for the state of the given Ys.
+     * Ask a mint what it thinks of the given proofs (NUT-07), through the
+     * library's fail-closed checkProofState(): one entry per proof, Y-matched,
+     * UNKNOWN when the mint sent no state; a short, empty, duplicated or
+     * re-ordered reply throws. No seed or storage is involved.
      *
-     * @param string[] $Ys
-     * @return array<string, string> Y => upper-cased state
+     * @param \Cashu\Proof[] $proofs
+     * @return array<string, string> Y (as the proof carries it) => upper-cased state
+     * @throws \Cashu\CashuException
      */
-    public static function checkStatesByY(string $mintUrl, array $Ys): array {
-        $Ys = array_values($Ys);
-        if (empty($Ys)) {
+    public static function checkProofStates(string $mintUrl, string $unit, array $proofs): array {
+        $proofs = array_values($proofs);
+        if (empty($proofs)) {
             return [];
         }
-        $client = new \Cashu\MintClient(rtrim($mintUrl, '/'));
-        $response = $client->post('checkstate', ['Ys' => $Ys]);
-        $states = self::validateStates($Ys, $response);
+        $wallet = new Wallet(rtrim($mintUrl, '/'), $unit);
+        $entries = $wallet->checkProofState($proofs);
         $out = [];
-        foreach ($Ys as $i => $Y) {
-            $out[$Y] = $states[$i];
+        foreach ($proofs as $i => $proof) {
+            $out[$proof->Y] = (string)($entries[$i]['state'] ?? ProofState::UNKNOWN);
+        }
+        return $out;
+    }
+
+    /**
+     * Same, for proofs known only by secret: the rows are read from the
+     * namespace that holds them so the mint is asked about real proofs.
+     *
+     * @param string[] $secrets
+     * @return array<string, string> secret => upper-cased state
+     * @throws \Exception when a secret is not in the namespace
+     */
+    public static function checkStatesBySecrets(string $mintUrl, string $unit, array $secrets): array {
+        $secrets = array_values(array_unique(array_filter(array_map('strval', $secrets), 'strlen')));
+        if (empty($secrets)) {
+            return [];
+        }
+        $proofs = self::storage($mintUrl, $unit)->getProofsBySecretsAsObjects($secrets);
+        if (count($proofs) !== count($secrets)) {
+            throw new \Exception('Some of these proofs are not in the wallet');
+        }
+        $byY = self::checkProofStates($mintUrl, $unit, $proofs);
+        $out = [];
+        foreach ($proofs as $proof) {
+            $out[$proof->secret] = $byY[$proof->Y] ?? ProofState::UNKNOWN;
         }
         return $out;
     }

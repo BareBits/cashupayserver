@@ -733,6 +733,7 @@ class Invoice {
         $quote = null;
         $usedMintUrl = null;
         $amountInMintUnit = null;
+        $recoveringMints = [];
         if ($cashuConfigured && !$strictMintFallbackBlocked && $swapAttempt === null
             && $lnurlAttempt === null && $strikeAttempt === null
             && $nofferAttempt === null && $nwcAttempt === null && $feeLightning === null) {
@@ -760,9 +761,20 @@ class Invoice {
             if ($amountInMintUnit !== null) {
                 require_once __DIR__ . '/mint_reliability.php';
                 $allMints = Config::getStoreAllMintUrls($storeId);
+                $recoveringMints = [];
                 foreach ($allMints as $tryMintUrl) {
                     try {
                         $wallet = self::getWalletForStore($storeId, $tryMintUrl);
+                        // An account whose seed has not been checked against
+                        // this mint yet must not issue a quote: the payment
+                        // would arrive at the mint but the wallet could not
+                        // mint the ecash (counter reuse). Use a ready backup;
+                        // the cron's recovery task readies this one.
+                        if ($wallet->requiresRecovery()) {
+                            $recoveringMints[] = $tryMintUrl;
+                            error_log("Mint {$tryMintUrl} skipped for store {$storeId}: wallet recovery in progress");
+                            continue;
+                        }
                         $quote = $wallet->requestMintQuote($amountInMintUnit);
                         $usedMintUrl = $tryMintUrl;
                         MintReliability::recordQuoteSuccess($tryMintUrl, $storeId);
@@ -777,6 +789,11 @@ class Invoice {
                 }
             }
             if ($quote === null && !$onchainConfigured) {
+                if ($lastError === null && !empty($recoveringMints)) {
+                    // Every candidate mint is still being prepared — nothing
+                    // was created, so the caller can simply retry later.
+                    throw new Exception(self::RECOVERY_MESSAGE);
+                }
                 throw new Exception(
                     'Failed to get mint quote from all configured mints. '
                     . 'Last error: ' . ($lastError ? $lastError->getMessage() : 'Unknown')
@@ -1851,6 +1868,18 @@ class Invoice {
     private static function mintAndStoreTokens(array $invoice, Wallet $wallet): void {
         self::clearWebhookQueue();
 
+        // The money is at the mint, but this seed may not issue secrets there
+        // until its scan completed (an imported seed; a mint added after the
+        // fact). Leave the invoice as it is — the quote stays PAID at the mint
+        // and the regular/late-payment pollers collect it once the account is
+        // ready — rather than claiming Processing and failing inside mint().
+        if ($wallet->requiresRecovery()) {
+            throw new Exception(
+                'Payment received at the mint, but the wallet is still being set up (recovering); '
+                . 'it will be collected once recovery completes.'
+            );
+        }
+
         // Mark as Processing BEFORE minting — status-guarded so a worker that
         // read the row before another one settled it never overwrites Settled
         // with Processing (and then re-fires InvoiceSettled). Expired/Invalid
@@ -2822,7 +2851,20 @@ class Invoice {
         if (!isset(self::$walletCache[$cacheKey])) {
             $wallet = new Wallet($mintUrl, $mintUnit, Database::getDbPath());
             $wallet->loadMint();
-            $wallet->initFromMnemonic($seedPhrase);
+            // Seed provenance is tracked per (namespace, seed). A seed that
+            // was bound through bindStoreSeed() keeps the readiness recorded
+            // there (a pasted seed stays unready until its scan completes).
+            // A seed not yet bound on this namespace is adopted the backward-
+            // compatible way (existing data → adopted ready, empty → fresh
+            // ready) — EXCEPT when the store's seed was imported: then every
+            // namespace it first touches (backup mints reached by failover)
+            // needs its own scan before it may issue secrets there.
+            if (self::storeSeedIsImported($store)
+                && !self::seedBoundOn($wallet->getStorage(), $seedPhrase)) {
+                $wallet->initializeForRestore($seedPhrase);
+            } else {
+                $wallet->initFromMnemonic($seedPhrase);
+            }
 
             self::$walletCache[$cacheKey] = $wallet;
         }
@@ -2835,6 +2877,391 @@ class Invoice {
      */
     public static function getWalletInstance(string $storeId): Wallet {
         return self::getWalletForStore($storeId);
+    }
+
+    /**
+     * Drop cached wallet objects (all stores, or one). Needed after a seed
+     * was (re)bound or a store's mint changed in this process, so the next
+     * getWalletForStore() reflects the recorded readiness.
+     */
+    public static function forgetWallets(?string $storeId = null): void {
+        if ($storeId === null) {
+            self::$walletCache = [];
+            self::$importedSeedCache = [];
+            return;
+        }
+        foreach (array_keys(self::$walletCache) as $key) {
+            if (str_starts_with($key, $storeId . '|')) {
+                unset(self::$walletCache[$key]);
+            }
+        }
+        unset(self::$importedSeedCache[$storeId]);
+    }
+
+    // =========================================================================
+    // WALLET READINESS (seed provenance + restore-before-issue gate)
+    // =========================================================================
+
+    /** Operator/payer-facing reason an unready account cannot take payments. */
+    public const RECOVERY_MESSAGE =
+        'Payments are being set up with your mint: the wallet is still being checked '
+        . 'against the mint before it can issue new ecash. Please try again in a few minutes.';
+
+    /** Seed-binding modes for bindStoreSeed(). */
+    public const SEED_NEW = 'new';           // generated in this request: never used anywhere
+    public const SEED_RESTORE = 'restore';   // pasted/imported, or a known seed on a new namespace
+    public const SEED_EXISTING = 'existing'; // backward-compatible adoption (upgrade path)
+
+    /** Recovery bookkeeping: retry schedule for failed restore steps. */
+    private const RECOVERY_BACKOFF_BASE_SEC = 30;
+    private const RECOVERY_BACKOFF_MAX_SEC = 3600;
+
+    /** @var array<string, bool> store id => the store's seed was imported (restore-bound on its primary) */
+    private static array $importedSeedCache = [];
+
+    /**
+     * Bind a store's seed to one wallet account (mint + unit) with explicit
+     * provenance:
+     *   SEED_NEW      — the seed was generated in this request; it has no
+     *                   history anywhere, so the account is ready at once.
+     *   SEED_RESTORE  — the seed came from outside (pasted, imported) or is
+     *                   being pointed at a mint it may have used before; the
+     *                   account stays unready until restoreStep() scanned the
+     *                   mint for the seed's existing outputs (otherwise the
+     *                   first mint request would reuse counter 0 and the mint
+     *                   would refuse the already-signed outputs, or worse,
+     *                   sign duplicates).
+     *   SEED_EXISTING — backward-compatible: adopt whatever the namespace
+     *                   holds (upgrade path for stores that predate seed
+     *                   provenance).
+     * A seed already bound on the namespace keeps the readiness recorded
+     * there; binding is idempotent. Returns the (uncached) wallet.
+     *
+     * @throws Exception when the mint cannot be loaded or the binding is refused
+     */
+    public static function bindStoreSeed(string $storeId, string $mintUrl, string $unit, string $mode): Wallet {
+        $store = Config::getStore($storeId);
+        if (!$store) {
+            throw new Exception('Store not found');
+        }
+        $seedPhrase = (string)($store['seed_phrase'] ?? '');
+        $mintUrl = rtrim($mintUrl, '/');
+        $unit = strtolower($unit);
+        if ($mintUrl === '' || $seedPhrase === '') {
+            throw new Exception('Store wallet not configured');
+        }
+        $wallet = new Wallet($mintUrl, $unit, Database::getDbPath());
+        $wallet->loadMint();
+        $storage = $wallet->getStorage();
+        switch ($mode) {
+            case self::SEED_NEW:
+                // A namespace that already holds wallet data but has no bound
+                // seed at all is legacy pooled storage of another store (one
+                // namespace per mint:unit on a multi-store server). A seed
+                // generated right now has no history there, so adopting it
+                // ready is safe; the library refuses a "new" binding on such
+                // data on purpose (it cannot tell our fresh seed from a
+                // re-imported one).
+                if ($storage->hasWalletData() && $storage->getBoundSeedFingerprints() === []) {
+                    $wallet->adoptSeedForExistingStorage($seedPhrase);
+                } else {
+                    $wallet->initializeNewFromMnemonic($seedPhrase);
+                }
+                break;
+            case self::SEED_RESTORE:
+                $wallet->initializeForRestore($seedPhrase);
+                break;
+            case self::SEED_EXISTING:
+                $wallet->initFromMnemonic($seedPhrase);
+                break;
+            default:
+                throw new Exception('Unknown seed binding mode: ' . $mode);
+        }
+        self::forgetWallets($storeId);
+        self::recordRecoveryState($storeId, $mintUrl, $unit, $wallet->requiresRecovery() ? 'pending' : 'ready', null, 0, 0);
+        return $wallet;
+    }
+
+    /** Is this seed already bound (any readiness) on the storage's namespace? */
+    private static function seedBoundOn(WalletStorage $storage, string $seedPhrase): bool {
+        try {
+            $fingerprint = Wallet::calculateSeedFingerprint($seedPhrase);
+        } catch (\Throwable $e) {
+            return false;
+        }
+        return in_array($fingerprint, $storage->getBoundSeedFingerprints(), true);
+    }
+
+    /**
+     * Was the store's seed imported (bound for restore on its primary
+     * account)? Such a seed may have history at ANY mint, so every namespace
+     * it first touches is bound for restore too. Read-only (no mint contact).
+     */
+    private static function storeSeedIsImported(array $store): bool {
+        $storeId = (string)($store['id'] ?? '');
+        if (isset(self::$importedSeedCache[$storeId])) {
+            return self::$importedSeedCache[$storeId];
+        }
+        $imported = false;
+        $mintUrl = rtrim((string)($store['mint_url'] ?? ''), '/');
+        $seed = (string)($store['seed_phrase'] ?? '');
+        if ($mintUrl !== '' && $seed !== '') {
+            try {
+                $storage = StoreSafety::storage($mintUrl, (string)($store['mint_unit'] ?? 'sat'));
+                $storage->setSeedFingerprint(Wallet::calculateSeedFingerprint($seed));
+                $imported = $storage->getSeedProvenance()['init_reason'] === WalletStorage::INIT_RESTORE_REQUIRED;
+            } catch (\Throwable $e) {
+                $imported = false;
+            }
+        }
+        return self::$importedSeedCache[$storeId] = $imported;
+    }
+
+    /**
+     * Readiness of one wallet account, read from the database only (never
+     * contacts the mint — safe for dashboards and store lists).
+     *
+     * @return array{status: string, ready: bool, error: ?string, bound: bool, progress: array, attempts: int, next_attempt_at: int}
+     *         status: 'ready' | 'pending' (scan in progress or not started) | 'error' (last step failed)
+     */
+    public static function accountRecoveryStatus(string $storeId, string $mintUrl, string $unit): array {
+        $store = Config::getStore($storeId);
+        $mintUrl = rtrim($mintUrl, '/');
+        $unit = strtolower($unit);
+        $out = ['status' => 'ready', 'ready' => true, 'error' => null, 'bound' => false,
+            'progress' => [], 'attempts' => 0, 'next_attempt_at' => 0];
+        $seed = (string)($store['seed_phrase'] ?? '');
+        if (!$store || $mintUrl === '' || $seed === '') {
+            return $out;
+        }
+        try {
+            $storage = StoreSafety::storage($mintUrl, $unit);
+            $storage->setSeedFingerprint(Wallet::calculateSeedFingerprint($seed));
+            $provenance = $storage->getSeedProvenance();
+        } catch (\Throwable $e) {
+            return $out;
+        }
+        $out['bound'] = (bool)$provenance['bound'];
+        if (!$provenance['bound'] || $provenance['ready']) {
+            // Unbound = legacy namespace, adopted ready on first use.
+            return $out;
+        }
+        $recovery = $provenance['recovery'];
+        $out['ready'] = false;
+        $out['status'] = ($recovery['status'] === 'in_progress' && $recovery['error'] !== null) ? 'error' : 'pending';
+        $out['error'] = $recovery['error'];
+        $out['progress'] = $recovery['keysets'] ?? [];
+        $row = self::recoveryRow($storeId, $mintUrl, $unit);
+        if ($row) {
+            $out['attempts'] = (int)$row['attempts'];
+            $out['next_attempt_at'] = (int)$row['next_attempt_at'];
+            if ($row['status'] === 'error') {
+                $out['status'] = 'error';
+                $out['error'] = $out['error'] ?? $row['last_error'];
+            }
+        }
+        return $out;
+    }
+
+    /**
+     * Readiness summary for a store's dashboard: the primary and every
+     * backup account, plus `pending` = the store cannot take mint payments on
+     * at least one ENABLED account. Read-only.
+     *
+     * @return array{pending: bool, primaryPending: bool, message: ?string, accounts: list<array>}
+     */
+    public static function storeRecoveryStatus(string $storeId): array {
+        $accounts = [];
+        $pending = false;
+        $primaryPending = false;
+        foreach (Config::getStoreWalletAccounts($storeId) as $account) {
+            $st = self::accountRecoveryStatus($storeId, $account['mint_url'], $account['unit']);
+            $accounts[] = [
+                'mint_url' => $account['mint_url'],
+                'unit' => $account['unit'],
+                'primary' => (bool)$account['primary'],
+                'enabled' => (bool)$account['enabled'],
+                'status' => $st['status'],
+                'ready' => $st['ready'],
+                'error' => $st['error'],
+                'attempts' => $st['attempts'],
+                'next_attempt_at' => $st['next_attempt_at'],
+            ];
+            if (!$st['ready'] && ($account['primary'] || $account['enabled'])) {
+                $pending = true;
+            }
+            if (!$st['ready'] && $account['primary']) {
+                $primaryPending = true;
+            }
+        }
+        return [
+            'pending' => $pending,
+            'primaryPending' => $primaryPending,
+            'message' => $pending ? 'Preparing payments with your mint' : null,
+            'accounts' => $accounts,
+        ];
+    }
+
+    /** Does the store's PRIMARY account still require recovery? Read-only. */
+    public static function primaryRequiresRecovery(string $storeId): bool {
+        $store = Config::getStore($storeId);
+        if (!$store || empty($store['mint_url']) || empty($store['seed_phrase'])) {
+            return false;
+        }
+        return !self::accountRecoveryStatus($storeId, (string)$store['mint_url'], (string)($store['mint_unit'] ?? 'sat'))['ready'];
+    }
+
+    /**
+     * Drive one bounded restore step for an account that requires recovery.
+     *
+     * Honours the exponential backoff recorded for repeated failures unless
+     * $force. $maxOutputs defaults to 300 with GMP and 30 without (BCMath
+     * derivation is ~10x slower; the step must fit a cron tick on a GMP-less
+     * shared host). Returns the library's step result plus `skipped`
+     * ('ready' | 'backoff') when nothing was done.
+     */
+    public static function advanceStoreRecovery(
+        string $storeId,
+        string $mintUrl,
+        string $unit,
+        ?float $deadline = null,
+        ?int $maxOutputs = null,
+        bool $force = false
+    ): array {
+        $mintUrl = rtrim($mintUrl, '/');
+        $unit = strtolower($unit);
+        $maxOutputs = $maxOutputs ?? (\Cashu\BigInt::isUsingGmp() ? 300 : 30);
+        $deadline = $deadline ?? (microtime(true) + 20.0);
+
+        $row = self::recoveryRow($storeId, $mintUrl, $unit);
+        if (!$force && $row && (int)$row['next_attempt_at'] > time()) {
+            return ['status' => $row['status'], 'skipped' => 'backoff', 'ready' => false,
+                'error' => $row['last_error'], 'next_attempt_at' => (int)$row['next_attempt_at']];
+        }
+
+        try {
+            $wallet = self::getWalletForStore($storeId, $mintUrl, $unit);
+        } catch (\Throwable $e) {
+            self::recordRecoveryFailure($storeId, $mintUrl, $unit, $row, $e->getMessage());
+            return ['status' => 'error', 'ready' => false, 'error' => $e->getMessage(), 'skipped' => null];
+        }
+        if (!$wallet->requiresRecovery()) {
+            self::recordRecoveryState($storeId, $mintUrl, $unit, 'ready', null, 0, 0);
+            return ['status' => 'complete', 'skipped' => 'ready', 'ready' => true, 'error' => null];
+        }
+
+        try {
+            $result = $wallet->restoreStep($maxOutputs, $deadline);
+        } catch (\Throwable $e) {
+            self::recordRecoveryFailure($storeId, $mintUrl, $unit, $row, $e->getMessage());
+            return ['status' => 'error', 'ready' => false, 'error' => $e->getMessage(), 'skipped' => null];
+        }
+        $result['skipped'] = null;
+        if ($result['status'] === 'error') {
+            self::recordRecoveryFailure($storeId, $mintUrl, $unit, $row, (string)($result['error'] ?? 'restore step failed'));
+        } elseif ($result['status'] === 'complete' || !empty($result['ready'])) {
+            self::recordRecoveryState($storeId, $mintUrl, $unit, 'ready', null, 0, 0);
+            self::forgetWallets($storeId);
+        } else {
+            // Progress was made: a later failure starts its backoff afresh.
+            self::recordRecoveryState($storeId, $mintUrl, $unit, 'pending', null, 0, 0);
+        }
+        return $result;
+    }
+
+    /**
+     * Cron entry point: step every account (primary + backups, disabled ones
+     * included so a "Retry recovery" is not the only way out of a transient
+     * mint outage) that still requires recovery, within a total time budget.
+     * Accounts are visited in a stable order and each gets at most one step
+     * per call, so a long scan cannot starve the others.
+     *
+     * @return array{accounts: int, stepped: int, completed: int, errors: int, backoff: int, details: array}
+     */
+    public static function ensureWalletsReady(float $budgetSeconds = 20.0): array {
+        $out = ['accounts' => 0, 'stepped' => 0, 'completed' => 0, 'errors' => 0, 'backoff' => 0, 'details' => []];
+        $deadline = microtime(true) + max(1.0, $budgetSeconds);
+        $stores = Database::fetchAll(
+            "SELECT id FROM stores WHERE mint_url IS NOT NULL AND mint_url <> '' AND seed_phrase IS NOT NULL AND seed_phrase <> '' ORDER BY created_at"
+        );
+        $todo = [];
+        foreach ($stores as $store) {
+            foreach (Config::getStoreWalletAccounts((string)$store['id']) as $account) {
+                $st = self::accountRecoveryStatus((string)$store['id'], $account['mint_url'], $account['unit']);
+                if ($st['ready']) {
+                    continue;
+                }
+                $todo[] = [(string)$store['id'], $account['mint_url'], $account['unit']];
+            }
+        }
+        $out['accounts'] = count($todo);
+        foreach ($todo as [$storeId, $mintUrl, $unit]) {
+            $remaining = $deadline - microtime(true);
+            if ($remaining <= 0.5) {
+                break;
+            }
+            $r = self::advanceStoreRecovery($storeId, $mintUrl, $unit, microtime(true) + $remaining);
+            $key = $storeId . '@' . $mintUrl . ':' . $unit;
+            if (($r['skipped'] ?? null) === 'backoff') {
+                $out['backoff']++;
+                $out['details'][$key] = 'backoff until ' . date('H:i:s', (int)$r['next_attempt_at']);
+                continue;
+            }
+            $out['stepped']++;
+            if (!empty($r['ready'])) {
+                $out['completed']++;
+                $out['details'][$key] = 'complete';
+            } elseif ($r['status'] === 'error') {
+                $out['errors']++;
+                $out['details'][$key] = 'error: ' . (string)($r['error'] ?? '');
+            } else {
+                $out['details'][$key] = 'pending';
+            }
+        }
+        return $out;
+    }
+
+    private static function recoveryRow(string $storeId, string $mintUrl, string $unit): ?array {
+        try {
+            return Database::fetchOne(
+                "SELECT * FROM wallet_recovery WHERE store_id = ? AND mint_url = ? AND unit = ?",
+                [$storeId, $mintUrl, $unit]
+            ) ?: null;
+        } catch (\Throwable $e) {
+            return null;
+        }
+    }
+
+    private static function recordRecoveryState(
+        string $storeId, string $mintUrl, string $unit, string $status, ?string $error, int $attempts, int $nextAttemptAt
+    ): void {
+        $now = time();
+        try {
+            $existing = self::recoveryRow($storeId, $mintUrl, $unit);
+            $data = [
+                'status' => $status,
+                'attempts' => $attempts,
+                'next_attempt_at' => $nextAttemptAt,
+                'last_error' => $error,
+                'updated_at' => $now,
+            ];
+            if ($existing) {
+                Database::update('wallet_recovery', $data, 'store_id = ? AND mint_url = ? AND unit = ?', [$storeId, $mintUrl, $unit]);
+            } else {
+                Database::insert('wallet_recovery', $data + [
+                    'store_id' => $storeId, 'mint_url' => $mintUrl, 'unit' => $unit, 'started_at' => $now,
+                ]);
+            }
+        } catch (\Throwable $e) {
+            error_log("CashuPayServer: could not record wallet recovery state for {$storeId}@{$mintUrl}: " . $e->getMessage());
+        }
+    }
+
+    private static function recordRecoveryFailure(string $storeId, string $mintUrl, string $unit, ?array $row, string $error): void {
+        $attempts = ($row ? (int)$row['attempts'] : 0) + 1;
+        $wait = min(self::RECOVERY_BACKOFF_MAX_SEC, self::RECOVERY_BACKOFF_BASE_SEC * (2 ** min(12, $attempts - 1)));
+        self::recordRecoveryState($storeId, $mintUrl, $unit, 'error', $error, $attempts, time() + $wait);
+        error_log("CashuPayServer: wallet recovery step failed for store {$storeId} at {$mintUrl} ({$unit}), attempt {$attempts}, retry in {$wait}s: {$error}");
     }
 
     // =========================================================================
@@ -3405,7 +3832,19 @@ class Invoice {
             return;
         }
         $account = self::namespaceHoldingSecrets($storeId, $secrets);
-        StoreSafety::storage($account['mint_url'], $account['unit'])->updateProofsState($secrets, ProofState::SPENT);
+        // Only rows the server may own move: inputs reserved by a melt/swap
+        // journal are excluded (the library's recovery settles them), and
+        // an already-SPENT row is simply not counted.
+        $changed = StoreSafety::transitionProofStates(
+            $account['mint_url'], $account['unit'], $secrets, ProofState::SPENT,
+            [ProofState::UNSPENT, ProofState::PENDING, ProofState::EXPORTED, ProofState::UNKNOWN]
+        );
+        if ($changed !== count($secrets)) {
+            error_log(sprintf(
+                'CashuPayServer: markProofsSpent moved %d of %d proofs for store %s (rest already spent or journal-reserved)',
+                $changed, count($secrets), $storeId
+            ));
+        }
     }
 
     /**
@@ -3452,6 +3891,7 @@ class Invoice {
      * the library's melt/swap journals. Token exports use markProofsExported().
      */
     public static function markProofsPending(string $storeId, array $secrets): void {
+        $secrets = array_values(array_unique(array_filter(array_map('strval', $secrets), 'strlen')));
         if (empty($secrets)) {
             return;
         }
@@ -3459,8 +3899,14 @@ class Invoice {
         if (!$store || empty($store['mint_url'])) {
             return;
         }
-        StoreSafety::storage($store['mint_url'], $store['mint_unit'] ?? 'sat')
-            ->updateProofsState($secrets, ProofState::PENDING);
+        // Only UNSPENT rows may be reserved, and only all of them: a proof
+        // another path already reserved or spent is not ours to hold.
+        $changed = StoreSafety::transitionProofStates(
+            $store['mint_url'], $store['mint_unit'] ?? 'sat', $secrets, ProofState::PENDING, [ProofState::UNSPENT], true
+        );
+        if ($changed !== count($secrets)) {
+            throw new Exception('Some of these proofs are no longer available; nothing was reserved.');
+        }
     }
 
     /**
@@ -3498,13 +3944,11 @@ class Invoice {
         if ($mintUrl === '') {
             throw new Exception('Store has no mint to ask');
         }
-        $Ys = array_map(fn($s) => \Cashu\Crypto::computeY($s), $secrets);
-        $byY = StoreSafety::checkStatesByY($mintUrl, $Ys);
-        $out = [];
-        foreach ($secrets as $i => $secret) {
-            $out[$secret] = $byY[$Ys[$i]] ?? '';
+        if ($unit === null || $unit === '') {
+            $account = $account ?? self::namespaceHoldingSecrets($storeId, $secrets);
+            $unit = $account['unit'];
         }
-        return $out;
+        return StoreSafety::checkStatesBySecrets($mintUrl, $unit, $secrets);
     }
 
     /**
@@ -3547,29 +3991,33 @@ class Invoice {
                     continue;
                 }
 
-                $Ys = [];
-                $proofMap = [];
-                foreach ($rows as $row) {
-                    $YHex = \Cashu\Crypto::computeY((string)$row['secret']);
-                    $Ys[] = $YHex;
-                    $proofMap[$YHex] = (string)$row['secret'];
-                }
-
-                $states = StoreSafety::checkStatesByY($account['mint_url'], $Ys);
+                $proofs = array_map(
+                    fn($row) => new Proof((string)$row['keyset_id'], (int)$row['amount'], (string)$row['secret'], (string)$row['C']),
+                    $rows
+                );
+                // Library NUT-07 check: fail-closed, Y-matched, UNKNOWN when
+                // the mint sent no state (never read as UNSPENT or SPENT).
+                $states = StoreSafety::checkProofStates($account['mint_url'], $account['unit'], $proofs);
 
                 $spentSecrets = [];
                 $stillPending = 0;
-                foreach ($Ys as $YHex) {
-                    if (($states[$YHex] ?? '') === ProofState::SPENT) {
-                        $spentSecrets[] = $proofMap[$YHex];
+                foreach ($proofs as $proof) {
+                    if (($states[$proof->Y] ?? '') === ProofState::SPENT) {
+                        $spentSecrets[] = $proof->secret;
                     } else {
                         $stillPending++;
                     }
                 }
                 if (!empty($spentSecrets)) {
-                    StoreSafety::transitionProofStates(
+                    $moved = StoreSafety::transitionProofStates(
                         $account['mint_url'], $account['unit'], $spentSecrets, ProofState::SPENT, [ProofState::PENDING]
                     );
+                    if ($moved !== count($spentSecrets)) {
+                        error_log(sprintf(
+                            'CashuPayServer: checkPendingProofs moved %d of %d spent proofs at %s (rest changed state meanwhile)',
+                            $moved, count($spentSecrets), $account['mint_url']
+                        ));
+                    }
                 }
                 $result['checked'] += count($rows);
                 $result['spent'] += count($spentSecrets);
@@ -3657,36 +4105,11 @@ class Invoice {
         $inputs = array_merge($proofs, $helpers);
         $total = Wallet::sumProofs($inputs);
 
-        // A swap() that takes an allowed-states list reserves the EXPORTED
-        // inputs straight from EXPORTED inside its journaled transaction: they
-        // are never spendable on the way, and a rejected swap returns them to
+        // swap() with the allowed-states list reserves the EXPORTED inputs
+        // straight from EXPORTED inside its journaled transaction: they are
+        // never spendable on the way, and a rejected swap returns them to
         // EXPORTED itself.
-        $swapTakesStates = (new \ReflectionMethod($wallet, 'swap'))->getNumberOfParameters() >= 3;
-        if ($swapTakesStates) {
-            $wallet->swap($inputs, Wallet::splitAmount($total - $fee), [ProofState::UNSPENT, $exported]);
-        } else {
-            // TODO(library): fallback for a swap() that only accepts UNSPENT
-            // inputs — flip the token's proofs to UNSPENT for the duration of
-            // the swap (under the funds lock, so nothing else can select them)
-            // and back if the mint refuses. Drop once every deployment runs a
-            // library whose swap() takes the reservable-states argument.
-            $flipped = StoreSafety::transitionProofStates(
-                $account['mint_url'], $account['unit'], $secrets, ProofState::UNSPENT, [$exported], true
-            );
-            if ($flipped !== count($secrets)) {
-                throw new Exception('This token is no longer in the exported state; nothing was changed.');
-            }
-            try {
-                $wallet->swap($inputs, Wallet::splitAmount($total - $fee));
-            } catch (\Throwable $e) {
-                // Only the token's own proofs go back to EXPORTED; the helpers
-                // were UNSPENT before and stay so.
-                StoreSafety::transitionProofStates(
-                    $account['mint_url'], $account['unit'], $secrets, $exported, [ProofState::UNSPENT]
-                );
-                throw $e;
-            }
-        }
+        $wallet->swap($inputs, Wallet::splitAmount($total - $fee), [ProofState::UNSPENT, $exported]);
 
         // What the operator gets back is the token's own value less the fee
         // this swap cost; the helpers were already theirs.

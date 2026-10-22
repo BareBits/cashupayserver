@@ -64,9 +64,60 @@ function cashupay_backup_mint_rows(string $storeId): array {
             $row['balance'] = null;
             $row['exported'] = null;
         }
+        // Readiness of the store's seed at this mint (read-only): 'ready',
+        // 'pending' (scan running / queued) or 'error' (last step failed;
+        // "Retry recovery" re-runs it).
+        try {
+            $st = Invoice::accountRecoveryStatus($storeId, (string)$row['mint_url'], (string)($row['unit'] ?? 'sat'));
+            $row['recovery'] = $st['status'];
+            $row['recovery_error'] = $st['error'];
+        } catch (Throwable $e) {
+            $row['recovery'] = 'ready';
+            $row['recovery_error'] = null;
+        }
     }
     unset($row);
     return $rows;
+}
+
+/**
+ * Bind the store's seed to a backup mint account for restore and run one
+ * short, bounded recovery step. On a failed step the row is kept but
+ * disabled (MC-6: resumable, never silently deleted); on a step that did
+ * not finish the row stays enabled and the cron continues the scan.
+ *
+ * @return array{status: string, enabled: bool, error: ?string, message: ?string}
+ */
+function cashupay_recover_backup_mint(string $storeId, string $mintUrl, string $unit, int $backupMintId): array {
+    $mintUrl = rtrim($mintUrl, '/');
+    $unit = strtolower($unit) ?: 'sat';
+    try {
+        Invoice::bindStoreSeed($storeId, $mintUrl, $unit, Invoice::SEED_RESTORE);
+        $step = Invoice::advanceStoreRecovery($storeId, $mintUrl, $unit, microtime(true) + 8.0, null, true);
+    } catch (Throwable $e) {
+        $step = ['status' => 'error', 'ready' => false, 'error' => $e->getMessage()];
+    }
+    if (!empty($step['ready'])) {
+        return ['status' => 'ready', 'enabled' => true, 'error' => null, 'message' => null];
+    }
+    if (($step['status'] ?? '') === 'error') {
+        Config::updateStoreBackupMint($backupMintId, ['enabled' => 0]);
+        $error = (string)($step['error'] ?? 'recovery step failed');
+        return [
+            'status' => 'error',
+            'enabled' => false,
+            'error' => $error,
+            'message' => 'The backup mint was added but could not be checked for ecash this recovery phrase already '
+                . 'owns there (' . $error . '). It stays disabled; use "Retry recovery" once the mint is reachable.',
+        ];
+    }
+    return [
+        'status' => 'pending',
+        'enabled' => true,
+        'error' => null,
+        'message' => 'Preparing payments with this mint: the recovery phrase is being checked for ecash it already '
+            . 'owns there. The mint is used for new invoices once that finishes.',
+    ];
 }
 
 // Check setup
@@ -269,6 +320,10 @@ if (isset($_GET['api'])) {
                 // Lightning-only or on-chain-only store isn't labeled
                 // "(not configured)".
                 $store['hasPaymentRail'] = Config::storeHasPaymentRail($store['id']);
+                // The primary mint account is still being scanned for the
+                // seed's existing ecash (imported phrase / new mint): the
+                // store cannot take mint payments until that completes.
+                $store['walletRecovering'] = Invoice::primaryRequiresRecovery($store['id']);
                 $store = Config::redactStoreSecrets($store);
             }
             unset($store);
@@ -569,6 +624,12 @@ if (isset($_GET['api'])) {
                 // token is fetched explicitly via transfer_token).
                 'exportedBalance' => $storeConfigured ? Invoice::getExportedBalance($storeId) : 0,
                 'accountBalances' => $storeConfigured ? Invoice::getAccountBalances($storeId) : [],
+                // Restore-before-issue gate: which accounts are still being
+                // checked against their mint (read-only; drives the
+                // "Preparing payments with your mint" status).
+                'walletRecovery' => $storeConfigured
+                    ? Invoice::storeRecoveryStatus($storeId)
+                    : ['pending' => false, 'primaryPending' => false, 'message' => null, 'accounts' => []],
                 'recentExports' => array_map(
                     [Transfer::class, 'formatForApi'],
                     Transfer::getByStore($storeId, 10)
@@ -1047,9 +1108,10 @@ if (isset($_GET['api'])) {
                 // is an error, never "spendable".
                 if (!empty($proofs)) {
                     try {
-                        $states = StoreSafety::checkStatesByY(
+                        $states = StoreSafety::checkProofStates(
                             $store['mint_url'] ?? Config::getStoreMintUrl($storeId),
-                            array_map(fn($p) => $p->Y, $proofs)
+                            $store['mint_unit'] ?? 'sat',
+                            $proofs
                         );
                         $validProofs = [];
                         $spentSecrets = [];
@@ -1767,7 +1829,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $name = trim($_POST['name'] ?? 'New Store');
                 $mintUrl = $_POST['mint_url'] ?? null;
                 $mintUnit = $_POST['mint_unit'] ?? 'sat';
-                $seedPhrase = $_POST['seed_phrase'] ?? null;
+                $seedPhrase = trim((string)($_POST['seed_phrase'] ?? '')) ?: null;
+                // A pasted seed may have been used before (at this mint or
+                // any other): it is bound for restore and the store cannot
+                // take mint payments until the cron scanned the mint for
+                // its existing outputs. A seed generated below is new.
+                $seedImported = $seedPhrase !== null;
+                if ($seedImported) {
+                    require_once __DIR__ . '/cashu-wallet-php/CashuWallet.php';
+                    if (!\Cashu\Mnemonic::validate($seedPhrase)) {
+                        throw new Exception('That recovery phrase is not valid (check the words and their order).');
+                    }
+                }
                 $exchangeFee = (float)($_POST['exchange_fee_percent'] ?? 0);
                 $primaryProvider = $_POST['price_provider_primary'] ?? 'coingecko';
                 $secondaryProvider = $_POST['price_provider_secondary'] ?? 'binance';
@@ -1830,11 +1903,46 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     error_log("TrustedMints::applyToNewStore failed in admin create_store: " . $e->getMessage());
                 }
 
+                // Bind the seed to every account the store now has (primary
+                // + trusted-list backups) with its provenance. An imported
+                // seed starts unready everywhere; the cron's recovery task
+                // scans each mint and readies the account.
+                $walletRecovery = 'ready';
+                $bindErrors = [];
+                if (!empty($mintUrl) && !empty($seedPhrase)) {
+                    $bindMode = $seedImported ? Invoice::SEED_RESTORE : Invoice::SEED_NEW;
+                    foreach (Config::getStoreWalletAccounts($storeId) as $account) {
+                        try {
+                            $bound = Invoice::bindStoreSeed($storeId, $account['mint_url'], $account['unit'], $bindMode);
+                            if ($bound->requiresRecovery()) {
+                                $walletRecovery = 'pending';
+                            }
+                        } catch (Exception $e) {
+                            $bindErrors[] = $account['mint_url'] . ': ' . $e->getMessage();
+                            if ($account['primary']) {
+                                $walletRecovery = 'pending';
+                            }
+                        }
+                    }
+                    if ($seedImported) {
+                        // Even a mint we could not bind right now is unready:
+                        // getWalletForStore() binds an imported seed for
+                        // restore on first contact.
+                        $walletRecovery = 'pending';
+                    }
+                }
+
                 echo json_encode([
                     'id' => $storeId,
                     'name' => $name,
                     'isConfigured' => !empty($mintUrl) && !empty($seedPhrase),
                     'seedPhrase' => $seedPhrase, // Show once for backup
+                    'walletRecovery' => $walletRecovery,
+                    'walletRecoveryMessage' => $walletRecovery === 'pending'
+                        ? 'Preparing payments with your mint: the recovery phrase is being checked against the mint '
+                          . 'for ecash it already owns. Payments start automatically once that finishes (usually a few minutes).'
+                        : null,
+                    'bindErrors' => $bindErrors,
                 ]);
             } catch (Exception $e) {
                 cashupay_status(400);
@@ -1981,9 +2089,32 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
                 Config::updateStore($storeId, $updates, $wouldStrand && $confirmStranding);
 
+                // The store now points at a namespace its seed may have used
+                // before (the operator may be returning to an old mint):
+                // bind it for restore so no secrets are issued there until
+                // the cron's recovery scan readied it. One short step runs
+                // right away so an empty, fast mint is ready before the
+                // operator's next click.
+                $walletRecovery = 'ready';
+                if (($mintChanged || $unitChanged) && !empty($store['seed_phrase'])) {
+                    $newMint = array_key_exists('mint_url', $updates) ? (string)$updates['mint_url'] : $currentMint;
+                    $newUnit = array_key_exists('mint_unit', $updates) ? (string)$updates['mint_unit'] : $currentUnit;
+                    if ($newMint !== '') {
+                        try {
+                            Invoice::bindStoreSeed($storeId, $newMint, $newUnit, Invoice::SEED_RESTORE);
+                            $step = Invoice::advanceStoreRecovery($storeId, $newMint, $newUnit, microtime(true) + 8.0, null, true);
+                            $walletRecovery = !empty($step['ready']) ? 'ready' : ($step['status'] === 'error' ? 'error' : 'pending');
+                        } catch (Exception $e) {
+                            error_log("update_store: seed binding failed for {$storeId} at {$newMint}: " . $e->getMessage());
+                            $walletRecovery = 'pending';
+                        }
+                    }
+                }
+
                 echo json_encode([
                     'success' => true,
                     'isConfigured' => Config::isStoreConfigured($storeId),
+                    'walletRecovery' => $walletRecovery,
                 ]);
             } catch (Exception $e) {
                 cashupay_status(400);
@@ -2063,6 +2194,25 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'seed_phrase' => $seedPhrase,
                 ]);
 
+                // Seed provenance: a seed generated right now is ready at
+                // once; a seed the store already had may have been used at
+                // this mint before (a previous mint, a restored install), so
+                // the account stays unready until the cron's recovery scan
+                // found its existing outputs there.
+                $walletRecovery = 'ready';
+                try {
+                    $bound = Invoice::bindStoreSeed(
+                        $storeId, $mintUrl, $mintUnit,
+                        $generatedSeed !== null ? Invoice::SEED_NEW : Invoice::SEED_RESTORE
+                    );
+                    if ($bound->requiresRecovery()) {
+                        $walletRecovery = 'pending';
+                    }
+                } catch (Exception $e) {
+                    error_log("enable_store_mint: seed binding failed for {$storeId} at {$mintUrl}: " . $e->getMessage());
+                    $walletRecovery = $generatedSeed !== null ? 'ready' : 'pending';
+                }
+
                 // Mintless setup pinned strict-no-mint-fallback FORCE_ON so a
                 // mint couldn't be acquired later without an explicit decision
                 // — this dialog IS that decision, so clear the pin. The mint
@@ -2079,6 +2229,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     // null when an existing seed was kept — the UI then skips
                     // the one-time backup panel.
                     'seedPhrase' => $generatedSeed,
+                    'walletRecovery' => $walletRecovery,
                 ]);
             } catch (Exception $e) {
                 cashupay_status(400);
@@ -2240,10 +2391,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 // that the recipient redeemed the token, so it must be proved
                 // for every proof: an empty, short or re-ordered reply is an
                 // error, never a confirmation.
-                $Ys = array_map(fn($s) => \Cashu\Crypto::computeY($s), $secrets);
-                $client = new \Cashu\MintClient($account['mint_url']);
-                $response = $client->post('checkstate', ['Ys' => $Ys]);
-                $allSpent = Invoice::proofStatesAllSpent($Ys, $response);
+                $states = StoreSafety::checkStatesBySecrets($account['mint_url'], $account['unit'], $secrets);
+                $allSpent = count($states) === count($secrets);
+                foreach ($secrets as $secret) {
+                    if (($states[$secret] ?? '') !== ProofState::SPENT) {
+                        $allSpent = false;
+                        break;
+                    }
+                }
 
                 // If all spent at mint but not in DB, update DB
                 if ($allSpent) {
@@ -3684,7 +3839,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         // Check proof states at mint first (filter out spent/pending).
                         // The reply is validated: short / re-ordered → error.
                         if (!empty($proofs)) {
-                            $states = StoreSafety::checkStatesByY($mintUrl, array_map(fn($p) => $p->Y, $proofs));
+                            $states = StoreSafety::checkProofStates($mintUrl, $mintUnit, $proofs);
                             $validProofs = [];
                             $spentSecrets = [];
                             foreach ($proofs as $proof) {
@@ -3708,7 +3863,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         // proof of the store into one journaled swap (and paid
                         // the input fee on all of them).
                         try {
-                            $inputs = StoreSafety::selectProofsWithFees($wallet, $proofs, $amount);
+                            $inputs = $wallet->selectProofsWithFees($proofs, $amount);
                         } catch (\Cashu\InsufficientBalanceException $ie) {
                             $fee = $wallet->calculateFee($proofs);
                             throw new Exception("Insufficient balance. Have: {$balance} {$mintUnit}, Need: " . ($amount + $fee) . " {$mintUnit}");
@@ -3866,10 +4021,24 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 }
 
                 $id = Config::addStoreBackupMint($storeId, $mintUrl, $unit, $priority);
+
+                // The store's seed may have been used at this mint before
+                // (it is the operator's own phrase at any mint): bind it for
+                // restore and run one short scan step now. A step that fails
+                // keeps the row, DISABLED, with a "Retry recovery" action —
+                // deleting it would hide the attempt and any funds the seed
+                // holds there. A step that merely did not finish leaves the
+                // row enabled: Invoice::create skips an unready account and
+                // the cron finishes the scan.
+                $recovery = cashupay_recover_backup_mint($storeId, $mintUrl, $unit, (int)$id);
                 echo json_encode([
                     'success' => true,
                     'id' => $id,
-                    'mint_info' => $test['info']
+                    'mint_info' => $test['info'],
+                    'walletRecovery' => $recovery['status'],
+                    'enabled' => $recovery['enabled'],
+                    'walletRecoveryError' => $recovery['error'],
+                    'message' => $recovery['message'],
                 ]);
             } catch (Exception $e) {
                 cashupay_status(400);
@@ -3885,11 +4054,45 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $priority = isset($_POST['priority']) ? (int)$_POST['priority'] : null;
 
                 $data = [];
-                if ($enabled !== null) $data['enabled'] = $enabled;
                 if ($priority !== null) $data['priority'] = $priority;
 
+                $recovery = null;
+                if ($enabled === 1) {
+                    // "Retry recovery" / re-enable: the account must be scanned
+                    // (or already ready) before it may serve invoices again.
+                    // A scan that fails keeps the row disabled and reports why.
+                    $row = Database::fetchOne('SELECT store_id, mint_url, unit FROM store_mints WHERE id = ?', [$id]);
+                    if (!$row) {
+                        throw new Exception('Backup mint not found');
+                    }
+                    $recovery = cashupay_recover_backup_mint(
+                        (string)$row['store_id'], (string)$row['mint_url'], (string)($row['unit'] ?? 'sat'), $id
+                    );
+                    if ($recovery['status'] === 'error') {
+                        if (!empty($data)) {
+                            Config::updateStoreBackupMint($id, $data);
+                        }
+                        cashupay_status(409);
+                        echo json_encode([
+                            'error' => 'wallet_recovery_failed',
+                            'message' => $recovery['message'],
+                            'walletRecovery' => 'error',
+                            'walletRecoveryError' => $recovery['error'],
+                            'enabled' => false,
+                        ]);
+                        break;
+                    }
+                    $data['enabled'] = 1;
+                } elseif ($enabled !== null) {
+                    $data['enabled'] = $enabled;
+                }
+
                 Config::updateStoreBackupMint($id, $data);
-                echo json_encode(['success' => true]);
+                echo json_encode([
+                    'success' => true,
+                    'walletRecovery' => $recovery['status'] ?? null,
+                    'message' => $recovery['message'] ?? null,
+                ]);
             } catch (Exception $e) {
                 cashupay_status(400);
                 echo json_encode(['error' => $e->getMessage()]);
@@ -6235,6 +6438,7 @@ header('Cache-Control: no-cache, must-revalidate');
                     <div class="balance-unit" id="balance-unit">sats</div>
                     <div class="balance-fiat" id="balance-fiat" style="display:none; margin-top:0.5rem; color:#000; font-size:1rem;"></div>
                     <div class="balance-exported" id="balance-exported" style="display:none; margin-top:0.35rem; color:#000; font-size:0.8rem; opacity:0.8;"></div>
+                    <div class="balance-recovery" id="wallet-recovery-status" style="display:none; margin-top:0.5rem; color:#000; font-size:0.85rem; background: rgba(255,255,255,0.55); border-radius: 6px; padding: 0.4rem 0.6rem;" data-testid="wallet-recovery-status"></div>
                     <div class="balance-actions">
                         <button class="balance-btn" id="btn-withdraw">
                             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -9846,7 +10050,9 @@ header('Cache-Control: no-cache, must-revalidate');
                 stores.forEach(store => {
                     const opt = document.createElement('option');
                     opt.value = store.id;
-                    opt.textContent = store.name + (store.hasPaymentRail ? '' : ' (not configured)');
+                    opt.textContent = store.name
+                        + (store.hasPaymentRail ? '' : ' (not configured)')
+                        + (store.walletRecovering ? ' (preparing payments)' : '');
                     select.appendChild(opt);
                 });
             }
@@ -10009,6 +10215,7 @@ header('Cache-Control: no-cache, must-revalidate');
                     exportAvailableEl.textContent = formatAmount(dashboardData.exportAvailable ?? 0, mintUnit);
                 }
                 renderRecentExports(dashboardData.recentExports || []);
+                renderWalletRecoveryStatus(dashboardData.walletRecovery || null);
 
                 // Reliability banner / settings cards.
                 updateReliabilityBanner(dashboardData.reliability);
@@ -14873,7 +15080,10 @@ header('Cache-Control: no-cache, must-revalidate');
                                             ${mintDiagnosticIcon(m.mint_url)}
                                             <span style="opacity: 0.6; font-size: 0.75rem; margin-left: 0.5rem;">(${escapeHtml(String(m.unit).toUpperCase())})</span>
                                             ${(m.balance > 0 || m.exported > 0) ? `<span style="display:block; font-size: 0.72rem; color: var(--warning, #f59e0b); margin-top: 0.2rem;">holds ${escapeHtml(formatAmount(m.balance || 0, m.unit))} ${escapeHtml(String(m.unit).toUpperCase())}${m.exported > 0 ? ` + ${escapeHtml(formatAmount(m.exported, m.unit))} exported` : ''}</span>` : ''}
+                                            ${m.recovery === 'pending' ? `<span class="backup-mint-recovery" style="display:block; font-size: 0.72rem; color: var(--text-secondary); margin-top: 0.2rem;">Preparing payments with this mint (checking the recovery phrase for existing ecash)</span>` : ''}
+                                            ${m.recovery === 'error' ? `<span class="backup-mint-recovery" style="display:block; font-size: 0.72rem; color: var(--danger, #ef4444); margin-top: 0.2rem;">Recovery failed${m.recovery_error ? ': ' + escapeHtml(m.recovery_error) : ''}${Number(m.enabled) ? '' : ' (disabled until it succeeds)'}</span>` : ''}
                                         </div>
+                                        ${m.recovery === 'error' ? `<button class="btn btn-secondary store-action" data-store-action="retry-backup-mint-recovery" data-mint-id="${escapeAttr(m.id)}" data-store-id="${sId}" data-store-name="${sName}" style="padding: 0.2rem 0.4rem; font-size: 0.7rem; margin-left: 0.5rem; white-space: nowrap;">Retry recovery</button>` : ''}
                                         <button class="btn btn-danger store-action" data-store-action="remove-backup-mint" data-mint-id="${escapeAttr(m.id)}" data-store-id="${sId}" data-store-name="${sName}" style="padding: 0.2rem 0.4rem; font-size: 0.7rem; margin-left: 0.5rem;">Remove</button>
                                     </div>
                                 `).join('')
@@ -14942,6 +15152,9 @@ header('Cache-Control: no-cache, must-revalidate');
                         case 'remove-backup-mint':
                             removeBackupMint(Number(btn.dataset.mintId), sid, sname);
                             break;
+                        case 'retry-backup-mint-recovery':
+                            retryBackupMintRecovery(Number(btn.dataset.mintId), sid, sname);
+                            break;
                         case 'discover-backup-mint':
                             openBackupMintDiscovery(sid, sname);
                             break;
@@ -14969,6 +15182,47 @@ header('Cache-Control: no-cache, must-revalidate');
             openModal('modal-store');
         }
 
+        // "Preparing payments with your mint": the store's recovery phrase is
+        // still being checked against a mint for ecash it already owns there
+        // (imported phrase, mint added later). Invoices on that mint wait
+        // until the cron finished the scan; a failed scan names the mint.
+        function renderWalletRecoveryStatus(rec) {
+            const el = document.getElementById('wallet-recovery-status');
+            if (!el) return;
+            if (!rec || !rec.pending) {
+                el.style.display = 'none';
+                el.textContent = '';
+                return;
+            }
+            const waiting = (rec.accounts || []).filter(a => !a.ready && (a.primary || a.enabled));
+            const failed = waiting.filter(a => a.status === 'error');
+            let text = (rec.message || 'Preparing payments with your mint')
+                + ' — checking the recovery phrase for ecash it already owns at '
+                + (waiting.length === 1 ? 'the mint' : waiting.length + ' mints')
+                + '. Invoices start automatically once that finishes.';
+            if (failed.length) {
+                text += ' Last check failed at ' + failed.map(a => a.mint_url).join(', ')
+                    + (failed[0].error ? ' (' + failed[0].error + ')' : '') + '; it is retried automatically.';
+            }
+            el.textContent = text;
+            el.style.display = 'block';
+        }
+
+        async function retryBackupMintRecovery(mintId, storeId, storeName) {
+            try {
+                const response = await postWithCsrf(adminUrl, `action=update_backup_mint&id=${mintId}&enabled=1`);
+                const result = await response.json().catch(() => ({}));
+                if (!response.ok) {
+                    showToast(result.message || result.error || 'Recovery failed again', 'error');
+                    return;
+                }
+                showToast(result.message || (result.walletRecovery === 'ready' ? 'Backup mint ready' : 'Recovery resumed'), 'success');
+                showStoreDetails(storeId, storeName);
+            } catch (e) {
+                showToast('Recovery failed again', 'error');
+            }
+        }
+
         async function addBackupMint(storeId, storeName) {
             const mintUrl = document.getElementById('backup-mint-url').value.trim();
             if (!mintUrl) {
@@ -14988,7 +15242,13 @@ header('Cache-Control: no-cache, must-revalidate');
                 const result = await response.json();
 
                 if (response.ok) {
-                    showToast('Backup mint added!', 'success');
+                    if (result.walletRecovery === 'error') {
+                        showToast(result.message || 'Backup mint added but its recovery failed; it stays disabled.', 'error');
+                    } else if (result.walletRecovery === 'pending') {
+                        showToast(result.message || 'Backup mint added; preparing payments with it.', 'success');
+                    } else {
+                        showToast('Backup mint added!', 'success');
+                    }
                     showStoreDetails(storeId, storeName);
                 } else {
                     showToast(result.error || 'Failed to add backup mint', 'error');

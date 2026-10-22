@@ -473,6 +473,24 @@ HTACCESS;
             updated_at INTEGER NOT NULL
         );
 
+        -- Wallet recovery bookkeeping (one row per store account = mint+unit
+        -- whose seed is being scanned at the mint before it may issue secrets
+        -- there): retry schedule with exponential backoff and the last error.
+        -- The scan progress itself lives in the library's
+        -- cashu_wallet_metadata / cashu_restore_progress tables.
+        CREATE TABLE IF NOT EXISTS wallet_recovery (
+            store_id TEXT NOT NULL,
+            mint_url TEXT NOT NULL,
+            unit TEXT NOT NULL DEFAULT 'sat',
+            status TEXT NOT NULL DEFAULT 'pending',
+            attempts INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT,
+            started_at INTEGER,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY (store_id, mint_url, unit)
+        );
+
         -- Per-mint event log: failures + every state-change decision. UI surfaces
         -- this as the diagnostic view. Capped at 1000 rows per mint_url (oldest
         -- pruned on insert).
@@ -1852,6 +1870,25 @@ HTACCESS;
         }
         if (!self::indexExists($pdo, 'idx_transfers_store')) {
             $pdo->exec("CREATE INDEX idx_transfers_store ON transfers(store_id, created_at);");
+        }
+
+        // Wallet recovery bookkeeping (restore-before-issue gate, see
+        // Invoice::advanceStoreRecovery): retry schedule per store account.
+        if (!self::tableExists($pdo, 'wallet_recovery')) {
+            $pdo->exec("
+                CREATE TABLE wallet_recovery (
+                    store_id TEXT NOT NULL,
+                    mint_url TEXT NOT NULL,
+                    unit TEXT NOT NULL DEFAULT 'sat',
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    next_attempt_at INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    started_at INTEGER,
+                    updated_at INTEGER NOT NULL,
+                    PRIMARY KEY (store_id, mint_url, unit)
+                );
+            ");
         }
 
         // One-off: PENDING used to mean two different things — "reserved by an

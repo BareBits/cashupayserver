@@ -902,6 +902,23 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         $_SESSION['setup_generated_seed'] = $mnemonic;
                         $generatedSeedThisRequest = true;
                     }
+                    // Bind the seed to the chosen mints with its provenance:
+                    // a seed generated right here has no history anywhere, so
+                    // both accounts are ready at once; a seed the store
+                    // already had is pointed at a mint it may have used
+                    // before, so those accounts stay unready until the cron's
+                    // recovery scan found its existing outputs there.
+                    require_once __DIR__ . '/includes/invoice.php';
+                    $bindMode = $generatedSeedThisRequest ? Invoice::SEED_NEW : Invoice::SEED_RESTORE;
+                    foreach ([$primaryUrl, $backupUrl] as $bindUrl) {
+                        try {
+                            Invoice::bindStoreSeed($storeId, $bindUrl, $unit, $bindMode);
+                        } catch (Exception $e) {
+                            // The mint answered a moment ago; a transient
+                            // failure here is adopted on first use instead.
+                            error_log('setup: seed binding at ' . $bindUrl . ' failed: ' . $e->getMessage());
+                        }
+                    }
 
                     // Now that mints are wanted, let the trusted list top up the
                     // backup chain (it leaves a 'manual' primary alone).
