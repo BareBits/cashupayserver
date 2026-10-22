@@ -11,6 +11,9 @@ BareBits can create invoices, receive payments, and be used as a point-of-sale s
 
 **Are you a web developer? Re-sell this software to your customers at a custom fee rate.** Your customers pay a x% fee, payments go directly to your lightning address. Just modify the appropriate settings in the store settings ("hosting fee")
 
+<video src="https://getbarebits.com/assets/videos/Bare_Bits_Launch_MASTER_V3_MIX2.mp4" controls="controls" style="max-width: 100%;">
+</video>
+
 ---
 
 ### Key Features
