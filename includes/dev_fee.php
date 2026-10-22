@@ -242,29 +242,52 @@ class DevFee {
         $threshold = CASHUPAY_FEE_SETTLE_THRESHOLD_SATS;
         $outcomes = [];
 
-        if ($owed['dev_owed'] >= $threshold) {
-            $outcomes['dev'] = self::payViaLnurl(
-                $storeId,
-                CASHUPAY_DEV_FEE_LNURL,
-                $owed['dev_owed'],
-                FEE_NOTE_DEV
-            );
+        if ($owed['dev_owed'] < $threshold && $owed['hosting_owed'] < $threshold) {
+            return ['owed' => $owed, 'outcomes' => $outcomes];
         }
 
-        // Hosting fee.
-        if ($owed['hosting_owed'] >= $threshold) {
-            $store = Config::getStore($storeId);
-            $hostingDest = $store['hosting_fee_destination'] ?? null;
-            if ($hostingDest === null || $hostingDest === '') {
-                $outcomes['hosting'] = ['success' => false, 'error' => 'hosting_fee_destination not configured'];
-            } else {
-                $outcomes['hosting'] = self::payViaLnurl(
+        // The fee melts spend the same proofs the dashboard withdraw / export
+        // and the auto-cashout rails do, so they take the same per-store
+        // funds lock, and they do not fight the operator for proofs while a
+        // withdrawal is still being settled by the mint.
+        require_once __DIR__ . '/locks.php';
+        $fundsLock = cashupay_acquire_lock('funds_' . $storeId);
+        if (!$fundsLock) {
+            return ['owed' => $owed, 'outcomes' => ['skipped' => 'busy']];
+        }
+        try {
+            try {
+                LightningAddress::assertNoPendingWithdrawal($storeId);
+            } catch (Exception $pendingErr) {
+                return ['owed' => $owed, 'outcomes' => ['skipped' => 'pending', 'error' => $pendingErr->getMessage()]];
+            }
+
+            if ($owed['dev_owed'] >= $threshold) {
+                $outcomes['dev'] = self::payViaLnurl(
                     $storeId,
-                    $hostingDest,
-                    $owed['hosting_owed'],
-                    FEE_NOTE_HOSTING
+                    CASHUPAY_DEV_FEE_LNURL,
+                    $owed['dev_owed'],
+                    FEE_NOTE_DEV
                 );
             }
+
+            // Hosting fee.
+            if ($owed['hosting_owed'] >= $threshold) {
+                $store = Config::getStore($storeId);
+                $hostingDest = $store['hosting_fee_destination'] ?? null;
+                if ($hostingDest === null || $hostingDest === '') {
+                    $outcomes['hosting'] = ['success' => false, 'error' => 'hosting_fee_destination not configured'];
+                } else {
+                    $outcomes['hosting'] = self::payViaLnurl(
+                        $storeId,
+                        $hostingDest,
+                        $owed['hosting_owed'],
+                        FEE_NOTE_HOSTING
+                    );
+                }
+            }
+        } finally {
+            cashupay_release_lock($fundsLock);
         }
 
         return ['owed' => $owed, 'outcomes' => $outcomes];
@@ -523,6 +546,7 @@ class LnurlPay {
         }
 
         $result = \SafeHttp::request($url, [
+            'maxBytes' => 64 * 1024,
             'timeout' => 10,
             'followRedirects' => false,
             'headers' => ['Accept: application/json'],
@@ -577,6 +601,7 @@ class LnurlPay {
         // attacker-influenced. Honor the operator opt-in (same flag the
         // mint and onchain provider use); refuse redirects unconditionally.
         $result = \SafeHttp::request($url, [
+            'maxBytes' => 64 * 1024,
             'timeout' => 15,
             'followRedirects' => false,
             'headers' => ['Accept: application/json'],

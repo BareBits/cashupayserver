@@ -35,6 +35,8 @@ class Database {
     private static ?PDO $instance = null;
     private static ?string $dbPath = null;
     private static ?string $dataDir = null;
+    /** Last connect/migration failure in this process (see getMigrationError). */
+    private static ?string $migrationError = null;
 
     /**
      * Get the data directory path
@@ -86,50 +88,93 @@ class Database {
      */
     public static function getInstance(): PDO {
         if (self::$instance === null) {
-            self::$instance = self::connect();
-
-            $hasConfig = self::$instance
-                ->query("SELECT name FROM sqlite_master WHERE type='table' AND name='config'")
-                ->fetch() !== false;
-            $hasUsers = self::$instance
-                ->query("SELECT name FROM sqlite_master WHERE type='table' AND name='users'")
-                ->fetch() !== false;
-            $hasReliability = self::$instance
-                ->query("SELECT name FROM sqlite_master WHERE type='table' AND name='mint_reliability'")
-                ->fetch() !== false;
-            // Marker for the most recent migration set. When a new migration
-            // is added, set this to a column/table that only exists *after*
-            // that migration ran — getInstance() will then trigger runMigrations()
-            // on existing installs that haven't yet picked it up. All migrations
-            // are idempotent, so a fire is safe.
-            $hasLatestMigration = $hasConfig
-                && self::columnExists(self::$instance, 'stores', 'invoice_first_method');
-            // The auto-withdraw → auto-cashout rename is a data-only migration
-            // (config key + notification event labels) with no schema artifact
-            // to mark it done, so probe for the legacy config key directly. The
-            // config table is keyed on `key`, so this is a cheap point lookup
-            // that returns false once the migration has run.
-            $needsCashoutRename = $hasConfig
-                && self::$instance
-                    ->query("SELECT 1 FROM config WHERE key = 'notifications_auto_withdraw_enabled' LIMIT 1")
+            // Keep the handle local until the migration gate has succeeded.
+            // Caching it first meant a failed ALTER TABLE (locked / read-only
+            // / full disk during an upgrade) left a half-migrated handle in
+            // the singleton: the first isInitialized() in a request saw the
+            // throw and answered false, the second reused the cached handle
+            // and answered true — and setup.php opened the first-run wizard
+            // on a live, configured install.
+            try {
+                $pdo = self::connect();
+                $hasConfig = $pdo
+                    ->query("SELECT name FROM sqlite_master WHERE type='table' AND name='config'")
                     ->fetch() !== false;
+                $hasUsers = $pdo
+                    ->query("SELECT name FROM sqlite_master WHERE type='table' AND name='users'")
+                    ->fetch() !== false;
+                $hasReliability = $pdo
+                    ->query("SELECT name FROM sqlite_master WHERE type='table' AND name='mint_reliability'")
+                    ->fetch() !== false;
+                // Marker for the most recent migration set. When a new migration
+                // is added, set this to a column/table that only exists *after*
+                // that migration ran — getInstance() will then trigger runMigrations()
+                // on existing installs that haven't yet picked it up. All migrations
+                // are idempotent, so a fire is safe.
+                $hasLatestMigration = $hasConfig
+                    && self::columnExists($pdo, 'invoices', 'last_poll_error');
+                // The auto-withdraw → auto-cashout rename is a data-only migration
+                // (config key + notification event labels) with no schema artifact
+                // to mark it done, so probe for the legacy config key directly. The
+                // config table is keyed on `key`, so this is a cheap point lookup
+                // that returns false once the migration has run.
+                $needsCashoutRename = $hasConfig
+                    && $pdo
+                        ->query("SELECT 1 FROM config WHERE key = 'notifications_auto_withdraw_enabled' LIMIT 1")
+                        ->fetch() !== false;
 
-            if ($hasConfig && (!$hasUsers || !$hasReliability || !$hasLatestMigration || $needsCashoutRename)) {
-                if (!$hasUsers) {
-                    self::$instance->exec("
-                        CREATE TABLE IF NOT EXISTS users (
-                            id              TEXT PRIMARY KEY,
-                            username        TEXT NOT NULL UNIQUE COLLATE NOCASE,
-                            password_hash   TEXT NOT NULL,
-                            role            TEXT NOT NULL CHECK (role IN ('admin','user')),
-                            created_at      INTEGER NOT NULL
-                        );
-                    ");
+                if ($hasConfig && (!$hasUsers || !$hasReliability || !$hasLatestMigration || $needsCashoutRename)) {
+                    if (!$hasUsers) {
+                        $pdo->exec("
+                            CREATE TABLE IF NOT EXISTS users (
+                                id              TEXT PRIMARY KEY,
+                                username        TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                                password_hash   TEXT NOT NULL,
+                                role            TEXT NOT NULL CHECK (role IN ('admin','user')),
+                                created_at      INTEGER NOT NULL
+                            );
+                        ");
+                    }
+                    self::runMigrations($pdo);
                 }
-                self::runMigrations(self::$instance);
+            } catch (\Throwable $e) {
+                self::$migrationError = $e->getMessage();
+                throw $e;
             }
+            self::$migrationError = null;
+            self::$instance = $pdo;
         }
         return self::$instance;
+    }
+
+    /**
+     * The message of the last failed connect/migration attempt in this
+     * process, or null. Entry points use it to render a "database upgrade
+     * failed" page instead of 500ing — or, worse, opening the wizard.
+     */
+    public static function getMigrationError(): ?string {
+        return self::$migrationError;
+    }
+
+    /**
+     * Direct probe for an existing installation that does NOT go through the
+     * migration gate: "is there a database file with a config table?".
+     * Unreadable-but-present answers true (fail closed): a database we cannot
+     * open is far more likely a permissions/lock problem on a live install
+     * than a fresh server, and treating it as fresh would reopen setup.
+     */
+    public static function hasExistingInstallation(): bool {
+        if (!file_exists(self::getDbPath())) {
+            return false;
+        }
+        try {
+            $probe = new PDO('sqlite:' . self::getDbPath());
+            $probe->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+            $stmt = $probe->query("SELECT name FROM sqlite_master WHERE type='table' AND name='config'");
+            return $stmt->fetch() !== false;
+        } catch (\Throwable $e) {
+            return true;
+        }
     }
 
     /**
@@ -211,8 +256,13 @@ HTACCESS;
             $pdo = self::getInstance();
             $stmt = $pdo->query("SELECT name FROM sqlite_master WHERE type='table' AND name='config'");
             return $stmt->fetch() !== false;
-        } catch (PDOException $e) {
-            return false;
+        } catch (\Throwable $e) {
+            // The migration gate (or the connect) failed. That is not "no
+            // installation": answer from a direct file probe, which reports
+            // an unreadable-but-present database as existing. Callers such as
+            // Config::get then rethrow instead of pretending the install is
+            // unconfigured.
+            return self::hasExistingInstallation();
         }
     }
 
@@ -421,6 +471,24 @@ HTACCESS;
             last_failure_message TEXT,
             last_success_at INTEGER,
             updated_at INTEGER NOT NULL
+        );
+
+        -- Wallet recovery bookkeeping (one row per store account = mint+unit
+        -- whose seed is being scanned at the mint before it may issue secrets
+        -- there): retry schedule with exponential backoff and the last error.
+        -- The scan progress itself lives in the library's
+        -- cashu_wallet_metadata / cashu_restore_progress tables.
+        CREATE TABLE IF NOT EXISTS wallet_recovery (
+            store_id TEXT NOT NULL,
+            mint_url TEXT NOT NULL,
+            unit TEXT NOT NULL DEFAULT 'sat',
+            status TEXT NOT NULL DEFAULT 'pending',
+            attempts INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT,
+            started_at INTEGER,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY (store_id, mint_url, unit)
         );
 
         -- Per-mint event log: failures + every state-change decision. UI surfaces
@@ -1754,10 +1822,105 @@ HTACCESS;
         // Per-store "Payment order" setting: which method the customer
         // invoice page shows first when an invoice offers both on-chain and
         // Lightning. NULL keeps the historical on-chain-first behaviour.
-        // stores.invoice_first_method is the "latest" migration marker (see
-        // getInstance), so this stays last.
+        // (stores.invoice_first_method was the migration marker before the
+        // 2026-10 security port; invoices.last_poll_error is now, see getInstance.)
         if (!self::columnExists($pdo, 'stores', 'invoice_first_method')) {
             $pdo->exec("ALTER TABLE stores ADD COLUMN invoice_first_method TEXT DEFAULT NULL");
+        }
+
+        // Money-safety port (security/upstream-audit-port). All additive and
+        // idempotent. invoices.last_poll_error is the getInstance() migration
+        // marker for this set, so existing installs pick all of it up.
+        //
+        // What the mint last said about an invoice's quote, and any poll
+        // failure. The expiry sweep only expires a mint-rail invoice within
+        // its confirm window once a post-expiry poll saw UNPAID; the dashboard
+        // can show why an order was not marked paid.
+        if (!self::columnExists($pdo, 'invoices', 'last_poll_state')) {
+            $pdo->exec("ALTER TABLE invoices ADD COLUMN last_poll_state TEXT DEFAULT NULL");
+        }
+        if (!self::columnExists($pdo, 'invoices', 'last_poll_error')) {
+            $pdo->exec("ALTER TABLE invoices ADD COLUMN last_poll_error TEXT DEFAULT NULL");
+        }
+
+        // Outgoing token ledger (see includes/transfer.php): every exported
+        // Cashu token is recorded with its proofs and the token itself BEFORE
+        // it is shown, so it can be re-shown, checked or taken back.
+        if (!self::tableExists($pdo, 'transfers')) {
+            $pdo->exec("
+                CREATE TABLE transfers (
+                    id TEXT PRIMARY KEY,
+                    store_id TEXT NOT NULL,
+                    type TEXT NOT NULL,
+                    amount INTEGER NOT NULL,
+                    unit TEXT NOT NULL DEFAULT 'sat',
+                    mint_url TEXT,
+                    destination TEXT,
+                    reference TEXT,
+                    token TEXT,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    note TEXT,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER
+                );
+            ");
+        }
+        if (!self::indexExists($pdo, 'idx_transfers_status')) {
+            $pdo->exec("CREATE INDEX idx_transfers_status ON transfers(status, created_at);");
+        }
+        if (!self::indexExists($pdo, 'idx_transfers_store')) {
+            $pdo->exec("CREATE INDEX idx_transfers_store ON transfers(store_id, created_at);");
+        }
+
+        // Wallet recovery bookkeeping (restore-before-issue gate, see
+        // Invoice::advanceStoreRecovery): retry schedule per store account.
+        if (!self::tableExists($pdo, 'wallet_recovery')) {
+            $pdo->exec("
+                CREATE TABLE wallet_recovery (
+                    store_id TEXT NOT NULL,
+                    mint_url TEXT NOT NULL,
+                    unit TEXT NOT NULL DEFAULT 'sat',
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    next_attempt_at INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    started_at INTEGER,
+                    updated_at INTEGER NOT NULL,
+                    PRIMARY KEY (store_id, mint_url, unit)
+                );
+            ");
+        }
+
+        // One-off: PENDING used to mean two different things — "reserved by an
+        // in-flight melt" and "handed out as an exported token". Recovery
+        // read the first meaning, so an unredeemed export was returned to the
+        // spendable pool and could be handed out twice. A PENDING proof that
+        // no melt/swap journal owns was an export; it becomes EXPORTED, a
+        // state nothing reclaims automatically.
+        self::migrateExportedProofs($pdo);
+    }
+
+    /**
+     * Reclassify PENDING proofs that no pending-operation journal owns as
+     * EXPORTED (see runMigrations). Idempotent: a second run finds nothing.
+     */
+    private static function migrateExportedProofs(\PDO $pdo): void {
+        if (!self::tableExists($pdo, 'cashu_proofs') || !self::tableExists($pdo, 'cashu_pending_operations')) {
+            return;
+        }
+        $reserved = [];
+        foreach ($pdo->query("SELECT data FROM cashu_pending_operations")->fetchAll(\PDO::FETCH_COLUMN) as $json) {
+            $data = json_decode((string)$json, true);
+            foreach ((array)($data['input_secrets'] ?? []) as $secret) {
+                $reserved[(string)$secret] = true;
+            }
+        }
+        $pending = $pdo->query("SELECT secret FROM cashu_proofs WHERE state = 'PENDING'")->fetchAll(\PDO::FETCH_COLUMN);
+        $update = $pdo->prepare("UPDATE cashu_proofs SET state = 'EXPORTED' WHERE secret = ? AND state = 'PENDING'");
+        foreach ($pending as $secret) {
+            if (!isset($reserved[(string)$secret])) {
+                $update->execute([$secret]);
+            }
         }
     }
 

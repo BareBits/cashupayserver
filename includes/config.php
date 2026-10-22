@@ -417,7 +417,55 @@ class Config {
      * explicitly. The trusted-mints code path uses the explicit value to mark
      * its auto-populated primaries differently so they can later be replaced.
      */
-    public static function updateStore(string $storeId, array $data): void {
+    public static function updateStore(string $storeId, array $data, bool $allowMintChange = false): void {
+        // Guards (not allowlist changes): the seed phrase is the store's
+        // recovery key and is never replaceable in place — a different phrase
+        // would make every future proof underivable from the operator's
+        // written-down backup while the old mint balance still exists. The
+        // mint URL / unit may only change once the current wallet namespace
+        // holds nothing, or with the caller's explicit consent
+        // ($allowMintChange, after the operator confirmed the stranding
+        // warning in the admin UI). Same-value writes always pass (setup and
+        // enable_store_mint re-pass the existing seed).
+        $store = self::getStore($storeId);
+        if ($store) {
+            if (array_key_exists('seed_phrase', $data)) {
+                $oldSeed = trim((string)($store['seed_phrase'] ?? ''));
+                $newSeed = trim((string)($data['seed_phrase'] ?? ''));
+                if ($oldSeed !== '' && $oldSeed !== $newSeed) {
+                    throw new Exception(
+                        'This store already has its recovery phrase, and it cannot be replaced. '
+                        . 'To use a different phrase, create a new store and move the money across.'
+                    );
+                }
+                if ($oldSeed !== '') {
+                    unset($data['seed_phrase']); // same phrase: nothing to write
+                }
+            }
+            $oldMint = rtrim((string)($store['mint_url'] ?? ''), '/');
+            $oldUnit = strtolower((string)($store['mint_unit'] ?? 'sat'));
+            $newMint = array_key_exists('mint_url', $data) ? rtrim((string)($data['mint_url'] ?? ''), '/') : $oldMint;
+            $newUnit = array_key_exists('mint_unit', $data) ? strtolower((string)($data['mint_unit'] ?? $oldUnit)) : $oldUnit;
+            if ($oldMint !== '' && ($newMint !== $oldMint || $newUnit !== $oldUnit)) {
+                require_once __DIR__ . '/store_safety.php';
+                if (StoreSafety::namespaceHasData($oldMint, $oldUnit)) {
+                    if (!$allowMintChange) {
+                        throw new Exception(
+                            'This store\'s wallet still holds funds or unfinished operations at its current mint. '
+                            . 'Changing the mint or unit would leave them behind; withdraw or export them first, '
+                            . 'or confirm the change in the store settings.'
+                        );
+                    }
+                    // Consented: remember where the money was left so the
+                    // stranded-funds scan can still name the mint later
+                    // (nothing else necessarily keeps the old URL around).
+                    $history = (array)self::get('previous_mints', []);
+                    $history[] = ['mint_url' => $oldMint, 'unit' => $oldUnit, 'store_id' => $storeId, 'at' => time()];
+                    self::set('previous_mints', array_slice($history, -50));
+                }
+            }
+        }
+
         $allowed = [
             'name', 'mint_url', 'mint_unit', 'seed_phrase',
             'exchange_fee_percent', 'price_provider_primary', 'price_provider_secondary',
@@ -454,6 +502,44 @@ class Config {
     // ========================================================================
     // PER-STORE BACKUP MINTS MANAGEMENT
     // ========================================================================
+
+    /**
+     * Every wallet namespace a store can hold money in: the primary mint plus
+     * every backup mint, disabled ones included (a disabled backup may still
+     * hold proofs settled by failover, exported tokens or an unfinished
+     * journal). De-duplicated on mint+unit.
+     *
+     * @return list<array{mint_url: string, unit: string, primary: bool, enabled: bool}>
+     */
+    public static function getStoreWalletAccounts(string $storeId): array {
+        $store = self::getStore($storeId);
+        if (!$store) {
+            return [];
+        }
+        $accounts = [];
+        $seen = [];
+        if (!empty($store['mint_url'])) {
+            $mint = rtrim((string)$store['mint_url'], '/');
+            $unit = strtolower((string)($store['mint_unit'] ?? 'sat'));
+            $accounts[] = ['mint_url' => $mint, 'unit' => $unit, 'primary' => true, 'enabled' => true];
+            $seen[$mint . '|' . $unit] = true;
+        }
+        foreach (self::getStoreBackupMints($storeId) as $backup) {
+            $mint = rtrim((string)$backup['mint_url'], '/');
+            $unit = strtolower((string)($backup['unit'] ?? 'sat'));
+            if ($mint === '' || isset($seen[$mint . '|' . $unit])) {
+                continue;
+            }
+            $seen[$mint . '|' . $unit] = true;
+            $accounts[] = [
+                'mint_url' => $mint,
+                'unit' => $unit,
+                'primary' => false,
+                'enabled' => (int)($backup['enabled'] ?? 1) === 1,
+            ];
+        }
+        return $accounts;
+    }
 
     /**
      * Get all backup mints for a store in priority order
@@ -570,18 +656,93 @@ class Config {
     // ========================================================================
 
     /**
+     * Normalise and validate a mint URL at every entry point that stores or
+     * probes one (setup wizard, store settings, backup/offline mints,
+     * test_mint). Returns the trimmed URL without a trailing slash; throws
+     * InvalidArgumentException with an operator-readable message otherwise.
+     *
+     * Policy: http(s) only (the library's MintClient hands the URL to curl,
+     * which would happily speak file://, gopher://, dict://), no userinfo,
+     * no fragment. Private/loopback reachability is decided at connect time
+     * (SafeHttp / CashuGuard honour the allow_private_endpoints opt-in), not
+     * here, so a self-hosted mint on the LAN still saves.
+     */
+    public static function validateMintUrl(string $mintUrl): string {
+        require_once __DIR__ . '/safe_http.php';
+        $url = rtrim(trim($mintUrl), '/');
+        if ($url === '') {
+            throw new \InvalidArgumentException('Mint URL required');
+        }
+        if (preg_match('/[\s\x00-\x1f\x7f]/', $url)) {
+            throw new \InvalidArgumentException('Mint URL must not contain whitespace or control characters');
+        }
+        $parts = parse_url($url);
+        $scheme = is_array($parts) ? strtolower((string)($parts['scheme'] ?? '')) : '';
+        if (!is_array($parts) || ($scheme !== 'http' && $scheme !== 'https') || empty($parts['host'])) {
+            throw new \InvalidArgumentException('Mint URL must be a valid http:// or https:// address');
+        }
+        // Same host syntax SafeHttp pins on (LDH labels, IP literals, '_' for
+        // Docker service names): anything else would not match the
+        // CURLOPT_RESOLVE pin at connect time anyway.
+        $host = $parts['host'];
+        if (strlen($host) >= 2 && $host[0] === '[' && substr($host, -1) === ']') {
+            $host = substr($host, 1, -1);
+        }
+        if (!\SafeHttp::isPlainHostSyntax($host)) {
+            throw new \InvalidArgumentException('Mint URL must be a valid http:// or https:// address');
+        }
+        if (isset($parts['user']) || isset($parts['pass'])) {
+            throw new \InvalidArgumentException('Mint URL must not contain credentials');
+        }
+        if (isset($parts['fragment'])) {
+            throw new \InvalidArgumentException('Mint URL must not contain a fragment');
+        }
+        return $url;
+    }
+
+    /**
      * Test connectivity to a mint
+     *
+     * The URL is validated (scheme/userinfo) and its host resolved and
+     * checked against the private-range policy BEFORE any socket is opened:
+     * this endpoint echoes the mint's /v1/info body (and, on failure, the
+     * error text) back to the caller, so an unchecked URL was a full-read
+     * SSRF primitive. Refusals return generic messages.
      *
      * @param string $mintUrl Mint URL to test
      * @return array{success: bool, error: ?string, info: ?array}
      */
     public static function testMintConnection(string $mintUrl): array {
         try {
-            $client = new \Cashu\MintClient(rtrim($mintUrl, '/'));
+            $mintUrl = self::validateMintUrl($mintUrl);
+        } catch (\InvalidArgumentException $e) {
+            return ['success' => false, 'error' => $e->getMessage(), 'info' => null];
+        }
+
+        require_once __DIR__ . '/safe_http.php';
+        try {
+            \SafeHttp::validateUrl($mintUrl, \SafeHttp::privateEndpointsAllowed());
+        } catch (\Throwable $e) {
+            $msg = $e->getMessage();
+            if (stripos($msg, 'private') !== false || stripos($msg, 'reserved') !== false) {
+                return [
+                    'success' => false,
+                    'error' => 'This mint address points at a private or local network, which is not allowed.',
+                    'info' => null,
+                ];
+            }
+            return ['success' => false, 'error' => 'Could not reach the mint at that address.', 'info' => null];
+        }
+
+        try {
+            $client = new \Cashu\MintClient($mintUrl);
             $info = $client->get('info');
             return ['success' => true, 'error' => null, 'info' => $info];
-        } catch (\Exception $e) {
+        } catch (\Cashu\CashuException $e) {
             return ['success' => false, 'error' => $e->getMessage(), 'info' => null];
+        } catch (\Throwable $e) {
+            error_log('CashuPayServer: testMintConnection failed: ' . get_class($e) . ': ' . $e->getMessage());
+            return ['success' => false, 'error' => 'Could not reach the mint at that address.', 'info' => null];
         }
     }
 }

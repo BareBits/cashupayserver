@@ -22,6 +22,15 @@ if (!Database::isInitialized()) {
     exit;
 }
 
+// A failed database upgrade must never look like a fresh install: say so
+// plainly instead of redirecting into the wizard or an opaque 500.
+if (Database::getMigrationError() !== null) {
+    http_response_code(503);
+    header('Content-Type: text/plain; charset=utf-8');
+    echo "Database upgrade failed: " . Database::getMigrationError() . "\nFix the data directory permissions or restore the database, then reload.\n";
+    exit;
+}
+
 // Check if setup is complete
 if (!Config::isSetupComplete()) {
     header('Location: ' . Urls::setup());

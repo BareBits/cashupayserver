@@ -115,7 +115,7 @@ function make_store(string $id, ?string $primaryMint = null, string $unit = 'sat
         'name' => 'test ' . $id,
         'mint_url' => $primaryMint,
         'mint_unit' => $unit,
-        'seed_phrase' => 'about about about about about about about about about about about above',
+        'seed_phrase' => 'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about',
         'primary_mint_source' => $source,
         'created_at' => Database::timestamp(),
     ]);

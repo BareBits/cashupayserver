@@ -140,7 +140,22 @@ if (stripos($effective, 'setup') === false) {
 $setupUrl = strtok($effective, '?');
 ok("fresh install serves the onboarding wizard ($effective)");
 
-$wpost = function (array $data) use ($ch, $setupUrl): string {
+/** The session's CSRF token from a rendered wizard screen (every wizard POST
+ *  must carry it; mirrors tests/fixtures/setup_helpers.py::wizard_csrf_token). */
+function wizard_csrf_token(string $body): ?string {
+    if (preg_match('/name="csrf_token"\s+value="([^"]+)"/', $body, $m)) {
+        return html_entity_decode($m[1], ENT_QUOTES | ENT_HTML5, 'UTF-8');
+    }
+    return null;
+}
+
+$wizardCsrf = wizard_csrf_token($body);
+if ($wizardCsrf === null) {
+    fail('the wizard screen rendered no csrf_token field', $body);
+}
+
+$wpost = function (array $data) use ($ch, $setupUrl, &$wizardCsrf): string {
+    $data['csrf_token'] = $wizardCsrf;
     [$status, $body] = request($ch, 'POST', $setupUrl, $data);
     $step = $data['step'] ?? '?';
     if ($status >= 400) {
@@ -149,6 +164,10 @@ $wpost = function (array $data) use ($ch, $setupUrl): string {
     $err = wizard_error($body);
     if ($err !== null) {
         fail("wizard step '$step' rejected: $err");
+    }
+    $next = wizard_csrf_token($body);
+    if ($next !== null) {
+        $wizardCsrf = $next;
     }
     return $body;
 };

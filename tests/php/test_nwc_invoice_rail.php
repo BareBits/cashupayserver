@@ -133,11 +133,16 @@ try {
     if (is_resource($proc)) { proc_terminate($proc); }
 }
 
-// ---------- expired invoice flips to Expired without touching the relay ----------
+// ---------- expiry: within the confirm window the wallet is asked first; a
+// dead relay cannot confirm "unpaid", so the invoice stays open. Past the
+// window it flips to Expired without touching the relay. ----------
 insert_nwc_invoice('inv_nwc_6', $store, 'nostr+walletconnect://' . $walletPk
     . '?relay=ws://127.0.0.1:1/&secret=' . $clientSk, $hash,
     ['expiration_time' => time() - 10]);
 Invoice::pollSingleNwc('inv_nwc_6');
-assert_eq('Expired', Invoice::getById('inv_nwc_6')['status'], 'expired invoice marked Expired');
+assert_eq('New', Invoice::getById('inv_nwc_6')['status'], 'just-expired invoice stays New while the relay cannot answer');
+Database::update('invoices', ['expiration_time' => time() - Invoice::EXPIRY_CONFIRM_WINDOW - 10], 'id = ?', ['inv_nwc_6']);
+Invoice::pollSingleNwc('inv_nwc_6');
+assert_eq('Expired', Invoice::getById('inv_nwc_6')['status'], 'expired invoice marked Expired past the confirm window');
 
 echo "test_nwc_invoice_rail: ok\n";

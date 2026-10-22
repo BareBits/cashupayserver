@@ -262,6 +262,7 @@ class LnUrlReceive {
         // respond directly, and following redirects opens an SSRF-via-
         // redirect path that the IP pin alone doesn't close.
         $result = \SafeHttp::request($url, [
+            'maxBytes' => 64 * 1024,
             'method' => 'GET',
             'timeout' => $timeoutSec,
             'connectTimeout' => $timeoutSec,

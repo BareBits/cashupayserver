@@ -449,11 +449,20 @@ def test_completion_screen_does_not_cry_wolf_on_a_fresh_session(
     """Reaching the final screen without the wizard's session — browser
     restarted, cookie expired, link reopened in another tab — leaves no store
     id to inspect. An unknown store must not be reported as unpayable: that
-    reads as "your setup failed" to an operator whose setup went fine."""
+    reads as "your setup failed" to an operator whose setup went fine.
+
+    On a configured install the tail screens are admin-only (an anonymous
+    tail POST is bounced to admin), so the fresh session signs in first; it
+    still has no wizard store id."""
     payserver = payserver_with_lnurlp
     walk(payserver, Choices(onchain="skip", lightning="address", swaps=False, mints=False))
 
     stranger = SetupWizard(payserver.url)  # brand new cookie jar
+    r = stranger.s.post(stranger.url, data={"step": "cron"}, timeout=15, allow_redirects=False)
+    assert r.status_code == 302 and "admin" in r.headers.get("Location", ""), (
+        "an anonymous tail POST must be bounced to admin"
+    )
+    stranger.login(payserver.url)
     body = stranger.post(step="cron")
     assert wizard_heading(body).startswith("You"), wizard_heading(body)
     assert "No payment method is set up yet" not in body, (
@@ -479,7 +488,8 @@ def test_wizard_updates_screen_persists_the_choice(payserver: PayserverHandle) -
         "declining automatic updates must persist an explicit false"
     )
 
-    w2 = SetupWizard(payserver.url)  # POST_COMPLETION screens accept tail posts
+    w2 = SetupWizard(payserver.url)  # fresh session: tail posts are admin-only
+    w2.login(payserver.url)
     body = w2.post(step="updates", auto_update="1")
     assert wizard_error(body) is None, wizard_error(body)
     assert _config(payserver, "auto_update_enabled") == "true", (
@@ -588,10 +598,9 @@ def test_add_store_applies_the_same_rail_resolution(
     w = walk(payserver, Choices(onchain="skip", lightning="skip", swaps=False, mints=False),
              store_name="First Store")
     w.login(payserver.url)
-    w2 = SetupWizard(payserver.url, mode="add_store")
-    w2.s.cookies.update(w.s.cookies)
-    # Re-prime under add_store so the session's store id is cleared.
-    w2.s.get(w2.url, params={"mode": "add_store"}, timeout=10)
+    # Same (admin) session, primed under add_store so the wizard's store id is
+    # cleared and the CSRF token of that screen is lifted.
+    w2 = SetupWizard(payserver.url, mode="add_store", session=w.s)
 
     w2.post(step="store", store_name="Added Store")
     w2.post(step="onchain", onchain_action="save",

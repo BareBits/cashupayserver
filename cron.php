@@ -184,6 +184,30 @@ $results = [
     'tasks' => [],
 ];
 
+// Task 0: Wallet recovery before quote polling. A store whose seed was
+// imported (or pointed at a new mint) must not issue new blinded secrets
+// there until the seed's existing outputs at that mint were scanned
+// (NUT-09) — otherwise counter 0 is reused and the mint refuses (or
+// double-signs) the outputs. Invoice::create skips such accounts; this task
+// drives the library's resumable restoreStep() for them, ~20 s per tick,
+// with exponential backoff on repeated failures. Runs before Task 1 so a
+// paid quote on a just-readied account is collected in the same tick.
+// Housekeeping-class (skipped in essentials-only mode): the external cron
+// picks it up.
+if (!$swapOnly && !$skipNonEssential) {
+    try {
+        $rec = Invoice::ensureWalletsReady(20.0);
+        $results['tasks']['wallet_recovery'] = $rec['accounts'] > 0
+            ? "accounts={$rec['accounts']} stepped={$rec['stepped']} completed={$rec['completed']} errors={$rec['errors']} backoff={$rec['backoff']}"
+            : 'none';
+        if ($rec['accounts'] > 0) {
+            $results['tasks']['wallet_recovery_details'] = $rec['details'];
+        }
+    } catch (\Throwable $e) {
+        $results['tasks']['wallet_recovery'] = 'error: ' . $e->getMessage();
+    }
+}
+
 // Task 1: Poll pending quotes
 if (!$swapOnly) {
     try {
@@ -191,6 +215,21 @@ if (!$swapOnly) {
         $results['tasks']['poll_quotes'] = 'success';
     } catch (\Throwable $e) {
         $results['tasks']['poll_quotes'] = 'error: ' . $e->getMessage();
+    }
+}
+
+// Task 1': Late payments on the mint rail. An invoice the local clock (or the
+// merchant) closed as Expired/Invalid can still be paid at the mint — the
+// bolt11 stays payable until the mint's own quote expiry, and a payment made
+// while cron was down is minted by nobody otherwise. Re-checks those quotes
+// (frequently for 72 h, then daily) and settles through the normal CAS paths,
+// so the usual InvoiceSettled webhook fires.
+if (!$swapOnly) {
+    try {
+        $late = Invoice::recoverLatePaidInvoices();
+        $results['tasks']['recover_late_paid'] = count($late) > 0 ? 'recovered ' . count($late) : 'none';
+    } catch (\Throwable $e) {
+        $results['tasks']['recover_late_paid'] = 'error: ' . $e->getMessage();
     }
 }
 
@@ -307,7 +346,7 @@ if (!$swapOnly && !$skipNonEssential) {
         if ($meltResult) {
             $results['tasks']['auto_melt'] = [
                 'success' => true,
-                'amount' => $meltResult['amountPaid'],
+                'stores_processed' => count($meltResult),
             ];
         } else {
             $results['tasks']['auto_melt'] = 'skipped';
@@ -459,47 +498,106 @@ if (!$swapOnly && !$skipNonEssential) try {
         "SELECT id FROM stores WHERE mint_url IS NOT NULL AND seed_phrase IS NOT NULL"
     );
     $meltPaid = 0; $meltRestored = 0; $swapRecovered = 0; $swapRestored = 0;
+    $mintRecovered = 0; $mintRetired = 0; $mintAmount = 0;
+    $attention = [];
+    // Every account of every store (primary + backups): a failover-settled
+    // payment or an export can leave a journal at a backup mint too.
+    $visited = [];
     foreach ($stores as $store) {
-        try {
-            $wallet = Invoice::getWalletInstance($store['id']);
-            if (!$wallet->hasStorage()) {
+        foreach (Config::getStoreWalletAccounts((string)$store['id']) as $account) {
+            $nsKey = $account['mint_url'] . '|' . $account['unit'];
+            if (isset($visited[$nsKey])) {
+                continue; // one namespace per mint:unit, shared by every store on it
+            }
+            $visited[$nsKey] = true;
+            // A namespace that holds nothing (no proofs, counters or
+            // journals) has nothing to reconcile: do not contact that mint
+            // (a dead backup would otherwise cost a connect timeout per tick).
+            if (!StoreSafety::namespaceHasData($account['mint_url'], $account['unit'])) {
                 continue;
             }
-            $m = $wallet->recoverPendingMelts();
-            $meltPaid += $m['paid']; $meltRestored += $m['restored'];
-            $s = $wallet->recoverPendingSwaps();
-            $swapRecovered += $s['recovered']; $swapRestored += $s['restored'];
-        } catch (\Throwable $e) {
-            error_log("Pending-op recovery failed for store {$store['id']}: " . $e->getMessage());
+            try {
+                $wallet = Invoice::getWalletForStore((string)$store['id'], $account['mint_url'], $account['unit']);
+                if (!$wallet->hasStorage()) {
+                    continue;
+                }
+                $m = $wallet->recoverPendingMelts();
+                $meltPaid += $m['paid']; $meltRestored += $m['restored'];
+                foreach (['change_unrecoverable', 'unknown_quote'] as $k) {
+                    if (!empty($m[$k])) {
+                        $attention[] = "melts.{$k}={$m[$k]} at {$account['mint_url']}";
+                    }
+                }
+                foreach ((array)($m['warnings'] ?? []) as $w) {
+                    error_log("Melt recovery warning for store {$store['id']} at {$account['mint_url']}: " . (is_string($w) ? $w : json_encode($w)));
+                }
+                $s = $wallet->recoverPendingSwaps();
+                $swapRecovered += $s['recovered']; $swapRestored += $s['restored'];
+                foreach (['orphaned', 'double_spent'] as $k) {
+                    if (!empty($s[$k])) {
+                        $attention[] = "swaps.{$k}={$s[$k]} at {$account['mint_url']}";
+                    }
+                }
+                foreach ((array)($s['errors'] ?? []) as $err) {
+                    error_log("Swap recovery error for store {$store['id']} at {$account['mint_url']}: " . (is_string($err) ? $err : json_encode($err)));
+                }
+                // Mint quotes the mint paid/issued whose response we never
+                // stored: NUT-09 restore of the journaled outputs, or a retry
+                // of the mint request while the quote is still payable.
+                $mi = $wallet->recoverPendingMints();
+                $mintRecovered += (int)($mi['recovered'] ?? 0);
+                $mintRetired += (int)($mi['retired'] ?? 0);
+                $mintAmount += (int)($mi['amount'] ?? 0);
+                foreach ((array)($mi['errors'] ?? []) as $err) {
+                    error_log("Mint recovery error for store {$store['id']} at {$account['mint_url']}: " . (is_string($err) ? $err : json_encode($err)));
+                }
+            } catch (\Throwable $e) {
+                error_log("Pending-op recovery failed for store {$store['id']} at {$account['mint_url']}: " . $e->getMessage());
+            }
         }
     }
     $results['tasks']['recover_pending_ops'] =
-        "melts(paid={$meltPaid},restored={$meltRestored}) swaps(recovered={$swapRecovered},restored={$swapRestored})";
+        "melts(paid={$meltPaid},restored={$meltRestored}) swaps(recovered={$swapRecovered},restored={$swapRestored})"
+        . " mints(recovered={$mintRecovered},retired={$mintRetired},amount={$mintAmount})";
+    if (!empty($attention)) {
+        // Journals that need a human decision (change the mint could not
+        // return, a quote the mint no longer knows, inputs moved outside the
+        // journal): surfaced here and in the log, never silently dropped.
+        $results['tasks']['recover_pending_ops_attention'] = $attention;
+        error_log('Pending-op recovery needs attention: ' . implode('; ', $attention));
+    }
 } catch (\Throwable $e) {
     $results['tasks']['recover_pending_ops'] = 'error: ' . $e->getMessage();
 }
 
-// Task 7: H3 - Auto-expire very old invoices (older than 30 days)
+// Task 6c: Reconcile exported tokens against the mint. A token the recipient
+// cashed in while no export screen was watching is settled here (its proofs
+// marked spent, the ledger row completed) instead of staying "not cashed in"
+// forever.
 if (!$swapOnly && !$skipNonEssential) try {
-    $veryOld = Database::query(
-        "UPDATE invoices SET status = 'Expired'
-         WHERE status = 'New' AND created_at < ?",
-        [time() - 30 * 24 * 3600]
-    )->rowCount();
+    $xfer = Invoice::reconcilePendingTokenTransfers();
+    $results['tasks']['reconcile_transfers'] = $xfer['checked'] > 0 ? $xfer : 'skipped';
+} catch (\Throwable $e) {
+    $results['tasks']['reconcile_transfers'] = 'error: ' . $e->getMessage();
+}
 
+// Task 7: H3 - Auto-expire very old invoices (older than 30 days). Goes
+// through the per-row expiry path so each one emits InvoiceExpired (the old
+// bulk UPDATE fired no webhook, leaving shop orders pending forever).
+if (!$swapOnly && !$skipNonEssential) try {
+    $veryOld = Invoice::expireInvoicesCreatedBefore(time() - 30 * 24 * 3600);
     $results['tasks']['expire_old_invoices'] = "expired {$veryOld} old invoices";
 } catch (\Throwable $e) {
     $results['tasks']['expire_old_invoices'] = 'error: ' . $e->getMessage();
 }
 
-// Task 8: L1 - Clean very old invoices (settled/expired older than 90 days)
+// Task 8: L1 - Clean very old invoices (settled/expired older than 90 days).
+// An Expired/Invalid row that still carries a quote_id is kept: it is the only
+// link to a payment that may still be collected (or claimed by hand with the
+// seed); the late-payment recovery writes the quote off once the mint says
+// plainly that nothing was paid.
 if (!$swapOnly && !$skipNonEssential) try {
-    $deleted = Database::query(
-        "DELETE FROM invoices WHERE status IN ('Settled', 'Expired', 'Invalid')
-         AND created_at < ?",
-        [time() - 90 * 24 * 3600]
-    )->rowCount();
-
+    $deleted = Invoice::cleanupOldInvoices(90 * 24 * 3600);
     $results['tasks']['cleanup_invoices'] = "deleted {$deleted} old invoices";
 } catch (\Throwable $e) {
     $results['tasks']['cleanup_invoices'] = 'error: ' . $e->getMessage();

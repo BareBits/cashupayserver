@@ -113,6 +113,28 @@ class Auth {
     }
 
     /**
+     * Password sign-in with the lockout reserved BEFORE the password check.
+     *
+     * Returns 'locked' (no password check happened — the per-address counter
+     * or the global sign-in budget is exhausted), 'ok' (session established,
+     * counters cleared) or 'invalid'. Callers that used to chain
+     * isLockedOut()/login()/recordFailedLogin() should use this instead: that
+     * sequence let N parallel guesses all see count < 5 and all get a bcrypt
+     * check. Report the wait with Security::getLockoutRemaining($ip, true).
+     */
+    public static function attemptLogin(string $username, string $password, ?string $ip = null): string {
+        $ip = $ip ?? Security::getClientIp();
+        if (!Security::reserveLoginAttempt($ip, true)) {
+            return 'locked';
+        }
+        if ($username !== '' && self::login($username, $password)) {
+            Security::clearLoginAttempts($ip);
+            return 'ok';
+        }
+        return 'invalid';
+    }
+
+    /**
      * Attempt login. Returns true on success.
      */
     public static function login(string $username, string $password): bool {

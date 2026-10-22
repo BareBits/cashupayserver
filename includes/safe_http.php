@@ -30,11 +30,22 @@
  *   CASHUPAY_ALLOW_PRIVATE_ENDPOINTS=1 environment variable
  *
  * The opt-in is consulted by the call sites that may legitimately point
- * at private IPs (mint client, onchain provider). Webhook delivery and
- * LNURL fetches NEVER opt in — those targets are attacker-controlled.
+ * at private IPs (mint client, onchain provider, and — via the global
+ * allow_private_endpoints switch — webhook delivery and our own LNURL
+ * clients, see includes/webhook_sender.php). The wallet library's own
+ * outbound requests are policed by the same rules through CashuGuard
+ * (includes/cashu_guard.php), which registers into \Cashu\ConnectGuard.
  */
 
 require_once __DIR__ . '/config.php';
+
+/**
+ * Thrown by SafeHttp::validateUrl() when the host could not be resolved at
+ * all (resolver down, NXDOMAIN). Distinct from a policy refusal: callers may
+ * treat it as "unreachable" (e.g. the offline-acceptance fallback), never as
+ * "the policy allowed it".
+ */
+class SafeHttpResolveException extends \RuntimeException {}
 
 class SafeHttp {
     public const DEFAULT_TIMEOUT_SEC = 15;
@@ -293,11 +304,28 @@ class SafeHttp {
             throw new \RuntimeException("Disallowed scheme '{$scheme}'");
         }
 
+        // Userinfo is refused outright: `https://user:pw@host/` is how a
+        // credential-bearing URL ends up in logs, and libcurl and parse_url
+        // can disagree on where the authority ends when '@' is in play.
+        if (isset($parts['user']) || isset($parts['pass'])) {
+            throw new \RuntimeException('URL must not contain credentials');
+        }
+
         $host = $parts['host'];
         // Strip IPv6 brackets if present
         $hostForResolve = $host;
         if (strlen($host) >= 2 && $host[0] === '[' && substr($host, -1) === ']') {
             $hostForResolve = substr($host, 1, -1);
+        }
+
+        // The CURLOPT_RESOLVE pin is keyed on the host string we hand curl.
+        // A host with a trailing dot, a percent escape, a backslash or
+        // non-ASCII would be normalised/decoded by libcurl to a DIFFERENT
+        // string, the pin would silently not apply, and curl would do its
+        // own (unchecked) lookup. Only plain LDH hosts and IP literals get
+        // through, so the pin always matches.
+        if (!self::isPlainHostSyntax($hostForResolve)) {
+            throw new \RuntimeException("Invalid host '{$hostForResolve}'");
         }
 
         $port = (int)($parts['port'] ?? ($scheme === 'https' ? 443 : 80));
@@ -309,7 +337,7 @@ class SafeHttp {
         } else {
             $ips = self::resolveHost($hostForResolve);
             if (empty($ips)) {
-                throw new \RuntimeException("DNS resolution failed for '{$hostForResolve}'");
+                throw new SafeHttpResolveException("DNS resolution failed for '{$hostForResolve}'");
             }
         }
 
@@ -338,27 +366,149 @@ class SafeHttp {
     }
 
     /**
+     * Address blocks that are never a legitimate unsolicited-HTTP target.
+     *
+     * PHP's FILTER_FLAG_NO_PRIV_RANGE / NO_RES_RANGE cover only a few
+     * blocks: carrier-grade NAT (100.64.0.0/10 — the address space of many
+     * VPS/container networks and Tailscale), the benchmarking range,
+     * multicast, 192.0.0.0/24 and the IPv6 transition prefixes that embed an
+     * IPv4 address (NAT64, 6to4, Teredo, SIIT) all pass them. The explicit
+     * table closes those. IPv4-mapped addresses (::ffff:a.b.c.d) are
+     * normalised to IPv4 first so the IPv4 rows apply.
+     */
+    private const NON_PUBLIC_RANGES = [
+        '0.0.0.0/8', '10.0.0.0/8', '100.64.0.0/10', '127.0.0.0/8', '169.254.0.0/16',
+        '172.16.0.0/12', '192.0.0.0/24', '192.0.2.0/24', '192.88.99.0/24', '192.168.0.0/16',
+        '198.18.0.0/15', '198.51.100.0/24', '203.0.113.0/24', '224.0.0.0/4', '240.0.0.0/4',
+        '::/128', '::1/128', '64:ff9b::/96', '64:ff9b:1::/48', '100::/64', '2001::/23',
+        '2001:db8::/32', '2002::/16', 'fc00::/7', 'fe80::/10', 'fec0::/10', 'ff00::/8',
+        '::ffff:0:0:0/96', // SIIT IPv4-translated (RFC 6145): embeds an IPv4 address
+    ];
+
+    /**
      * Returns true if the IP address falls in a range we never want to
      * send unsolicited HTTP to: RFC1918, loopback, link-local, multicast,
-     * reserved, and (per the operator's request) carrier-grade NAT.
+     * reserved, carrier-grade NAT, benchmarking, and the IPv6 transition
+     * prefixes (NAT64 / 6to4 / Teredo / SIIT) that embed an IPv4 address.
      *
-     * Implemented with PHP's built-in FILTER_VALIDATE_IP flags, which
-     * cover the IPv4 and IPv6 cases declaratively.
+     * PHP's FILTER_VALIDATE_IP flags are the first pass; the explicit CIDR
+     * table in NON_PUBLIC_RANGES covers what they miss.
      */
     public static function isPrivateIp(string $ip): bool {
-        if (!filter_var($ip, FILTER_VALIDATE_IP)) {
+        $ip = self::normalizeIp($ip);
+        if ($ip === null) {
             return true; // unparsable -> refuse
         }
         // FILTER_FLAG_NO_PRIV_RANGE blocks 10/8, 172.16/12, 192.168/16, fc00::/7
-        // FILTER_FLAG_NO_RES_RANGE blocks 0/8, 127/8, 169.254/16, 192.0.0/24,
-        //   192.0.2/24, 192.88.99/24, 198.18/15, 198.51.100/24, 203.0.113/24,
-        //   224/4, 240/4, ::1, fe80::/10, etc.
-        return !filter_var(
-            $ip,
-            FILTER_VALIDATE_IP,
-            FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE
-        );
+        // FILTER_FLAG_NO_RES_RANGE blocks 0/8, 127/8, 169.254/16, 192.0.2/24,
+        //   240/4, ::1, fe80::/10, etc.
+        if (!filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE)) {
+            return true;
+        }
+        foreach (self::NON_PUBLIC_RANGES as $range) {
+            if (self::ipInRange($ip, $range)) {
+                return true;
+            }
+        }
+        return false;
     }
+
+    /**
+     * Canonical textual form of an IP literal, with IPv4-mapped IPv6
+     * (::ffff:a.b.c.d) unwrapped to the IPv4 it embeds. Null when not an IP.
+     */
+    public static function normalizeIp(string $ip): ?string {
+        $ip = trim($ip, " \t[]");
+        if (!filter_var($ip, FILTER_VALIDATE_IP)) {
+            return null;
+        }
+        $bin = @inet_pton($ip);
+        if ($bin === false) {
+            return null;
+        }
+        if (strlen($bin) === 16 && substr($bin, 0, 12) === str_repeat("\0", 10) . "\xff\xff") {
+            return inet_ntop(substr($bin, 12));
+        }
+        return inet_ntop($bin);
+    }
+
+    /**
+     * Whether an address falls in a range given as CIDR ("10.0.0.0/8",
+     * "64:ff9b::/96") or as a single address. Mismatched families never match.
+     */
+    public static function ipInRange(string $ip, string $range): bool {
+        $ip = self::normalizeIp($ip);
+        if ($ip === null) {
+            return false;
+        }
+        $range = trim($range);
+        $bits = null;
+        if (str_contains($range, '/')) {
+            [$range, $bitsRaw] = explode('/', $range, 2);
+            if (!ctype_digit($bitsRaw)) {
+                return false;
+            }
+            $bits = (int)$bitsRaw;
+        }
+        // The range's network address is compared in its own family: do NOT
+        // unwrap an IPv4-mapped network ('::ffff:0:0:0/96' is an IPv6 row).
+        $netBin = @inet_pton(trim($range, " \t[]"));
+        $ipBin = @inet_pton($ip);
+        if ($ipBin === false || $netBin === false || strlen($ipBin) !== strlen($netBin)) {
+            return false;
+        }
+        $max = strlen($ipBin) * 8;
+        $bits = $bits ?? $max;
+        if ($bits < 0 || $bits > $max) {
+            return false;
+        }
+        $fullBytes = intdiv($bits, 8);
+        if ($fullBytes > 0 && strncmp($ipBin, $netBin, $fullBytes) !== 0) {
+            return false;
+        }
+        $remBits = $bits % 8;
+        if ($remBits === 0) {
+            return true;
+        }
+        $mask = (0xFF << (8 - $remBits)) & 0xFF;
+        return (ord($ipBin[$fullBytes]) & $mask) === (ord($netBin[$fullBytes]) & $mask);
+    }
+
+    /**
+     * Plain host syntax: an IPv4/IPv6 literal, or LDH labels only (letters,
+     * digits, hyphen; '_' tolerated for Docker/Umbrel service names) — no
+     * empty label, no trailing dot, no percent escape, no non-ASCII, and a
+     * last label that is not numeric (URL parsers would read that as an IPv4
+     * address and libcurl would disagree with our pin).
+     */
+    public static function isPlainHostSyntax(string $host): bool {
+        if ($host === '') {
+            return false;
+        }
+        if (str_starts_with($host, '[')) {
+            return str_ends_with($host, ']')
+                && filter_var(substr($host, 1, -1), FILTER_VALIDATE_IP, FILTER_FLAG_IPV6) !== false;
+        }
+        if (filter_var($host, FILTER_VALIDATE_IP) !== false) {
+            return true;
+        }
+        if (strlen($host) > 253) {
+            return false;
+        }
+        $labels = explode('.', $host);
+        foreach ($labels as $label) {
+            if (!preg_match('/^[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?$/D', $label)) {
+                return false;
+            }
+        }
+        return !preg_match('/^(?:[0-9]+|0x[0-9a-f]*)$/iD', (string)end($labels));
+    }
+
+    /**
+     * Test hook: replaces DNS resolution (callable(string $host): string[]).
+     * Lets tests exercise the resolve-then-pin path without a network.
+     */
+    public static $resolverForTesting = null;
 
     /**
      * Resolve A and AAAA records for a hostname.
@@ -366,6 +516,16 @@ class SafeHttp {
      * @return string[] list of IP literals
      */
     private static function resolveHost(string $host): array {
+        if (self::$resolverForTesting !== null) {
+            $out = [];
+            foreach ((array)call_user_func(self::$resolverForTesting, $host) as $ip) {
+                if (is_string($ip) && filter_var($ip, FILTER_VALIDATE_IP)) {
+                    $out[] = $ip;
+                }
+            }
+            return array_values(array_unique($out));
+        }
+
         $ips = [];
 
         // gethostbynamel returns IPv4 A records as an array
@@ -412,3 +572,9 @@ class SafeHttp {
         return in_array(strtolower($env), ['1', 'true', 'yes', 'on'], true);
     }
 }
+
+// Wire the same policy into the wallet library's outbound requests. Done
+// here (and in security.php, which every entry point loads) so no entry
+// point that uses the library can run without the guard.
+require_once __DIR__ . '/cashu_guard.php';
+CashuGuard::install();

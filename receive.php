@@ -118,9 +118,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     try {
         $probeToken = (new Wallet(Config::getStoreMintUrl($storeId), $unit))
             ->deserializeToken($tokenString);
-    } catch (Exception $e) {
+    } catch (\Throwable $e) {
+        // Throwable, not Exception: a TypeError/Error from a malformed token
+        // (or a missing extension) must not become an HTML fatal on a JSON
+        // endpoint. Only library errors carry a message safe to relay.
         cashupay_status(400);
-        echo json_encode(['error' => 'Could not read token: ' . $e->getMessage()]);
+        $detail = ($e instanceof \Cashu\CashuException) ? ': ' . $e->getMessage() : '';
+        echo json_encode(['error' => 'Could not read token' . $detail]);
         exit;
     }
     $tokenUnit = OfflineCashu::normUnit($probeToken->unit ?? null);
@@ -195,11 +199,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'settlement' => 'rejected',
             ]);
         }
-    } catch (Exception $e) {
+    } catch (\Throwable $e) {
         // Mint responded and rejected (already spent, wrong mint, etc.) or any
-        // other error: never accept these offline.
+        // other error: never accept these offline. Non-library throwables
+        // (TypeError, Error) get a generic public message — their text can
+        // carry file paths and internals.
         cashupay_status(400);
-        echo json_encode(['error' => $e->getMessage()]);
+        $public = ($e instanceof \Cashu\CashuException)
+            ? $e->getMessage()
+            : 'Could not accept the token right now.';
+        if (!($e instanceof \Cashu\CashuException)) {
+            error_log('CashuPayServer: receive failed: ' . get_class($e) . ': ' . $e->getMessage());
+        }
+        echo json_encode(['error' => $public]);
     }
     exit;
 }

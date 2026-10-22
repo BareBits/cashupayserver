@@ -11,29 +11,44 @@ require_once __DIR__ . '/config.php';
 class Security {
     private const RATE_LIMIT_WINDOW = 60; // seconds
     private const MAX_LOGIN_ATTEMPTS = 5;
+    // Address-independent ceiling on password sign-ins. Without it a caller
+    // who can choose the address that keys the per-address counter (a botnet,
+    // an IPv6 /64, a forged forwarded header behind a mis-set proxy) gets five
+    // guesses per address with no limit. Small enough to matter, large enough
+    // that a shared office address does not trip it. Trade-off, documented:
+    // anyone can pause password sign-in for everyone for LOCKOUT_DURATION;
+    // SSO and the reset links do not spend it. Only password sign-ins count
+    // (reserveLoginAttempt(..., true)); the authenticated re-auth prompts use
+    // the per-address counter alone so a hijacked session cannot burn the
+    // operator's sign-in budget.
+    private const MAX_GLOBAL_LOGIN_ATTEMPTS = 20;
     private const LOCKOUT_DURATION = 300; // 5 minutes
 
     /**
-     * Check rate limit for an action
+     * Check rate limit for an action.
+     *
+     * Read, increment and write happen under a per-key file lock: separate
+     * read/write steps lose counts under concurrency, which is exactly when a
+     * limit matters. A limiter that cannot record state fails CLOSED (false)
+     * rather than silently allowing everything on an unwritable data dir.
      */
     public static function checkRateLimit(string $action, string $identifier, int $maxAttempts = 60): bool {
         $key = "rate_{$action}_{$identifier}";
-        $data = self::getCache($key);
-
-        if ($data === null) {
-            self::setCache($key, ['count' => 1, 'window_start' => time()], self::RATE_LIMIT_WINDOW);
-            return true;
+        try {
+            $data = self::withLock($key, function () use ($key): array {
+                $data = self::getCache($key);
+                if ($data === null || time() - (int)($data['window_start'] ?? 0) > self::RATE_LIMIT_WINDOW) {
+                    $data = ['count' => 1, 'window_start' => time()];
+                } else {
+                    $data['count'] = (int)($data['count'] ?? 0) + 1;
+                }
+                self::setCache($key, $data, self::RATE_LIMIT_WINDOW);
+                return $data;
+            });
+        } catch (\Throwable $e) {
+            error_log('CashuPayServer: rate limit storage failed: ' . $e->getMessage());
+            return false;
         }
-
-        // Check if window has expired
-        if (time() - $data['window_start'] > self::RATE_LIMIT_WINDOW) {
-            self::setCache($key, ['count' => 1, 'window_start' => time()], self::RATE_LIMIT_WINDOW);
-            return true;
-        }
-
-        // Increment count
-        $data['count']++;
-        self::setCache($key, $data, self::RATE_LIMIT_WINDOW);
 
         // M4: Log rate limit exceeded
         if ($data['count'] > $maxAttempts) {
@@ -44,62 +59,182 @@ class Security {
     }
 
     /**
-     * Record failed login attempt
+     * Reserve one login attempt for an identifier, BEFORE the password is
+     * checked.
+     *
+     * Check and increment happen under one exclusive lock, so N parallel
+     * guesses cost N attempts: the old isLockedOut / bcrypt / recordFailedLogin
+     * sequence let every concurrent request read the same count and get its
+     * password checked. Returns false when the identifier (or, with
+     * $countGlobal, the global sign-in budget) is locked out; nothing is
+     * counted then. On success call clearLoginAttempts(); on a wrong password
+     * do nothing more — the attempt is already counted.
+     *
+     * Fails closed: if the counter cannot be read or written the attempt is
+     * refused, never silently allowed.
+     */
+    public static function reserveLoginAttempt(string $identifier, bool $countGlobal = false): bool {
+        $key = self::lockoutKey($identifier);
+        try {
+            return self::withLock(self::LOGIN_LOCK, function () use ($key, $countGlobal): bool {
+                $data = self::getCache($key) ?? ['count' => 0, 'first_attempt' => time()];
+                if (self::lockoutEnd($data, self::MAX_LOGIN_ATTEMPTS) > time()) {
+                    return false;
+                }
+                if ($countGlobal) {
+                    $globalKey = self::globalLockoutKey();
+                    $global = self::getCache($globalKey) ?? ['count' => 0, 'first_attempt' => time()];
+                    if (self::lockoutEnd($global, self::MAX_GLOBAL_LOGIN_ATTEMPTS) > time()) {
+                        return false;
+                    }
+                    if ((int)($global['count'] ?? 0) >= self::MAX_GLOBAL_LOGIN_ATTEMPTS) {
+                        // The previous global pause has run out: fresh budget.
+                        $global = ['count' => 0, 'first_attempt' => time()];
+                    }
+                    $global['count'] = (int)($global['count'] ?? 0) + 1;
+                    $global['last_attempt'] = time();
+                    self::setCache($globalKey, $global, self::LOCKOUT_DURATION);
+                }
+                if ((int)($data['count'] ?? 0) >= self::MAX_LOGIN_ATTEMPTS) {
+                    // The previous lockout has run out: start a fresh budget.
+                    $data = ['count' => 0, 'first_attempt' => time()];
+                }
+                $data['count'] = (int)($data['count'] ?? 0) + 1;
+                $data['last_attempt'] = time();
+                self::setCache($key, $data, self::LOCKOUT_DURATION);
+                return true;
+            });
+        } catch (\Throwable $e) {
+            error_log('CashuPayServer: login attempt storage failed: ' . $e->getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Record failed login attempt.
+     *
+     * Kept for callers that check the password first. New code should use
+     * reserveLoginAttempt(), which counts the attempt before the password
+     * check; calling both counts a wrong password twice.
      */
     public static function recordFailedLogin(string $identifier): void {
-        $key = "login_attempts_{$identifier}";
-        $data = self::getCache($key);
-
-        if ($data === null) {
-            $data = ['count' => 0, 'first_attempt' => time()];
+        $key = self::lockoutKey($identifier);
+        try {
+            self::withLock(self::LOGIN_LOCK, function () use ($key): void {
+                $data = self::getCache($key) ?? ['count' => 0, 'first_attempt' => time()];
+                $data['count'] = (int)($data['count'] ?? 0) + 1;
+                $data['last_attempt'] = time();
+                self::setCache($key, $data, self::LOCKOUT_DURATION);
+            });
+        } catch (\Throwable $e) {
+            error_log('CashuPayServer: login attempt storage failed: ' . $e->getMessage());
         }
-
-        $data['count']++;
-        $data['last_attempt'] = time();
-
-        self::setCache($key, $data, self::LOCKOUT_DURATION);
     }
 
     /**
      * Check if identifier is locked out
      */
     public static function isLockedOut(string $identifier): bool {
-        $key = "login_attempts_{$identifier}";
-        $data = self::getCache($key);
-
-        if ($data === null) {
-            return false;
-        }
-
-        if ($data['count'] >= self::MAX_LOGIN_ATTEMPTS) {
-            $lockoutEnd = ($data['last_attempt'] ?? time()) + self::LOCKOUT_DURATION;
-            return time() < $lockoutEnd;
-        }
-
-        return false;
+        $data = self::getCache(self::lockoutKey($identifier));
+        return $data !== null && self::lockoutEnd($data, self::MAX_LOGIN_ATTEMPTS) > time();
     }
 
     /**
-     * Clear login attempts on successful login
+     * Clear login attempts on successful login.
+     *
+     * The global budget is cleared too: whoever just proved the password is
+     * the operator, and leaving it spent would lock them out for no reason.
      */
     public static function clearLoginAttempts(string $identifier): void {
-        $key = "login_attempts_{$identifier}";
-        self::deleteCache($key);
+        self::deleteCache(self::lockoutKey($identifier));
+        self::deleteCache(self::globalLockoutKey());
     }
 
     /**
-     * Get remaining lockout time
+     * Get remaining lockout time (seconds). With $includeGlobal the global
+     * sign-in pause is folded in, for password sign-in prompts.
      */
-    public static function getLockoutRemaining(string $identifier): int {
-        $key = "login_attempts_{$identifier}";
-        $data = self::getCache($key);
+    public static function getLockoutRemaining(string $identifier, bool $includeGlobal = false): int {
+        $remaining = 0;
+        $data = self::getCache(self::lockoutKey($identifier));
+        if ($data !== null) {
+            $remaining = max(0, self::lockoutEnd($data, self::MAX_LOGIN_ATTEMPTS) - time());
+        }
+        if ($includeGlobal) {
+            $global = self::getCache(self::globalLockoutKey());
+            if ($global !== null) {
+                $remaining = max($remaining, max(0, self::lockoutEnd($global, self::MAX_GLOBAL_LOGIN_ATTEMPTS) - time()));
+            }
+        }
+        return $remaining;
+    }
 
-        if ($data === null || $data['count'] < self::MAX_LOGIN_ATTEMPTS) {
+    /** One lock for every login counter: the global budget and the per-address
+     *  counter are updated together, so they share a lock. */
+    private const LOGIN_LOCK = 'login_attempts';
+
+    /**
+     * Cache key of an identifier's login counter. IPv6 clients usually hold a
+     * whole /64, so one address per guess would give them billions of fresh
+     * budgets: aggregate IPv6 identifiers per /64. Non-IP identifiers (user
+     * names, opaque tokens) are keyed verbatim.
+     */
+    public static function lockoutKey(string $identifier): string {
+        $ip = trim($identifier, " \t[]");
+        if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6)) {
+            $bin = @inet_pton($ip);
+            if ($bin !== false && strlen($bin) === 16) {
+                // IPv4-mapped (::ffff:a.b.c.d) is really an IPv4 client: key on
+                // the embedded address so the /64 aggregation does not fold the
+                // whole mapped range together.
+                if (substr($bin, 0, 12) === str_repeat("\0", 10) . "\xff\xff") {
+                    $identifier = (string)inet_ntop(substr($bin, 12));
+                } else {
+                    $identifier = inet_ntop(substr($bin, 0, 8) . str_repeat("\0", 8)) . '/64';
+                }
+            }
+        }
+        return "login_attempts_{$identifier}";
+    }
+
+    /** Cache key of the address-independent sign-in budget. */
+    private static function globalLockoutKey(): string {
+        return 'login_attempts_global';
+    }
+
+    /** When a lockout ends for the given limit, or 0 when the counter is below it. */
+    private static function lockoutEnd(array $data, int $limit): int {
+        if ((int)($data['count'] ?? 0) < $limit) {
             return 0;
         }
+        return (int)($data['last_attempt'] ?? time()) + self::LOCKOUT_DURATION;
+    }
 
-        $lockoutEnd = ($data['last_attempt'] ?? time()) + self::LOCKOUT_DURATION;
-        return max(0, $lockoutEnd - time());
+    /**
+     * Run $fn while holding an exclusive flock on a per-name lock file in the
+     * cache directory. The lock file is separate from the data files so a
+     * reader that unlinks an expired entry never races the lock itself.
+     * Throws when the lock cannot be taken (unwritable data dir) so callers
+     * fail closed.
+     */
+    private static function withLock(string $name, callable $fn): mixed {
+        $lockFile = self::getCacheDir() . '/' . md5($name) . '.lock';
+        $fh = @fopen($lockFile, 'c');
+        if ($fh === false) {
+            throw new \RuntimeException("cannot open lock file {$lockFile}");
+        }
+        try {
+            if (!flock($fh, LOCK_EX)) {
+                throw new \RuntimeException("cannot lock {$lockFile}");
+            }
+            try {
+                return $fn();
+            } finally {
+                flock($fh, LOCK_UN);
+            }
+        } finally {
+            fclose($fh);
+        }
     }
 
     /**
@@ -345,11 +480,16 @@ class Security {
         header("Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self'");
     }
 
-    // Simple file-based cache for rate limiting
+    // Simple file-based cache for rate limiting. Lives under the data
+    // directory (which honours CASHUPAY_DATA_DIR) rather than the code tree:
+    // the WordPress installer keeps data outside the web root, and a
+    // read-only or mis-owned code tree used to disable every lockout silently.
     private static function getCacheDir(): string {
-        $dir = __DIR__ . '/../data/cache';
+        $dir = Database::getDataDir() . '/cache';
         if (!is_dir($dir)) {
-            mkdir($dir, 0750, true);
+            if (!@mkdir($dir, 0750, true) && !is_dir($dir)) {
+                throw new \RuntimeException("cannot create cache directory {$dir}");
+            }
         }
         return $dir;
     }
@@ -359,13 +499,22 @@ class Security {
     }
 
     private static function getCache(string $key): ?array {
-        $file = self::getCacheFile($key);
+        try {
+            $file = self::getCacheFile($key);
+        } catch (\Throwable $e) {
+            // Readers are informational; the writers (reserve/check) fail
+            // closed on the same condition via setCache/withLock.
+            return null;
+        }
 
         if (!file_exists($file)) {
             return null;
         }
 
-        $data = file_get_contents($file);
+        $data = @file_get_contents($file);
+        if ($data === false) {
+            return null;
+        }
         $decoded = json_decode($data, true);
 
         if ($decoded === null || !isset($decoded['expires']) || $decoded['expires'] < time()) {
@@ -382,11 +531,19 @@ class Security {
             'data' => $data,
             'expires' => time() + $ttl,
         ]);
-        file_put_contents($file, $content, LOCK_EX);
+        if (@file_put_contents($file, $content, LOCK_EX) === false) {
+            // Surface the failure so limiters fail closed instead of
+            // forgetting the attempt they just granted.
+            throw new \RuntimeException("cannot write cache file {$file}");
+        }
     }
 
     private static function deleteCache(string $key): void {
-        $file = self::getCacheFile($key);
+        try {
+            $file = self::getCacheFile($key);
+        } catch (\Throwable $e) {
+            return;
+        }
         if (file_exists($file)) {
             @unlink($file);
         }
@@ -396,7 +553,11 @@ class Security {
      * Clean expired cache files
      */
     public static function cleanCache(): void {
-        $dir = self::getCacheDir();
+        try {
+            $dir = self::getCacheDir();
+        } catch (\Throwable $e) {
+            return;
+        }
         if (!is_dir($dir)) {
             return;
         }
@@ -411,3 +572,10 @@ class Security {
         }
     }
 }
+
+// Every entry point loads this module (directly or via auth.php), which
+// makes it the bootstrap spot for the wallet library's address policy:
+// \Cashu\ConnectGuard is wired to SafeHttp so mint and LNURL requests made
+// by the library obey the same private-range / DNS-pin rules as our own.
+require_once __DIR__ . '/cashu_guard.php';
+CashuGuard::install();

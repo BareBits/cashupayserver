@@ -220,21 +220,109 @@ function upd_base_url(): string {
  *                    a transient loopback/TLS hiccup never triggers a false
  *                    rollback of a perfectly good update.
  */
+/**
+ * Self-request target + curl policy for the health probe. Inlined mirror of
+ * Background::selfRequest() (this file must not depend on includes/): a
+ * pinned base_url (CASHUPAY_BASE_URL constant or DB base_url) is used
+ * verbatim; otherwise the request-derived URL is only used when the Host
+ * header has plain `host[:port]` / `[v6]:port` syntax AND the connection
+ * can be pinned via CURLOPT_RESOLVE to the address this request arrived on
+ * (SERVER_ADDR, or the built-in server's SERVER_NAME bind address), so the
+ * cron key never travels to a Host-derived third party. Never follows
+ * redirects; TLS verified unless loopback. Null when no safe target exists.
+ *
+ * @return array{url: string, options: array<int,mixed>}|null
+ */
+function upd_self_request(string $pathAndQuery): ?array {
+    $pinned = null;
+    if (defined('CASHUPAY_BASE_URL') && CASHUPAY_BASE_URL !== '') {
+        $pinned = rtrim((string)CASHUPAY_BASE_URL, '/');
+    } else {
+        $configured = upd_config_get('base_url');
+        if (is_string($configured) && $configured !== '') {
+            $pinned = rtrim($configured, '/');
+        }
+    }
+    $url = ($pinned ?? upd_base_url()) . $pathAndQuery;
+    $parts = parse_url($url);
+    if ($parts === false || empty($parts['host'])) {
+        return null;
+    }
+    $scheme = strtolower((string)($parts['scheme'] ?? 'http'));
+    if ($scheme !== 'http' && $scheme !== 'https') {
+        return null;
+    }
+
+    $resolve = null;
+    if ($pinned === null) {
+        $hostHeader = (string)($_SERVER['HTTP_HOST'] ?? '');
+        $plain = preg_match('/^[A-Za-z0-9.\-]+(:[0-9]{1,5})?$/D', $hostHeader) === 1
+            || (preg_match('/^\[([0-9A-Fa-f:.]+)\](:[0-9]{1,5})?$/D', $hostHeader, $m) === 1
+                && filter_var($m[1], FILTER_VALIDATE_IP, FILTER_FLAG_IPV6) !== false);
+        if (!$plain) {
+            return null;
+        }
+        $addr = trim((string)($_SERVER['SERVER_ADDR'] ?? ''), '[]');
+        if ($addr === '') {
+            $name = trim((string)($_SERVER['SERVER_NAME'] ?? ''), '[]');
+            if (filter_var($name, FILTER_VALIDATE_IP)) {
+                $addr = $name;
+            }
+        }
+        if ($addr === '' || !filter_var($addr, FILTER_VALIDATE_IP)) {
+            return null;
+        }
+        if ($addr === '0.0.0.0') {
+            $addr = '127.0.0.1';
+        } elseif ($addr === '::') {
+            $addr = '::1';
+        }
+        $defaultPort = $scheme === 'https' ? 443 : 80;
+        $port = (int)($parts['port'] ?? $defaultPort);
+        $serverPort = (int)($_SERVER['SERVER_PORT'] ?? 0);
+        if ($serverPort > 0 && $serverPort <= 65535) {
+            $port = $serverPort;
+        }
+        $hostForPin = trim($parts['host'], '[]');
+        $url = $scheme . '://' . $parts['host'] . ($port === $defaultPort ? '' : ':' . $port)
+            . ($parts['path'] ?? '') . (isset($parts['query']) ? '?' . $parts['query'] : '');
+        $resolve = [$hostForPin . ':' . $port . ':' . $addr];
+    }
+
+    $host = strtolower(trim((string)$parts['host'], '[]'));
+    $loopback = $host === 'localhost' || $host === '::1' || str_ends_with($host, '.localhost')
+        || (filter_var($host, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) && str_starts_with($host, '127.'));
+    $options = [
+        CURLOPT_FOLLOWLOCATION => false,
+        CURLOPT_PROTOCOLS => CURLPROTO_HTTP | CURLPROTO_HTTPS,
+        CURLOPT_REDIR_PROTOCOLS => CURLPROTO_HTTP | CURLPROTO_HTTPS,
+        CURLOPT_SSL_VERIFYPEER => !$loopback,
+        CURLOPT_SSL_VERIFYHOST => $loopback ? 0 : 2,
+    ];
+    if ($resolve !== null) {
+        $options[CURLOPT_RESOLVE] = $resolve;
+    }
+    return ['url' => $url, 'options' => $options];
+}
+
 function upd_health_status(string $cronKey): string {
-    $url = upd_base_url() . '/health.php';
+    $target = upd_self_request('/health.php');
+    if ($target === null) {
+        // No safe self origin: not a rollback signal (see the docblock).
+        return 'inconclusive';
+    }
+    $url = $target['url'];
     $last = 'inconclusive';
     for ($attempt = 0; $attempt < 3; $attempt++) {
         if ($attempt > 0) {
             sleep(2);
         }
         $ch = curl_init($url);
-        curl_setopt_array($ch, [
+        curl_setopt_array($ch, $target['options'] + [
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_CONNECTTIMEOUT => 5,
             CURLOPT_TIMEOUT => 20,
             CURLOPT_NOSIGNAL => 1,
-            CURLOPT_SSL_VERIFYPEER => false, // localhost self-request, same as Background::trigger
-            CURLOPT_FOLLOWLOCATION => true,
             CURLOPT_HTTPHEADER => ['X-CRON-KEY: ' . $cronKey, 'Accept: application/json'],
         ]);
         $body = curl_exec($ch);

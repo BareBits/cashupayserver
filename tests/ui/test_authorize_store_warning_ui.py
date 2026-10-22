@@ -18,6 +18,7 @@ import pytest
 import requests
 
 from conftest import ConfiguredPayserver
+from fixtures.setup_helpers import SetupWizard, wizard_error
 
 pytestmark = pytest.mark.ui
 
@@ -33,14 +34,13 @@ def _create_zero_rail_store(configured: ConfiguredPayserver, store_name: str) ->
     )
     assert r.status_code == 200 and r.json().get("success") is True, r.text[:200]
 
-    setup = f"{configured.handle.url}/setup"
-    s.get(setup, params={"mode": "add_store"}, timeout=30)
+    # The wizard's POSTs carry the session's CSRF token; SetupWizard lifts it
+    # from the priming GET (add_store mode, admin session).
+    w = SetupWizard(configured.handle.url, mode="add_store", session=s)
 
     def post(**data) -> None:
-        data["mode"] = "add_store"
-        resp = s.post(setup, data=data, timeout=30, allow_redirects=False)
-        assert resp.status_code < 400, resp.text[:300]
-        assert '<div class="error">' not in resp.text, resp.text[:500]
+        body = w.post(**data)
+        assert wizard_error(body) is None, wizard_error(body)
 
     post(step="store", store_name=store_name, default_currency="sat")
     post(step="onchain", onchain_action="skip")

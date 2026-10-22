@@ -45,8 +45,10 @@ function has_table(string $table): bool {
 }
 
 // A fresh install has the newest marker artifact (the
-// stores.invoice_first_method column) AND the older migration artifacts.
-assert_true(has_col('stores', 'invoice_first_method'), 'fresh install has the current marker column');
+// invoices.last_poll_error column) AND the older migration artifacts.
+assert_true(has_col('invoices', 'last_poll_error'), 'fresh install has the current marker column');
+assert_true(has_table('transfers'), 'fresh install has the transfers ledger');
+assert_true(has_col('stores', 'invoice_first_method'), 'fresh install has the previous marker column');
 assert_true(has_col('stores', 'onchain_source_order'), 'fresh install has the rail-order marker column');
 assert_true(has_col('stores', 'ln_rail_order'), 'fresh install has the lightning rail-order column');
 assert_true(has_col('invoices', 'onchain_last_polled_at'), 'fresh install has the previous marker column');
@@ -63,6 +65,9 @@ assert_true(has_col('melts', 'melt_quote_id'), 'fresh install has older migratio
 // Simulate a pre-merge install: the newest artifacts are missing, but older
 // ones are still present — exactly the state of a running instance when it
 // pulls code that adds a new migration.
+Database::getInstance()->exec("ALTER TABLE invoices DROP COLUMN last_poll_error");
+Database::getInstance()->exec("ALTER TABLE invoices DROP COLUMN last_poll_state");
+Database::getInstance()->exec("DROP TABLE transfers");
 Database::getInstance()->exec("ALTER TABLE stores DROP COLUMN invoice_first_method");
 Database::getInstance()->exec("ALTER TABLE stores DROP COLUMN onchain_source_order");
 Database::getInstance()->exec("ALTER TABLE stores DROP COLUMN ln_rail_order");
@@ -73,7 +78,9 @@ Database::getInstance()->exec("ALTER TABLE melts DROP COLUMN strike_invoice_id")
 Database::getInstance()->exec("ALTER TABLE invoices DROP COLUMN strike_invoice_id");
 Database::getInstance()->exec("ALTER TABLE invoices DROP COLUMN strike_api_key");
 Database::getInstance()->exec("ALTER TABLE stores DROP COLUMN onchain_offer_enabled");
-assert_false(has_col('stores', 'invoice_first_method'), 'pre-merge: marker column dropped');
+assert_false(has_col('invoices', 'last_poll_error'), 'pre-merge: marker column dropped');
+assert_false(has_table('transfers'), 'pre-merge: transfers ledger dropped');
+assert_false(has_col('stores', 'invoice_first_method'), 'pre-merge: previous marker column dropped');
 assert_false(has_col('stores', 'onchain_source_order'), 'pre-merge: rail-order marker column dropped');
 assert_false(has_col('invoices', 'onchain_last_polled_at'), 'pre-merge: previous marker column dropped');
 assert_false(has_col('stores', 'onchain_offer_enabled'), 'pre-merge: column dropped');
@@ -83,7 +90,10 @@ assert_true(has_col('melts', 'melt_quote_id'), 'pre-merge: older artifacts still
 // First DB access after the "deploy" must re-run migrations and re-add them.
 reset_db_singleton();
 Database::getInstance();
-assert_true(has_col('stores', 'invoice_first_method'), 'getInstance() self-heals the marker column');
+assert_true(has_col('invoices', 'last_poll_error'), 'getInstance() self-heals the marker column');
+assert_true(has_col('invoices', 'last_poll_state'), 'getInstance() self-heals the poll-state column');
+assert_true(has_table('transfers'), 'getInstance() self-heals the transfers ledger');
+assert_true(has_col('stores', 'invoice_first_method'), 'getInstance() self-heals the previous marker column');
 assert_true(has_col('stores', 'onchain_source_order'), 'getInstance() self-heals the rail-order marker column');
 assert_true(has_col('stores', 'ln_rail_order'), 'getInstance() self-heals the lightning rail-order column');
 assert_true(has_col('invoices', 'onchain_last_polled_at'), 'getInstance() self-heals the previous marker column');
@@ -107,7 +117,8 @@ assert_true(OnchainConfig::isEnabledForStore('store_offer_mig'), 'OnchainConfig 
 reset_db_singleton();
 Database::getInstance();
 assert_true(has_col('stores', 'onchain_offer_enabled'), 're-run leaves the column in place');
-assert_true(has_col('stores', 'invoice_first_method'), 're-run leaves the marker column in place');
+assert_true(has_col('invoices', 'last_poll_error'), 're-run leaves the marker column in place');
+assert_true(has_col('stores', 'invoice_first_method'), 're-run leaves the previous marker column in place');
 assert_true(has_col('stores', 'onchain_source_order'), 're-run leaves the rail-order marker column in place');
 assert_true(has_col('invoices', 'onchain_last_polled_at'), 're-run leaves the previous marker column in place');
 

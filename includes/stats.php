@@ -445,7 +445,7 @@ class Stats {
             // invoice-only
             'status', 'additional_status', 'amount', 'currency',
             'exchange_rate', 'quote_id', 'bolt11', 'mint_url',
-            'metadata', 'checkout_config', 'expiration_time', 'last_polled_at',
+            'metadata', 'checkout_config', 'expiration_time', 'last_polled_at', 'last_poll_state', 'last_poll_error',
             'onchain_address', 'onchain_address_index', 'onchain_amount_sat',
             'onchain_first_seen_at', 'onchain_created_tip_height',
             // melt-only
@@ -488,7 +488,7 @@ class Stats {
             'id', 'store_id', 'status', 'additional_status', 'amount',
             'currency', 'amount_sats', 'exchange_rate', 'quote_id', 'bolt11',
             'mint_url', 'metadata', 'checkout_config', 'created_at',
-            'expiration_time', 'last_polled_at', 'paid_at', 'settled_rail',
+            'expiration_time', 'last_polled_at', 'last_poll_state', 'last_poll_error', 'paid_at', 'settled_rail',
             'payment_rail', 'customer_email', 'newsletter_opt_in',
             'payer_receipt_requested', 'receive_errors',
             'onchain_address', 'onchain_address_index', 'onchain_amount_sat',

@@ -137,7 +137,7 @@ function admin_post(array $post): array {
         . ' T_POST=' . escapeshellarg(json_encode($post));
     $out = [];
     $rc = 0;
-    exec($env . ' ' . escapeshellarg(PHP_BINARY) . ' ' . escapeshellarg($runner) . ' 2>&1', $out, $rc);
+    exec($env . ' ' . escapeshellarg(PHP_BINARY) . ' ' . escapeshellarg($runner) . ' 2>>' . escapeshellarg($dataDir . '/runner-stderr.log'), $out, $rc);
     $raw = implode("\n", $out);
     if (!preg_match('/^(.*)\nHTTP_STATUS:(\d+)$/s', $raw, $m)) {
         fail("admin runner produced unparseable output (rc=$rc): " . substr($raw, 0, 800));
