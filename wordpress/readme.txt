@@ -4,7 +4,7 @@ Tags: bitcoin, lightning, payments, woocommerce, btcpay
 Requires at least: 6.0
 Tested up to: 7.1
 Requires PHP: 8.0
-Stable tag: 1.6.3
+Stable tag: 1.7
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -74,6 +74,9 @@ During onboarding the plugin installs and activates the "BTCPay for WooCommerce"
 The full plugin build distributed on the project's GitHub releases page can additionally install a BareBits server alongside WordPress. That flow fetches release metadata from api.github.com and downloads the release archive and its checksums from github.com. The build distributed on wordpress.org does not include this component and never contacts GitHub. GitHub terms of service: https://docs.github.com/en/site-policy/github-terms/github-terms-of-service — privacy statement: https://docs.github.com/en/site-policy/privacy-policies/github-general-privacy-statement
 
 == Changelog ==
+
+= 1.7 =
+* Security release — every server and WordPress install should upgrade. Server-side: exported Cashu tokens can no longer be handed out twice and are tracked in a Recent exports list; withdrawals cannot pay twice; invoices paid late are still credited; unused Lightning fee reserves come back (NUT-08); proof storage is atomic and a stale mint reply can never revive spent ecash; an imported recovery phrase is scanned at the mint before new payments; mint and recovery-phrase changes on a funded store need confirmation; the setup wizard and login are hardened (CSRF on every wizard step, atomic lockout counting, global sign-in budget); mint and Lightning-address requests follow the same SSRF policy as everything else.
 
 = 1.6.3 =
 * Server-side (for installs updating the companion BareBits server): after an update, the admin banner's "Update applied — reload the page" notice goes away once the page has been reloaded, and the "apply it as soon as you can" wording only appears while an update is actually available.
