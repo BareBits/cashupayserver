@@ -110,8 +110,8 @@ def test_payment_page_with_forged_host_never_sends_the_internal_key_elsewhere(
     """GET /payment.php with `Host: 127.0.0.1:<listener>` used to make the server
     curl http://127.0.0.1:<listener>/cron.php?internal=1 with X-CRON-KEY. The
     self-request is now pinned to the address:port the request arrived on, so
-    the listener named by the Host header never sees it, while the trigger
-    itself still fires (stamped) and cron keeps working."""
+    the listener named by the Host header never sees it, and cron keeps
+    working."""
     handle = configured.handle
     _Capture.seen = []
     port = ports.allocate(1)[0]
@@ -119,8 +119,6 @@ def test_payment_page_with_forged_host_never_sends_the_internal_key_elsewhere(
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        # Make sure the 30 s coalescing window is open so the trigger really fires.
-        _set_config(handle, "last_background_trigger", 0)
         internal_key = None
         with handle.db() as db:
             row = db.execute("SELECT value FROM config WHERE key = 'internal_background_key'").fetchone()
@@ -140,10 +138,6 @@ def test_payment_page_with_forged_host_never_sends_the_internal_key_elsewhere(
         if internal_key:
             for req in _Capture.seen:
                 assert req["headers"].get("x-cron-key") != internal_key
-
-        with handle.db() as db:
-            row = db.execute("SELECT value FROM config WHERE key = 'last_background_trigger'").fetchone()
-        assert row is not None and int(json.loads(row["value"])) > 0, "the trigger fired (stamped), it was not skipped"
 
         # Cron itself is unaffected.
         r = handle.trigger_cron()

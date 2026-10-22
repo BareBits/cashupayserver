@@ -197,7 +197,7 @@ def test_migration_failure_shows_upgrade_failed_page_not_the_wizard(configured: 
     # file and its directory read-only so the ALTER TABLE cannot run.
     conn = sqlite3.connect(db_path, isolation_level=None)
     try:
-        conn.execute("ALTER TABLE stores DROP COLUMN invoice_first_method")
+        conn.execute("ALTER TABLE invoices DROP COLUMN last_poll_error")
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         conn.execute("PRAGMA journal_mode = DELETE")
     finally:
@@ -236,7 +236,7 @@ def test_migration_failure_shows_upgrade_failed_page_not_the_wizard(configured: 
     r = requests.get(f"{handle.url}/setup.php", timeout=15, allow_redirects=False)
     assert r.status_code == 302 and "admin" in r.headers.get("Location", ""), (r.status_code, r.headers)
     with handle.db() as db:
-        cols = [row[1] for row in db.execute("PRAGMA table_info(stores)")]
-        assert "invoice_first_method" in cols, "marker column restored by the migration"
+        cols = [row[1] for row in db.execute("PRAGMA table_info(invoices)")]
+        assert "last_poll_error" in cols, "marker column restored by the migration"
         names = [row[0] for row in db.execute("SELECT name FROM stores")]
     assert "Wedged Store" not in names, "no store was created while wedged"

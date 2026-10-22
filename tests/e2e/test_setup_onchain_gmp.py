@@ -61,6 +61,7 @@ def _validate_xpub(w: SetupWizard, xpub: str) -> dict:
         w.url,
         data={
             "action": "validate_xpub",
+            "csrf_token": w.csrf_token or "",
             "xpub": xpub,
             "network": "mainnet",
             "address_type": "P2WPKH",

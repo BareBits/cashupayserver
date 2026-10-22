@@ -10,16 +10,13 @@ require_once __DIR__ . '/config.php';
 require_once __DIR__ . '/urls.php';
 
 class Background {
-    /** Shortest interval between two opportunistic background runs. */
-    public const TRIGGER_INTERVAL = 30;
-
     /**
      * Trigger background processing without blocking the current request
      *
      * Fires a non-blocking self-request to cron.php to process background tasks.
-     * Uses a short timeout (100ms) so the calling request doesn't wait, and
-     * is coalesced (once per TRIGGER_INTERVAL) so a busy checkout or a
-     * webhook burst does not start a full cron run per page view.
+     * Uses a short timeout (100ms) so the calling request doesn't wait.
+     * cron.php itself serialises runs (cron.lock), so overlapping triggers
+     * cost one refused request, never a second full pass.
      *
      * The request carries the internal key, so it must only ever reach THIS
      * server: see selfRequest() for how the target is chosen. Redirects are
@@ -27,12 +24,6 @@ class Background {
      * and TLS is verified unless the target is loopback.
      */
     public static function trigger(): void {
-        $last = (int)Config::get('last_background_trigger', 0);
-        if (time() - $last < self::TRIGGER_INTERVAL) {
-            return;
-        }
-        Config::set('last_background_trigger', time());
-
         $target = self::selfRequest('/cron.php?internal=1');
         if ($target === null) {
             // No origin we can trust: without one a poisoned Host header

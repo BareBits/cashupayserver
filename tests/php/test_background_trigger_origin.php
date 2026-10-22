@@ -10,7 +10,6 @@
  *  - a Host header with odd syntax means no self-request at all;
  *  - redirects are never followed (a 302 from our own server to the
  *    attacker listener is not honoured);
- *  - throttled to one trigger per 30 s (last_background_trigger);
  *  - loopback detection and TLS policy matrix.
  */
 declare(strict_types=1);
@@ -23,10 +22,6 @@ function reset_server_vars(): void {
     unset($_SERVER['HTTPS'], $_SERVER['SERVER_ADDR'], $_SERVER['SERVER_PORT'], $_SERVER['SERVER_NAME']);
     $_SERVER['SCRIPT_NAME'] = '/index.php';
     $_SERVER['HTTP_HOST'] = 'pay.example';
-}
-function reset_throttle(): void {
-    Database::update('config', ['value' => '0'], 'key = ?', ['last_background_trigger']);
-    Config::clearCache();
 }
 function wait_for_requests(RequestSink $s, int $n, float $timeout = 3.0): array {
     $deadline = microtime(true) + $timeout;
@@ -122,7 +117,6 @@ $internalKey = Background::getInternalKey();
 // (a) Host names the attacker listener (by address:port, so it would really
 //     be reachable); SERVER_ADDR/PORT are our own listener's.
 reset_server_vars();
-reset_throttle();
 $_SERVER['HTTP_HOST'] = '127.0.0.1:' . $attacker->port;
 $_SERVER['SERVER_ADDR'] = '127.0.0.1';
 $_SERVER['SERVER_PORT'] = (string)$own->port;
@@ -133,15 +127,7 @@ assert_eq('/cron.php?internal=1', $ownReqs[0]['uri'], 'cron path');
 assert_eq($internalKey, $ownReqs[0]['headers']['HTTP_X_CRON_KEY'] ?? null, 'carrying the internal key');
 usleep(300000);
 assert_eq([], $attacker->requests(), 'the attacker listener never saw a request (no Host-derived connect, no redirect follow)');
-assert_true((int)Config::get('last_background_trigger', 0) > 0, 'trigger stamped');
-
-// (b) Throttle: a second trigger inside the window does nothing.
-Background::trigger();
-usleep(300000);
-assert_eq(1, count($own->requests()), 'second trigger within 30 s is coalesced');
-
-// (c) Plain attacker hostname: still lands on our own address.
-reset_throttle();
+// (b) Plain attacker hostname: still lands on our own address.
 $_SERVER['HTTP_HOST'] = 'attacker.example';
 Background::trigger();
 $ownReqs = wait_for_requests($own, 2);
@@ -149,16 +135,14 @@ assert_eq(2, count($ownReqs), 'request with a forged hostname still reached our 
 assert_eq('attacker.example:' . $own->port, $ownReqs[1]['headers']['HTTP_HOST'] ?? null, 'Host header is what the client sent (harmless on our own server)');
 assert_eq([], $attacker->requests(), 'attacker listener still empty');
 
-// (d) Odd Host syntax: nothing is sent anywhere.
-reset_throttle();
+// (c) Odd Host syntax: nothing is sent anywhere.
 $_SERVER['HTTP_HOST'] = 'evil.example/..';
 Background::trigger();
 usleep(300000);
 assert_eq(2, count($own->requests()), 'odd Host -> no self-request');
 assert_eq([], $attacker->requests(), 'and nothing to the attacker');
 
-// (e) Pinned base_url pointing at our own listener: used as-is.
-reset_throttle();
+// (d) Pinned base_url pointing at our own listener: used as-is.
 Config::set('base_url', $own->base);
 $_SERVER['HTTP_HOST'] = '127.0.0.1:' . $attacker->port;
 Background::trigger();

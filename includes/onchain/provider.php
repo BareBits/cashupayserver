@@ -359,6 +359,28 @@ final class BitcoindRpcProvider implements BlockchainProvider {
         }
     }
 
+    /**
+     * Split `scheme://user:pass@host...` into a credential-free URL plus the
+     * matching `Authorization: Basic` header line (none when the URL carries
+     * no userinfo). parse_url percent-decoding is honoured so an encoded
+     * password round-trips the way curl would have sent it.
+     *
+     * @return array{0: string, 1: string[]}
+     */
+    public static function splitCredentials(string $url): array {
+        $parts = parse_url($url);
+        if ($parts === false || (!isset($parts['user']) && !isset($parts['pass']))) {
+            return [$url, []];
+        }
+        $user = rawurldecode((string)($parts['user'] ?? ''));
+        $pass = rawurldecode((string)($parts['pass'] ?? ''));
+        $rebuilt = ($parts['scheme'] ?? 'http') . '://' . ($parts['host'] ?? '')
+            . (isset($parts['port']) ? ':' . $parts['port'] : '')
+            . ($parts['path'] ?? '')
+            . (isset($parts['query']) ? '?' . $parts['query'] : '');
+        return [$rebuilt, ['Authorization: Basic ' . base64_encode($user . ':' . $pass)]];
+    }
+
     public function rpc(string $method, array $params): mixed {
         $body = json_encode([
             'jsonrpc' => '1.0',
@@ -367,13 +389,18 @@ final class BitcoindRpcProvider implements BlockchainProvider {
             'params' => $params,
         ]);
         // bitcoind RPC almost always points at localhost; the URL is
-        // admin-configured via the store record.
-        $result = \SafeHttp::request($this->rpcUrl, [
+        // admin-configured via the store record. Its rpcuser:rpcpassword
+        // ride the URL in the usual bitcoind form, but SafeHttp refuses
+        // userinfo (it must never reach a log line or confuse host parsing),
+        // so they are peeled off here and sent as HTTP basic auth instead.
+        [$url, $headers] = self::splitCredentials($this->rpcUrl);
+        $headers[] = 'Content-Type: application/json';
+        $result = \SafeHttp::request($url, [
             'method' => 'POST',
             'body' => $body,
             'timeout' => $this->timeoutSec,
             'connectTimeout' => 5,
-            'headers' => ['Content-Type: application/json'],
+            'headers' => $headers,
             'allowPrivate' => \SafeHttp::privateEndpointsAllowed(),
         ]);
         if ($result['error'] !== '') {

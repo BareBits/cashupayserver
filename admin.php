@@ -6654,23 +6654,6 @@ header('Cache-Control: no-cache, must-revalidate');
                         </div>
                     </div>
 
-                    <!-- Funds left in a wallet namespace no store uses any more
-                         (a past mint/unit change). Hidden unless the scan finds
-                         something. -->
-                    <div class="card hidden" id="card-stranded-funds" data-admin-only="true">
-                        <div class="card-header">
-                            <div class="card-title">Recover funds from a previous mint</div>
-                        </div>
-                        <div class="card-body">
-                            <p style="font-size: 0.85rem; color: var(--text-secondary); margin: 0 0 0.75rem 0;">
-                                Ecash is still stored for a mint this store no longer uses. Create a recovery
-                                token, claim it in any Cashu wallet, then mark it recovered. The same token
-                                is shown again until it is claimed.
-                            </p>
-                            <div id="stranded-funds-list"></div>
-                        </div>
-                    </div>
-
                     <div class="card collapsible" id="card-payment-order">
                         <div class="card-header">
                             <div class="card-title">Payment order</div>
@@ -7357,6 +7340,23 @@ header('Cache-Control: no-cache, must-revalidate');
                                       user-select:all; font-size:0.9rem;"></code>
                             </div>
                             <button class="btn btn-full" id="btn-reveal-store-seed">Show recovery phrase</button>
+                        </div>
+                    </div>
+
+                    <!-- Funds left in a wallet namespace no store uses any more
+                         (a past mint/unit change). Hidden unless the scan finds
+                         something. -->
+                    <div class="card hidden" id="card-stranded-funds" data-admin-only="true">
+                        <div class="card-header">
+                            <div class="card-title">Recover funds from a previous mint</div>
+                        </div>
+                        <div class="card-body">
+                            <p style="font-size: 0.85rem; color: var(--text-secondary); margin: 0 0 0.75rem 0;">
+                                Ecash is still stored for a mint this store no longer uses. Create a recovery
+                                token, claim it in any Cashu wallet, then mark it recovered. The same token
+                                is shown again until it is claimed.
+                            </p>
+                            <div id="stranded-funds-list"></div>
                         </div>
                     </div>
 
@@ -10076,7 +10076,14 @@ header('Cache-Control: no-cache, must-revalidate');
         }
 
         // Data loading
+        // Dashboard loads overlap (store switch, view switch, a save's own
+        // refresh); only the most recently started one may publish its
+        // payload. A slower, older response landing after a newer one used
+        // to roll the UI back to stale state — e.g. flip the on-chain offer
+        // select back to "on" right after the operator saved "off".
+        let dashboardLoadSeq = 0;
         async function loadDashboard() {
+            const loadSeq = ++dashboardLoadSeq;
             try {
                 // Fetch with store_id if one is selected
                 let url = adminUrl + '?api=dashboard';
@@ -10085,6 +10092,7 @@ header('Cache-Control: no-cache, must-revalidate');
                 }
 
                 const response = await fetch(url);
+                if (loadSeq !== dashboardLoadSeq) return; // superseded by a newer load
 
                 // Handle stale store_id from localStorage (store deleted or new database)
                 if (response.status === 404 && currentStoreId) {
@@ -10095,7 +10103,9 @@ header('Cache-Control: no-cache, must-revalidate');
 
                 if (!response.ok) throw new Error('Failed to load');
 
-                dashboardData = await response.json();
+                const payload = await response.json();
+                if (loadSeq !== dashboardLoadSeq) return; // superseded while the body streamed
+                dashboardData = payload;
 
                 // Update store selector with available stores
                 updateStoreSelector(dashboardData.stores);
@@ -12464,6 +12474,10 @@ header('Cache-Control: no-cache, must-revalidate');
                 return;
             }
             const enabled = document.getElementById('onchain-offer-override').value;
+            // A dashboard load already in flight was answered from the
+            // pre-save state; let the post-save reload below be the one
+            // that publishes, or the select would flip back for a moment.
+            dashboardLoadSeq++;
             try {
                 const response = await postWithCsrf(adminUrl,
                     `action=save_onchain_offer&store_id=${encodeURIComponent(currentStoreId)}&offer_enabled=${encodeURIComponent(enabled)}`);

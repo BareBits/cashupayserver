@@ -173,6 +173,12 @@ class SetupWizard:
             timeout=15,
         )
         assert r.status_code == 200 and r.json().get("success") is True, r.text
+        # The login answer carries the session's CSRF token; the wizard's
+        # tail screens (updates/cron/done) on a configured install are
+        # admin-only POSTs that never render a form to lift it from.
+        tok = r.json().get("csrfToken")
+        if tok:
+            self.csrf_token = tok
 
     def accept_terms(self) -> str:
         """Tick every terms-of-service box — the first-run gate before security.

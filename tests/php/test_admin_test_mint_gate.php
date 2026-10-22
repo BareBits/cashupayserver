@@ -22,9 +22,8 @@ make_store('store_a');
 Config::set('allow_private_endpoints', false);
 // Keep the driver's single php -S worker free: a fresh external-cron stamp
 // makes the login's opportunistic self-trigger run essentials-only (no ipgeo
-// download), and a fresh trigger stamp stops it firing at all during the test.
+// download holding the worker while the next request waits).
 Config::set('last_external_cron_at', time());
-Config::set('last_background_trigger', time());
 
 $srv = HttpDriver::start($dir);
 
