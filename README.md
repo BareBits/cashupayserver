@@ -193,7 +193,7 @@ Absolutely! You can create multiple stores and can create non-admin accounts (so
 
 #### Which wallets do you suggest? What if my wallet is offline or doesn't have enough inbound liquidity?
 
-Any on-chain wallet will work for on-chain payments. Lightning wallets will work for lightning payments if they have NWC, NOFFER, or an LNURL function. We suggest Electrum, see [Suggested Payment Configurations](#Suggested Payment Configurations)
+Any on-chain wallet will work for on-chain payments. Lightning wallets will work for lightning payments if they have NWC, NOFFER, or an LNURL function. We suggest Electrum, see [Suggested Payment Configurations](#suggested-payment-configurations)
 
 If your wallet is offline, on-chain payments continue functioning as normal. Lightning payments require an online wallet, so if your wallet is offline, BareBits gracefully falls back to the next lightning payment option until all are exhausted and if none work, it will skip showing a lightning payment QR code to your customer. You can customize this fallback order. Options include: NWC wallets, CLINK wallets, Strike API wallets, and LNURL wallets. If none of those work, and submarine swaps are enabled, your customer can pay via LN but you receive the funds on-chain. If submarine swaps are not possible (for example it does not meet the minimum transaction size) or disabled, and a cashu mint IS enabled, funds will go to your cashu mint. 
 
