@@ -20,6 +20,11 @@ make_store('store_a');
 // Private endpoints OFF for the policy checks below (the driver env sets the
 // opt-in; the DB key wins).
 Config::set('allow_private_endpoints', false);
+// Keep the driver's single php -S worker free: a fresh external-cron stamp
+// makes the login's opportunistic self-trigger run essentials-only (no ipgeo
+// download), and a fresh trigger stamp stops it firing at all during the test.
+Config::set('last_external_cron_at', time());
+Config::set('last_background_trigger', time());
 
 $srv = HttpDriver::start($dir);
 
