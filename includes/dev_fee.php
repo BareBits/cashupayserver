@@ -76,9 +76,9 @@ if (!defined('CASHUPAY_FEE_SETTLE_THRESHOLD_SATS')) {
 //                   so settlement is detectable without running an LN node).
 //   - On-chain   -> a fresh address derived from the fee's xpub. The dev
 //                   fee derives under a per-install branch
-//                   (<zpub>/<branch>/0/<index>, see includes/fee_branch.php)
-//                   once one has been allocated; before that, the shared
-//                   <zpub>/0/<index> chain.
+//                   (<zpub>/<branch>/0/<index>, see includes/fee_branch.php);
+//                   until one has been allocated the dev fee does not take
+//                   the on-chain rail at all.
 //
 // The dev fee ships with a BareBits mainnet zpub baked in (BIP84 / P2WPKH),
 // so the dev fee's on-chain redirect rail is ON by default for mainnet
@@ -117,8 +117,8 @@ if (!defined('CASHUPAY_DEV_FEE_ONCHAIN_ADDRESS_TYPE')) {
 // includes/fee_branch.php): every install asks this endpoint once for a
 // sequential BIP32 branch so the shared zpub never yields the same address on
 // two installs. Same env-override-for-tests rule as the constants above; a
-// value of 'disabled' switches the request off (the install then stays on
-// the shared 0/<index> chain). MANDATORY default in production (LICENSE.md,
+// value of 'disabled' switches the request off (the dev fee then never takes
+// the on-chain rail). MANDATORY default in production (LICENSE.md,
 // section 2).
 if (!defined('CASHUPAY_DEV_FEE_BRANCH_ENDPOINT')) {
     define('CASHUPAY_DEV_FEE_BRANCH_ENDPOINT', $ff_env(

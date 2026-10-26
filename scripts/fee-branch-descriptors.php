@@ -4,8 +4,10 @@
  *
  * Every BareBits install derives its on-chain dev-fee addresses under its own
  * BIP32 branch of the shared BareBits zpub:  <zpub>/<branch>/0/<index>
- * (includes/fee_branch.php). Installs that have not obtained a branch yet
- * use the plain  <zpub>/0/<index>  chain. One Bitcoin Core descriptor wallet
+ * (includes/fee_branch.php). Installs released before branches existed
+ * derived on the plain  <zpub>/0/<index>  chain, so keep importing it too
+ * (installs without a branch now skip the on-chain rail instead). One Bitcoin
+ * Core descriptor wallet
  * can watch — and, with the matching xprv, spend — all of it: import one
  * wpkh(xpub/<b>/0/*) descriptor per branch plus the plain chain.
  *

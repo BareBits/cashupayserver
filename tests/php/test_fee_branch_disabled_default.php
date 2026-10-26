@@ -4,8 +4,8 @@
  * must. The guard is the fixtures' `.updater_disabled` sentinel in the data
  * dir (tests/fixtures/payserver.py writes it): with the sentinel present and
  * no explicit CASHUPAY_DEV_FEE_BRANCH_ENDPOINT, FeeBranch is disabled — the
- * cron tick reports 'disabled', ensure() is a no-op, fee addresses stay on
- * the shared chain. The CASHUPAY_UPDATER_DISABLED env var alone must NOT
+ * cron tick reports 'disabled', ensure() is a no-op, the dev fee never takes
+ * an on-chain rail. The CASHUPAY_UPDATER_DISABLED env var alone must NOT
  * disable it: the Windows desktop launcher sets that for real users.
  */
 declare(strict_types=1);

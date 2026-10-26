@@ -76,9 +76,9 @@ assert_eq(0, $b0['index'], 'branch 8 is independent of branch 7');
 $p2 = OnchainPayments::allocateFeeAddress($xpubA, 'mainnet', 'P2WPKH', null);
 assert_eq(2, $p2['index'], 'plain chain counter untouched by branched allocations');
 assert_eq(6, count(array_unique(array_column([$p0, $p1, $a0, $a1, $b0, $p2], 'address'))), 'six distinct addresses');
-// Switching an install from plain to branched mid-life: the branched stream
-// starts at 0 even though the plain stream is at 3 — by design, the sweep
-// wallet scans each chain from 0.
+// The branched stream starts at 0 regardless of the plain stream's position
+// (installs that predate branches advanced it) — by design, the sweep wallet
+// scans each chain from 0.
 $row = Database::fetchOne("SELECT next_index FROM onchain_xpub_state WHERE xpub_hash = ?", [hash('sha256', $xpubA . '/7')]);
 assert_eq(2, (int)$row['next_index'], 'branched counter keyed by xpub/branch');
 

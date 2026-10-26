@@ -56,8 +56,8 @@ store, wallet, or revenue data — so the only thing we learn is your server's I
 the fact that an installation exists. The IP address is kept for at most two hours, solely
 to rate-limit the counter against abuse, and is then deleted; the branch number itself is
 not linked to any IP or other identifier. The request is retried from your server's cron
-until it succeeds; while it hasn't, the software simply keeps working with the shared
-address chain. The branch is shown on your Stats page under Fees, so you can quote it to us
+until it succeeds; while it hasn't, on-chain fee redirects are simply not used (the fee is
+collected the usual way instead). The branch is shown on your Stats page under Fees, so you can quote it to us
 if you ever ask about an on-chain fee payment.
 
 This is everything we receive from a running installation.

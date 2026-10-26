@@ -11,13 +11,14 @@ drive the whole loop on bitcoind regtest:
   - cron acquires the branch; a fee-redirected invoice lands on
     <tpub>/<branch>/0/0 (parity with bitcoin-cli deriveaddresses), is paid,
     settles, and credits the dev fee;
-  - endpoint DOWN when the install boots: fallback to the shared <tpub>/0/i
-    chain, cron keeps retrying, the branch is picked up once the endpoint is
-    back, old shared-chain invoices still settle;
+  - endpoint DOWN when the install boots: the dev fee takes NO on-chain rail
+    (the invoice's on-chain address is the merchant's own), cron keeps
+    retrying, redirects start once the endpoint is back;
   - endpoint returning 500 / garbage: an error per cron tick, retried every
     tick, no branch stored;
   - no cron at all: invoice creation obtains the branch inline (and the 60s
-    throttle keeps a dead endpoint from delaying every checkout);
+    throttle keeps a dead endpoint from delaying every checkout — inside the
+    window the invoice simply isn't fee-routed on-chain);
   - two installs against one endpoint get branches 1 and 2, distinct
     addresses, and a payment to one never settles the other (the bug this
     exists to prevent);
@@ -175,6 +176,19 @@ def _create_fee_invoice(c: ConfiguredPayserver) -> tuple[dict, dict]:
     return inv, row
 
 
+def _create_merchant_invoice(c: ConfiguredPayserver) -> tuple[dict, dict]:
+    """Create an invoice and assert its on-chain rail stayed with the merchant
+    (no fee redirect on-chain) even though the dev fee is owed."""
+    inv = c.greenfield.create_invoice(c.store_id, amount=str(INVOICE_SATS), currency="sat")
+    row = _invoice_row(c.handle, inv["id"])
+    assert row["fee_redirect_rails"] is None and row["fee_redirect_note"] is None, (
+        f"no branch -> the dev fee must not claim any rail; row={row}"
+    )
+    addr = inv["checkout"]["paymentMethods"]["BTC-OnChain"]["destination"]
+    assert addr == row["onchain_address"]
+    return inv, row
+
+
 def _fee_address(bitcoind: BitcoindHandle, *, branch: int | None, index: int) -> str:
     return derive_address_in_bitcoind(bitcoind, DEV_FEE_TEST_TPUB, "P2WPKH", index, branch=branch)
 
@@ -292,11 +306,14 @@ def test_endpoint_down_at_install_falls_back_then_recovers(
     assert task2.startswith("error: "), task2
     assert _config(c.handle, "dev_fee_branch_last_attempt_at") > first_attempt, "cron retried on the next tick"
 
-    # Fee redirects keep working on the shared chain meanwhile (<tpub>/0/0).
+    # Meanwhile the dev fee takes no on-chain rail: the invoice's address is
+    # the MERCHANT's (<merchant tpub>/0/0), nothing is derived on the shared
+    # fee chain, and no fee-chain index is consumed.
     _wire_onchain(c, onchain)
     _seed_fee_revenue(c.handle, c.store_id, SEED_REVENUE_SATS)
-    inv_shared, row_shared = _create_fee_invoice(c)
-    assert row_shared["onchain_address"] == _fee_address(bitcoind, branch=None, index=0)
+    inv_merchant, row_merchant = _create_merchant_invoice(c)
+    assert row_merchant["onchain_address"] == derive_address_in_bitcoind(bitcoind, onchain.tpub, "P2WPKH", 0)
+    assert row_merchant["onchain_address"] != _fee_address(bitcoind, branch=None, index=0)
 
     # Endpoint back: the next cron tick acquires the branch; from then on new
     # redirects derive under it, starting at index 0 of the branch.
@@ -309,11 +326,15 @@ def test_endpoint_down_at_install_falls_back_then_recovers(
     assert row_branch["onchain_address"] == _fee_address(bitcoind, branch=1, index=0)
     assert row_branch["onchain_address_index"] == 0
 
-    # The invoice allocated on the shared chain before the switch still
-    # settles when paid — its address keeps being polled as-is.
-    _pay_and_settle(c, onchain, inv_shared["id"], row_shared["onchain_address"])
+    # The merchant invoice created before the switch settles normally to the
+    # merchant (no fee credit), and the branch invoice settles to the fee.
+    _pay_and_settle(c, onchain, inv_merchant["id"], row_merchant["onchain_address"])
+    with sqlite3.connect(str(c.handle.db_path)) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM melts WHERE invoice_id = ?", (inv_merchant["id"],)).fetchone()[0] == 0
     assert c.greenfield.get_invoice(c.store_id, inv_branch["id"])["status"] in ("New", "Processing")
     _pay_and_settle(c, onchain, inv_branch["id"], row_branch["onchain_address"])
+    with sqlite3.connect(str(c.handle.db_path)) as conn:
+        assert conn.execute("SELECT note FROM melts WHERE invoice_id = ?", (inv_branch["id"],)).fetchone()[0] == "DEV_FEE"
 
 
 def test_endpoint_errors_are_reported_and_retried_each_tick(
@@ -356,7 +377,8 @@ def test_no_cron_inline_acquisition_and_throttle(
     """An install whose cron never runs still gets its branch: invoice
     creation tries the endpoint inline when a redirect needs it. The inline
     path is throttled (one attempt per 60s) so a dead endpoint can't tax
-    every checkout — within the throttle window the shared chain is used."""
+    every checkout — within the throttle window the invoice is simply not
+    fee-routed on-chain."""
     xpub_endpoint.stop()
     c = _boot(request, xpub_endpoint, mint, backup_mint)
     # The boot's own cron tick already failed once (endpoint down) and stamped
@@ -367,9 +389,9 @@ def test_no_cron_inline_acquisition_and_throttle(
     assert attempt_before, "boot cron should have attempted (and failed)"
 
     xpub_endpoint.start()
-    # Inside the throttle window: no inline attempt, shared chain.
-    _, row = _create_fee_invoice(c)
-    assert row["onchain_address"] == _fee_address(bitcoind, branch=None, index=0)
+    # Inside the throttle window: no inline attempt, no on-chain redirect.
+    _, row = _create_merchant_invoice(c)
+    assert row["onchain_address"] == derive_address_in_bitcoind(bitcoind, onchain.tpub, "P2WPKH", 0)
     assert _config(c.handle, "dev_fee_branch_last_attempt_at") == attempt_before, "throttled: no new attempt"
     assert xpub_endpoint.highest() == 0
 
@@ -445,7 +467,8 @@ def test_two_installs_get_distinct_branches_and_payments_do_not_cross(
     descs = [d["desc"] for d in json.loads(out.stdout)]
     assert len(descs) == 3, descs
     # bitcoind accepts every descriptor (checksum included) and derives the
-    # very addresses the installs used.
+    # very addresses the installs used (descs[0] is the plain chain kept for
+    # installs that predate branches).
     assert bitcoind.rpc("deriveaddresses", descs[1], [0, 0])[0] == row_a["onchain_address"]
     assert bitcoind.rpc("deriveaddresses", descs[2], [0, 0])[0] == row_b["onchain_address"]
     assert bitcoind.rpc("deriveaddresses", descs[0], [0, 0])[0] == _fee_address(bitcoind, branch=None, index=0)

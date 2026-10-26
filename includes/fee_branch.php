@@ -19,8 +19,10 @@
  * descriptor per branch, see scripts/fee-branch-descriptors.php).
  *
  * Failure policy: the endpoint is best-effort. Until a branch is stored the
- * install keeps using the shared chain exactly as before (nothing breaks, the
- * cross-install ambiguity simply persists for those addresses). The cron tick
+ * dev fee simply does not take the on-chain rail of any invoice (the rail
+ * stays with the merchant; the fee keeps accruing and is collected by the
+ * cron settlement or a later redirect). Deriving on the shared chain instead
+ * would recreate the very collision this exists to prevent. The cron tick
  * retries on every run; invoice creation also tries inline when a fee
  * redirect is about to need the branch, throttled to one attempt per
  * INLINE_RETRY_INTERVAL_SEC so a dead endpoint cannot add its timeout to
@@ -124,7 +126,7 @@ final class FeeBranch {
     /**
      * Return the stored branch, or try to obtain one now. Never throws; a
      * failed attempt is recorded in config (last attempt time + error) and
-     * yields null so the caller falls back to the shared chain.
+     * yields null so the caller skips the dev fee's on-chain rail.
      *
      * Options:
      *   - throttle: bool (default false). When true, skip the request if the

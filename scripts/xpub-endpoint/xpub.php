@@ -7,7 +7,8 @@
  * identical address at the same index and could no longer tell whose customer
  * paid. This endpoint hands every install a unique, sequential BIP32 "branch"
  * number; the install then derives fee addresses at  <zpub>/<branch>/0/<index>
- * (see includes/fee_branch.php in the payserver). BareBits sweeps the lot with
+ * (see includes/fee_branch.php in the payserver); without a branch the dev fee
+ * never takes the on-chain rail. BareBits sweeps the lot with
  * one Bitcoin Core descriptor wallet that imports  wpkh(xpub/<b>/0/*)  for
  * every branch up to the highest one allocated (scripts/fee-branch-descriptors.php
  * prints the import list).

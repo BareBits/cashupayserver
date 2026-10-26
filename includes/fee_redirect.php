@@ -69,8 +69,8 @@ class FeeRedirect {
                 'network' => (string)CASHUPAY_DEV_FEE_ONCHAIN_NETWORK,
                 'type'    => (string)CASHUPAY_DEV_FEE_ONCHAIN_ADDRESS_TYPE,
                 // Per-install branch under the shared BareBits zpub (null until
-                // allocated — buildRails tries to obtain one inline, and falls
-                // back to the shared 0/<index> chain when it can't).
+                // allocated — buildRails tries to obtain one inline, and leaves
+                // the on-chain rail to the merchant when it can't).
                 'branch'  => FeeBranch::current(),
             ],
             [
@@ -235,8 +235,17 @@ class FeeRedirect {
                 if ($branch === null && ($cand['key'] ?? '') === 'dev') {
                     // No branch stored yet: one throttled inline attempt so an
                     // install whose cron never fired still gets its branch
-                    // the first time it matters. Null again = shared chain.
+                    // the first time it matters.
                     $branch = FeeBranch::ensure(['throttle' => true]);
+                }
+                if ($branch === null && ($cand['key'] ?? '') === 'dev') {
+                    // Still none: the dev fee does NOT take the on-chain rail
+                    // on this invoice. Deriving on the shared <zpub>/0/<index>
+                    // chain would hand two installs the same address, which is
+                    // exactly the ambiguity the branch exists to prevent — so
+                    // the rail stays with the merchant and the fee keeps
+                    // accruing for the cron settlement / a later redirect.
+                    throw new RuntimeException('no dev-fee branch allocated yet (see cron task fee_branch)');
                 }
                 $alloc = OnchainPayments::allocateFeeAddress(
                     $cand['xpub'], $cand['network'], $cand['type'], $store, $branch
@@ -250,10 +259,6 @@ class FeeRedirect {
                 ];
                 $rails[] = 'onchain';
                 $labels[] = $alloc['address'];
-                if (($cand['key'] ?? '') === 'dev' && $branch === null) {
-                    error_log('[fee-redirect] dev fee on-chain address allocated on the SHARED chain '
-                        . '(no branch yet; see cron task fee_branch)');
-                }
             } catch (Throwable $e) {
                 error_log('[fee-redirect] onchain rail derivation failed for '
                     . ($cand['key'] ?? '?') . ': ' . $e->getMessage()

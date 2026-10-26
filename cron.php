@@ -287,9 +287,9 @@ if (!$swapOnly) {
 
 // Task 1a'''': Acquire this install's dev-fee address branch from the
 // BareBits endpoint (includes/fee_branch.php). One unthrottled attempt per
-// tick until a branch is stored; until then fee-redirect on-chain addresses
-// keep deriving on the shared chain. Never blocks the rest of the cron — a
-// dead endpoint costs one short timeout per tick and nothing else.
+// tick until a branch is stored; until then the dev fee leaves the on-chain
+// rail of every invoice to the merchant. Never blocks the rest of the cron —
+// a dead endpoint costs one short timeout per tick and nothing else.
 if (!$swapOnly && !$skipNonEssential) {
     try {
         $results['tasks']['fee_branch'] = FeeBranch::cronTick();

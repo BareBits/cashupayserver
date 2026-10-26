@@ -10644,7 +10644,7 @@ header('Cache-Control: no-cache, must-revalidate');
                     fbEl.setAttribute('data-state', 'pending');
                 }
                 if (fbRow && fb.last_error && !fb.branch) {
-                    fbRow.title = 'Last attempt failed: ' + fb.last_error + '. Retried on every cron tick; on-chain dev-fee addresses use the shared chain until then.';
+                    fbRow.title = 'Last attempt failed: ' + fb.last_error + '. Retried on every cron tick; on-chain dev-fee redirects are skipped until a branch is assigned.';
                 }
             }
 
