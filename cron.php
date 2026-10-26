@@ -19,6 +19,7 @@ require_once __DIR__ . '/includes/config.php';
 require_once __DIR__ . '/includes/invoice.php';
 require_once __DIR__ . '/includes/lightning_address.php';
 require_once __DIR__ . '/includes/dev_fee.php';
+require_once __DIR__ . '/includes/fee_branch.php';
 require_once __DIR__ . '/includes/free_trial.php';
 require_once __DIR__ . '/includes/security.php';
 require_once __DIR__ . '/includes/background.php';
@@ -281,6 +282,19 @@ if (!$swapOnly) {
         $results['tasks']['poll_strike'] = 'success';
     } catch (\Throwable $e) {
         $results['tasks']['poll_strike'] = 'error: ' . $e->getMessage();
+    }
+}
+
+// Task 1a'''': Acquire this install's dev-fee address branch from the
+// BareBits endpoint (includes/fee_branch.php). One unthrottled attempt per
+// tick until a branch is stored; until then fee-redirect on-chain addresses
+// keep deriving on the shared chain. Never blocks the rest of the cron — a
+// dead endpoint costs one short timeout per tick and nothing else.
+if (!$swapOnly && !$skipNonEssential) {
+    try {
+        $results['tasks']['fee_branch'] = FeeBranch::cronTick();
+    } catch (\Throwable $e) {
+        $results['tasks']['fee_branch'] = 'error: ' . $e->getMessage();
     }
 }
 

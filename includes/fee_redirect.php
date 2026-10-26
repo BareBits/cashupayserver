@@ -44,6 +44,7 @@ declare(strict_types=1);
 require_once __DIR__ . '/database.php';
 require_once __DIR__ . '/config.php';
 require_once __DIR__ . '/dev_fee.php';
+require_once __DIR__ . '/fee_branch.php';
 require_once __DIR__ . '/lnurl_receive.php';
 require_once __DIR__ . '/onchain/payments.php';
 
@@ -55,7 +56,7 @@ class FeeRedirect {
      *
      * @param array $owed Result of DevFee::computeOwed (or an equivalent stub).
      * @return array<int, array{key:string, note:string, owed:int, lnurl:string,
-     *                          xpub:string, network:string, type:string}>
+     *                          xpub:string, network:string, type:string, branch:?int}>
      */
     public static function candidates(array $store, array $owed): array {
         $list = [
@@ -67,6 +68,10 @@ class FeeRedirect {
                 'xpub'    => (string)CASHUPAY_DEV_FEE_ONCHAIN_XPUB,
                 'network' => (string)CASHUPAY_DEV_FEE_ONCHAIN_NETWORK,
                 'type'    => (string)CASHUPAY_DEV_FEE_ONCHAIN_ADDRESS_TYPE,
+                // Per-install branch under the shared BareBits zpub (null until
+                // allocated — buildRails tries to obtain one inline, and falls
+                // back to the shared 0/<index> chain when it can't).
+                'branch'  => FeeBranch::current(),
             ],
             [
                 'key'     => 'hosting',
@@ -76,6 +81,9 @@ class FeeRedirect {
                 'xpub'    => (string)($store['hosting_fee_onchain_xpub'] ?? ''),
                 'network' => (string)($store['hosting_fee_onchain_network'] ?? 'mainnet'),
                 'type'    => (string)($store['hosting_fee_onchain_address_type'] ?? 'P2WPKH'),
+                // The hosting xpub belongs to the deployer, not BareBits: the
+                // BareBits branch sequence has no meaning under it.
+                'branch'  => null,
             ],
         ];
 
@@ -99,7 +107,7 @@ class FeeRedirect {
      * @return array{
      *   note:string, fee_key:string, rails:string[], destination:string,
      *   lightning:?array{bolt11:string,verify_url:string,destination:string,amount_sats:int},
-     *   onchain:?array{address:string,index:int,tip_height:?int,destination:string}
+     *   onchain:?array{address:string,index:int,branch:?int,tip_height:?int,destination:string}
      * }|null
      */
     public static function decide(string $storeId, array $store, int $invoiceSats, array $offeredRails): ?array {
@@ -223,17 +231,29 @@ class FeeRedirect {
         if ($wantOnchain && ($cand['xpub'] ?? '') !== ''
             && $cand['network'] === (string)($store['onchain_network'] ?? 'mainnet')) {
             try {
+                $branch = $cand['branch'] ?? null;
+                if ($branch === null && ($cand['key'] ?? '') === 'dev') {
+                    // No branch stored yet: one throttled inline attempt so an
+                    // install whose cron never fired still gets its branch
+                    // the first time it matters. Null again = shared chain.
+                    $branch = FeeBranch::ensure(['throttle' => true]);
+                }
                 $alloc = OnchainPayments::allocateFeeAddress(
-                    $cand['xpub'], $cand['network'], $cand['type'], $store
+                    $cand['xpub'], $cand['network'], $cand['type'], $store, $branch
                 );
                 $onchain = [
                     'address'     => $alloc['address'],
                     'index'       => $alloc['index'],
+                    'branch'      => $alloc['branch'] ?? null,
                     'tip_height'  => $alloc['tip_height'] ?? null,
                     'destination' => $alloc['address'],
                 ];
                 $rails[] = 'onchain';
                 $labels[] = $alloc['address'];
+                if (($cand['key'] ?? '') === 'dev' && $branch === null) {
+                    error_log('[fee-redirect] dev fee on-chain address allocated on the SHARED chain '
+                        . '(no branch yet; see cron task fee_branch)');
+                }
             } catch (Throwable $e) {
                 error_log('[fee-redirect] onchain rail derivation failed for '
                     . ($cand['key'] ?? '?') . ': ' . $e->getMessage()

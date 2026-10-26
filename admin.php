@@ -8339,6 +8339,10 @@ header('Cache-Control: no-cache, must-revalidate');
                                     <span class="stats-stat-label">Effective fee % (paid &divide; revenue)</span>
                                     <span class="stats-stat-value" id="stats-effective-fee">—</span>
                                 </div>
+                                <div class="stats-stat-row" id="stats-fee-branch-row" title="Install-wide BIP32 branch that on-chain dev-fee payments derive under (zpub/&lt;branch&gt;/0/&lt;index&gt;). Assigned once by getbarebits.com; retried on every cron tick until assigned. Quote it to BareBits support when asking about an on-chain fee payment.">
+                                    <span class="stats-stat-label">Dev fee address branch</span>
+                                    <span class="stats-stat-value" id="stats-fee-branch">—</span>
+                                </div>
                             </div>
                             <div>
                                 <div style="position: relative; height: 240px;">
@@ -10623,6 +10627,26 @@ header('Cache-Control: no-cache, must-revalidate');
 
             const pct = (s.effective_fee_pct || 0).toFixed(2);
             document.getElementById('stats-effective-fee').textContent = `${pct}%`;
+
+            // Dev-fee address branch (install-wide; see includes/fee_branch.php).
+            const fb = s.dev_fee_branch || {};
+            const fbEl = document.getElementById('stats-fee-branch');
+            const fbRow = document.getElementById('stats-fee-branch-row');
+            if (fbEl) {
+                if (fb.branch) {
+                    fbEl.textContent = '#' + fb.branch;
+                    fbEl.removeAttribute('data-state');
+                } else if (fb.disabled) {
+                    fbEl.textContent = 'off';
+                    fbEl.setAttribute('data-state', 'disabled');
+                } else {
+                    fbEl.textContent = fb.last_attempt_at ? 'pending (retrying)' : 'pending';
+                    fbEl.setAttribute('data-state', 'pending');
+                }
+                if (fbRow && fb.last_error && !fb.branch) {
+                    fbRow.title = 'Last attempt failed: ' + fb.last_error + '. Retried on every cron tick; on-chain dev-fee addresses use the shared chain until then.';
+                }
+            }
 
             renderFreeTrialBanner(s.free_trial);
             renderCcSaved();

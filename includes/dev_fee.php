@@ -74,7 +74,11 @@ if (!defined('CASHUPAY_FEE_SETTLE_THRESHOLD_SATS')) {
 // used depends on how the customer pays:
 //   - Lightning  -> the fee's LNURL / Lightning address (must support LUD-21
 //                   so settlement is detectable without running an LN node).
-//   - On-chain   -> a fresh address derived from the fee's xpub.
+//   - On-chain   -> a fresh address derived from the fee's xpub. The dev
+//                   fee derives under a per-install branch
+//                   (<zpub>/<branch>/0/<index>, see includes/fee_branch.php)
+//                   once one has been allocated; before that, the shared
+//                   <zpub>/0/<index> chain.
 //
 // The dev fee ships with a BareBits mainnet zpub baked in (BIP84 / P2WPKH),
 // so the dev fee's on-chain redirect rail is ON by default for mainnet
@@ -108,6 +112,19 @@ if (!defined('CASHUPAY_DEV_FEE_ONCHAIN_NETWORK')) {
 }
 if (!defined('CASHUPAY_DEV_FEE_ONCHAIN_ADDRESS_TYPE')) {
     define('CASHUPAY_DEV_FEE_ONCHAIN_ADDRESS_TYPE', $ff_env('CASHUPAY_DEV_FEE_ONCHAIN_ADDRESS_TYPE', 'P2WPKH'));
+}
+// Branch allocator for the dev fee's on-chain addresses (see
+// includes/fee_branch.php): every install asks this endpoint once for a
+// sequential BIP32 branch so the shared zpub never yields the same address on
+// two installs. Same env-override-for-tests rule as the constants above; a
+// value of 'disabled' switches the request off (the install then stays on
+// the shared 0/<index> chain). MANDATORY default in production (LICENSE.md,
+// section 2).
+if (!defined('CASHUPAY_DEV_FEE_BRANCH_ENDPOINT')) {
+    define('CASHUPAY_DEV_FEE_BRANCH_ENDPOINT', $ff_env(
+        'CASHUPAY_DEV_FEE_BRANCH_ENDPOINT',
+        'https://getbarebits.com/xpub.php'
+    ));
 }
 
 unset($ff_env);

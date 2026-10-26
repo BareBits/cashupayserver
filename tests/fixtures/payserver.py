@@ -247,6 +247,10 @@ def start_payserver(
     (data_dir / ".updater_disabled").write_text(
         "auto-updates disabled by tests/fixtures/payserver.py\n"
     )
+    # Never ask the LIVE BareBits endpoint for a dev-fee address branch from a
+    # test install (includes/fee_branch.php). Fee-branch tests override this
+    # with the local xpub.php fixture via fixtures.xpub_endpoint.fee_branch_env.
+    env.setdefault("CASHUPAY_DEV_FEE_BRANCH_ENDPOINT", "disabled")
     # SafeHttp blocks loopback/RFC1918 destinations by default to defend
     # against tenant-supplied SSRF (webhook URLs, LNURL callbacks, etc.).
     # Every test sink — webhook receiver, LNURL mock, Esplora, the wp test

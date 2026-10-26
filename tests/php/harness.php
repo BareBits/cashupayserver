@@ -81,6 +81,13 @@ function fresh_db(): string {
     $dir = sys_get_temp_dir() . '/cashupay_test_' . bin2hex(random_bytes(6));
     mkdir($dir, 0750, true);
     define('CASHUPAY_DATA_DIR', $dir);
+    // Never let a unit test ask the live BareBits endpoint for a dev-fee
+    // branch (includes/fee_branch.php). Tests that exercise the client point
+    // this at a local php -S copy of scripts/xpub-endpoint/xpub.php BEFORE
+    // calling fresh_db().
+    if (getenv('CASHUPAY_DEV_FEE_BRANCH_ENDPOINT') === false) {
+        putenv('CASHUPAY_DEV_FEE_BRANCH_ENDPOINT=disabled');
+    }
 
     require_once dirname(__DIR__, 2) . '/includes/database.php';
     Database::ensureExists();

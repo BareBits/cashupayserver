@@ -44,6 +44,8 @@ if (-not (Test-Path $DriverPhp)) { throw "desktop-smoke.php not found next to th
 # Keep the update-check cron task from reaching out to GitHub mid-smoke for
 # processes we spawn directly (the .bat sets this for its own children anyway).
 $env:CASHUPAY_UPDATER_DISABLED = '1'
+# Smoke installs must not take a dev-fee branch from the live BareBits endpoint.
+$env:CASHUPAY_DEV_FEE_BRANCH_ENDPOINT = 'disabled'
 # Fast helper ticks so the 3-missed-ticks self-shutdown is observable.
 $env:CASHUPAY_HELPER_TICK = '2'
 
