@@ -81,6 +81,16 @@ Playwright note: the admin SPA auto-selects `stores[0]` unless
 `localStorage.selectedStoreId` is set, so UI tests on a shared server must
 pin their own store (see `add_init_script(...selectedStoreId...)` uses).
 
+Playwright note: two admin loads re-render the per-store cards from scratch
+and wipe unsaved edits made before they land — `loadStoreSettings()` (the
+Stores tab, after `?api=stores`) and the un-awaited `loadDashboard()` every
+save fires. Gate on them with `fixtures.browser.wait_for_store_settings_loaded`
+and `wait_for_dashboard_settled` (which reads the page's
+`dashboardLoadSeq`/`dashboardRenderedSeq` counters) instead of sleeping.
+Also, wait for a modal to close with `wait_for_selector("#modal.visible",
+state="hidden")` — a `:not(.visible)` selector with the default visible-state
+wait only matches during the fade-out.
+
 ## WordPress golden templates
 
 The WP tier used to run `wp core install` (+ plugin activations, + the whole

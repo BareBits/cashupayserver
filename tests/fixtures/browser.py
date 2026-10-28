@@ -37,6 +37,43 @@ def page(browser):
     context.close()
 
 
+def dashboard_seq(page) -> int:
+    """The admin page's dashboard load counter (see loadDashboard in admin.php)."""
+    return int(page.evaluate("() => (typeof dashboardLoadSeq === 'number') ? dashboardLoadSeq : 0"))
+
+
+def wait_for_dashboard_settled(page, after_seq: int | None = None, timeout: int = 30000) -> None:
+    """Block until no dashboard load is in flight — every loadDashboard() that
+    started has finished rendering. Several admin saves kick off a reload
+    without awaiting it; that reload re-renders the Lightning-payments lists
+    (and more) from the payload, wiping unsaved rows and undoing in-progress
+    edits. Pass `after_seq` (a dashboard_seq() reading taken before the action)
+    to additionally require that at least one NEW load started since, so a
+    reload the action is expected to trigger can't be missed by arriving
+    early."""
+    page.wait_for_function(
+        "(n) => typeof dashboardLoadSeq === 'number'"
+        " && dashboardRenderedSeq === dashboardLoadSeq"
+        " && (n === null || dashboardLoadSeq > n)",
+        arg=after_seq,
+        timeout=timeout,
+    )
+
+
+def wait_for_store_settings_loaded(page, store_id: str, timeout: int = 30000) -> None:
+    """The Stores view's loadStoreSettings() awaits ?api=stores and then
+    re-renders the per-store cards — including the Lightning-payments lists —
+    from scratch. Store Info's id is written in the same synchronous block,
+    so once it shows this store the re-render has already happened and rows
+    added afterwards survive."""
+    page.wait_for_function(
+        "(id) => document.getElementById('store-settings-id')"
+        " && document.getElementById('store-settings-id').textContent.trim() === id",
+        arg=store_id,
+        timeout=timeout,
+    )
+
+
 def open_manual_mints(page) -> None:
     """Expand the wizard's manual mint entry with verify-and-retry.
 

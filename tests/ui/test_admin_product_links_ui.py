@@ -20,6 +20,7 @@ import secrets
 import time
 
 import pytest
+from playwright.sync_api import expect
 
 from conftest import ConfiguredPayserver
 
@@ -39,6 +40,23 @@ def _login(configured: ConfiguredPayserver, page) -> None:
     # (payUrl, enabled state) is loaded per selected store.
     page.select_option("#store-select", configured.store_id)
     page.wait_for_function("() => dashboardData && dashboardData.selfserve")
+
+
+def _cart_modal_state(page) -> dict:
+    return page.evaluate(
+        """() => {
+            const m = document.getElementById('modal-cart');
+            const b = document.getElementById('btn-cart-checkout');
+            const box = el => { const r = el.getBoundingClientRect(); return [r.x, r.y, r.width, r.height]; };
+            const vis = el => { const s = getComputedStyle(el); return [s.display, s.visibility, s.opacity]; };
+            return {
+                modalClass: m.className, modalStyle: vis(m), modalBox: box(m),
+                btnText: b.textContent, btnStyle: vis(b), btnBox: box(b), btnDisplay: b.style.display,
+                lockScreen: document.getElementById('lock-screen')?.className,
+                app: document.getElementById('app')?.className,
+            };
+        }"""
+    )
 
 
 def _set_selfserve(configured: ConfiguredPayserver, enabled: bool) -> None:
@@ -86,7 +104,14 @@ def test_invoices_view_offers_both_create_flows(
     page.click("#btn-new-invoice-advanced")
     page.wait_for_selector("#modal-cart.visible")
     assert page.locator("#cart-modal-title").inner_text().strip() == "Create invoice"
-    assert page.locator("#btn-cart-checkout").inner_text().strip() == "Create"
+    # Retrying assertion: this read came back '' in ~7 CI runs on 2026-10-21/22
+    # without a reproducible cause (an empty innerText means the overlay was
+    # not visible at that instant). Retry briefly, and on failure dump the
+    # modal state so the next occurrence is diagnosable.
+    try:
+        expect(page.locator("#btn-cart-checkout")).to_have_text("Create", timeout=5000)
+    except AssertionError as e:
+        raise AssertionError(f"{e}\nmodal state: {_cart_modal_state(page)}") from None
     page.evaluate("() => closeModal('modal-cart')")
 
     # …and the simple button still opens the simple modal.

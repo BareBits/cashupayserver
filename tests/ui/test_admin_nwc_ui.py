@@ -19,6 +19,11 @@ from typing import Iterator
 import pytest
 
 from conftest import ConfiguredPayserver, SESSION_TMP
+from fixtures.browser import (
+    dashboard_seq,
+    wait_for_dashboard_settled,
+    wait_for_store_settings_loaded,
+)
 from fixtures.lnd import LndHandle
 from fixtures.nwc_wallet import NwcStack, start_nwc_stack, stop_nwc_stack
 
@@ -61,15 +66,22 @@ def _reset_toast(page) -> None:
 def _save_lists_and_wait(page) -> None:
     """Save the Lightning payments lists and wait for a fresh success toast."""
     _reset_toast(page)
+    seq = dashboard_seq(page)
     page.click("#btn-save-lightning-payments")
     page.wait_for_selector("#toast.show:has-text('Settings saved!')", timeout=30000)
+    # The save kicks off an un-awaited dashboard reload that re-renders the
+    # lists; wait it out so the next edit can't be undone by it.
+    wait_for_dashboard_settled(page, after_seq=seq)
 
 
 def _save_cashout_and_wait(page) -> None:
     """Save the Cashu automatic cashout card and wait for its success toast."""
     _reset_toast(page)
+    seq = dashboard_seq(page)
     page.click("#btn-save-auto-melt")
     page.wait_for_selector("#toast.show:has-text('Settings saved!')", timeout=30000)
+    # Same un-awaited post-save reload as the lists save.
+    wait_for_dashboard_settled(page, after_seq=seq)
 
 
 def _open_lightning_payments(page, configured: ConfiguredPayserver) -> None:
@@ -97,14 +109,14 @@ def _open_lightning_payments(page, configured: ConfiguredPayserver) -> None:
     # The lists live in the always-visible "Lightning payments" card now — no
     # cashout-mode column click needed to reveal them.
     page.wait_for_selector("#card-lightning-payments", state="visible")
-    # Wait for the dashboard payload to land (it re-renders the saved lists);
-    # rows added before that render would be wiped by it. It also applies the
-    # per-section default collapse states, so the expansion below must come
-    # after it or it would be undone.
-    page.wait_for_function(
-        "() => { const el = document.getElementById('onchain-offer-effective');"
-        " return el && el.textContent.trim() && el.textContent.trim() !== '\\u2014'; }"
-    )
+    # Two async loads re-render the saved lists from scratch and would wipe
+    # rows added before they land: the dashboard payload (already loaded at
+    # login, and re-fetched on store switches) and loadStoreSettings(), which
+    # the Stores click above fires and which awaits ?api=stores first. Gate on
+    # both. They also apply the per-section default collapse states, so the
+    # expansion below must come after them or it would be undone.
+    wait_for_store_settings_loaded(page, configured.store_id)
+    wait_for_dashboard_settled(page)
     # Sections with no saved entries are collapsed by default; expand them all
     # so the test can drive the controls directly (the default-state behavior
     # has its own coverage in test_settings_lightning_sections.py).
@@ -136,7 +148,6 @@ def test_add_save_masked_rerender_and_remove(
     # the list save: its dashboard reload resets these inputs to persisted
     # values. The toggle is a CSS-hidden checkbox, so set it directly; the
     # value is only read on save.
-    page.wait_for_timeout(1500)  # let the post-save dashboard reload land
     page.evaluate("() => { document.getElementById('auto-melt-enabled').checked = true; }")
     page.fill("#auto-melt-threshold", "100")
     _save_cashout_and_wait(page)
@@ -157,7 +168,6 @@ def test_add_save_masked_rerender_and_remove(
     # --- remove + save clears the chain ---
     # Turn auto-melt off first (its own save button), then clear the list —
     # leaving auto-cashout enabled with no destinations would be a dead config.
-    page.wait_for_timeout(1500)  # let the post-save dashboard reload land
     page.evaluate("() => { document.getElementById('auto-melt-enabled').checked = false; }")
     _save_cashout_and_wait(page)
     page.wait_for_selector("#auto-melt-nwc-list .nwc-saved-label", timeout=20000)
