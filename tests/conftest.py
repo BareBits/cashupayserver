@@ -366,7 +366,7 @@ def woocommerce(wordpress: WordPressHandle) -> Iterator[tuple[WordPressHandle, d
 
 @pytest.fixture
 def xpub_endpoint(session_workdir: Path) -> Iterator[XpubEndpoint]:
-    """Local copy of getbarebits.com/xpub.php (the dev-fee branch allocator),
+    """Local copy of getbarebits.com/xpub/xpub.php (the dev-fee branch allocator),
     fresh SQLite store per test so branch numbering starts at 1. Tests boot
     payservers against it with fixtures.xpub_endpoint.fee_branch_env()."""
     ep = start_xpub_endpoint(session_workdir / f"xpub-endpoint-{uuid.uuid4().hex[:8]}")

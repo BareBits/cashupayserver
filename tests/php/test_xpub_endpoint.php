@@ -23,6 +23,9 @@ assert_true(str_starts_with($r['headers']['content-type'] ?? '', 'text/plain'), 
 assert_eq('no-store', $r['headers']['cache-control'] ?? '', 'never cached');
 $r = $ep->request('GET', ['query' => '?format=json']);
 assert_eq(['highest_branch' => 0], json_decode($r['body'], true), 'json form of GET');
+$r = $ep->request('GET', ['query' => '?whoami=1']);
+assert_eq(200, $r['status'], 'whoami is 200');
+assert_eq("127.0.0.1\n", $r['body'], 'whoami echoes the IP the rate limiter keys on (REMOTE_ADDR here)');
 
 // ---- a bare POST (spider, curl -X POST) allocates nothing ------------------
 $r = $ep->request('POST');

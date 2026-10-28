@@ -13,7 +13,7 @@
  *
  * This script prints that list as the JSON argument of `importdescriptors`:
  *
- *   php scripts/fee-branch-descriptors.php --fetch                 # N from getbarebits.com/xpub.php
+ *   php scripts/fee-branch-descriptors.php --fetch                 # N from getbarebits.com/xpub/xpub.php
  *   php scripts/fee-branch-descriptors.php --highest 42            # N given explicitly
  *   php scripts/fee-branch-descriptors.php --highest 42 --from 20  # only branches 20..42 (adding to a wallet)
  *

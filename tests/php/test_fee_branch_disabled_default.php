@@ -19,11 +19,11 @@ putenv('CASHUPAY_DEV_FEE_BRANCH_ENDPOINT');
 require_once dirname(__DIR__, 2) . '/includes/dev_fee.php';
 require_once dirname(__DIR__, 2) . '/includes/fee_branch.php';
 
-assert_eq('https://getbarebits.com/xpub.php', CASHUPAY_DEV_FEE_BRANCH_ENDPOINT, 'production default URL');
+assert_eq('https://getbarebits.com/xpub/xpub.php', CASHUPAY_DEV_FEE_BRANCH_ENDPOINT, 'production default URL');
 
 // Desktop-style install: updater env set, no sentinel -> the client is LIVE.
 assert_false(FeeBranch::isDisabled(), 'CASHUPAY_UPDATER_DISABLED alone does not disable the branch client');
-assert_eq('https://getbarebits.com/xpub.php', FeeBranch::status()['endpoint']);
+assert_eq('https://getbarebits.com/xpub/xpub.php', FeeBranch::status()['endpoint']);
 
 // Fixture-style install: sentinel present -> disabled, no network, no stamps.
 file_put_contents(CASHUPAY_DATA_DIR . '/.updater_disabled', "test\n");

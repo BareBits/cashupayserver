@@ -48,7 +48,7 @@ require_once __DIR__ . '/safe_http.php';
 if (!defined('CASHUPAY_DEV_FEE_BRANCH_ENDPOINT')) {
     $fbEnv = getenv('CASHUPAY_DEV_FEE_BRANCH_ENDPOINT');
     define('CASHUPAY_DEV_FEE_BRANCH_ENDPOINT',
-        ($fbEnv !== false && $fbEnv !== '') ? $fbEnv : 'https://getbarebits.com/xpub.php');
+        ($fbEnv !== false && $fbEnv !== '') ? $fbEnv : 'https://getbarebits.com/xpub/xpub.php');
     unset($fbEnv);
 }
 

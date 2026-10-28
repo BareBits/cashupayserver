@@ -1,6 +1,6 @@
 <?php
 /**
- * BareBits fee-branch allocator — deployed at https://getbarebits.com/xpub.php
+ * BareBits fee-branch allocator — deployed at https://getbarebits.com/xpub/xpub.php
  *
  * Every BareBits payserver install derives its on-chain dev-fee addresses from
  * the same BareBits zpub. Without coordination two installs would derive the
@@ -16,7 +16,9 @@
  * Protocol
  *   GET  /xpub.php                 -> text/plain: highest branch allocated so far
  *                                     (0 when none). ?format=json gives
- *                                     {"highest_branch": N}.
+ *                                     {"highest_branch": N}; ?whoami=1 echoes
+ *                                     the caller's IP as the rate limiter sees it
+ *                                     (deploy check for proxied setups).
  *   POST /xpub.php  client=barebits-payserver
  *                                  -> {"branch": N}  (200). The marker field is
  *                                     what distinguishes a payserver install from
@@ -162,6 +164,15 @@ try {
     $method = strtoupper((string)($_SERVER['REQUEST_METHOD'] ?? 'GET'));
 
     if ($method === 'GET' || $method === 'HEAD') {
+        if (($_GET['whoami'] ?? '') === '1') {
+            // Deploy check: the address the rate limiter will key on for THIS
+            // caller. Behind a reverse proxy that is not declared via
+            // XPUB_TRUSTED_PROXY_IP_HEADER this prints the proxy's address for
+            // everyone, i.e. one shared 20/hour bucket for every install.
+            header('Content-Type: text/plain; charset=utf-8');
+            echo xpub_client_ip(), "\n";
+            exit;
+        }
         $highest = xpub_highest($pdo);
         if (($_GET['format'] ?? '') === 'json') {
             xpub_json(200, ['highest_branch' => $highest]);

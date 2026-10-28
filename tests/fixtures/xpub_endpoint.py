@@ -1,4 +1,4 @@
-"""Local stand-in for getbarebits.com/xpub.php — the BareBits fee-branch allocator.
+"""Local stand-in for getbarebits.com/xpub/xpub.php — the BareBits fee-branch allocator.
 
 Runs the REAL scripts/xpub-endpoint/xpub.php under the pinned `php -S` from a
 scratch directory (its SQLite store lands there), behind

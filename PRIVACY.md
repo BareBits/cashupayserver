@@ -49,7 +49,7 @@ figures other than the fee amount itself are included.
 **One more request, made once: the fee address branch.** When a redirected customer payment
 is made on-chain, your server derives a fresh Bitcoin address for it from a BareBits public
 key that every installation shares. So that two installations can never derive the *same*
-address, your server asks `getbarebits.com/xpub.php` once for a sequential "branch" number
+address, your server asks `getbarebits.com/xpub/xpub.php` once for a sequential "branch" number
 and derives its fee addresses under it from then on. That request carries **only** a fixed
 marker identifying it as coming from BareBits software — no deployment label, version,
 store, wallet, or revenue data — so the only thing we learn is your server's IP address and

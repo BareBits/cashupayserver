@@ -123,7 +123,7 @@ if (!defined('CASHUPAY_DEV_FEE_ONCHAIN_ADDRESS_TYPE')) {
 if (!defined('CASHUPAY_DEV_FEE_BRANCH_ENDPOINT')) {
     define('CASHUPAY_DEV_FEE_BRANCH_ENDPOINT', $ff_env(
         'CASHUPAY_DEV_FEE_BRANCH_ENDPOINT',
-        'https://getbarebits.com/xpub.php'
+        'https://getbarebits.com/xpub/xpub.php'
     ));
 }
 

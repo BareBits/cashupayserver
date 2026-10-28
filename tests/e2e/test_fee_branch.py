@@ -3,7 +3,7 @@
 Every install derives dev-fee addresses from the same BareBits zpub, so
 without coordination two installs produce the same address at the same index
 and can't tell whose customer paid. includes/fee_branch.php fixes that by
-asking getbarebits.com/xpub.php for a sequential branch once; addresses then
+asking getbarebits.com/xpub/xpub.php for a sequential branch once; addresses then
 derive at <zpub>/<branch>/0/<index>. These tests run the REAL xpub.php on a
 local php -S (fixtures/xpub_endpoint.py) with a regtest dev-fee tpub and
 drive the whole loop on bitcoind regtest:
