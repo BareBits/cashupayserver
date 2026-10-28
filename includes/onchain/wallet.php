@@ -172,7 +172,7 @@ class OnchainWallet {
     /**
      * Derive a single receiving address at path m/0/{index} from the given xpub.
      */
-    public static function deriveAddress(string $xpub, string $type, string $network, int $index): string {
+    public static function deriveAddress(string $xpub, string $type, string $network, int $index, ?int $branch = null): string {
         if (!in_array($type, self::SUPPORTED_TYPES, true)) {
             throw new InvalidArgumentException("Unsupported address type: {$type}");
         }
@@ -181,6 +181,14 @@ class OnchainWallet {
         }
         if ($index < 0) {
             throw new InvalidArgumentException('Negative derivation index');
+        }
+        // $branch inserts one extra non-hardened level ABOVE the receive chain
+        // (<xpub>/<branch>/0/<index>) — the per-install dev-fee branch, see
+        // includes/fee_branch.php. Null keeps the plain <xpub>/0/<index> path
+        // every merchant / hosting-fee xpub uses. 0 is not a valid branch (it
+        // would collide with the plain chain's meaning in the sweep wallet).
+        if ($branch !== null && ($branch < 1 || $branch > 2147483647)) {
+            throw new InvalidArgumentException('Derivation branch out of range');
         }
         if (($envError = self::environmentError()) !== null) {
             throw new RuntimeException($envError);
@@ -196,7 +204,7 @@ class OnchainWallet {
         try {
             $factory = new HierarchicalKeyFactory();
             $hk = $factory->fromExtended($canonicalXpub, $net);
-            $child = $hk->derivePath("0/{$index}");
+            $child = $hk->derivePath($branch === null ? "0/{$index}" : "{$branch}/0/{$index}");
             $pubKeyHash = $child->getPublicKey()->getPubKeyHash();
 
             if ($type === 'P2WPKH') {
@@ -273,6 +281,15 @@ class OnchainWallet {
             $out[$i] = self::deriveAddress($xpub, $type, $network, $i);
         }
         return $out;
+    }
+
+    /**
+     * Public form of the SLIP-32 normalisation: the xpub/tpub spelling of a
+     * zpub/ypub/vpub — what Bitcoin Core descriptors expect (Core rejects
+     * zpub inside wpkh(...)). Used by scripts/fee-branch-descriptors.php.
+     */
+    public static function toCanonicalXpub(string $xpub, string $network): string {
+        return self::normalizeToCanonicalXpub(trim($xpub), $network);
     }
 
     // ---------- internals ----------

@@ -54,6 +54,7 @@ from fixtures.strike_api import (  # noqa: E402
     stop_strike_api,
 )
 from fixtures.webhook_sink import WebhookSink, start_webhook_sink, stop_webhook_sink  # noqa: E402
+from fixtures.xpub_endpoint import XpubEndpoint, start_xpub_endpoint, stop_xpub_endpoint  # noqa: E402
 from fixtures.wordpress import (  # noqa: E402
     WordPressHandle,
     install_woocommerce,
@@ -361,6 +362,16 @@ def woocommerce(wordpress: WordPressHandle) -> Iterator[tuple[WordPressHandle, d
     else:
         info = install_woocommerce(wordpress)
     yield wordpress, info
+
+
+@pytest.fixture
+def xpub_endpoint(session_workdir: Path) -> Iterator[XpubEndpoint]:
+    """Local copy of getbarebits.com/xpub/xpub.php (the dev-fee branch allocator),
+    fresh SQLite store per test so branch numbering starts at 1. Tests boot
+    payservers against it with fixtures.xpub_endpoint.fee_branch_env()."""
+    ep = start_xpub_endpoint(session_workdir / f"xpub-endpoint-{uuid.uuid4().hex[:8]}")
+    yield ep
+    stop_xpub_endpoint(ep)
 
 
 @pytest.fixture

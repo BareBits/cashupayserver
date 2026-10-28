@@ -163,6 +163,7 @@ jobs:
             -v /tmp/nginx-conf/site.conf:/etc/nginx/test-sites/site.conf:ro \
             -v /tmp/nginx-conf/fpm-pool.conf:/usr/local/etc/php-fpm.d/zz-test.conf:ro \
             -e CASHUPAY_UPDATER_DISABLED=1 \
+            -e CASHUPAY_DEV_FEE_BRANCH_ENDPOINT=disabled \
             barebits-nginx
           for i in $(seq 1 30); do
             curl -fs -o /dev/null "http://127.0.0.1:8081/setup.php" && exit 0

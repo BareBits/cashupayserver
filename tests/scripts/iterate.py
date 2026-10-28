@@ -420,6 +420,7 @@ def main() -> int:
     # Honoured by includes/updater.php::isDisabledForTests() — keep the
     # auto-updater from overlaying the working tree mid-session.
     os.environ.setdefault("CASHUPAY_UPDATER_DISABLED", "1")
+    os.environ.setdefault("CASHUPAY_DEV_FEE_BRANCH_ENDPOINT", "disabled")
 
     # Honoured by includes/safe_http.php — the local stack points the mint
     # and onchain provider at 127.0.0.1 / regtest endpoints, which

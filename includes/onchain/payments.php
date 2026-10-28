@@ -277,18 +277,26 @@ class OnchainPayments {
      *        polled with the paying store's provider, so tip filtering only
      *        works when the fee xpub is on that store's network — callers
      *        enforce a network match before getting here).
-     * @return array{address:string, index:int, tip_height:?int}
+     * @param int|null $branch Per-install dev-fee branch (FeeBranch::current):
+     *        derive at <xpub>/<branch>/0/<index> with a counter of its own.
+     *        Null = the plain <xpub>/0/<index> chain (hosting fee, legacy).
+     * @return array{address:string, index:int, tip_height:?int, branch:?int}
      */
     public static function allocateFeeAddress(
         string $xpub,
         string $network,
         string $type,
-        ?array $tipProviderStore = null
+        ?array $tipProviderStore = null,
+        ?int $branch = null
     ): array {
         $pdo = Database::getInstance();
         Database::beginImmediate(); // write lock up front: read-before-write allocator (see Database::beginImmediate)
         try {
-            $xpubHash = hash('sha256', $xpub);
+            // A branched chain (<xpub>/<branch>/0/<index>, the per-install
+            // dev-fee branch) gets its own index stream, keyed separately from
+            // the plain <xpub>/0/<index> chain, so switching to a branch starts
+            // at index 0 under it and the plain chain's counter is untouched.
+            $xpubHash = hash('sha256', $branch === null ? $xpub : $xpub . '/' . $branch);
             $now = time();
             $pdo->prepare(
                 "INSERT INTO onchain_xpub_state (xpub_hash, next_index, updated_at)
@@ -304,7 +312,7 @@ class OnchainPayments {
                   WHERE xpub_hash = ?"
             )->execute([$now, $xpubHash]);
 
-            $address = OnchainWallet::deriveAddress($xpub, $type ?: 'P2WPKH', $network ?: 'mainnet', $index);
+            $address = OnchainWallet::deriveAddress($xpub, $type ?: 'P2WPKH', $network ?: 'mainnet', $index, $branch);
             $pdo->commit();
         } catch (Throwable $e) {
             if ($pdo->inTransaction()) {
@@ -316,7 +324,7 @@ class OnchainPayments {
         // Tip read is outside the txn (best-effort network call); failure
         // leaves tip NULL which simply disables historical-UTXO filtering.
         $tip = $tipProviderStore !== null ? self::currentTipBestEffort($tipProviderStore) : null;
-        return ['address' => $address, 'index' => $index, 'tip_height' => $tip];
+        return ['address' => $address, 'index' => $index, 'tip_height' => $tip, 'branch' => $branch];
     }
 
     /**
