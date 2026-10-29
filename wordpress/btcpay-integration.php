@@ -696,10 +696,26 @@ function barebits_configure_btcpay_plugin(string $store_id, string $api_key): ar
     // barebits_gateway_base_url), the canonical URL for remote servers.
     // The btcpay_gf_* names below are the BTCPay for WooCommerce plugin's
     // own options (deliberately outside this plugin's barebits_ prefix):
-    // writing them is how that gateway plugin gets configured.
-    update_option('btcpay_gf_url', barebits_gateway_server_url());
-    update_option('btcpay_gf_api_key', $api_key);
-    update_option('btcpay_gf_store_id', $store_id);
+    // writing them is how that gateway plugin gets configured. Each write is
+    // read back: the gateway treats an empty URL/key/store as "not
+    // configured" and refuses every checkout with "Can't process order", so
+    // a write the database quietly dropped must fail the connection here,
+    // loudly, rather than at the shopper's Place Order.
+    $gatewayOptions = [
+        'btcpay_gf_url' => barebits_gateway_server_url(),
+        'btcpay_gf_api_key' => $api_key,
+        'btcpay_gf_store_id' => $store_id,
+    ];
+    foreach ($gatewayOptions as $name => $value) {
+        if (!barebits_update_option_verified($name, $value)) {
+            return [
+                'success' => false,
+                'error' => 'options',
+                'message' => 'Could not save the payment gateway settings: the site database '
+                           . 'did not keep the ' . $name . ' option. Reload to retry the connection.',
+            ];
+        }
+    }
 
     // Register the invoice-events webhook with the BareBits server.
     $webhookResult = barebits_register_webhook($store_id, $api_key);
@@ -715,6 +731,29 @@ function barebits_configure_btcpay_plugin(string $store_id, string $api_key): ar
         'success' => true,
         'webhook' => $webhookResult
     ];
+}
+
+/**
+ * update_option() that confirms the value landed. On the SQLite database
+ * drop-in a write racing another worker's can be lost without an error
+ * reaching the caller (the row simply keeps its old value); the object cache
+ * would then happily serve the value we never stored. Read back past the
+ * cache and retry briefly before reporting failure. A no-op write (same value
+ * already stored) counts as success.
+ */
+function barebits_update_option_verified(string $name, string $value): bool {
+    for ($attempt = 0; $attempt < 3; $attempt++) {
+        if ($attempt > 0) {
+            usleep(250000);
+        }
+        update_option($name, $value);
+        wp_cache_delete($name, 'options');
+        wp_cache_delete('alloptions', 'options');
+        if ((string) get_option($name, '') === $value) {
+            return true;
+        }
+    }
+    return false;
 }
 
 /**
