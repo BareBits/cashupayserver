@@ -109,6 +109,21 @@ fixture variants share the same three goldens. Escape hatch:
 `CASHUPAY_WP_NO_TEMPLATE=1` restores the per-test real install; the template
 contract itself is pinned by `wordpress/test_wp_template_clone.py`.
 
+### SQLite drop-in driver
+
+The fixture's `wp-config.php` turns on the sqlite-database-integration
+plugin's newer "AST" driver (`WP_SQLITE_AST_DRIVER`). The legacy translator
+driver wraps every statement in a deferred `BEGIN`; once another `php -S`
+worker has committed, a connection that read first cannot upgrade to a write
+and SQLite fails it with "database is locked" without consulting the busy
+timeout. WooCommerce saves the cart session from a shutdown hook in exactly
+that shape, which is where the empty-cart checkout flakes came from. The AST
+driver opens writes with `BEGIN IMMEDIATE` and queues on the busy timeout
+instead. `CASHUPAY_WP_SQLITE_AST_DRIVER=0` restores the legacy driver and
+`CASHUPAY_WP_SQLITE_JOURNAL_MODE=WAL` sets the journal mode, both for A/B runs
+only (WAL measured *worse* with the legacy driver). Pinned by
+`wordpress/test_wp_fixture_sqlite_driver.py`.
+
 ## Workdir cleanup
 
 A test that passes deletes its workdir in teardown; failures keep theirs for
