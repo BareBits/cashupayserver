@@ -36,6 +36,7 @@ final class HttpDriver {
             'CASHUPAY_DATA_DIR' => $dataDir,
             'CASHUPAY_UPDATER_DISABLED' => '1',
             'CASHUPAY_DEV_FEE_BRANCH_ENDPOINT' => 'disabled',
+            'CASHUPAY_USAGE_STATS_ENDPOINT' => 'disabled',
             'CASHUPAY_ALLOW_PRIVATE_ENDPOINTS' => '1',
             'PATH' => (string)getenv('PATH'),
         ], $env);

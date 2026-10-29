@@ -316,6 +316,7 @@ def setup_payserver_with_stores(workdir: Path, vpub: str, mint_url: str,
     # auto-updater from clobbering the working tree mid-run.
     env.setdefault("CASHUPAY_UPDATER_DISABLED", "1")
     env.setdefault("CASHUPAY_DEV_FEE_BRANCH_ENDPOINT", "disabled")
+    env.setdefault("CASHUPAY_USAGE_STATS_ENDPOINT", "disabled")
     port = swap_stack.free_port()
     log = (data_dir / "payserver.log").open("ab")
     proc = subprocess.Popen(

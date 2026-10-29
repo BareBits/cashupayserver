@@ -26,6 +26,7 @@ require_once __DIR__ . '/includes/managed.php';
 require_once __DIR__ . '/includes/locks.php';
 require_once __DIR__ . '/includes/transfer.php';
 require_once __DIR__ . '/includes/store_safety.php';
+require_once __DIR__ . '/includes/usage_stats.php';
 
 use Cashu\ProofState;
 
@@ -718,6 +719,14 @@ if (isset($_GET['api'])) {
                 'auto_update_enabled' => Updater::isAutoUpdateEnabled(),
                 'auto_update_source' => Updater::autoUpdateEnabledSource(),
             ]);
+            break;
+
+        // Anonymous usage statistics (Settings card): opt-in state plus the
+        // exact report each level would send, built by the same code that
+        // sends it (UsageStats::buildPayload) so the preview is the payload.
+        case 'usage_stats_status':
+            Auth::requireAdmin();
+            echo json_encode(UsageStats::status());
             break;
 
         // Product catalog for the request modal — any logged-in user. Only
@@ -1774,6 +1783,28 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'auto_update_enabled' => Updater::isAutoUpdateEnabled(),
                 'auto_update_source' => Updater::autoUpdateEnabledSource(),
             ]);
+            break;
+
+        // Anonymous usage statistics opt-in (Settings card; the wizard's
+        // analytics screen writes the same keys). Enabling with a level
+        // sends the first report immediately so the choice takes effect
+        // without waiting for cron; disabling just stops future reports.
+        case 'save_usage_stats':
+            Auth::requireAdmin();
+            $usEnabled = ($_POST['enabled'] ?? '') === '1';
+            $usLevelRaw = (string)($_POST['level'] ?? '');
+            $usLevel = preg_match('/^[123]$/', $usLevelRaw) ? (int)$usLevelRaw : null;
+            try {
+                UsageStats::setChoice($usEnabled, $usLevel);
+            } catch (InvalidArgumentException $e) {
+                cashupay_status(400);
+                echo json_encode(['success' => false, 'error' => $e->getMessage()]);
+                break;
+            }
+            // Interactive path: short timeouts so a slow endpoint can't hold the
+            // request; cron retries within the hour if this fails.
+            $usSent = $usEnabled ? UsageStats::sendNow(null, ['timeout' => 5, 'connectTimeout' => 3]) : false;
+            echo json_encode(['success' => true, 'sent' => $usSent] + UsageStats::status(false));
             break;
 
         case 'rollback_update':
@@ -7897,6 +7928,64 @@ header('Cache-Control: no-cache, must-revalidate');
                     </div>
                 </div>
 
+                <!--
+                    Anonymous usage statistics — opt-in telemetry to BareBits
+                    (includes/usage_stats.php). Off unless the operator chose a
+                    level here or on the wizard's analytics screen. The preview
+                    is the exact JSON the chosen level sends.
+                -->
+                <div class="card collapsible" data-admin-only="true" id="card-usage-stats">
+                    <div class="card-header">
+                        <div class="card-title">Anonymous usage statistics</div>
+                    </div>
+                    <div class="card-body">
+                        <p style="font-size: 0.85rem; color: var(--text-secondary); margin: 0 0 0.75rem 0;">
+                            Optionally send BareBits a small weekly report so we know how many
+                            installs exist and which features matter. Off by default. You choose
+                            how much is included and can preview the exact report below. No report
+                            ever includes your deployment ID, store names, mint or Lightning
+                            addresses, email addresses, customer or invoice details. Our side
+                            records the country your server connected from and discards the IP
+                            address. Turning this off stops future reports.
+                            <a href="https://github.com/BareBits/cashupayserver/blob/main/PRIVACY.md" target="_blank" rel="noopener" style="color: var(--accent);">Privacy Policy</a>
+                        </p>
+                        <div class="toggle-container">
+                            <span><strong>Send anonymous usage statistics</strong></span>
+                            <label class="toggle">
+                                <input type="checkbox" id="usage-stats-enabled">
+                                <span class="toggle-slider"></span>
+                            </label>
+                        </div>
+                        <p class="form-help hidden" id="usage-stats-disabled-note" style="margin-top: 0.25rem;">
+                            Reporting is switched off for this deployment
+                            (<code>CASHUPAY_USAGE_STATS_ENDPOINT</code> is disabled), so nothing is
+                            sent regardless of this setting.
+                        </p>
+                        <div class="form-group" style="margin-top: 0.75rem;">
+                            <label class="form-label">How much to share</label>
+                            <?php foreach (UsageStats::levelDescriptions() as $usLevel => $usDesc): ?>
+                            <label class="usage-stats-level-option" style="display: flex; gap: 0.6rem; align-items: flex-start; padding: 0.5rem 0; cursor: pointer;">
+                                <input type="radio" name="usage_stats_level" class="usage-stats-level" value="<?= (int)$usLevel ?>" style="width: auto; margin: 0.2rem 0 0 0;">
+                                <span style="font-size: 0.9rem;">
+                                    <strong><?= (int)$usLevel ?> &middot; <?= htmlspecialchars($usDesc['title']) ?></strong>
+                                    <span style="display: block; color: var(--text-secondary); font-size: 0.85rem;"><?= htmlspecialchars($usDesc['summary']) ?></span>
+                                    <ul style="margin: 0.3rem 0 0 1rem; padding: 0; color: var(--text-secondary); font-size: 0.8rem; line-height: 1.4;">
+                                        <?php foreach ($usDesc['items'] as $usItem): ?>
+                                        <li><?= htmlspecialchars($usItem) ?></li>
+                                        <?php endforeach; ?>
+                                    </ul>
+                                </span>
+                            </label>
+                            <?php endforeach; ?>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Preview of the exact report for the selected option</label>
+                            <pre id="usage-stats-preview" style="background: rgba(0,0,0,0.2); padding: 0.6rem; border-radius: 8px; font-size: 0.75rem; overflow-x: auto; white-space: pre; max-height: 22rem; margin: 0;">Loading…</pre>
+                        </div>
+                        <p class="form-help" id="usage-stats-status" style="margin-top: 0.25rem;"></p>
+                    </div>
+                </div>
+
                 <!-- My Account card: own password + logout, available to every logged-in user.
                      Managed installs hide it: login is automatic via SSO from the shop admin. -->
                 <div class="card collapsible<?= $isManaged ? ' managed-hidden' : '' ?>" id="card-my-account">
@@ -9280,6 +9369,11 @@ header('Cache-Control: no-cache, must-revalidate');
             if (saveChannelBtn) saveChannelBtn.addEventListener('click', saveUpdateChannel);
             const autoUpdateToggle = document.getElementById('auto-update-enabled');
             if (autoUpdateToggle) autoUpdateToggle.addEventListener('change', saveAutoUpdateEnabled);
+            const usageStatsToggle = document.getElementById('usage-stats-enabled');
+            if (usageStatsToggle) usageStatsToggle.addEventListener('change', onUsageStatsToggle);
+            document.querySelectorAll('.usage-stats-level').forEach(function (radio) {
+                radio.addEventListener('change', onUsageStatsLevelChange);
+            });
             const rollbackBtn = document.getElementById('btn-rollback-update');
             if (rollbackBtn) rollbackBtn.addEventListener('click', rollbackUpdate);
             const dismissAutoRbBtn = document.getElementById('btn-dismiss-auto-rollback');
@@ -9504,6 +9598,7 @@ header('Cache-Control: no-cache, must-revalidate');
                     loadTrustedMintsCard();
                     loadCronUrl();
                     loadAutoUpdateCard();
+                    loadUsageStatsCard();
                     loadNotificationSettings();
                     loadDeveloperSettings();
                     loadInvoiceErrorSettings();
@@ -15840,6 +15935,129 @@ header('Cache-Control: no-cache, must-revalidate');
             } catch (e) {
                 toggle.checked = !toggle.checked;
                 showToast('Failed to save automatic-update setting', 'error');
+            }
+        }
+
+        // Anonymous usage statistics card. State and the per-level previews
+        // come from ?api=usage_stats_status; the preview shown is the exact
+        // JSON the selected level would send (built server-side by the same
+        // code that sends it). Saving with the toggle on sends the first
+        // report immediately.
+        let usageStatsState = null;
+
+        function usageStatsSelectedLevel() {
+            const checked = document.querySelector('.usage-stats-level:checked');
+            return checked ? parseInt(checked.value, 10) : null;
+        }
+
+        function renderUsageStatsCard(data) {
+            usageStatsState = data;
+            const toggle = document.getElementById('usage-stats-enabled');
+            const note = document.getElementById('usage-stats-disabled-note');
+            if (!toggle) return;
+            toggle.checked = !!data.enabled;
+            if (note) note.classList.toggle('hidden', !data.disabled);
+            const level = data.level || usageStatsSelectedLevel() || 1;
+            document.querySelectorAll('.usage-stats-level').forEach(function (radio) {
+                radio.checked = parseInt(radio.value, 10) === level;
+            });
+            renderUsageStatsPreview();
+            renderUsageStatsStatus();
+        }
+
+        function renderUsageStatsPreview() {
+            const pre = document.getElementById('usage-stats-preview');
+            if (!pre || !usageStatsState || !usageStatsState.previews) return;
+            const level = usageStatsSelectedLevel() || 1;
+            const payload = usageStatsState.previews[String(level)];
+            pre.textContent = payload ? JSON.stringify(payload, null, 2) : 'Unavailable';
+        }
+
+        function renderUsageStatsStatus() {
+            const el = document.getElementById('usage-stats-status');
+            if (!el || !usageStatsState) return;
+            const d = usageStatsState;
+            const parts = [];
+            if (!d.enabled) {
+                parts.push(d.answered ? 'Off — nothing is sent.' : 'Not yet chosen — nothing is sent.');
+            } else {
+                parts.push('On — a report is sent every ' + (d.interval_days || 7) + ' days.');
+                if (d.last_sent_at) {
+                    parts.push('Last sent ' + new Date(d.last_sent_at * 1000).toLocaleString() + '.');
+                } else {
+                    parts.push('No report sent yet.');
+                }
+                if (d.last_error) parts.push('Last attempt failed: ' + d.last_error + ' (retried automatically).');
+            }
+            if (d.install_id) parts.push('Install identifier: ' + d.install_id);
+            el.textContent = parts.join(' ');
+        }
+
+        async function loadUsageStatsCard() {
+            const card = document.getElementById('card-usage-stats');
+            if (!card) return;
+            try {
+                const r = await fetch(adminUrl + '?api=usage_stats_status', { credentials: 'same-origin' });
+                const data = await r.json();
+                renderUsageStatsCard(data);
+            } catch (e) {
+                const pre = document.getElementById('usage-stats-preview');
+                if (pre) pre.textContent = 'Unable to load usage-statistics settings';
+            }
+        }
+
+        async function saveUsageStats(enabled, level) {
+            const toggle = document.getElementById('usage-stats-enabled');
+            try {
+                const body = 'action=save_usage_stats&enabled=' + (enabled ? '1' : '0')
+                    + (level ? '&level=' + level : '');
+                const response = await postWithCsrf(adminUrl, body);
+                const result = await response.json();
+                if (response.ok && result.success) {
+                    // Re-read the card: the previews now carry the real install
+                    // id (minted on the first opt-in) and the status line the
+                    // outcome of the send.
+                    await loadUsageStatsCard();
+                    if (!enabled) {
+                        showToast('Anonymous usage statistics turned off', 'success');
+                    } else if (result.sent) {
+                        showToast('Anonymous usage statistics enabled — first report sent', 'success');
+                    } else if (result.disabled) {
+                        showToast('Saved — reporting is disabled for this deployment', 'success');
+                    } else {
+                        showToast('Saved — the first report could not be sent yet: ' + (result.last_error || 'unknown error'), 'error');
+                    }
+                } else {
+                    if (toggle) toggle.checked = !enabled;
+                    showToast(result.error || 'Failed to save', 'error');
+                }
+            } catch (e) {
+                if (toggle) toggle.checked = !enabled;
+                showToast('Failed to save usage-statistics setting', 'error');
+            }
+        }
+
+        function onUsageStatsToggle() {
+            const toggle = document.getElementById('usage-stats-enabled');
+            if (!toggle) return;
+            if (toggle.checked) {
+                const level = usageStatsSelectedLevel();
+                if (!level) {
+                    toggle.checked = false;
+                    showToast('Choose how much to share first', 'error');
+                    return;
+                }
+                saveUsageStats(true, level);
+            } else {
+                saveUsageStats(false, null);
+            }
+        }
+
+        function onUsageStatsLevelChange() {
+            renderUsageStatsPreview();
+            const toggle = document.getElementById('usage-stats-enabled');
+            if (toggle && toggle.checked) {
+                saveUsageStats(true, usageStatsSelectedLevel());
             }
         }
 

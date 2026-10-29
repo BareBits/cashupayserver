@@ -24,7 +24,7 @@ final class SetupFlow {
      */
     public const STEPS = [
         'terms', 'security', 'password', 'store', 'onchain', 'lightning',
-        'zeroconf', 'swaps', 'mints', 'updates', 'cron', 'done',
+        'zeroconf', 'swaps', 'mints', 'updates', 'analytics', 'cron', 'done',
     ];
 
     /** The screens add_store mode walks before returning to admin. */
@@ -54,9 +54,11 @@ final class SetupFlow {
      *
      * updates sits here deliberately: the install is usable without an
      * answer, and abandoning the wizard on this screen leaves automatic
-     * updates at their safe default (off).
+     * updates at their safe default (off). analytics (the anonymous
+     * usage-statistics opt-in) follows for the same reason: unanswered
+     * means nothing is ever sent.
      */
-    public const POST_COMPLETION = ['updates', 'cron', 'done'];
+    public const POST_COMPLETION = ['updates', 'analytics', 'cron', 'done'];
 
     public static function isKnownStep(string $step): bool {
         return in_array($step, self::STEPS, true) || $step === self::ADD_STORE_COMPLETE;

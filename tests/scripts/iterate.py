@@ -421,6 +421,7 @@ def main() -> int:
     # auto-updater from overlaying the working tree mid-session.
     os.environ.setdefault("CASHUPAY_UPDATER_DISABLED", "1")
     os.environ.setdefault("CASHUPAY_DEV_FEE_BRANCH_ENDPOINT", "disabled")
+    os.environ.setdefault("CASHUPAY_USAGE_STATS_ENDPOINT", "disabled")
 
     # Honoured by includes/safe_http.php — the local stack points the mint
     # and onchain provider at 127.0.0.1 / regtest endpoints, which
@@ -550,9 +551,11 @@ def main() -> int:
             page.fill("#mint_url_manual", mint.url)
             page.fill("#backup_mint_url_manual", backup_mint.url)
             page.click("#mints-continue-btn")
-            # setup_complete flips here; updates, cron and done are advisory.
+            # setup_complete flips here; updates, analytics, cron and done are advisory.
             page.wait_for_selector("h2:has-text('Enable automatic updates?')")
             page.click("button:has-text('Not now')")
+            page.wait_for_selector("h2:has-text('Anonymous usage statistics')")
+            page.click("button[name='usage_stats'][value='0']")
             page.wait_for_selector("h2:has-text('Enable cron')")
             page.click("button:has-text('Continue')")
             page.wait_for_selector("h2:has-text(\"You're all set!\")")

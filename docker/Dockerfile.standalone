@@ -1,5 +1,9 @@
 FROM wordpress:php8.2-apache
 
+# Lets the app label itself a Docker install (anonymous usage statistics,
+# opt-in only — see includes/usage_stats.php). Nothing else reads it.
+ENV CASHUPAY_DOCKER=1
+
 # Install PHP extensions needed by CashuPayServer
 RUN apt-get update && apt-get install -y libgmp-dev libsqlite3-dev \
     && docker-php-ext-install gmp pdo_sqlite \

@@ -75,6 +75,11 @@ class Diagnostics {
         'updater_notified_sha',
         'updater_pending_verify',
         'url_mode',
+        'usage_stats_enabled',
+        'usage_stats_level',
+        'usage_stats_last_sent_at',
+        'usage_stats_last_attempt_at',
+        'usage_stats_last_error',
     ];
 
     /**

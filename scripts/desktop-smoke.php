@@ -20,8 +20,8 @@
  * against real Apache and nginx containers.
  *
  * The optional shape argument selects which wizard the target shows:
- *   desktop (default)  terms -> password, "of 9", no security or cron screens
- *   server             terms -> security -> password, "of 11" (data dir
+ *   desktop (default)  terms -> password, "of 10", no security or cron screens
+ *   server             terms -> security -> password, "of 12" (data dir
  *                      inside the webroot), cron screen with a crontab line
  *
  * Usage: php desktop-smoke.php <base-url> [desktop|server]   (exit 0 = pass)
@@ -178,17 +178,17 @@ if ($shape === 'desktop') {
     if (heading($body) !== 'Create your admin password') {
         fail("desktop mode must go straight from terms to password, landed on '" . heading($body) . "'", $body);
     }
-    if (strpos($body, 'of 9') === false) {
-        fail('step counter must show the desktop count ("of 9")', $body);
+    if (strpos($body, 'of 10') === false) {
+        fail('step counter must show the desktop count ("of 10")', $body);
     }
 } else {
     if (heading($body) !== 'Quick safety check') {
         fail("server mode must show the security screen after terms, landed on '" . heading($body) . "'", $body);
     }
-    // "of 10": full sequence minus zeroconf (no on-chain rail in this walk),
+    // "of 12": full sequence minus zeroconf (no on-chain rail in this walk),
     // with the security screen present (data dir inside the webroot).
-    if (strpos($body, 'of 11') === false) {
-        fail('step counter must show the server count ("of 11")', $body);
+    if (strpos($body, 'of 12') === false) {
+        fail('step counter must show the server count ("of 12")', $body);
     }
     $body = $wpost(['step' => 'security', 'security_acknowledged' => '1']);
     if (heading($body) !== 'Create your admin password') {
@@ -209,10 +209,15 @@ if (heading($body) !== 'Enable automatic updates?') {
     fail("declining mints must land on the auto-update screen, landed on '" . heading($body) . "'", $body);
 }
 $body = $wpost(['step' => 'updates', 'auto_update' => '0']);
+// Both shapes then ask about anonymous usage statistics; decline (the default).
+if (heading($body) !== 'Anonymous usage statistics') {
+    fail("declining auto-update must land on the usage-statistics screen, landed on '" . heading($body) . "'", $body);
+}
+$body = $wpost(['step' => 'analytics', 'usage_stats' => '0']);
 
 if ($shape === 'desktop') {
     if (heading($body) !== "You're all set!") {
-        fail("declining auto-update must land on the completion screen, landed on '" . heading($body) . "'", $body);
+        fail("declining usage statistics must land on the completion screen, landed on '" . heading($body) . "'", $body);
     }
     if (strpos($body, 'Background jobs run automatically') === false) {
         fail('completion screen must carry the desktop background-jobs note', $body);
@@ -223,7 +228,7 @@ if ($shape === 'desktop') {
     ok('onboarding wizard completes in its desktop shape (no security or cron screens)');
 } else {
     if (heading($body) !== 'Enable cron') {
-        fail("declining auto-update must land on the cron screen, landed on '" . heading($body) . "'", $body);
+        fail("declining usage statistics must land on the cron screen, landed on '" . heading($body) . "'", $body);
     }
     if (stripos($body, 'crontab') === false) {
         fail('server cron screen must show the crontab instructions', $body);
