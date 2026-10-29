@@ -152,7 +152,7 @@ def test_admin_reset_other_users_password_lets_them_login(
     page.wait_for_selector("#modal-reset-user-password.visible")
     page.fill("#rup-new", "carolnew99XYZ")
     page.click("#btn-confirm-reset-user-password")
-    page.wait_for_selector("#modal-reset-user-password:not(.visible)")
+    page.wait_for_selector("#modal-reset-user-password.visible", state="hidden")
 
     # Carol can log in with the new password via the API client.
     carol = AdminClient(configured.handle.url)

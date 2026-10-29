@@ -726,11 +726,31 @@ def _ensure_golden_install(
             meta["product_id"] = handle.woo_product_id
     finally:
         stop_wordpress(handle)
+    # If a WAL journal was opted into (CASHUPAY_WP_SQLITE_JOURNAL_MODE), fold
+    # the -wal back into the main file so every clone starts from one
+    # self-contained database. A no-op for the default rollback journal.
+    _checkpoint_sqlite(handle.wp_root / "wp-content" / "database" / "wordpress.sqlite")
     # Serve-time leftovers (router wrapper, server log) stay outside wp/ and
     # are never cloned; the golden's wp-config.php is overwritten per clone.
     (workdir / "template-meta.json").write_text(json.dumps({"key": key, **meta}))
     _GOLDEN_CACHE[key] = (handle.wp_root, meta)
     return _GOLDEN_CACHE[key]
+
+
+def _checkpoint_sqlite(db: Path) -> None:
+    """Best-effort `PRAGMA wal_checkpoint(TRUNCATE)` on a WAL-mode SQLite file
+    nothing else has open. Leaves the mode as WAL (it is persisted in the file
+    header), only empties the side files."""
+    if not db.is_file():
+        return
+    try:
+        conn = sqlite3.connect(str(db), timeout=10)
+        try:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        pass
 
 
 def stop_wordpress(handle: WordPressHandle) -> None:
@@ -939,8 +959,30 @@ def _wp_config_php(
             "// operator would use to opt into the testing channel.\n"
             f"define('BAREBITS_RELEASE_CHANNEL', '{release_channel}');\n"
         )
+    # Opt-in knobs for the sqlite-database-integration drop-in, for A/B runs
+    # against its lock behaviour (see the comments in the config below):
+    #   CASHUPAY_WP_SQLITE_JOURNAL_MODE=WAL|DELETE|...   PRAGMA journal_mode
+    #   CASHUPAY_WP_SQLITE_AST_DRIVER=1                  the plugin's newer driver
+    sqlite_defines = ""
+    journal_mode = os.environ.get("CASHUPAY_WP_SQLITE_JOURNAL_MODE", "")
+    if journal_mode:
+        sqlite_defines += (
+            "// Measured 2026-10-28 with the default (translator) driver: WAL made the\n"
+            "// lost-write race WORSE (3 empty-cart checkouts in 4 runs vs 0 in 3 with\n"
+            "// the rollback journal). Its deferred BEGIN cannot upgrade to a write once\n"
+            "// another worker committed, and WAL widens that window to the whole\n"
+            "// transaction. Kept as an opt-in for experiments only.\n"
+            f"define('SQLITE_JOURNAL_MODE', '{journal_mode}');\n"
+        )
+    if os.environ.get("CASHUPAY_WP_SQLITE_AST_DRIVER"):
+        sqlite_defines += (
+            "// The plugin's newer driver opens write statements with BEGIN IMMEDIATE,\n"
+            "// which queues concurrent writers on the busy timeout instead of failing\n"
+            "// the read-to-write upgrade with \"database is locked\".\n"
+            "define('WP_SQLITE_AST_DRIVER', true);\n"
+        )
     return f"""<?php
-{release_defines}
+{release_defines}{sqlite_defines}
 // SQLite drop-in expects these even though they're unused.
 define('DB_NAME', 'wordpress');
 define('DB_USER', '');

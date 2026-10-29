@@ -10086,6 +10086,12 @@ header('Cache-Control: no-cache, must-revalidate');
         // to roll the UI back to stale state — e.g. flip the on-chain offer
         // select back to "on" right after the operator saved "off".
         let dashboardLoadSeq = 0;
+        // Sequence number of the last load that finished rendering (or gave
+        // up). dashboardRenderedSeq === dashboardLoadSeq means no load is in
+        // flight — the hook the UI tests use to wait for a (re)load to land
+        // instead of sleeping, since several saves kick off a reload without
+        // awaiting it.
+        let dashboardRenderedSeq = 0;
         async function loadDashboard() {
             const loadSeq = ++dashboardLoadSeq;
             try {
@@ -10254,6 +10260,10 @@ header('Cache-Control: no-cache, must-revalidate');
             } catch (e) {
                 console.error(e);
                 showToast('Failed to load dashboard', 'error');
+            } finally {
+                // A superseded load (or one that handed off to a retry) must
+                // not mark the newer one as rendered.
+                if (loadSeq === dashboardLoadSeq) dashboardRenderedSeq = loadSeq;
             }
         }
 
