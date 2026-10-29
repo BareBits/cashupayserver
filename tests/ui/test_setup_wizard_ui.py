@@ -111,6 +111,10 @@ def test_setup_wizard_completes_in_browser(
     page.wait_for_selector("h2:has-text('Enable automatic updates?')")
     page.click("button:has-text('Enable automatic updates')")
 
+    # anonymous usage statistics: decline (nothing is sent either way on a rig).
+    page.wait_for_selector("h2:has-text('Anonymous usage statistics')")
+    page.click("button[name='usage_stats'][value='0']")
+
     # cron reminder, then completion.
     page.wait_for_selector("h2:has-text('Enable cron')")
     assert "X-CRON-KEY" in page.content(), "the cron screen should show a ready-made crontab line"
@@ -170,8 +174,8 @@ def test_setup_wizard_without_onchain_skips_zeroconf(
     page.click("button[type=submit]")
 
     page.wait_for_selector("#onchain-form")
-    assert "of 11" in page.locator(".subtitle").inner_text(), (
-        "without an on-chain rail the wizard should advertise 11 screens, not 12"
+    assert "of 12" in page.locator(".subtitle").inner_text(), (
+        "without an on-chain rail the wizard should advertise 12 screens, not 13"
     )
     page.click("button:has-text('Skip for now')")
 
@@ -227,8 +231,8 @@ def test_outside_webroot_skips_security_screen_but_still_detects_url_mode(
             page.check("#terms_fee")
             page.click("button[type=submit]")
             page.wait_for_selector("#password")
-            assert "of 10" in page.locator(".subtitle").inner_text(), (
-                "skipping the security screen should advertise 10 screens"
+            assert "of 11" in page.locator(".subtitle").inner_text(), (
+                "skipping the security screen should advertise 11 screens"
             )
         finally:
             stop_payserver(handle)

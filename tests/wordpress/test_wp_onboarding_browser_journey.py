@@ -142,6 +142,10 @@ def _walk_wizard_in_iframe(page) -> None:
     frame.locator("h2:has-text('Enable automatic updates?')").wait_for()
     frame.locator("button[name='auto_update'][value='0']").click()
 
+    # Anonymous usage statistics: opt-in only, asked once after updates. Decline.
+    frame.locator("h2:has-text('Anonymous usage statistics')").wait_for()
+    frame.locator("button[name='usage_stats'][value='0']").click()
+
     # Managed install: completion directly — never the crontab screen
     # (WP-cron owns the heartbeat).
     frame.locator("h2:has-text(\"You're all set\")").wait_for()

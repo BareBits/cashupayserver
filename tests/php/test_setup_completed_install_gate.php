@@ -92,7 +92,18 @@ assert_null(cfg('auto_update_enabled'), 'opt-in still unwritten');
 $strangerJar = $srv->switchSession($sessionA);
 $r = $post(['step' => 'updates', 'auto_update' => '1']);
 assert_eq(200, $r['status'], 'the completing session answers the updates screen');
+assert_eq('analytics', HttpDriver::wizardStep($r['body']), 'and is shown the usage-statistics screen');
+// A stranger can't answer the usage-statistics screen either (it would opt
+// the install in to sending reports).
+$srv->switchSession($strangerJar);
+$r = $srv->post('/setup.php', ['step' => 'analytics', 'usage_stats' => '3', 'csrf_token' => $csrf]);
+assert_eq(302, $r['status'], 'anonymous step=analytics on a completed install is redirected');
+assert_null(cfg('usage_stats_enabled'), 'usage-statistics opt-in still unwritten');
+$srv->switchSession($sessionA);
+$r = $post(['step' => 'analytics', 'usage_stats' => '0']);
+assert_eq(200, $r['status'], 'the completing session answers the usage-statistics screen');
 assert_eq('cron', HttpDriver::wizardStep($r['body']), 'and is shown the cron screen');
+assert_true(cfg('usage_stats_enabled') === false, 'the decline is written');
 assert_true(str_contains($r['body'], $cronKey), 'the cron screen renders the cron key for the operator');
 assert_true(cfg('auto_update_enabled') === true, 'the operator answer is written');
 $r = $post(['step' => 'cron']);
@@ -116,5 +127,9 @@ assert_eq(302, $r['status'], 'a logged-in GET of a tail screen still goes to adm
 $r = $srv->post('/setup.php', ['step' => 'updates', 'auto_update' => '0', 'csrf_token' => $adminCsrf]);
 assert_eq(200, $r['status'], 'a logged-in user may answer the updates screen');
 assert_true(cfg('auto_update_enabled') === false, 'their answer is written');
+$r = $srv->post('/setup.php', ['step' => 'analytics', 'usage_stats' => '1', 'csrf_token' => $adminCsrf]);
+assert_eq(200, $r['status'], 'a logged-in user may answer the usage-statistics screen');
+assert_true(cfg('usage_stats_enabled') === true, 'their opt-in is written');
+assert_eq(1, cfg('usage_stats_level'));
 
 echo "ok\n";

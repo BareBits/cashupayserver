@@ -92,6 +92,8 @@ def test_declining_mints_pins_strict_mode(
 
     page.wait_for_selector("h2:has-text('Enable automatic updates?')")
     page.click("button:has-text('Not now')")
+    page.wait_for_selector("h2:has-text('Anonymous usage statistics')")
+    page.click("button[name='usage_stats'][value='0']")
     page.wait_for_selector("h2:has-text('Enable cron')")
 
     row = _rows(payserver, "SELECT * FROM stores")[0]
@@ -293,6 +295,8 @@ def test_add_store_mode_runs_the_same_screens(
     page.click("button:has-text('No thanks, run without mints')")
     page.wait_for_selector("h2:has-text('Enable automatic updates?')")
     page.click("button:has-text('Not now')")
+    page.wait_for_selector("h2:has-text('Anonymous usage statistics')")
+    page.click("button[name='usage_stats'][value='0']")
     page.wait_for_selector("h2:has-text('Enable cron')")
 
     page.goto(f"{payserver.url}/admin")
@@ -343,6 +347,8 @@ def test_add_store_with_mints_shows_the_generated_seed_once(
     page.click("button:has-text('No thanks, run without mints')")
     page.wait_for_selector("h2:has-text('Enable automatic updates?')")
     page.click("button:has-text('Not now')")
+    page.wait_for_selector("h2:has-text('Anonymous usage statistics')")
+    page.click("button[name='usage_stats'][value='0']")
     page.wait_for_selector("h2:has-text('Enable cron')")
 
     page.goto(f"{payserver.url}/admin")

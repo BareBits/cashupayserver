@@ -88,6 +88,10 @@ function fresh_db(): string {
     if (getenv('CASHUPAY_DEV_FEE_BRANCH_ENDPOINT') === false) {
         putenv('CASHUPAY_DEV_FEE_BRANCH_ENDPOINT=disabled');
     }
+    // Same for the opt-in usage-statistics report (includes/usage_stats.php).
+    if (getenv('CASHUPAY_USAGE_STATS_ENDPOINT') === false) {
+        putenv('CASHUPAY_USAGE_STATS_ENDPOINT=disabled');
+    }
 
     require_once dirname(__DIR__, 2) . '/includes/database.php';
     Database::ensureExists();

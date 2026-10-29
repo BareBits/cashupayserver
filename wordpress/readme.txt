@@ -57,7 +57,7 @@ Only the WordPress-side wiring is removed. A BareBits server installed alongside
 
 == External services ==
 
-This plugin talks to the following services. None of them receive data on behalf of BareBits: the server you connect is your own, and BareBits receives nothing from your site through this plugin. (The BareBits server software itself contacts BareBits only for its development fee and a one-time fee-address branch number; both are documented in its Privacy Policy linked below.)
+This plugin talks to the following services. None of them receive data on behalf of BareBits: the server you connect is your own, and BareBits receives nothing from your site through this plugin. (The BareBits server software itself contacts BareBits only for its development fee, a one-time fee-address branch number and — solely if its operator opts in during setup or under Settings — an anonymous weekly usage-statistics report whose exact contents are previewed before enabling; all three are documented in its Privacy Policy linked below.)
 
 = Your own BareBits server =
 

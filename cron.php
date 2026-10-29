@@ -32,6 +32,7 @@ require_once __DIR__ . '/includes/trusted_mints.php';
 require_once __DIR__ . '/includes/updater.php';
 require_once __DIR__ . '/includes/notification_sender.php';
 require_once __DIR__ . '/includes/webhook_sender.php';
+require_once __DIR__ . '/includes/usage_stats.php';
 
 // Marks "we are inside a cron run" so code that would otherwise fire an
 // opportunistic Background::trigger() (e.g. WebhookSender::fireEvent) skips it —
@@ -756,6 +757,19 @@ if (!$isInternal && !$swapOnly && !$skipNonEssential) {
         }
     } catch (Throwable $e) {
         $results['tasks']['update_notify'] = 'error: ' . $e->getMessage();
+    }
+}
+
+// Task 12f: Anonymous usage statistics (opt-in, includes/usage_stats.php).
+// Weekly report to the BareBits endpoint when the operator chose a level;
+// 'off' when they did not, 'disabled' on test rigs / when the endpoint is
+// switched off. Never blocks the rest of the cron — a dead endpoint costs
+// one short timeout and is retried an hour later.
+if (!$isInternal && !$swapOnly && !$skipNonEssential) {
+    try {
+        $results['tasks']['usage_stats'] = UsageStats::cronTick();
+    } catch (\Throwable $e) {
+        $results['tasks']['usage_stats'] = 'error: ' . $e->getMessage();
     }
 }
 

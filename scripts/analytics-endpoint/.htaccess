@@ -1,0 +1,28 @@
+# Companion to report.php / summary.php / import-geo.php. Merge into the
+# site's existing .htaccess if one is already in place at this level.
+
+# 1. The SQLite store (and its WAL/journal files), the geo CSV download and
+#    the shared helper must never be fetched over the web.
+<FilesMatch "^(usage-reports\.sqlite|dbip-country-lite\..*|common\.php)">
+    <IfModule mod_authz_core.c>
+        Require all denied
+    </IfModule>
+    <IfModule !mod_authz_core.c>
+        Order allow,deny
+        Deny from all
+    </IfModule>
+</FilesMatch>
+
+# 2. Operator-only pages. Create the password file OUTSIDE the web root:
+#      htpasswd -c /home/<account>/.htpasswd-analytics <user>
+#    and uncomment. Without this block the pages fall back to the
+#    ANALYTICS_ACCESS_TOKEN in common.php; with neither configured they
+#    answer 403.
+#<FilesMatch "^(summary|import-geo)\.php$">
+#    AuthType Basic
+#    AuthName "BareBits usage statistics"
+#    AuthUserFile /home/<account>/.htpasswd-analytics
+#    Require valid-user
+#</FilesMatch>
+
+# 3. report.php stays public (installs POST to it) — no auth here.

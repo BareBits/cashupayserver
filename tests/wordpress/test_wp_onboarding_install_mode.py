@@ -66,6 +66,9 @@ def _walk_barebits_wizard(wp: WordPressHandle, mint_url: str, backup_mint_url: s
     # Managed installs still get the auto-update question after mints…
     assert wizard_heading(body) == "Enable automatic updates?", wizard_heading(body)
     body = wiz.post(step="updates", auto_update="0")
+    # …and the usage-statistics question…
+    assert wizard_heading(body) == "Anonymous usage statistics", wizard_heading(body)
+    body = wiz.post(step="analytics", usage_stats="0")
     # …then must land on completion, never the crontab screen — WP-cron owns
     # the heartbeat.
     heading = wizard_heading(body)

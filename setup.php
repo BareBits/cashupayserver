@@ -43,6 +43,7 @@ require_once __DIR__ . '/includes/swap/config.php';
 require_once __DIR__ . '/includes/setup_flow.php';
 require_once __DIR__ . '/includes/desktop.php';
 require_once __DIR__ . '/includes/managed.php';
+require_once __DIR__ . '/includes/usage_stats.php';
 
 // Initialize session early - needed for storing temp data during setup
 Auth::initSession();
@@ -967,7 +968,31 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 // Both answers write the key: an explicit "Not now" is a decision,
                 // not an unanswered question.
                 Config::set('auto_update_enabled', $_POST['auto_update'] === '1');
-                $step = SetupFlow::nextStep('updates', $flowSteps) ?? 'cron';
+                $step = SetupFlow::nextStep('updates', $flowSteps) ?? 'analytics';
+                break;
+
+            case 'analytics':
+                if (!isset($_POST['usage_stats'])) {
+                    // GET landing — fall through to render the form.
+                    break;
+                }
+                // Anonymous usage statistics opt-in (UsageStats). "0" is an
+                // explicit decline and is stored as such; 1-3 pick a level,
+                // which also fires the first report right away so the
+                // operator's choice takes effect without waiting for cron.
+                $usChoice = (string)$_POST['usage_stats'];
+                if (!in_array($usChoice, ['0', '1', '2', '3'], true)) {
+                    throw new Exception('Please choose one of the options.');
+                }
+                if ($usChoice === '0') {
+                    UsageStats::setChoice(false);
+                } else {
+                    UsageStats::setChoice(true, (int)$usChoice);
+                    // Interactive path: short timeouts so a slow endpoint can't
+                    // hold the wizard; cron retries within the hour if this fails.
+                    UsageStats::sendNow(null, ['timeout' => 5, 'connectTimeout' => 3]);
+                }
+                $step = SetupFlow::nextStep('analytics', $flowSteps) ?? 'cron';
                 break;
 
             case 'cron':
@@ -2994,6 +3019,62 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                     <?= setupCsrfField() ?>
                     <button type="submit" name="auto_update" value="1" class="btn" style="width: 100%; margin-bottom: 0.75rem;">Enable automatic updates</button>
                     <button type="submit" name="auto_update" value="0" class="btn btn-secondary" style="width: 100%;">Not now &mdash; I'll update manually</button>
+                </form>
+
+            <?php elseif ($step === 'analytics'): ?>
+                <!-- Screen: anonymous usage statistics opt-in. Nothing is
+                     pre-selected and nothing is sent unless one of the three
+                     level buttons is clicked (UsageStats). Each level shows
+                     the exact JSON it would send, rendered by the same code
+                     that builds the real report, so the preview IS the
+                     payload. No JavaScript: plain <details> + one submit
+                     button per level. Abandoning the wizard here is safe —
+                     unanswered means off. -->
+                <?php
+                $usLevels = UsageStats::levelDescriptions();
+                $usPreviewNow = time();
+                ?>
+                <h2 style="margin-bottom: 1rem;">📊 Anonymous usage statistics</h2>
+                <p style="margin-bottom: 1rem;">
+                    Help us understand how many people run BareBits and which
+                    features matter. This is <strong>off by default</strong> and
+                    entirely optional. If you enable it, your server sends one
+                    small report now and then one a week to
+                    <code>getbarebits.com</code>. You choose how much it
+                    contains, and you can preview the exact report for each
+                    option below.
+                </p>
+                <p style="margin-bottom: 1.25rem; font-size: 0.9rem; color: #a0aec0;">
+                    No report ever includes your deployment ID, store names,
+                    mint or Lightning addresses, email addresses, customer or
+                    invoice details. Our side records the country your server
+                    connected from and then discards the IP address. Change
+                    your mind any time under Settings &rarr; Anonymous usage
+                    statistics; turning it off stops the reports. Details in the
+                    <a href="https://github.com/BareBits/cashupayserver/blob/main/PRIVACY.md" target="_blank" rel="noopener" style="color: #f7931a;">Privacy Policy</a>.
+                </p>
+                <form method="POST" action="<?= htmlspecialchars(setupSelfUrl()) ?>">
+                    <input type="hidden" name="step" value="analytics">
+                    <?= setupCsrfField() ?>
+                    <?php foreach ($usLevels as $usLevel => $usDesc): ?>
+                    <div class="usage-stats-option" style="background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); border-radius: 10px; padding: 1rem; margin-bottom: 0.9rem;">
+                        <div style="font-weight: 600; margin-bottom: 0.25rem;">
+                            Option <?= (int)$usLevel ?>: <?= htmlspecialchars($usDesc['title']) ?>
+                        </div>
+                        <p style="margin: 0 0 0.5rem 0; font-size: 0.9rem; color: #a0aec0;"><?= htmlspecialchars($usDesc['summary']) ?></p>
+                        <ul style="margin: 0 0 0.75rem 1.1rem; padding: 0; font-size: 0.85rem; color: #cbd5e0; line-height: 1.45;">
+                            <?php foreach ($usDesc['items'] as $usItem): ?>
+                            <li><?= htmlspecialchars($usItem) ?></li>
+                            <?php endforeach; ?>
+                        </ul>
+                        <details style="margin-bottom: 0.75rem;">
+                            <summary style="cursor: pointer; font-size: 0.85rem; color: #f7931a;">Preview the exact report for option <?= (int)$usLevel ?></summary>
+                            <pre class="usage-stats-preview" data-level="<?= (int)$usLevel ?>" style="background: rgba(0,0,0,0.3); padding: 0.75rem; border-radius: 6px; font-size: 0.75rem; margin-top: 0.5rem; overflow-x: auto; white-space: pre; max-height: 20rem;"><?= htmlspecialchars(UsageStats::previewJson($usLevel, $usPreviewNow)) ?></pre>
+                        </details>
+                        <button type="submit" name="usage_stats" value="<?= (int)$usLevel ?>" class="btn" style="width: 100%;">Share option <?= (int)$usLevel ?>: <?= htmlspecialchars($usDesc['title']) ?></button>
+                    </div>
+                    <?php endforeach; ?>
+                    <button type="submit" name="usage_stats" value="0" class="btn btn-secondary" style="width: 100%;">No thanks, don&rsquo;t send statistics</button>
                 </form>
 
             <?php elseif ($step === 'cron'): ?>

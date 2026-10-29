@@ -251,6 +251,7 @@ def start_payserver(
     # test install (includes/fee_branch.php). Fee-branch tests override this
     # with the local xpub.php fixture via fixtures.xpub_endpoint.fee_branch_env.
     env.setdefault("CASHUPAY_DEV_FEE_BRANCH_ENDPOINT", "disabled")
+    env.setdefault("CASHUPAY_USAGE_STATS_ENDPOINT", "disabled")
     # SafeHttp blocks loopback/RFC1918 destinations by default to defend
     # against tenant-supplied SSRF (webhook URLs, LNURL callbacks, etc.).
     # Every test sink — webhook receiver, LNURL mock, Esplora, the wp test
