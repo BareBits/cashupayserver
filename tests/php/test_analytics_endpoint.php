@@ -44,6 +44,8 @@ $r = $ep->request('POST', ['raw' => '{not json']);
 assert_eq('invalid_json', json_decode($r['body'], true)['error'] ?? null, 'malformed JSON refused');
 $r = $ep->request('POST', ['raw' => '[1,2,3]']);
 assert_eq('not_an_object', json_decode($r['body'], true)['error'] ?? null, 'a JSON list is not a report');
+$r = $ep->request('POST', ['raw' => '{}']);
+assert_eq(['error' => 'missing_field', 'field' => 'schema_version'], json_decode($r['body'], true), 'an empty object is a report with everything missing');
 $r = $ep->request('POST', ['raw' => str_repeat('x', 20000)]);
 assert_eq(413, $r['status'], 'oversize body refused');
 assert_eq('too_large', json_decode($r['body'], true)['error'] ?? null);

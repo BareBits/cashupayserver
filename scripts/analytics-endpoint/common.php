@@ -265,7 +265,8 @@ function analytics_is_uuid_v4(string $v): bool {
  */
 function analytics_validate(mixed $decoded): array {
     $fail = static fn(string $error, string $field = '') => ['ok' => false, 'error' => $error, 'field' => $field];
-    if (!is_array($decoded) || array_is_list($decoded)) {
+    // json_decode('{}', true) is [] — an empty object, not a list.
+    if (!is_array($decoded) || ($decoded !== [] && array_is_list($decoded))) {
         return $fail('not_an_object');
     }
     $envelopeKeys = ['schema_version', 'event', 'client', 'install_id', 'sent_at', 'level', 'properties'];
