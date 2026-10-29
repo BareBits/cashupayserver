@@ -940,6 +940,13 @@ def use_classic_checkout(handle: WordPressHandle) -> None:
     )
 
 
+def _wp_sqlite_ast_driver_enabled() -> bool:
+    """The drop-in's AST driver is on unless CASHUPAY_WP_SQLITE_AST_DRIVER is
+    set to an explicit off value (0/false/no/off)."""
+    raw = os.environ.get("CASHUPAY_WP_SQLITE_AST_DRIVER", "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
 def _wp_config_php(
     *,
     port: int,
@@ -959,26 +966,39 @@ def _wp_config_php(
             "// operator would use to opt into the testing channel.\n"
             f"define('BAREBITS_RELEASE_CHANNEL', '{release_channel}');\n"
         )
-    # Opt-in knobs for the sqlite-database-integration drop-in, for A/B runs
-    # against its lock behaviour (see the comments in the config below):
-    #   CASHUPAY_WP_SQLITE_JOURNAL_MODE=WAL|DELETE|...   PRAGMA journal_mode
-    #   CASHUPAY_WP_SQLITE_AST_DRIVER=1                  the plugin's newer driver
+    # sqlite-database-integration drop-in driver + journal knobs.
+    #
+    #   CASHUPAY_WP_SQLITE_AST_DRIVER=0              fall back to the legacy translator
+    #   CASHUPAY_WP_SQLITE_JOURNAL_MODE=WAL|DELETE|...   PRAGMA journal_mode (A/B only)
+    #
+    # The plugin's newer "AST" driver is the default here. Its legacy
+    # translator wraps every statement in a deferred BEGIN, and a connection
+    # that read first cannot upgrade to a write once another php -S worker
+    # committed in between: SQLite fails the upgrade with "database is locked"
+    # without consulting the busy timeout. WooCommerce saves the cart session
+    # from a shutdown hook in exactly that shape, so under the multi-worker
+    # checkout tier a buyer's cart could silently vanish between requests
+    # (woocommerce_rest_cart_empty). The AST driver opens write transactions
+    # with BEGIN IMMEDIATE, which queues concurrent writers on the busy
+    # timeout instead. Measured 2026-10-28 on test_wp_woocommerce_checkout.py:
+    # translator 3/3 clean but flaky in CI, translator+WAL 3 empty-cart
+    # failures in 4 runs, AST driver 3/3 clean.
     sqlite_defines = ""
     journal_mode = os.environ.get("CASHUPAY_WP_SQLITE_JOURNAL_MODE", "")
     if journal_mode:
         sqlite_defines += (
-            "// Measured 2026-10-28 with the default (translator) driver: WAL made the\n"
-            "// lost-write race WORSE (3 empty-cart checkouts in 4 runs vs 0 in 3 with\n"
-            "// the rollback journal). Its deferred BEGIN cannot upgrade to a write once\n"
-            "// another worker committed, and WAL widens that window to the whole\n"
-            "// transaction. Kept as an opt-in for experiments only.\n"
+            "// A/B knob only. With the legacy translator driver WAL made the\n"
+            "// lost-write race WORSE: its deferred BEGIN cannot upgrade to a write\n"
+            "// once another worker committed, and WAL widens that window to the\n"
+            "// whole transaction.\n"
             f"define('SQLITE_JOURNAL_MODE', '{journal_mode}');\n"
         )
-    if os.environ.get("CASHUPAY_WP_SQLITE_AST_DRIVER"):
+    if _wp_sqlite_ast_driver_enabled():
         sqlite_defines += (
             "// The plugin's newer driver opens write statements with BEGIN IMMEDIATE,\n"
             "// which queues concurrent writers on the busy timeout instead of failing\n"
-            "// the read-to-write upgrade with \"database is locked\".\n"
+            "// the read-to-write upgrade with \"database is locked\" (the cause of the\n"
+            "// empty-cart checkout flakes on the legacy translator driver).\n"
             "define('WP_SQLITE_AST_DRIVER', true);\n"
         )
     return f"""<?php
