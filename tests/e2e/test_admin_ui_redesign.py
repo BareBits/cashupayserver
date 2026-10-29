@@ -1,7 +1,6 @@
 """Browser e2e coverage for the admin UI redesign:
-  - Export Token button present again (reinstated with the exports ledger
-    in the 2026-10 security release: every token is recorded before it is
-    shown and listed under Recent exports).
+  - No Export Token button on the dashboard (removed 2026-10; the Recent
+    exports ledger and its token modal stay for tokens handed out earlier).
   - Settings + store-settings cards are collapsible (default open) and toggle.
   - On-chain "Advanced" subsection is collapsed by default.
   - Auto-cashout column selector renders (store: 2 cols — the "-1"/inherit
@@ -46,11 +45,20 @@ def _goto(page, base, view):
     page.wait_for_timeout(1200)
 
 
-def test_export_button_and_modal_present(admin_page):
+def test_export_button_removed_but_ledger_modal_present(admin_page):
     page, base = admin_page
     _goto(page, base, "dashboard")
-    assert page.evaluate("!!document.getElementById('btn-export')") is True
+    # The dashboard no longer offers to generate a new token...
+    assert page.evaluate("!!document.getElementById('btn-export')") is False
+    assert page.evaluate("!!document.getElementById('export-form')") is False
+    assert page.evaluate("!!document.getElementById('btn-confirm-export')") is False
+    # ...but the modal that shows an already-recorded token (Recent exports
+    # > Show, wallet-recovery tokens) is still there.
     assert page.evaluate("!!document.getElementById('modal-export')") is True
+    assert page.evaluate("!!document.getElementById('export-token')") is True
+    # The three remaining balance actions are present.
+    for btn_id in ("btn-withdraw", "btn-request", "btn-request-simple"):
+        assert page.evaluate(f"!!document.getElementById('{btn_id}')") is True, btn_id
 
 
 def test_store_settings_collapsible_and_order(admin_page):

@@ -348,7 +348,6 @@ if (isset($_GET['api'])) {
             $storeConfigured = Config::isStoreConfigured($storeId);
             $balance = 0;
             $swapFee = 0;
-            $exportAvailable = 0;
             $mintUnit = Config::getStoreMintUnit($storeId);
 
             // Dashboard uses LOCAL balance (no mint contact) for fast loading
@@ -361,11 +360,6 @@ if (isset($_GET['api'])) {
                 // User can click "Refresh" to contact mint and verify proof states
                 $balance = Invoice::getBalance($storeId);
                 $balanceCached = true;
-
-                // When using offline balance, set exportAvailable = balance
-                // This allows Max button to work even without mint contact
-                // (no fee deduction since we can't calculate swap fee without mint)
-                $exportAvailable = $balance;
             }
 
             // Get invoices for this store
@@ -591,7 +585,6 @@ if (isset($_GET['api'])) {
                 'balanceFiatCurrency' => $balanceFiatCurrency,
                 'defaultCurrency' => $defaultCurrency,
                 'swapFee' => $swapFee,
-                'exportAvailable' => $exportAvailable,
                 'mintUnit' => $mintUnit,
                 'balanceCached' => $balanceCached,
                 'invoices' => array_map([Invoice::class, 'formatForApi'], $recentInvoices),
@@ -1103,7 +1096,7 @@ if (isset($_GET['api'])) {
                 $wallet = Invoice::getWalletInstance($storeId);
                 $store = Config::getStore($storeId);
 
-                // Check proof states at mint (same as export_token). The reply
+                // Check proof states at mint (same as the ledger checks). The reply
                 // is validated (complete, in order) — a short or empty answer
                 // is an error, never "spendable".
                 if (!empty($proofs)) {
@@ -1123,7 +1116,7 @@ if (isset($_GET['api'])) {
                             } elseif ($mintState === ProofState::SPENT) {
                                 $spentSecrets[] = $proof->secret;
                             }
-                            // Skip PENDING proofs (same as export_token)
+                            // Skip PENDING proofs (same as the ledger checks)
                         }
 
                         // Update spent proofs locally
@@ -1196,7 +1189,7 @@ if (isset($_GET['api'])) {
 
         case 'proofs':
             // Admin-only: these rows carry secret + C — i.e. spendable bearer
-            // ecash. Match the sibling fund endpoints (export_info/export_token).
+            // ecash. Match the sibling fund endpoint (export_info).
             Auth::requireAdmin();
             $storeId = $_GET['store_id'] ?? null;
             if (!$storeId || !Config::isStoreConfigured($storeId)) {
@@ -3759,236 +3752,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
             break;
 
-        case 'export_token':
-            Auth::requireAdmin();
-            // OFFLINE-FIRST EXPORT: Minimize mint contact, maximize reliability
-            //
-            // Flow:
-            // 1. Get proofs from local storage
-            // 2. Try greedy selection (no mint needed if exact change available)
-            // 3. If no exact change, swap the SMALLEST covering input set at the
-            //    mint (if reachable) — never the whole balance
-            // 4. If mint unreachable, ask user to confirm larger amount
-            // 5. Record the export in the transfers ledger, reserve the proofs
-            //    as EXPORTED, and only then return the token
-            //
-            // The whole thing runs under the store's funds lock (shared with
-            // withdraw / reclaim / the cron cashout and fee melt): two exports,
-            // or an export racing a withdrawal, can never hand out the same
-            // proofs. A swap can take a while at a slow mint; being cut off
-            // mid-way is how a token's proofs get lost.
-            @set_time_limit(0);
-            $fundsLock = null;
-            try {
-                require_once __DIR__ . '/cashu-wallet-php/CashuWallet.php';
-
-                $storeId = $_POST['store_id'] ?? '';
-                $amount = (int)($_POST['amount'] ?? 0);
-                $forceAmount = isset($_POST['force_amount']) ? (int)$_POST['force_amount'] : null;
-
-                if (empty($storeId)) {
-                    throw new Exception('Store ID required');
-                }
-                if (!Config::isStoreConfigured($storeId)) {
-                    throw new Exception('Store not configured');
-                }
-                if ($amount < 1) {
-                    throw new Exception('Amount required');
-                }
-
-                $fundsLock = cashupay_acquire_lock('funds_' . $storeId);
-                if (!$fundsLock) {
-                    cashupay_status(409);
-                    echo json_encode(['error' => 'Another withdrawal or export is in progress. Try again in a moment.']);
-                    break;
-                }
-
-                // Reconcile PENDING proofs first (SPENT transition only — an
-                // exported-but-unredeemed token is never put back on sale).
-                Invoice::checkPendingProofs($storeId);
-
-                // 1. Get proofs from local storage (offline-first; inputs an
-                //    unfinished melt/swap journal owns are already excluded)
-                $proofs = Invoice::getUnspentProofs($storeId);
-                $balance = \Cashu\Wallet::sumProofs($proofs);
-
-                $store = Config::getStore($storeId);
-                $mintUrl = rtrim((string)$store['mint_url'], '/');
-                $mintUnit = strtolower((string)($store['mint_unit'] ?? 'sat'));
-
-                if ($balance < $amount) {
-                    throw new Exception("Insufficient balance. Have: {$balance} {$mintUnit}, Need: {$amount} {$mintUnit}");
-                }
-
-                // 2. Try greedy selection first (no mint needed if exact change available)
-                $selected = \Cashu\Wallet::selectProofs($proofs, $amount);
-                $selectedSum = \Cashu\Wallet::sumProofs($selected);
-                $hasExactChange = ($selectedSum === $amount);
-
-                // Track state
-                $sendProofs = null;
-                $mintUsed = false;
-                $mintReachable = true;
-                $wallet = null;
-
-                // 3. If no exact change, try mint swap
-                if (!$hasExactChange) {
-                    try {
-                        $wallet = Invoice::getWalletInstance($storeId);
-
-                        // Check proof states at mint first (filter out spent/pending).
-                        // The reply is validated: short / re-ordered → error.
-                        if (!empty($proofs)) {
-                            $states = StoreSafety::checkProofStates($mintUrl, $mintUnit, $proofs);
-                            $validProofs = [];
-                            $spentSecrets = [];
-                            foreach ($proofs as $proof) {
-                                $mintState = $states[$proof->Y] ?? '';
-                                if ($mintState === ProofState::SPENT) {
-                                    $spentSecrets[] = $proof->secret;
-                                } elseif ($mintState === ProofState::UNSPENT) {
-                                    $validProofs[] = $proof;
-                                }
-                                // Skip PENDING proofs
-                            }
-                            if (!empty($spentSecrets)) {
-                                Invoice::markProofsSpent($storeId, $spentSecrets);
-                            }
-                            $proofs = $validProofs;
-                            $balance = \Cashu\Wallet::sumProofs($proofs);
-                        }
-
-                        // Smallest input set that covers the amount plus its own
-                        // NUT-02 input fee — swapping the whole balance put every
-                        // proof of the store into one journaled swap (and paid
-                        // the input fee on all of them).
-                        try {
-                            $inputs = $wallet->selectProofsWithFees($proofs, $amount);
-                        } catch (\Cashu\InsufficientBalanceException $ie) {
-                            $fee = $wallet->calculateFee($proofs);
-                            throw new Exception("Insufficient balance. Have: {$balance} {$mintUnit}, Need: " . ($amount + $fee) . " {$mintUnit}");
-                        }
-                        $result = $wallet->split($inputs, $amount);
-                        $sendProofs = $result['send'];
-                        $mintUsed = true;
-
-                    } catch (Exception $e) {
-                        // Check if mint is unreachable
-                        if (Invoice::isMintUnreachable($e)) {
-                            $mintReachable = false;
-                            // Continue with greedy selection below
-                        } elseif (stripos($e->getMessage(), 'already spent') !== false ||
-                                  stripos($e->getMessage(), 'proof already spent') !== false) {
-                            // Sync proof states and ask user to retry
-                            if ($wallet) {
-                                try { $wallet->syncProofStates(); } catch (Exception $se) {}
-                            }
-                            cashupay_status(400);
-                            echo json_encode([
-                                'error' => 'Some proofs were already spent. Balance updated. Please try again.',
-                                'sync' => true
-                            ]);
-                            break;
-                        } else {
-                            throw $e; // Re-throw other errors
-                        }
-                    }
-                }
-
-                // 4. If mint not used (exact change locally OR mint unreachable), use greedy selection
-                if (!$mintUsed) {
-                    // Re-select in case proofs changed during state check
-                    $selected = \Cashu\Wallet::selectProofs($proofs, $amount);
-                    $selectedSum = \Cashu\Wallet::sumProofs($selected);
-
-                    // Ask user to confirm if amount differs and mint is unreachable
-                    if ($selectedSum !== $amount && $forceAmount !== $selectedSum) {
-                        $message = $mintReachable
-                            ? "Exact change unavailable. Export {$selectedSum} instead of {$amount}?"
-                            : "Mint unreachable. Exact change unavailable. Export {$selectedSum} instead of {$amount}?";
-
-                        echo json_encode([
-                            'error' => 'change_needed',
-                            'requested' => $amount,
-                            'available' => $selectedSum,
-                            'mintUnreachable' => !$mintReachable,
-                            'message' => $message
-                        ]);
-                        break;
-                    }
-
-                    $sendProofs = $selected;
-                    $amount = $selectedSum; // Update to actual amount
-                }
-
-                // 5. Serialize
-                if (empty($sendProofs)) {
-                    throw new Exception("Export failed: no proofs available");
-                }
-
-                // Use wallet serialization if available, otherwise manual
-                if ($wallet && $mintUsed) {
-                    $token = $wallet->serializeToken($sendProofs);
-                } else {
-                    // Offline serialization - detect V4 vs V3 format
-                    $useV4 = true;
-                    foreach ($sendProofs as $proof) {
-                        if (!\Cashu\TokenSerializer::isHexKeysetId($proof->id)) {
-                            $useV4 = false;
-                            break;
-                        }
-                    }
-                    $token = $useV4
-                        ? \Cashu\TokenSerializer::serializeV4($mintUrl, $sendProofs, $mintUnit)
-                        : \Cashu\TokenSerializer::serializeV3($mintUrl, $sendProofs, $mintUnit);
-                }
-
-                // Record the export BEFORE anything is disclosed, then reserve
-                // the proofs as EXPORTED (never PENDING: that state belongs to
-                // in-flight melts, and recovery used to return exported proofs
-                // to the balance when the mint reported them unredeemed). If
-                // the reservation fails — another path spent one of them in
-                // the meantime — the ledger row is failed and nothing goes out.
-                $sentSecrets = array_map(fn($p) => $p->secret, $sendProofs);
-                $exportAmount = \Cashu\Wallet::sumProofs($sendProofs);
-                $transferId = Transfer::open(
-                    $storeId, Transfer::TYPE_TOKEN_EXPORT, $exportAmount, $mintUnit, $sentSecrets, $token, $mintUrl,
-                    $mintUsed ? 'Cashu token export' : 'Cashu token export (offline)'
-                );
-                try {
-                    Invoice::markProofsExported($storeId, $sentSecrets, $mintUrl, $mintUnit);
-                } catch (\Throwable $reserveErr) {
-                    Transfer::fail($transferId, 'Reservation failed: ' . $reserveErr->getMessage());
-                    throw $reserveErr;
-                }
-
-                $response = [
-                    'token' => $token,
-                    'amount' => $exportAmount,
-                    'secrets' => $sentSecrets,
-                    'transfer_id' => $transferId,
-                ];
-
-                if (!$mintUsed) {
-                    $response['offlineExport'] = true;
-                }
-                if (!$mintReachable) {
-                    $response['mintUnreachable'] = true;
-                }
-
-                echo json_encode($response);
-
-            } catch (\Throwable $e) {
-                if (Database::getInstance()->inTransaction()) {
-                    Database::rollback();
-                }
-                cashupay_status(400);
-                echo json_encode(['error' => $e->getMessage()]);
-            } finally {
-                cashupay_release_lock($fundsLock);
-            }
-            break;
-
         case 'get_backup_mints':
             $storeId = $_GET['store_id'] ?? $_POST['store_id'] ?? null;
             if (!$storeId) {
@@ -5349,12 +5112,17 @@ header('Cache-Control: no-cache, must-revalidate');
 
         .balance-actions {
             display: flex;
+            /* Phone widths can't fit every action side by side: let the row
+               wrap (two up, the last one stretching across) instead of
+               pushing the trailing button past the edge of the screen. */
+            flex-wrap: wrap;
             gap: 0.75rem;
             margin-top: 1rem;
         }
 
         .balance-btn {
-            flex: 1;
+            flex: 1 1 140px;
+            min-width: 0;
             padding: 0.75rem;
             background: rgba(255, 255, 255, 0.2);
             border: none;
@@ -5397,6 +5165,36 @@ header('Cache-Control: no-cache, must-revalidate');
 
         .card-body {
             padding: 1rem;
+        }
+
+        /* Button group beside a card title. Wraps rather than overflowing;
+           on phones the buttons shrink and swap their labels for the short
+           form (.label-short) so the whole group still fits beside the title. */
+        .card-header-actions {
+            display: flex;
+            gap: 0.5rem;
+            flex-wrap: wrap;
+            justify-content: flex-end;
+            min-width: 0;
+        }
+        .card-header-actions .label-short {
+            display: none;
+        }
+        .card-header:has(> .card-header-actions) > .card-title {
+            white-space: nowrap;
+        }
+        @media (max-width: 500px) {
+            .card-header-actions .btn {
+                padding: 0.5rem 0.75rem;
+                font-size: 0.85rem;
+                white-space: nowrap;
+            }
+            .card-header-actions .label-full {
+                display: none;
+            }
+            .card-header-actions .label-short {
+                display: inline;
+            }
         }
 
         /* Collapsible cards (default open; add .collapsed to start closed) */
@@ -6185,12 +5983,22 @@ header('Cache-Control: no-cache, must-revalidate');
         .inv-filter-row {
             display: flex;
             align-items: center;
+            /* Several label+select pairs share this row (Log and Customers
+               carry two filters). Let them wrap on narrow phones instead of
+               pushing the last dropdown past the edge of the screen. */
+            flex-wrap: wrap;
             gap: 0.5rem;
             padding: 0 0 0.75rem 0;
+        }
+        .inv-filter {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
         }
         .inv-filter-row label {
             color: var(--text-secondary);
             font-size: 0.85rem;
+            white-space: nowrap;
         }
         /* Match the header store selector so the dropdown is readable and
            consistent with the rest of the admin UI. */
@@ -6446,12 +6254,6 @@ header('Cache-Control: no-cache, must-revalidate');
                             </svg>
                             Withdraw
                         </button>
-                        <button class="balance-btn" id="btn-export" data-admin-only="true">
-                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12"></path>
-                            </svg>
-                            Export token
-                        </button>
                         <button class="balance-btn" id="btn-request">
                             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                                 <circle cx="9" cy="21" r="1"></circle><circle cx="20" cy="21" r="1"></circle>
@@ -6529,14 +6331,14 @@ header('Cache-Control: no-cache, must-revalidate');
                 <div class="card view-fill">
                     <div class="card-header">
                         <div class="card-title">All Invoices</div>
-                        <div style="display: flex; gap: 0.5rem;">
-                            <button class="btn btn-secondary" id="btn-export-invoices-csv">Export CSV</button>
-                            <button class="btn" id="btn-new-invoice-advanced">Create invoice</button>
-                            <button class="btn" id="btn-new-invoice">Create invoice (simple)</button>
+                        <div class="card-header-actions">
+                            <button class="btn btn-secondary" id="btn-export-invoices-csv"><span class="label-full">Export CSV</span><span class="label-short">CSV</span></button>
+                            <button class="btn" id="btn-new-invoice-advanced"><span class="label-full">Create invoice</span><span class="label-short">New</span></button>
+                            <button class="btn" id="btn-new-invoice"><span class="label-full">Create invoice (simple)</span><span class="label-short">New (simple)</span></button>
                         </div>
                     </div>
                     <div class="inv-filter-row">
-                        <label for="invoice-status-filter">Status:</label>
+                        <span class="inv-filter"><label for="invoice-status-filter">Status:</label>
                         <select id="invoice-status-filter">
                             <option value="">All</option>
                             <option value="New">New</option>
@@ -6544,11 +6346,11 @@ header('Cache-Control: no-cache, must-revalidate');
                             <option value="Settled">Paid</option>
                             <option value="Expired">Expired</option>
                             <option value="Invalid">Invalid</option>
-                        </select>
-                        <label for="invoice-store-filter">Store:</label>
+                        </select></span>
+                        <span class="inv-filter"><label for="invoice-store-filter">Store:</label>
                         <select id="invoice-store-filter">
                             <option value="__all__">All stores</option>
-                        </select>
+                        </select></span>
                     </div>
                     <div id="all-invoices">
                         <div class="loading"><div class="spinner"></div></div>
@@ -6568,7 +6370,7 @@ header('Cache-Control: no-cache, must-revalidate');
                         <button class="btn btn-secondary" id="btn-refresh-log">Refresh</button>
                     </div>
                     <div class="inv-filter-row">
-                        <label for="log-category-filter">Category:</label>
+                        <span class="inv-filter"><label for="log-category-filter">Category:</label>
                         <select id="log-category-filter">
                             <option value="">All</option>
                             <option value="nwc">NWC wallet</option>
@@ -6579,11 +6381,11 @@ header('Cache-Control: no-cache, must-revalidate');
                             <option value="email">Email</option>
                             <option value="swap">Swap</option>
                             <option value="sweep">Sweep</option>
-                        </select>
-                        <label for="log-store-filter">Store:</label>
+                        </select></span>
+                        <span class="inv-filter"><label for="log-store-filter">Store:</label>
                         <select id="log-store-filter">
                             <option value="__all__">All stores</option>
-                        </select>
+                        </select></span>
                     </div>
                     <div id="admin-log-list">
                         <div class="loading"><div class="spinner"></div></div>
@@ -6603,16 +6405,16 @@ header('Cache-Control: no-cache, must-revalidate');
                         </div>
                     </div>
                     <div class="inv-filter-row">
-                        <label for="customer-subscription-filter">Newsletter:</label>
+                        <span class="inv-filter"><label for="customer-subscription-filter">Newsletter:</label>
                         <select id="customer-subscription-filter">
                             <option value="">All</option>
                             <option value="subscribed">Subscribed</option>
                             <option value="unsubscribed">Not subscribed</option>
-                        </select>
-                        <label for="customer-store-filter">Store:</label>
+                        </select></span>
+                        <span class="inv-filter"><label for="customer-store-filter">Store:</label>
                         <select id="customer-store-filter">
                             <option value="__all__">All stores</option>
-                        </select>
+                        </select></span>
                     </div>
                     <div id="all-customers">
                         <div class="loading"><div class="spinner"></div></div>
@@ -8499,24 +8301,12 @@ header('Cache-Control: no-cache, must-revalidate');
     <div class="modal-overlay" id="modal-export">
         <div class="modal">
             <div class="modal-handle"></div>
-            <div class="modal-title" id="modal-export-title">Export Cashu Token</div>
+            <div class="modal-title" id="modal-export-title">Cashu Token</div>
 
-            <div id="export-form">
-                <div class="form-group">
-                    <label class="form-label">Amount (<span class="unit-label">SAT</span>)</label>
-                    <div style="display: flex; gap: 0.5rem;">
-                        <input type="number" class="form-input" id="export-amount"
-                               placeholder="0" min="1" step="1" style="flex: 1;" oninput="updateExportButton()">
-                        <button type="button" class="btn btn-secondary" id="btn-send-max" onclick="sendMax()">Max</button>
-                    </div>
-                    <p class="form-help">Available: <span id="export-available">0</span> <span class="unit-label">SAT</span></p>
-                    <p class="form-help">The token is recorded before it is shown: you can show it again, check whether it was cashed in, or take it back from the Recent exports list.</p>
-                </div>
-
-                <button class="btn btn-full" id="btn-confirm-export" onclick="handleExport(null)">Generate Token</button>
-            </div>
-
-            <div id="export-result" style="display: none;">
+            <!-- Shows a token the ledger already holds (Recent exports ▸ Show,
+                 wallet-recovery tokens). New tokens can no longer be generated
+                 from the UI: the Export token action was removed. -->
+            <div id="export-result">
                 <div class="modal-qr" id="export-qr"></div>
                 <div class="token-display" id="export-token"></div>
                 <p class="form-help" id="export-result-note" style="margin-top: 0.5rem;"></p>
@@ -9295,11 +9085,6 @@ header('Cache-Control: no-cache, must-revalidate');
             document.getElementById('btn-withdraw').addEventListener('click', () => {
                 if (!ensureAdmin('Only admins can withdraw funds.')) return;
                 openModal('modal-withdraw');
-            });
-            const btnExport = document.getElementById('btn-export');
-            if (btnExport) btnExport.addEventListener('click', () => {
-                if (!ensureAdmin('Only admins can export a Cashu token.')) return;
-                openModal('modal-export');
             });
             document.getElementById('btn-request').addEventListener('click', () => openCartModal());
             const btnReqSimple = document.getElementById('btn-request-simple');
@@ -10229,10 +10014,6 @@ header('Cache-Control: no-cache, must-revalidate');
                     });
                     exportedEl.textContent = parts.join(' · ');
                     exportedEl.style.display = parts.length ? 'block' : 'none';
-                }
-                const exportAvailableEl = document.getElementById('export-available');
-                if (exportAvailableEl) {
-                    exportAvailableEl.textContent = formatAmount(dashboardData.exportAvailable ?? 0, mintUnit);
                 }
                 renderRecentExports(dashboardData.recentExports || []);
                 renderWalletRecoveryStatus(dashboardData.walletRecovery || null);
@@ -11743,170 +11524,11 @@ header('Cache-Control: no-cache, must-revalidate');
             updateWithdrawInfo();
         }
 
-        // Update export button enable state when amount changes
-        function updateExportButton() {
-            const mintUnit = dashboardData?.mintUnit || 'sat';
-            // Parse as smallest unit (cents for fiat, sats for bitcoin)
-            const amountSmallest = parseAmount(document.getElementById('export-amount').value, mintUnit);
-
-            // Validate and update button state
-            const exportBtn = document.getElementById('btn-confirm-export');
-            const exportAvailable = dashboardData?.exportAvailable || 0;
-
-            const isValid = amountSmallest > 0 && amountSmallest <= exportAvailable;
-            exportBtn.disabled = !isValid;
-        }
-
-        // Track export state for claiming detection
+        // Claim detection for a token shown from the ledger (Recent exports
+        // ▸ Show, wallet-recovery tokens): poll the mint while the modal is
+        // open and flip to a success overlay once the proofs are spent.
         let exportCheckInterval = null;
         let exportSecrets = null;
-
-        async function handleExport(forceAmount = null) {
-            const mintUnit = dashboardData?.mintUnit || 'sat';
-            const amount = forceAmount || parseAmount(document.getElementById('export-amount').value, mintUnit);
-
-            const minAmount = isFiatUnit(mintUnit) ? 1 : 1; // 1 cent or 1 sat minimum
-            if (!amount || amount < minAmount) {
-                showToast('Please enter an amount', 'error');
-                return;
-            }
-
-            if (!currentStoreId) {
-                showToast('No store selected', 'error');
-                return;
-            }
-
-            const exportBtn = document.getElementById('btn-confirm-export');
-            const exportBtnOrigText = exportBtn.textContent;
-            exportBtn.textContent = 'Processing, please wait...';
-            exportBtn.disabled = true;
-
-            try {
-                let postData = `action=export_token&store_id=${encodeURIComponent(currentStoreId)}&amount=${amount}`;
-                if (forceAmount !== null) {
-                    postData += `&force_amount=${forceAmount}`;
-                }
-
-                const response = await postWithCsrf(adminUrl, postData);
-                const result = await response.json();
-
-                // Handle mint unreachable - needs user confirmation for different amount
-                if (result.error === 'change_needed' || result.error === 'mint_unreachable_change_needed') {
-                    const unitLabel = mintUnit.toUpperCase();
-                    const requestedDisplay = formatAmount(result.requested, mintUnit);
-                    const availableDisplay = formatAmount(result.available, mintUnit);
-
-                    const confirmed = confirm(
-                        `Mint Unreachable - Offline Export\n\n` +
-                        `The mint is currently unreachable, so exact change cannot be provided.\n\n` +
-                        `Requested: ${requestedDisplay} ${unitLabel}\n` +
-                        `Available (closest match): ${availableDisplay} ${unitLabel}\n\n` +
-                        `Export ${availableDisplay} ${unitLabel} instead?`
-                    );
-
-                    if (confirmed) {
-                        // Re-submit with force_amount
-                        exportBtn.textContent = exportBtnOrigText;
-                        exportBtn.disabled = false;
-                        handleExport(result.available);
-                    } else {
-                        showToast('Export cancelled. Try using "Max" for exact match.', 'info');
-                        exportBtn.textContent = exportBtnOrigText;
-                        exportBtn.disabled = false;
-                    }
-                    return;
-                }
-
-                if (response.ok && result.token) {
-                    // Show result
-                    document.getElementById('export-form').style.display = 'none';
-                    document.getElementById('export-result').style.display = 'block';
-                    document.getElementById('export-token').textContent = result.token;
-
-                    // Store secrets for claim detection
-                    exportSecrets = result.secrets;
-
-                    // Show offline export notice if mint was unreachable
-                    if (result.offlineExport && result.mintUnreachable) {
-                        setTimeout(() => {
-                            showToast('Token exported offline (mint unreachable). Claim detection disabled.', 'info');
-                        }, 500);
-                        // Don't start claim detection - mint is unreachable
-                    } else if (result.offlineExport) {
-                        // Had exact change locally - mint wasn't needed but is reachable
-                        // Start claim detection since mint is available
-                        if (exportCheckInterval) clearInterval(exportCheckInterval);
-                        exportCheckInterval = setInterval(checkIfTokenClaimed, 5000);
-                    } else {
-                        // Start checking if token has been claimed (every 5 seconds)
-                        if (exportCheckInterval) clearInterval(exportCheckInterval);
-                        exportCheckInterval = setInterval(checkIfTokenClaimed, 5000);
-                    }
-
-                    // Generate QR code (single or animated based on size)
-                    const qrContainer = document.getElementById('export-qr');
-                    qrContainer.innerHTML = '';
-
-                    try {
-                        // Check if we need animated QR based on token size
-                        if (AnimatedQR.needsAnimation(result.token)) {
-                            // Large token - use NUT-16 animated QR with UR encoding
-                            const animatedQr = new AnimatedQR(qrContainer, {
-                                frameRate: 200,
-                                maxFragmentLen: 200,
-                                qrSize: 280,
-                                errorCorrection: 'M'
-                            });
-
-                            if (!animatedQr.encode(result.token)) {
-                                throw new Error('Failed to encode animated QR');
-                            }
-                        } else {
-                            // Small token - use single static QR
-                            if (typeof QRious !== 'undefined') {
-                                const canvas = document.createElement('canvas');
-                                qrContainer.appendChild(canvas);
-
-                                const maxSize = Math.min(280, window.innerWidth - 80);
-
-                                new QRious({
-                                    element: canvas,
-                                    value: result.token,
-                                    size: maxSize,
-                                    backgroundAlpha: 1,
-                                    foreground: '#000000',
-                                    background: '#ffffff',
-                                    level: 'L'
-                                });
-                            } else {
-                                throw new Error('QR library not loaded');
-                            }
-                        }
-                    } catch (e) {
-                        console.error('QR generation failed:', e);
-                        const warning = document.createElement('div');
-                        warning.style.cssText = 'color: #888; text-align: center; padding: 2rem; font-size: 0.9rem;';
-                        warning.textContent = 'QR code generation failed. Please copy the token below.';
-                        qrContainer.appendChild(warning);
-                    }
-
-                    loadDashboard();
-                } else {
-                    showToast(result.error || 'Export failed', 'error');
-                    exportBtn.textContent = exportBtnOrigText;
-                    exportBtn.disabled = false;
-
-                    // If sync happened, reload dashboard to show updated balance
-                    if (result.sync) {
-                        loadDashboard();
-                    }
-                }
-            } catch (e) {
-                showToast('Export failed', 'error');
-                exportBtn.textContent = exportBtnOrigText;
-                exportBtn.disabled = false;
-            }
-        }
 
         function copyToken() {
             const token = document.getElementById('export-token').textContent;
@@ -11968,8 +11590,6 @@ header('Cache-Control: no-cache, must-revalidate');
         // Render a token (QR + text) in the export modal's result pane.
         function showExportResultToken(token, note) {
             openModal('modal-export');
-            document.getElementById('export-form').style.display = 'none';
-            document.getElementById('export-result').style.display = 'block';
             document.getElementById('export-token').textContent = token;
             const noteEl = document.getElementById('export-result-note');
             if (noteEl) noteEl.textContent = note || '';
@@ -16494,25 +16114,6 @@ header('Cache-Control: no-cache, must-revalidate');
             }
         }
 
-        // Export Max button - uses pre-loaded dashboard data for instant response
-        function sendMax() {
-            const mintUnit = dashboardData?.mintUnit || 'sat';
-            const exportAvailable = dashboardData?.exportAvailable || 0;
-
-            if (exportAvailable > 0) {
-                const maxAmountSmallest = exportAvailable;
-
-                // Convert to display format (divide by 100 for fiat)
-                const displayValue = isFiatUnit(mintUnit)
-                    ? (Math.max(0, maxAmountSmallest) / 100).toFixed(2)
-                    : Math.max(0, maxAmountSmallest);
-                document.getElementById('export-amount').value = displayValue;
-                updateExportButton();
-            } else {
-                showToast('No balance available to send', 'error');
-            }
-        }
-
         // Modals
         // ============================ Products + cart ============================
 
@@ -17176,21 +16777,9 @@ header('Cache-Control: no-cache, must-revalidate');
                     existingOverlay.remove();
                 }
 
-                document.getElementById('export-form').style.display = 'block';
-                document.getElementById('export-result').style.display = 'none';
-                document.getElementById('export-amount').value = '';
+                document.getElementById('export-token').textContent = '';
+                document.getElementById('export-result-note').textContent = '';
                 document.getElementById('export-qr').innerHTML = '';
-
-                // Set input attributes for fiat vs sats
-                const exportInput = document.getElementById('export-amount');
-                exportInput.step = isFiat ? '0.01' : '1';
-                exportInput.min = isFiat ? '0.01' : '1';
-                exportInput.placeholder = isFiat ? '0.00' : '0';
-
-                // Reset export button state
-                const exportBtn = document.getElementById('btn-confirm-export');
-                exportBtn.textContent = 'Generate Token';
-                exportBtn.disabled = true; // Will be enabled by updateExportButton() when amount entered
             }
             if (id === 'modal-withdraw') {
                 document.getElementById('withdraw-address').value = '';
