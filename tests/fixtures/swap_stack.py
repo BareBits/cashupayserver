@@ -469,6 +469,7 @@ def setup_payserver(workdir: Path, vpub: str, boltz_api_url: str,
     # that runs for several minutes will eventually overlay the working tree
     # with the latest channel-main build mid-run.
     env.setdefault("CASHUPAY_UPDATER_DISABLED", "1")
+    env.setdefault("CASHUPAY_DEV_FEE_BRANCH_ENDPOINT", "disabled")
     # Allow outbound HTTP to private/loopback IPs: the local stack points
     # the mint, Esplora, and Boltz at 127.0.0.1 / regtest endpoints, which
     # SafeHttp's default posture would reject.
@@ -920,6 +921,7 @@ def setup_payserver_for_sweep(workdir: Path, vpub: str, mint_url: str,
     env = os.environ.copy()
     env["CASHUPAY_DATA_DIR"] = str(data_dir)
     env.setdefault("CASHUPAY_UPDATER_DISABLED", "1")
+    env.setdefault("CASHUPAY_DEV_FEE_BRANCH_ENDPOINT", "disabled")
     # Same reason as the swap-stack payserver: local mint/Esplora/Boltz
     # all live on loopback in this test rig.
     env.setdefault("CASHUPAY_ALLOW_PRIVATE_ENDPOINTS", "1")

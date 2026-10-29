@@ -81,6 +81,16 @@ Playwright note: the admin SPA auto-selects `stores[0]` unless
 `localStorage.selectedStoreId` is set, so UI tests on a shared server must
 pin their own store (see `add_init_script(...selectedStoreId...)` uses).
 
+Playwright note: two admin loads re-render the per-store cards from scratch
+and wipe unsaved edits made before they land — `loadStoreSettings()` (the
+Stores tab, after `?api=stores`) and the un-awaited `loadDashboard()` every
+save fires. Gate on them with `fixtures.browser.wait_for_store_settings_loaded`
+and `wait_for_dashboard_settled` (which reads the page's
+`dashboardLoadSeq`/`dashboardRenderedSeq` counters) instead of sleeping.
+Also, wait for a modal to close with `wait_for_selector("#modal.visible",
+state="hidden")` — a `:not(.visible)` selector with the default visible-state
+wait only matches during the fade-out.
+
 ## WordPress golden templates
 
 The WP tier used to run `wp core install` (+ plugin activations, + the whole
@@ -98,6 +108,21 @@ plus its own router wrapper/vhost. `emulate_rewrites`, `php_workers`,
 fixture variants share the same three goldens. Escape hatch:
 `CASHUPAY_WP_NO_TEMPLATE=1` restores the per-test real install; the template
 contract itself is pinned by `wordpress/test_wp_template_clone.py`.
+
+### SQLite drop-in driver
+
+The fixture's `wp-config.php` turns on the sqlite-database-integration
+plugin's newer "AST" driver (`WP_SQLITE_AST_DRIVER`). The legacy translator
+driver wraps every statement in a deferred `BEGIN`; once another `php -S`
+worker has committed, a connection that read first cannot upgrade to a write
+and SQLite fails it with "database is locked" without consulting the busy
+timeout. WooCommerce saves the cart session from a shutdown hook in exactly
+that shape, which is where the empty-cart checkout flakes came from. The AST
+driver opens writes with `BEGIN IMMEDIATE` and queues on the busy timeout
+instead. `CASHUPAY_WP_SQLITE_AST_DRIVER=0` restores the legacy driver and
+`CASHUPAY_WP_SQLITE_JOURNAL_MODE=WAL` sets the journal mode, both for A/B runs
+only (WAL measured *worse* with the legacy driver). Pinned by
+`wordpress/test_wp_fixture_sqlite_driver.py`.
 
 ## Workdir cleanup
 

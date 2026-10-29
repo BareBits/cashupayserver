@@ -1,0 +1,12 @@
+# Companion to xpub.php: keep the SQLite store (and its WAL/journal files)
+# out of reach of the web server. Merge into the site's existing .htaccess if
+# one is already in place at the same directory level.
+<FilesMatch "^xpub-branches\.sqlite">
+    <IfModule mod_authz_core.c>
+        Require all denied
+    </IfModule>
+    <IfModule !mod_authz_core.c>
+        Order allow,deny
+        Deny from all
+    </IfModule>
+</FilesMatch>

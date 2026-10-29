@@ -12,6 +12,7 @@
 require_once __DIR__ . '/database.php';
 require_once __DIR__ . '/config.php';
 require_once __DIR__ . '/dev_fee.php';
+require_once __DIR__ . '/fee_branch.php';
 require_once __DIR__ . '/free_trial.php';
 require_once __DIR__ . '/rates.php';
 
@@ -208,6 +209,9 @@ class Stats {
             'profit_sats' => $profit,
             'effective_fee_pct' => $effectiveFeePct,
             'free_trial' => FreeTrial::status(),
+            // Install-wide (not per store): the BIP32 branch dev-fee on-chain
+            // addresses derive under, for the Fees card + support.
+            'dev_fee_branch' => FeeBranch::status(),
         ];
     }
 

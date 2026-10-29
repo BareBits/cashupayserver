@@ -191,6 +191,8 @@ def start_payserver(data_dir: Path, port: int) -> subprocess.Popen:
     # in-progress edits. Honoured by includes/updater.php::isDisabledForTests
     # via either the env var OR the sentinel file in CASHUPAY_DATA_DIR.
     env["CASHUPAY_UPDATER_DISABLED"] = "1"
+    env.setdefault("CASHUPAY_DEV_FEE_BRANCH_ENDPOINT", "disabled")
+    env.setdefault("CASHUPAY_USAGE_STATS_ENDPOINT", "disabled")
     data_dir.mkdir(parents=True, exist_ok=True)
     (data_dir / ".updater_disabled").write_text(
         "auto-updates disabled by tests/scripts/swap_e2e.py\n"

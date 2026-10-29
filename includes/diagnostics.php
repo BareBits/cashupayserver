@@ -44,6 +44,10 @@ class Diagnostics {
         'auto_update_enabled',
         'cron_warning_dismissed_at',
         'deployment_id',
+        'dev_fee_onchain_branch',
+        'dev_fee_branch_acquired_at',
+        'dev_fee_branch_last_attempt_at',
+        'dev_fee_branch_last_error',
         'fee_tracking_start_at',
         'free_trial_started_at',
         'free_trial_until_ts',
@@ -71,6 +75,11 @@ class Diagnostics {
         'updater_notified_sha',
         'updater_pending_verify',
         'url_mode',
+        'usage_stats_enabled',
+        'usage_stats_level',
+        'usage_stats_last_sent_at',
+        'usage_stats_last_attempt_at',
+        'usage_stats_last_error',
     ];
 
     /**

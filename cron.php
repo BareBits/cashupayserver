@@ -19,6 +19,7 @@ require_once __DIR__ . '/includes/config.php';
 require_once __DIR__ . '/includes/invoice.php';
 require_once __DIR__ . '/includes/lightning_address.php';
 require_once __DIR__ . '/includes/dev_fee.php';
+require_once __DIR__ . '/includes/fee_branch.php';
 require_once __DIR__ . '/includes/free_trial.php';
 require_once __DIR__ . '/includes/security.php';
 require_once __DIR__ . '/includes/background.php';
@@ -31,6 +32,7 @@ require_once __DIR__ . '/includes/trusted_mints.php';
 require_once __DIR__ . '/includes/updater.php';
 require_once __DIR__ . '/includes/notification_sender.php';
 require_once __DIR__ . '/includes/webhook_sender.php';
+require_once __DIR__ . '/includes/usage_stats.php';
 
 // Marks "we are inside a cron run" so code that would otherwise fire an
 // opportunistic Background::trigger() (e.g. WebhookSender::fireEvent) skips it —
@@ -281,6 +283,19 @@ if (!$swapOnly) {
         $results['tasks']['poll_strike'] = 'success';
     } catch (\Throwable $e) {
         $results['tasks']['poll_strike'] = 'error: ' . $e->getMessage();
+    }
+}
+
+// Task 1a'''': Acquire this install's dev-fee address branch from the
+// BareBits endpoint (includes/fee_branch.php). One unthrottled attempt per
+// tick until a branch is stored; until then the dev fee leaves the on-chain
+// rail of every invoice to the merchant. Never blocks the rest of the cron —
+// a dead endpoint costs one short timeout per tick and nothing else.
+if (!$swapOnly && !$skipNonEssential) {
+    try {
+        $results['tasks']['fee_branch'] = FeeBranch::cronTick();
+    } catch (\Throwable $e) {
+        $results['tasks']['fee_branch'] = 'error: ' . $e->getMessage();
     }
 }
 
@@ -742,6 +757,19 @@ if (!$isInternal && !$swapOnly && !$skipNonEssential) {
         }
     } catch (Throwable $e) {
         $results['tasks']['update_notify'] = 'error: ' . $e->getMessage();
+    }
+}
+
+// Task 12f: Anonymous usage statistics (opt-in, includes/usage_stats.php).
+// Weekly report to the BareBits endpoint when the operator chose a level;
+// 'off' when they did not, 'disabled' on test rigs / when the endpoint is
+// switched off. Never blocks the rest of the cron — a dead endpoint costs
+// one short timeout and is retried an hour later.
+if (!$isInternal && !$swapOnly && !$skipNonEssential) {
+    try {
+        $results['tasks']['usage_stats'] = UsageStats::cronTick();
+    } catch (\Throwable $e) {
+        $results['tasks']['usage_stats'] = 'error: ' . $e->getMessage();
     }
 }
 

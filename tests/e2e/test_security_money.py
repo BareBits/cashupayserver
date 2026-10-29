@@ -1,5 +1,6 @@
-"""Money-safety port (security/upstream-audit-port): exports, withdrawals,
-late payments and mint changes against the real nutshell mint + lnd payer.
+"""Money-safety port (security/upstream-audit-port): withdrawals, late
+payments and mint changes against the real nutshell mint + lnd payer (plus a
+guard that the removed token-export action stays gone).
 
 Every test funds its own per-test store on the shared server by paying a
 mint-rail invoice through lnd, then exercises the admin money endpoints
@@ -75,79 +76,21 @@ def _wallet_id(mint_url: str, unit: str = "sat") -> str:
 # ---------------------------------------------------------------- exports
 
 
-def test_exports_reserve_distinct_proofs_and_can_be_shown_checked_and_taken_back(
-    shared_configured: ConfiguredPayserver,
-    lnd_payer: LndHandle,
-) -> None:
+def test_export_token_action_is_gone(shared_configured: ConfiguredPayserver) -> None:
+    """The admin UI no longer generates Cashu tokens (the dashboard "Export
+    token" button, its modal form and the export_token action were removed
+    2026-10). The action must be unknown — not merely unlinked — so nothing
+    can hand out bearer ecash through it. The ledger endpoints that service
+    tokens handed out earlier (Show / Check / Take back) stay."""
     cfg = shared_configured
-    _fund_store(cfg, lnd_payer, 1500)
-    before = _balance(cfg)
-
-    # Two exports: the proofs are reserved as EXPORTED under the funds lock,
-    # so the second export can never contain a proof of the first one — and
-    # opening the export again must not resurrect the first token's proofs.
-    r1 = _admin_post(cfg, "export_token", store_id=cfg.store_id, amount="100")
-    assert r1.status_code == 200, r1.text
-    e1 = r1.json()
-    assert e1["token"].startswith("cashu"), e1
-    assert e1["amount"] == 100 and e1["secrets"] and e1["transfer_id"]
-
-    r2 = _admin_post(cfg, "export_token", store_id=cfg.store_id, amount="100")
-    assert r2.status_code == 200, r2.text
-    e2 = r2.json()
-    assert e2["transfer_id"] != e1["transfer_id"]
-    assert set(e1["secrets"]).isdisjoint(set(e2["secrets"])), "second export re-used a proof of the first"
-    assert before - _balance(cfg) == 200, "both exports left the spendable balance"
-
-    # The ledger lists both as pending, without exposing the tokens.
+    r = _admin_post(cfg, "export_token", store_id=cfg.store_id, amount="100")
+    assert r.status_code == 400, r.text
+    assert r.json() == {"error": "Unknown action"}
+    # The dashboard payload no longer advertises an exportable amount, but
+    # still carries the ledger for existing tokens.
     dash = _dashboard(cfg)
-    pending = {t["id"]: t for t in dash["recentExports"] if t["status"] == "pending"}
-    assert e1["transfer_id"] in pending and e2["transfer_id"] in pending
-    assert "token" not in pending[e1["transfer_id"]] and pending[e1["transfer_id"]]["hasToken"] is True
-    assert dash["exportedBalance"] >= 200
-
-    # Show: the same token again.
-    r = _admin_post(cfg, "transfer_token", id=e1["transfer_id"])
-    assert r.status_code == 200, r.text
-    assert r.json()["token"] == e1["token"]
-    assert sorted(r.json()["secrets"]) == sorted(e1["secrets"])
-
-    # Check: nobody has cashed it in.
-    r = _admin_post(cfg, "check_transfer", id=e1["transfer_id"])
-    assert r.status_code == 200, r.text
-    assert r.json()["status"] == "pending" and r.json().get("reclaimable") is True, r.json()
-
-    # The export screen's poll agrees (fail-closed checker: real mint reply).
-    import json as _json
-    r = _admin_post(cfg, "check_proofs_spent", store_id=cfg.store_id, secrets=_json.dumps(e1["secrets"]))
-    assert r.status_code == 200 and r.json()["spent"] is False, r.text
-
-    # Take back: swaps the proofs, the old token dies, balance returns.
-    mid = _balance(cfg)
-    r = _admin_post(cfg, "reclaim_transfer", id=e1["transfer_id"])
-    assert r.status_code == 200, r.text
-    assert r.json()["success"] is True
-    assert _balance(cfg) - mid == r.json()["amount"] > 0
-    r = _admin_post(cfg, "transfer_token", id=e1["transfer_id"])
-    assert r.status_code == 200
-    # A second take-back is refused: the row is terminal.
-    r = _admin_post(cfg, "reclaim_transfer", id=e1["transfer_id"])
-    assert r.status_code == 409, r.text
-    dash = _dashboard(cfg)
-    statuses = {t["id"]: t["status"] for t in dash["recentExports"]}
-    assert statuses[e1["transfer_id"]] == "reclaimed"
-    assert statuses[e2["transfer_id"]] == "pending"
-
-    # The reclaimed token's proofs are spent at the mint: checking reports so,
-    # and the check never flips a terminal row.
-    r = _admin_post(cfg, "check_transfer", id=e1["transfer_id"])
-    assert r.status_code == 200 and r.json()["status"] == "reclaimed", r.text
-
-    # Leave nothing outstanding: the wallet namespace is shared per mint:unit
-    # on this server, and an unclaimed export is a mint-change blocker for
-    # every store on the mint (see test_changing_the_mint_of_a_funded_store).
-    r = _admin_post(cfg, "reclaim_transfer", id=e2["transfer_id"])
-    assert r.status_code == 200, r.text
+    assert "exportAvailable" not in dash
+    assert "recentExports" in dash and "exportedBalance" in dash
 
 
 def test_withdrawal_is_refused_while_the_funds_lock_is_held(
@@ -168,14 +111,14 @@ def test_withdrawal_is_refused_while_the_funds_lock_is_held(
             )
             assert r.status_code == 409, r.text
             assert "in progress" in r.json()["error"]
-            r = _admin_post(cfg, "export_token", store_id=cfg.store_id, amount="10")
-            assert r.status_code == 409, r.text
         finally:
             fcntl.flock(fp.fileno(), fcntl.LOCK_UN)
-    # Released: the export goes through (and is taken back so nothing stays outstanding).
-    r = _admin_post(cfg, "export_token", store_id=cfg.store_id, amount="10")
-    assert r.status_code == 200, r.text
-    r = _admin_post(cfg, "reclaim_transfer", id=r.json()["transfer_id"])
+    # Released: the withdrawal is accepted again.
+    inv = lnd_payer.add_invoice(100, "lock-test-2")
+    r = _admin_post(
+        cfg, "manual_melt", store_id=cfg.store_id,
+        address=inv["payment_request"], amount="100", amount_is_sats="1",
+    )
     assert r.status_code == 200, r.text
 
 

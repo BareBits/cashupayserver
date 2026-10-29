@@ -166,8 +166,11 @@ def walk(
         body = w.post(step="mints", mints_enabled="0")
     assert wizard_error(body) is None, wizard_error(body)
 
-    # updates: decline automatic updates (the safe default), landing on cron.
+    # updates: decline automatic updates (the safe default).
     body = w.post(step="updates", auto_update="0")
+    assert wizard_error(body) is None, wizard_error(body)
+    # analytics: decline usage statistics (the default), landing on cron.
+    body = w.post(step="analytics", usage_stats="0")
     assert wizard_error(body) is None, wizard_error(body)
     return w
 

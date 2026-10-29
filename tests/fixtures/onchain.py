@@ -72,6 +72,15 @@ _MAINNET_VECTOR_XPUB = (
 )
 TEST_TPUB = _xpub_to_tpub(_MAINNET_VECTOR_XPUB)
 
+# A second, unrelated key (BIP32 test vector 1, chain m/0H/1) standing in for
+# the BareBits dev-fee zpub in fee-branch tests, so fee addresses never
+# collide with the merchant addresses derived from TEST_TPUB.
+_DEV_FEE_VECTOR_XPUB = (
+    "xpub6ASuArnXKPbfEwhqN6e3mwBcDTgzisQN1wXN9BJcM47sSikHjJf3UFHKkNAWbWMiGj7"
+    "Wf5uMash7SyYq527Hqck2AxYysAA7xmALppuCkwQ"
+)
+DEV_FEE_TEST_TPUB = _xpub_to_tpub(_DEV_FEE_VECTOR_XPUB)
+
 
 @dataclass
 class OnchainContext:
@@ -217,11 +226,15 @@ def configure_store_for_static_onchain(
         conn.close()
 
 
-def derive_address_in_bitcoind(bitcoind: BitcoindHandle, xpub: str, address_type: str, index: int) -> str:
-    """Reference derivation via `bitcoin-cli deriveaddresses` for parity checks."""
-    # Build a watch-only descriptor matching cashupayserver's m/0/{index}.
+def derive_address_in_bitcoind(
+    bitcoind: BitcoindHandle, xpub: str, address_type: str, index: int, *, branch: int | None = None
+) -> str:
+    """Reference derivation via `bitcoin-cli deriveaddresses` for parity checks.
+    `branch` selects the per-install dev-fee chain m/{branch}/0/{index}
+    (includes/fee_branch.php); None is the plain m/0/{index} chain."""
     inner = "wpkh" if address_type == "P2WPKH" else "sh(wpkh"
     closing = ")" if address_type == "P2WPKH" else "))"
-    raw = f"{inner}({xpub}/0/{index}{closing}"
+    path = f"/{branch}/0/{index}" if branch is not None else f"/0/{index}"
+    raw = f"{inner}({xpub}{path}{closing}"
     info = bitcoind.rpc("getdescriptorinfo", raw)
     return bitcoind.rpc("deriveaddresses", info["descriptor"])[0]

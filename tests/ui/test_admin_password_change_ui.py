@@ -29,7 +29,9 @@ def test_user_changes_own_password(configured: ConfiguredPayserver, page) -> Non
     page.fill("#cp-new", "newAdminPw99")
     page.fill("#cp-confirm", "newAdminPw99")
     page.click("#btn-confirm-change-password")
-    page.wait_for_selector("#modal-change-password:not(.visible)")
+    # Wait for the modal to CLOSE: a `:not(.visible)` selector with the
+    # default visible-state wait only matches during the 0.3s fade-out.
+    page.wait_for_selector("#modal-change-password.visible", state="hidden")
 
     # Verify via fresh API client: new password works, old does not.
     fresh = AdminClient(configured.handle.url)

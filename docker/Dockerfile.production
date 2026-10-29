@@ -89,7 +89,8 @@ RUN chmod +x /usr/local/bin/cashupay-entrypoint.sh
 # enable it from the admin UI / onboarding wizard, or force it on for the whole
 # deployment with CASHUPAY_AUTO_UPDATE_ENABLED=1 at runtime.
 ENV CRON_INTERVAL_SECONDS=60 \
-    TZ=UTC
+    TZ=UTC \
+    CASHUPAY_DOCKER=1
 
 EXPOSE 80
 

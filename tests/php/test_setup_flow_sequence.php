@@ -20,14 +20,14 @@ require_once dirname(__DIR__, 2) . '/includes/setup_flow.php';
 
 $noOnchain = SetupFlow::stepSequence('', false);
 assert_eq(
-    ['terms', 'security', 'password', 'store', 'onchain', 'lightning', 'swaps', 'mints', 'updates', 'cron', 'done'],
+    ['terms', 'security', 'password', 'store', 'onchain', 'lightning', 'swaps', 'mints', 'updates', 'analytics', 'cron', 'done'],
     $noOnchain,
     'standalone without an on-chain rail drops zeroconf'
 );
 
 $withOnchain = SetupFlow::stepSequence('', true);
 assert_eq(
-    ['terms', 'security', 'password', 'store', 'onchain', 'lightning', 'zeroconf', 'swaps', 'mints', 'updates', 'cron', 'done'],
+    ['terms', 'security', 'password', 'store', 'onchain', 'lightning', 'zeroconf', 'swaps', 'mints', 'updates', 'analytics', 'cron', 'done'],
     $withOnchain,
     'standalone with an on-chain rail includes zeroconf'
 );
@@ -45,7 +45,7 @@ assert_eq('terms', $withOnchain[0], 'a first run opens on the terms-of-service g
 
 $noSecurity = SetupFlow::stepSequence('', false, false);
 assert_eq(
-    ['terms', 'password', 'store', 'onchain', 'lightning', 'swaps', 'mints', 'updates', 'cron', 'done'],
+    ['terms', 'password', 'store', 'onchain', 'lightning', 'swaps', 'mints', 'updates', 'analytics', 'cron', 'done'],
     $noSecurity,
     'standalone with the data dir outside the web root drops the security screen'
 );
@@ -78,7 +78,7 @@ assert_eq([], SetupFlow::missingRequirements(), 'the bundled test PHP passes all
 
 $externalCron = SetupFlow::stepSequence('', true, true, false, true);
 assert_eq(
-    ['terms', 'security', 'password', 'store', 'onchain', 'lightning', 'zeroconf', 'swaps', 'mints', 'updates', 'done'],
+    ['terms', 'security', 'password', 'store', 'onchain', 'lightning', 'zeroconf', 'swaps', 'mints', 'updates', 'analytics', 'done'],
     $externalCron,
     'external cron drops the cron screen and nothing else'
 );
@@ -88,7 +88,8 @@ assert_eq(
     'the external-cron sequence is exactly the standalone one minus cron'
 );
 assert_eq('updates', SetupFlow::nextStep('mints', $externalCron), 'with external cron, updates still follows mints');
-assert_eq('done', SetupFlow::nextStep('updates', $externalCron), 'with external cron, done follows updates directly');
+assert_eq('analytics', SetupFlow::nextStep('updates', $externalCron), 'with external cron, the usage-statistics question still follows updates');
+assert_eq('done', SetupFlow::nextStep('analytics', $externalCron), 'with external cron, done follows the usage-statistics question directly');
 
 // add_store never had the cron screen, so the flag must change nothing there.
 assert_eq(
@@ -121,7 +122,7 @@ assert_false(SetupFlow::externalCronConfigured(), 'cleanup: unset reads as off a
 
 $preseeded = SetupFlow::stepSequence('', true, true, false, false, true);
 assert_eq(
-    ['terms', 'security', 'store', 'onchain', 'lightning', 'zeroconf', 'swaps', 'mints', 'updates', 'cron', 'done'],
+    ['terms', 'security', 'store', 'onchain', 'lightning', 'zeroconf', 'swaps', 'mints', 'updates', 'analytics', 'cron', 'done'],
     $preseeded,
     'a pre-seeded password drops the password screen and nothing else'
 );
@@ -150,7 +151,7 @@ assert_eq(
 // seeded the admin — both screens go, independently.
 $managed = SetupFlow::stepSequence('', true, true, false, true, true);
 assert_eq(
-    ['terms', 'security', 'store', 'onchain', 'lightning', 'zeroconf', 'swaps', 'mints', 'updates', 'done'],
+    ['terms', 'security', 'store', 'onchain', 'lightning', 'zeroconf', 'swaps', 'mints', 'updates', 'analytics', 'done'],
     $managed,
     'external cron + pre-seeded password drop both cron and password'
 );
@@ -188,7 +189,8 @@ assert_eq('lightning', SetupFlow::nextStep('onchain', $withOnchain), 'lightning 
 assert_eq('zeroconf', SetupFlow::nextStep('lightning', $withOnchain), 'zeroconf follows lightning');
 assert_eq('swaps', SetupFlow::nextStep('lightning', $noOnchain), 'without zeroconf, swaps follow lightning');
 assert_eq('updates', SetupFlow::nextStep('mints', $withOnchain), 'the auto-update question follows mints');
-assert_eq('cron', SetupFlow::nextStep('updates', $withOnchain), 'cron follows the auto-update question');
+assert_eq('analytics', SetupFlow::nextStep('updates', $withOnchain), 'the usage-statistics question follows the auto-update question');
+assert_eq('cron', SetupFlow::nextStep('analytics', $withOnchain), 'cron follows the usage-statistics question');
 assert_null(SetupFlow::nextStep('done', $withOnchain), 'done is terminal');
 assert_null(SetupFlow::nextStep('mints', $addStore), 'mints is terminal in add_store mode');
 assert_null(SetupFlow::nextStep('cron', $addStore), 'a screen outside the sequence has no next');
@@ -212,8 +214,9 @@ assert_eq('lightning', SetupFlow::backStep('zeroconf', $withOnchain), 'Back from
 assert_eq('lightning', SetupFlow::backStep('swaps', $noOnchain), 'Back skips the absent zeroconf screen');
 // The post-completion screens are past the point of no return: setup_complete
 // is already set and the store is live.
-assert_eq(['updates', 'cron', 'done'], SetupFlow::POST_COMPLETION, 'updates, cron and done are the only post-completion screens');
+assert_eq(['updates', 'analytics', 'cron', 'done'], SetupFlow::POST_COMPLETION, 'updates, analytics, cron and done are the only post-completion screens');
 assert_null(SetupFlow::backStep('updates', $withOnchain), 'the auto-update screen is past the point of no return');
+assert_null(SetupFlow::backStep('analytics', $withOnchain), 'the usage-statistics screen is past the point of no return');
 assert_null(SetupFlow::backStep('cron', $withOnchain), 'cron is past the point of no return');
 assert_null(SetupFlow::backStep('done', $withOnchain), 'done is past the point of no return');
 // In add_store mode the store screen is genuinely first, so still no Back.

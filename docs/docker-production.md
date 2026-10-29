@@ -78,7 +78,8 @@ you don't set falls back to the in-app defaults or the admin UI.
 
 Only a subset of settings are read from the environment: the variables in the
 table above plus `CASHUPAY_UPDATER_DISABLED`, `CASHUPAY_DATA_DIR`,
-`CASHUPAY_DEPLOYMENT_ID`, `CASHUPAY_DEV_FEE_LNURL`,
+`CASHUPAY_DEPLOYMENT_ID`, `CASHUPAY_DEV_FEE_LNURL`, `CASHUPAY_DEV_FEE_BRANCH_ENDPOINT`
+(test rigs only — see `includes/fee_branch.php`),
 `CASHUPAY_TRUSTED_MINTS_URL`, and `CASHUPAY_TRUSTED_MINTS_REFRESH_MINUTES`.
 Any other constant documented in [`user_config.example.php`](../user_config.example.php)
 is **not** picked up from the environment — set it as a PHP constant in
