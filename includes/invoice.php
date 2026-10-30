@@ -342,9 +342,10 @@ class Invoice {
         $metadata = $options['metadata'] ?? null;
         $checkout = $options['checkout'] ?? null;
         // Long-lived (shareable) invoice: lives for $lifetimeSec instead of the
-        // checkout window, never fee-redirected, Lightning re-sourced by the
-        // payment page as the bolt11 lapses, fiat re-quoted on page load. Set
-        // by the admin Request modal / self-serve page / API opt-in — see
+        // checkout window, Lightning re-sourced by the payment page as the
+        // bolt11 lapses, fiat re-quoted on page load (unless fee-redirected:
+        // then the sats are locked at creation, see requoteForView). Set by
+        // the admin Request modal / self-serve page / API opt-in — see
         // Config::getSharedInvoiceLifetime.
         $longLived = !empty($options['long_lived']);
         $lifetimeSec = isset($options['lifetime_sec'])
@@ -439,10 +440,12 @@ class Invoice {
         if ($lightningCapable)   { $offeredRails[] = 'lightning'; }
         if ($onchainOffered)     { $offeredRails[] = 'onchain'; }
 
-        // A long-lived invoice is never fee-redirected: its rails are re-sourced
-        // and re-quoted over its lifetime, which the one-shot fee gate (owed >=
-        // this exact amount) cannot follow. Owed fees stay with the cron melt.
-        $feeRoute       = $longLived ? null : FeeRedirect::decide($storeId, $store, $invoiceSats, $offeredRails);
+        // Long-lived invoices take part too: a fee-redirected invoice locks its
+        // sats at creation (fees are owed in sats, so there is no fiat
+        // re-quote — see requoteForView) and a lapsed fee bolt11 is re-fetched
+        // from the SAME fee payee at that amount (see refreshLightning), so the
+        // gate decided here holds for the invoice's whole life.
+        $feeRoute       = FeeRedirect::decide($storeId, $store, $invoiceSats, $offeredRails);
         $feeNote        = $feeRoute['note'] ?? null;
         $feeRails       = $feeRoute['rails'] ?? [];
         $feeDestination = $feeRoute['destination'] ?? null;
@@ -2736,6 +2739,14 @@ class Invoice {
     // Replaced bolt11s are parked in invoice_ln_quotes and still polled for a
     // grace period, so a payer who scanned the previous QR seconds before the
     // refresh is settled against the quote they actually paid.
+    //
+    // Fee-redirected invoices (fee_redirect_rails set): the fee was owed in
+    // sats, so the sats decided at creation are locked — no fiat re-quote on
+    // either rail. A fee-routed Lightning rail still refreshes when its bolt11
+    // lapses, re-fetched from the same fee payee (ln_destination) at the same
+    // amount with nothing but that amount in the request (see
+    // FeeRedirect's PRIVACY note); routing never changes mid-life, so a
+    // superseded fee quote paid late still credits the fee.
     // =========================================================================
 
     /** A bolt11 this close to lapsing may already be refreshed. */
@@ -2830,6 +2841,10 @@ class Invoice {
      *     address attributes by exact amount, so its amount stays locked.
      *   - Nothing moves once a payment has been seen on-chain, and reloads
      *     are throttled to one re-quote per REQUOTE_MIN_INTERVAL.
+     *   - Fee-redirected invoices are never re-quoted: the fee is owed in
+     *     sats and the amount decided at creation is what the payee is due.
+     *     This covers every rail of such an invoice, including a merchant
+     *     rail on a mixed one — the fee's share must stay as decided.
      *
      * @return array{requoted:bool, lightning_done:bool} lightning_done is true
      *         when this call already (re)sourced the bolt11.
@@ -2837,7 +2852,8 @@ class Invoice {
     public static function requoteForView(array $invoice): array {
         $none = ['requoted' => false, 'lightning_done' => false];
         if (empty($invoice['long_lived']) || $invoice['status'] !== 'New'
-                || !self::isFiatCurrency((string)$invoice['currency'])) {
+                || !self::isFiatCurrency((string)$invoice['currency'])
+                || !empty($invoice['fee_redirect_rails'])) {
             return $none;
         }
         $now = time();
@@ -2957,10 +2973,17 @@ class Invoice {
      * swap). The current bolt11 is checked for a payment first and, when
      * unpaid, parked in invoice_ln_quotes for a grace-period poll.
      *
+     * A fee-routed Lightning rail (fee_redirect_rails includes 'lightning')
+     * is re-fetched from the same fee payee at the invoice's locked sats
+     * amount — never from the merchant chain or a mint, since that would
+     * silently hand the fee's payment to the merchant. Unreachable payee ->
+     * 'unavailable', the current bolt11 stays.
+     *
      * Options:
      *   force    skip the "is it due yet" gate (re-quote / explicit request)
      *   requote  price the new bolt11 at the CURRENT rate instead of reusing
-     *            the invoice's present sats amount
+     *            the invoice's present sats amount (ignored on a fee-routed
+     *            rail: its sats are locked)
      *
      * @return array{ok:bool, reason?:string, status?:string, invoice?:array,
      *               receive_errors?:array, ln_expires_at?:int}
@@ -2975,9 +2998,7 @@ class Invoice {
             return ['ok' => false, 'reason' => 'settled', 'status' => $invoice['status']];
         }
         $feeRails = array_filter(explode(',', (string)($invoice['fee_redirect_rails'] ?? '')));
-        if (in_array('lightning', $feeRails, true)) {
-            return ['ok' => false, 'reason' => 'not_refreshable'];
-        }
+        $feeRouted = in_array('lightning', $feeRails, true);
         $now = time();
         if (empty($opts['force']) && !self::lightningRefreshDue($invoice, $now)) {
             return ['ok' => false, 'reason' => 'not_due', 'ln_expires_at' => (int)$invoice['ln_expires_at'], 'invoice' => $invoice];
@@ -3021,7 +3042,7 @@ class Invoice {
         $currency = (string)$invoice['currency'];
         $currentRail = (string)($invoice['payment_rail'] ?? '');
         $currentIsDirect = in_array($currentRail, self::DIRECT_RAILS, true);
-        $requote = !empty($opts['requote']);
+        $requote = !empty($opts['requote']) && !$feeRouted;
 
         // Target amounts. Without a re-quote the payer keeps seeing the same
         // sats: a direct rail reuses amount_sats (plain sats), the mint rail
@@ -3030,6 +3051,19 @@ class Invoice {
         // from the invoice amount the way creation would.
         $sourced = null;
         $receiveErrors = [];
+        if ($feeRouted) {
+            $sourced = self::sourceFeeLightning($invoice, $receiveErrors);
+            if ($sourced === null) {
+                error_log(sprintf('[long-lived] fee payee could not re-issue invoice=%s store=%s', $invoiceId, $storeId));
+                AdminLog::log('lightning', 'refresh', $storeId, $invoiceId, (string)($invoice['ln_destination'] ?? ''),
+                    'Fee-routed Lightning invoice could not be refreshed: the fee payee produced no bolt11');
+                return [
+                    'ok' => false, 'reason' => 'unavailable', 'invoice' => $invoice,
+                    'receive_errors' => self::dedupeReceiveErrors($receiveErrors),
+                ];
+            }
+            $sourced['_quote'] = null;
+        }
         try {
             $directSats = (!$requote && $currentIsDirect && !empty($invoice['bolt11']))
                 ? (int)$invoice['amount_sats']
@@ -3038,7 +3072,7 @@ class Invoice {
             $directSats = $currentIsDirect ? (int)$invoice['amount_sats'] : 0;
         }
         $destinations = StoreLnAddresses::destinationsForStore($storeId);
-        if ($destinations !== [] && $directSats > 0) {
+        if ($sourced === null && $destinations !== [] && $directSats > 0) {
             $direct = self::sourceDirectReceive(
                 $storeId, $store, $destinations, $directSats, self::metadataOf($invoice), $invoiceId, $receiveErrors
             );
@@ -3118,6 +3152,49 @@ class Invoice {
             (string)$sourced['amount_sats'], $requote ? ' (re-quoted)' : ''
         ));
         return ['ok' => true, 'invoice' => self::getById($invoiceId)];
+    }
+
+    /**
+     * Re-fetch a fee-routed invoice's bolt11 from the fee payee it was issued
+     * by (ln_destination, the dev / hosting LNURL chosen at creation) for the
+     * invoice's locked sats amount. The request carries the amount and
+     * nothing else — the payee learns nothing about the sale (see the
+     * PRIVACY note in includes/fee_redirect.php). Returns the LN column map
+     * (same shape as lightningFieldsFromAttempt) or null when the payee is
+     * unreachable / refuses; a sanitized reason is appended to $receiveErrors.
+     */
+    private static function sourceFeeLightning(array $invoice, array &$receiveErrors): ?array {
+        $address = (string)($invoice['ln_destination'] ?? '');
+        $sats = (int)($invoice['amount_sats'] ?? 0);
+        if ($address === '' || $sats < 1) {
+            error_log(sprintf(
+                '[long-lived] fee-routed invoice=%s has no fee LNURL / amount to re-source from (dest=%s sats=%d)',
+                (string)$invoice['id'], $address, $sats
+            ));
+            $receiveErrors[] = ['type' => 'lnurl', 'reason' => 'the Lightning address could not produce an invoice'];
+            return null;
+        }
+        $failReason = null;
+        try {
+            $probed = LnUrlReceive::probeAndFetchInvoice($address, $sats, null, $failReason);
+        } catch (Throwable $e) {
+            error_log("[long-lived] fee LNURL probe threw for invoice {$invoice['id']}: " . $e->getMessage());
+            $probed = null;
+            $failReason = 'the Lightning address service could not be reached';
+        }
+        if ($probed === null) {
+            $receiveErrors[] = [
+                'type' => 'lnurl',
+                'reason' => $failReason ?? 'the Lightning address could not produce an invoice',
+            ];
+            return null;
+        }
+        return self::lightningFieldsFromAttempt('lnurl', [
+            'bolt11' => $probed['bolt11'],
+            'verify_url' => $probed['verify_url'],
+            'amount_sats' => $sats,
+            'address' => $address,
+        ]);
     }
 
     /** Decoded metadata array of an invoice row (null when absent / invalid). */

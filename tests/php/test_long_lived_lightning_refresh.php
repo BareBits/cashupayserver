@@ -54,7 +54,7 @@ assert_eq(1, (int)$ll['long_lived'], 'long-lived flag persisted');
 assert_eq('lnaddress', $ll['payment_rail'], 'rides the lnaddress rail');
 assert_true(abs((int)$ll['expiration_time'] - ($now + $lifetime)) <= 5, 'long-lived invoice expires after the shared lifetime');
 assert_true(abs((int)$ll['ln_expires_at'] - ($now + 3600)) <= 5, 'bolt11 keeps its own (1h) expiry');
-assert_null($ll['fee_redirect_note'], 'long-lived invoices are never fee-redirected');
+assert_null($ll['fee_redirect_note'], 'no fee owed on this store -> not fee-redirected (fee-routed long-lived invoices: test_long_lived_fee_redirect_refresh.php)');
 $api = Invoice::formatForApi($ll);
 assert_true($api['longLived'], 'API exposes longLived');
 assert_eq((int)$ll['expiration_time'], (int)$api['expirationTime'], 'API expirationTime is the far-future real expiry');

@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Iterator
 
 import pytest
+import requests
 
 from conftest import (
     ConfiguredPayserver,
@@ -491,37 +492,160 @@ def test_fee_redirect_lightning_claims_whole_invoice(
     assert (api.get("feeRedirect") or {}).get("settledToFee") is True, api
 
 
-def test_long_lived_invoice_is_never_fee_redirected(
-    configured_with_lnurlp: ConfiguredPayserver,
-) -> None:
-    """Same owed-fee setup as the redirect test above, but the invoice is a
-    long-lived payment request (checkout.expirationMinutes, no orderId): its
-    rails are re-sourced and re-quoted over its lifetime, which the one-shot
-    fee gate cannot follow, so it is never fee-redirected. It still rides the
-    merchant's own Lightning address, and an ordinary invoice created right
-    after it IS redirected — proving the fee is owed and the gate is what
-    differs. Function-scoped fixture for the same reason as the test above
-    (the revenue seed rewrites the global fee_tracking_start_at)."""
-    configured = configured_with_lnurlp
+def _set_invoice(payserver: PayserverHandle, invoice_id: str, **cols) -> None:
+    sets = ", ".join(f"{k} = ?" for k in cols)
+    with sqlite3.connect(str(payserver.db_path)) as conn:
+        conn.execute(f"UPDATE invoices SET {sets} WHERE id = ?", (*cols.values(), invoice_id))
+
+
+def _parked_quotes(payserver: PayserverHandle, invoice_id: str) -> list[dict]:
+    with sqlite3.connect(str(payserver.db_path)) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT * FROM invoice_ln_quotes WHERE invoice_id = ? ORDER BY created_at, id", (invoice_id,)
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _create_long_lived_fee_invoice(configured: ConfiguredPayserver, lnurlp_server: LnurlpServer) -> dict:
+    """Owed-fee setup + a long-lived payment request: it IS fee-redirected
+    (lightning rail -> the dev LNURL, resolved through the mock host) and the
+    request that fetched the fee bolt11 carried the amount only."""
     assert _enable_auto_melt(configured).get("success") is True
     _seed_fee_revenue(configured.handle, configured.store_id, sats=1_000_000)
-
-    long_lived = configured.greenfield.create_invoice(
+    before = len(lnurlp_server.requests)
+    inv = configured.greenfield.create_invoice(
         configured.store_id, amount=str(INVOICE_AMOUNT_SAT), currency="sat",
         checkout={"expirationMinutes": 90 * 1440},
     )
-    row = _read_invoice_row(configured.handle, long_lived["id"])
+    row = _read_invoice_row(configured.handle, inv["id"])
     assert row["long_lived"] == 1
-    assert row["fee_redirect_note"] is None, row["fee_redirect_note"]
-    assert row["fee_redirect_rails"] is None
+    assert row["fee_redirect_note"] == "DEV_FEE", row
+    assert row["fee_redirect_rails"] == "lightning", row
     assert row["payment_rail"] == "lnaddress", row["payment_rail"]
-    assert row["ln_destination"] == LNURL_ADDRESS, "merchant's own address, not the fee LNURL"
-    assert not (long_lived.get("feeRedirect") or {}).get("note")
+    assert row["ln_destination"] == row["fee_redirect_destination"] != LNURL_ADDRESS, "fee LNURL, not the merchant's"
+    assert (inv.get("feeRedirect") or {}).get("note") == "DEV_FEE"
+    _assert_fee_payee_saw_amount_only(lnurlp_server.requests[before:], row["ln_destination"], "create")
+    return inv
 
-    ordinary = configured.greenfield.create_invoice(
-        configured.store_id, amount=str(INVOICE_AMOUNT_SAT), currency="sat"
+
+def _assert_fee_payee_saw_amount_only(reqs: list[str], fee_lnurl: str, label: str) -> None:
+    """The mock host's own callback URL carries ``user``; cashupayserver may
+    add ``amount`` and nothing else — no comment, payerdata, memo, order or
+    store data ever reaches the fee payee."""
+    from urllib.parse import parse_qs, urlparse
+
+    fee_user = fee_lnurl.split("@", 1)[0]
+    lookups = [r for r in reqs if r.startswith("/.well-known/lnurlp/")]
+    callbacks = [r for r in reqs if urlparse(r).path == "/callback"]
+    assert lookups == [f"/.well-known/lnurlp/{fee_user}"], f"{label}: {reqs}"
+    assert len(callbacks) == 1, f"{label}: {reqs}"
+    qs = parse_qs(urlparse(callbacks[0]).query)
+    assert set(qs) == {"user", "amount"}, f"{label}: unexpected callback params {qs}"
+    assert qs["user"] == [fee_user] and qs["amount"] == [str(INVOICE_AMOUNT_SAT * 1000)], f"{label}: {qs}"
+    assert "merchant" not in "\n".join(reqs), f"{label}: merchant address must not be contacted"
+
+
+def test_long_lived_fee_invoice_refreshes_from_the_fee_payee(
+    configured_with_lnurlp: ConfiguredPayserver,
+    lnd_mint: LndHandle,
+    lnurlp_server: LnurlpServer,
+) -> None:
+    """A long-lived payment request with a fee owed >= its amount is redirected
+    like any other invoice. Its sats are locked at creation and, when the fee
+    bolt11 lapses, the refresh re-fetches one from the SAME fee payee at that
+    amount (amount-only request), parks the old quote, and leaves the fee
+    attribution untouched. Paying the refreshed bolt11 settles the invoice and
+    credits the fee via redirect. Function-scoped fixture: the revenue seed
+    rewrites the global fee_tracking_start_at."""
+    configured = configured_with_lnurlp
+    inv = _create_long_lived_fee_invoice(configured, lnurlp_server)
+    row0 = _read_invoice_row(configured.handle, inv["id"])
+    first = row0["bolt11"]
+
+    # Lapse the fee bolt11 -> the payment page's refresh endpoint re-sources it.
+    _set_invoice(configured.handle, inv["id"], ln_expires_at=int(time.time()) - 5)
+    before = len(lnurlp_server.requests)
+    r = requests.post(
+        f"{configured.handle.url}/payment.php?id={inv['id']}", data={"action": "refresh_lightning"}, timeout=30
     )
-    assert _read_invoice_row(configured.handle, ordinary["id"])["fee_redirect_note"] == "DEV_FEE"
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["ok"] is True and body["bolt11"] != first, body
+    row = _read_invoice_row(configured.handle, inv["id"])
+    assert row["bolt11"] == body["bolt11"] and row["bolt11"].lower().startswith("lnbcrt")
+    for col in ("fee_redirect_note", "fee_redirect_rails", "fee_redirect_destination", "ln_destination",
+                "amount_sats", "payment_rail", "long_lived"):
+        assert row[col] == row0[col], (col, row[col], row0[col])
+    assert row["ln_expires_at"] > int(time.time()) + 60 and row["ln_refreshed_at"] is not None
+    assert [q["bolt11"] for q in _parked_quotes(configured.handle, inv["id"])] == [first]
+    _assert_fee_payee_saw_amount_only(lnurlp_server.requests[before:], row["ln_destination"], "refresh")
+
+    # The refreshed fee bolt11 is real and payable; settlement credits the fee.
+    pay = lnd_mint.pay_invoice_sync(row["bolt11"], timeout=30)
+    assert not pay.get("payment_error"), pay
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        if _poll_payment_page(configured.handle, inv["id"]).get("status") == "Settled":
+            break
+        time.sleep(0.5)
+    else:
+        raise AssertionError(f"refreshed fee invoice {inv['id']} did not settle within 30s")
+    final = _read_invoice_row(configured.handle, inv["id"])
+    assert final["settled_rail"] == "lnaddress" and final["bolt11"] == row["bolt11"]
+    melt = _read_redirect_melt(configured.handle, inv["id"])
+    assert melt is not None and melt["note"] == "DEV_FEE", melt
+    assert int(melt["amount_sats"]) == INVOICE_AMOUNT_SAT, melt
+    api = configured.greenfield.get_invoice(configured.store_id, inv["id"])
+    assert (api.get("feeRedirect") or {}).get("settledToFee") is True, api
+
+
+def test_long_lived_fee_invoice_live_refresh_in_page(
+    configured_with_lnurlp: ConfiguredPayserver,
+    lnd_mint: LndHandle,
+    lnurlp_server: LnurlpServer,
+    browser,
+) -> None:
+    """Same as above through the payment page itself: the in-page timer runs
+    out, the page swaps in a bolt11 freshly issued by the fee payee (QR / copy
+    / wallet link), and paying it from the page settles to the fee."""
+    configured = configured_with_lnurlp
+    inv = _create_long_lived_fee_invoice(configured, lnurlp_server)
+    row0 = _read_invoice_row(configured.handle, inv["id"])
+    first = row0["bolt11"]
+    url = f"{configured.handle.url}/payment.php?id={inv['id']}"
+    ctx = browser.new_context()
+    page = ctx.new_page()
+    try:
+        page.goto(url, wait_until="domcontentloaded")
+        page.wait_for_selector("#ln-refreshed", timeout=10000)
+        page.wait_for_function(
+            "document.getElementById('timer').textContent.startsWith('Lightning invoice refreshes in')", timeout=10000
+        )
+        before = len(lnurlp_server.requests)
+        _set_invoice(configured.handle, inv["id"], ln_expires_at=int(time.time()) - 1)
+        page.evaluate("lnExpiresAt = Math.floor(Date.now() / 1000) + 2")
+        page.wait_for_function(
+            "(first) => document.querySelector('[data-method-block=\"lightning\"] .invoice-input').dataset.copy !== first",
+            arg=first, timeout=20000,
+        )
+        shown = page.evaluate("document.querySelector('[data-method-block=\"lightning\"] .invoice-input').dataset.copy")
+        row = _read_invoice_row(configured.handle, inv["id"])
+        assert shown == row["bolt11"] != first
+        assert page.evaluate("document.querySelector('[data-method-block=\"lightning\"] a.btn').href") == "lightning:" + row["bolt11"]
+        assert row["fee_redirect_note"] == "DEV_FEE" and row["ln_destination"] == row0["ln_destination"]
+        assert row["amount_sats"] == row0["amount_sats"] == INVOICE_AMOUNT_SAT
+        _assert_fee_payee_saw_amount_only(lnurlp_server.requests[before:], row["ln_destination"], "live refresh")
+
+        pay = lnd_mint.pay_invoice_sync(row["bolt11"], timeout=30)
+        assert not pay.get("payment_error"), pay
+        page.wait_for_selector("#payment-success.show", timeout=30000)
+    finally:
+        ctx.close()
+    final = _read_invoice_row(configured.handle, inv["id"])
+    assert final["status"] == "Settled" and final["bolt11"] == row["bolt11"]
+    melt = _read_redirect_melt(configured.handle, inv["id"])
+    assert melt is not None and melt["note"] == "DEV_FEE" and int(melt["amount_sats"]) == INVOICE_AMOUNT_SAT, melt
 
 
 # ---------------------------------------------------------------------------
