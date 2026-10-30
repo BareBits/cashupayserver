@@ -286,6 +286,22 @@ if (!$swapOnly) {
     }
 }
 
+// Task 1a''''': Superseded Lightning quotes of long-lived invoices. When the
+// payment page re-sources a lapsed bolt11 the previous one is parked and kept
+// under watch for a grace period, so a payer who scanned the old QR seconds
+// before the refresh still settles the invoice (through the rail's normal
+// settlement path, webhooks included).
+if (!$swapOnly) {
+    try {
+        $sup = Invoice::pollSupersededQuotes();
+        $results['tasks']['poll_superseded_ln'] = sprintf(
+            'polled %d, settled %d, closed %d', $sup['polled'], $sup['settled'], $sup['closed']
+        );
+    } catch (\Throwable $e) {
+        $results['tasks']['poll_superseded_ln'] = 'error: ' . $e->getMessage();
+    }
+}
+
 // Task 1a'''': Acquire this install's dev-fee address branch from the
 // BareBits endpoint (includes/fee_branch.php). One unthrottled attempt per
 // tick until a branch is stored; until then the dev fee leaves the on-chain

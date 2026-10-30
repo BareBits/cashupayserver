@@ -491,6 +491,39 @@ def test_fee_redirect_lightning_claims_whole_invoice(
     assert (api.get("feeRedirect") or {}).get("settledToFee") is True, api
 
 
+def test_long_lived_invoice_is_never_fee_redirected(
+    configured_with_lnurlp: ConfiguredPayserver,
+) -> None:
+    """Same owed-fee setup as the redirect test above, but the invoice is a
+    long-lived payment request (checkout.expirationMinutes, no orderId): its
+    rails are re-sourced and re-quoted over its lifetime, which the one-shot
+    fee gate cannot follow, so it is never fee-redirected. It still rides the
+    merchant's own Lightning address, and an ordinary invoice created right
+    after it IS redirected — proving the fee is owed and the gate is what
+    differs. Function-scoped fixture for the same reason as the test above
+    (the revenue seed rewrites the global fee_tracking_start_at)."""
+    configured = configured_with_lnurlp
+    assert _enable_auto_melt(configured).get("success") is True
+    _seed_fee_revenue(configured.handle, configured.store_id, sats=1_000_000)
+
+    long_lived = configured.greenfield.create_invoice(
+        configured.store_id, amount=str(INVOICE_AMOUNT_SAT), currency="sat",
+        checkout={"expirationMinutes": 90 * 1440},
+    )
+    row = _read_invoice_row(configured.handle, long_lived["id"])
+    assert row["long_lived"] == 1
+    assert row["fee_redirect_note"] is None, row["fee_redirect_note"]
+    assert row["fee_redirect_rails"] is None
+    assert row["payment_rail"] == "lnaddress", row["payment_rail"]
+    assert row["ln_destination"] == LNURL_ADDRESS, "merchant's own address, not the fee LNURL"
+    assert not (long_lived.get("feeRedirect") or {}).get("note")
+
+    ordinary = configured.greenfield.create_invoice(
+        configured.store_id, amount=str(INVOICE_AMOUNT_SAT), currency="sat"
+    )
+    assert _read_invoice_row(configured.handle, ordinary["id"])["fee_redirect_note"] == "DEV_FEE"
+
+
 # ---------------------------------------------------------------------------
 # LUD-21 fallback: host without verify URL → routes via mint silently
 # ---------------------------------------------------------------------------

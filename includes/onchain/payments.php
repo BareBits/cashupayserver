@@ -20,6 +20,11 @@ class OnchainPayments {
      */
     public const ERR_TWEAK_SLOTS_EXHAUSTED = 'onchain_static_tweak_slots_exhausted';
 
+    /** Cron poll spacing for an unpaid long-lived invoice 1–7 days old. */
+    public const LONG_LIVED_POLL_SEC_WEEK = 600;
+    /** Cron poll spacing for an unpaid long-lived invoice older than a week. */
+    public const LONG_LIVED_POLL_SEC_OLD = 3600;
+
     /**
      * A confirmed payment buried at least this many blocks is treated as
      * final: the reorg reconciliation in pollInvoice() will NOT drop it even
@@ -559,14 +564,30 @@ class OnchainPayments {
         // text). The old shape meant a stamped invoice was never re-polled.
         // Same quirk SwapPoller::pollPending documents and works around.
         $cutoff = $now - $minIntervalSec;
+        // Long-lived invoices stay New for up to 90 days; polling every one of
+        // them each minute would starve fresh checkouts and burn the provider
+        // budget. They back off with age while still unpaid (New): the base
+        // interval for the first day, then LONG_LIVED_POLL_SEC_WEEK until a
+        // week old, then LONG_LIVED_POLL_SEC_OLD. A detected payment
+        // (Processing) and the payment page's own poll are never slowed.
+        $dayAgo = $now - 86400;
+        $weekAgo = $now - 7 * 86400;
         $rows = Database::fetchAll(
             "SELECT id FROM invoices
               WHERE onchain_address IS NOT NULL
                 AND status IN ('New', 'Processing')
-                AND (onchain_last_polled_at IS NULL OR onchain_last_polled_at <= ?)
+                AND (onchain_last_polled_at IS NULL
+                     OR ((long_lived = 0 OR status = 'Processing' OR created_at > ?) AND onchain_last_polled_at <= ?)
+                     OR (long_lived = 1 AND status = 'New' AND created_at <= ? AND created_at > ? AND onchain_last_polled_at <= ?)
+                     OR (long_lived = 1 AND status = 'New' AND created_at <= ? AND onchain_last_polled_at <= ?))
               ORDER BY onchain_last_polled_at ASC NULLS FIRST
               LIMIT ?",
-            [$cutoff, $batchLimit]
+            [
+                $dayAgo, $cutoff,
+                $dayAgo, $weekAgo, $now - self::LONG_LIVED_POLL_SEC_WEEK,
+                $weekAgo, $now - self::LONG_LIVED_POLL_SEC_OLD,
+                $batchLimit,
+            ]
         );
         $results = [];
         foreach ($rows as $r) {
@@ -893,6 +914,13 @@ class OnchainPayments {
         int $now
     ): array {
         $amount = (int)($invoice['onchain_amount_sat'] ?? 0);
+        // A long-lived fiat invoice is re-quoted on page load; a payer who
+        // already saw an earlier (smaller) amount and pays it still settles.
+        // The floor is the smallest amount ever shown (Invoice::requoteForView).
+        $floor = (int)($invoice['onchain_amount_floor_sat'] ?? 0);
+        if ($floor > 0 && $floor < $amount) {
+            $amount = $floor;
+        }
         $status = $invoice['status'];
         $fired = null;
 

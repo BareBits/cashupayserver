@@ -53,6 +53,23 @@ function normalizeApiInvoiceAmount($amount, string $currency): ?string {
 }
 
 /**
+ * Parse checkout.expirationMinutes from untrusted JSON: a whole number as
+ * int, integral float, or digit string. Null for anything else.
+ */
+function apiExpirationMinutes($value): ?int {
+    if (is_int($value)) {
+        return $value;
+    }
+    if (is_float($value)) {
+        return (is_finite($value) && floor($value) === $value) ? (int)$value : null;
+    }
+    if (is_string($value) && preg_match('/^\d{1,9}$/', trim($value))) {
+        return (int)trim($value);
+    }
+    return null;
+}
+
+/**
  * Create a new invoice
  */
 function handleCreateInvoice(array $auth, array $params, array $body): void {
@@ -94,14 +111,39 @@ function handleCreateInvoice(array $auth, array $params, array $body): void {
         }
     }
 
+    // checkout.expirationMinutes (BTCPay Greenfield field): how long the
+    // invoice stays payable, 1 minute up to the shared-invoice lifetime. An
+    // invoice created with it — and not tied to a shop order (metadata.orderId)
+    // — is a long-lived payment request: its Lightning bolt11 is re-sourced by
+    // the payment page as it lapses and a fiat amount is re-quoted on load.
+    // E-commerce invoices keep the plain lifetime and the existing expiry
+    // behaviour; without the field nothing changes at all.
+    $createOptions = [
+        'amount' => $amount,
+        'currency' => strtoupper($currency),
+        'metadata' => $body['metadata'] ?? null,
+        'checkout' => $checkout,
+    ];
+    if (is_array($checkout) && array_key_exists('expirationMinutes', $checkout)
+            && $checkout['expirationMinutes'] !== null && $checkout['expirationMinutes'] !== '') {
+        $minutes = apiExpirationMinutes($checkout['expirationMinutes']);
+        $maxMinutes = intdiv(Config::getSharedInvoiceLifetime(), 60);
+        if ($minutes === null || $minutes < 1 || $minutes > $maxMinutes) {
+            errorResponse(
+                'validation-error',
+                "checkout.expirationMinutes must be a whole number between 1 and {$maxMinutes}"
+            );
+        }
+        $metadata = $body['metadata'] ?? null;
+        $isOrder = is_array($metadata) && isset($metadata['orderId'])
+            && is_scalar($metadata['orderId']) && trim((string)$metadata['orderId']) !== '';
+        $createOptions['lifetime_sec'] = $minutes * 60;
+        $createOptions['long_lived'] = !$isOrder;
+    }
+
     // Create invoice
     try {
-        $invoice = Invoice::create($storeId, [
-            'amount' => $amount,
-            'currency' => strtoupper($currency),
-            'metadata' => $body['metadata'] ?? null,
-            'checkout' => $checkout,
-        ]);
+        $invoice = Invoice::create($storeId, $createOptions);
 
         jsonResponse(Invoice::formatForApi($invoice), 200);
     } catch (Exception $e) {

@@ -446,6 +446,23 @@ curl -X POST "https://yoursite.com/api/v1/stores/{storeId}/invoices" \
   -d '{"amount": "10.00", "currency": "EUR"}'
 ```
 
+A checkout invoice expires after one hour by default. Pass
+`checkout.expirationMinutes` (1 up to 129600, i.e. 90 days) to choose the
+lifetime. An invoice created with that field and no `metadata.orderId` is a
+**long-lived payment request**: the payment page re-sources its Lightning
+invoice whenever the previous one lapses (the old one stays under watch so a
+payer who already scanned it still settles the invoice), and a fiat amount is
+re-quoted in sats each time the page is opened. The admin "Create invoice"
+screen and the self-serve page create their invoices this way. Shop orders
+(any invoice carrying `metadata.orderId`) keep the standard expiry behavior.
+
+```bash
+curl -X POST "https://yoursite.com/api/v1/stores/{storeId}/invoices" \
+  -H "Authorization: token YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"amount": "10.00", "currency": "EUR", "checkout": {"expirationMinutes": 129600}}'
+```
+
 ### Get Invoice
 ```bash
 curl "https://yoursite.com/api/v1/stores/{storeId}/invoices/{invoiceId}" \

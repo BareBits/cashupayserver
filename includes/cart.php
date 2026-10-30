@@ -128,7 +128,7 @@ class Cart {
      *                              Omitted keys fall back to the store defaults.
      * @return array ['invoiceId','checkoutLink','amountSats']
      */
-    public static function checkout(string $storeId, array $items, ?string $memo = null, ?string $redirect = null, array $privacy = []): array {
+    public static function checkout(string $storeId, array $items, ?string $memo = null, ?string $redirect = null, array $privacy = [], bool $longLived = false): array {
         $priced = self::priceItems($storeId, $items);
         $lines = $priced['lines'];
         $totalSats = $priced['totalSats'];
@@ -148,6 +148,12 @@ class Cart {
             $metadata['hideNote'] = (bool)$privacy['hideNote'];
         }
         $options = ['amount' => (string)$totalSats, 'currency' => 'sat', 'metadata' => $metadata];
+        if ($longLived) {
+            // Admin cart / self-serve product link: a shareable payment
+            // request, not a checkout window (see Config::getSharedInvoiceLifetime).
+            $options['lifetime_sec'] = Config::getSharedInvoiceLifetime();
+            $options['long_lived'] = true;
+        }
         if ($redirect !== null && $redirect !== '') {
             // The redirect is rendered as an <a href> on the public payment
             // page; an unvalidated value lets a javascript:/data: URL execute

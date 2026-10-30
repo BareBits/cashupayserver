@@ -341,6 +341,15 @@ class Invoice {
         $currency = $options['currency'] ?? 'sat';
         $metadata = $options['metadata'] ?? null;
         $checkout = $options['checkout'] ?? null;
+        // Long-lived (shareable) invoice: lives for $lifetimeSec instead of the
+        // checkout window, never fee-redirected, Lightning re-sourced by the
+        // payment page as the bolt11 lapses, fiat re-quoted on page load. Set
+        // by the admin Request modal / self-serve page / API opt-in — see
+        // Config::getSharedInvoiceLifetime.
+        $longLived = !empty($options['long_lived']);
+        $lifetimeSec = isset($options['lifetime_sec'])
+            ? max(60, (int)$options['lifetime_sec'])
+            : Config::getInvoiceExpiration();
 
         // Get store configuration
         $store = Config::getStore($storeId);
@@ -430,7 +439,10 @@ class Invoice {
         if ($lightningCapable)   { $offeredRails[] = 'lightning'; }
         if ($onchainOffered)     { $offeredRails[] = 'onchain'; }
 
-        $feeRoute       = FeeRedirect::decide($storeId, $store, $invoiceSats, $offeredRails);
+        // A long-lived invoice is never fee-redirected: its rails are re-sourced
+        // and re-quoted over its lifetime, which the one-shot fee gate (owed >=
+        // this exact amount) cannot follow. Owed fees stay with the cron melt.
+        $feeRoute       = $longLived ? null : FeeRedirect::decide($storeId, $store, $invoiceSats, $offeredRails);
         $feeNote        = $feeRoute['note'] ?? null;
         $feeRails       = $feeRoute['rails'] ?? [];
         $feeDestination = $feeRoute['destination'] ?? null;
@@ -475,187 +487,16 @@ class Invoice {
         if ($feeLightning === null && !empty($destinations)) {
             $lnurlTargetSats = (int) ExchangeRates::convertToSats((string)$amount, $currency, 'sat');
             if ($lnurlTargetSats > 0) {
-                // Walk the priority chain. First destination to return a usable
-                // invoice wins; the rest are only tried when earlier ones are
-                // down / out of range / can't produce a verifiable invoice.
-                foreach ($destinations as $priority => $dest) {
-                    if ($dest['type'] === StoreLnAddresses::TYPE_STRIKE) {
-                        // Strike API: create a BTC invoice in the merchant's
-                        // Strike account and quote it into a BOLT11. Settlement
-                        // is later confirmed by reading the Strike invoice back
-                        // (payment page + cron) until state=PAID. Strike leads
-                        // the chain in the default type order (configurable per
-                        // store — see RailOrder). Strike caps
-                        // descriptions at 200 chars, so the memo gets the wider
-                        // cap rather than the 100-char CLINK one.
-                        $strikeMemo = self::buildInvoiceMemo($store, $metadata, 200);
-                        try {
-                            $made = StrikeClient::createInvoiceWithQuote(
-                                $dest['value'],
-                                $lnurlTargetSats,
-                                $strikeMemo !== '' ? $strikeMemo : null,
-                                $invoiceId,
-                                self::directReceiveTimeoutSec('STRIKE_TIMEOUT_SEC')
-                            );
-                        } catch (Throwable $e) {
-                            error_log(sprintf(
-                                '[strike-receive] create+quote failed store=%s priority=%d dest=%s: %s; trying next',
-                                $storeId, $priority, StrikeClient::maskKey($dest['value']), $e->getMessage()
-                            ));
-                            $receiveErrors[] = ['type' => 'strike', 'reason' => StrikeClient::describeFailure($e)];
-                            AdminLog::log('strike', 'checkout', $storeId, null, StrikeClient::maskKey($dest['value']), $e->getMessage());
-                            continue;
-                        }
-                        $strikeAttempt = [
-                            'bolt11' => $made['bolt11'],
-                            'amount_sats' => $lnurlTargetSats,
-                            'api_key' => $dest['value'],
-                            'strike_invoice_id' => $made['invoice_id'],
-                        ];
-                        if ($priority > 0) {
-                            error_log("[strike-receive] using fallback Strike key store={$storeId} priority={$priority}");
-                        }
-                        break;
+                $direct = self::sourceDirectReceive(
+                    $storeId, $store, $destinations, $lnurlTargetSats, $metadata, $invoiceId, $receiveErrors
+                );
+                if ($direct !== null) {
+                    switch ($direct['type']) {
+                        case 'strike': $strikeAttempt = $direct['attempt']; break;
+                        case 'noffer': $nofferAttempt = $direct['attempt']; break;
+                        case 'nwc':    $nwcAttempt = $direct['attempt']; break;
+                        case 'lnurl':  $lnurlAttempt = $direct['attempt']; break;
                     }
-
-                    if ($dest['type'] === StoreLnAddresses::TYPE_NOFFER) {
-                        // CLINK noffer: act as the payer toward the merchant's
-                        // Nostr service and fetch a BOLT11. Settlement is later
-                        // confirmed by a kind-21001 receipt (payment page + cron).
-                        // Send a best-effort, spec-compliant memo (NIP-69
-                        // description) so the receiving wallet can label the
-                        // payment with the store name; the wallet may ignore it.
-                        $nofferMemo = self::nofferMemo($store, $metadata);
-                        try {
-                            $resolved = ClinkClient::requestInvoice(
-                                $dest['value'],
-                                $lnurlTargetSats,
-                                $nofferMemo !== '' ? $nofferMemo : null,
-                                self::directReceiveTimeoutSec('CLINK_NOFFER_TIMEOUT_SEC')
-                            );
-                        } catch (Throwable $e) {
-                            error_log(sprintf(
-                                '[clink-receive] noffer fetch failed store=%s priority=%d: %s; trying next',
-                                $storeId, $priority, $e->getMessage()
-                            ));
-                            $receiveErrors[] = ['type' => 'noffer', 'reason' => self::describeNofferFailure($e)];
-                            AdminLog::log('noffer', 'checkout', $storeId, null, $dest['value'], $e->getMessage());
-                            continue;
-                        }
-                        $nofferAttempt = [
-                            'bolt11' => $resolved['bolt11'],
-                            'amount_sats' => $lnurlTargetSats,
-                            'noffer' => $dest['value'],
-                            'relay' => $resolved['relay'],
-                            'receiver_pubkey' => $resolved['receiver_pubkey'],
-                            'ephemeral_sk' => $resolved['ephemeral_sk'],
-                            'ephemeral_pubkey' => $resolved['ephemeral_pubkey'],
-                            'request_event_id' => $resolved['request_event_id'],
-                            'created_at' => $resolved['created_at'],
-                        ];
-                        if ($priority > 0) {
-                            error_log("[clink-receive] using fallback noffer store={$storeId} priority={$priority}");
-                        }
-                        break;
-                    }
-
-                    if ($dest['type'] === StoreLnAddresses::TYPE_NWC) {
-                        // NWC (NIP-47): ask the merchant's own wallet to mint
-                        // the BOLT11 over Nostr Wallet Connect. Settlement is
-                        // later confirmed by polling lookup_invoice (payment
-                        // page + cron). Same memo the noffer rail sends; the
-                        // wallet may ignore it. Give the wallet invoice the
-                        // same lifetime the payserver invoice will get so the
-                        // two expire together. NwcClient verifies the returned
-                        // bolt11 encodes exactly the requested amount. Errors
-                        // (including a GMP-less host) log + fall through to
-                        // the next destination.
-                        $nwcMemo = self::nofferMemo($store, $metadata);
-                        try {
-                            $made = NwcClient::makeInvoice(
-                                $dest['value'],
-                                $lnurlTargetSats,
-                                $nwcMemo !== '' ? $nwcMemo : null,
-                                Config::getInvoiceExpiration(),
-                                self::directReceiveTimeoutSec('NWC_TIMEOUT_SEC')
-                            );
-                        } catch (Throwable $e) {
-                            error_log(sprintf(
-                                '[nwc-receive] make_invoice failed store=%s priority=%d dest=%s: %s; trying next',
-                                $storeId, $priority, NwcUri::displayLabel($dest['value']), $e->getMessage()
-                            ));
-                            $receiveErrors[] = ['type' => 'nwc', 'reason' => self::describeNwcFailure($e)];
-                            AdminLog::log('nwc', 'checkout', $storeId, null, NwcUri::displayLabel($dest['value']), $e->getMessage());
-                            continue;
-                        }
-                        $nwcAttempt = [
-                            'bolt11' => $made['bolt11'],
-                            'amount_sats' => $lnurlTargetSats,
-                            'uri' => $dest['value'],
-                            'payment_hash' => $made['payment_hash'],
-                        ];
-                        if ($priority > 0) {
-                            error_log("[nwc-receive] using fallback NWC connection store={$storeId} priority={$priority}");
-                        }
-                        break;
-                    }
-
-                    // Lightning address (LNURL/LUD-21) path.
-                    if (!StoreLnAddresses::isValid($dest['value'])) {
-                        error_log(sprintf(
-                            '[lnurl-receive] skipping malformed address store=%s priority=%d address=%s',
-                            $storeId, $priority, $dest['value']
-                        ));
-                        $receiveErrors[] = ['type' => 'lnurl', 'reason' => 'the configured Lightning address is malformed'];
-                        AdminLog::log('lnurl', 'checkout', $storeId, null, $dest['value'], 'malformed Lightning address configured');
-                        continue;
-                    }
-                    $lnurlFailReason = null;
-                    try {
-                        $probed = LnUrlReceive::probeAndFetchInvoice(
-                            $dest['value'], $lnurlTargetSats, null, $lnurlFailReason
-                        );
-                    } catch (Throwable $e) {
-                        error_log("[lnurl-receive] probe threw for store {$storeId} address {$dest['value']}: " . $e->getMessage());
-                        $probed = null;
-                        $lnurlFailReason = 'the Lightning address service could not be reached';
-                    }
-                    if ($probed !== null) {
-                        $lnurlAttempt = [
-                            'bolt11' => $probed['bolt11'],
-                            'verify_url' => $probed['verify_url'],
-                            'amount_sats' => $lnurlTargetSats,
-                            // The LN address this bolt11 was fetched from. Persisted
-                            // as ln_destination so the admin invoice view can show
-                            // where a lightning payment was sent.
-                            'address' => $dest['value'],
-                        ];
-                        if ($priority > 0) {
-                            error_log(sprintf(
-                                '[lnurl-receive] using fallback address store=%s priority=%d address=%s',
-                                $storeId, $priority, $dest['value']
-                            ));
-                        }
-                        break;
-                    }
-                    error_log(sprintf(
-                        '[lnurl-receive] probe failed for store=%s priority=%d address=%s amount_sats=%d reason=%s; trying next',
-                        $storeId, $priority, $dest['value'], $lnurlTargetSats,
-                        $lnurlFailReason ?? 'unknown'
-                    ));
-                    $receiveErrors[] = [
-                        'type' => 'lnurl',
-                        'reason' => $lnurlFailReason ?? 'the Lightning address could not produce an invoice',
-                    ];
-                    AdminLog::log('lnurl', 'checkout', $storeId, null, $dest['value'],
-                        $lnurlFailReason ?? 'probe failed');
-                }
-                if ($lnurlAttempt === null && $nofferAttempt === null && $nwcAttempt === null
-                        && $strikeAttempt === null) {
-                    error_log(sprintf(
-                        '[direct-receive] all %d destination(s) failed for store=%s amount_sats=%d; falling back to swap/mint/onchain',
-                        count($destinations), $storeId, $lnurlTargetSats
-                    ));
                 }
             }
         }
@@ -737,57 +578,12 @@ class Invoice {
         if ($cashuConfigured && !$strictMintFallbackBlocked && $swapAttempt === null
             && $lnurlAttempt === null && $strikeAttempt === null
             && $nofferAttempt === null && $nwcAttempt === null && $feeLightning === null) {
-            $mintUnit = $store['mint_unit'];
-            $lastError = null;
-            try {
-                $amountInMintUnit = ExchangeRates::convertToMintUnit(
-                    $amount, $currency, $mintUnit, $exchangeFee, $primaryProvider, $secondaryProvider
-                );
-            } catch (Throwable $e) {
-                // A rate failure (fiat-unit mint, providers down) is a failure
-                // of the MINT path, not of the invoice: with an on-chain rail
-                // configured the invoice still comes out payable. Only abort
-                // when nothing else could serve it (same contract as the
-                // all-mints-failed throw below).
-                if (!$onchainConfigured) {
-                    throw $e;
-                }
-                error_log(sprintf(
-                    '[mint] unit conversion failed for store=%s (%s -> %s): %s; skipping mint path',
-                    $storeId, $currency, (string)$mintUnit, $e->getMessage()
-                ));
-                $amountInMintUnit = null;
-            }
-            if ($amountInMintUnit !== null) {
-                require_once __DIR__ . '/mint_reliability.php';
-                $allMints = Config::getStoreAllMintUrls($storeId);
-                $recoveringMints = [];
-                foreach ($allMints as $tryMintUrl) {
-                    try {
-                        $wallet = self::getWalletForStore($storeId, $tryMintUrl);
-                        // An account whose seed has not been checked against
-                        // this mint yet must not issue a quote: the payment
-                        // would arrive at the mint but the wallet could not
-                        // mint the ecash (counter reuse). Use a ready backup;
-                        // the cron's recovery task readies this one.
-                        if ($wallet->requiresRecovery()) {
-                            $recoveringMints[] = $tryMintUrl;
-                            error_log("Mint {$tryMintUrl} skipped for store {$storeId}: wallet recovery in progress");
-                            continue;
-                        }
-                        $quote = $wallet->requestMintQuote($amountInMintUnit);
-                        $usedMintUrl = $tryMintUrl;
-                        MintReliability::recordQuoteSuccess($tryMintUrl, $storeId);
-                        break;
-                    } catch (Exception $e) {
-                        $lastError = $e;
-                        error_log("Mint quote failed for $tryMintUrl: " . $e->getMessage());
-                        $kind = MintReliability::classifyException($e, 'requestMintQuote');
-                        MintReliability::recordQuoteFailure($tryMintUrl, $storeId, $kind, $e->getMessage());
-                        continue;
-                    }
-                }
-            }
+            $mq = self::sourceMintQuote($storeId, $store, (string)$amount, $currency, $onchainConfigured);
+            $quote = $mq['quote'];
+            $usedMintUrl = $mq['mint_url'];
+            $amountInMintUnit = $mq['amount'];
+            $recoveringMints = $mq['recovering'];
+            $lastError = $mq['last_error'];
             if ($quote === null && !$onchainConfigured) {
                 if ($lastError === null && !empty($recoveringMints)) {
                     // Every candidate mint is still being prepared — nothing
@@ -955,10 +751,18 @@ class Invoice {
 
         // Calculate expiration. A mint quote carries its own (short, ~minutes)
         // expiry; everything else uses the default invoice window.
-        $defaultExpiration = time() + Config::getInvoiceExpiration();
-        $expiration = ($quote && isset($quote->expiry))
+        $defaultExpiration = time() + $lifetimeSec;
+        $expiration = ($quote && isset($quote->expiry) && !$longLived)
             ? $quote->expiry
             : $defaultExpiration;
+        // An explicitly requested lifetime (checkout.expirationMinutes on an
+        // order invoice) is an upper bound the caller relies on: a mint quote
+        // that outlives it must not stretch the invoice past it. Without an
+        // explicit lifetime the historical rule stands — the quote's expiry
+        // wins over the default window, even when it is longer.
+        if (!$longLived && isset($options['lifetime_sec']) && $expiration > $defaultExpiration) {
+            $expiration = $defaultExpiration;
+        }
         // When an on-chain address is offered alongside a shorter-lived
         // Lightning rail (e.g. a ~15-min mint quote), don't let that rail cut
         // the on-chain window short — keep the invoice alive for the longer of
@@ -1097,6 +901,12 @@ class Invoice {
             $amountSatsFinal = $invoiceSats;
         }
 
+        // When the Lightning side lapses, independent of the invoice: the mint
+        // quote's own expiry, else what the bolt11 encodes, else the default
+        // window. Drives the long-lived page's refresh timer and the pollers'
+        // "still payable" cutoff.
+        $lnExpiresAt = self::lightningExpiresAt($bolt11Final, $quote, $now);
+
         Database::insert('invoices', [
             'id' => $invoiceId,
             'store_id' => $storeId,
@@ -1136,6 +946,8 @@ class Invoice {
             'checkout_config' => $checkout ? json_encode($checkout) : null,
             'created_at' => $now,
             'expiration_time' => $expiration,
+            'long_lived' => $longLived ? 1 : 0,
+            'ln_expires_at' => $lnExpiresAt,
         ]);
 
         // Persist the swap_attempts row, now that the invoice exists for the FK.
@@ -1149,6 +961,299 @@ class Invoice {
         WebhookSender::fireEvent($storeId, 'InvoiceCreated', $invoice);
 
         return $invoice;
+    }
+
+    /**
+     * Walk the store's ordered direct-receive chain (Strike / CLINK noffer /
+     * NWC / Lightning address) for a bolt11 of exactly $lnurlTargetSats.
+     * First destination to return a usable invoice wins; the rest are only
+     * tried when earlier ones are down / out of range / can't produce a
+     * verifiable invoice. Sanitized failure records are appended to
+     * $receiveErrors. Shared by Invoice::create and the long-lived-invoice
+     * Lightning refresh (refreshLightning), so a re-sourced bolt11 follows
+     * exactly the chain a fresh invoice would.
+     *
+     * @return array{type:string, attempt:array}|null type is one of
+     *         strike|noffer|nwc|lnurl; attempt is that rail's context array.
+     */
+    private static function sourceDirectReceive(
+        string $storeId,
+        array $store,
+        array $destinations,
+        int $lnurlTargetSats,
+        ?array $metadata,
+        string $invoiceId,
+        array &$receiveErrors
+    ): ?array {
+        $strikeAttempt = null;
+        $nofferAttempt = null;
+        $nwcAttempt = null;
+        $lnurlAttempt = null;
+        // Walk the priority chain. First destination to return a usable
+        // invoice wins; the rest are only tried when earlier ones are
+        // down / out of range / can't produce a verifiable invoice.
+        foreach ($destinations as $priority => $dest) {
+            if ($dest['type'] === StoreLnAddresses::TYPE_STRIKE) {
+                // Strike API: create a BTC invoice in the merchant's
+                // Strike account and quote it into a BOLT11. Settlement
+                // is later confirmed by reading the Strike invoice back
+                // (payment page + cron) until state=PAID. Strike leads
+                // the chain in the default type order (configurable per
+                // store — see RailOrder). Strike caps
+                // descriptions at 200 chars, so the memo gets the wider
+                // cap rather than the 100-char CLINK one.
+                $strikeMemo = self::buildInvoiceMemo($store, $metadata, 200);
+                try {
+                    $made = StrikeClient::createInvoiceWithQuote(
+                        $dest['value'],
+                        $lnurlTargetSats,
+                        $strikeMemo !== '' ? $strikeMemo : null,
+                        $invoiceId,
+                        self::directReceiveTimeoutSec('STRIKE_TIMEOUT_SEC')
+                    );
+                } catch (Throwable $e) {
+                    error_log(sprintf(
+                        '[strike-receive] create+quote failed store=%s priority=%d dest=%s: %s; trying next',
+                        $storeId, $priority, StrikeClient::maskKey($dest['value']), $e->getMessage()
+                    ));
+                    $receiveErrors[] = ['type' => 'strike', 'reason' => StrikeClient::describeFailure($e)];
+                    AdminLog::log('strike', 'checkout', $storeId, null, StrikeClient::maskKey($dest['value']), $e->getMessage());
+                    continue;
+                }
+                $strikeAttempt = [
+                    'bolt11' => $made['bolt11'],
+                    'amount_sats' => $lnurlTargetSats,
+                    'api_key' => $dest['value'],
+                    'strike_invoice_id' => $made['invoice_id'],
+                ];
+                if ($priority > 0) {
+                    error_log("[strike-receive] using fallback Strike key store={$storeId} priority={$priority}");
+                }
+                return ['type' => 'strike', 'attempt' => $strikeAttempt];
+            }
+
+            if ($dest['type'] === StoreLnAddresses::TYPE_NOFFER) {
+                // CLINK noffer: act as the payer toward the merchant's
+                // Nostr service and fetch a BOLT11. Settlement is later
+                // confirmed by a kind-21001 receipt (payment page + cron).
+                // Send a best-effort, spec-compliant memo (NIP-69
+                // description) so the receiving wallet can label the
+                // payment with the store name; the wallet may ignore it.
+                $nofferMemo = self::nofferMemo($store, $metadata);
+                try {
+                    $resolved = ClinkClient::requestInvoice(
+                        $dest['value'],
+                        $lnurlTargetSats,
+                        $nofferMemo !== '' ? $nofferMemo : null,
+                        self::directReceiveTimeoutSec('CLINK_NOFFER_TIMEOUT_SEC')
+                    );
+                } catch (Throwable $e) {
+                    error_log(sprintf(
+                        '[clink-receive] noffer fetch failed store=%s priority=%d: %s; trying next',
+                        $storeId, $priority, $e->getMessage()
+                    ));
+                    $receiveErrors[] = ['type' => 'noffer', 'reason' => self::describeNofferFailure($e)];
+                    AdminLog::log('noffer', 'checkout', $storeId, null, $dest['value'], $e->getMessage());
+                    continue;
+                }
+                $nofferAttempt = [
+                    'bolt11' => $resolved['bolt11'],
+                    'amount_sats' => $lnurlTargetSats,
+                    'noffer' => $dest['value'],
+                    'relay' => $resolved['relay'],
+                    'receiver_pubkey' => $resolved['receiver_pubkey'],
+                    'ephemeral_sk' => $resolved['ephemeral_sk'],
+                    'ephemeral_pubkey' => $resolved['ephemeral_pubkey'],
+                    'request_event_id' => $resolved['request_event_id'],
+                    'created_at' => $resolved['created_at'],
+                ];
+                if ($priority > 0) {
+                    error_log("[clink-receive] using fallback noffer store={$storeId} priority={$priority}");
+                }
+                return ['type' => 'noffer', 'attempt' => $nofferAttempt];
+            }
+
+            if ($dest['type'] === StoreLnAddresses::TYPE_NWC) {
+                // NWC (NIP-47): ask the merchant's own wallet to mint
+                // the BOLT11 over Nostr Wallet Connect. Settlement is
+                // later confirmed by polling lookup_invoice (payment
+                // page + cron). Same memo the noffer rail sends; the
+                // wallet may ignore it. Give the wallet invoice the
+                // same lifetime the payserver invoice will get so the
+                // two expire together. NwcClient verifies the returned
+                // bolt11 encodes exactly the requested amount. Errors
+                // (including a GMP-less host) log + fall through to
+                // the next destination.
+                $nwcMemo = self::nofferMemo($store, $metadata);
+                try {
+                    $made = NwcClient::makeInvoice(
+                        $dest['value'],
+                        $lnurlTargetSats,
+                        $nwcMemo !== '' ? $nwcMemo : null,
+                        Config::getInvoiceExpiration(),
+                        self::directReceiveTimeoutSec('NWC_TIMEOUT_SEC')
+                    );
+                } catch (Throwable $e) {
+                    error_log(sprintf(
+                        '[nwc-receive] make_invoice failed store=%s priority=%d dest=%s: %s; trying next',
+                        $storeId, $priority, NwcUri::displayLabel($dest['value']), $e->getMessage()
+                    ));
+                    $receiveErrors[] = ['type' => 'nwc', 'reason' => self::describeNwcFailure($e)];
+                    AdminLog::log('nwc', 'checkout', $storeId, null, NwcUri::displayLabel($dest['value']), $e->getMessage());
+                    continue;
+                }
+                $nwcAttempt = [
+                    'bolt11' => $made['bolt11'],
+                    'amount_sats' => $lnurlTargetSats,
+                    'uri' => $dest['value'],
+                    'payment_hash' => $made['payment_hash'],
+                ];
+                if ($priority > 0) {
+                    error_log("[nwc-receive] using fallback NWC connection store={$storeId} priority={$priority}");
+                }
+                return ['type' => 'nwc', 'attempt' => $nwcAttempt];
+            }
+
+            // Lightning address (LNURL/LUD-21) path.
+            if (!StoreLnAddresses::isValid($dest['value'])) {
+                error_log(sprintf(
+                    '[lnurl-receive] skipping malformed address store=%s priority=%d address=%s',
+                    $storeId, $priority, $dest['value']
+                ));
+                $receiveErrors[] = ['type' => 'lnurl', 'reason' => 'the configured Lightning address is malformed'];
+                AdminLog::log('lnurl', 'checkout', $storeId, null, $dest['value'], 'malformed Lightning address configured');
+                continue;
+            }
+            $lnurlFailReason = null;
+            try {
+                $probed = LnUrlReceive::probeAndFetchInvoice(
+                    $dest['value'], $lnurlTargetSats, null, $lnurlFailReason
+                );
+            } catch (Throwable $e) {
+                error_log("[lnurl-receive] probe threw for store {$storeId} address {$dest['value']}: " . $e->getMessage());
+                $probed = null;
+                $lnurlFailReason = 'the Lightning address service could not be reached';
+            }
+            if ($probed !== null) {
+                $lnurlAttempt = [
+                    'bolt11' => $probed['bolt11'],
+                    'verify_url' => $probed['verify_url'],
+                    'amount_sats' => $lnurlTargetSats,
+                    // The LN address this bolt11 was fetched from. Persisted
+                    // as ln_destination so the admin invoice view can show
+                    // where a lightning payment was sent.
+                    'address' => $dest['value'],
+                ];
+                if ($priority > 0) {
+                    error_log(sprintf(
+                        '[lnurl-receive] using fallback address store=%s priority=%d address=%s',
+                        $storeId, $priority, $dest['value']
+                    ));
+                }
+                return ['type' => 'lnurl', 'attempt' => $lnurlAttempt];
+            }
+            error_log(sprintf(
+                '[lnurl-receive] probe failed for store=%s priority=%d address=%s amount_sats=%d reason=%s; trying next',
+                $storeId, $priority, $dest['value'], $lnurlTargetSats,
+                $lnurlFailReason ?? 'unknown'
+            ));
+            $receiveErrors[] = [
+                'type' => 'lnurl',
+                'reason' => $lnurlFailReason ?? 'the Lightning address could not produce an invoice',
+            ];
+            AdminLog::log('lnurl', 'checkout', $storeId, null, $dest['value'],
+                $lnurlFailReason ?? 'probe failed');
+        }
+        error_log(sprintf(
+            '[direct-receive] all %d destination(s) failed for store=%s amount_sats=%d; falling back to swap/mint/onchain',
+            count($destinations), $storeId, $lnurlTargetSats
+        ));
+        return null;
+    }
+
+    /**
+     * Request a mint quote for $amount/$currency from the store's mints in
+     * failover order (accounts still recovering are skipped). $fixedAmount
+     * (already in the mint unit) bypasses the rate conversion — the Lightning
+     * refresh of a long-lived invoice re-quotes at the amount the payer is
+     * already looking at. Throws on a rate failure only when no on-chain rail
+     * could serve the invoice instead (same contract as Invoice::create).
+     *
+     * @return array{quote:?\Cashu\MintQuote, mint_url:?string, amount:?int,
+     *               recovering:string[], last_error:?Throwable}
+     */
+    private static function sourceMintQuote(
+        string $storeId,
+        array $store,
+        string $amount,
+        string $currency,
+        bool $onchainConfigured,
+        ?int $fixedAmount = null
+    ): array {
+        $mintUnit = $store['mint_unit'];
+        $exchangeFee = (float)($store['exchange_fee_percent'] ?? 0);
+        $primaryProvider = $store['price_provider_primary'] ?? 'coingecko';
+        $secondaryProvider = $store['price_provider_secondary'] ?? 'binance';
+        $lastError = null;
+        $quote = null;
+        $usedMintUrl = null;
+        $recoveringMints = [];
+        try {
+            $amountInMintUnit = $fixedAmount ?? ExchangeRates::convertToMintUnit(
+                $amount, $currency, $mintUnit, $exchangeFee, $primaryProvider, $secondaryProvider
+            );
+        } catch (Throwable $e) {
+            // A rate failure (fiat-unit mint, providers down) is a failure
+            // of the MINT path, not of the invoice: with an on-chain rail
+            // configured the invoice still comes out payable. Only abort
+            // when nothing else could serve it (same contract as the
+            // all-mints-failed throw below).
+            if (!$onchainConfigured) {
+                throw $e;
+            }
+            error_log(sprintf(
+                '[mint] unit conversion failed for store=%s (%s -> %s): %s; skipping mint path',
+                $storeId, $currency, (string)$mintUnit, $e->getMessage()
+            ));
+            $amountInMintUnit = null;
+        }
+        if ($amountInMintUnit !== null) {
+            require_once __DIR__ . '/mint_reliability.php';
+            $allMints = Config::getStoreAllMintUrls($storeId);
+            $recoveringMints = [];
+            foreach ($allMints as $tryMintUrl) {
+                try {
+                    $wallet = self::getWalletForStore($storeId, $tryMintUrl);
+                    // An account whose seed has not been checked against
+                    // this mint yet must not issue a quote: the payment
+                    // would arrive at the mint but the wallet could not
+                    // mint the ecash (counter reuse). Use a ready backup;
+                    // the cron's recovery task readies this one.
+                    if ($wallet->requiresRecovery()) {
+                        $recoveringMints[] = $tryMintUrl;
+                        error_log("Mint {$tryMintUrl} skipped for store {$storeId}: wallet recovery in progress");
+                        continue;
+                    }
+                    $quote = $wallet->requestMintQuote($amountInMintUnit);
+                    $usedMintUrl = $tryMintUrl;
+                    MintReliability::recordQuoteSuccess($tryMintUrl, $storeId);
+                    break;
+                } catch (Exception $e) {
+                    $lastError = $e;
+                    error_log("Mint quote failed for $tryMintUrl: " . $e->getMessage());
+                    $kind = MintReliability::classifyException($e, 'requestMintQuote');
+                    MintReliability::recordQuoteFailure($tryMintUrl, $storeId, $kind, $e->getMessage());
+                    continue;
+                }
+            }
+        }
+        return [
+            'quote' => $quote,
+            'mint_url' => $usedMintUrl,
+            'amount' => $amountInMintUnit,
+            'recovering' => $recoveringMints,
+            'last_error' => $lastError,
+        ];
     }
 
     /**
@@ -1814,18 +1919,23 @@ class Invoice {
         // A New invoice that has just expired is still polled for up to
         // EXPIRY_CONFIRM_WINDOW, and expired only once the mint says the
         // quote is unpaid (see markExpiredInvoices()).
+        // A long-lived invoice (90-day expiration_time) is polled only while
+        // its CURRENT bolt11 is payable (ln_expires_at): a lapsed one cannot
+        // be paid, and the page re-sources it (resetting last_polled_at) when
+        // someone is looking. Same cutoff in the four rail pollers below.
         $cutoff = $now - $minInterval;
         $pendingInvoices = Database::fetchAll(
             "SELECT * FROM invoices
              WHERE status = 'New'
              AND quote_id IS NOT NULL
-             AND expiration_time > ?
+             AND ((long_lived = 0 AND expiration_time > ?)
+                  OR (long_lived = 1 AND COALESCE(ln_expires_at, expiration_time) > ?))
              AND (last_polled_at IS NULL OR last_polled_at <= ?)
              ORDER BY
                  CASE WHEN last_polled_at IS NULL THEN 0 ELSE 1 END,
                  last_polled_at ASC
              LIMIT ?",
-            [$now - self::EXPIRY_CONFIRM_WINDOW, $cutoff, $batchLimit]
+            [$now - self::EXPIRY_CONFIRM_WINDOW, $now - self::EXPIRY_CONFIRM_WINDOW, $cutoff, $batchLimit]
         );
 
         if (empty($pendingInvoices)) {
@@ -1962,13 +2072,14 @@ class Invoice {
               WHERE status = 'New'
                 AND payment_rail = 'lnaddress'
                 AND lnurl_verify_url IS NOT NULL
-                AND expiration_time > ?
+                AND ((long_lived = 0 AND expiration_time > ?)
+                     OR (long_lived = 1 AND COALESCE(ln_expires_at, expiration_time) > ?))
                 AND (last_polled_at IS NULL OR last_polled_at <= ?)
               ORDER BY
                   CASE WHEN last_polled_at IS NULL THEN 0 ELSE 1 END,
                   last_polled_at ASC
               LIMIT ?",
-            [$now, $cutoff, $batchLimit]
+            [$now, $now, $cutoff, $batchLimit]
         );
 
         if (empty($pending)) {
@@ -2114,13 +2225,14 @@ class Invoice {
               WHERE status = 'New'
                 AND payment_rail = 'nwc'
                 AND nwc_payment_hash IS NOT NULL
-                AND expiration_time > ?
+                AND ((long_lived = 0 AND expiration_time > ?)
+                     OR (long_lived = 1 AND COALESCE(ln_expires_at, expiration_time) > ?))
                 AND (last_polled_at IS NULL OR last_polled_at <= ?)
               ORDER BY
                   CASE WHEN last_polled_at IS NULL THEN 0 ELSE 1 END,
                   last_polled_at ASC
               LIMIT ?",
-            [$now, $cutoff, $batchLimit]
+            [$now, $now, $cutoff, $batchLimit]
         );
 
         foreach ($pending as $invoice) {
@@ -2268,13 +2380,14 @@ class Invoice {
               WHERE status = 'New'
                 AND payment_rail = 'strike'
                 AND strike_invoice_id IS NOT NULL
-                AND expiration_time > ?
+                AND ((long_lived = 0 AND expiration_time > ?)
+                     OR (long_lived = 1 AND COALESCE(ln_expires_at, expiration_time) > ?))
                 AND (last_polled_at IS NULL OR last_polled_at <= ?)
               ORDER BY
                   CASE WHEN last_polled_at IS NULL THEN 0 ELSE 1 END,
                   last_polled_at ASC
               LIMIT ?",
-            [$now, $cutoff, $batchLimit]
+            [$now, $now, $cutoff, $batchLimit]
         );
 
         foreach ($pending as $invoice) {
@@ -2445,13 +2558,14 @@ class Invoice {
               WHERE status = 'New'
                 AND payment_rail = 'noffer'
                 AND noffer_request_event_id IS NOT NULL
-                AND expiration_time > ?
+                AND ((long_lived = 0 AND expiration_time > ?)
+                     OR (long_lived = 1 AND COALESCE(ln_expires_at, expiration_time) > ?))
                 AND (last_polled_at IS NULL OR last_polled_at <= ?)
               ORDER BY
                   CASE WHEN last_polled_at IS NULL THEN 0 ELSE 1 END,
                   last_polled_at ASC
               LIMIT ?",
-            [$now, $cutoff, $batchLimit]
+            [$now, $now, $cutoff, $batchLimit]
         );
 
         foreach ($pending as $invoice) {
@@ -2606,6 +2720,700 @@ class Invoice {
         ));
     }
 
+    // =========================================================================
+    // LONG-LIVED INVOICES: Lightning refresh + fiat re-quote
+    //
+    // A long-lived invoice (invoices.long_lived = 1) is a shareable payment
+    // request: it stays payable for Config::getSharedInvoiceLifetime() while
+    // its Lightning bolt11 lapses every hour or so. The payment page keeps the
+    // Lightning side payable by re-sourcing the bolt11 (same destination chain
+    // / mint failover as creation, never a submarine swap) when it lapses —
+    // on page load and, while someone is watching, when the timer runs out.
+    // A fiat-denominated request is also re-quoted in sats on page load, so a
+    // link opened days after it was made asks for today's value; after that
+    // load the amounts stay fixed for the viewing session.
+    //
+    // Replaced bolt11s are parked in invoice_ln_quotes and still polled for a
+    // grace period, so a payer who scanned the previous QR seconds before the
+    // refresh is settled against the quote they actually paid.
+    // =========================================================================
+
+    /** A bolt11 this close to lapsing may already be refreshed. */
+    public const LN_REFRESH_LEAD_SEC = 30;
+    /** At most one Lightning re-source per invoice per this many seconds. */
+    public const LN_REFRESH_MIN_INTERVAL = 15;
+    /** At most one fiat re-quote per invoice per this many seconds. */
+    public const REQUOTE_MIN_INTERVAL = 60;
+    /** How long past its own expiry a superseded bolt11 is still polled. */
+    public const SUPERSEDED_QUOTE_GRACE = 3600;
+    /** Rails whose bolt11 comes from a merchant destination (not a mint). */
+    private const DIRECT_RAILS = ['strike', 'lnaddress', 'nwc', 'noffer'];
+    /** Every Lightning-rail column; reset together on a refresh. */
+    private const LN_COLUMNS = [
+        'payment_rail', 'bolt11', 'quote_id', 'mint_url', 'lnurl_verify_url', 'lnurl_preimage',
+        'ln_destination', 'noffer_relay', 'noffer_receiver_pubkey', 'noffer_ephemeral_sk',
+        'noffer_ephemeral_pubkey', 'noffer_request_event_id', 'noffer_created_at',
+        'nwc_uri', 'nwc_payment_hash', 'nwc_preimage', 'strike_invoice_id', 'strike_api_key',
+    ];
+
+    /**
+     * When an invoice's Lightning side lapses: the mint quote's own expiry,
+     * else what the bolt11 encodes (BOLT #11 `x` field, default 3600 s), else
+     * the default invoice window. Null when there is no bolt11 at all.
+     */
+    public static function lightningExpiresAt(?string $bolt11, $quote, int $now): ?int {
+        if ($bolt11 === null || $bolt11 === '') {
+            return null;
+        }
+        if ($quote !== null && isset($quote->expiry) && (int)$quote->expiry > 0) {
+            return (int)$quote->expiry;
+        }
+        require_once __DIR__ . '/bolt11_expiry.php';
+        $decoded = Bolt11Expiry::expiresAt($bolt11);
+        // An expiry already (nearly) in the past would put the page into a
+        // refresh loop; treat it like an unreadable one.
+        if ($decoded !== null && $decoded > $now + self::LN_REFRESH_LEAD_SEC) {
+            return $decoded;
+        }
+        return $now + Config::getInvoiceExpiration();
+    }
+
+    /** Is this invoice's current bolt11 missing or about to lapse? */
+    public static function lightningRefreshDue(array $invoice, ?int $now = null): bool {
+        $now = $now ?? time();
+        if (empty($invoice['bolt11'])) {
+            return true;
+        }
+        $exp = (int)($invoice['ln_expires_at'] ?? 0);
+        return $exp > 0 && $exp <= $now + self::LN_REFRESH_LEAD_SEC;
+    }
+
+    /**
+     * Payment-page load hook for a long-lived invoice: re-quote a fiat amount
+     * at today's rate, then re-source the Lightning invoice when the amount
+     * changed or the bolt11 has lapsed. Never throws — a failure here leaves
+     * the page rendering whatever the invoice already carries.
+     */
+    public static function prepareForView(string $invoiceId): void {
+        $invoice = self::getById($invoiceId);
+        if (!$invoice || empty($invoice['long_lived']) || $invoice['status'] !== 'New') {
+            return;
+        }
+        try {
+            $requoted = self::requoteForView($invoice);
+            $invoice = self::getById($invoiceId);
+            if ($invoice && $invoice['status'] === 'New'
+                    && !$requoted['lightning_done'] && self::lightningRefreshDue($invoice)) {
+                self::refreshLightning($invoiceId);
+            }
+        } catch (Throwable $e) {
+            error_log("[long-lived] prepareForView failed for {$invoiceId}: " . $e->getMessage());
+        }
+    }
+
+    /** Is this currency priced through an exchange rate (fiat) rather than BTC/sat? */
+    public static function isFiatCurrency(string $currency): bool {
+        return !in_array(strtoupper($currency), ['SAT', 'SATS', 'MSAT', 'BTC'], true);
+    }
+
+    /**
+     * Re-quote a long-lived fiat invoice's sats amounts at the current rate.
+     *
+     *   - Lightning: re-sourced at the new amount through refreshLightning
+     *     (which also handles the lapsed-bolt11 case), so amount_sats and the
+     *     bolt11 only ever change together. A failed re-source leaves the
+     *     previous bolt11 + amount in place.
+     *   - On-chain: onchain_amount_sat is moved to the new value and
+     *     onchain_amount_floor_sat keeps the smallest amount ever shown, so a
+     *     payer who already saw (and pays) an earlier amount still settles.
+     *     Only for invoice-unique addresses (xpub / Strike): a static shared
+     *     address attributes by exact amount, so its amount stays locked.
+     *   - Nothing moves once a payment has been seen on-chain, and reloads
+     *     are throttled to one re-quote per REQUOTE_MIN_INTERVAL.
+     *
+     * @return array{requoted:bool, lightning_done:bool} lightning_done is true
+     *         when this call already (re)sourced the bolt11.
+     */
+    public static function requoteForView(array $invoice): array {
+        $none = ['requoted' => false, 'lightning_done' => false];
+        if (empty($invoice['long_lived']) || $invoice['status'] !== 'New'
+                || !self::isFiatCurrency((string)$invoice['currency'])) {
+            return $none;
+        }
+        $now = time();
+        if ((int)($invoice['requoted_at'] ?? 0) > $now - self::REQUOTE_MIN_INTERVAL) {
+            return $none;
+        }
+        if (!empty($invoice['onchain_first_seen_at'])) {
+            return $none;
+        }
+        $seen = Database::fetchOne(
+            "SELECT 1 AS x FROM onchain_payments WHERE invoice_id = ? LIMIT 1", [$invoice['id']]
+        );
+        if ($seen) {
+            return $none;
+        }
+        // Stamp first: a rate outage must not make every reload retry at once.
+        Database::update('invoices', ['requoted_at' => $now], 'id = ? AND status = ?', [$invoice['id'], 'New']);
+
+        $store = Config::getStore($invoice['store_id']);
+        if (!$store) {
+            return $none;
+        }
+        try {
+            $newSats = (int)ExchangeRates::convertToSats((string)$invoice['amount'], (string)$invoice['currency'], 'sat');
+            $rate = ExchangeRates::getBtcPrice(
+                (string)$invoice['currency'],
+                $store['price_provider_primary'] ?? 'coingecko',
+                $store['price_provider_secondary'] ?? 'binance'
+            );
+        } catch (Throwable $e) {
+            error_log("[long-lived] re-quote skipped for {$invoice['id']}: rate unavailable: " . $e->getMessage());
+            return $none;
+        }
+        if ($newSats <= 0) {
+            return $none;
+        }
+
+        // ---- Lightning first: re-source at the new amount when it differs ----
+        // (or when the bolt11 has lapsed anyway). The on-chain amount below
+        // only moves when the Lightning side is consistent with it: a refresh
+        // blocked by a concurrent one ('busy') or a settled invoice leaves
+        // everything as it is; a destination that is down ('unavailable')
+        // keeps the old bolt11 (it encodes its own amount) while on-chain
+        // still re-quotes.
+        $changed = false;
+        $lightningDone = false;
+        $lnChanged = false;
+        if (!empty($invoice['bolt11']) && !empty($invoice['payment_rail'])) {
+            $rail = (string)$invoice['payment_rail'];
+            if (in_array($rail, self::DIRECT_RAILS, true)) {
+                $lnChanged = (int)$invoice['amount_sats'] !== $newSats;
+            } elseif ($rail === 'mint') {
+                try {
+                    $mintTarget = ExchangeRates::convertToMintUnit(
+                        (string)$invoice['amount'], (string)$invoice['currency'],
+                        (string)($store['mint_unit'] ?? 'sat'),
+                        (float)($store['exchange_fee_percent'] ?? 0),
+                        $store['price_provider_primary'] ?? null,
+                        $store['price_provider_secondary'] ?? null
+                    );
+                    $lnChanged = (int)$invoice['amount_sats'] !== (int)$mintTarget;
+                } catch (Throwable $e) {
+                    $lnChanged = false;
+                }
+            } elseif ($rail === 'swap') {
+                // Swaps are never refreshed in place; a direct rail or mint
+                // may still take the invoice over at the new amount.
+                $lnChanged = (int)$invoice['amount_sats'] !== $newSats;
+            }
+        }
+        if ($lnChanged || self::lightningRefreshDue($invoice, $now)) {
+            $res = self::refreshLightning((string)$invoice['id'], ['force' => true, 'requote' => true]);
+            $lightningDone = true;
+            if (!empty($res['ok'])) {
+                $changed = true;
+            } elseif (in_array($res['reason'] ?? '', ['busy', 'settled', 'not_refreshable'], true)) {
+                return ['requoted' => false, 'lightning_done' => true];
+            } elseif (empty($invoice['bolt11']) && (int)$invoice['amount_sats'] !== $newSats) {
+                // No Lightning rail could be sourced (none at creation, none
+                // now): nothing ties amount_sats to a bolt11, so move the
+                // plain sats figure (Cashu request / API) to today's value.
+                Database::update(
+                    'invoices', ['amount_sats' => $newSats],
+                    "id = ? AND status = 'New' AND bolt11 IS NULL", [$invoice['id']]
+                );
+                $changed = true;
+            }
+        }
+
+        // ---- On-chain amount (unique-address modes only) ----
+        if (!empty($invoice['onchain_address']) && empty($invoice['fee_redirect_rails'])) {
+            $staticShared = (($store['onchain_address_mode'] ?? 'xpub') === 'static')
+                && empty($invoice['strike_receive_request_id']);
+            $current = (int)($invoice['onchain_amount_sat'] ?? 0);
+            if (!$staticShared && $current > 0 && $current !== $newSats) {
+                $floor = (int)($invoice['onchain_amount_floor_sat'] ?? 0);
+                $floor = $floor > 0 ? min($floor, $current, $newSats) : min($current, $newSats);
+                Database::update(
+                    'invoices',
+                    ['onchain_amount_sat' => $newSats, 'onchain_amount_floor_sat' => $floor],
+                    'id = ? AND status = ? AND onchain_first_seen_at IS NULL',
+                    [$invoice['id'], 'New']
+                );
+                $changed = true;
+            }
+        }
+
+        if ($changed && $rate !== null) {
+            Database::update('invoices', ['exchange_rate' => $rate], 'id = ? AND status = ?', [$invoice['id'], 'New']);
+        }
+        return ['requoted' => $changed, 'lightning_done' => $lightningDone];
+    }
+
+    /**
+     * Replace a long-lived invoice's Lightning bolt11 with a freshly sourced
+     * one (merchant destination chain first, then the store's mints; never a
+     * swap). The current bolt11 is checked for a payment first and, when
+     * unpaid, parked in invoice_ln_quotes for a grace-period poll.
+     *
+     * Options:
+     *   force    skip the "is it due yet" gate (re-quote / explicit request)
+     *   requote  price the new bolt11 at the CURRENT rate instead of reusing
+     *            the invoice's present sats amount
+     *
+     * @return array{ok:bool, reason?:string, status?:string, invoice?:array,
+     *               receive_errors?:array, ln_expires_at?:int}
+     *   reasons: not_refreshable | not_due | busy | settled | unavailable
+     */
+    public static function refreshLightning(string $invoiceId, array $opts = []): array {
+        $invoice = self::getById($invoiceId);
+        if (!$invoice || empty($invoice['long_lived'])) {
+            return ['ok' => false, 'reason' => 'not_refreshable'];
+        }
+        if ($invoice['status'] !== 'New') {
+            return ['ok' => false, 'reason' => 'settled', 'status' => $invoice['status']];
+        }
+        $feeRails = array_filter(explode(',', (string)($invoice['fee_redirect_rails'] ?? '')));
+        if (in_array('lightning', $feeRails, true)) {
+            return ['ok' => false, 'reason' => 'not_refreshable'];
+        }
+        $now = time();
+        if (empty($opts['force']) && !self::lightningRefreshDue($invoice, $now)) {
+            return ['ok' => false, 'reason' => 'not_due', 'ln_expires_at' => (int)$invoice['ln_expires_at'], 'invoice' => $invoice];
+        }
+        // One re-source per window across tabs / reloads / the cron. A re-quote
+        // is already throttled by REQUOTE_MIN_INTERVAL, so it only needs the
+        // lock as a mutex (interval 0), not as a rate limit — otherwise a
+        // reload right after a timer-driven refresh could move the on-chain
+        // amount while the bolt11 stayed at the old one.
+        $lockInterval = !empty($opts['requote']) ? 0 : self::LN_REFRESH_MIN_INTERVAL;
+        $claimed = Database::update(
+            'invoices',
+            ['ln_refresh_lock_at' => $now],
+            "id = ? AND status = 'New' AND (ln_refresh_lock_at IS NULL OR ln_refresh_lock_at <= ?)",
+            [$invoiceId, $now - $lockInterval]
+        );
+        if ($claimed !== 1) {
+            return ['ok' => false, 'reason' => 'busy', 'invoice' => $invoice];
+        }
+
+        // The current bolt11 may have been paid in the last seconds: ask its
+        // rail before replacing it, so that payment settles THIS invoice.
+        if (!empty($invoice['bolt11'])) {
+            try {
+                self::checkLightningPaid($invoice);
+            } catch (Throwable $e) {
+                error_log("[long-lived] pre-refresh check failed for {$invoiceId}: " . $e->getMessage());
+            }
+            $invoice = self::getById($invoiceId);
+            if (!$invoice || $invoice['status'] !== 'New') {
+                return ['ok' => false, 'reason' => 'settled', 'status' => $invoice['status'] ?? 'Unknown'];
+            }
+        }
+
+        $store = Config::getStore($invoice['store_id']);
+        if (!$store) {
+            return ['ok' => false, 'reason' => 'not_refreshable'];
+        }
+        $storeId = (string)$invoice['store_id'];
+        $amount = (string)$invoice['amount'];
+        $currency = (string)$invoice['currency'];
+        $currentRail = (string)($invoice['payment_rail'] ?? '');
+        $currentIsDirect = in_array($currentRail, self::DIRECT_RAILS, true);
+        $requote = !empty($opts['requote']);
+
+        // Target amounts. Without a re-quote the payer keeps seeing the same
+        // sats: a direct rail reuses amount_sats (plain sats), the mint rail
+        // reuses amount_sats as the fixed mint-unit amount. Across a rail
+        // class switch (wallet down -> mint, or back) the amount is derived
+        // from the invoice amount the way creation would.
+        $sourced = null;
+        $receiveErrors = [];
+        try {
+            $directSats = (!$requote && $currentIsDirect && !empty($invoice['bolt11']))
+                ? (int)$invoice['amount_sats']
+                : (int)ExchangeRates::convertToSats($amount, $currency, 'sat');
+        } catch (Throwable $e) {
+            $directSats = $currentIsDirect ? (int)$invoice['amount_sats'] : 0;
+        }
+        $destinations = StoreLnAddresses::destinationsForStore($storeId);
+        if ($destinations !== [] && $directSats > 0) {
+            $direct = self::sourceDirectReceive(
+                $storeId, $store, $destinations, $directSats, self::metadataOf($invoice), $invoiceId, $receiveErrors
+            );
+            if ($direct !== null) {
+                $sourced = self::lightningFieldsFromAttempt($direct['type'], $direct['attempt']);
+                $sourced['_quote'] = null;
+            }
+        }
+        if ($sourced === null && Config::isStoreConfigured($storeId)) {
+            $fixed = (!$requote && $currentRail === 'mint' && !empty($invoice['bolt11']))
+                ? (int)$invoice['amount_sats'] : null;
+            try {
+                $mq = self::sourceMintQuote($storeId, $store, $amount, $currency, true, $fixed);
+            } catch (Throwable $e) {
+                $mq = ['quote' => null, 'last_error' => $e];
+            }
+            if (!empty($mq['quote'])) {
+                $q = $mq['quote'];
+                $sourced = array_fill_keys(self::LN_COLUMNS, null);
+                $sourced['payment_rail'] = 'mint';
+                $sourced['bolt11'] = $q->request;
+                $sourced['quote_id'] = $q->quote;
+                $sourced['mint_url'] = $mq['mint_url'];
+                $sourced['amount_sats'] = $mq['amount'];
+                $sourced['_quote'] = $q;
+            } elseif (!empty($mq['last_error'])) {
+                $receiveErrors[] = ['type' => 'mint', 'reason' => 'no configured mint could issue a Lightning invoice'];
+            }
+        }
+        if ($sourced === null) {
+            error_log(sprintf('[long-lived] no Lightning rail could re-source invoice=%s store=%s', $invoiceId, $storeId));
+            AdminLog::log('lightning', 'refresh', $storeId, $invoiceId, null,
+                'Lightning invoice could not be refreshed: no destination or mint produced a bolt11');
+            return [
+                'ok' => false, 'reason' => 'unavailable', 'invoice' => $invoice,
+                'receive_errors' => self::dedupeReceiveErrors($receiveErrors),
+            ];
+        }
+
+        $quote = $sourced['_quote'];
+        unset($sourced['_quote']);
+        $sourced['ln_expires_at'] = self::lightningExpiresAt($sourced['bolt11'], $quote, $now);
+        $sourced['ln_refreshed_at'] = $now;
+        $sourced['last_polled_at'] = null;
+        $sourced['last_poll_state'] = null;
+        $sourced['last_poll_error'] = null;
+        $sourced['receive_errors'] = $receiveErrors !== []
+            ? json_encode(self::dedupeReceiveErrors($receiveErrors)) : null;
+
+        Database::beginImmediate();
+        try {
+            if (!empty($invoice['bolt11'])) {
+                self::parkCurrentLightning($invoice, $now);
+            }
+            $updated = Database::update('invoices', $sourced, "id = ? AND status = 'New'", [$invoiceId]);
+            if ($updated !== 1) {
+                Database::rollback();
+                $fresh = self::getById($invoiceId);
+                return ['ok' => false, 'reason' => 'settled', 'status' => $fresh['status'] ?? 'Unknown'];
+            }
+            Database::commit();
+        } catch (Throwable $e) {
+            Database::rollback();
+            throw $e;
+        }
+        if ($currentRail === 'swap') {
+            // The held swap invoice is no longer shown to anyone: release it.
+            try {
+                SwapPoller::cancelOpenAttemptsForInvoice($invoiceId, 'Lightning invoice superseded by refresh');
+            } catch (Throwable $e) {
+                error_log("[long-lived] swap release failed for {$invoiceId}: " . $e->getMessage());
+            }
+        }
+        error_log(sprintf(
+            '[long-lived] invoice=%s lightning refreshed rail=%s->%s amount_sats=%s%s',
+            $invoiceId, $currentRail ?: 'none', $sourced['payment_rail'],
+            (string)$sourced['amount_sats'], $requote ? ' (re-quoted)' : ''
+        ));
+        return ['ok' => true, 'invoice' => self::getById($invoiceId)];
+    }
+
+    /** Decoded metadata array of an invoice row (null when absent / invalid). */
+    private static function metadataOf(array $invoice): ?array {
+        if (empty($invoice['metadata'])) {
+            return null;
+        }
+        $m = json_decode((string)$invoice['metadata'], true);
+        return is_array($m) ? $m : null;
+    }
+
+    /**
+     * Column map for a direct-receive attempt (every LN column present, the
+     * unused ones null) — the refresh-path twin of the "decide payment_rail"
+     * block in Invoice::create.
+     */
+    private static function lightningFieldsFromAttempt(string $type, array $attempt): array {
+        $f = array_fill_keys(self::LN_COLUMNS, null);
+        $f['bolt11'] = $attempt['bolt11'];
+        $f['amount_sats'] = (int)$attempt['amount_sats'];
+        switch ($type) {
+            case 'strike':
+                $f['payment_rail'] = 'strike';
+                $f['ln_destination'] = StrikeClient::maskKey($attempt['api_key']);
+                $f['strike_invoice_id'] = $attempt['strike_invoice_id'];
+                $f['strike_api_key'] = $attempt['api_key'];
+                break;
+            case 'lnurl':
+                $f['payment_rail'] = 'lnaddress';
+                $f['lnurl_verify_url'] = $attempt['verify_url'];
+                $f['ln_destination'] = $attempt['address'] ?? null;
+                break;
+            case 'nwc':
+                $f['payment_rail'] = 'nwc';
+                $f['ln_destination'] = NwcUri::displayLabel($attempt['uri']);
+                $f['nwc_uri'] = $attempt['uri'];
+                $f['nwc_payment_hash'] = $attempt['payment_hash'];
+                break;
+            case 'noffer':
+                $f['payment_rail'] = 'noffer';
+                $f['ln_destination'] = $attempt['noffer'];
+                $f['noffer_relay'] = $attempt['relay'];
+                $f['noffer_receiver_pubkey'] = $attempt['receiver_pubkey'];
+                $f['noffer_ephemeral_sk'] = $attempt['ephemeral_sk'];
+                $f['noffer_ephemeral_pubkey'] = $attempt['ephemeral_pubkey'];
+                $f['noffer_request_event_id'] = $attempt['request_event_id'];
+                $f['noffer_created_at'] = $attempt['created_at'];
+                break;
+            default:
+                throw new InvalidArgumentException("unknown direct rail type {$type}");
+        }
+        return $f;
+    }
+
+    /**
+     * Park the invoice's CURRENT Lightning quote in invoice_ln_quotes (state
+     * open) so the superseded-quote poller keeps watching it. Runs inside the
+     * caller's transaction.
+     */
+    private static function parkCurrentLightning(array $invoice, int $now): void {
+        $context = [];
+        foreach (self::LN_COLUMNS as $col) {
+            $context[$col] = $invoice[$col] ?? null;
+        }
+        Database::insert('invoice_ln_quotes', [
+            'id' => Database::generateId('lnq'),
+            'invoice_id' => $invoice['id'],
+            'store_id' => $invoice['store_id'],
+            'payment_rail' => (string)($invoice['payment_rail'] ?? ''),
+            'bolt11' => $invoice['bolt11'],
+            'amount_sats' => $invoice['amount_sats'],
+            'context' => json_encode($context),
+            'expires_at' => $invoice['ln_expires_at'] ?? null,
+            'superseded_at' => $now,
+            'state' => 'open',
+            'created_at' => $now,
+        ]);
+    }
+
+    /**
+     * Ask the invoice's current Lightning rail whether its bolt11 was paid and
+     * settle through the rail's normal path when it was. No expiry handling,
+     * no rate-limit gate — the callers already decided this check is wanted.
+     */
+    private static function checkLightningPaid(array $invoice): void {
+        switch ((string)($invoice['payment_rail'] ?? '')) {
+            case 'mint':
+                if (empty($invoice['quote_id'])) {
+                    return;
+                }
+                $wallet = self::getWalletForStore($invoice['store_id'], $invoice['mint_url'] ?? null);
+                $st = $wallet->checkMintQuote($invoice['quote_id']);
+                self::recordPollOutcome($invoice['id'], (string)$st->state, null);
+                if ($st->isIssued()) {
+                    self::completeIssuedInvoice($invoice, $wallet);
+                } elseif ($st->isPaid()) {
+                    self::mintAndStoreTokens($invoice, $wallet);
+                }
+                return;
+            case 'lnaddress':
+                if (empty($invoice['lnurl_verify_url'])) {
+                    return;
+                }
+                $result = LnUrlReceive::pollVerifyUrl((string)$invoice['lnurl_verify_url']);
+                if ($result['state'] === 'paid') {
+                    self::markLnAddressPaid($invoice, $result['preimage']);
+                }
+                return;
+            case 'nwc':
+                if (!empty($invoice['nwc_uri']) && !empty($invoice['nwc_payment_hash'])) {
+                    self::checkNwcSettlement($invoice);
+                }
+                return;
+            case 'strike':
+                if (!empty($invoice['strike_invoice_id']) && !empty($invoice['strike_api_key'])) {
+                    self::checkStrikeSettlement($invoice);
+                }
+                return;
+            case 'noffer':
+                $ctx = self::nofferCtxFromInvoice($invoice);
+                if ($ctx !== null) {
+                    $res = ClinkClient::fetchReceipt($ctx);
+                    if (!empty($res['paid'])) {
+                        self::markNofferPaid($invoice);
+                    }
+                }
+                return;
+            case 'swap':
+                SwapPoller::pollByInvoiceId((string)$invoice['id'], 0);
+                return;
+        }
+    }
+
+    /**
+     * Side-effect-free "was this (superseded) bolt11 paid?" probe for one
+     * rail, from an invoice row overlaid with the parked quote's context.
+     */
+    private static function probeLightningPaid(array $overlay): bool {
+        switch ((string)($overlay['payment_rail'] ?? '')) {
+            case 'mint':
+                if (empty($overlay['quote_id'])) {
+                    return false;
+                }
+                $wallet = self::getWalletForStore($overlay['store_id'], $overlay['mint_url'] ?? null);
+                $st = $wallet->checkMintQuote($overlay['quote_id']);
+                return $st->isPaid() || $st->isIssued();
+            case 'lnaddress':
+                if (empty($overlay['lnurl_verify_url'])) {
+                    return false;
+                }
+                return LnUrlReceive::pollVerifyUrl((string)$overlay['lnurl_verify_url'])['state'] === 'paid';
+            case 'nwc':
+                if (empty($overlay['nwc_uri']) || empty($overlay['nwc_payment_hash'])) {
+                    return false;
+                }
+                $r = NwcClient::lookupInvoice((string)$overlay['nwc_uri'], (string)$overlay['nwc_payment_hash']);
+                return !empty($r['found']) && !empty($r['paid']);
+            case 'strike':
+                if (empty($overlay['strike_invoice_id']) || empty($overlay['strike_api_key'])) {
+                    return false;
+                }
+                return StrikeClient::findInvoice((string)$overlay['strike_api_key'], (string)$overlay['strike_invoice_id'])['state'] === 'paid';
+            case 'noffer':
+                $ctx = self::nofferCtxFromInvoice($overlay);
+                return $ctx !== null && !empty(ClinkClient::fetchReceipt($ctx)['paid']);
+        }
+        return false;
+    }
+
+    /**
+     * Poll superseded Lightning quotes (invoice_ln_quotes, state open) of
+     * still-open invoices. A quote found paid is restored onto its invoice
+     * (the bolt11 the payer actually paid becomes the invoice's bolt11 again,
+     * the one it displaced is parked in turn) and settled through the rail's
+     * normal path, so webhooks and notifications fire exactly as usual.
+     * Quotes past expires_at + SUPERSEDED_QUOTE_GRACE, or whose invoice has
+     * left New/Processing, are closed.
+     *
+     * @param string|null $invoiceId Only this invoice's quotes (payment-page
+     *        tick); null = cron batch.
+     * @return array{polled:int, settled:int, closed:int}
+     */
+    public static function pollSupersededQuotes(?string $invoiceId = null, int $minInterval = 30, int $batchLimit = 20): array {
+        $now = time();
+        $cutoff = $now - $minInterval;
+        $params = [$cutoff];
+        $where = "q.state = 'open' AND (q.last_polled_at IS NULL OR q.last_polled_at <= ?)";
+        if ($invoiceId !== null) {
+            $where .= " AND q.invoice_id = ?";
+            $params[] = $invoiceId;
+        }
+        $params[] = $batchLimit;
+        $rows = Database::fetchAll(
+            "SELECT q.*, i.status AS inv_status
+               FROM invoice_ln_quotes q
+               JOIN invoices i ON i.id = q.invoice_id
+              WHERE {$where}
+              ORDER BY CASE WHEN q.last_polled_at IS NULL THEN 0 ELSE 1 END, q.last_polled_at ASC
+              LIMIT ?",
+            $params
+        );
+        $out = ['polled' => 0, 'settled' => 0, 'closed' => 0];
+        foreach ($rows as $q) {
+            $graceEnd = (int)($q['expires_at'] ?? 0) + self::SUPERSEDED_QUOTE_GRACE;
+            if (!in_array($q['inv_status'], ['New', 'Processing'], true)
+                    || ((int)($q['expires_at'] ?? 0) > 0 && $graceEnd < $now)) {
+                Database::update('invoice_ln_quotes', ['state' => 'closed'], "id = ? AND state = 'open'", [$q['id']]);
+                $out['closed']++;
+                continue;
+            }
+            $claimed = Database::update(
+                'invoice_ln_quotes',
+                ['last_polled_at' => $now],
+                "id = ? AND state = 'open' AND (last_polled_at IS NULL OR last_polled_at <= ?)",
+                [$q['id'], $cutoff]
+            );
+            if ($claimed !== 1) {
+                continue;
+            }
+            $out['polled']++;
+            $invoice = self::getById((string)$q['invoice_id']);
+            if (!$invoice) {
+                continue;
+            }
+            $context = json_decode((string)($q['context'] ?? ''), true);
+            $overlay = array_merge($invoice, is_array($context) ? $context : [], [
+                'payment_rail' => $q['payment_rail'],
+                'bolt11' => $q['bolt11'],
+                'amount_sats' => $q['amount_sats'],
+            ]);
+            try {
+                if (!self::probeLightningPaid($overlay)) {
+                    continue;
+                }
+                if (self::restoreSupersededQuote($q, $invoice, $now)) {
+                    $fresh = self::getById((string)$invoice['id']);
+                    if ($fresh) {
+                        self::checkLightningPaid($fresh);
+                        $after = self::getById((string)$invoice['id']);
+                        if ($after && $after['status'] === 'Settled') {
+                            $out['settled']++;
+                        }
+                    }
+                }
+            } catch (Throwable $e) {
+                error_log("[long-lived] superseded quote poll failed quote={$q['id']} invoice={$q['invoice_id']}: " . $e->getMessage());
+            }
+        }
+        return $out;
+    }
+
+    /**
+     * Make a parked quote the invoice's current Lightning quote again (the
+     * displaced one is parked), status-guarded to New/Processing. Returns
+     * whether the swap happened.
+     */
+    private static function restoreSupersededQuote(array $q, array $invoice, int $now): bool {
+        $context = json_decode((string)($q['context'] ?? ''), true);
+        if (!is_array($context)) {
+            return false;
+        }
+        $fields = array_fill_keys(self::LN_COLUMNS, null);
+        foreach (self::LN_COLUMNS as $col) {
+            $fields[$col] = $context[$col] ?? null;
+        }
+        $fields['payment_rail'] = $q['payment_rail'];
+        $fields['bolt11'] = $q['bolt11'];
+        $fields['amount_sats'] = $q['amount_sats'];
+        $fields['ln_expires_at'] = $q['expires_at'];
+        $fields['last_polled_at'] = null;
+        $fields['last_poll_state'] = null;
+        $fields['last_poll_error'] = null;
+        Database::beginImmediate();
+        try {
+            $current = self::getById((string)$invoice['id']);
+            if (!$current || !in_array($current['status'], ['New', 'Processing'], true)) {
+                Database::rollback();
+                return false;
+            }
+            if (!empty($current['bolt11']) && $current['bolt11'] !== $q['bolt11']) {
+                self::parkCurrentLightning($current, $now);
+            }
+            $n = Database::update('invoices', $fields, "id = ? AND status IN ('New', 'Processing')", [$invoice['id']]);
+            Database::update('invoice_ln_quotes', ['state' => 'settled'], 'id = ?', [$q['id']]);
+            Database::commit();
+            error_log(sprintf(
+                '[long-lived] invoice=%s superseded %s quote paid; restored for settlement',
+                $invoice['id'], $q['payment_rail']
+            ));
+            return $n === 1;
+        } catch (Throwable $e) {
+            Database::rollback();
+            throw $e;
+        }
+    }
+
     /**
      * The rail that actually moved funds, corrected for a historical quirk:
      * direct ecash-token receipts used to settle with settled_rail='mint'
@@ -2640,6 +3448,10 @@ class Invoice {
             'additionalStatus' => $invoice['additional_status'],
             'createdTime' => $invoice['created_at'],
             'expirationTime' => $invoice['expiration_time'],
+            // Shareable payment request: lives for the shared lifetime, the
+            // payment page re-sources its Lightning invoice as it lapses and
+            // re-quotes a fiat amount on load. See Invoice::refreshLightning.
+            'longLived' => !empty($invoice['long_lived']),
             'paidTime' => $invoice['paid_at'] ?? null,
             // settled_rail is the rail that actually moved funds; fall back to
             // payment_rail (the rail chosen at create time) for rows that
@@ -3299,6 +4111,20 @@ class Invoice {
         // Only process New or Processing invoices
         if (!in_array($invoice['status'], ['New', 'Processing'])) {
             return;
+        }
+
+        // Long-lived invoice: a payer may have paid the PREVIOUS bolt11 just
+        // before a refresh replaced it. Cheap no-op when nothing is parked.
+        if (!empty($invoice['long_lived'])) {
+            try {
+                self::pollSupersededQuotes($invoiceId, 10, 5);
+            } catch (Throwable $e) {
+                error_log("superseded-quote poll failed for {$invoiceId}: " . $e->getMessage());
+            }
+            $invoice = self::getById($invoiceId);
+            if (!$invoice || !in_array($invoice['status'], ['New', 'Processing'])) {
+                return;
+            }
         }
 
         // Direct-receive / swap Lightning rails: poll the Lightning side first,

@@ -54,6 +54,13 @@ foreach ($blockedPatterns as $pattern) {
 if (php_sapi_name() === 'cli-server') {
     // PHP built-in server: use REQUEST_URI
     $uri = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH);
+    // Front-controller form under the built-in server too: the admin's
+    // Request modal (and any client configured for 'router' URL mode) calls
+    // /router.php/api/v1/... — php -S has no PATH_INFO for that, so the
+    // prefix stayed in $uri, matched no route, and the request 404ed.
+    if (preg_match('#^/router\.php(/.*)?$#', (string)$uri, $m)) {
+        $uri = $m[1] ?? '/';
+    }
 } else {
     // Apache/nginx: check for front-controller mode (PATH_INFO) first
     $uri = !empty($_SERVER['PATH_INFO'])
