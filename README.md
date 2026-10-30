@@ -133,7 +133,7 @@ Generally speaking, BareBits tries to offer both on-chain and lightning as payme
 
 The BareBits software charges a 1% fee for usage. If you are a web developer, you can sell this service to your clients and charge an additional fee on top. Fees are paid in two ways, both of which are clearly shown in the invoices and stats tabs in your BareBits installation.
 
- - When any invoice is generated where the invoice amount is < the fee due, the payment will be automatically redirected to the fee destination. For example, if you owe 1000 sats in fees and a customer pays a 500 sat invoice, that payment will be sent directly to BareBits developers.
+ - When any invoice is generated where the invoice amount is < the fee due, the payment will be automatically redirected to the fee destination. For example, if you owe 1000 sats in fees and a customer pays a 500 sat invoice, that payment will be sent directly to BareBits developers. The Lightning invoice is requested from the fee destination with the amount only: no store name, order reference, item description, memo or invoice ID is ever sent to the fee payee. A long-lived payment request can be redirected too; its sats amount is then locked at creation (fees are owed in sats, so it is never re-quoted) and a lapsed Lightning invoice is refreshed from the same fee destination at that amount.
  - If any funds are in the cashu mint and a fee is due, those funds will be used to pay the fee
 
 This "payment redirection" method of paying fees ensures that BareBits developers never have access to your funds or your customer's private information.
@@ -455,6 +455,9 @@ payer who already scanned it still settles the invoice), and a fiat amount is
 re-quoted in sats each time the page is opened. The admin "Create invoice"
 screen and the self-serve page create their invoices this way. Shop orders
 (any invoice carrying `metadata.orderId`) keep the standard expiry behavior.
+A long-lived request that was redirected to a fee destination (see Fee
+Payments) keeps the sats amount it was created with and refreshes its
+Lightning invoice from that same destination.
 
 ```bash
 curl -X POST "https://yoursite.com/api/v1/stores/{storeId}/invoices" \

@@ -140,7 +140,8 @@ the whole lifetime, polled every minute for the first day, every 10 minutes
 until a week old, then hourly while unpaid; a detected payment is always
 polled at the normal rate. A fiat-denominated request is re-quoted in sats
 when the payment page is opened (unique-address modes only — a static shared
-address keeps the amount it was created with), and the smallest amount ever
+address keeps the amount it was created with; a request redirected to a fee
+destination keeps its amount on every rail), and the smallest amount ever
 shown still settles the invoice.
 
 Both settings apply to every on-chain receive source, Strike-minted
