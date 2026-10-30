@@ -37,6 +37,14 @@
  * The lightning rail reuses {@see LnUrlReceive::probeAndFetchInvoice}, which
  * requires a LUD-21 `verify` URL — without it we couldn't detect settlement
  * (we don't run an LN node), exactly as the existing lnaddress receive rail.
+ *
+ * PRIVACY (locked in with the operator): a fee payee learns nothing about the
+ * merchant's sale. The fee bolt11 is requested with the amount ONLY — no
+ * LUD-12 comment, no LUD-18 payer data, no store name, order id, item
+ * description, memo or invoice id. The merchant rails may label their own
+ * invoices (Strike / noffer / NWC memos); the fee rail never does. Guarded by
+ * tests/php/test_fee_redirect_invoice_privacy.php — keep that test green when
+ * touching probeAndFetchInvoice or this builder.
  */
 
 declare(strict_types=1);

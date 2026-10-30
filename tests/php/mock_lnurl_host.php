@@ -6,6 +6,8 @@
  *   mock_lnurl_set_mode($dir, 'fail')  → /cb answers 500 (destination down)
  *   mock_lnurl_settle($dir, $verifyUrl)→ that verify URL now reports settled
  *   mock_lnurl_calls($dir)             → number of /cb hits so far
+ *   mock_lnurl_requests($dir)          → every request URI the host served
+ *                                        (path + raw query), in order
  *
  * Every callback hands out a NEW stub bolt11 ("lnbc1pretend<hex>") with its
  * own verify URL, so tests can tell one sourced invoice from the next.
@@ -23,6 +25,9 @@ function start_mock_lnurl_host(): array {
 header('Content-Type: application/json');
 $path = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?? '/';
 $dir = __DIR__;
+if ($path !== '/__mock_lnurl') {
+    file_put_contents($dir . '/requests.log', ($_SERVER['REQUEST_URI'] ?? '/') . "\n", FILE_APPEND);
+}
 $port = (int)($_SERVER['SERVER_PORT'] ?? 0);
 if ($path === '/__mock_lnurl') { echo json_encode(['dir' => $dir]); exit; }
 if (strpos($path, '/.well-known/lnurlp/') === 0) {
@@ -96,4 +101,10 @@ function mock_lnurl_settle(string $dir, string $verifyUrl): void {
 function mock_lnurl_calls(string $dir): int {
     $f = $dir . '/calls.log';
     return is_file($f) ? count(array_filter(explode("\n", (string)file_get_contents($f)))) : 0;
+}
+
+/** @return string[] request URIs (path + query) served so far, oldest first. */
+function mock_lnurl_requests(string $dir): array {
+    $f = $dir . '/requests.log';
+    return is_file($f) ? array_values(array_filter(explode("\n", (string)file_get_contents($f)))) : [];
 }
