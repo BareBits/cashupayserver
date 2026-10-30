@@ -39,14 +39,23 @@ assert_eq('qauto2', $ll['quote_id'], 'second mock quote');
 assert_true(abs((int)$ll['expiration_time'] - ($now + $lifetime)) <= 5, 'long-lived invoice outlives its quote');
 assert_true(abs((int)$ll['ln_expires_at'] - ($now + 600)) <= 5, 'ln_expires_at = quote expiry (600 s)');
 
+// An explicit lifetime on an ORDINARY invoice (API expirationMinutes on a shop
+// order) is an upper bound: the 600 s quote must not stretch a 300 s window.
+$bounded = Invoice::create('s1', ['amount' => 500, 'currency' => 'sat', 'lifetime_sec' => 300]);
+assert_eq(0, (int)$bounded['long_lived'], 'explicit lifetime alone does not make it long-lived');
+assert_true(abs((int)$bounded['expiration_time'] - ($now + 300)) <= 5, 'explicit 300 s lifetime bounds the longer quote');
+assert_true((int)$bounded['ln_expires_at'] > (int)$bounded['expiration_time'], 'quote expiry itself still recorded');
+$longer = Invoice::create('s1', ['amount' => 500, 'currency' => 'sat', 'lifetime_sec' => 1800]);
+assert_true(abs((int)$longer['expiration_time'] - ($now + 600)) <= 5, 'a quote shorter than the explicit window still cuts it (no on-chain rail)');
+
 // ---- 2. refresh sources a new quote at the same amount ----
 Database::update('invoices', ['ln_expires_at' => $now - 10, 'last_polled_at' => $now, 'last_poll_state' => 'UNPAID'], 'id = ?', [$ll['id']]);
 mock_mint_clear_requests($mint['dir']);
 $r = Invoice::refreshLightning($ll['id']);
 assert_true($r['ok'], 'refresh ok: ' . json_encode($r['reason'] ?? null));
 $a = row($ll['id']);
-assert_eq('qauto3', $a['quote_id'], 'new quote id');
-assert_eq('lnbc1stubqauto3', $a['bolt11'], 'new bolt11');
+assert_eq('qauto5', $a['quote_id'], 'new quote id');
+assert_eq('lnbc1stubqauto5', $a['bolt11'], 'new bolt11');
 assert_eq('mint', $a['payment_rail'], 'still mint rail');
 assert_eq($mint['url'], $a['mint_url'], 'same mint');
 assert_eq(500, (int)$a['amount_sats'], 'same mint-unit amount');
@@ -55,7 +64,7 @@ assert_true((int)$a['ln_expires_at'] > $now + 500, 'fresh quote expiry recorded'
 $posts = array_values(array_filter(mock_mint_requests($mint['dir']), fn($l) => str_starts_with($l, 'POST /v1/mint/quote/bolt11')));
 assert_eq(1, count($posts), 'exactly one quote request');
 $mintState = json_decode((string)file_get_contents($mint['dir'] . '/state.json'), true);
-assert_eq(500, (int)($mintState['quotes']['qauto3']['amount'] ?? 0), 'requested the fixed 500 amount');
+assert_eq(500, (int)($mintState['quotes']['qauto5']['amount'] ?? 0), 'requested the fixed 500 amount');
 $p = Database::fetchAll("SELECT * FROM invoice_ln_quotes WHERE invoice_id = ?", [$ll['id']]);
 assert_eq(1, count($p), 'old quote parked');
 $ctx = json_decode($p[0]['context'], true);
@@ -66,13 +75,13 @@ assert_eq('mint', $p[0]['payment_rail'], 'parked rail');
 // ---- 3. a PAID current quote is settled, not parked ----
 Database::update('invoices', ['ln_expires_at' => $now - 10, 'ln_refresh_lock_at' => null], 'id = ?', [$ll['id']]);
 mock_mint_update_state($mint['dir'], ['quotes' => [
-    'qauto3' => ['state' => 'PAID', 'expiry' => $now + 600, 'amount' => 500, 'request' => 'lnbc1stubqauto3'],
+    'qauto5' => ['state' => 'PAID', 'expiry' => $now + 600, 'amount' => 500, 'request' => 'lnbc1stubqauto5'],
 ]]);
 $r = Invoice::refreshLightning($ll['id']);
 assert_eq('settled', $r['reason'], 'paid quote found before replacing: ' . json_encode($r));
 $b = row($ll['id']);
 assert_true(in_array($b['status'], ['Processing', 'Settled'], true), 'invoice moved into settlement (' . $b['status'] . ')');
-assert_eq('qauto3', $b['quote_id'], 'the paid quote stays on the invoice');
+assert_eq('qauto5', $b['quote_id'], 'the paid quote stays on the invoice');
 assert_eq(1, count(Database::fetchAll("SELECT * FROM invoice_ln_quotes WHERE invoice_id = ?", [$ll['id']])), 'nothing new parked');
 
 // ---- 4. mint down ----

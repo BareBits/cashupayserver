@@ -755,6 +755,14 @@ class Invoice {
         $expiration = ($quote && isset($quote->expiry) && !$longLived)
             ? $quote->expiry
             : $defaultExpiration;
+        // An explicitly requested lifetime (checkout.expirationMinutes on an
+        // order invoice) is an upper bound the caller relies on: a mint quote
+        // that outlives it must not stretch the invoice past it. Without an
+        // explicit lifetime the historical rule stands — the quote's expiry
+        // wins over the default window, even when it is longer.
+        if (!$longLived && isset($options['lifetime_sec']) && $expiration > $defaultExpiration) {
+            $expiration = $defaultExpiration;
+        }
         // When an on-chain address is offered alongside a shorter-lived
         // Lightning rail (e.g. a ~15-min mint quote), don't let that rail cut
         // the on-chain window short — keep the invoice alive for the longer of

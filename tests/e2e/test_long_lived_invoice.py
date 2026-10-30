@@ -30,14 +30,16 @@ poll backoff) live in tests/php/test_long_lived_*.php.
 from __future__ import annotations
 
 import json
+import re
 import time
+import uuid
 
 import pytest
 import requests
 
 from conftest import ConfiguredPayserver
 from fixtures.lnd import LndHandle
-from fixtures.onchain import OnchainContext, configure_store_for_onchain
+from fixtures.onchain import OnchainContext, configure_store_for_onchain, configure_store_for_static_onchain
 
 NINETY_DAYS_MIN = 90 * 1440
 
@@ -408,18 +410,15 @@ def test_admin_request_modal_creates_long_lived_invoice(shared_configured: Confi
         # invoice a long-lived payment request on the server.
         assert body["checkout"]["expirationMinutes"] == NINETY_DAYS_MIN, body
         assert body["amount"] == 1234 and body["currency"] == "sat", body
-        resp = req.response()
-        created = resp.json() if resp is not None and resp.status == 200 else None
+        # The modal lands the admin on the new invoice's payment page (the
+        # response body is gone once the page navigates, so read the id from
+        # the URL: /payment.php?id=... or /payment/...).
+        page.wait_for_url("**/payment**", timeout=30000)
+        current = page.url
+        invoice_id = current.split("id=")[-1].split("&")[0] if "id=" in current else current.rstrip("/").split("/")[-1]
     finally:
         ctx.close()
-    if created is None:
-        # php -S in the default 'router' URL mode cannot serve the modal's
-        # /router.php/api/v1/... form (pre-existing: router.php only strips
-        # PATH_INFO on Apache/nginx). The request shape above is this
-        # feature's contract; the server side of it is covered by the API
-        # tests, and the full round trip by the Apache/nginx backends.
-        return
-    row = _row(cfg, created["id"])
+    row = _row(cfg, invoice_id)
     assert row["long_lived"] == 1
     assert row["amount"] == "1234"
     assert abs(row["expiration_time"] - (int(time.time()) + NINETY_DAYS_MIN * 60)) < 300
@@ -440,3 +439,236 @@ def test_selfserve_invoice_is_long_lived(shared_configured: ConfiguredPayserver)
     row = _row(cfg, invoice_id)
     assert row["long_lived"] == 1
     assert abs(row["expiration_time"] - (int(time.time()) + NINETY_DAYS_MIN * 60)) < 300
+
+
+def test_router_front_controller_api_form_works_under_builtin_server(shared_configured: ConfiguredPayserver) -> None:
+    """The admin modal (and any 'router' URL-mode client) calls
+    /router.php/api/v1/...; php -S has no PATH_INFO for that form, so router.php
+    now strips the prefix itself. Both URL forms must answer identically."""
+    cfg = shared_configured
+    headers = {"Authorization": f"token {cfg.api_token}"}
+    r = requests.post(
+        f"{cfg.handle.url}/router.php/api/v1/stores/{cfg.store_id}/invoices",
+        json={"amount": "1000", "currency": "sat"}, headers=headers, timeout=30,
+    )
+    assert r.status_code == 200, r.text[:300]
+    inv = r.json()
+    r2 = requests.get(f"{cfg.handle.url}/router.php/api/v1/stores/{cfg.store_id}/invoices/{inv['id']}", headers=headers, timeout=15)
+    assert r2.status_code == 200 and r2.json()["id"] == inv["id"], r2.text[:300]
+    r3 = requests.get(f"{cfg.handle.url}/router.php/api/v1/server/info", headers=headers, timeout=15)
+    assert r3.status_code == 200, r3.text[:300]
+    # The bare prefix still lands on the front page redirect, and the
+    # sensitive-path block still applies through the prefix.
+    r4 = requests.get(f"{cfg.handle.url}/router.php", timeout=15, allow_redirects=False)
+    assert r4.status_code in (200, 302), r4.status_code
+    r5 = requests.get(f"{cfg.handle.url}/router.php/data/cashupay.sqlite", timeout=15)
+    assert r5.status_code == 403
+
+
+def test_order_invoice_explicit_lifetime_bounds_a_longer_quote(shared_configured: ConfiguredPayserver) -> None:
+    """An e-commerce invoice asking for 10 minutes gets 10 minutes even though
+    the mint quote lasts a day: an explicit lifetime is an upper bound. (The
+    historical rule — the quote's expiry wins over the DEFAULT window — is
+    kept for invoices without the field; see test_api_without_field_is_unchanged.)"""
+    now = int(time.time())
+    inv = shared_configured.greenfield.create_invoice(
+        shared_configured.store_id, amount="1000", currency="sat",
+        metadata={"orderId": "wc-10min"}, checkout={"expirationMinutes": 10},
+    )
+    assert inv["longLived"] is False
+    assert abs(inv["expirationTime"] - (now + 600)) < 60, inv["expirationTime"]
+    row = _row(shared_configured, inv["id"])
+    assert row["ln_expires_at"] > row["expiration_time"], "the quote itself outlives the invoice window"
+
+
+def test_static_address_store_keeps_onchain_amount_but_requotes_lightning(
+    shared_configured: ConfiguredPayserver, onchain: OnchainContext
+) -> None:
+    """A static shared address attributes payments by exact amount, so its
+    amount is locked at creation; the Lightning side still re-quotes."""
+    addr = onchain.bitcoind.rpc("getnewaddress", "", "bech32")
+    configure_store_for_static_onchain(
+        shared_configured.handle.db_path, shared_configured.store_id,
+        static_address=addr, network="regtest", tweak_range=1000, min_confs=0,
+        confirm_timeout_sec=86400, provider_url=onchain.watch_wallet_url,
+    )
+    _seed_usd_rate(shared_configured, 100_000.0)
+    inv = _create_long_lived(shared_configured, amount="10.00", currency="USD")
+    row = _row(shared_configured, inv["id"])
+    assert row["onchain_address"] == addr
+    locked = row["onchain_amount_sat"]
+    assert 10_000 <= locked < 11_000, locked  # 10 000 + uniqueness tweak
+    assert row["amount_sats"] == 10_000
+
+    _seed_usd_rate(shared_configured, 200_000.0)
+    _set(shared_configured, inv["id"], requoted_at=None)
+    html = requests.get(_payment_url(shared_configured, inv["id"]), timeout=30).text
+    after = _row(shared_configured, inv["id"])
+    assert after["onchain_amount_sat"] == locked, "static address amount locked"
+    assert after["onchain_amount_floor_sat"] is None
+    assert after["amount_sats"] == 5_000, "Lightning re-quoted"
+    assert after["bolt11"] != row["bolt11"]
+    assert f"{locked:,} sat" in html
+
+
+def test_cart_checkout_from_admin_is_long_lived(shared_configured: ConfiguredPayserver) -> None:
+    cfg = shared_configured
+    pid = "prod_" + uuid.uuid4().hex[:12]
+    now = int(time.time())
+    with cfg.handle.db() as db:
+        db.execute(
+            "INSERT INTO products (id, store_id, title, price, currency, image_type, image_value,"
+            " purchase_count, enabled, created_at, updated_at) VALUES (?, ?, 'LL Cart Item', '600', 'sat', 'none', NULL, 0, 1, ?, ?)",
+            (pid, cfg.store_id, now, now),
+        )
+    res = cfg.admin._post_action(
+        "cart_checkout", store_id=cfg.store_id, items=json.dumps([{"product_id": pid, "quantity": 2}]), memo="cart ll",
+    )
+    assert res.get("success") is True and res.get("invoiceId"), res
+    row = _row(cfg, res["invoiceId"])
+    assert row["long_lived"] == 1
+    assert row["amount"] == "1200"
+    assert abs(row["expiration_time"] - (now + NINETY_DAYS_MIN * 60)) < 300
+
+
+def test_selfserve_product_link_checkout_is_long_lived(shared_configured: ConfiguredPayserver) -> None:
+    cfg = shared_configured
+    pid = "prod_" + uuid.uuid4().hex[:12]
+    now = int(time.time())
+    with cfg.handle.db() as db:
+        db.execute("UPDATE stores SET selfserve_enabled = 1 WHERE id = ?", (cfg.store_id,))
+        db.execute(
+            "INSERT INTO products (id, store_id, title, price, currency, image_type, image_value,"
+            " purchase_count, enabled, created_at, updated_at) VALUES (?, ?, 'LL Link Item', '800', 'sat', 'none', NULL, 0, 1, ?, ?)",
+            (pid, cfg.store_id, now, now),
+        )
+    r = requests.post(
+        f"{cfg.handle.url}/pay/{cfg.store_id}?products={pid}",
+        data={"tip_mode": "", "tip_percent": "", "tip_amount": "", "notes": ""},
+        timeout=30, allow_redirects=False,
+    )
+    assert r.status_code in (301, 302, 303), r.text[:300]
+    loc = r.headers["Location"]
+    invoice_id = loc.split("id=")[-1].split("&")[0] if "id=" in loc else loc.rstrip("/").split("/")[-1]
+    row = _row(cfg, invoice_id)
+    assert row["long_lived"] == 1 and row["amount"] == "800"
+
+
+def test_cron_skips_lapsed_long_lived_bolt11_and_closes_stale_parked_quotes(shared_configured: ConfiguredPayserver) -> None:
+    cfg = shared_configured
+    now = int(time.time())
+    ll = _create_long_lived(cfg)
+    ordinary = cfg.greenfield.create_invoice(cfg.store_id, amount="1000", currency="sat")
+    _set(cfg, ll["id"], ln_expires_at=now - 7200, last_polled_at=None)
+    _set(cfg, ordinary["id"], last_polled_at=None)
+    with cfg.handle.db() as db:
+        db.execute(
+            "INSERT INTO invoice_ln_quotes (id, invoice_id, store_id, payment_rail, bolt11, amount_sats, context,"
+            " expires_at, superseded_at, state, created_at) VALUES ('lnq_e2e_old', ?, ?, 'mint', 'lnbcrt1old', 1000,"
+            " '{}', ?, ?, 'open', ?)",
+            (ll["id"], cfg.store_id, now - 7200, now - 7000, now - 7000),
+        )
+    summary = cfg.handle.trigger_cron_json()
+    # Other tests on this shared server may have parked quotes of their own;
+    # only the stale one here must have been closed by this pass.
+    task = summary["tasks"]["poll_superseded_ln"]
+    assert int(re.search(r"closed (\d+)", task).group(1)) >= 1, task
+    assert _row(cfg, ll["id"])["last_polled_at"] is None, "lapsed long-lived bolt11 is not polled"
+    assert _row(cfg, ordinary["id"])["last_polled_at"] is not None, "ordinary live invoice still polled"
+    with cfg.handle.db() as db:
+        state = db.execute("SELECT state FROM invoice_ln_quotes WHERE id = 'lnq_e2e_old'").fetchone()[0]
+    assert state == "closed"
+    # Nothing expired it: the invoice lives for the shared lifetime.
+    assert cfg.greenfield.get_invoice(cfg.store_id, ll["id"])["status"] == "New"
+
+
+def _set_store_mints(cfg: ConfiguredPayserver, url: str | None, backup_url: str | None) -> dict:
+    """Point the store's primary + backup mints somewhere else; returns the previous values."""
+    with cfg.handle.db() as db:
+        prev_primary = db.execute("SELECT mint_url FROM stores WHERE id = ?", (cfg.store_id,)).fetchone()[0]
+        prev_backups = [r[0] for r in db.execute("SELECT mint_url FROM store_mints WHERE store_id = ? ORDER BY priority", (cfg.store_id,))]
+        if url is not None:
+            db.execute("UPDATE stores SET mint_url = ? WHERE id = ?", (url, cfg.store_id))
+            db.execute("UPDATE store_mints SET mint_url = ? WHERE store_id = ?", (backup_url or url, cfg.store_id))
+    return {"primary": prev_primary, "backups": prev_backups}
+
+
+def test_refresh_failure_shows_retry_and_recovers(shared_configured: ConfiguredPayserver, browser) -> None:
+    """Mint unreachable when the bolt11 lapses: the page says so and keeps
+    retrying every 30 s; once the mint is back the next attempt succeeds."""
+    cfg = shared_configured
+    inv = _create_long_lived(cfg)
+    first = _bolt11(inv)
+    url = _payment_url(cfg, inv["id"])
+    prev = _set_store_mints(cfg, "http://127.0.0.1:1", "http://127.0.0.1:1")
+    ctx = browser.new_context()
+    page = ctx.new_page()
+    try:
+        page.goto(url, wait_until="domcontentloaded")
+        page.wait_for_selector("#ln-refreshed", timeout=10000)
+        _set(cfg, inv["id"], ln_expires_at=int(time.time()) - 1)
+        page.evaluate("lnExpiresAt = Math.floor(Date.now() / 1000) + 1")
+        page.wait_for_function(
+            "document.getElementById('timer').textContent.includes('retrying')", timeout=20000,
+        )
+        assert _row(cfg, inv["id"])["bolt11"] == first, "failed refresh keeps the current bolt11"
+        assert _row(cfg, inv["id"])["status"] == "New"
+        # Mint back: the retry (forced early instead of waiting 30 s) succeeds.
+        with cfg.handle.db() as db:
+            db.execute("UPDATE stores SET mint_url = ? WHERE id = ?", (prev["primary"], cfg.store_id))
+            for i, u in enumerate(prev["backups"]):
+                db.execute(
+                    "UPDATE store_mints SET mint_url = ? WHERE store_id = ? AND rowid IN "
+                    "(SELECT rowid FROM store_mints WHERE store_id = ? ORDER BY priority LIMIT 1 OFFSET ?)",
+                    (u, cfg.store_id, cfg.store_id, i),
+                )
+        _set(cfg, inv["id"], ln_refresh_lock_at=None)
+        page.evaluate("lnRefreshNextAt = 0")
+        page.wait_for_function(
+            "(first) => document.querySelector('[data-method-block=\"lightning\"] .invoice-input').dataset.copy !== first",
+            arg=first, timeout=40000,
+        )
+        page.wait_for_function(
+            "document.getElementById('timer').textContent.startsWith('Lightning invoice refreshes in')", timeout=10000,
+        )
+        assert _row(cfg, inv["id"])["bolt11"].lower().startswith("lnbcrt")
+    finally:
+        ctx.close()
+        with cfg.handle.db() as db:
+            db.execute("UPDATE stores SET mint_url = ? WHERE id = ?", (prev["primary"], cfg.store_id))
+
+
+def test_other_tab_adopts_refreshed_bolt11(shared_configured: ConfiguredPayserver, browser) -> None:
+    """A second tab (or a reload elsewhere) refreshed the bolt11: the open
+    page learns it from its status poll and swaps QR + copy targets, flashing
+    the refreshed label."""
+    cfg = shared_configured
+    inv = _create_long_lived(cfg)
+    first = _bolt11(inv)
+    url = _payment_url(cfg, inv["id"])
+    ctx = browser.new_context()
+    page = ctx.new_page()
+    try:
+        page.goto(url, wait_until="domcontentloaded")
+        page.wait_for_selector("#ln-refreshed", timeout=10000)
+        page.evaluate(
+            """() => {
+                window.__flashes = 0;
+                new MutationObserver(() => {
+                    if (document.getElementById('ln-refreshed').classList.contains('flash')) window.__flashes++;
+                }).observe(document.getElementById('ln-refreshed'), { attributes: true, attributeFilter: ['class'] });
+            }"""
+        )
+        _set(cfg, inv["id"], ln_expires_at=int(time.time()) - 1)
+        r = requests.post(url, data={"action": "refresh_lightning"}, timeout=30)
+        assert r.json()["ok"] is True, r.text
+        second = r.json()["bolt11"]
+        page.wait_for_function(
+            "(second) => document.querySelector('[data-method-block=\"lightning\"] .invoice-input').dataset.copy === second",
+            arg=second, timeout=15000,
+        )
+        page.wait_for_function("window.__flashes >= 1", timeout=5000)
+        assert page.evaluate("document.querySelector('[data-method-block=\"lightning\"] a.btn').href") == "lightning:" + second
+        assert page.evaluate("lnExpiresAt") == _row(cfg, inv["id"])["ln_expires_at"]
+    finally:
+        ctx.close()
