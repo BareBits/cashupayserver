@@ -70,6 +70,72 @@ function cashupay_onchain_tx_url(array $invoice): ?string {
     return $base . '/tx/' . rawurlencode($oc['txid']);
 }
 
+/**
+ * Relay-subscription parameters the page needs to watch for the merchant's
+ * kind-21001 payment receipt; null unless this invoice currently rides the
+ * noffer rail. Shared by the HTML bootstrap, the JSON poll and the Lightning
+ * refresh endpoint (a refresh can move the invoice onto / off the rail).
+ */
+function cashupay_noffer_sub(array $invoice): ?array {
+    if (($invoice['payment_rail'] ?? '') !== 'noffer' || empty($invoice['noffer_relay'])) {
+        return null;
+    }
+    return [
+        'relay' => (string)$invoice['noffer_relay'],
+        'pubkey' => (string)$invoice['noffer_ephemeral_pubkey'],
+        'requestId' => (string)$invoice['noffer_request_event_id'],
+        'since' => (int)($invoice['noffer_created_at'] ?? 0),
+    ];
+}
+
+/**
+ * Lightning-side fields the page keeps in sync while an invoice is New: the
+ * current bolt11, when it lapses, when it was last (re)sourced, and the noffer
+ * subscription for it. Empty for any other status (nothing left to pay).
+ */
+function cashupay_lightning_state(array $invoice): array {
+    if ($invoice['status'] !== 'New') {
+        return [];
+    }
+    return [
+        'bolt11' => $invoice['bolt11'] ?? null,
+        'lnExpiresAt' => (int)($invoice['ln_expires_at'] ?? 0),
+        'lnRefreshedAt' => (int)(($invoice['ln_refreshed_at'] ?? null) ?: ($invoice['created_at'] ?? 0)),
+        'paymentRail' => $invoice['payment_rail'] ?? null,
+        'nofferSub' => cashupay_noffer_sub($invoice),
+        'amountSats' => (int)($invoice['amount_sats'] ?? 0),
+    ];
+}
+
+// Lightning refresh endpoint for long-lived invoices: the page calls this when
+// its bolt11 lapses (or learns from the JSON poll that another tab refreshed).
+// Rate-limited and status-guarded server-side (Invoice::refreshLightning), so
+// hammering it costs nothing beyond one re-source per window. No CSRF token —
+// unauthenticated page, nothing to abuse: a refresh never changes what is owed.
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'refresh_lightning') {
+    header('Content-Type: application/json');
+    $res = Invoice::refreshLightning($invoiceId);
+    $inv = $res['invoice'] ?? Invoice::getById($invoiceId);
+    if ($inv === null) {
+        cashupay_status(404);
+        echo json_encode(['ok' => false, 'error' => 'Invoice not found']);
+        exit;
+    }
+    if (($res['reason'] ?? '') === 'not_refreshable') {
+        cashupay_status(400);
+    }
+    $payload = [
+        'ok' => !empty($res['ok']),
+        'reason' => $res['reason'] ?? null,
+        'status' => $inv['status'],
+    ] + cashupay_lightning_state($inv);
+    if (!empty($res['receive_errors']) && !AdminLog::suppressOnInvoice()) {
+        $payload['receiveErrors'] = $res['receive_errors'];
+    }
+    echo json_encode($payload);
+    exit;
+}
+
 // CLINK noffer receipt endpoint: the payment page holds a live Nostr
 // subscription (native WebSocket) for the merchant's kind-21001 payment
 // receipt and forwards the raw signed event here. We verify the merchant's
@@ -133,13 +199,20 @@ if (isset($_GET['json'])) {
         'receiveErrors' => (!AdminLog::suppressOnInvoice() && !empty($invoice['receive_errors']))
             ? (json_decode((string)$invoice['receive_errors'], true) ?: [])
             : [],
-    ]);
+        // Long-lived invoice: lets a tab pick up a bolt11 another tab (or a
+        // reload) refreshed, and drives its "refreshes in" timer.
+        'longLived' => !empty($invoice['long_lived']),
+    ] + (!empty($invoice['long_lived']) ? cashupay_lightning_state($invoice) : []));
     exit;
 }
 
 // HTML render: poll this one quote so the initial page reflects current
 // state, then kick background work for everything else.
 Invoice::pollSingleQuote($invoiceId);
+// Long-lived (shareable) invoice: re-quote a fiat amount at today's rate and
+// re-source a lapsed Lightning invoice BEFORE rendering, so the first paint
+// already carries a payable QR. No-op for ordinary checkout invoices.
+Invoice::prepareForView($invoiceId);
 Background::trigger();
 
 // Get invoice
@@ -744,6 +817,25 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
             color: var(--error);
         }
 
+        /* Long-lived invoices: "Refreshed N seconds ago" under the Lightning
+           QR; .flash is added for one second each time the bolt11 changes. */
+        .ln-refreshed {
+            display: inline-block;
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            margin: -0.5rem 0 0.75rem;
+            padding: 0.15rem 0.55rem;
+            border-radius: 6px;
+            min-height: 1.1em;
+        }
+        .ln-refreshed.flash {
+            animation: ln-flash 1s ease-out;
+        }
+        @keyframes ln-flash {
+            0%   { background: var(--accent); color: #fff; }
+            100% { background: transparent; color: var(--text-secondary); }
+        }
+
         /* "Pay with [logos] or any Bitcoin wallet" row.
            Each SVG carries its own brand fill; the row only sets size. */
         .payment-methods {
@@ -1233,6 +1325,10 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                 <?php if ($hasLightning): ?>
                 <div class="method-block <?= $firstMethod === 'lightning' ? '' : 'hidden' ?>" data-method-block="lightning">
                     <div class="qr-container" id="qr-lightning"></div>
+                    <?php if (!empty($invoice['long_lived'])): ?>
+                    <?php // When this bolt11 was (re)sourced; flashes for a second on each refresh. ?>
+                    <div class="ln-refreshed" id="ln-refreshed" aria-live="polite"></div>
+                    <?php endif; ?>
                     <div class="invoice-input" data-copy="<?= htmlspecialchars($invoice['bolt11']) ?>">
                         <?= htmlspecialchars(substr($invoice['bolt11'], 0, 40) . '...' . substr($invoice['bolt11'], -10)) ?>
                     </div>
@@ -1530,26 +1626,24 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
     <script src="<?= htmlspecialchars(Urls::assets('js/')) ?>qrcode-generator.js"></script>
     <script src="<?= htmlspecialchars(Urls::assets('js/')) ?>qr-shim.js"></script>
     <script>
-        const invoice = <?= json_encode($invoice['bolt11']) ?>;
+        // `let`: a long-lived invoice's bolt11 is replaced in place when it lapses.
+        let invoice = <?= json_encode($invoice['bolt11']) ?>;
         const onchainAddress = <?= json_encode($invoice['onchain_address'] ?? null) ?>;
         const onchainBip21 = <?= json_encode($bip21 ?? '') ?>;
         const invoiceId = <?= json_encode($invoiceId) ?>;
         const expirationTime = <?= (int)$invoice['expiration_time'] ?>;
+        // Long-lived (shareable) invoice: the invoice itself lives for months;
+        // the timer below tracks the Lightning bolt11 instead and asks the
+        // server for a fresh one when it lapses.
+        const longLived = <?= json_encode(!empty($invoice['long_lived'])) ?>;
+        let lnExpiresAt = <?= (int)($invoice['ln_expires_at'] ?? 0) ?>;
+        let lnRefreshedAt = <?= (int)(($invoice['ln_refreshed_at'] ?? null) ?: ($invoice['created_at'] ?? 0)) ?>;
         const redirectUrl = <?= json_encode($redirectUrl) ?>;
         const payerReceiptOffered = <?= json_encode($payerReceiptOffered) ?>;
         // CLINK noffer receive: subscription params so the page can watch the
         // offer's relay for the merchant's kind-21001 payment receipt. Null
         // unless this invoice rides the noffer rail.
-        const nofferSub = <?= json_encode(
-            (($invoice['payment_rail'] ?? '') === 'noffer' && !empty($invoice['noffer_relay']))
-                ? [
-                    'relay' => (string)$invoice['noffer_relay'],
-                    'pubkey' => (string)$invoice['noffer_ephemeral_pubkey'],
-                    'requestId' => (string)$invoice['noffer_request_event_id'],
-                    'since' => (int)($invoice['noffer_created_at'] ?? 0),
-                ]
-                : null
-        ) ?>;
+        let nofferSub = <?= json_encode(cashupay_noffer_sub($invoice)) ?>;
         let currentStatus = <?= json_encode($invoice['status']) ?>;
         // Whether a detected on-chain payment is still waiting for
         // confirmation — selects the unified screen's pending mode while
@@ -1676,36 +1770,157 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
         // Backwards-compat alias for any handlers that still reference copyInvoice.
         function copyInvoice() { copyText(invoice); }
 
-        // Update timer
-        function updateTimer() {
-            const now = Math.floor(Date.now() / 1000);
-            const remaining = expirationTime - now;
-
-            if (remaining <= 0) {
-                document.getElementById('timer').textContent = 'Invoice expired';
-                document.getElementById('timer').className = 'timer expired';
-                return;
-            }
-
-            const timerEl = document.getElementById('timer');
+        function formatRemaining(remaining) {
             const hours = Math.floor(remaining / 3600);
             const minutes = Math.floor((remaining % 3600) / 60);
             const seconds = remaining % 60;
-
-            let timeStr;
             if (remaining < 600) {
                 // Less than 10 minutes: show minutes:seconds
-                timeStr = `${minutes}:${seconds.toString().padStart(2, '0')}`;
+                return `${minutes}:${seconds.toString().padStart(2, '0')}`;
             } else if (hours > 0) {
                 // 1+ hours: show Xh Ym
-                timeStr = `${hours}h ${minutes}m`;
-            } else {
-                // 10-59 minutes: show just minutes
-                timeStr = `${minutes} min`;
+                return `${hours}h ${minutes}m`;
+            }
+            // 10-59 minutes: show just minutes
+            return `${minutes} min`;
+        }
+
+        // Update timer
+        function updateTimer() {
+            const now = Math.floor(Date.now() / 1000);
+            const timerEl = document.getElementById('timer');
+
+            if (longLived) {
+                // The invoice does not lapse for months; what lapses is the
+                // Lightning bolt11, which the server re-sources on request.
+                updateRefreshedLabel(false);
+                if (!invoice) {
+                    timerEl.textContent = '';
+                    timerEl.className = 'timer';
+                    return;
+                }
+                const lnRemaining = lnExpiresAt - now;
+                if (lnRemaining <= 0) {
+                    timerEl.textContent = lnRefreshState === 'failed'
+                        ? 'Couldn\u2019t get a new Lightning invoice \u2014 retrying\u2026'
+                        : 'Refreshing Lightning invoice\u2026';
+                    timerEl.className = lnRefreshState === 'failed' ? 'timer urgent' : 'timer';
+                    requestLightningRefresh();
+                    return;
+                }
+                timerEl.textContent = `Lightning invoice refreshes in ${formatRemaining(lnRemaining)}`;
+                timerEl.className = 'timer';
+                return;
             }
 
-            timerEl.textContent = `Expires in ${timeStr}`;
+            const remaining = expirationTime - now;
+            if (remaining <= 0) {
+                timerEl.textContent = 'Invoice expired';
+                timerEl.className = 'timer expired';
+                return;
+            }
+            timerEl.textContent = `Expires in ${formatRemaining(remaining)}`;
             timerEl.className = remaining < 300 ? 'timer urgent' : 'timer';
+        }
+
+        // ---- Long-lived invoices: Lightning refresh ----
+        // When the bolt11 lapses the page asks the server for a fresh one
+        // (same destination chain / mint failover as creation). The server
+        // first checks the old bolt11 for a payment and keeps it under watch
+        // afterwards, so a scan made seconds before the swap still settles.
+        // A failed attempt is retried every 30 s; on-chain stays payable.
+        let lnRefreshInFlight = false;
+        let lnRefreshNextAt = 0;
+        let lnRefreshState = 'idle';
+        async function requestLightningRefresh() {
+            if (!longLived || lnRefreshInFlight || currentStatus !== 'New') return;
+            const now = Math.floor(Date.now() / 1000);
+            if (now < lnRefreshNextAt) return;
+            lnRefreshInFlight = true;
+            try {
+                const body = new URLSearchParams();
+                body.set('action', 'refresh_lightning');
+                const url = new URL(window.location.href);
+                url.searchParams.set('id', invoiceId);
+                const r = await fetch(url.toString(), {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body: body.toString(),
+                });
+                const data = await r.json().catch(() => ({}));
+                if (data && data.ok) {
+                    lnRefreshState = 'idle';
+                    applyLightning(data, true);
+                } else if (data && data.reason === 'settled') {
+                    pollStatus();
+                } else if (data && data.bolt11 && (data.reason === 'not_due' || data.reason === 'busy')) {
+                    // Another tab / a reload already refreshed it: adopt that.
+                    lnRefreshState = 'idle';
+                    lnRefreshNextAt = now + 5;
+                    applyLightning(data, true);
+                } else {
+                    lnRefreshState = 'failed';
+                    lnRefreshNextAt = now + 30;
+                    updateTimer();
+                }
+            } catch (e) {
+                lnRefreshState = 'failed';
+                lnRefreshNextAt = now + 30;
+            } finally {
+                lnRefreshInFlight = false;
+            }
+        }
+
+        // Swap the page onto a new bolt11: QR, copy targets, wallet link,
+        // noffer watch, timer, and the "Refreshed ... ago" label (flashed
+        // when the invoice actually changed).
+        function applyLightning(data, flash) {
+            if (!data || !data.bolt11) return;
+            const changed = data.bolt11 !== invoice;
+            invoice = data.bolt11;
+            if (data.lnExpiresAt) lnExpiresAt = data.lnExpiresAt;
+            if (data.lnRefreshedAt) lnRefreshedAt = data.lnRefreshedAt;
+            if (changed) {
+                renderQR('qr-lightning', 'lightning:' + invoice.toUpperCase());
+                const block = document.querySelector('[data-method-block="lightning"]');
+                if (block) {
+                    const input = block.querySelector('.invoice-input');
+                    if (input) {
+                        input.dataset.copy = invoice;
+                        input.textContent = invoice.slice(0, 40) + '...' + invoice.slice(-10);
+                    }
+                    const open = block.querySelector('a.btn[href^="lightning:"]');
+                    if (open) open.href = 'lightning:' + invoice;
+                    block.querySelectorAll('button[data-copy]').forEach(b => { b.dataset.copy = invoice; });
+                }
+                nofferSub = data.nofferSub || null;
+                restartNofferWatch();
+            }
+            updateRefreshedLabel(changed && flash);
+            updateTimer();
+        }
+
+        function formatAgo(seconds) {
+            if (seconds < 5) return 'just now';
+            if (seconds < 60) return `${seconds} seconds ago`;
+            const m = Math.floor(seconds / 60);
+            if (m < 60) return m === 1 ? '1 minute ago' : `${m} minutes ago`;
+            const h = Math.floor(m / 60);
+            if (h < 48) return h === 1 ? '1 hour ago' : `${h} hours ago`;
+            return `${Math.floor(h / 24)} days ago`;
+        }
+
+        function updateRefreshedLabel(flash) {
+            const el = document.getElementById('ln-refreshed');
+            if (!el) return;
+            const ago = Math.max(0, Math.floor(Date.now() / 1000) - lnRefreshedAt);
+            el.textContent = 'Refreshed ' + formatAgo(ago);
+            if (flash) {
+                el.classList.remove('flash');
+                void el.offsetWidth; // restart the animation
+                el.classList.add('flash');
+                setTimeout(() => el.classList.remove('flash'), 1000);
+            }
         }
 
         // CLINK noffer: hold a live Nostr subscription on the offer's relay and
@@ -1714,6 +1929,11 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
         // reliable settlement path for the noffer rail (cron is best-effort,
         // since the receipt is an ephemeral event relays may not retain). Uses
         // the browser's native WebSocket — no library/bundle needed.
+        let activeNofferWatch = null;
+        function restartNofferWatch() {
+            if (activeNofferWatch) { activeNofferWatch.stop(); activeNofferWatch = null; }
+            startNofferReceiptWatch();
+        }
         function startNofferReceiptWatch() {
             if (!nofferSub || !nofferSub.relay) return;
             let ws = null;
@@ -1815,6 +2035,15 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                     clearInterval(guard);
                 }
             }, 2000);
+            // A Lightning refresh moving the invoice to a new noffer request
+            // (or off the rail) tears this watch down via restartNofferWatch.
+            activeNofferWatch = {
+                stop: function () {
+                    stopped = true;
+                    try { if (ws) ws.close(); } catch (e) {}
+                    clearInterval(guard);
+                },
+            };
         }
 
         // Poll for status
@@ -1839,6 +2068,12 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                         txLink.href = data.onchainTxUrl;
                         txLink.classList.remove('hidden');
                     }
+                }
+
+                // Long-lived invoice: another tab or a reload may have
+                // refreshed the bolt11 — adopt it so this QR stays payable.
+                if (longLived && data.status === 'New' && data.bolt11 && data.bolt11 !== invoice) {
+                    applyLightning(data, true);
                 }
 
                 const onchainPending = !!data.onchainPending;

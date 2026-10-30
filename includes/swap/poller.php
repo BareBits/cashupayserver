@@ -195,6 +195,31 @@ final class SwapPoller {
     }
 
     /**
+     * Release the held swap invoice(s) of ONE invoice whose Lightning side was
+     * re-sourced elsewhere (a long-lived invoice's refresh): nobody is shown
+     * the swap's bolt11 any more. Same terminal transition as expireStale,
+     * best-effort against the provider.
+     */
+    public static function cancelOpenAttemptsForInvoice(string $invoiceId, string $message): void {
+        $rows = Database::fetchAll(
+            "SELECT * FROM swap_attempts WHERE invoice_id = ? AND status = 'swap.created'",
+            [$invoiceId]
+        );
+        $ctx = new CustomerSwapSettlement();
+        foreach ($rows as $row) {
+            $provider = SwapProviderFactory::byName($row['provider']);
+            if ($provider) {
+                try {
+                    $provider->cancelInvoice($row['network'], $row['swap_id_external']);
+                } catch (Throwable $e) {
+                    error_log("SwapPoller cancelInvoice {$row['id']}: " . $e->getMessage());
+                }
+            }
+            self::transitionToInvalid($row, 'invoice.expired', $message, $ctx);
+        }
+    }
+
+    /**
      * Drive a single row through one tick of state.
      */
     private static function processRow(array $row, SwapSettlementContext $ctx): void {

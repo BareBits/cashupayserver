@@ -170,6 +170,24 @@ class Config {
     }
 
     /**
+     * Lifetime of a long-lived (shareable) invoice: the admin Request modal,
+     * the self-serve page and API callers opting in via
+     * checkout.expirationMinutes. Such an invoice is a payment request whose
+     * link may sit in a chat for days, so it stays payable far longer than
+     * the checkout window above; its Lightning bolt11 is re-sourced by the
+     * payment page as it lapses. 90 days by default (config key
+     * shared_invoice_lifetime, seconds). Also the ceiling for an API-supplied
+     * expirationMinutes.
+     */
+    public static function getSharedInvoiceLifetime(): int {
+        $v = (int)self::get('shared_invoice_lifetime', self::SHARED_INVOICE_LIFETIME_DEFAULT);
+        return $v > 0 ? $v : self::SHARED_INVOICE_LIFETIME_DEFAULT;
+    }
+
+    /** 90 days. */
+    public const SHARED_INVOICE_LIFETIME_DEFAULT = 90 * 86400;
+
+    /**
      * Get URL mode for standalone deployments.
      *
      * - 'clean'  : extension-less pretty URLs (/admin, /setup, /pay/x) served

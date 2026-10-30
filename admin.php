@@ -334,6 +334,7 @@ if (isset($_GET['api'])) {
                 echo json_encode([
                     'stores' => $stores,
                     'noStoreSelected' => true,
+                    'sharedInvoiceLifetimeMinutes' => intdiv(Config::getSharedInvoiceLifetime(), 60),
                 ]);
                 break;
             }
@@ -590,6 +591,9 @@ if (isset($_GET['api'])) {
                 'balanceCached' => $balanceCached,
                 'invoices' => array_map([Invoice::class, 'formatForApi'], $recentInvoices),
                 'stores' => $stores,
+                // Lifetime the Request modal asks for (checkout.expirationMinutes)
+                // so its invoices are long-lived payment requests.
+                'sharedInvoiceLifetimeMinutes' => intdiv(Config::getSharedInvoiceLifetime(), 60),
                 'autoMelt' => $autoMelt,
                 'notifications' => $storeNotifications,
                 // Per-store invoice-memo privacy defaults. Drives both the
@@ -1723,7 +1727,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if (isset($_POST['hide_note'])) {
                     $privacy['hideNote'] = $_POST['hide_note'] === '1';
                 }
-                $result = Cart::checkout($storeId, $items, $memo, $redirect, $privacy);
+                $result = Cart::checkout($storeId, $items, $memo, $redirect, $privacy, true);
                 echo json_encode(['success' => true] + $result);
             } catch (InvalidArgumentException $e) {
                 cashupay_status(400);
@@ -11956,7 +11960,12 @@ header('Cache-Control: no-cache, must-revalidate');
                         // only show them the lock screen. Standalone keeps
                         // the return-to-admin convenience (no shop exists).
                         redirectURL: shopHomeUrl || window.location.href.split('?')[0],
-                        redirectAutomatically: true
+                        redirectAutomatically: true,
+                        // A requested invoice is a shareable payment request:
+                        // asking for the shared lifetime makes it long-lived
+                        // (Lightning re-sourced as it lapses, fiat re-quoted
+                        // on load) instead of a one-hour checkout.
+                        expirationMinutes: dashboardData?.sharedInvoiceLifetimeMinutes || (90 * 1440)
                     }
                 };
 

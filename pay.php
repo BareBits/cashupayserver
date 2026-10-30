@@ -157,7 +157,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $productMode) {
         // Cart::checkout creates the invoice + persists the invoice_items
         // snapshots (products and the tip line), exactly like the admin cart.
         $memo = $notes !== '' ? $notes : count($linkItems) . ' item(s)';
-        $result = Cart::checkout($storeId, $items, $memo);
+        $result = Cart::checkout($storeId, $items, $memo, null, [], true);
 
         header('Location: ' . Urls::payment($result['invoiceId']));
         exit;
@@ -201,6 +201,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && !$productMode) {
             // Uppercase to match the Greenfield API / admin Request modal, which
             // store the currency code uppercased (e.g. SAT, USD).
             'currency' => strtoupper($currency),
+            // A self-serve invoice is a payment request the customer may come
+            // back to (or forward): long-lived, Lightning re-sourced on view.
+            'lifetime_sec' => Config::getSharedInvoiceLifetime(),
+            'long_lived' => true,
         ];
         if ($notes !== '') {
             // itemDesc is the payer-facing note convention used across the app

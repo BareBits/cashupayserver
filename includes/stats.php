@@ -495,6 +495,10 @@ class Stats {
             'expiration_time', 'last_polled_at', 'last_poll_state', 'last_poll_error', 'paid_at', 'settled_rail',
             'payment_rail', 'customer_email', 'newsletter_opt_in',
             'payer_receipt_requested', 'receive_errors',
+            // Long-lived (shareable) invoices: lifetime flag, Lightning
+            // refresh bookkeeping, fiat re-quote stamp, on-chain amount floor.
+            'long_lived', 'ln_expires_at', 'ln_refreshed_at', 'ln_refresh_lock_at', 'requoted_at',
+            'onchain_amount_floor_sat',
             'onchain_address', 'onchain_address_index', 'onchain_amount_sat',
             'onchain_first_seen_at', 'onchain_created_tip_height',
             'onchain_amount_tweak_sats', 'onchain_needs_manual_confirmation',

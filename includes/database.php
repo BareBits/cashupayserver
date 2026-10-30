@@ -112,7 +112,7 @@ class Database {
                 // on existing installs that haven't yet picked it up. All migrations
                 // are idempotent, so a fire is safe.
                 $hasLatestMigration = $hasConfig
-                    && self::columnExists($pdo, 'invoices', 'last_poll_error');
+                    && self::columnExists($pdo, 'invoices', 'ln_expires_at');
                 // The auto-withdraw → auto-cashout rename is a data-only migration
                 // (config key + notification event labels) with no schema artifact
                 // to mark it done, so probe for the legacy config key directly. The
@@ -1841,6 +1841,72 @@ HTACCESS;
         }
         if (!self::columnExists($pdo, 'invoices', 'last_poll_error')) {
             $pdo->exec("ALTER TABLE invoices ADD COLUMN last_poll_error TEXT DEFAULT NULL");
+        }
+
+        // Long-lived (shareable) invoices. All additive and idempotent;
+        // invoices.ln_expires_at is the getInstance() migration marker for
+        // this set.
+        //
+        //   long_lived      1 for invoices created as shareable payment
+        //                   requests (admin Request modal, self-serve page,
+        //                   API with checkout.expirationMinutes and no
+        //                   orderId): the invoice lives for the configured
+        //                   shared lifetime, the payment page re-sources the
+        //                   Lightning invoice when it lapses, and a fiat
+        //                   amount is re-quoted in sats on page load.
+        //   ln_expires_at   when the CURRENT bolt11 lapses (mint quote expiry,
+        //                   or decoded from the bolt11); the invoice itself
+        //                   may live much longer.
+        //   ln_refreshed_at when the bolt11 was last replaced (NULL = never;
+        //                   the page shows "refreshed N seconds ago").
+        //   ln_refresh_lock_at CAS stamp so concurrent tabs / reloads run at
+        //                   most one Lightning re-source per window.
+        //   requoted_at     last fiat → sats re-quote (throttles reloads).
+        //   onchain_amount_floor_sat the smallest on-chain amount ever shown
+        //                   for this invoice; a payment of any amount the
+        //                   payer was shown settles it (unique-address modes
+        //                   only; static mode never re-quotes).
+        foreach ([
+            'long_lived' => 'INTEGER NOT NULL DEFAULT 0',
+            'ln_refreshed_at' => 'INTEGER DEFAULT NULL',
+            'ln_refresh_lock_at' => 'INTEGER DEFAULT NULL',
+            'requoted_at' => 'INTEGER DEFAULT NULL',
+            'onchain_amount_floor_sat' => 'INTEGER DEFAULT NULL',
+            'ln_expires_at' => 'INTEGER DEFAULT NULL',
+        ] as $col => $decl) {
+            if (!self::columnExists($pdo, 'invoices', $col)) {
+                $pdo->exec("ALTER TABLE invoices ADD COLUMN {$col} {$decl}");
+            }
+        }
+        // Superseded Lightning quotes. When a long-lived invoice's bolt11 is
+        // replaced, the previous one is parked here and still polled for a
+        // grace period: a payer who scanned the old QR seconds before the
+        // refresh is settled against THIS row (its rail context is restored
+        // onto the invoice before the normal settlement path runs).
+        //   context  JSON of the rail-specific columns the pollers need
+        //            (quote_id, mint_url, lnurl_verify_url, nwc_uri,
+        //            nwc_payment_hash, strike_*, noffer_*, ln_destination).
+        //   state    open | closed (grace passed) | settled
+        if (!self::tableExists($pdo, 'invoice_ln_quotes')) {
+            $pdo->exec("
+                CREATE TABLE invoice_ln_quotes (
+                    id TEXT PRIMARY KEY,
+                    invoice_id TEXT NOT NULL,
+                    store_id TEXT NOT NULL,
+                    payment_rail TEXT NOT NULL,
+                    bolt11 TEXT,
+                    amount_sats INTEGER,
+                    context TEXT,
+                    expires_at INTEGER,
+                    superseded_at INTEGER NOT NULL,
+                    last_polled_at INTEGER DEFAULT NULL,
+                    state TEXT NOT NULL DEFAULT 'open',
+                    created_at INTEGER NOT NULL,
+                    FOREIGN KEY (invoice_id) REFERENCES invoices(id) ON DELETE CASCADE
+                )
+            ");
+            $pdo->exec("CREATE INDEX IF NOT EXISTS idx_invoice_ln_quotes_open ON invoice_ln_quotes(state, expires_at)");
+            $pdo->exec("CREATE INDEX IF NOT EXISTS idx_invoice_ln_quotes_invoice ON invoice_ln_quotes(invoice_id)");
         }
 
         // Outgoing token ledger (see includes/transfer.php): every exported
