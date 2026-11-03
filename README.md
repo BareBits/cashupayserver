@@ -18,6 +18,7 @@ BareBits can create invoices, receive payments, and be used as a point-of-sale s
 - **No application or approval process** - Just download and run!
 - **Self-custody** - A fully self-custody solution, or add Cashu mint for convenience.
 - **Fiat conversion** via Strike gives you access to instant fiat conversion in 100+ countries
+- **Secure by design** - No hot wallet sitting on your web server (unless using Cashu mint). Connects to your LN wallet via CLINK or NWCU with no ability to spend funds.
 - **Multiple stores** - Each store can have it's own invoice settings, cashout addresses, etc.
 - **Tip Jar** - Let customers make their own payments using a shared link. Links can be generic (any amount) or for specific products.
 - **E-commerce integration** - Plugin for WooCommerce. On magneto, shopify, or another platform? Use the BTCPay plugin and point it to your BareBits URL.
