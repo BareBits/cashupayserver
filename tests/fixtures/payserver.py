@@ -51,6 +51,10 @@ class PayserverHandle:
     port: int
     data_dir: Path
     workdir: Path
+    # URL path prefix for an install that is not the docroot itself — the
+    # BareBits server the WordPress plugin installs at <site>/barebits. Empty
+    # for every standalone fixture.
+    base_path: str = ""
 
     @property
     def process(self) -> subprocess.Popen[bytes] | None:
@@ -59,7 +63,7 @@ class PayserverHandle:
 
     @property
     def url(self) -> str:
-        return f"http://127.0.0.1:{self.port}"
+        return f"http://127.0.0.1:{self.port}{self.base_path}"
 
     def wait_ready(self, timeout_s: float = 30.0) -> None:
         """Any HTTP response means the PHP server is up. Pre-setup the API

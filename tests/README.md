@@ -143,6 +143,19 @@ fallback when GitHub is unreachable.
 | `test_upgrade_from_release[tag]` | the OLD release's own updater ("Update now") downloads, backs up, overlays and health-verifies the candidate; the merchant's login, store, products, API key and invoices survive; pre-upgrade unpaid invoices and fresh ones settle on Lightning and on-chain; the webhook fires; rolling back restores the old build, which still boots on the migrated database |
 | `test_testing_to_main_and_back` | from the newest stable, via the cron line (`update.php`, auto-update on): testing → candidate, main → the stable again (older code on a newer database), testing → candidate, each hop healthy and paying on both rails |
 | `test_old_data_dir_boots_on_candidate[tag]` | the Windows upgrade contract on Linux: a data dir written by the old release is carried into the build under test (served by the regular fixture in desktop shape) and keeps serving and settling |
+| `test_alongside_install_upgrades_both_halves[tag-order]` | WordPress install mode: that release's PUBLISHED plugin zip installs that release's server alongside a WooCommerce shop (its own channel, from a local release server); wizard walked, WooCommerce wired, a guest order paid over Lightning and an on-chain invoice settled; then the server (its own updater, "Update now") and the plugin (WordPress upload-and-replace, the GitHub-distributed plugin's update path) move to the candidate in the parametrised order, an order paid after each half — old plugin + new server and new plugin + old server both take money; rollback brings the old server back under the new plugin, still paying |
+| `test_wporg_plugin_url_mode_upgrades_both_halves[tag-order]` | WordPress URL mode with the wordpress.org plugin variant (no installer): the old release standalone, the old wordpress.org plugin connects by URL and pairs, WooCommerce wired, order paid; server via its updater, plugin via a wordpress.org-style update (WordPress's own update offer names the candidate's wporg zip from the catalog, `Plugin_Upgrader::bulk_upgrade` applies it — the auto-update code path); order after each half, rollback, order again |
+
+The WordPress tests run server-first for the whole window and plugin-first
+(new plugin on an old server) for the newest stable + newest testing release
+only. The candidate's plugin zips are built from the working tree
+(`scripts/build-wordpress-plugin.sh`, both variants) and published in the
+candidate catalog with their `Version:` header stamped to `<version>.9999`
+(`upgrade/wp_flow.py::stamp_plugin_zip`): the tree's header equals the newest
+release's until the release bump, and WordPress never applies an update to the
+version it already has. The shipped artifacts are untouched. The wordpress.org
+update offer is injected by a test-only mu-plugin (`site_transient_update_plugins`),
+the directory itself cannot be pointed at a candidate build.
 
 The candidate is the standalone zip of the working tree (`scripts/build-standalone.sh`,
 built once per session; `CASHUPAY_STANDALONE_ZIP` points at a prebuilt one). The
@@ -157,6 +170,8 @@ screen it does not know — add the screen there when the wizard grows one.
 ```bash
 # one release, php -S
 CASHUPAY_UPGRADE_FROM=v1.8 pytest upgrade/ -v
+# just the WordPress half for one release
+CASHUPAY_UPGRADE_FROM=v1.8 pytest upgrade/test_wordpress_alongside_upgrade.py upgrade/test_wordpress_wporg_upgrade.py -v
 # the whole window on Apache
 CASHUPAY_TEST_BACKEND=apache pytest upgrade/ -v
 # window size

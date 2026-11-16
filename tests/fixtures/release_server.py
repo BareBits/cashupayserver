@@ -24,7 +24,7 @@ import json
 import os
 import subprocess
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -79,6 +79,11 @@ class ReleaseServer:
         (Updater::$releaseApiUrlBase / CASHUPAY_RELEASE_API_BASE): it appends
         /latest and ?per_page= itself."""
         return f"http://127.0.0.1:{self.port}/releases"
+
+    def catalog_asset_url(self, tag: str, name: str) -> str:
+        """Download URL of one asset of a start_release_catalog() release —
+        what its GitHub-shaped listing advertises as browser_download_url."""
+        return f"{self.api_base}/assets/{tag}/{name}"
 
 
 def start_release_server(
@@ -183,10 +188,24 @@ class CatalogRelease:
     # None = lift barebits/BUILD_INFO out of the zip.
     build_info: bytes | None = None
     with_sums: bool = True
+    # Further real assets to publish under this release, asset name -> file:
+    # the WordPress plugin zips (barebits_wordpress_plugin[_wporg]-<tag>.zip)
+    # when a test installs or updates the plugin from the catalog. Sibling
+    # names not listed here are still advertised with no bytes behind them,
+    # as the realistic clutter the server-side updater must skip over.
+    extra_assets: dict[str, Path] = field(default_factory=dict)
 
     @property
     def zip_asset_name(self) -> str:
         return f"barebits-{self.tag}.zip"
+
+    @property
+    def plugin_asset_name(self) -> str:
+        return f"barebits_wordpress_plugin-{self.tag}.zip"
+
+    @property
+    def plugin_wporg_asset_name(self) -> str:
+        return f"barebits_wordpress_plugin_wporg-{self.tag}.zip"
 
 
 def start_release_catalog(releases: list[CatalogRelease]) -> ReleaseServer:
@@ -220,10 +239,17 @@ def start_release_catalog(releases: list[CatalogRelease]) -> ReleaseServer:
         prefix = f"{rel.tag}/"
         assets[prefix + rel.zip_asset_name] = (zip_bytes, "application/zip")
         assets[prefix + "BUILD_INFO"] = (build_info, "text/plain")
-        names = [rel.zip_asset_name, "BUILD_INFO",
-                 f"barebits-windows-{rel.tag}.zip", f"barebits_wordpress_plugin-{rel.tag}.zip"]
+        names = [rel.zip_asset_name, "BUILD_INFO", f"barebits-windows-{rel.tag}.zip",
+                 rel.plugin_asset_name, rel.plugin_wporg_asset_name]
+        sums_lines = [f"{hashlib.sha256(zip_bytes).hexdigest()}  {rel.zip_asset_name}"]
+        for name, path in rel.extra_assets.items():
+            body = Path(path).read_bytes()
+            assets[prefix + name] = (body, "application/zip")
+            if name not in names:
+                names.append(name)
+            sums_lines.append(f"{hashlib.sha256(body).hexdigest()}  {name}")
         if rel.with_sums:
-            sums = f"{hashlib.sha256(zip_bytes).hexdigest()}  {rel.zip_asset_name}\n".encode()
+            sums = ("\n".join(sums_lines) + "\n").encode()
             assets[prefix + "SHA256SUMS"] = (sums, "text/plain")
             names.append("SHA256SUMS")
         objs.append({
