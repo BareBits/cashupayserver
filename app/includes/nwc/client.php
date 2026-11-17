@@ -386,12 +386,28 @@ class NwcClient
                     if (!NostrCrypto::verifyEventArray($ev)) {
                         continue;
                     }
+                    // Bind the response to THIS request. The REQ filter asked
+                    // the relay for `#e` = our request id, but the relay is
+                    // untrusted: without this check a relay (or a ws:// MITM)
+                    // could replay any earlier genuine response from the same
+                    // wallet — a "settled" lookup_invoice reply, say — onto a
+                    // new request and settle an unpaid invoice.
+                    if (!self::eventReferences($ev, $requestId)) {
+                        continue;
+                    }
                     $plain = self::decryptResponse((string)($ev['content'] ?? ''), $skHex, $walletPubkey, $convKey);
                     if ($plain === null) {
                         continue;
                     }
                     $reply = json_decode($plain, true);
                     if (!is_array($reply)) {
+                        continue;
+                    }
+                    // NIP-47 responses name the method they answer. A reply
+                    // for a different method (a replayed make_invoice blob
+                    // answering lookup_invoice) is not an answer to us.
+                    $resultType = $reply['result_type'] ?? null;
+                    if ($resultType !== null && (!is_string($resultType) || $resultType !== $method)) {
                         continue;
                     }
                     if (isset($reply['error']) && is_array($reply['error']) && ($reply['error']['code'] ?? '') !== '') {
@@ -532,6 +548,26 @@ class NwcClient
                 return (int)ceil($amount / 10000); // pico-BTC (0.0001 sat)
         }
         return 0;
+    }
+
+    /**
+     * Does this response event carry an `e` tag naming $requestId? NIP-47
+     * responses reference the request they answer; anything else is noise
+     * (or a replay) and is skipped.
+     */
+    private static function eventReferences(array $ev, string $requestId): bool
+    {
+        $tags = $ev['tags'] ?? null;
+        if (!is_array($tags)) {
+            return false;
+        }
+        foreach ($tags as $tag) {
+            if (is_array($tag) && ($tag[0] ?? null) === 'e'
+                && is_string($tag[1] ?? null) && hash_equals($requestId, $tag[1])) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** Receive the next text frame's content, or null on timeout/close; '' for control noise. */

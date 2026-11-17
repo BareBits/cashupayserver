@@ -38,6 +38,25 @@ class OnchainPayments {
     public const REORG_SAFETY_DEPTH = 5;
 
     /**
+     * How long a zero-conf settlement stays under watch. An invoice settled
+     * on a mempool-only payment keeps being polled until that payment has a
+     * confirmation or this many seconds have passed; a payment that
+     * vanishes meanwhile (replaced / double-spent) flips the invoice to
+     * Invalid and fires InvoiceInvalid. Long enough to outlast any realistic
+     * mempool eviction, short enough that the watch set stays small.
+     */
+    public const ZERO_CONF_WATCH_SEC = 72 * 3600;
+
+    /**
+     * additional_status stamped on a Settled zero-conf invoice whose payment
+     * was missing from the provider's view on the last watch poll. A second
+     * consecutive miss reverses the settlement (Invalid); the payment
+     * reappearing clears it. One poll alone never reverses: a provider
+     * answering an empty page during a hiccup must not cancel a paid order.
+     */
+    public const ZERO_CONF_MISSING_STATUS = 'ZeroConfPaymentMissing';
+
+    /**
      * Atomically allocate the next receive address for a store.
      *
      * For xpub-mode stores: derives a fresh address at m/0/{next_index}.
@@ -484,14 +503,28 @@ class OnchainPayments {
         }
 
         // Recompute totals from the persisted state (canonical source).
+        // Zero-conf (minConfs = 0) stores count a mempool-only payment as
+        // confirmed — unless the sender signalled replace-by-fee on it: such
+        // a payment can be replaced by a conflicting one until it is mined,
+        // so it stays pending (Processing) until it has a confirmation. The
+        // signal rides on this poll's observations (keyed by txid:vout);
+        // confirmed rows are unaffected.
+        $replaceableKeys = [];
+        foreach ($observations as $obs) {
+            if ($obs->replaceable && $obs->confirmations === 0) {
+                $replaceableKeys[$obs->txid . ':' . $obs->vout] = true;
+            }
+        }
         $rows = Database::fetchAll(
-            "SELECT amount_sat, confirmations FROM onchain_payments WHERE invoice_id = ?",
+            "SELECT txid, vout, amount_sat, confirmations FROM onchain_payments WHERE invoice_id = ?",
             [$invoiceId]
         );
         $totalConfirmed = 0;
         $totalPending = 0;
         foreach ($rows as $r) {
-            if ((int)$r['confirmations'] >= $minConfs) {
+            $confs = (int)$r['confirmations'];
+            $rbfUnconfirmed = $confs === 0 && isset($replaceableKeys[$r['txid'] . ':' . (int)$r['vout']]);
+            if ($confs >= $minConfs && !$rbfUnconfirmed) {
                 $totalConfirmed += (int)$r['amount_sat'];
             } else {
                 $totalPending += (int)$r['amount_sat'];
@@ -572,20 +605,35 @@ class OnchainPayments {
         // (Processing) and the payment page's own poll are never slowed.
         $dayAgo = $now - 86400;
         $weekAgo = $now - 7 * 86400;
+        // The last OR branch is the zero-conf watch: an invoice settled on a
+        // payment that still has no confirmation keeps being polled (for
+        // ZERO_CONF_WATCH_SEC after settlement) so a replaced / evicted
+        // payment is noticed — see applyTransitions. An invoice whose payment
+        // went missing on the last poll (reconciliation dropped the row) is
+        // kept in the set by its additional_status so the second look happens.
         $rows = Database::fetchAll(
             "SELECT id FROM invoices
               WHERE onchain_address IS NOT NULL
-                AND status IN ('New', 'Processing')
-                AND (onchain_last_polled_at IS NULL
-                     OR ((long_lived = 0 OR status = 'Processing' OR created_at > ?) AND onchain_last_polled_at <= ?)
-                     OR (long_lived = 1 AND status = 'New' AND created_at <= ? AND created_at > ? AND onchain_last_polled_at <= ?)
-                     OR (long_lived = 1 AND status = 'New' AND created_at <= ? AND onchain_last_polled_at <= ?))
+                AND (
+                  (status IN ('New', 'Processing')
+                    AND (onchain_last_polled_at IS NULL
+                         OR ((long_lived = 0 OR status = 'Processing' OR created_at > ?) AND onchain_last_polled_at <= ?)
+                         OR (long_lived = 1 AND status = 'New' AND created_at <= ? AND created_at > ? AND onchain_last_polled_at <= ?)
+                         OR (long_lived = 1 AND status = 'New' AND created_at <= ? AND onchain_last_polled_at <= ?)))
+                  OR (status = 'Settled' AND settled_rail = 'onchain'
+                      AND paid_at IS NOT NULL AND paid_at >= ?
+                      AND (onchain_last_polled_at IS NULL OR onchain_last_polled_at <= ?)
+                      AND (additional_status = ?
+                           OR EXISTS (SELECT 1 FROM onchain_payments op
+                                       WHERE op.invoice_id = invoices.id AND op.confirmations < 1)))
+                )
               ORDER BY onchain_last_polled_at ASC NULLS FIRST
               LIMIT ?",
             [
                 $dayAgo, $cutoff,
                 $dayAgo, $weekAgo, $now - self::LONG_LIVED_POLL_SEC_WEEK,
                 $weekAgo, $now - self::LONG_LIVED_POLL_SEC_OLD,
+                $now - self::ZERO_CONF_WATCH_SEC, $cutoff, self::ZERO_CONF_MISSING_STATUS,
                 $batchLimit,
             ]
         );
@@ -923,6 +971,55 @@ class OnchainPayments {
         }
         $status = $invoice['status'];
         $fired = null;
+
+        // Zero-conf watch: an invoice settled on a mempool-only payment whose
+        // payment has since vanished (replaced by a conflicting spend, or
+        // evicted) no longer has the funds it was settled on. Flip it to
+        // Invalid — the merchant has to know before shipping — and fire
+        // InvoiceInvalid so the shop reverses the order. Only reachable from
+        // pollPending's watch branch / a direct poll of a Settled invoice;
+        // a payment that merely confirmed leaves the watch set untouched.
+        if ($status === 'Settled') {
+            $missing = $amount > 0 && $totalConfirmed < $amount;
+            $wasMissing = ($invoice['additional_status'] ?? null) === self::ZERO_CONF_MISSING_STATUS;
+            if ($missing && !$wasMissing) {
+                // First miss: remember it, stay Settled, look again next poll.
+                Database::query(
+                    "UPDATE invoices SET additional_status = ? WHERE id = ? AND status = 'Settled'",
+                    [self::ZERO_CONF_MISSING_STATUS, $invoice['id']]
+                );
+                error_log(sprintf(
+                    'on-chain %s: zero-conf payment missing from the provider view (%d sat confirmed of %d); '
+                    . 'will reverse the settlement if it is still missing on the next poll',
+                    $invoice['id'], $totalConfirmed, $amount
+                ));
+                return ['status' => $status, 'fired' => null];
+            }
+            if ($missing && $wasMissing) {
+                require_once __DIR__ . '/../invoice.php';
+                require_once __DIR__ . '/../admin_log.php';
+                $flipped = Invoice::updateStatus($invoice['id'], 'Invalid', null, null, ['Settled']);
+                if ($flipped) {
+                    $msg = sprintf(
+                        'zero-conf payment reversed: %d sat confirmed of %d after settlement; the funding transaction '
+                        . 'disappeared from the mempool (replaced or double-spent). Invoice marked Invalid.',
+                        $totalConfirmed, $amount
+                    );
+                    error_log("on-chain {$invoice['id']}: {$msg}");
+                    AdminLog::log('onchain', 'zero_conf_reversed', $invoice['store_id'], $invoice['id'],
+                        $invoice['onchain_address'] ?? null, $msg);
+                    return ['status' => 'Invalid', 'fired' => 'InvoiceInvalid'];
+                }
+            }
+            if (!$missing && $wasMissing) {
+                // The payment is back (provider hiccup): clear the strike.
+                Database::query(
+                    "UPDATE invoices SET additional_status = NULL WHERE id = ? AND status = 'Settled' AND additional_status = ?",
+                    [$invoice['id'], self::ZERO_CONF_MISSING_STATUS]
+                );
+            }
+            return ['status' => $status, 'fired' => null];
+        }
 
         // First mempool sighting flips New -> Processing and starts TTCW.
         if ($status === 'New' && $anyObservation) {

@@ -28,9 +28,36 @@ if (!Database::isInitialized() || !Config::isSetupComplete()) {
 
 // Get invoice ID
 $invoiceId = $_GET['id'] ?? '';
-if (empty($invoiceId)) {
+if (empty($invoiceId) || !is_string($invoiceId)) {
     cashupay_status(400);
     echo 'Invoice ID required';
+    exit;
+}
+
+// Rate-limit this anonymous page per client address. Every GET (the HTML
+// view and the 2 s JSON poll) runs pollSingleQuote — a mint quote check, an
+// LNURL verify or an Esplora scan — and the POST actions do real work too
+// (the noffer receipt verifies a Schnorr signature + ECDH, ~1 s of BCMath on
+// GMP-less hosts). Unthrottled, one client could amplify its requests 1:1
+// onto the mint / chain provider and pin the worker pool. The GET budget is
+// generous (one buyer polls ~30/min; several buyers may share a NAT); POSTs
+// are rarer and dearer. Overridable for tests and unusual deployments via
+// CASHUPAY_PAYMENT_RATE_LIMIT / CASHUPAY_PAYMENT_POST_RATE_LIMIT.
+$paymentIsPost = ($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'POST';
+$paymentRateLimit = (int)(getenv($paymentIsPost ? 'CASHUPAY_PAYMENT_POST_RATE_LIMIT' : 'CASHUPAY_PAYMENT_RATE_LIMIT') ?: 0);
+if ($paymentRateLimit <= 0) {
+    $paymentRateLimit = $paymentIsPost ? 30 : 240;
+}
+if (!Security::checkRateLimit($paymentIsPost ? 'payment_post' : 'payment_view', Security::getClientIp(), $paymentRateLimit)) {
+    cashupay_status(429);
+    header('Retry-After: 60');
+    if ($paymentIsPost || isset($_GET['json'])) {
+        header('Content-Type: application/json');
+        echo json_encode(['error' => 'Too many requests. Please wait a minute and try again.']);
+    } else {
+        header('Content-Type: text/plain; charset=UTF-8');
+        echo 'Too many requests. Please wait a minute and try again.';
+    }
     exit;
 }
 
@@ -2391,6 +2418,13 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                 pollUrl.searchParams.set('id', invoiceId);
                 pollUrl.searchParams.set('json', '1');
                 const response = await fetch(pollUrl.toString());
+                if (!response.ok) {
+                    // Rate-limited or a transient server error: keep the
+                    // current screen and back off rather than feeding an
+                    // error body into updateUI.
+                    setTimeout(pollStatus, response.status === 429 ? 10000 : 5000);
+                    return;
+                }
                 const data = await response.json();
 
                 // Populate the explorer link as soon as the poll knows the

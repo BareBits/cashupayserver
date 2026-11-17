@@ -101,9 +101,17 @@ function handleGetStore(array $auth, array $params, array $body): void {
 
 /**
  * Delete a store
+ *
+ * Server-wide (wildcard) keys only, like creating one: deletion cascades to
+ * the store's invoices, melts, webhooks, API keys and wallet seed, so a
+ * store-bound integration key must never be able to wipe its own store.
+ * Operators delete stores from the admin UI.
  */
 function handleDeleteStore(array $auth, array $params, array $body): void {
     $storeId = $params['storeId'];
+    if (!Auth::hasPermission($auth, '*')) {
+        errorResponse('unauthorized', 'Insufficient permissions', 403);
+    }
     requireStoreAccess($auth, $storeId);
 
     $store = Database::fetchOne(

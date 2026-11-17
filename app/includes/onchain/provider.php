@@ -21,7 +21,19 @@ final class OnchainTxObservation {
         public readonly int $amountSat,
         public readonly int $confirmations,
         public readonly ?int $blockHeight,
+        /**
+         * Does the transaction signal BIP-125 replace-by-fee (any input
+         * sequence < 0xfffffffe; bitcoind's bip125-replaceable=yes)? Only
+         * meaningful while unconfirmed: a zero-conf store must not settle on
+         * a payment its sender has pre-announced they may replace.
+         */
+        public readonly bool $replaceable = false,
     ) {}
+
+    /** Is $v a transaction id as the chain spells it: exactly 64 hex characters? */
+    public static function isTxid(mixed $v): bool {
+        return is_string($v) && strlen($v) === 64 && ctype_xdigit($v);
+    }
 }
 
 interface BlockchainProvider {
@@ -347,23 +359,41 @@ final class EsploraProvider implements BlockchainProvider {
                     }
                 }
                 $confs = ($confirmed && $blockHeight !== null) ? max(0, $tip - $blockHeight + 1) : 0;
-                foreach ($tx['vout'] ?? [] as $voutIdx => $vout) {
-                    if (($vout['scriptpubkey_address'] ?? null) !== $address) {
+                // The txid is persisted and later rendered in the admin UI
+                // and the payment page's explorer link: accept only the
+                // 64-hex shape a real txid has. Anything else from a buggy
+                // or hostile provider is dropped (and the page is still
+                // walked), never stored.
+                $txid = $tx['txid'] ?? null;
+                if (!OnchainTxObservation::isTxid($txid)) {
+                    error_log(sprintf(
+                        'EsploraProvider::addressTransactions(%s): skipping tx with malformed txid %s',
+                        $address, var_export($txid, true)
+                    ));
+                    continue;
+                }
+                $vouts = $tx['vout'] ?? [];
+                if (!is_array($vouts)) {
+                    continue;
+                }
+                $replaceable = self::signalsRbf($tx['vin'] ?? null);
+                foreach ($vouts as $voutIdx => $vout) {
+                    if (!is_int($voutIdx) || !is_array($vout)
+                            || ($vout['scriptpubkey_address'] ?? null) !== $address) {
                         continue;
                     }
                     $out[] = new OnchainTxObservation(
-                        txid: $tx['txid'],
+                        txid: $txid,
                         vout: $voutIdx,
                         // Floor at 0: a negative value would corrupt the
                         // received-amount / underpayment math downstream.
                         amountSat: max(0, (int)($vout['value'] ?? 0)),
                         confirmations: $confs,
                         blockHeight: $blockHeight,
+                        replaceable: $replaceable,
                     );
                 }
-                if (isset($tx['txid'])) {
-                    $lastSeenTxid = $tx['txid'];
-                }
+                $lastSeenTxid = $txid;
             }
 
             // Fewer than a full confirmed page => no more chain history.
@@ -379,6 +409,31 @@ final class EsploraProvider implements BlockchainProvider {
             }
         }
         return $out;
+    }
+
+    /**
+     * BIP-125: a transaction is replaceable when any input's nSequence is
+     * below 0xfffffffe. Esplora returns vin[].sequence as an integer; a
+     * missing or malformed vin is treated as replaceable (unknown = unsafe
+     * for zero-conf, the only consumer of this flag).
+     */
+    private static function signalsRbf(mixed $vin): bool {
+        if (!is_array($vin) || $vin === []) {
+            return true;
+        }
+        foreach ($vin as $in) {
+            if (!is_array($in)) {
+                return true;
+            }
+            $seq = $in['sequence'] ?? null;
+            if (!is_int($seq) && !(is_float($seq) && floor($seq) === $seq)) {
+                return true;
+            }
+            if ((int)$seq < 0xfffffffe) {
+                return true;
+            }
+        }
+        return false;
     }
 
     public function currentTipHeight(): int {
@@ -506,7 +561,14 @@ final class BitcoindRpcProvider implements BlockchainProvider {
                 continue;
             }
             $txids = $entry['txids'] ?? [];
+            if (!is_array($txids)) {
+                continue;
+            }
             foreach ($txids as $txid) {
+                if (!OnchainTxObservation::isTxid($txid)) {
+                    error_log("BitcoindRpcProvider::addressTransactions({$address}): skipping malformed txid " . var_export($txid, true));
+                    continue;
+                }
                 $tx = $this->rpc('gettransaction', [$txid, true]);
                 $details = $tx['details'] ?? [];
                 $blockHeight = $tx['blockheight'] ?? null;
@@ -515,6 +577,10 @@ final class BitcoindRpcProvider implements BlockchainProvider {
                     // Negative confirmations mean the tx was double-spent / reorged out.
                     continue;
                 }
+                // gettransaction reports BIP-125 signalling as yes/no/unknown
+                // for an unconfirmed tx. Anything but an explicit "no" counts
+                // as replaceable (see OnchainTxObservation::$replaceable).
+                $replaceable = $confs === 0 && (($tx['bip125-replaceable'] ?? 'unknown') !== 'no');
                 foreach ($details as $d) {
                     if (($d['address'] ?? null) !== $address) {
                         continue;
@@ -528,6 +594,7 @@ final class BitcoindRpcProvider implements BlockchainProvider {
                         amountSat: (int)round(((float)$d['amount']) * 100_000_000),
                         confirmations: $confs,
                         blockHeight: $confs > 0 ? $blockHeight : null,
+                        replaceable: $replaceable,
                     );
                 }
             }

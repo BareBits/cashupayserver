@@ -33,6 +33,10 @@ class Security {
      * rather than silently allowing everything on an unwritable data dir.
      */
     public static function checkRateLimit(string $action, string $identifier, int $maxAttempts = 60): bool {
+        // IPv6 clients hold a whole /64: fold the identifier the same way the
+        // login lockout does, or one address per request hands an attacker
+        // 2^64 fresh budgets (and 2^64 fresh lock files, see withLock).
+        $identifier = self::foldIpIdentifier($identifier);
         $key = "rate_{$action}_{$identifier}";
         try {
             $data = self::withLock($key, function () use ($key): array {
@@ -180,6 +184,16 @@ class Security {
      * names, opaque tokens) are keyed verbatim.
      */
     public static function lockoutKey(string $identifier): string {
+        return 'login_attempts_' . self::foldIpIdentifier($identifier);
+    }
+
+    /**
+     * Fold an IPv6 identifier to its /64 (an IPv6 client usually holds the
+     * whole prefix); IPv4, IPv4-mapped IPv6 and non-IP identifiers (user
+     * names, opaque tokens) are returned verbatim. Shared by the login
+     * lockout and every per-IP rate limit so both key on the same client.
+     */
+    public static function foldIpIdentifier(string $identifier): string {
         $ip = trim($identifier, " \t[]");
         if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6)) {
             $bin = @inet_pton($ip);
@@ -188,13 +202,12 @@ class Security {
                 // the embedded address so the /64 aggregation does not fold the
                 // whole mapped range together.
                 if (substr($bin, 0, 12) === str_repeat("\0", 10) . "\xff\xff") {
-                    $identifier = (string)inet_ntop(substr($bin, 12));
-                } else {
-                    $identifier = inet_ntop(substr($bin, 0, 8) . str_repeat("\0", 8)) . '/64';
+                    return (string)inet_ntop(substr($bin, 12));
                 }
+                return inet_ntop(substr($bin, 0, 8) . str_repeat("\0", 8)) . '/64';
             }
         }
-        return "login_attempts_{$identifier}";
+        return $identifier;
     }
 
     /** Cache key of the address-independent sign-in budget. */
@@ -227,6 +240,13 @@ class Security {
             if (!flock($fh, LOCK_EX)) {
                 throw new \RuntimeException("cannot lock {$lockFile}");
             }
+            // fopen('c') never updates mtime, so stamp the file on every
+            // acquisition: cleanCache() sweeps lock files idle for longer
+            // than LOCK_SWEEP_AGE by mtime. Without the sweep every client
+            // address that ever hit a rate-limited endpoint left one inode
+            // behind forever (an unauthenticated inode-fill on shared hosts,
+            // after which every limiter fails closed).
+            @touch($lockFile);
             try {
                 return $fn();
             } finally {
@@ -550,7 +570,15 @@ class Security {
     }
 
     /**
-     * Clean expired cache files
+     * A lock file untouched for this long is swept by cleanCache(). Longer
+     * than any counter window (RATE_LIMIT_WINDOW, LOCKOUT_DURATION) so a
+     * live counter's lock is never removed from under it; a process that
+     * does race the sweep merely loses one count on that key.
+     */
+    public const LOCK_SWEEP_AGE = 3600;
+
+    /**
+     * Clean expired cache files and idle lock files.
      */
     public static function cleanCache(): void {
         try {
@@ -567,6 +595,16 @@ class Security {
             $decoded = json_decode($data, true);
 
             if ($decoded === null || !isset($decoded['expires']) || $decoded['expires'] < time()) {
+                @unlink($file);
+            }
+        }
+
+        // Lock files are one per rate-limited identifier (client address)
+        // and are only ever created, so sweep the idle ones (see withLock).
+        $cutoff = time() - self::LOCK_SWEEP_AGE;
+        foreach (glob($dir . '/*.lock') as $file) {
+            $mtime = @filemtime($file);
+            if ($mtime !== false && $mtime < $cutoff) {
                 @unlink($file);
             }
         }

@@ -215,6 +215,19 @@ function requireStoreAccess(array $auth, string $storeId): void {
 }
 
 /**
+ * Permission guard: 403 unless the key holds $permission (directly, by
+ * BTCPay's implication hierarchy, or via the legacy wildcard). Keys only
+ * ever carry the permissions the admin or the pairing flow granted them,
+ * so every endpoint names what it needs — a key paired for creating
+ * invoices cannot edit webhooks or mark invoices settled.
+ */
+function requireApiPermission(array $auth, string $permission): void {
+    if (!Auth::hasPermission($auth, $permission)) {
+        errorResponse('unauthorized', 'Insufficient permissions', 403);
+    }
+}
+
+/**
  * Server info endpoint (no auth required)
  */
 function handleServerInfo(): void {

@@ -290,3 +290,74 @@ def test_address_uniqueness_across_invoices(
         addr = inv["checkout"]["paymentMethods"]["BTC-OnChain"]["destination"]
         assert addr not in seen, f"duplicate address {addr}"
         seen.add(addr)
+
+
+def test_rbf_payment_waits_for_confirmation_at_zero_conf(
+    shared_configured: ConfiguredPayserver,
+    onchain: OnchainContext,
+) -> None:
+    """min_confs=0 + a payment that signals replace-by-fee: detected
+    (Processing) but NOT settled while unconfirmed — the sender could still
+    replace it — and settled once it is mined."""
+    _wire_onchain(shared_configured, onchain, min_confs=0)
+    inv = shared_configured.greenfield.create_invoice(
+        shared_configured.store_id, amount=str(INVOICE_AMOUNT_SAT), currency="sat"
+    )
+    addr = inv["checkout"]["paymentMethods"]["BTC-OnChain"]["destination"]
+    onchain.fund_address(addr, INVOICE_AMOUNT_SAT, replaceable=True)
+
+    processing = _poll_until(shared_configured, inv["id"], "Processing", timeout_s=20)
+    assert processing["status"] == "Processing"
+    # A few more cron passes: still not settled while the RBF tx sits in the mempool.
+    for _ in range(3):
+        shared_configured.handle.trigger_cron()
+        time.sleep(0.5)
+    still = shared_configured.greenfield.get_invoice(shared_configured.store_id, inv["id"])
+    assert still["status"] == "Processing", still
+
+    onchain.confirm(1)
+    settled = _poll_until(shared_configured, inv["id"], "Settled", timeout_s=20)
+    assert settled["status"] == "Settled"
+
+
+def test_zero_conf_settlement_stays_watched_until_confirmed(
+    shared_configured: ConfiguredPayserver,
+    onchain: OnchainContext,
+) -> None:
+    """An invoice settled at zero-conf is re-polled by cron while its payment
+    is unconfirmed (the post-settlement watch) and stays Settled once the
+    payment confirms; the watch then ends."""
+    _wire_onchain(shared_configured, onchain, min_confs=0)
+    inv = shared_configured.greenfield.create_invoice(
+        shared_configured.store_id, amount=str(INVOICE_AMOUNT_SAT), currency="sat"
+    )
+    addr = inv["checkout"]["paymentMethods"]["BTC-OnChain"]["destination"]
+    onchain.fund_address(addr, INVOICE_AMOUNT_SAT)
+    settled = _poll_until(shared_configured, inv["id"], "Settled", timeout_s=20)
+    assert settled["status"] == "Settled"
+
+    def _row():
+        with shared_configured.handle.db() as conn:
+            return conn.execute(
+                "SELECT status, onchain_last_polled_at FROM invoices WHERE id = ?", (inv["id"],)
+            ).fetchone()
+
+    # Clear the throttle stamp: the next cron pass must pick the Settled
+    # invoice up because its payment has no confirmation yet.
+    with shared_configured.handle.db() as conn:
+        conn.execute("UPDATE invoices SET onchain_last_polled_at = NULL WHERE id = ?", (inv["id"],))
+    shared_configured.handle.trigger_cron()
+    row = _row()
+    assert row["status"] == "Settled"
+    assert row["onchain_last_polled_at"] is not None, "settled zero-conf invoice was re-polled by the watch"
+
+    onchain.confirm(1)
+    with shared_configured.handle.db() as conn:
+        conn.execute("UPDATE invoices SET onchain_last_polled_at = NULL WHERE id = ?", (inv["id"],))
+    shared_configured.handle.trigger_cron()  # refreshes confirmations to 1
+    with shared_configured.handle.db() as conn:
+        conn.execute("UPDATE invoices SET onchain_last_polled_at = NULL WHERE id = ?", (inv["id"],))
+    shared_configured.handle.trigger_cron()
+    row = _row()
+    assert row["status"] == "Settled"
+    assert row["onchain_last_polled_at"] is None, "once confirmed the invoice leaves the watch set"

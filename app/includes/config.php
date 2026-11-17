@@ -226,7 +226,17 @@ class Config {
             return rtrim($baseUrl, '/');
         }
 
-        // Auto-detect
+        return self::detectRequestBaseUrl();
+    }
+
+    /**
+     * The base URL as the CURRENT request spells it: scheme + Host header +
+     * script directory. The Host header is client-controlled, so this is
+     * only safe for links handed back to the same client (the payment page
+     * a buyer just opened); never put it in anything sent elsewhere — use
+     * getTrustedBaseUrl() for that.
+     */
+    public static function detectRequestBaseUrl(): string {
         $protocol = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
         $host = $_SERVER['HTTP_HOST'] ?? 'localhost';
         // dirname() uses '\' separators on Windows ('/router.php' -> '\').
@@ -236,6 +246,49 @@ class Config {
         $path = str_replace('\\', '/', dirname($_SERVER['SCRIPT_NAME'] ?? ''));
 
         return rtrim($protocol . '://' . $host . $path, '/');
+    }
+
+    /**
+     * A base URL nobody but the operator could have chosen, for links that
+     * leave the request (the e-mailed password-reset link): the deployment
+     * pin, the configured base_url, else the URL the admin last signed in
+     * from (recordAdminBaseUrl). null when none of those exist yet — the
+     * caller must then do without an absolute link rather than fall back
+     * to the Host header, which an anonymous reset request can forge to
+     * point the operator's genuine reset mail at an attacker's host.
+     */
+    public static function getTrustedBaseUrl(): ?string {
+        if (defined('CASHUPAY_BASE_URL') && CASHUPAY_BASE_URL !== '') {
+            return rtrim((string)CASHUPAY_BASE_URL, '/');
+        }
+        $baseUrl = self::get('base_url');
+        if (is_string($baseUrl) && $baseUrl !== '') {
+            return rtrim($baseUrl, '/');
+        }
+        $seen = self::get('admin_base_url');
+        if (is_string($seen) && preg_match('#^https?://#i', $seen)) {
+            return rtrim($seen, '/');
+        }
+        return null;
+    }
+
+    /**
+     * Remember the URL the admin is using right now (called on every
+     * successful admin sign-in and when the wizard sets the admin
+     * password). Only a request that proved the admin credential gets to
+     * write it, which is what makes it trustworthy for getTrustedBaseUrl().
+     */
+    public static function recordAdminBaseUrl(): void {
+        if (empty($_SERVER['HTTP_HOST'])) {
+            return; // not an HTTP request (cron/CLI): nothing to record
+        }
+        $url = self::detectRequestBaseUrl();
+        if (!preg_match('#^https?://#i', $url)) {
+            return;
+        }
+        if (self::get('admin_base_url') !== $url) {
+            self::set('admin_base_url', $url);
+        }
     }
 
     /**

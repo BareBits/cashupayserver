@@ -130,12 +130,19 @@ class MockEsplora:
         """The URL an operator should enter: base + api prefix (if any)."""
         return self.url + (self.api_prefix or "")
 
-    def pay(self, address: str, amount_sat: int, txid: str, height: int | None) -> None:
-        """Record a payment to `address`. height=None -> unconfirmed (mempool)."""
+    def pay(
+        self, address: str, amount_sat: int, txid: str, height: int | None, *, replaceable: bool = False
+    ) -> None:
+        """Record a payment to `address`. height=None -> unconfirmed (mempool).
+
+        The tx carries one input whose nSequence encodes BIP-125 signalling:
+        0xfffffffe (final, non-RBF) by default, 0xfffffffd when `replaceable`.
+        A zero-conf store refuses to settle on an unconfirmed RBF payment."""
         status = {"confirmed": True, "block_height": height} if height is not None else {"confirmed": False}
         self.txs.setdefault(address, []).append({
             "txid": txid,
             "status": status,
+            "vin": [{"txid": "f" * 64, "vout": 0, "sequence": 0xFFFFFFFD if replaceable else 0xFFFFFFFE}],
             "vout": [{"scriptpubkey_address": address, "value": amount_sat}],
         })
 

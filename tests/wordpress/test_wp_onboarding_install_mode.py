@@ -18,6 +18,7 @@ Needs the mint fixtures (the wizard's mints screen talks to a live mint).
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 
@@ -191,7 +192,26 @@ def test_install_mode_end_to_end(wordpress_install_mode, mint, backup_mint) -> N
 
     assert wp_option(wp, "btcpay_gf_url") == wp.barebits_gateway_url
     assert wp_option(wp, "btcpay_gf_store_id") == store_id
-    assert wp_option(wp, "btcpay_gf_api_key") == internal_key["internal_api_key"]
+    # The gateway holds a dedicated store-scoped key minted by provision.php
+    # with the default store permission set (invoices + webhooks) — never the
+    # dashboard's internal key, which stays create-only because the limited
+    # user role is handed it for Request Payment.
+    paired_key = wp_option(wp, "btcpay_gf_api_key")
+    assert paired_key and paired_key != internal_key["internal_api_key"]
+    with wp.db() as db:
+        key_row = db.execute(
+            "SELECT store_id, application_identifier, permissions FROM api_keys WHERE key_hash = ?",
+            (hashlib.sha256(paired_key.encode()).hexdigest(),),
+        ).fetchone()
+    assert key_row is not None and key_row["store_id"] == store_id
+    assert key_row["application_identifier"] == "cashupay-provision"
+    assert set(json.loads(key_row["permissions"])) == {
+        "btcpay.store.canviewinvoices",
+        "btcpay.store.cancreateinvoice",
+        "btcpay.store.canmodifyinvoices",
+        "btcpay.store.canviewstoresettings",
+        "btcpay.store.webhooks.canmodifywebhooks",
+    }
 
     # Webhook registered over the Greenfield API, secret shared with the
     # gateway plugin's option.
@@ -289,7 +309,7 @@ def test_install_mode_end_to_end(wordpress_install_mode, mint, backup_mint) -> N
     invoice = requests.post(
         f"{wp.barebits_url}/api/v1/stores/{store_id}/invoices",
         json={"amount": "21", "currency": "SATS"},
-        headers={"Authorization": f"token {internal_key['internal_api_key']}"},
+        headers={"Authorization": f"token {paired_key}"},
         timeout=60,
     )
     assert invoice.status_code == 200, invoice.text[:300]
@@ -315,7 +335,7 @@ def test_install_mode_end_to_end(wordpress_install_mode, mint, backup_mint) -> N
     order_invoice = requests.post(
         f"{wp.barebits_url}/api/v1/stores/{store_id}/invoices",
         json={"amount": "21", "currency": "SATS", "metadata": {"orderId": "4242"}},
-        headers={"Authorization": f"token {internal_key['internal_api_key']}"},
+        headers={"Authorization": f"token {paired_key}"},
         timeout=60,
     ).json()
     order_page = requests.get(
