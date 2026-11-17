@@ -593,11 +593,21 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
             text-align: center;
         }
 
+        /* "powered by" + logo travel as one flex item, so a long store name
+           that wraps pushes the PAIR onto the next row instead of stranding
+           "powered by" at the end of the name's row with the logo alone
+           beneath it. */
+        .powered-by-group {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.35rem;
+            flex: none;
+        }
+
         .powered-by {
             font-size: 0.75rem;
             color: var(--text-secondary);
             opacity: 0.8;
-            margin-left: 0.25rem;
         }
 
         .amount {
@@ -1287,8 +1297,7 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
         <div class="payment-card">
             <div class="merchant-header">
                 <span class="merchant-name"><?= htmlspecialchars($storeName) ?></span>
-                <span class="powered-by">powered by</span>
-                <img class="logo" src="<?= htmlspecialchars(Urls::assets('img/barebits-logo.svg')) ?>" alt="BareBits">
+                <span class="powered-by-group"><span class="powered-by">powered by</span><img class="logo" src="<?= htmlspecialchars(Urls::assets('img/barebits-logo.svg')) ?>" alt="BareBits"></span>
             </div>
 
             <?php
