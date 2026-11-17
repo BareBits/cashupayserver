@@ -41,20 +41,99 @@ class Auth {
         }
     }
 
+    /** Per-request cache of the validated session user (see validateSessionUser). */
+    private static ?array $sessionUser = null;
+    private static bool $sessionChecked = false;
+
     /**
      * Check if a user is logged in (any role).
+     *
+     * A session is only as alive as the credential it was minted with: the
+     * user row must still exist and its password hash must still match the
+     * fingerprint stamped at sign-in. Deleting a user or resetting a password
+     * (admin reset, e-mailed token, file reset) therefore ends every other
+     * session of that account on its next request, instead of leaving the
+     * old cookie usable until the browser is closed.
      */
     public static function isLoggedIn(): bool {
         self::initSession();
-        return !empty($_SESSION['user_id']);
+        if (empty($_SESSION['user_id'])) {
+            return false;
+        }
+        return self::validateSessionUser() !== null;
     }
 
     /**
-     * Check if the current session is an admin.
+     * Check if the current session is an admin. The role is read from the
+     * users table on every request (not from the cookie), so a demotion or
+     * deletion takes effect immediately.
      */
     public static function isAdmin(): bool {
+        if (!self::isLoggedIn()) {
+            return false;
+        }
+        return (self::validateSessionUser()['role'] ?? null) === self::ROLE_ADMIN;
+    }
+
+    /**
+     * Fingerprint of the credential a session was established with. Stored
+     * in the session (never the hash itself) and compared on every request.
+     */
+    public static function credentialFingerprint(string $passwordHash): string {
+        return hash('sha256', 'cashupay-session:' . $passwordHash);
+    }
+
+    /**
+     * Start an authenticated session for $user (a full users row, including
+     * password_hash). Rotates the session id and records the admin's own
+     * base URL for the password-reset e-mail (Config::recordAdminBaseUrl).
+     */
+    public static function establishSession(array $user): void {
         self::initSession();
-        return ($_SESSION['user_role'] ?? null) === self::ROLE_ADMIN;
+        $_SESSION['user_id']    = $user['id'];
+        $_SESSION['user_role']  = $user['role'];
+        $_SESSION['login_time'] = time();
+        $_SESSION['auth_fp']    = self::credentialFingerprint((string)($user['password_hash'] ?? ''));
+        self::$sessionChecked = false;
+        self::$sessionUser = null;
+        session_regenerate_id(true);
+        if (($user['role'] ?? null) === self::ROLE_ADMIN) {
+            Config::recordAdminBaseUrl();
+        }
+    }
+
+    /**
+     * Resolve the session's user row once per request, or null (and a
+     * cleared identity) when the session no longer matches a live
+     * credential. Sessions minted before the fingerprint existed carry no
+     * auth_fp and are retired too: one re-login after the upgrade.
+     */
+    private static function validateSessionUser(): ?array {
+        if (self::$sessionChecked) {
+            return self::$sessionUser;
+        }
+        self::$sessionChecked = true;
+        self::$sessionUser = null;
+        $userId = $_SESSION['user_id'] ?? null;
+        if (!$userId) {
+            return null;
+        }
+        $row = Database::fetchOne(
+            "SELECT id, username, role, email, created_at, password_hash FROM users WHERE id = ?",
+            [$userId]
+        );
+        $fp = $_SESSION['auth_fp'] ?? null;
+        $ok = $row !== null
+            && is_string($fp)
+            && hash_equals(self::credentialFingerprint((string)$row['password_hash']), $fp);
+        if (!$ok) {
+            unset($_SESSION['user_id'], $_SESSION['user_role'], $_SESSION['login_time'], $_SESSION['auth_fp']);
+            return null;
+        }
+        $_SESSION['user_role'] = $row['role'];
+        unset($row['password_hash']);
+        self::$sessionUser = $row;
+        return $row;
     }
 
     /**
@@ -75,12 +154,10 @@ class Auth {
      * if no session. Does NOT return password_hash.
      */
     public static function currentUser(): ?array {
-        self::initSession();
-        $userId = $_SESSION['user_id'] ?? null;
-        if (!$userId) {
+        if (!self::isLoggedIn()) {
             return null;
         }
-        return self::getUserById($userId);
+        return self::validateSessionUser();
     }
 
     /**
@@ -143,12 +220,7 @@ class Auth {
 
         if ($user && password_verify($password, $user['password_hash'])) {
             error_log("CashuPayServer: Login successful for '{$username}' from {$clientIp}");
-
-            self::initSession();
-            $_SESSION['user_id']    = $user['id'];
-            $_SESSION['user_role']  = $user['role'];
-            $_SESSION['login_time'] = time();
-            session_regenerate_id(true);
+            self::establishSession($user);
             return true;
         }
 
@@ -340,12 +412,18 @@ class Auth {
         if (!self::getUserById($userId)) {
             throw new \RuntimeException('User not found');
         }
+        $hash = password_hash($newPassword, PASSWORD_DEFAULT);
         Database::update(
             'users',
-            ['password_hash' => password_hash($newPassword, PASSWORD_DEFAULT)],
+            ['password_hash' => $hash],
             'id = ?',
             [$userId]
         );
+        // Every other session of this account dies with the old hash (see
+        // validateSessionUser); the session that made the change keeps going.
+        if (session_status() === PHP_SESSION_ACTIVE && ($_SESSION['user_id'] ?? null) === $userId) {
+            $_SESSION['auth_fp'] = self::credentialFingerprint($hash);
+        }
     }
 
     // =========================================================================
@@ -674,26 +752,83 @@ class Auth {
         ];
     }
 
+    // Greenfield permission strings the API understands. '*' is the
+    // server-wide wildcard: it crosses store boundaries, so it is never
+    // granted to a new key (admin-created keys are store-scoped, pairing
+    // refuses it); keys that already hold it keep working.
+    public const PERM_VIEW_INVOICES   = 'btcpay.store.canviewinvoices';
+    public const PERM_CREATE_INVOICE  = 'btcpay.store.cancreateinvoice';
+    public const PERM_MODIFY_INVOICES = 'btcpay.store.canmodifyinvoices';
+    public const PERM_VIEW_STORE      = 'btcpay.store.canviewstoresettings';
+    public const PERM_MODIFY_STORE    = 'btcpay.store.canmodifystoresettings';
+    public const PERM_MODIFY_WEBHOOKS = 'btcpay.store.webhooks.canmodifywebhooks';
+
+    public const KNOWN_PERMISSIONS = [
+        self::PERM_VIEW_INVOICES, self::PERM_CREATE_INVOICE, self::PERM_MODIFY_INVOICES,
+        self::PERM_VIEW_STORE, self::PERM_MODIFY_STORE, self::PERM_MODIFY_WEBHOOKS,
+    ];
+
     /**
-     * Check if API key has specific permission
+     * What a key created from the admin UI gets: everything a store
+     * integration (the WooCommerce gateway) needs on ITS store, explicitly.
+     * No wildcard — the key cannot list, create or delete other stores.
+     */
+    public const DEFAULT_STORE_KEY_PERMISSIONS = [
+        self::PERM_VIEW_INVOICES, self::PERM_CREATE_INVOICE, self::PERM_MODIFY_INVOICES,
+        self::PERM_VIEW_STORE, self::PERM_MODIFY_WEBHOOKS,
+    ];
+
+    /**
+     * BTCPay's permission hierarchy: a broader permission implies the
+     * narrower ones, so a key paired with canmodifyinvoices alone can still
+     * read invoices (BTCPay clients rely on that).
+     */
+    private const PERMISSION_IMPLIES = [
+        self::PERM_MODIFY_STORE => [
+            self::PERM_VIEW_STORE, self::PERM_MODIFY_INVOICES, self::PERM_CREATE_INVOICE,
+            self::PERM_VIEW_INVOICES, self::PERM_MODIFY_WEBHOOKS,
+        ],
+        self::PERM_MODIFY_INVOICES => [self::PERM_CREATE_INVOICE, self::PERM_VIEW_INVOICES],
+        self::PERM_CREATE_INVOICE  => [self::PERM_VIEW_INVOICES],
+    ];
+
+    /**
+     * Check if API key has specific permission (directly, by implication,
+     * or through the legacy wildcard).
      */
     public static function hasPermission(array $authData, string $permission): bool {
+        $granted = $authData['permissions'] ?? [];
+        if (!is_array($granted)) {
+            return false;
+        }
         // Check for wildcard permission
-        if (in_array('*', $authData['permissions'])) {
+        if (in_array('*', $granted, true)) {
             return true;
         }
+        if (in_array($permission, $granted, true)) {
+            return true;
+        }
+        foreach ($granted as $g) {
+            if (is_string($g) && in_array($permission, self::PERMISSION_IMPLIES[$g] ?? [], true)) {
+                return true;
+            }
+        }
+        return false;
+    }
 
-        // Check for specific permission
-        return in_array($permission, $authData['permissions']);
+    /** Is $permission a string the API knows how to enforce? ('*' is not grantable.) */
+    public static function isKnownPermission(mixed $permission): bool {
+        return is_string($permission) && in_array($permission, self::KNOWN_PERMISSIONS, true);
     }
 
     /**
-     * Create a new API key
+     * Create a new API key. Store-scoped with the explicit default set
+     * unless the caller (pairing) supplies the permissions it was asked for.
      */
     public static function createApiKey(
         string $storeId,
         string $label = '',
-        array $permissions = ['*'],
+        array $permissions = self::DEFAULT_STORE_KEY_PERMISSIONS,
         ?string $applicationIdentifier = null,
         ?string $redirectHost = null
     ): array {
@@ -789,6 +924,11 @@ class Auth {
      * Internal API keys are used for admin dashboard features that need
      * to use the Greenfield API (like the Request button). They are stored
      * in the stores table and have a corresponding hash in api_keys.
+     *
+     * The key is create-only (PERM_CREATE_INVOICE): the dashboard payload
+     * hands it to the limited user role as well, so it must not open
+     * invoice listing or webhook management. Integrations get their own
+     * key (api-keys/authorize.php pairing, provision.php).
      */
     public static function getOrCreateInternalApiKey(string $storeId): ?string {
         // Check if store exists and has internal key

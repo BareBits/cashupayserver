@@ -5,14 +5,17 @@
  * An external orchestrator (the GPL WordPress companion plugin's alongside
  * install) deploys the app with only a token *hash* in user_config.php, then
  * POSTs the plaintext token here after the operator finishes the wizard and
- * collects — exactly once — the store id, internal API key, and cron key.
+ * collects — exactly once — the store id, a store-scoped API key minted for
+ * the integration, and the cron key.
  * The invariants pinned here: the endpoint is a 404 on deployments that never
  * opted in, the token is checked in constant time against the sha256 hash,
  * nothing is minted before the wizard completes ({"status":"pending"} lets
- * the installer poll), the first successful collection stamps
- * provision_consumed_at, a re-collection inside the short delivery-failure
- * grace window returns the SAME credentials without moving the stamp, and
- * every attempt after the window gets 410.
+ * the installer poll), the minted key carries the default store permission
+ * set and is NOT the dashboard's create-only internal key, the first
+ * successful collection stamps provision_consumed_at, a re-collection inside
+ * the short delivery-failure grace window re-mints the key (revoking the
+ * undelivered one) while keeping the store id, cron key and stamp, and every
+ * attempt after the window gets 410.
  *
  * provision.php echoes JSON and exits, so each scenario runs it in a
  * subprocess through a small driver that fakes the request superglobals and
@@ -23,6 +26,7 @@ declare(strict_types=1);
 require __DIR__ . '/harness.php';
 $dataDir = fresh_db();
 require_once dirname(__DIR__, 2) . '/app/includes/config.php';
+require_once dirname(__DIR__, 2) . '/app/includes/auth.php';
 
 $token = bin2hex(random_bytes(32));
 $tokenHash = hash('sha256', $token);
@@ -122,25 +126,63 @@ assert_true((bool)preg_match('/^[0-9a-f]{64}$/', $cronKey), 'cronKey is 64 hex c
 // The handed-out credentials are the persisted ones, not one-off values.
 // (Config::get is safe here: this process never read or wrote these keys, so
 // its cache cannot mask the subprocess's writes.)
+//
+// The key is a dedicated store-scoped key with the default store permission
+// set — the one the API enforces for invoices + webhooks — and never the
+// dashboard's internal key, which stays create-only because the limited user
+// role is handed it for Request Payment.
+$keyRow = Database::fetchOne(
+    "SELECT store_id, label, permissions, application_identifier FROM api_keys WHERE key_hash = ?",
+    [hash('sha256', $apiKey)]
+);
+assert_true($keyRow !== null, 'the minted key is persisted in api_keys');
+assert_eq('store_prov', $keyRow['store_id'] ?? null, 'and belongs to the handed-out store');
+assert_eq('cashupay-provision', $keyRow['application_identifier'] ?? null, 'stamped with the provisioning identifier');
+assert_eq(
+    Auth::DEFAULT_STORE_KEY_PERMISSIONS,
+    json_decode((string)$keyRow['permissions'], true),
+    'the key carries the default store permission set (invoices + webhooks)'
+);
 $storeRow = Database::fetchOne("SELECT internal_api_key FROM stores WHERE id = ?", ['store_prov']);
-assert_eq($apiKey, $storeRow['internal_api_key'] ?? null, 'apiKey matches stores.internal_api_key');
+assert_true(($storeRow['internal_api_key'] ?? null) !== $apiKey, 'the dashboard internal key is NOT what was handed out');
+$internalRow = Database::fetchOne("SELECT permissions FROM api_keys WHERE label = 'Internal (Dashboard)' AND store_id = ?", ['store_prov']);
+assert_true(
+    $internalRow === null || json_decode((string)$internalRow['permissions'], true) === [Auth::PERM_CREATE_INVOICE],
+    'the internal dashboard key (if any) stays create-only'
+);
 assert_eq($cronKey, (string)Config::get('cron_key'), 'the lazily seeded cron_key is persisted in config');
 assert_true((int)Config::get('provision_consumed_at', 0) > 0, 'provision_consumed_at is stamped');
 
-// --- 6. Re-collection inside the delivery grace: same credentials ------------
+// --- 6. Re-collection inside the delivery grace: re-minted key ---------------
 //
 // The consumed stamp records that the server SENT the response, not that the
 // installer received it; a response lost to a timeout must not orphan the
 // install. Within CASHUPAY_PROVISION_GRACE_SECONDS the same token repeats the
-// collection and gets the IDENTICAL credentials — nothing is re-minted, and
-// the original stamp is kept so polling can never extend the window.
+// collection: the store id and cron key are the same, the API key is
+// re-minted (its plaintext existed only at mint time) and the undelivered one
+// revoked so no orphan key lingers, and the original stamp is kept so
+// polling can never extend the window.
 $firstStamp = (int)Config::get('provision_consumed_at', 0);
 $res = run_provision($tokenHash, 'POST', $token);
 assert_eq(200, $res['status'], 'a re-collection inside the grace window succeeds');
 assert_eq('ready', $res['json']['status'] ?? null, 'and is a full ready answer');
-assert_eq($apiKey, $res['json']['apiKey'] ?? null, 'with the SAME apiKey — nothing re-minted');
+$secondKey = (string)($res['json']['apiKey'] ?? '');
+assert_true((bool)preg_match('/^[0-9a-f]{64}$/', $secondKey), 'the re-collection hands out a key');
+assert_true($secondKey !== $apiKey, 'the key is re-minted, not replayed');
+assert_true(
+    Database::fetchOne("SELECT 1 FROM api_keys WHERE key_hash = ?", [hash('sha256', $apiKey)]) === null,
+    'the undelivered first key is revoked'
+);
+$secondRow = Database::fetchOne("SELECT permissions FROM api_keys WHERE key_hash = ?", [hash('sha256', $secondKey)]);
+assert_eq(Auth::DEFAULT_STORE_KEY_PERMISSIONS, json_decode((string)($secondRow['permissions'] ?? ''), true), 'the re-minted key has the same permission set');
+assert_eq(
+    1,
+    (int)(Database::fetchOne("SELECT COUNT(*) AS n FROM api_keys WHERE application_identifier = 'cashupay-provision'")['n'] ?? 0),
+    'exactly one provisioned key exists after the re-collection'
+);
 assert_eq($cronKey, $res['json']['cronKey'] ?? null, 'and the SAME cronKey');
 assert_eq('store_prov', $res['json']['storeId'] ?? null, 'and the same store');
+$apiKey = $secondKey;
 // Re-read raw: this process's Config cache already holds the first stamp.
 $row = Database::fetchOne("SELECT value FROM config WHERE key = 'provision_consumed_at'");
 assert_eq($firstStamp, (int)json_decode($row['value'], true), 'the grace re-collection keeps the ORIGINAL stamp');
@@ -151,9 +193,11 @@ $res = run_provision($tokenHash, 'POST', $token);
 assert_eq(410, $res['status'], 'a collection after the grace window gets 410');
 assert_true(str_contains((string)($res['json']['error'] ?? ''), 'already'), 'and says the credentials were already collected');
 
-// The refusal must not have rotated anything: the first collection's
+// The refusal must not have rotated anything: the last collection's
 // credentials stay valid for the orchestrator that holds them.
-$storeRow = Database::fetchOne("SELECT internal_api_key FROM stores WHERE id = ?", ['store_prov']);
-assert_eq($apiKey, $storeRow['internal_api_key'] ?? null, 'the API key survives the refused retry');
+assert_true(
+    Database::fetchOne("SELECT 1 FROM api_keys WHERE key_hash = ?", [hash('sha256', $apiKey)]) !== null,
+    'the API key survives the refused retry'
+);
 
 echo "test_provision_endpoint: ok\n";

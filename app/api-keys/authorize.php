@@ -41,6 +41,24 @@ if (!empty($parsedQuery['permissions'])) {
 } elseif (!empty($_GET['permissions'])) {
     $permissions = (array)$_GET['permissions'];
 }
+// Only permissions the API enforces can be requested. The server-wide
+// wildcard and unknown strings are refused up front: a pairing request is
+// attacker-shaped data, and '*' would hand the integration every store.
+$permissions = array_values(array_unique(array_map('strval', array_filter($permissions, 'is_scalar'))));
+foreach ($permissions as $requestedPerm) {
+    if (!Auth::isKnownPermission($requestedPerm)) {
+        cashupay_status(400);
+        header('Content-Type: text/html; charset=UTF-8');
+        echo '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>Unsupported permission</title></head>'
+            . '<body style="font-family: sans-serif; max-width: 40rem; margin: 3rem auto; padding: 0 1rem;">'
+            . '<h1>Unsupported permission requested</h1>'
+            . '<p>The application asked for a permission this server does not grant: <code>'
+            . htmlspecialchars($requestedPerm, ENT_QUOTES, 'UTF-8') . '</code>.</p>'
+            . '<p>Supported: <code>' . htmlspecialchars(implode('</code>, <code>', Auth::KNOWN_PERMISSIONS), ENT_QUOTES, 'UTF-8') . '</code>.</p>'
+            . '</body></html>';
+        exit;
+    }
+}
 $applicationName = $_GET['applicationName'] ?? 'Unknown Application';
 $rawRedirect = $_GET['redirect'] ?? null;
 // Only accept http(s) URLs — $redirect is later used as a Location header,
@@ -117,12 +135,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $error = 'Invalid username or password';
         }
     } elseif ($action === 'approve' && Auth::isAdmin()) {
-        // Get selected store and permissions
+        // Get selected store and permissions. The approved set is the
+        // ticked subset of what was REQUESTED (never anything else the form
+        // might post); in strict mode the form carries every requested
+        // permission as a hidden field. Unticking everything approves
+        // nothing — it used to fall back to the full requested list.
         $selectedStoreId = $_POST['store_id'] ?? null;
-        $approvedPermissions = $_POST['approved_permissions'] ?? $permissions;
+        $posted = isset($_POST['approved_permissions']) && is_array($_POST['approved_permissions'])
+            ? array_map('strval', array_filter($_POST['approved_permissions'], 'is_scalar'))
+            : [];
+        $approvedPermissions = array_values(array_intersect($permissions, $posted));
 
         if (empty($selectedStoreId)) {
             $error = 'Please select a store';
+        } elseif (!empty($permissions) && empty($approvedPermissions)) {
+            $error = 'Select at least one permission to grant, or deny the request.';
         } else {
             $redirectHost = $redirect ? parse_url($redirect, PHP_URL_HOST) : null;
 

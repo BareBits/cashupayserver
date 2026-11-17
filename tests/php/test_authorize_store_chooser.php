@@ -23,6 +23,11 @@ declare(strict_types=1);
 require __DIR__ . '/harness.php';
 $dataDir = fresh_db();
 require_once dirname(__DIR__, 2) . '/app/includes/store_ln_addresses.php';
+// The pre-seeded session below must point at a real admin row.
+Database::insert('users', [
+    'id' => 'admin', 'username' => 'admin', 'role' => 'admin',
+    'password_hash' => password_hash('irrelevant', PASSWORD_DEFAULT), 'created_at' => time(),
+]);
 
 $root = dirname(__DIR__, 2) . '/app';
 $runner = $dataDir . '/authorize_runner.php';
@@ -43,6 +48,12 @@ ini_set('session.save_path', getenv('T_DATA_DIR'));
 session_start();
 $_SESSION['user_id'] = 'admin';
 $_SESSION['user_role'] = 'admin';
+// Sessions are bound to the live credential: stamp the fingerprint of the
+// seeded admin row's hash (Auth::credentialFingerprint).
+$pdo = new PDO('sqlite:' . getenv('T_DATA_DIR') . '/cashupay.sqlite');
+$hash = (string)$pdo->query("SELECT password_hash FROM users WHERE id = 'admin'")->fetchColumn();
+$_SESSION['auth_fp'] = hash('sha256', 'cashupay-session:' . $hash);
+unset($pdo);
 require %s;
 PHP, var_export($root . '/api-keys/authorize.php', true)));
 

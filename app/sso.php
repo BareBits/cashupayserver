@@ -93,7 +93,7 @@ if ($method === 'GET') {
     }
 
     $admin = Database::fetchOne(
-        "SELECT id, role FROM users WHERE role = 'admin' ORDER BY rowid ASC LIMIT 1"
+        "SELECT * FROM users WHERE role = 'admin' ORDER BY rowid ASC LIMIT 1"
     );
     if ($admin === null) {
         cashupay_status(403);
@@ -102,11 +102,7 @@ if ($method === 'GET') {
         exit;
     }
 
-    Auth::initSession();
-    $_SESSION['user_id'] = $admin['id'];
-    $_SESSION['user_role'] = $admin['role'];
-    $_SESSION['login_time'] = time();
-    session_regenerate_id(true);
+    Auth::establishSession($admin);
 
     header('Location: ' . Urls::admin());
     exit;

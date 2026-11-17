@@ -11,8 +11,11 @@
  * e-commerce integration:
  *
  *   - storeId  — the store the wizard created
- *   - apiKey   — the store's internal (full-permission) API key, the same one
- *                the admin UI hands to e-commerce plugins
+ *   - apiKey   — a store-scoped API key minted for the integration with the
+ *                default store permission set (invoices + webhooks, see
+ *                Auth::DEFAULT_STORE_KEY_PERMISSIONS). Never the dashboard's
+ *                internal key: that one is create-only on purpose, because the
+ *                limited user role receives it for Request Payment.
  *   - cronKey  — for driving cron.php from the orchestrator's scheduler
  *
  * Design constraints:
@@ -23,9 +26,11 @@
  *   - Single use, with a delivery-failure grace: the first successful
  *     collection stamps provision_consumed_at in config. For a short window
  *     after that stamp (CASHUPAY_PROVISION_GRACE_SECONDS) the same token may
- *     re-collect the SAME credentials — the stamp records when the server
- *     SENT the response, not that the installer received it, and a response
- *     lost to a timeout must not orphan the install forever. After the
+ *     re-collect — the stamp records when the server SENT the response, not
+ *     that the installer received it, and a response lost to a timeout must
+ *     not orphan the install forever. The store id and cron key are the same
+ *     on a re-collection; the API key is re-minted and the undelivered one
+ *     revoked, since a key's plaintext exists only at mint time. After the
  *     window every attempt gets 410. Consumption is recorded in the
  *     database rather than by rewriting user_config.php — this endpoint
  *     never modifies deployment files.
@@ -74,9 +79,12 @@ if (!Database::isInitialized() || !Config::isSetupComplete()) {
 // credentials, not that the installer received them. A response lost to a
 // timeout would otherwise orphan the install permanently (the token is
 // worthless, yet the credentials were never delivered), so the same token
-// may repeat the collection briefly; the repeat hands out the SAME
-// credentials — nothing is re-minted.
+// may repeat the collection briefly. The repeat hands out the same store id
+// and cron key; the API key is re-minted and the undelivered one revoked.
 const CASHUPAY_PROVISION_GRACE_SECONDS = 600;
+// application_identifier stamped on the key this endpoint mints, so a grace
+// re-collection can find and revoke the undelivered one.
+const CASHUPAY_PROVISION_APP_IDENTIFIER = 'cashupay-provision';
 
 // The whole check-then-mint-then-stamp sequence must be one write
 // transaction: two concurrent collections would otherwise both pass the
@@ -102,13 +110,26 @@ try {
         exit;
     }
 
-    $apiKey = Auth::getOrCreateInternalApiKey($store['id']);
-    if (!$apiKey) {
-        Database::rollback();
-        cashupay_status(500);
-        echo json_encode(['error' => 'Could not resolve the store API key']);
-        exit;
+    // A dedicated store-scoped key for the integration, carrying the default
+    // store permission set (invoices + webhooks) the API enforces. The
+    // dashboard's internal key is deliberately create-only — the limited user
+    // role is handed it for Request Payment — so it is never given out here.
+    // A grace re-collection re-mints: the previous key's plaintext is gone,
+    // so revoke it and issue a fresh one rather than leave an orphan behind.
+    $previousKeys = Database::fetchAll(
+        "SELECT id FROM api_keys WHERE store_id = ? AND application_identifier = ?",
+        [$store['id'], CASHUPAY_PROVISION_APP_IDENTIFIER]
+    );
+    foreach ($previousKeys as $previousKey) {
+        Auth::deleteApiKey($previousKey['id']);
     }
+    $apiKey = Auth::createApiKey(
+        $store['id'],
+        'Provisioned integration (WordPress plugin)',
+        Auth::DEFAULT_STORE_KEY_PERMISSIONS,
+        CASHUPAY_PROVISION_APP_IDENTIFIER,
+        null
+    )['key'];
 
     // Seed the cron key if the wizard never rendered the cron screen
     // (provisioned installs skip it via CASHUPAY_EXTERNAL_CRON) — same lazy

@@ -14,6 +14,7 @@ require_once __DIR__ . '/../security.php';
 function handleCreateWebhook(array $auth, array $params, array $body): void {
     $storeId = $params['storeId'];
     requireStoreAccess($auth, $storeId);
+    requireApiPermission($auth, Auth::PERM_MODIFY_WEBHOOKS);
 
     // Verify store exists
     $store = Database::fetchOne("SELECT id FROM stores WHERE id = ?", [$storeId]);
@@ -62,6 +63,7 @@ function handleCreateWebhook(array $auth, array $params, array $body): void {
 function handleGetWebhooks(array $auth, array $params, array $body): void {
     $storeId = $params['storeId'];
     requireStoreAccess($auth, $storeId);
+    requireApiPermission($auth, Auth::PERM_MODIFY_WEBHOOKS);
 
     $webhooks = Database::fetchAll(
         "SELECT * FROM webhooks WHERE store_id = ? ORDER BY created_at DESC",
@@ -79,6 +81,7 @@ function handleGetWebhook(array $auth, array $params, array $body): void {
     $storeId = $params['storeId'];
     $webhookId = $params['webhookId'];
     requireStoreAccess($auth, $storeId);
+    requireApiPermission($auth, Auth::PERM_MODIFY_WEBHOOKS);
 
     $webhook = Database::fetchOne(
         "SELECT * FROM webhooks WHERE id = ? AND store_id = ?",
@@ -99,6 +102,7 @@ function handleUpdateWebhook(array $auth, array $params, array $body): void {
     $storeId = $params['storeId'];
     $webhookId = $params['webhookId'];
     requireStoreAccess($auth, $storeId);
+    requireApiPermission($auth, Auth::PERM_MODIFY_WEBHOOKS);
 
     $webhook = Database::fetchOne(
         "SELECT * FROM webhooks WHERE id = ? AND store_id = ?",
@@ -143,6 +147,7 @@ function handleDeleteWebhook(array $auth, array $params, array $body): void {
     $storeId = $params['storeId'];
     $webhookId = $params['webhookId'];
     requireStoreAccess($auth, $storeId);
+    requireApiPermission($auth, Auth::PERM_MODIFY_WEBHOOKS);
 
     $webhook = Database::fetchOne(
         "SELECT id FROM webhooks WHERE id = ? AND store_id = ?",

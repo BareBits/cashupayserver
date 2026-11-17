@@ -123,7 +123,14 @@ Two related settings per store:
 
 - **Required confirmations** (`onchain_min_confs`). Default: 1. Set to 0 to
   accept zero-confirmation (mempool) payments — fastest but reversible by
-  fee-bumping (RBF) until confirmed.
+  fee-bumping (RBF) until confirmed. Two guards apply: an unconfirmed payment
+  that signals BIP-125 replace-by-fee is counted as pending (the invoice shows
+  Processing) until it has one confirmation, and an invoice settled on a
+  mempool-only payment stays under watch for 72 hours — if that payment is
+  gone from the chain provider's view on two consecutive polls before it
+  confirms, the invoice flips to Invalid, fires `InvoiceInvalid` and the
+  reversal is written to the admin log (`additionalStatus` reads
+  `ZeroConfPaymentMissing` after the first miss).
 - **Confirmation window** (`onchain_confirm_timeout_sec`). Default: 86400
   (24h). Once a payment is first seen in mempool, how long the server waits
   for it to reach the required confirmation count. If the window passes

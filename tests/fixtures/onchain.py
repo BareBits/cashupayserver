@@ -91,10 +91,16 @@ class OnchainContext:
     watch_wallet_url: str
     watch_wallet_name: str
 
-    def fund_address(self, address: str, amount_sat: int) -> str:
-        """Send `amount_sat` to `address`, return the txid (mempool, unconfirmed)."""
+    def fund_address(self, address: str, amount_sat: int, *, replaceable: bool = False) -> str:
+        """Send `amount_sat` to `address`, return the txid (mempool, unconfirmed).
+
+        Non-RBF by default: a zero-conf store only settles on an unconfirmed
+        payment that does NOT signal replace-by-fee, and most tests here want
+        the mempool sighting to settle. Pass `replaceable=True` for Core's own
+        default (RBF-signalling since 0.21) to exercise the wait-for-
+        confirmation path."""
         btc = f"{amount_sat / 100_000_000:.8f}"
-        return self.bitcoind.send_to_address(address, float(btc))
+        return self.bitcoind.send_to_address(address, float(btc), replaceable=replaceable)
 
     def confirm(self, blocks: int = 1) -> None:
         self.bitcoind.mine(blocks)

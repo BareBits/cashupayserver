@@ -190,12 +190,34 @@ if ($setupComplete) {
     } elseif ($completingSession && $stepRequested) {
         // The wizard that just completed, still on its tail screens (or
         // stepping Back from them). Falls through to render.
-    } elseif ($isTailPost && Auth::isLoggedIn()) {
-        // A logged-in operator re-answering a tail screen.
+    } elseif ($isTailPost && Auth::isAdmin()) {
+        // A signed-in admin re-answering a tail screen. Admin, not merely
+        // logged in: these screens flip the auto-update opt-in and render
+        // the cron key, which drives update.php?manual=1 and full cron runs.
     } else {
         header('Location: ' . Urls::admin());
         exit;
     }
+}
+
+// Ownership of an UNFINISHED first run. The wizard is anonymous by design
+// up to the password screen (a fresh install has nobody to authenticate),
+// but from the moment the admin account exists every later screen — the
+// password-reset / SMTP address, the store, its rails, finalisation — must
+// belong to whoever created it. Without this, anyone who reached setup.php
+// in the minutes between the password screen and completion could post
+// `step=email` with their own reset address and take the install over
+// later through a password reset. The session that set the password is
+// marked the owner (managed installs: the session whose first request
+// seeded the provisioned admin); a signed-in admin (SSO, or the resume
+// form below after a lost session) qualifies too. Everyone else gets a
+// sign-in page instead of the wizard.
+$setupAdminExists = $dbInitialized
+    && Database::fetchOne("SELECT id FROM users WHERE role = 'admin' LIMIT 1") !== null;
+if (!$setupComplete && $setupAdminExists
+        && empty($_SESSION['setup_owner']) && !Auth::isAdmin()) {
+    setupRenderLockedPage();
+    exit;
 }
 
 // Initialize database if needed
@@ -205,8 +227,20 @@ if (!Database::isInitialized()) {
 
 // Managed installs provision the admin account up front (see managed.php);
 // seed it before the wizard's shape is computed so the password screen is
-// consistently absent from the very first render.
-ManagedInstall::seedAdminIfProvisioned();
+// consistently absent from the very first render. The request that seeds
+// it is the orchestrator's own first wizard load, so that session owns the
+// run (the ownership gate below) — the equivalent of the password screen
+// on a standalone install.
+if ($mode !== 'add_store' && ManagedInstall::adminPasswordHash() !== ''
+        && Database::fetchOne("SELECT id FROM users LIMIT 1") === null) {
+    ManagedInstall::seedAdminIfProvisioned();
+    if (Database::fetchOne("SELECT id FROM users WHERE role = 'admin' LIMIT 1") !== null) {
+        $_SESSION['setup_owner'] = true;
+        Config::recordAdminBaseUrl();
+    }
+} else {
+    ManagedInstall::seedAdminIfProvisioned();
+}
 
 // One resolve per request: the answer can't change mid-request, and the
 // wizard's shape must not either. A managed install implies the external
@@ -300,6 +334,95 @@ $success = null;
 /** Hidden CSRF field for every wizard form (the AJAX calls append the same token). */
 function setupCsrfField(): string {
     return '<input type="hidden" name="csrf_token" value="' . htmlspecialchars(Auth::generateCsrfToken()) . '">';
+}
+
+/**
+ * The page a visitor who does not own the unfinished first run sees: a
+ * sign-in form (admin credentials; the lockout applies) that, on success,
+ * makes this session the owner and resumes the wizard. POSTed here as
+ * `setup_action=resume_login` so the ordinary step dispatcher never runs
+ * for a non-owner. Renders and the caller exits.
+ */
+function setupRenderLockedPage(): void {
+    $error = null;
+    if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['setup_action'] ?? '') === 'resume_login') {
+        if (!Auth::validateCsrfToken((string)($_POST['csrf_token'] ?? ''))) {
+            cashupay_status(403);
+            $error = 'Session expired or invalid request. Reload the page and try again.';
+        } else {
+            $ip = Security::getClientIp();
+            $result = Auth::attemptLogin(
+                trim((string)($_POST['username'] ?? '')),
+                (string)($_POST['password'] ?? ''),
+                $ip
+            );
+            if ($result === 'ok' && Auth::isAdmin()) {
+                $_SESSION['setup_owner'] = true;
+                header('Location: ' . setupSelfUrl());
+                exit;
+            }
+            if ($result === 'ok') {
+                Auth::logout();
+                Auth::initSession();
+                cashupay_status(403);
+                $error = 'Only an admin account can continue the setup.';
+            } elseif ($result === 'locked') {
+                $remaining = Security::getLockoutRemaining($ip, true);
+                cashupay_status(429);
+                $error = "Too many failed attempts. Try again in {$remaining} seconds.";
+            } else {
+                cashupay_status(401);
+                $error = 'Invalid username or password.';
+            }
+        }
+    } else {
+        cashupay_status(403);
+    }
+    header('Content-Type: text/html; charset=UTF-8');
+    header('Cache-Control: no-store');
+    $action = htmlspecialchars(setupSelfUrl(), ENT_QUOTES, 'UTF-8');
+    $csrf = setupCsrfField();
+    $errorHtml = $error !== null
+        ? '<p class="err">' . htmlspecialchars($error, ENT_QUOTES, 'UTF-8') . '</p>'
+        : '';
+    echo <<<HTML
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BareBits Setup</title>
+<style>
+  body { font-family: -apple-system, system-ui, sans-serif; background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+         color: #e2e8f0; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; padding: 1.5rem; }
+  .box { width: 100%; max-width: 420px; background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1);
+         border-radius: 16px; padding: 2rem; }
+  h1 { font-size: 1.3rem; margin: 0 0 0.75rem; }
+  p { color: #a0aec0; font-size: 0.95rem; line-height: 1.5; margin: 0 0 1rem; }
+  label { display: block; font-size: 0.85rem; color: #a0aec0; margin-bottom: 0.3rem; }
+  input { width: 100%; box-sizing: border-box; padding: 0.7rem 0.85rem; margin-bottom: 0.9rem; background: rgba(0,0,0,0.3);
+          border: 1px solid rgba(255,255,255,0.15); border-radius: 8px; color: #e2e8f0; font-size: 1rem; }
+  button { width: 100%; padding: 0.8rem; border: 0; border-radius: 8px; background: #f7931a; color: #1a1a2e;
+           font-weight: 600; font-size: 1rem; cursor: pointer; }
+  .err { color: #fc8181; }
+</style></head>
+<body>
+  <div class="box" id="setup-locked">
+    <h1>🔒 Setup in progress</h1>
+    <p>This BareBits installation is being set up from another browser. Only the person who created the
+       admin password can continue — sign in with it to resume the setup here.</p>
+    {$errorHtml}
+    <form method="post" action="{$action}">
+      <input type="hidden" name="setup_action" value="resume_login">
+      {$csrf}
+      <label for="setup-login-username">Username</label>
+      <input type="text" id="setup-login-username" name="username" value="admin" autocomplete="username">
+      <label for="setup-login-password">Password</label>
+      <input type="password" id="setup-login-password" name="password" autocomplete="current-password" required>
+      <button type="submit">Sign in and continue setup</button>
+    </form>
+  </div>
+</body></html>
+HTML;
 }
 
 /**
@@ -524,6 +647,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 // The password-reset e-mail address is collected on the
                 // e-mail screen that follows.
                 Auth::setAdminPassword($password);
+                // This browser owns the rest of the run (see the ownership
+                // gate above), and the URL it is using is the admin's own —
+                // the reset e-mail builds its link from it.
+                $_SESSION['setup_owner'] = true;
+                Config::recordAdminBaseUrl();
                 $step = SetupFlow::nextStep('password', $flowSteps) ?? 'email';
                 break;
 
@@ -3195,11 +3323,18 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                     waiting for an on-chain confirmation (seconds to minutes,
                     depending on fees).
                 </p>
-                <p style="margin-bottom: 1.5rem;">
+                <p style="margin-bottom: 0.75rem;">
                     There's a small catch: a customer
                     <a href="https://getbarebits.com/help/Understanding%20Bitcoin/Zero-conf%20transactions/" target="_blank" rel="noopener" style="color: #63b3ed;">could try to game it</a>.
                     For most merchants, though, the extra speed is well worth
                     that tiny risk.
+                </p>
+                <p style="margin-bottom: 1.5rem; font-size: 0.9rem; color: #a0aec0;">
+                    BareBits limits that risk for you: a payment whose sender
+                    marked it replaceable (RBF) waits for one confirmation
+                    even with zero-conf on, and a zero-conf payment that
+                    disappears before confirming flips the invoice back to
+                    unpaid and tells you.
                 </p>
 
                 <form method="POST" action="<?= htmlspecialchars(setupSelfUrl()) ?>">
@@ -4496,11 +4631,12 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
         if (!cardEl || !cc) return;
         var holder = cardEl.querySelector('.mint-country-slot');
         if (!holder) return;
-        var safe = cc.toLowerCase().replace(/[^a-z]/g, '');
+        var safe = String(cc).toLowerCase().replace(/[^a-z]/g, '');
         if (safe.length !== 2) return;
+        var label = safe.toUpperCase();
         holder.innerHTML = '<img src="' + FLAG_BASE + safe + '.svg" alt="' +
-            cc + '" class="mint-flag" style="width: 16px; height: 12px; vertical-align: middle; border-radius: 2px; margin-right: 0.25rem; box-shadow: 0 0 0 1px rgba(0,0,0,0.2);"> ' +
-            '<span style="font-size: 0.75rem; color: #a0aec0; letter-spacing: 0.5px;">' + cc + '</span>';
+            label + '" class="mint-flag" style="width: 16px; height: 12px; vertical-align: middle; border-radius: 2px; margin-right: 0.25rem; box-shadow: 0 0 0 1px rgba(0,0,0,0.2);"> ' +
+            '<span style="font-size: 0.75rem; color: #a0aec0; letter-spacing: 0.5px;">' + label + '</span>';
     }
 
     function onDisclaimerChange(checkbox) {
@@ -4724,7 +4860,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                 '<h4 style="margin: 0 0 0.25rem 0; font-size: 1rem;">' + escapeHtml(name) + '</h4>' +
                 '<p style="font-size: 0.8rem; color: #a0aec0; margin: 0 0 0.5rem 0; word-break: break-all;">' + escapeHtml(m.url) + '</p>' +
                 '<div style="font-size: 0.8rem; color: #a0aec0; margin-bottom: 0.75rem;">' +
-                    (units.length > 0 ? units.map(function(u) { return u.toUpperCase(); }).join(' \u2022 ') : 'Unknown units') +
+                    (units.length > 0 ? units.map(function(u) { return escapeHtml(String(u).toUpperCase()); }).join(' \u2022 ') : 'Unknown units') +
                 '</div>' +
                 '<button type="button" class="btn select-discovered-mint" data-mint-url="' + escapeAttr(m.url) + '" style="width: 100%;">Select</button>' +
             '</div>';

@@ -126,8 +126,13 @@ class BitcoindHandle:
             self.miner_address = self.new_address()
         return self.generate_to_address(n, self.miner_address)
 
-    def send_to_address(self, address: str, amount_btc: float) -> str:
-        return self.rpc("sendtoaddress", address, amount_btc)
+    def send_to_address(self, address: str, amount_btc: float, *, replaceable: bool | None = None) -> str:
+        """sendtoaddress; `replaceable` pins BIP-125 signalling (Core 28 signals
+        RBF by default, which a zero-conf store refuses to settle on)."""
+        if replaceable is None:
+            return self.rpc("sendtoaddress", address, amount_btc)
+        # positional: address amount comment comment_to subtractfeefromamount replaceable
+        return self.rpc("sendtoaddress", address, amount_btc, "", "", False, replaceable)
 
     def block_count(self) -> int:
         return self.rpc("getblockcount")

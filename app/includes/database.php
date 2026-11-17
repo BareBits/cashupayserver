@@ -289,8 +289,24 @@ class Database {
                     && $pdo
                         ->query("SELECT 1 FROM config WHERE key = 'notifications_auto_withdraw_enabled' LIMIT 1")
                         ->fetch() !== false;
+                // Provisioned installs (the WordPress alongside install) were
+                // handed the store's create-only internal dashboard key as the
+                // plugin's credential. The API now enforces key permissions, so
+                // that key is widened once to the default store key set — also a
+                // data-only migration; probe for a provisioned install that still
+                // holds a create-only internal key (false once it has run).
+                $needsProvisionedKeyGrant = $hasConfig
+                    && self::tableExists($pdo, 'api_keys')
+                    && $pdo
+                        ->query("SELECT 1 FROM config WHERE key = 'provision_consumed_at' LIMIT 1")
+                        ->fetch() !== false
+                    && $pdo
+                        ->query("SELECT 1 FROM api_keys WHERE label = 'Internal (Dashboard)'"
+                            . " AND permissions = '[\"btcpay.store.cancreateinvoice\"]' LIMIT 1")
+                        ->fetch() !== false;
 
-                if ($hasConfig && (!$hasUsers || !$hasReliability || !$hasLatestMigration || $needsCashoutRename)) {
+                if ($hasConfig && (!$hasUsers || !$hasReliability || !$hasLatestMigration
+                        || $needsCashoutRename || $needsProvisionedKeyGrant)) {
                     if (!$hasUsers) {
                         $pdo->exec("
                             CREATE TABLE IF NOT EXISTS users (
@@ -1762,6 +1778,36 @@ HTACCESS;
             $stmt = $pdo->prepare("UPDATE {$table} SET event_type = ? WHERE event_type = ?");
             foreach ($eventRenames as $oldEvent => $newEvent) {
                 $stmt->execute([$newEvent, $oldEvent]);
+            }
+        }
+
+        // provision.php used to hand the WordPress alongside install the
+        // store's internal dashboard key, which carries only cancreateinvoice.
+        // The Greenfield API now enforces key permissions, and the plugin
+        // holding that key lists/creates webhooks and reads invoices, so an
+        // upgraded shop would stop settling orders. Widen that key once to the
+        // default store key set (what provision.php mints today; mirrors
+        // Auth::DEFAULT_STORE_KEY_PERMISSIONS at the time of this migration).
+        // Only on installs that actually provisioned: elsewhere the internal
+        // key was never handed out and stays create-only for the limited user
+        // role. Idempotent — the WHERE matches nothing once widened.
+        if (self::tableExists($pdo, 'api_keys')) {
+            $provisioned = $pdo
+                ->query("SELECT 1 FROM config WHERE key = 'provision_consumed_at' LIMIT 1")
+                ->fetch() !== false;
+            if ($provisioned) {
+                $pdo->prepare(
+                    "UPDATE api_keys SET permissions = ? WHERE label = 'Internal (Dashboard)' AND permissions = ?"
+                )->execute([
+                    json_encode([
+                        'btcpay.store.canviewinvoices',
+                        'btcpay.store.cancreateinvoice',
+                        'btcpay.store.canmodifyinvoices',
+                        'btcpay.store.canviewstoresettings',
+                        'btcpay.store.webhooks.canmodifywebhooks',
+                    ]),
+                    json_encode(['btcpay.store.cancreateinvoice']),
+                ]);
             }
         }
 

@@ -1457,16 +1457,33 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 try {
                     require_once __DIR__ . '/includes/email_sender.php';
                     $raw  = Auth::createPasswordResetToken($admin['id']);
-                    $base = rtrim(Config::getBaseUrl(), '/');
-                    $adminAbs = Config::getUrlMode() === 'direct'
-                        ? $base . '/admin.php'
-                        : $base . '/router.php/admin.php';
-                    $link = $adminAbs . '?action=reset&token=' . urlencode($raw);
-                    $body = "A password reset was requested for your CashuPayServer admin account.\n\n"
-                          . "Open this link to choose a new password (valid for 1 hour, single use):\n\n"
-                          . $link . "\n\n"
-                          . "If you did not request this, you can ignore this email. The link does "
-                          . "nothing until used and expires on its own.\n";
+                    // Never build this link from the request's Host header:
+                    // the request is anonymous, so a forged Host would mail
+                    // the operator a genuine-looking link to an attacker's
+                    // domain carrying the real token. Only operator-chosen
+                    // URLs qualify (deployment pin, base_url, the URL the
+                    // admin last signed in from); without one, send the
+                    // token with instructions instead of a link.
+                    $base = Config::getTrustedBaseUrl();
+                    $resetQuery = '?action=reset&token=' . urlencode($raw);
+                    if ($base !== null) {
+                        $adminAbs = Config::getUrlMode() === 'direct'
+                            ? $base . '/admin.php'
+                            : $base . '/router.php/admin.php';
+                        $link = $adminAbs . $resetQuery;
+                        $body = "A password reset was requested for your CashuPayServer admin account.\n\n"
+                              . "Open this link to choose a new password (valid for 1 hour, single use):\n\n"
+                              . $link . "\n\n"
+                              . "If you did not request this, you can ignore this email. The link does "
+                              . "nothing until used and expires on its own.\n";
+                    } else {
+                        $body = "A password reset was requested for your CashuPayServer admin account.\n\n"
+                              . "Open your BareBits admin sign-in page in the browser and append the "
+                              . "following to its address (valid for 1 hour, single use):\n\n"
+                              . $resetQuery . "\n\n"
+                              . "If you did not request this, you can ignore this email. The code does "
+                              . "nothing until used and expires on its own.\n";
+                    }
                     EmailSender::send($admin['email'], 'Reset your CashuPayServer admin password', $body);
                 } catch (\Throwable $e) {
                     // Never surface SMTP/config detail to an unauthenticated
@@ -7205,7 +7222,10 @@ header('Cache-Control: no-cache, must-revalidate');
                                         <br><br>
                                         <strong>0 (zero-conf):</strong> instant settlement, but a malicious
                                         customer could double-spend the unconfirmed tx. For ~90% of merchants
-                                        taking small consumer payments, zero-conf is a fine default.
+                                        taking small consumer payments, zero-conf is a fine default. Payments
+                                        that signal replace-by-fee (RBF) wait for one confirmation regardless,
+                                        and a zero-conf payment that vanishes before confirming marks the
+                                        invoice Invalid and fires InvoiceInvalid.
                                         <br><br>
                                         <strong>1+ confirmations:</strong> safer for high-value invoices, but
                                         customers wait ~10 minutes per confirmation.
@@ -17534,11 +17554,17 @@ header('Cache-Control: no-cache, must-revalidate');
             loadDashboard();
         }
 
-        // Utility: escape HTML
+        // Utility: escape HTML. Quote-safe on purpose: this helper is used
+        // inside attribute values (title=, href=, data-*) as well as text
+        // nodes, and the textContent/innerHTML trick leaves quotes alone,
+        // which let a value containing `"` break out of an attribute.
         function escapeHtml(text) {
-            const div = document.createElement('div');
-            div.textContent = text;
-            return div.innerHTML;
+            return String(text ?? '')
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
         }
 
         // Toast

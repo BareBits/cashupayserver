@@ -317,12 +317,17 @@ def drive_pairing(
         timeout=30,
     ).text
     csrf = re.search(r'name="csrf_token" value="([^"]+)"', body).group(1)
+    # The approval form carries every requested permission as
+    # approved_permissions[] (hidden fields in strict mode, checkboxes
+    # otherwise); the server grants the ticked subset of the request and
+    # refuses an approval that grants nothing. Post what the browser would.
     body = ps.post(
         authorize_url,
         data={
             "action": "approve",
             "store_id": store_id,
             "csrf_token": csrf,
+            "approved_permissions[]": query["permissions"],
         },
         timeout=30,
     ).text

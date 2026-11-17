@@ -75,6 +75,7 @@ function apiExpirationMinutes($value): ?int {
 function handleCreateInvoice(array $auth, array $params, array $body): void {
     $storeId = $params['storeId'];
     requireStoreAccess($auth, $storeId);
+    requireApiPermission($auth, Auth::PERM_CREATE_INVOICE);
 
     // Verify store exists
     $store = Database::fetchOne("SELECT id FROM stores WHERE id = ?", [$storeId]);
@@ -163,6 +164,7 @@ function handleCreateInvoice(array $auth, array $params, array $body): void {
 function handleGetInvoices(array $auth, array $params, array $body): void {
     $storeId = $params['storeId'];
     requireStoreAccess($auth, $storeId);
+    requireApiPermission($auth, Auth::PERM_VIEW_INVOICES);
 
     // Parse query parameters
     $status = $_GET['status'] ?? null;
@@ -182,6 +184,7 @@ function handleGetInvoice(array $auth, array $params, array $body): void {
     $storeId = $params['storeId'];
     $invoiceId = $params['invoiceId'];
     requireStoreAccess($auth, $storeId);
+    requireApiPermission($auth, Auth::PERM_VIEW_INVOICES);
 
     // Confirm the invoice belongs to this store BEFORE polling — otherwise
     // anyone with any API key could force-poll arbitrary invoice IDs.
@@ -205,6 +208,7 @@ function handleUpdateInvoiceStatus(array $auth, array $params, array $body): voi
     $storeId = $params['storeId'];
     $invoiceId = $params['invoiceId'];
     requireStoreAccess($auth, $storeId);
+    requireApiPermission($auth, Auth::PERM_MODIFY_INVOICES);
 
     $invoice = Invoice::getById($invoiceId);
 
