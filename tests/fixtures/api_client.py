@@ -14,14 +14,26 @@ import requests
 
 
 class AdminClient:
-    def __init__(self, base_url: str, *, session: Optional[requests.Session] = None) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        *,
+        session: Optional[requests.Session] = None,
+        admin_entry: str = "/admin",
+    ) -> None:
+        """`admin_entry` is the admin entry point under `base_url`: the pretty
+        /admin route by default (what the standalone install's .htaccess /
+        router.php serve), or "/admin.php" for an install whose rewrites are
+        not ours — e.g. one served under a WordPress docroot, where
+        /barebits/admin falls through to WordPress's 404."""
         self.base_url = base_url.rstrip("/")
         self.s = session or requests.Session()
         self.csrf_token: Optional[str] = None
+        self.admin_entry = admin_entry
 
     @property
     def _admin_url(self) -> str:
-        return f"{self.base_url}/admin"
+        return f"{self.base_url}{self.admin_entry}"
 
     def login(self, password: str, username: str = "admin") -> dict[str, Any]:
         r = self.s.post(

@@ -6,6 +6,13 @@ live, and upgrades it to the build under test — the standalone zip built from
 this working tree (or $CASHUPAY_STANDALONE_ZIP), published to the install
 through a local GitHub-shaped release server.
 
+The WordPress half (test_wordpress_*.py) starts from the same window's
+PUBLISHED PLUGIN zips: the old plugin installs (or is pointed at) the old
+server, WooCommerce is wired and takes an order, and then the server's own
+updater and WordPress's plugin upgrade paths move each half to the build under
+test — in both orders, so both version skews (old plugin + new server, new
+plugin + old server) are lived through with real orders.
+
 Local suite only: tests.yml passes --skip-upgrade-tier (see tests/conftest.py).
 The tier needs the regtest stack (payments are part of the acceptance
 criteria) and reaches GitHub once per hour for the release listing; release
@@ -39,13 +46,41 @@ from fixtures.release_server import (
     stop_release_server,
 )
 from fixtures.releases import Release
+from fixtures.wordpress import (
+    WordPressHandle,
+    ensure_wp_plugin_wporg_zip,
+    ensure_wp_plugin_zip,
+    start_wordpress,
+    stop_wordpress,
+)
+from upgrade.wp_flow import ALONGSIDE_SERVER_ENV, stamp_plugin_zip
+from wordpress.conftest import _allow_nonstandard_ports
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
 
+UPGRADE_ORDERS = ("server_first", "plugin_first")
+
+
 def pytest_generate_tests(metafunc) -> None:
-    """Parametrize `source_release` over the window: one test per release."""
-    if "source_release" in metafunc.fixturenames:
+    """Parametrize `source_release` over the window: one test per release.
+
+    A test that also takes `upgrade_order` (the WordPress half: which of the
+    plugin and the server is upgraded first) runs server-first for the whole
+    window — the everyday shape, the server's daily auto-update landing
+    before the merchant gets round to the plugin — and plugin-first for the
+    newest stable and the newest testing release only: that order only adds
+    the new-plugin-on-old-server skew, and the newest of each channel is the
+    server such a plugin meets in the field."""
+    if "upgrade_order" in metafunc.fixturenames:
+        window = releases.resolve_window()
+        newest = [r for r in window if not r.prerelease][:1] + [r for r in window if r.prerelease][:1]
+        params = [("server_first", r) for r in window] + [("plugin_first", r) for r in newest]
+        metafunc.parametrize(
+            "upgrade_order,source_release", params,
+            ids=[f"{r.tag}-{order}" for order, r in params],
+        )
+    elif "source_release" in metafunc.fixturenames:
         window = releases.resolve_window()
         metafunc.parametrize("source_release", window, ids=[r.tag for r in window])
 
@@ -115,15 +150,116 @@ def candidate_info(candidate_zip: Path) -> dict[str, str]:
 
 
 @pytest.fixture(scope="session")
-def candidate_catalog(candidate_zip: Path, candidate_info: dict[str, str]) -> Iterator[ReleaseServer]:
+def candidate_plugin_zips(candidate_info: dict[str, str]) -> dict[str, object]:
+    """The build under test's WordPress plugin zips — both variants, built
+    from this working tree (or $CASHUPAY_WP_PLUGIN_ZIP /
+    $CASHUPAY_WP_PLUGIN_WPORG_ZIP) — as stamped copies whose Version header
+    outranks every published release's, so WordPress's update paths treat
+    them as the newer build they are (see wp_flow.stamp_plugin_zip).
+    Keys: 'full', 'wporg' (paths) and 'version' (the stamped header)."""
+    tag = candidate_info["TAG"]
+    SESSION_TMP.mkdir(parents=True, exist_ok=True)
+    full = SESSION_TMP / f"candidate-plugin-{tag}" / f"barebits_wordpress_plugin-{tag}.zip"
+    wporg = SESSION_TMP / f"candidate-plugin-{tag}" / f"barebits_wordpress_plugin_wporg-{tag}.zip"
+    v_full = stamp_plugin_zip(ensure_wp_plugin_zip(), full)
+    v_wporg = stamp_plugin_zip(ensure_wp_plugin_wporg_zip(), wporg)
+    assert v_full == v_wporg, (v_full, v_wporg)
+    return {"full": full, "wporg": wporg, "version": v_full}
+
+
+@pytest.fixture(scope="session")
+def candidate_catalog(
+    candidate_zip: Path, candidate_info: dict[str, str], candidate_plugin_zips: dict[str, object]
+) -> Iterator[ReleaseServer]:
     """A release server whose only release is the candidate, published as
     stable so BOTH channels resolve to it: whatever channel the source
-    release is on, "update" means "move to the build under test"."""
+    release is on, "update" means "move to the build under test". Carries
+    the candidate's plugin zips as real assets, the way a published release
+    does — the WordPress half updates the plugin from here."""
+    tag = candidate_info["TAG"]
     rs = start_release_catalog([
-        CatalogRelease(tag=candidate_info["TAG"], zip_path=candidate_zip, prerelease=False),
+        CatalogRelease(
+            tag=tag, zip_path=candidate_zip, prerelease=False,
+            extra_assets={
+                f"barebits_wordpress_plugin-{tag}.zip": candidate_plugin_zips["full"],
+                f"barebits_wordpress_plugin_wporg-{tag}.zip": candidate_plugin_zips["wporg"],
+            },
+        ),
     ])
     yield rs
     stop_release_server(rs)
+
+
+@pytest.fixture
+def source_plugin_catalog() -> Iterator[Callable[[Release], ReleaseServer]]:
+    """Factory: a release server whose ONLY release is the given published
+    release — with its real plugin zips as assets — so that release's own
+    plugin, reading its own channel, installs that very server alongside
+    WordPress: a stable plugin from /releases/latest, a testing plugin from
+    the /releases listing (where /releases/latest answers 404, as on GitHub
+    when the newest release is a prerelease)."""
+    started: list[ReleaseServer] = []
+
+    def _start(release: Release) -> ReleaseServer:
+        rs = start_release_catalog([
+            CatalogRelease(
+                tag=release.tag, zip_path=releases.ensure_standalone_zip(release),
+                prerelease=release.prerelease,
+                extra_assets={
+                    release.plugin_asset: releases.ensure_plugin_zip(release),
+                    release.plugin_wporg_asset: releases.ensure_plugin_zip(release, wporg=True),
+                },
+            ),
+        ])
+        started.append(rs)
+        return rs
+
+    yield _start
+    for rs in started:
+        stop_release_server(rs)
+
+
+ShopFactory = Callable[..., WordPressHandle]
+
+
+@pytest.fixture
+def wordpress_shop(request) -> Iterator[ShopFactory]:
+    """Factory: a WooCommerce shop (WooCommerce + the BTCPay gateway + the
+    fixture product) with NO barebits plugin — the test installs the plugin
+    zip of a published release itself. `plugin_release_api_base` is where
+    that plugin's install-alongside flow downloads its server from;
+    `server_release_api_base` is where the server it installs reads updates
+    from (its auto-updater is live on this site). Everything started is
+    stopped at teardown; the workdir is kept only when the test failed."""
+    started: list[tuple[WordPressHandle, Path]] = []
+
+    def _start(
+        *, plugin_release_api_base: str | None = None, server_release_api_base: str | None = None,
+        label: str = "",
+    ) -> WordPressHandle:
+        workdir = SESSION_TMP / f"upgrade-wp-{label}-{uuid.uuid4().hex[:8]}"
+        handle = start_wordpress(
+            workdir,
+            install_barebits=False,
+            with_woocommerce=True,
+            release_api_base=plugin_release_api_base,
+            server_release_api_base=server_release_api_base,
+            updater_enabled=True,
+            extra_env=dict(ALONGSIDE_SERVER_ENV),
+        )
+        # download_url() rejects non-standard ports unless told otherwise —
+        # the fixture release servers (server zip, plugin package) live on
+        # random ports.
+        _allow_nonstandard_ports(handle)
+        started.append((handle, workdir))
+        return handle
+
+    yield _start
+
+    green = _test_went_green(request)
+    for handle, workdir in started:
+        stop_wordpress(handle)
+        _maybe_remove_workdir(workdir, green)
 
 
 @pytest.fixture(scope="session")

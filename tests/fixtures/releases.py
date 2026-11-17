@@ -70,6 +70,16 @@ class Release:
         return f"barebits-windows-{self.tag}.zip"
 
     @property
+    def plugin_asset(self) -> str:
+        """The WordPress plugin zip (install-alongside capable)."""
+        return f"barebits_wordpress_plugin-{self.tag}.zip"
+
+    @property
+    def plugin_wporg_asset(self) -> str:
+        """The wordpress.org variant of the plugin zip (no installer.php)."""
+        return f"barebits_wordpress_plugin_wporg-{self.tag}.zip"
+
+    @property
     def channel(self) -> str:
         return "testing" if self.prerelease else "main"
 
@@ -243,6 +253,26 @@ def ensure_standalone_zip(release: Release) -> Path:
 
 def ensure_windows_zip(release: Release) -> Path:
     return ensure_asset(release, release.windows_asset)
+
+
+def ensure_plugin_zip(release: Release, *, wporg: bool = False) -> Path:
+    """The WordPress plugin zip the release published (the wordpress.org
+    variant with wporg=True), downloaded once and checksum-verified."""
+    return ensure_asset(release, release.plugin_wporg_asset if wporg else release.plugin_asset)
+
+
+def plugin_version_in_zip(zip_path: Path) -> str:
+    """The `Version:` header of barebits/barebits.php inside a plugin zip —
+    what WordPress shows as the installed version."""
+    import re
+    import zipfile
+
+    with zipfile.ZipFile(zip_path) as zf:
+        main = zf.read("barebits/barebits.php").decode("utf-8", "replace")
+    m = re.search(r"^\s*\*\s*Version:\s*(\S+)", main, re.M)
+    if not m:
+        raise RuntimeError(f"{zip_path} has no Version header in barebits/barebits.php")
+    return m.group(1)
 
 
 def build_info_from_zip(zip_path: Path) -> dict[str, str]:

@@ -96,12 +96,19 @@ def seed_install(
     onchain: OnchainContext,
     webhook_sink: WebhookSink | None = None,
     products: int = PRODUCT_COUNT,
+    password: str = ADMIN_PASSWORD,
+    admin_entry: str = "/admin",
 ) -> SeededInstall:
     """Make the fresh install look lived-in: wizard with the regtest mints,
-    the regtest xpub on the store, products, an API key and a webhook."""
+    the regtest xpub on the store, products, an API key and a webhook.
+
+    `password` is what the wizard's password screen is answered with — or,
+    for a managed install whose admin account was pre-seeded by the
+    WordPress plugin (no password screen), the password the plugin
+    generated. `admin_entry` is the AdminClient entry point (see there)."""
     res = run_driver(
         handle.url, "seed",
-        password=ADMIN_PASSWORD, store=STORE_NAME,
+        password=password, store=STORE_NAME,
         mint=mint.url, backup_mint=backup_mint.url, unit="sat",
         products=str(products),
     )
@@ -112,13 +119,14 @@ def seed_install(
         min_confs=1, confirm_timeout_sec=86400,
         provider_url=onchain.watch_wallet_url, start_index=0,
     )
-    admin = AdminClient(handle.url)
-    admin.login(ADMIN_PASSWORD)
+    admin = AdminClient(handle.url, admin_entry=admin_entry)
+    admin.login(password)
     seeded = SeededInstall(
         handle=handle, install=install, tag=tag, admin=admin,
         greenfield=GreenfieldClient(handle.url, res["api_key"]),
         store_id=store_id, api_key=res["api_key"],
         product_titles=[p["title"] for p in res["products"]],
+        password=password,
     )
     if webhook_sink is not None:
         seeded.webhook_path = f"/hook/upgrade-{tag}"
@@ -147,9 +155,14 @@ def verify_install(seeded: SeededInstall, *, min_invoices: int | None = None) ->
 def server_php_errors(handle: PayserverHandle, limit: int = 15) -> str:
     """The last PHP fatal/parse/warning lines the served install logged —
     what a 500 from the driver actually means."""
-    log = handle.workdir / "php-server.log"
-    if not log.is_file():
-        return "(no php-server.log)"
+    # php-server.log for a standalone install, wp-server.log when the install
+    # is served under a WordPress site's docroot.
+    log = next(
+        (p for p in (handle.workdir / "php-server.log", handle.workdir / "wp-server.log") if p.is_file()),
+        None,
+    )
+    if log is None:
+        return "(no server log)"
     lines = [
         ln for ln in log.read_text(errors="replace").splitlines()
         if "PHP Fatal" in ln or "PHP Parse" in ln or "PHP Warning" in ln or "Uncaught" in ln
@@ -304,6 +317,48 @@ def run_update_endpoint(seeded: SeededInstall, *, manual: bool = False, timeout_
 
 def rollback_update(seeded: SeededInstall) -> dict:
     return seeded.admin._post_action("rollback_update")
+
+
+def upgrade_server_via_dashboard(seeded: SeededInstall, candidate_info: dict[str, str]) -> dict:
+    """The whole server-side hop the merchant clicks through: "Update now",
+    the old release's own updater applies the candidate and verifies it
+    healthy, the files on disk are the candidate's, and the merchant's world
+    (login, store, products, API key, invoices) is intact. Returns the
+    final update_status payload."""
+    from .installed_payserver import read_build_info
+
+    before = update_status(seeded)
+    assert before.get("manual_blocked") in (None, ""), f"updater blocked on {seeded.tag}: {before}"
+    status = trigger_manual_update(seeded)
+    assert_healthy_apply(
+        seeded, status,
+        expect_version=candidate_info["VERSION"], expect_sha=candidate_info["COMMIT_SHA"],
+    )
+    on_disk = read_build_info(seeded.install)
+    assert on_disk.get("COMMIT_SHA") == candidate_info["COMMIT_SHA"], on_disk
+    assert not (seeded.install / ".htaccess.new").exists(), ".htaccess was held back on a pristine install"
+    result = verify_install(seeded, min_invoices=len(seeded.invoice_ids))
+    assert result["current_sha"] == candidate_info["COMMIT_SHA"], result
+    assert set(seeded.invoice_ids) <= set(result["invoice_ids"]), (
+        f"invoices lost across the upgrade: {set(seeded.invoice_ids) - set(result['invoice_ids'])}"
+    )
+    return status
+
+
+def rollback_server(seeded: SeededInstall, old_info: dict[str, str]) -> None:
+    """Roll the applied update back and prove the old build is live again and
+    still boots on the database the new build migrated (also what a
+    bad-health auto-rollback leaves behind)."""
+    from .installed_payserver import read_build_info
+
+    rb = rollback_update(seeded)
+    assert rb.get("success") is True, f"rollback refused on {seeded.tag}: {rb}"
+    restored = read_build_info(seeded.install)
+    assert restored.get("COMMIT_SHA") == old_info["COMMIT_SHA"], (
+        f"rollback left BUILD_INFO at {restored.get('COMMIT_SHA')}, expected {old_info['COMMIT_SHA']}"
+    )
+    seeded.admin.login(seeded.password)
+    verify_install(seeded, min_invoices=len(seeded.invoice_ids))
 
 
 def assert_healthy_apply(seeded: SeededInstall, status: dict, *, expect_version: str, expect_sha: str) -> None:
