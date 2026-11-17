@@ -1433,6 +1433,7 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                     'lnurl' => 'Lightning address',
                     'strike' => 'Strike API',
                     'swap' => 'Lightning (submarine swap)',
+                    'mint' => 'Cashu mint',
                 ];
                 if ($receiveErrors !== []): ?>
                 <div class="receive-errors">
