@@ -5862,6 +5862,28 @@ header('Cache-Control: no-cache, must-revalidate');
             transform: translateY(0);
         }
 
+        /* Mint discovery dialog (#mint-discovery-modal): a centred overlay
+           that stacks above the enable-mint / store dialogs. Keep it off the
+           .modal class above — those bottom-sheet rules slide it out of the
+           viewport. The panel is 90% wide (capped at 700px inline) so it
+           clears the screen edges on phones; min-height:0 on the list lets
+           the flex column shrink it so the list scrolls instead of being
+           clipped by the panel's overflow:hidden. */
+        .mint-discovery-overlay {
+            /* The mint cards paint with --card-bg, which this page never
+               defines (the wizard's stylesheet does); scope a value here so
+               they read as cards on the opaque --bg-secondary panel. */
+            --card-bg: rgba(0, 0, 0, 0.2);
+        }
+
+        .mint-discovery-overlay > .mint-discovery-panel {
+            width: 90%;
+        }
+
+        .mint-discovery-overlay #mint-discovery-list {
+            min-height: 0;
+        }
+
         .modal-handle {
             width: 40px;
             height: 4px;
@@ -9000,9 +9022,14 @@ header('Cache-Control: no-cache, must-revalidate');
         </div>
     </div>
 
-    <!-- Mint Discovery Modal -->
-    <div id="mint-discovery-modal" class="modal" style="display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.7); z-index: 1100; justify-content: center; align-items: center;">
-        <div class="modal-content" style="max-width: 700px; max-height: 85vh; overflow: hidden; display: flex; flex-direction: column; background: var(--card-bg); border-radius: 12px; padding: 1.5rem;">
+    <!-- Mint Discovery Modal. Deliberately NOT class="modal": on this page
+         that class is the bottom-sheet style (translateY(100%) until a
+         .modal-overlay.visible parent slides it back, 500px max width), which
+         pushed this overlay off-screen and left only an empty dark strip
+         peeking in at the bottom. It is its own centred overlay, same as the
+         wizard's copy in setup.php. -->
+    <div id="mint-discovery-modal" class="mint-discovery-overlay" style="display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.7); z-index: 1100; justify-content: center; align-items: center;">
+        <div class="mint-discovery-panel" style="max-width: 700px; max-height: 85vh; overflow: hidden; display: flex; flex-direction: column; background: var(--bg-secondary); border-radius: 12px; padding: 1.5rem;">
             <div class="modal-header" style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
                 <h3 style="margin: 0;">Discover Mints</h3>
                 <button type="button" onclick="closeMintDiscoveryModal()" style="background: none; border: none; font-size: 1.5rem; cursor: pointer; color: var(--text);">&times;</button>
@@ -9727,6 +9754,13 @@ header('Cache-Control: no-cache, must-revalidate');
                         overlay.classList.remove('visible');
                     }
                 });
+            });
+            // The mint-discovery dialog is not a .modal-overlay; give its
+            // scrim the same click-to-close. Only the discovery dialog
+            // closes — the enable-mint / store dialog underneath stays open.
+            const discoveryOverlay = document.getElementById('mint-discovery-modal');
+            discoveryOverlay.addEventListener('click', (e) => {
+                if (e.target === discoveryOverlay) closeMintDiscoveryModal();
             });
 
             // Delegated handler for mint-reliability buttons rendered via
