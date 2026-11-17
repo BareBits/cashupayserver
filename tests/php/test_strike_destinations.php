@@ -175,22 +175,49 @@ if (strpos($path, '/callback') === 0) {
     echo json_encode(['pr' => 'lnbc1mocknoverify']); // no `verify` field
     return;
 }
+if ($path === '/__lnurl_hint_mock') {
+    echo json_encode(['dir' => __DIR__]);
+    return;
+}
 http_response_code(404);
 PHP;
 file_put_contents($lnurlDir . '/router.php', $router);
-$lnurlPort = 27100 + (getmypid() % 800);
-$lnurlPid = (int) shell_exec(sprintf(
-    '%s -S 127.0.0.1:%d -t %s %s >/dev/null 2>&1 & echo $!',
-    escapeshellarg(PHP_BINARY), $lnurlPort,
-    escapeshellarg($lnurlDir), escapeshellarg($lnurlDir . '/router.php')
-));
-register_shutdown_function(static function () use ($lnurlPid) {
-    @posix_kill($lnurlPid, 9);
-});
-for ($i = 0; $i < 40; $i++) {
-    $c = @fsockopen('127.0.0.1', $lnurlPort, $e, $s, 0.2);
-    if ($c) { fclose($c); break; }
-    usleep(50000);
+// Pick the port the same way mock_strike_api.php / mock_lnurl_host.php do:
+// walk a pid-derived base and accept a port only once THIS router answers
+// its health route. The old single pid-derived port could coincide with
+// the Strike mock's (27500 + pid % 900 == 27100 + pid % 800 for pids
+// ending in 39xx), in which case the probe below hit the Strike mock's
+// 404 instead and the refusal lost its Strike hint — deterministically on
+// a fresh CI runner, whose pid sequence repeats run to run.
+$lnurlPort = 0;
+$base = 27100 + (getmypid() % 800);
+for ($attempt = 0; $attempt < 12 && $lnurlPort === 0; $attempt++) {
+    $candidate = $base + $attempt;
+    $lnurlPid = (int) shell_exec(sprintf(
+        '%s -S 127.0.0.1:%d -t %s %s >/dev/null 2>&1 & echo $!',
+        escapeshellarg(PHP_BINARY), $candidate,
+        escapeshellarg($lnurlDir), escapeshellarg($lnurlDir . '/router.php')
+    ));
+    register_shutdown_function(static function () use ($lnurlPid) {
+        @posix_kill($lnurlPid, 9);
+    });
+    for ($i = 0; $i < 40; $i++) {
+        $resp = @file_get_contents("http://127.0.0.1:{$candidate}/__lnurl_hint_mock");
+        if ($resp !== false) {
+            $h = json_decode($resp, true);
+            if (is_array($h) && ($h['dir'] ?? '') === $lnurlDir) {
+                $lnurlPort = $candidate;
+            }
+            break; // answered, but by someone else: next candidate
+        }
+        usleep(50000);
+    }
+    if ($lnurlPort === 0) {
+        @posix_kill($lnurlPid, 9);
+    }
+}
+if ($lnurlPort === 0) {
+    fail('could not start the LNURL hint mock on any candidate port');
 }
 putenv("CASHU_LNURL_URL_TEMPLATE=http://127.0.0.1:{$lnurlPort}/.well-known/lnurlp/{user}");
 try {
