@@ -39,7 +39,7 @@ from fixtures.wordpress import (
 )
 
 TESTS_DIR = Path(__file__).resolve().parent.parent
-SESSION_TMP = TESTS_DIR / ".tmp"
+SESSION_TMP = TESTS_DIR.parent / "app" / ".tmp"  # inside the served tree, see tests/conftest.py
 
 
 @pytest.fixture(scope="session")
@@ -268,3 +268,84 @@ def wp_option(wp: WordPressHandle, name: str) -> str:
     """An option's value via wp-cli ('' when unset)."""
     result = wp.wp_cli("option", "get", name, check=False)
     return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def drive_pairing(
+    wp: WordPressHandle, s: requests.Session, *, server_url: str, admin_password: str, store_id: str
+) -> None:
+    """Do what the merchant's browser does after clicking "Pair with
+    BareBits" in URL mode: follow the plugin's redirect to the server's
+    authorize page, sign in there, approve for `store_id`, and let the
+    approval's auto-submit form POST the minted key back to the plugin's
+    callback. Ends with the state token proven single-use."""
+    import html
+    from urllib.parse import parse_qs, urlparse
+
+    nonces = page_nonces(onboarding_page(s, wp))
+    r = s.post(
+        f"{wp.url}/wp-admin/admin-post.php",
+        data={"action": "barebits_start_pairing", "_wpnonce": nonces["barebits_start_pairing"]},
+        timeout=30,
+        allow_redirects=False,
+    )
+    assert r.status_code == 302, r.text[:300]
+    authorize_url = r.headers["Location"]
+    assert authorize_url.startswith(server_url), authorize_url
+    # Always the real file, never the pretty /api-keys/authorize rewrite —
+    # remote hosts that ignore .htaccess 404 the extension-less path.
+    assert urlparse(authorize_url).path.endswith("/api-keys/authorize.php"), authorize_url
+    query = parse_qs(urlparse(authorize_url).query)
+    callback = query["redirect"][0]
+    assert "state=" in callback
+    assert "barebits_pairing_callback" in callback
+    # BTCPay-convention repeated bare permissions.
+    assert "btcpay.store.webhooks.canmodifywebhooks" in query["permissions"]
+
+    # The server side: log in and approve. Fresh session — the payserver knows
+    # nothing about WordPress cookies.
+    ps = requests.Session()
+    body = ps.get(authorize_url, timeout=30).text
+    csrf = re.search(r'name="csrf_token" value="([^"]+)"', body).group(1)
+    body = ps.post(
+        authorize_url,
+        data={
+            "action": "login",
+            "username": "admin",
+            "password": admin_password,
+            "csrf_token": csrf,
+        },
+        timeout=30,
+    ).text
+    csrf = re.search(r'name="csrf_token" value="([^"]+)"', body).group(1)
+    # The approval form carries every requested permission as
+    # approved_permissions[] (hidden fields in strict mode, checkboxes
+    # otherwise); the server grants the ticked subset of the request and
+    # refuses an approval that grants nothing. Post what the browser would.
+    body = ps.post(
+        authorize_url,
+        data={
+            "action": "approve",
+            "store_id": store_id,
+            "csrf_token": csrf,
+            "approved_permissions[]": query["permissions"],
+        },
+        timeout=30,
+    ).text
+
+    # The approval renders an auto-submit form POSTing the key to the
+    # callback; replay it the way the browser would. The action attribute is
+    # HTML-escaped (&amp; between query params), so unescape like a browser.
+    form_action = html.unescape(re.search(r'<form[^>]+action="([^"]+)"', body).group(1))
+    fields = {
+        html.unescape(name): html.unescape(value)
+        for name, value in re.findall(
+            r'<input type="hidden" name="([^"]+)" value="([^"]*)"', body
+        )
+    }
+    assert fields.get("apiKey") and fields.get("storeId") == store_id, body[:500]
+    r = requests.post(form_action, data=fields, timeout=60, allow_redirects=False)
+    assert r.status_code in (301, 302), f"callback -> {r.status_code}: {r.text[:300]}"
+
+    # Replay protection: the state token is single-use.
+    replay = requests.post(form_action, data=fields, timeout=30)
+    assert replay.status_code == 403

@@ -13,6 +13,7 @@ import time
 import pytest
 
 from conftest import ConfiguredPayserver
+from fixtures.browser import expand_settings_cards
 
 pytestmark = pytest.mark.ui
 
@@ -51,6 +52,7 @@ def _open_store_settings(page, configured: ConfiguredPayserver) -> None:
     # assertions must target the per-test store's row.
     page.select_option("#store-select", configured.store_id)
     page.locator('.nav-item[data-view="stores"]').click()
+    expand_settings_cards(page)
     page.wait_for_selector("#card-payment-order", state="visible")
     # The card hydrates from the ?api=stores fetch; wait for Store Info to be
     # populated with this store's id so the radios reflect its row.
@@ -95,7 +97,7 @@ def test_payment_order_card_sits_below_store_info(
         "#store-settings-content > .card > .card-header > .card-title",
         "els => els.map(e => e.textContent.trim())",
     )
-    assert titles[:3] == ["Store Info", "Payment order", "Lightning payments"], titles
+    assert titles[:4] == ["Store Info", "Payment order", "Popular wallet tabs", "Lightning payments"], titles
 
     # Two radios, on-chain checked by default for a store that never saved.
     assert _store_first_method(shared_configured.handle, shared_configured.store_id) is None

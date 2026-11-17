@@ -32,6 +32,7 @@ from fixtures.api_client import AdminClient
 from fixtures.payserver import PayserverHandle, start_payserver, stop_payserver
 from fixtures.setup_helpers import SetupWizard
 from fixtures import ports
+from fixtures.browser import expand_settings_cards
 
 # Reference noffer from @shocknet/clink-sdk (decodes to a valid pubkey/relay/
 # offer). Used only for config persistence — never dialled in this test.
@@ -100,7 +101,6 @@ def _walk_wizard_mintless(url: str, store: str) -> None:
     w.through_store(store)
     w.post(step="onchain", onchain_action="skip")
     w.post(step="lightning", lightning_action="skip")
-    w.post(step="swaps", swaps_enabled="0")
     w.post(step="mints", mints_enabled="0")
 
 
@@ -135,14 +135,15 @@ def test_sections_markup_order_and_default_collapsed(mintless_payserver) -> None
     page = _admin_html(mintless_payserver)
 
     # All five sections render inside the Lightning payments card, in path
-    # order, with the save button between the destinations and the Cashu
+    # order, with the save button at the bottom of the card after the Cashu
     # section; the separate cashout / offline cards are gone.
     lp = page.index('id="card-lightning-payments"')
     positions = [page.index(f'id="{sid}"') for sid in SECTION_IDS]
     assert positions == sorted(positions), positions
     assert lp < positions[0]
     save_btn = page.index('id="btn-save-lightning-payments"')
-    assert positions[3] < save_btn < positions[4]
+    assert positions[4] < save_btn
+    assert save_btn < page.index('id="card-store-swaps"')
     assert 'id="card-cashu-cashout"' not in page
     assert ">Offline Cashu Acceptance<" not in page
 
@@ -201,6 +202,7 @@ def admin_page(mintless_payserver, browser):
 
 def _goto_stores(page, base) -> None:
     page.goto(f"{base}/admin/stores", wait_until="networkidle")
+    expand_settings_cards(page)
     page.wait_for_timeout(1500)
 
 

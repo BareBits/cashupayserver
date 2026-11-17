@@ -17,8 +17,8 @@ declare(strict_types=1);
 require __DIR__ . '/harness.php';
 require __DIR__ . '/mock_mint_stub.php';
 $dataDir = fresh_db();
-require_once dirname(__DIR__, 2) . '/includes/config.php';
-require_once dirname(__DIR__, 2) . '/includes/invoice.php';
+require_once dirname(__DIR__, 2) . '/app/includes/config.php';
+require_once dirname(__DIR__, 2) . '/app/includes/invoice.php';
 
 use Cashu\Proof;
 use Cashu\ProofState;
@@ -33,7 +33,7 @@ Database::insert('users', [
     'id' => 'user_mc_admin', 'username' => 'admin', 'password_hash' => password_hash('x', PASSWORD_DEFAULT),
     'role' => 'admin', 'created_at' => Database::timestamp(),
 ]);
-$root = dirname(__DIR__, 2);
+$root = dirname(__DIR__, 2) . '/app';
 $runner = $dataDir . '/admin_runner.php';
 file_put_contents($runner, sprintf(<<<'PHP'
 <?php
@@ -50,6 +50,7 @@ require %s;
 Auth::initSession();
 $_SESSION['user_id'] = 'user_mc_admin';
 $_SESSION['user_role'] = 'admin';
+$_SESSION['auth_fp'] = hash('sha256', 'cashupay-session:' . (string)Database::fetchOne("SELECT password_hash FROM users WHERE id = ?", [$_SESSION['user_id']])['password_hash']);
 $_SESSION['login_time'] = time();
 $_POST = json_decode((string)getenv('T_POST'), true);
 $_POST['csrf_token'] = Auth::generateCsrfToken();

@@ -9,6 +9,8 @@
  *
  *   {
  *     "quotes":  { "<quoteId>": {"state": "UNPAID|PAID|ISSUED", "expiry": 123, "amount": 500} },
+ *     "quote_ttl": 600,                      // expiry of quotes created via POST (qauto1, qauto2, ...)
+ *     "quote_create_fail": false,            // POST quote → 500 when true
  *     "states":  { "<Yhex>": "SPENT" },      // per-Y override for checkstate
  *     "default_state": "UNSPENT",            // checkstate answer for other Ys
  *     "checkstate_mode": "ok|empty|short|reorder|lowercase",
@@ -59,6 +61,34 @@ if ($path === '/v1/keys' || $path === '/v1/keys/' . $keysetId) {
     echo json_encode(['keysets' => [['id' => $keysetId, 'unit' => 'sat', 'keys' => $keys]]]);
     exit;
 }
+if ($path === '/v1/mint/quote/bolt11' && ($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
+    // Quote creation (NUT-04). Ids are sequential ("qauto1", ...), the
+    // bolt11 is a per-quote stub string, expiry = now + quote_ttl (600 s).
+    // Set "quote_create_fail": true in the state to simulate a mint that is
+    // down for new quotes while still answering status checks.
+    if (!empty($state['quote_create_fail'])) {
+        http_response_code(500);
+        echo json_encode(['detail' => 'mint unavailable', 'code' => 20000]);
+        exit;
+    }
+    $req = json_decode($body, true) ?: [];
+    $n = (int)($state['quote_seq'] ?? 0) + 1;
+    $id = 'qauto' . $n;
+    $q = [
+        'state' => 'UNPAID',
+        'expiry' => time() + (int)($state['quote_ttl'] ?? 600),
+        'amount' => (int)($req['amount'] ?? 0),
+        'request' => 'lnbc1stub' . $id,
+    ];
+    $state['quotes'][$id] = $q;
+    $state['quote_seq'] = $n;
+    file_put_contents(__DIR__ . '/state.json', json_encode($state));
+    echo json_encode([
+        'quote' => $id, 'request' => $q['request'], 'amount' => $q['amount'],
+        'unit' => 'sat', 'state' => 'UNPAID', 'expiry' => $q['expiry'],
+    ]);
+    exit;
+}
 if (preg_match('#^/v1/mint/quote/bolt11/([^/]+)$#', $path, $m)) {
     $q = $state['quotes'][$m[1]] ?? null;
     if ($q === null) {
@@ -68,7 +98,7 @@ if (preg_match('#^/v1/mint/quote/bolt11/([^/]+)$#', $path, $m)) {
     }
     echo json_encode([
         'quote' => $m[1],
-        'request' => 'lnbc1stub',
+        'request' => (string)($q['request'] ?? 'lnbc1stub'),
         'amount' => (int)($q['amount'] ?? 0),
         'unit' => 'sat',
         'state' => (string)($q['state'] ?? 'UNPAID'),

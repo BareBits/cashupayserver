@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/img/barebits-logo.svg">
-    <img src="assets/img/barebits-logo-dark.svg" alt="BareBits" width="360">
+    <source media="(prefers-color-scheme: dark)" srcset="app/assets/img/barebits-logo.svg">
+    <img src="app/assets/img/barebits-logo-dark.svg" alt="BareBits" width="360">
   </picture>
 </p>
 
@@ -134,7 +134,7 @@ Generally speaking, BareBits tries to offer both on-chain and lightning as payme
 
 The BareBits software charges a 1% fee for usage. If you are a web developer, you can sell this service to your clients and charge an additional fee on top. Fees are paid in two ways, both of which are clearly shown in the invoices and stats tabs in your BareBits installation.
 
- - When any invoice is generated where the invoice amount is < the fee due, the payment will be automatically redirected to the fee destination. For example, if you owe 1000 sats in fees and a customer pays a 500 sat invoice, that payment will be sent directly to BareBits developers.
+ - When any invoice is generated where the invoice amount is < the fee due, the payment will be automatically redirected to the fee destination. For example, if you owe 1000 sats in fees and a customer pays a 500 sat invoice, that payment will be sent directly to BareBits developers. The Lightning invoice is requested from the fee destination with the amount only: no store name, order reference, item description, memo or invoice ID is ever sent to the fee payee. A long-lived payment request can be redirected too; its sats amount is then locked at creation (fees are owed in sats, so it is never re-quoted) and a lapsed Lightning invoice is refreshed from the same fee destination at that amount.
  - If any funds are in the cashu mint and a fee is due, those funds will be used to pay the fee
 
 This "payment redirection" method of paying fees ensures that BareBits developers never have access to your funds or your customer's private information.
@@ -275,6 +275,28 @@ curl -I https://yoursite.com/barebits/data/cashupay.sqlite
 define('CASHUPAY_DATA_DIR', '/home/user/cashupay-data');
 ```
 
+### Keep the database on a local disk
+
+The database is SQLite in write-ahead-logging (WAL) mode. Concurrent payments
+are safe on a local filesystem: writers queue on a file lock for a few
+milliseconds each, every settlement is a status-guarded update that can only
+succeed once, and a lock wait that runs out is retried automatically before
+the request fails.
+
+That safety depends on file locking that works, which network filesystems do
+not reliably provide. **Never place `data/` on NFS, SMB/CIFS, sshfs, or a VM
+shared folder (VirtualBox `vboxsf`, 9p).** Two processes can both believe they
+hold the write lock there, which corrupts the database — and the ecash in it.
+This also rules out sharing one `data/` directory between several web servers;
+each install needs its own local copy.
+
+The setup wizard's safety check and the admin dashboard warn when the data
+directory is detected on such a filesystem (Linux reads the mount table, Windows
+recognises `\\server\share` paths; macOS and mapped drive letters are not
+detected) or when SQLite could not enable WAL mode there. If you have verified
+your setup is safe, dismiss the dashboard notice or add
+`define('CASHUPAY_IGNORE_NETWORK_FS', true);` to `includes/config.local.php`.
+
 ### Seed Phrase
 
 Your seed phrase is your backup of funds stored in your Cashu mint (if enabled). Write it down and store it safely. If you lose access to your server, you can recover your funds with the seed phrase.
@@ -287,7 +309,7 @@ If you're locked out of the admin dashboard there are two ways to recover, both 
 
 **Option 1 — Email a reset link.** Requires two things to be set up in advance:
 
-- A **recovery email** on the admin account. Set it during the setup wizard (the optional "Recovery email" field on the password step) or later under **Settings → My Account → Recovery email**.
+- A **recovery email** on the admin account. Set it during the setup wizard (the "E-mail notifications" step collects it alongside your SMTP settings; by default it is the same address notifications go to) or later under **Settings → My Account → Recovery email**.
 - **Outbound email (SMTP)** configured under **Settings → Email Notifications** in the admin UI (global, with an optional per-store override). As a fallback, SMTP can also be set via the `CASHUPAY_SMTP_*` settings in `user_config.php` (see `user_config.example.php`). Without working email this option cannot deliver the link.
 
 Click **Forgot password? → Email me a reset link**, enter the admin recovery email, and open the link that arrives. The link is valid for **one hour** and can be used **once**. (For privacy, the page always reports success regardless of whether the address matched an account.)
@@ -310,7 +332,7 @@ The simplest way to run BareBits locally:
 
 ```bash
 git clone --recurse-submodules https://github.com/BareBits/cashupayserver.git
-cd cashupayserver
+cd cashupayserver/app
 # Install PHP dependencies (bitwasp/bitcoin for on-chain payment support).
 # Composer is only needed for development and at build time — the deploy zip
 # bundles vendor/ so end users don't need Composer on their hosting.
@@ -318,7 +340,12 @@ php composer.phar install --no-dev --ignore-platform-reqs   # or: composer insta
 php -S localhost:8000 router.php
 ```
 
-If `composer.phar` isn't checked in, fetch it once with:
+The application lives in the repository's `app/` directory — the exact tree a
+release zip extracts to (`admin.php`, `includes/`, `assets/`, ...). Everything
+outside `app/` (tests, build scripts, Docker files, docs) is development
+tooling that never ships. Serve `app/` as the web root, never the repo root.
+
+If `composer.phar` isn't checked in, fetch it once (inside `app/`) with:
 
 ```bash
 curl -sS https://getcomposer.org/installer | php
@@ -332,7 +359,7 @@ The `router.php` handles routing and **blocks access to sensitive directories** 
 
 A Docker configuration is available for **testing only** (not production). It includes WordPress, WooCommerce, and the BTCPay plugin pre-installed with SQLite (no MySQL needed).
 
-See [DOCKER.md](DOCKER.md) for detailed setup instructions, persistent data volumes, and troubleshooting.
+See [docs/DOCKER.md](docs/DOCKER.md) for detailed setup instructions, persistent data volumes, and troubleshooting.
 
 #### Standalone + WordPress
 
@@ -365,7 +392,7 @@ This starts:
 If you modify the mint-discovery submodule:
 
 ```bash
-cd mint-discovery
+cd app/mint-discovery
 npm install
 npm run build
 cp dist/mint-discovery.bundle.js ../assets/js/
@@ -373,20 +400,18 @@ cp dist/mint-discovery.bundle.js ../assets/js/
 
 ## Security for Development Environments
 
-**When running directly from the git repository (not from the distribution zip), you MUST ensure your web server blocks access to sensitive files.**
+**When running directly from the git repository (not from the distribution zip), serve the `app/` directory as the web root and make sure your web server blocks access to sensitive files.**
 
-The distribution zip only includes necessary files. The git repository contains test scripts, examples, and documentation that should never be web-accessible.
+The distribution zip only includes necessary files. The git repository's `app/` directory is that same tree plus the `mint-discovery/` submodule source; everything else in the repository (tests, build scripts, Docker files, docs) sits outside `app/` and is never reachable when `app/` is the web root. Never point a web server at the repository root.
 
 ### What Needs Protection
 
-| Directory/File | Contains | Risk if Exposed |
+| Directory/File (inside `app/`) | Contains | Risk if Exposed |
 |---------------|----------|-----------------|
 | `data/` | SQLite database with ecash tokens | **Critical** - Loss of funds |
 | `includes/` | PHP classes | Code execution |
 | `cashu-wallet-php/` | Library with test scripts | Code execution |
 | `mint-discovery/` | Node.js source | Info leak |
-| `scripts/` | Build scripts | Info leak |
-| `docker/` | Docker configs | Info leak |
 
 ### Apache (Development)
 
@@ -430,7 +455,7 @@ scripts/webserver-smoke.sh https://yoursite.com --nginx  # nginx
 Using `router.php` is safe - it blocks sensitive paths:
 
 ```bash
-php -S localhost:8000 router.php
+cd app && php -S localhost:8000 router.php
 ```
 
 **Do NOT use** `php -S localhost:8000` without the router - it will serve all files!
@@ -445,6 +470,26 @@ curl -X POST "https://yoursite.com/api/v1/stores/{storeId}/invoices" \
   -H "Authorization: token YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"amount": "10.00", "currency": "EUR"}'
+```
+
+A checkout invoice expires after one hour by default. Pass
+`checkout.expirationMinutes` (1 up to 129600, i.e. 90 days) to choose the
+lifetime. An invoice created with that field and no `metadata.orderId` is a
+**long-lived payment request**: the payment page re-sources its Lightning
+invoice whenever the previous one lapses (the old one stays under watch so a
+payer who already scanned it still settles the invoice), and a fiat amount is
+re-quoted in sats each time the page is opened. The admin "Create invoice"
+screen and the self-serve page create their invoices this way. Shop orders
+(any invoice carrying `metadata.orderId`) keep the standard expiry behavior.
+A long-lived request that was redirected to a fee destination (see Fee
+Payments) keeps the sats amount it was created with and refreshes its
+Lightning invoice from that same destination.
+
+```bash
+curl -X POST "https://yoursite.com/api/v1/stores/{storeId}/invoices" \
+  -H "Authorization: token YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"amount": "10.00", "currency": "EUR", "checkout": {"expirationMinutes": 129600}}'
 ```
 
 ### Get Invoice

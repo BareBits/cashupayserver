@@ -36,6 +36,10 @@ class LnurlpServer:
     # endpoint refuses to look up payment hashes we never minted, which keeps
     # tests from accidentally querying random hashes.
     issued_hashes: set[str] = field(default_factory=set)
+    # Every request URI (path + raw query) served, oldest first. Lets tests
+    # assert exactly what cashupayserver sent — e.g. that a fee payee's
+    # callback carried the amount and nothing about the sale.
+    requests: list[str] = field(default_factory=list)
 
     @property
     def base_url(self) -> str:
@@ -68,6 +72,7 @@ def start_lnurlp_server(receiver: LndHandle, *, lud21: bool = True) -> LnurlpSer
     """
     port = ports.allocate(1)[0]
     issued_hashes: set[str] = set()
+    seen_requests: list[str] = []
 
     class Handler(BaseHTTPRequestHandler):
         def _send_json(self, status: int, body: dict) -> None:
@@ -79,6 +84,7 @@ def start_lnurlp_server(receiver: LndHandle, *, lud21: bool = True) -> LnurlpSer
             self.wfile.write(payload)
 
         def do_GET(self):  # noqa: N802
+            seen_requests.append(self.path)
             parsed = urlparse(self.path)
             path = parsed.path
 
@@ -161,7 +167,7 @@ def start_lnurlp_server(receiver: LndHandle, *, lud21: bool = True) -> LnurlpSer
     server = HTTPServer(("127.0.0.1", port), Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True, name=f"lnurlp-{port}")
     thread.start()
-    return LnurlpServer(port=port, server=server, thread=thread, issued_hashes=issued_hashes)
+    return LnurlpServer(port=port, server=server, thread=thread, issued_hashes=issued_hashes, requests=seen_requests)
 
 
 def stop_lnurlp_server(s: LnurlpServer) -> None:

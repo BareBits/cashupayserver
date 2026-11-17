@@ -3,7 +3,7 @@
 The repo ships a production image for operators who'd rather run a single
 container than wire up PHP/Apache by hand. It's the same code as the
 shared-hosting deploy described in the README — just packaged for
-`docker compose up`.
+`docker compose` (compose file: `docker/docker-compose.yml`).
 
 > **Heads up:** This is the BareBits fork of cashupayserver. The README's
 > warnings about experimental software and "do not use with amounts you
@@ -20,7 +20,11 @@ shared-hosting deploy described in the README — just packaged for
 - **Persistent volume:** `/var/www/html`. The app source lives here so
   the in-app auto-updater can overlay files durably across restarts;
   the SQLite database, cache, and update backups live under
-  `/var/www/html/data/`.
+  `/var/www/html/data/`. Back the volume with local disk: SQLite's file
+  locking is not reliable on NFS/SMB or VM shared folders, and the app
+  warns in the wizard and on the dashboard when it detects one (see
+  "Keep the database on a local disk" in the README). One volume per
+  container — never point two containers at the same `data/`.
 - **In-container cron:** A background loop runs `cron.php` every
   `CRON_INTERVAL_SECONDS` (default 60). Set to `0` if you'd rather run
   cron from an external scheduler.
@@ -38,15 +42,16 @@ shared-hosting deploy described in the README — just packaged for
   degrades to `direct`/`router` without its front controller). Either way,
   verify a deployment with `scripts/webserver-smoke.sh <url> [--nginx]`.
 - **WordPress / WooCommerce integration testing.** That's what the other
-  two `docker/Dockerfile.*` images are for — see [DOCKER.md](../DOCKER.md).
+  two `docker/Dockerfile.*` images are for — see [DOCKER.md](DOCKER.md).
 - **Multi-tenant orchestration.** This is one container per deployment.
 
 ## Quick start
 
-From the repo root:
+From the repo root (the compose file lives in `docker/`; the build context is
+the repo root and the image copies the application tree from `app/`):
 
 ```bash
-docker compose up -d --build
+docker compose -f docker/docker-compose.yml up -d --build
 ```
 
 Then open `http://localhost:8080/setup.php` and complete the setup wizard.
@@ -54,13 +59,13 @@ Then open `http://localhost:8080/setup.php` and complete the setup wizard.
 To stop:
 
 ```bash
-docker compose down
+docker compose -f docker/docker-compose.yml down
 ```
 
 To wipe everything (including the database):
 
 ```bash
-docker compose down -v
+docker compose -f docker/docker-compose.yml down -v
 ```
 
 ## Configuration
@@ -81,7 +86,7 @@ table above plus `CASHUPAY_UPDATER_DISABLED`, `CASHUPAY_DATA_DIR`,
 `CASHUPAY_DEPLOYMENT_ID`, `CASHUPAY_DEV_FEE_LNURL`, `CASHUPAY_DEV_FEE_BRANCH_ENDPOINT`
 (test rigs only — see `includes/fee_branch.php`),
 `CASHUPAY_TRUSTED_MINTS_URL`, and `CASHUPAY_TRUSTED_MINTS_REFRESH_MINUTES`.
-Any other constant documented in [`user_config.example.php`](../user_config.example.php)
+Any other constant documented in [`user_config.example.php`](../app/user_config.example.php)
 is **not** picked up from the environment — set it as a PHP constant in
 `user_config.php` or from the admin UI. Two common cases:
 
@@ -127,9 +132,9 @@ There are two upgrade paths and they intentionally do not collide:
    redeploy with a newer image tag when you want to upgrade. The
    entrypoint will **not** overwrite an existing `/var/www/html` volume,
    so you must either:
-   - apply updates by hand: `docker compose down`, mount the volume into
+   - apply updates by hand: `docker compose -f docker/docker-compose.yml down`, mount the volume into
      an alpine container, copy in the new sources, restart; or
-   - wipe the volume (`docker compose down -v`) and lose your data.
+   - wipe the volume (`docker compose -f docker/docker-compose.yml down -v`) and lose your data.
 
 Pick one strategy and stick with it. Mixing them — running auto-update
 on top of a pinned image — works but makes debugging harder because
@@ -157,20 +162,20 @@ Restore is the inverse with the container stopped.
 ## Troubleshooting
 
 ### Container starts but `/setup.php` returns 500
-Check Apache + cron output: `docker compose logs -f cashupayserver`.
+Check Apache + cron output: `docker compose -f docker/docker-compose.yml logs -f cashupayserver`.
 The auto-updater and cron-driven workers write to the same stream.
 
 ### `pdo_sqlite` or `gmp` missing
-Confirm the build succeeded: `docker compose exec cashupayserver php -m`
+Confirm the build succeeded: `docker compose -f docker/docker-compose.yml exec cashupayserver php -m`
 should list both. If not, rebuild without cache:
-`docker compose build --no-cache`.
+`docker compose -f docker/docker-compose.yml build --no-cache`.
 
 ### Auto-updater not running
-Verify the env var is set: `docker compose exec cashupayserver env | grep AUTO_UPDATE`.
+Verify the env var is set: `docker compose -f docker/docker-compose.yml exec cashupayserver env | grep AUTO_UPDATE`.
 Then check `data/updates/` for a `.lock` file — a stuck lock will skip
 new ticks. Delete the lock and wait for the next cron interval.
 
 ### "Permission denied" on `data/`
 Re-running the entrypoint fixes ownership:
-`docker compose restart cashupayserver`. If the problem persists,
+`docker compose -f docker/docker-compose.yml restart cashupayserver`. If the problem persists,
 something else is writing to the volume as a non-`www-data` user.

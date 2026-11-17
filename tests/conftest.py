@@ -67,7 +67,13 @@ from fixtures import webserver  # noqa: E402
 DEFAULT_ADMIN_PASSWORD = "test-admin-pw-1234"
 DEFAULT_STORE_NAME = "Test Store"
 
-SESSION_TMP = TESTS_DIR / ".tmp"
+# Session scratch (per-test workdirs, data dirs, logs). Lives INSIDE the served
+# application tree (app/.tmp) on purpose: a fixture server's data dir is then
+# under the web root, the shape of a shared-hosting install, so the wizard
+# shows its security screen and the deny rules (router.php / .htaccess /
+# nginx) are exercised against real files. Gitignored, never copied by the
+# build scripts, and hidden-path-denied like any dot-directory.
+SESSION_TMP = TESTS_DIR.parent / "app" / ".tmp"
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +87,30 @@ def pytest_addoption(parser) -> None:
         help="Run only the Mth of N deterministic file-level suite shards "
         "(whole files stay together; see fixtures/partition.py).",
     )
+    parser.addoption(
+        "--skip-upgrade-tier",
+        action="store_true",
+        default=False,
+        help="Do not collect tests/upgrade/ (the published-release upgrade matrix: "
+        "needs GitHub for the release window and runs for many minutes per release). "
+        "CI passes this; the local full run does not.",
+    )
+
+
+UPGRADE_TIER_DIR = TESTS_DIR / "upgrade"
+
+
+def pytest_ignore_collect(collection_path, config) -> bool | None:
+    """--skip-upgrade-tier drops tests/upgrade/ before collection, so CI never
+    even resolves the release window (a GitHub API call) for tests it will
+    not run."""
+    if config.getoption("--skip-upgrade-tier"):
+        try:
+            Path(str(collection_path)).resolve().relative_to(UPGRADE_TIER_DIR)
+        except ValueError:
+            return None
+        return True
+    return None
 
 
 def pytest_report_header(config) -> str:
@@ -88,6 +118,8 @@ def pytest_report_header(config) -> str:
     spec = config.getoption("--split-group")
     if spec:
         header += f" | suite shard: {spec}"
+    if config.getoption("--skip-upgrade-tier"):
+        header += " | upgrade tier: skipped"
     return header
 
 
@@ -171,7 +203,7 @@ def _maybe_remove_workdir(workdir: Path, green: bool) -> None:
 
 def _sweep_stale_fixture_processes() -> None:
     """Kill fixture processes (php -S, bitcoind, lnd, mint, …) orphaned by a
-    previous killed run: anything whose cmdline references tests/.tmp. Runs
+    previous killed run: anything whose cmdline references app/.tmp. Runs
     before this session creates its own workdirs, so a live match is stale by
     definition — except a concurrently running suite on this same checkout;
     opt out with CASHUPAY_NO_STALE_SWEEP=1 in that case."""

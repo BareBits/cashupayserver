@@ -19,7 +19,7 @@
 declare(strict_types=1);
 require __DIR__ . '/harness.php';
 $dataDir = fresh_db();
-require_once dirname(__DIR__, 2) . '/includes/config.php';
+require_once dirname(__DIR__, 2) . '/app/includes/config.php';
 
 // The session needs a real admin row so anything resolving currentUser works.
 Database::insert('users', [
@@ -30,7 +30,7 @@ Database::insert('users', [
     'created_at'    => Database::timestamp(),
 ]);
 
-$root = dirname(__DIR__, 2);
+$root = dirname(__DIR__, 2) . '/app';
 $runner = $dataDir . '/admin_notif_runner.php';
 file_put_contents($runner, sprintf(<<<'PHP'
 <?php
@@ -49,6 +49,7 @@ require %s;
 Auth::initSession();
 $_SESSION['user_id'] = 'user_notif_admin';
 $_SESSION['user_role'] = 'admin';
+$_SESSION['auth_fp'] = hash('sha256', 'cashupay-session:' . (string)Database::fetchOne("SELECT password_hash FROM users WHERE id = ?", [$_SESSION['user_id']])['password_hash']);
 $_SESSION['login_time'] = time();
 $_POST = json_decode((string)getenv('T_POST'), true);
 $_POST['csrf_token'] = Auth::generateCsrfToken();
@@ -156,6 +157,7 @@ require %s;
 Auth::initSession();
 $_SESSION['user_id'] = 'user_notif_admin';
 $_SESSION['user_role'] = 'admin';
+$_SESSION['auth_fp'] = hash('sha256', 'cashupay-session:' . (string)Database::fetchOne("SELECT password_hash FROM users WHERE id = ?", [$_SESSION['user_id']])['password_hash']);
 $_SESSION['login_time'] = time();
 $_POST = [
     'action' => 'save_notifications_settings',

@@ -18,6 +18,7 @@ Needs the mint fixtures (the wizard's mints screen talks to a live mint).
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 
@@ -43,19 +44,24 @@ def _walk_barebits_wizard(wp: WordPressHandle, mint_url: str, backup_mint_url: s
     merchant never types a BareBits password), and CASHUPAY_MANAGED_INSTALL
     (cron screen skipped)."""
     wiz = SetupWizard(wp.url, setup_path="/barebits/setup.php")
-    body = wiz.accept_terms()
+    wiz.accept_terms()
+    wiz.decline_analytics()
+    body = wiz.choose_install_type("other")
     heading = wizard_heading(body)
-    # Managed install: terms lands straight on the store screen — no
-    # security screen (data dir outside the web root) and no password screen
-    # (the admin account was pre-seeded from CASHUPAY_ADMIN_PASSWORD_HASH).
+    # Managed install: the installation type lands straight on the e-mail
+    # screen — no security screen (data dir outside the web root) and no
+    # password screen (the admin account was pre-seeded from
+    # CASHUPAY_ADMIN_PASSWORD_HASH).
     assert "password" not in heading.lower(), (
         f"password screen rendered despite the pre-seeded admin: {heading!r}"
     )
+    assert heading == "E-mail notifications", f"expected the e-mail screen, got {heading!r}"
+    body = wiz.skip_email()
+    heading = wizard_heading(body)
     assert "store" in heading.lower(), f"expected the store screen, got {heading!r}"
     body = wiz.post(step="store", store_name="Alongside Store", default_currency="sat")
     body = wiz.post(step="onchain", onchain_action="skip")
     body = wiz.post(step="lightning", lightning_action="skip")
-    body = wiz.post(step="swaps", swaps_enabled="0")
     body = wiz.post(
         step="mints",
         mints_enabled="1",
@@ -63,12 +69,15 @@ def _walk_barebits_wizard(wp: WordPressHandle, mint_url: str, backup_mint_url: s
         backup_mint_url=backup_mint_url,
         mint_unit="sat",
     )
-    # Managed installs still get the auto-update question after mints…
+    # The wallet-tabs question follows the last rail screen; skip it. The
+    # mints answer minted a wallet seed: the recovery-phrase screen follows,
+    # then the auto-update question…
+    assert wizard_heading(body) == "Popular wallet tabs", wizard_heading(body)
+    body = wiz.post(step="wallet_tabs", wallet_tabs_action="skip")
+    assert wizard_heading(body) == "Save your recovery phrase", wizard_heading(body)
+    body = wiz.post(step="seed", seed_saved="1")
     assert wizard_heading(body) == "Enable automatic updates?", wizard_heading(body)
     body = wiz.post(step="updates", auto_update="0")
-    # …and the usage-statistics question…
-    assert wizard_heading(body) == "Anonymous usage statistics", wizard_heading(body)
-    body = wiz.post(step="analytics", usage_stats="0")
     # …then must land on completion, never the crontab screen — WP-cron owns
     # the heartbeat.
     heading = wizard_heading(body)
@@ -183,7 +192,26 @@ def test_install_mode_end_to_end(wordpress_install_mode, mint, backup_mint) -> N
 
     assert wp_option(wp, "btcpay_gf_url") == wp.barebits_gateway_url
     assert wp_option(wp, "btcpay_gf_store_id") == store_id
-    assert wp_option(wp, "btcpay_gf_api_key") == internal_key["internal_api_key"]
+    # The gateway holds a dedicated store-scoped key minted by provision.php
+    # with the default store permission set (invoices + webhooks) — never the
+    # dashboard's internal key, which stays create-only because the limited
+    # user role is handed it for Request Payment.
+    paired_key = wp_option(wp, "btcpay_gf_api_key")
+    assert paired_key and paired_key != internal_key["internal_api_key"]
+    with wp.db() as db:
+        key_row = db.execute(
+            "SELECT store_id, application_identifier, permissions FROM api_keys WHERE key_hash = ?",
+            (hashlib.sha256(paired_key.encode()).hexdigest(),),
+        ).fetchone()
+    assert key_row is not None and key_row["store_id"] == store_id
+    assert key_row["application_identifier"] == "cashupay-provision"
+    assert set(json.loads(key_row["permissions"])) == {
+        "btcpay.store.canviewinvoices",
+        "btcpay.store.cancreateinvoice",
+        "btcpay.store.canmodifyinvoices",
+        "btcpay.store.canviewstoresettings",
+        "btcpay.store.webhooks.canmodifywebhooks",
+    }
 
     # Webhook registered over the Greenfield API, secret shared with the
     # gateway plugin's option.
@@ -281,7 +309,7 @@ def test_install_mode_end_to_end(wordpress_install_mode, mint, backup_mint) -> N
     invoice = requests.post(
         f"{wp.barebits_url}/api/v1/stores/{store_id}/invoices",
         json={"amount": "21", "currency": "SATS"},
-        headers={"Authorization": f"token {internal_key['internal_api_key']}"},
+        headers={"Authorization": f"token {paired_key}"},
         timeout=60,
     )
     assert invoice.status_code == 200, invoice.text[:300]
@@ -307,7 +335,7 @@ def test_install_mode_end_to_end(wordpress_install_mode, mint, backup_mint) -> N
     order_invoice = requests.post(
         f"{wp.barebits_url}/api/v1/stores/{store_id}/invoices",
         json={"amount": "21", "currency": "SATS", "metadata": {"orderId": "4242"}},
-        headers={"Authorization": f"token {internal_key['internal_api_key']}"},
+        headers={"Authorization": f"token {paired_key}"},
         timeout=60,
     ).json()
     order_page = requests.get(

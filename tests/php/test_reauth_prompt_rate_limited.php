@@ -14,7 +14,7 @@
 declare(strict_types=1);
 require __DIR__ . '/harness.php';
 fresh_db();
-require_once dirname(__DIR__, 2) . '/includes/auth.php';
+require_once dirname(__DIR__, 2) . '/app/includes/auth.php';
 
 Auth::setAdminPassword('correct-horse-battery');
 $admin = Auth::getUserByUsername('admin');
@@ -24,6 +24,7 @@ assert_not_null($admin, 'admin user exists');
 Auth::initSession();
 $_SESSION['user_id'] = $admin['id'];
 $_SESSION['user_role'] = Auth::ROLE_ADMIN;
+$_SESSION['auth_fp'] = hash('sha256', 'cashupay-session:' . (string)Database::fetchOne("SELECT password_hash FROM users WHERE id = ?", [$_SESSION['user_id']])['password_hash']);
 
 $ip = '198.51.100.77';
 $_SERVER['REMOTE_ADDR'] = $ip;

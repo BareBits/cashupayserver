@@ -24,8 +24,11 @@ import requests
 from . import binaries, ports, webserver
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent  # /home/user/payserver
+# The application tree (what a release zip extracts to) lives under app/;
+# it is the served docroot. REPO_ROOT stays the container bind-mount root.
+APP_ROOT = REPO_ROOT / "app"
 TESTS_DIR = REPO_ROOT / "tests"
-TMP_DIR = TESTS_DIR / ".tmp"
+TMP_DIR = APP_ROOT / ".tmp"  # see conftest.SESSION_TMP: inside the served tree on purpose
 
 # php -S's router script does NOT honor auto_prepend_file, so we wrap router.php
 # in a tiny entry script. The wrapper:
@@ -48,6 +51,10 @@ class PayserverHandle:
     port: int
     data_dir: Path
     workdir: Path
+    # URL path prefix for an install that is not the docroot itself — the
+    # BareBits server the WordPress plugin installs at <site>/barebits. Empty
+    # for every standalone fixture.
+    base_path: str = ""
 
     @property
     def process(self) -> subprocess.Popen[bytes] | None:
@@ -56,7 +63,7 @@ class PayserverHandle:
 
     @property
     def url(self) -> str:
-        return f"http://127.0.0.1:{self.port}"
+        return f"http://127.0.0.1:{self.port}{self.base_path}"
 
     def wait_ready(self, timeout_s: float = 30.0) -> None:
         """Any HTTP response means the PHP server is up. Pre-setup the API
@@ -209,9 +216,9 @@ def start_payserver(
     data_dir.mkdir(parents=True, exist_ok=True)
 
     # includes/security.php caches rate-limit + lockout counters at
-    # <repo-root>/data/cache/ irrespective of CASHUPAY_DATA_DIR. Without this
+    # <app-root>/data/cache/ irrespective of CASHUPAY_DATA_DIR. Without this
     # wipe, state (especially login lockouts) bleeds across tests.
-    shared_cache = REPO_ROOT / "data" / "cache"
+    shared_cache = APP_ROOT / "data" / "cache"
     if shared_cache.exists():
         shutil.rmtree(shared_cache, ignore_errors=True)
 
@@ -229,7 +236,7 @@ def start_payserver(
     # wrapper in the first place).
     router_wrapper = workdir / "router-wrapper.php"
     router_wrapper.write_text(
-        ROUTER_WRAPPER_TEMPLATE.format(router_path=str(REPO_ROOT / "router.php"))
+        ROUTER_WRAPPER_TEMPLATE.format(router_path=str(APP_ROOT / "router.php"))
     )
 
     port = ports.allocate(1)[0]
@@ -278,7 +285,7 @@ def start_payserver(
 
     server = webserver.start_php_site(
         port=port,
-        docroot=REPO_ROOT,
+        docroot=APP_ROOT,
         workdir=workdir,
         env=env,
         role="payserver",
@@ -290,7 +297,7 @@ def start_payserver(
         ini_overrides=webserver.parse_extra_php_args(extra_php_args),
         workers=workers,
         phps_router=router_wrapper,
-        phps_cwd=REPO_ROOT,
+        phps_cwd=APP_ROOT,
         phps_binary=php,
     )
 

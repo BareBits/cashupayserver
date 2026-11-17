@@ -11,7 +11,7 @@
  */
 declare(strict_types=1);
 require __DIR__ . '/harness.php';
-require_once dirname(__DIR__, 2) . '/includes/nwc/client.php';
+require_once dirname(__DIR__, 2) . '/app/includes/nwc/client.php';
 
 use swentel\nostr\Key\Key;
 
@@ -172,6 +172,48 @@ try {
         assert_eq('', $e->nwcCode, 'unsigned reply is treated as no reply, not a wallet error');
     }
     assert_true($threw, 'reply with an invalid signature is not accepted');
+} finally {
+    stop_wallet($proc);
+}
+
+// ---------- replayed reply (e tag names another request) is ignored ----------
+// A relay that ignores our REQ filter can hand us any earlier, genuinely
+// signed reply from the wallet. The client must bind the reply to its own
+// request id, not just to the wallet key, or a replayed "settled" blob would
+// settle a new invoice.
+[$proc, $port] = start_wallet([
+    'MOCK_NWC_WALLET_SK' => $walletSk,
+    'MOCK_NWC_WRONG_E' => '1',
+]);
+try {
+    $uri = wallet_uri($walletPk, $port, $clientSk);
+    $threw = false;
+    try {
+        NwcClient::makeInvoice($uri, 21, null, null, 3);
+    } catch (NwcException $e) {
+        $threw = true;
+        assert_eq('', $e->nwcCode, 'reply for another request is treated as no reply');
+    }
+    assert_true($threw, 'reply whose e tag names a different request is not accepted');
+} finally {
+    stop_wallet($proc);
+}
+
+// ---------- reply for a different method is ignored ----------
+[$proc, $port] = start_wallet([
+    'MOCK_NWC_WALLET_SK' => $walletSk,
+    'MOCK_NWC_STATE' => 'settled',
+    'MOCK_NWC_RESULT_TYPE' => 'make_invoice', // answering lookup_invoice with a make_invoice body
+]);
+try {
+    $uri = wallet_uri($walletPk, $port, $clientSk);
+    $threw = false;
+    try {
+        NwcClient::lookupInvoice($uri, hash('sha256', 'x'), 3);
+    } catch (NwcException $e) {
+        $threw = true;
+    }
+    assert_true($threw, 'a settled reply with the wrong result_type does not count as paid');
 } finally {
     stop_wallet($proc);
 }

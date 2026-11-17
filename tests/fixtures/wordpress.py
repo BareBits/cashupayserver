@@ -441,6 +441,9 @@ def start_wordpress(
     emulate_rewrites: bool = True,
     php_workers: int | None = None,
     with_woocommerce: bool = False,
+    server_release_api_base: str | None = None,
+    updater_enabled: bool = False,
+    extra_env: dict[str, str] | None = None,
     _from_template: bool = True,
 ) -> WordPressHandle:
     """Stand up a fresh SQLite-backed WordPress install.
@@ -468,10 +471,21 @@ def start_wordpress(
     with_woocommerce=True yields an install that already carries WooCommerce +
     the BTCPay gateway + the configured BTC store and one virtual product
     (`install_woocommerce`'s end state); the product id is on
-    `handle.woo_product_id`.
+    `handle.woo_product_id`. Combined with install_barebits=False it is a
+    shop with NO barebits plugin yet — for tests that install a specific
+    plugin zip (a past release's) themselves.
+
+    server_release_api_base / updater_enabled / extra_env shape the BareBits
+    server the plugin installs alongside (it runs inside this site's PHP):
+    the releases URL ITS auto-updater reads (CASHUPAY_RELEASE_API_BASE —
+    distinct from release_api_base, which is what the PLUGIN downloads the
+    server from), whether that updater may run at all (every other fixture
+    leaves the kill switch to the environment; the upgrade tier needs it
+    live), and further CASHUPAY_* environment for it.
 
     Golden templates: the first install of each DB-affecting shape (bare /
-    plugin / plugin+woocommerce) per pytest session is kept as a golden tree,
+    plugin / plugin+woocommerce / woocommerce-only) per pytest session is
+    kept as a golden tree,
     and later installs of that shape are file-copies of it — skipping
     `wp core install` and plugin activations entirely. Safe because every
     URL-bearing value WordPress persists is overridden at runtime by the
@@ -626,10 +640,18 @@ def start_wordpress(
     # sink and the alongside BareBits install both live on 127.0.0.1, so the
     # served stack opts in.
     env.setdefault("CASHUPAY_ALLOW_PRIVATE_ENDPOINTS", "1")
-    if release_api_base:
+    if server_release_api_base:
+        env["CASHUPAY_RELEASE_API_BASE"] = server_release_api_base
+    elif release_api_base:
         env["CASHUPAY_RELEASE_API_BASE"] = release_api_base
     if release_channel:
         env["CASHUPAY_RELEASE_CHANNEL"] = release_channel
+    if updater_enabled:
+        # The alongside install's auto-updater must RUN: override an outer
+        # shell's kill switch explicitly ("0" means not disabled).
+        env["CASHUPAY_UPDATER_DISABLED"] = "0"
+    if extra_env:
+        env.update(extra_env)
     # A multi-worker pool on every backend. A single-threaded server deadlocks
     # on any same-server loopback request, and this stack makes several: the
     # BTCPay gateway calls the BareBits Greenfield API (same host) during
@@ -687,14 +709,18 @@ def start_wordpress(
 #
 # Cache key is the install's DB-affecting shape only. release_api_base /
 # release_channel are wp-config constants (rewritten per clone), and
-# emulate_rewrites / php_workers only shape serving — none of them touch the
-# installed tree or the SQLite DB.
+# emulate_rewrites / php_workers / server_release_api_base / updater_enabled /
+# extra_env only shape serving — none of them touch the installed tree or the
+# SQLite DB.
 _GOLDEN_CACHE: dict[str, tuple[Path, dict]] = {}
 
 
 def _golden_template_key(*, install_barebits: bool, with_woocommerce: bool) -> str:
     if with_woocommerce:
-        return "woo"
+        # "woo-bare": the shop with WooCommerce + the BTCPay gateway but no
+        # barebits plugin — the upgrade tier installs a past release's plugin
+        # zip into it.
+        return "woo" if install_barebits else "woo-bare"
     return "plugin" if install_barebits else "bare"
 
 
@@ -712,11 +738,11 @@ def _ensure_golden_install(
     if key in _GOLDEN_CACHE:
         return _GOLDEN_CACHE[key]
 
-    workdir = TESTS_DIR / ".tmp" / f"wp-golden-{key}-{uuid.uuid4().hex[:8]}"
+    workdir = TESTS_DIR.parent / "app" / ".tmp" / f"wp-golden-{key}-{uuid.uuid4().hex[:8]}"
     print(f"[wp] building golden '{key}' WordPress template (once per session) ...")
     handle = start_wordpress(
         workdir,
-        install_barebits=install_barebits or with_woocommerce,
+        install_barebits=install_barebits,
         with_woocommerce=with_woocommerce,
         _from_template=False,
     )

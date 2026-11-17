@@ -18,7 +18,7 @@ $dir = sys_get_temp_dir() . '/cashupay_test_' . bin2hex(random_bytes(6));
 mkdir($dir, 0750, true);
 define('CASHUPAY_DATA_DIR', $dir);
 register_shutdown_function(function () use ($dir) { @cleanup_db($dir); });
-require_once dirname(__DIR__, 2) . '/includes/auth.php';
+require_once dirname(__DIR__, 2) . '/app/includes/auth.php';
 
 $srv = HttpDriver::start($dir);
 
@@ -90,12 +90,14 @@ $post = function (array $data) use ($srv, &$csrf): array {
     assert_true($r['status'] < 400, ($data['step'] ?? '?') . ' -> ' . $r['status']);
     return $r;
 };
+$post(['step' => 'analytics', 'usage_stats' => '0']);
+$post(['step' => 'install_type', 'install_type' => 'other']);
 $post(['step' => 'security', 'security_acknowledged' => '1']);
 $post(['step' => 'password', 'password' => 'csrf-test-pw-1234', 'confirm_password' => 'csrf-test-pw-1234']);
+$post(['step' => 'email', 'email_action' => 'skip']);
 $post(['step' => 'store', 'store_name' => 'CSRF Store', 'default_currency' => 'sat']);
 $post(['step' => 'onchain', 'onchain_action' => 'skip']);
 $post(['step' => 'lightning', 'lightning_action' => 'skip']);
-$post(['step' => 'swaps', 'swaps_enabled' => '0']);
 $post(['step' => 'mints', 'mints_enabled' => '0']);
 assert_true(cfg('setup_complete') === true, 'install complete');
 

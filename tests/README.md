@@ -97,7 +97,7 @@ The WP tier used to run `wp core install` (+ plugin activations, + the whole
 WooCommerce/BTCPay install for checkout tests) per test. Now the first install
 of each DB-affecting shape per session — `bare` (no cashupay plugin), `plugin`
 (cashupay active), `woo` (plugin + WooCommerce + BTC store + one product) — is
-kept as a golden tree under `tests/.tmp/wp-golden-*`, and every later test
+kept as a golden tree under `app/.tmp/wp-golden-*`, and every later test
 gets a `cp -a` clone of it (`fixtures/wordpress.py`).
 
 Safe because the only per-instance state is serve-time: each clone gets a
@@ -124,6 +124,66 @@ instead. `CASHUPAY_WP_SQLITE_AST_DRIVER=0` restores the legacy driver and
 only (WAL measured *worse* with the legacy driver). Pinned by
 `wordpress/test_wp_fixture_sqlite_driver.py`.
 
+## Upgrade tier (published-release upgrade matrix)
+
+`upgrade/` installs REAL past releases from GitHub and upgrades each one to the
+build under test, on the active backend, with payments. It is part of the
+local suite only — CI passes `--skip-upgrade-tier` (`tests.yml`), because the
+tier reaches GitHub and runs for several minutes per release.
+
+The window is resolved at collection time from the releases API
+(`fixtures/releases.py`): the five newest stable releases plus the newest
+testing prerelease (older testing prereleases are pruned by the release
+workflow, so only one exists). Zips are cached forever under
+`tests/bin/.cache/releases/<tag>/`; the listing for an hour, with a stale
+fallback when GitHub is unreachable.
+
+| Test | What it proves |
+|------|----------------|
+| `test_upgrade_from_release[tag]` | the OLD release's own updater ("Update now") downloads, backs up, overlays and health-verifies the candidate; the merchant's login, store, products, API key and invoices survive; pre-upgrade unpaid invoices and fresh ones settle on Lightning and on-chain; the webhook fires; rolling back restores the old build, which still boots on the migrated database |
+| `test_testing_to_main_and_back` | from the newest stable, via the cron line (`update.php`, auto-update on): testing → candidate, main → the stable again (older code on a newer database), testing → candidate, each hop healthy and paying on both rails |
+| `test_old_data_dir_boots_on_candidate[tag]` | the Windows upgrade contract on Linux: a data dir written by the old release is carried into the build under test (served by the regular fixture in desktop shape) and keeps serving and settling |
+| `test_alongside_install_upgrades_both_halves[tag-order]` | WordPress install mode: that release's PUBLISHED plugin zip installs that release's server alongside a WooCommerce shop (its own channel, from a local release server); wizard walked, WooCommerce wired, a guest order paid over Lightning and an on-chain invoice settled; then the server (its own updater, "Update now") and the plugin (WordPress upload-and-replace, the GitHub-distributed plugin's update path) move to the candidate in the parametrised order, an order paid after each half — old plugin + new server and new plugin + old server both take money; rollback brings the old server back under the new plugin, still paying |
+| `test_wporg_plugin_url_mode_upgrades_both_halves[tag-order]` | WordPress URL mode with the wordpress.org plugin variant (no installer): the old release standalone, the old wordpress.org plugin connects by URL and pairs, WooCommerce wired, order paid; server via its updater, plugin via a wordpress.org-style update (WordPress's own update offer names the candidate's wporg zip from the catalog, `Plugin_Upgrader::bulk_upgrade` applies it — the auto-update code path); order after each half, rollback, order again |
+
+The WordPress tests run server-first for the whole window and plugin-first
+(new plugin on an old server) for the newest stable + newest testing release
+only. The candidate's plugin zips are built from the working tree
+(`scripts/build-wordpress-plugin.sh`, both variants) and published in the
+candidate catalog with their `Version:` header stamped to `<version>.9999`
+(`upgrade/wp_flow.py::stamp_plugin_zip`): the tree's header equals the newest
+release's until the release bump, and WordPress never applies an update to the
+version it already has. The shipped artifacts are untouched. The wordpress.org
+update offer is injected by a test-only mu-plugin (`site_transient_update_plugins`),
+the directory itself cannot be pointed at a candidate build.
+
+The candidate is the standalone zip of the working tree (`scripts/build-standalone.sh`,
+built once per session; `CASHUPAY_STANDALONE_ZIP` points at a prebuilt one). The
+old install's updater is pointed at a local GitHub-shaped release server
+(`fixtures/release_server.py::start_release_catalog`): releases that know
+`CASHUPAY_RELEASE_API_BASE` take it from the environment, older ones get the one
+default line of their test seam rewritten (`fixtures/installed_payserver.py`).
+Seeding and verification go through `scripts/upgrade-smoke.php`, which answers
+whatever wizard screen the installed release renders next and fails loudly on a
+screen it does not know — add the screen there when the wizard grows one.
+
+```bash
+# one release, php -S
+CASHUPAY_UPGRADE_FROM=v1.8 pytest upgrade/ -v
+# just the WordPress half for one release
+CASHUPAY_UPGRADE_FROM=v1.8 pytest upgrade/test_wordpress_alongside_upgrade.py upgrade/test_wordpress_wporg_upgrade.py -v
+# the whole window on Apache
+CASHUPAY_TEST_BACKEND=apache pytest upgrade/ -v
+# window size
+CASHUPAY_UPGRADE_STABLE_COUNT=3 pytest upgrade/
+```
+
+The Windows package half runs on a Windows machine:
+`pwsh scripts/windows-upgrade-smoke.ps1 -Zip build/barebits-windows.zip`
+extracts each old Windows package, seeds it, carries `app\data` into a fresh
+copy of the candidate package and verifies it (no payments: the regtest stack
+has no Windows fixtures).
+
 ## Workdir cleanup
 
 A test that passes deletes its workdir in teardown; failures keep theirs for
@@ -134,7 +194,7 @@ free disk/RAM before each pytest pass and refuses to start below 4G disk /
 2G available RAM (warns below 10G / 4G) — `CASHUPAY_SKIP_PREFLIGHT=1`
 bypasses. Every run ends with pytest's `--durations` ranking of the slowest
 tests and fixture setups, so future speedup work starts from data. At session start, orphaned
-fixture processes from previously killed runs (anything with `tests/.tmp` in
+fixture processes from previously killed runs (anything with `app/.tmp` in
 its cmdline) are swept — set `CASHUPAY_NO_STALE_SWEEP=1` when deliberately
 running two suites concurrently from this checkout.
 
@@ -156,10 +216,15 @@ tests/
   e2e/                 # API-level end-to-end tests
   ui/                  # Playwright-driven browser tests
   wordpress/           # WordPress plugin tests (wp-cli + sqlite drop-in)
+  upgrade/             # published-release upgrade matrix (local suite only)
   scripts/             # run-tests.sh, download-binaries.sh
   bin/                 # cached binaries (gitignored)
-  .tmp/                # per-test isolated dirs (gitignored)
 ```
+
+Per-test isolated dirs live in `app/.tmp/` (gitignored): inside the served
+application tree on purpose, so a fixture server's data dir sits under the web
+root like a shared-hosting install (wizard security screen, deny rules on real
+files). See `SESSION_TMP` in `conftest.py`.
 
 ## Pinned versions
 

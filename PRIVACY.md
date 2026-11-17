@@ -1,6 +1,6 @@
 # BareBits Privacy Policy
 
-_Last updated: October 29, 2026_
+_Last updated: November 11, 2026_
 
 BareBits is **self-hosted** payment processing software published by Zaphaus LLC ("BareBits",
 "we"). You download the software and run it on infrastructure you control. We do not operate a
@@ -192,7 +192,10 @@ address and transaction IDs of their payment. Your SMTP provider's privacy polic
   day. Nothing is sent beyond the request itself.
 - **Custom block explorer / Bitcoin Core:** the on-chain rail's default explorer (section 3)
   can be replaced with your own Esplora instance or your own Bitcoin Core node, in which case
-  no third party is involved in chain watching.
+  no third party is involved in chain watching. When you save a custom explorer URL the
+  server makes one request to it (`/blocks/tip/height`) to verify it answers. An optional,
+  off-by-default per-store switch lets the public explorers take over while your instance
+  is unreachable.
 
 ## 3. Built-in services (default configuration)
 
@@ -223,7 +226,10 @@ queried repeatedly while an invoice is pending; blockstream.info sees nothing wh
 mempool.space is healthy. Both are also used, in the same order, for fee estimates and as a
 fallback for broadcasting swap-claim transactions. Configuring your own explorer or node
 (section 2) disables both built-in explorers entirely — a custom endpoint is used
-exclusively, and its outage never diverts queries to a public explorer.
+exclusively, and its outage never diverts queries to a public explorer — unless you tick the
+per-store **public fallback** opt-in, in which case mempool.space and blockstream.info are
+queried (in that order, for chain watching, fee estimates and swap-claim broadcasts) only
+while your own endpoint is unreachable.
 
 ### Submarine swap providers — Zeus, Boltz
 
@@ -244,7 +250,9 @@ address and a `cashupayserver-updater` user agent — your installed version and
 are **not** sent; version comparison happens locally. Release files are downloaded from
 GitHub only when an update is actually applied (automatic updates are opt-in on source
 installs and enabled by default in the official Docker image; the Windows desktop package
-disables the updater entirely). GitHub:
+disables the updater entirely). An operator can point the updater at a release mirror of
+their own instead of GitHub (`CASHUPAY_RELEASE_API_BASE`, see `user_config.example.php`);
+then that mirror, not GitHub, sees the update checks and downloads. GitHub:
 [Terms of Service](https://docs.github.com/en/site-policy/github-terms/github-terms-of-service) ·
 [Privacy Statement](https://docs.github.com/en/site-policy/privacy-policies/github-general-privacy-statement).
 
@@ -276,8 +284,8 @@ remaining browser-side connections are:
   browser opens a read-only connection to the Nostr relay from your noffer string to learn of
   settlement quickly. That relay sees the customer's IP address. Other rails do not do this.
 - **Plain links:** pages link to external sites (for example, transaction views on
-  mempool.space, wallet vendors on the payment page, documentation). These transmit nothing
-  unless clicked.
+  mempool.space, wallet vendors on the payment page, Cash App's open-in-app link for a
+  Lightning invoice, documentation). These transmit nothing unless clicked.
 
 ## 5. What the software does *not* do
 

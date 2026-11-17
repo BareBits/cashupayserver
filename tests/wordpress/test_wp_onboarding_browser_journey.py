@@ -112,13 +112,26 @@ def _walk_wizard_in_iframe(page) -> None:
         frame.locator(box).check()
     frame.locator("button[type=submit]:has-text('Continue')").click()
 
-    # Managed install: terms lands straight on the store screen. No security
-    # screen (data dir outside the web root) and — the regression — no
-    # password screen: the admin account was pre-seeded from
+    # Anonymous usage statistics (screen two): opt-in only. Decline.
+    frame.locator("h2:has-text('Anonymous usage statistics')").wait_for()
+    frame.locator("button[name='usage_stats'][value='0']").click()
+
+    # Installation type (screen three): "something else" keeps every rail
+    # screen, which is what this journey walks.
+    frame.locator("h2:has-text('Choose your installation type')").wait_for()
+    frame.locator("#install-option-other > summary").click()
+    frame.locator("button[name='install_type'][value='other']").click()
+
+    # Managed install: the installation type lands straight on the e-mail
+    # screen. No security screen (data dir outside the web root) and — the
+    # regression — no password screen: the admin account was pre-seeded from
     # CASHUPAY_ADMIN_PASSWORD_HASH, the merchant never types a BareBits
-    # credential.
-    frame.locator("h2:has-text(\"Let's name your store\")").wait_for()
+    # credential. Skip the e-mail screen (no SMTP server in the rig).
+    frame.locator("h2:has-text('E-mail notifications')").wait_for()
     assert frame.locator("h2:has-text('admin password')").count() == 0
+    frame.locator("button:has-text('Skip for now')").click()
+
+    frame.locator("h2:has-text(\"Let's name your store\")").wait_for()
     frame.locator("input[name='store_name']").fill("Browser Journey Store")
     frame.locator("button[type=submit]").first.click()
 
@@ -131,20 +144,18 @@ def _walk_wizard_in_iframe(page) -> None:
     frame.locator("h2:has-text('Lightning payments')").wait_for()
 
     frame.locator("button:has-text('Skip for now')").click()
-    frame.locator("h2:has-text('Submarine swaps')").wait_for()
-    frame.locator("button:has-text('No thanks')").click()
     frame.locator("h2:has-text('Cashu mints')").wait_for()
     frame.locator("button:has-text('No thanks, run without mints')").click()
+
+    # The wallet-tabs question follows the last rail screen; skip it.
+    frame.locator("h2:has-text('Popular wallet tabs')").wait_for()
+    frame.locator("button[name='wallet_tabs_action'][value='skip']").click()
 
     # Automatic updates are opt-in everywhere (incl. managed installs): the
     # wizard asks once, after the mints screen. Decline — the merchant can
     # enable them later from the Auto-update card.
     frame.locator("h2:has-text('Enable automatic updates?')").wait_for()
     frame.locator("button[name='auto_update'][value='0']").click()
-
-    # Anonymous usage statistics: opt-in only, asked once after updates. Decline.
-    frame.locator("h2:has-text('Anonymous usage statistics')").wait_for()
-    frame.locator("button[name='usage_stats'][value='0']").click()
 
     # Managed install: completion directly — never the crontab screen
     # (WP-cron owns the heartbeat).

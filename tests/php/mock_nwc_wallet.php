@@ -42,7 +42,7 @@
 
 declare(strict_types=1);
 
-require __DIR__ . '/../../vendor/autoload.php';
+require __DIR__ . '/../../app/vendor/autoload.php';
 
 use swentel\nostr\Key\Key;
 use swentel\nostr\Event\Event;
@@ -139,9 +139,18 @@ $server->onText(function (Server $srv, $conn, Text $message) use ($walletSk, $wa
         }
 
         $body = buildResponseBody($method, is_array($params) ? $params : []);
+        if (($rt = getenv('MOCK_NWC_RESULT_TYPE')) !== false && $rt !== '') {
+            // Replay mode: a genuine, correctly signed reply that answers a
+            // DIFFERENT method (what a relay replaying an old blob looks like).
+            $body['result_type'] = (string)$rt;
+        }
         $reply = new Event();
         $reply->setKind(23195);
-        $reply->setTags([['p', $clientPk], ['e', $reqId]]);
+        // Replay mode: reference some other request id. The client's REQ
+        // filter asked for #e = its own id, but a hostile relay ignores
+        // filters; the client must check the tag itself.
+        $eRef = getenv('MOCK_NWC_WRONG_E') === '1' ? bin2hex(random_bytes(32)) : $reqId;
+        $reply->setTags([['p', $clientPk], ['e', $eRef]]);
         if ($usedNip04) {
             $reply->setContent(Nip04::encrypt(json_encode($body), $walletSk, $clientPk));
         } else {

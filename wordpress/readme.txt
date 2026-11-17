@@ -4,7 +4,7 @@ Tags: bitcoin, lightning, payments, woocommerce, btcpay
 Requires at least: 6.0
 Tested up to: 7.1
 Requires PHP: 8.0
-Stable tag: 1.8
+Stable tag: 1.9
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -74,6 +74,9 @@ During onboarding the plugin installs and activates the "BTCPay for WooCommerce"
 The full plugin build distributed on the project's GitHub releases page can additionally install a BareBits server alongside WordPress. That flow fetches release metadata from api.github.com and downloads the release archive and its checksums from github.com. The build distributed on wordpress.org does not include this component and never contacts GitHub. GitHub terms of service: https://docs.github.com/en/site-policy/github-terms/github-terms-of-service — privacy statement: https://docs.github.com/en/site-policy/privacy-policies/github-general-privacy-statement
 
 == Changelog ==
+
+= 1.9 =
+* Server-side (for installs updating the companion BareBits server): security hardening from the November 2026 codebase review (password-reset links built from a trusted base URL, replaceable zero-conf on-chain payments held until one confirmation, API keys with explicit per-store permissions, wizard screens owned by the installing session, sessions bound to their credential, stricter NWC response matching, per-client rate limiting of the payment page); reworked setup wizard (installation types, e-mail delivery test, recovery-phrase screen, Back everywhere); shareable invoices stay payable for up to 90 days with Lightning refresh and fiat re-quote; optional Cash App / Venmo / PayPal tabs on the payment page; store name and BareBits wordmark in the payment header; custom Esplora URLs validated on save with opt-in public fallback; SQLite busy-retry and network-filesystem warning; updater resets opcache after applying a build.
 
 = 1.8 =
 * Server-side (for installs updating the companion BareBits server): opt-in anonymous usage statistics (off by default; three levels, each previewed before you choose); dev-fee on-chain addresses are derived under a per-install branch so two installs can never share an address, and no branch means no on-chain fee redirect; the admin UI fits phone widths; the Export token button is gone (the Recent exports list stays). WordPress: the BTCPay gateway settings written at connect time are verified, so a lost write fails the connection instead of producing a checkout that rejects every order.

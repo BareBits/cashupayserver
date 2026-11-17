@@ -123,7 +123,14 @@ Two related settings per store:
 
 - **Required confirmations** (`onchain_min_confs`). Default: 1. Set to 0 to
   accept zero-confirmation (mempool) payments — fastest but reversible by
-  fee-bumping (RBF) until confirmed.
+  fee-bumping (RBF) until confirmed. Two guards apply: an unconfirmed payment
+  that signals BIP-125 replace-by-fee is counted as pending (the invoice shows
+  Processing) until it has one confirmation, and an invoice settled on a
+  mempool-only payment stays under watch for 72 hours — if that payment is
+  gone from the chain provider's view on two consecutive polls before it
+  confirms, the invoice flips to Invalid, fires `InvoiceInvalid` and the
+  reversal is written to the admin log (`additionalStatus` reads
+  `ZeroConfPaymentMissing` after the first miss).
 - **Confirmation window** (`onchain_confirm_timeout_sec`). Default: 86400
   (24h). Once a payment is first seen in mempool, how long the server waits
   for it to reach the required confirmation count. If the window passes
@@ -132,6 +139,17 @@ Two related settings per store:
 The standard `invoice_expiration` (default 1 hour, global) still applies as
 the "time to broadcast" window: if no mempool sighting happens before it
 elapses, the invoice expires.
+
+Long-lived payment requests (admin "Create invoice", the self-serve page, or
+API calls with `checkout.expirationMinutes`) use the shared lifetime instead
+(`shared_invoice_lifetime`, default 90 days). Their address stays watched for
+the whole lifetime, polled every minute for the first day, every 10 minutes
+until a week old, then hourly while unpaid; a detected payment is always
+polled at the normal rate. A fiat-denominated request is re-quoted in sats
+when the payment page is opened (unique-address modes only — a static shared
+address keeps the amount it was created with; a request redirected to a fee
+destination keeps its amount on every rail), and the smallest amount ever
+shown still settles the invoice.
 
 Both settings apply to every on-chain receive source, Strike-minted
 addresses included. The onboarding wizard asks the zero-conf question
@@ -170,8 +188,33 @@ and mempool (zero-conf) transactions through a single endpoint.
 
 You can run your own mempool.space / Esplora instance for full sovereignty
 and privacy (the public API otherwise sees every address your store
-generates). Set **Provider URL** in the store settings to the base URL of
-your instance, e.g. `https://my-mempool.example.com/api`.
+generates). Set **Provider URL** in the store settings (on-chain card,
+Advanced) to the API base of your instance, e.g.
+`https://my-mempool.example.com/api` or `http://umbrel.local:3006/api`.
+
+The URL is validated when you save:
+
+- it must be a plain `http://` or `https://` address with no username or
+  password (a Bitcoin Core `user:pass@host` RPC URL is refused with a hint
+  — this field takes an Esplora-style HTTP API);
+- whenever the URL changes, the server fetches `{url}/blocks/tip/height`
+  and the save is rejected unless it answers with a block height. The error
+  names the cause (unreachable, HTTP status, non-API page, DNS failure). If
+  you pasted the explorer's web root instead of its API base and `{url}/api`
+  works, the message suggests that URL.
+- a LAN or localhost host is refused unless private endpoints are enabled
+  on the server (`allow_private_endpoints` setting or
+  `CASHUPAY_ALLOW_PRIVATE_ENDPOINTS=1`); the error says so.
+
+**Public fallback (opt-in).** By default a custom URL is used *exclusively*:
+if your instance is down, payments are simply not detected until it is back,
+and the addresses your store watches never reach a public explorer. Tick
+**"If my explorer is unreachable, fall back to the public explorers"** to
+instead continue through mempool.space, then blockstream.info, while your
+instance is unavailable (the custom URL stays first and is retried after a
+short cooldown). The same chain — custom first, public hosts only if you
+opted in — is used for submarine-swap claim fee estimates and as the
+broadcast fallback for swap-claim transactions.
 
 ### Bitcoin Core RPC (advanced)
 
