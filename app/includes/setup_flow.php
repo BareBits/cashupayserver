@@ -10,6 +10,7 @@
  */
 
 require_once __DIR__ . '/database.php';
+require_once __DIR__ . '/urls.php';
 
 final class SetupFlow {
     /**
@@ -244,31 +245,37 @@ final class SetupFlow {
 
     /**
      * The instruction the cron screen shows for wiring up the scheduler,
-     * keyed on the host OS. Unix hosts get the classic crontab line; a
-     * Windows server (IIS, XAMPP — not the desktop package, which never
-     * shows the screen) has no cron, so it gets the Task Scheduler
-     * equivalent instead. curl.exe ships with Windows 10 1803+; the inner
-     * quotes are backslash-escaped per schtasks' /TR quoting rules, and
-     * there is no > /dev/null because /TR runs the command directly, not
-     * through a shell.
+     * keyed on the host OS. The key rides in the URL (?key=…) so the same
+     * string works pasted into a hosting panel's "URL cron" field or a
+     * scheduler service, not just a shell; `url` is that bare keyed URL and
+     * `line` wraps it for the host's native scheduler. Unix hosts get the
+     * classic crontab line; a Windows server (IIS, XAMPP — not the desktop
+     * package, which never shows the screen) has no cron, so it gets the
+     * Task Scheduler equivalent instead. curl.exe ships with Windows 10
+     * 1803+; the URL is wrapped in backslash-escaped quotes per schtasks'
+     * /TR quoting rules (and so a future `&` in it can't be read by cmd.exe
+     * as a command separator), and there is no > /dev/null because /TR runs
+     * the command directly, not through a shell.
      *
-     * @return array{intro: string, line: string}
+     * @return array{intro: string, url: string, line: string}
      */
     public static function cronScheduleLine(
         string $osFamily, string $cronKey, string $cronUrl
     ): array {
+        $keyedUrl = Urls::withCronKey($cronUrl, $cronKey);
         if ($osFamily === 'Windows') {
             return [
                 'intro' => 'This server runs on Windows, which has no cron — '
                     . 'create a Task Scheduler entry instead (run in a Command Prompt):',
+                'url' => $keyedUrl,
                 'line' => 'schtasks /Create /F /SC MINUTE /MO 1 /TN "CashuPayServer cron" '
-                    . '/TR "curl.exe -fsS -H \"X-CRON-KEY: ' . $cronKey . '\" ' . $cronUrl . '"',
+                    . '/TR "curl.exe -fsS \"' . $keyedUrl . '\""',
             ];
         }
         return [
             'intro' => "Add this line to your crontab (or your host's cron panel):",
-            'line' => '* * * * * curl -fsS -H \'X-CRON-KEY: ' . $cronKey . '\' '
-                . $cronUrl . ' > /dev/null',
+            'url' => $keyedUrl,
+            'line' => "* * * * * curl -fsS '" . $keyedUrl . "' > /dev/null",
         ];
     }
 

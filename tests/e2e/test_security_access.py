@@ -65,6 +65,7 @@ def test_anonymous_tail_post_on_configured_install_is_refused(configured: Config
         assert "admin" in r.headers.get("Location", ""), r.headers
         assert cron_key not in r.text, f"step={step} leaked the cron key"
         assert "X-CRON-KEY" not in r.text
+        assert "cron.php?key=" not in r.text
 
     assert _config(handle, "auto_update_enabled") == before, "the auto-update opt-in must be untouched"
 

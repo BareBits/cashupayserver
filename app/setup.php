@@ -4192,11 +4192,13 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                     Config::set('cron_key', $cronKey);
                 }
                 // Same shape the admin Settings page renders, so operators see
-                // one canonical line in both places. The key travels in a
-                // header rather than the query string so it stays out of
-                // access logs. A Windows server host (the desktop package
-                // never reaches this screen) gets the Task Scheduler
-                // equivalent — a crontab line is unusable there.
+                // one canonical URL + line in both places. The key travels in
+                // the URL (?key=…) so a non-technical operator can paste the
+                // bare URL into a hosting panel or scheduler service; the
+                // native scheduler line below it is for those with a shell.
+                // A Windows server host (the desktop package never reaches
+                // this screen) gets the Task Scheduler equivalent — a crontab
+                // line is unusable there.
                 $cronSchedule = SetupFlow::cronScheduleLine(PHP_OS_FAMILY, $cronKey, Urls::cron());
                 ?>
                 <h2 style="margin-bottom: 1rem;">⏰ Enable cron</h2>
@@ -4208,9 +4210,16 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                 </p>
 
                 <p style="margin-bottom: 0.5rem; font-size: 0.9rem; color: #a0aec0;">
-                    <?= htmlspecialchars($cronSchedule['intro']) ?>
+                    Your cron URL &mdash; schedule a visit to it every minute from your
+                    hosting panel or a scheduler service (the key is part of the URL,
+                    so treat it like a password):
                 </p>
-                <pre style="background: rgba(0,0,0,0.3); padding: 0.75rem; border-radius: 6px; font-size: 0.8rem; user-select: all;"><?= htmlspecialchars($cronSchedule['line']) ?></pre>
+                <pre id="wizard-cron-url" style="background: rgba(0,0,0,0.3); padding: 0.75rem; border-radius: 6px; font-size: 0.8rem; user-select: all; white-space: pre-wrap; word-break: break-all;"><?= htmlspecialchars($cronSchedule['url']) ?></pre>
+
+                <p style="margin: 1rem 0 0.5rem; font-size: 0.9rem; color: #a0aec0;">
+                    Or, if you have shell access: <?= htmlspecialchars(lcfirst($cronSchedule['intro'])) ?>
+                </p>
+                <pre id="wizard-cron-line" style="background: rgba(0,0,0,0.3); padding: 0.75rem; border-radius: 6px; font-size: 0.8rem; user-select: all; white-space: pre-wrap; word-break: break-all;"><?= htmlspecialchars($cronSchedule['line']) ?></pre>
 
                 <form method="POST" action="<?= htmlspecialchars(setupSelfUrl()) ?>" style="margin-top: 1.5rem;">
                     <input type="hidden" name="step" value="cron">

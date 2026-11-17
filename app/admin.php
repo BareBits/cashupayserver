@@ -612,12 +612,15 @@ if (isset($_GET['api'])) {
             break;
 
         case 'cron_url':
-            // Surfaces the operator-facing cron URL with key. The key is seeded
+            // Surfaces the operator-facing cron URLs with key. The key is seeded
             // at install time (Database::initialize) and lazily regenerated
             // here for the rare case of an install that predates seeding.
-            // Crontab is rendered with the key passed via the X-CRON-KEY
-            // header instead of ?key= so it doesn't leak through access logs.
-            // cron.php still accepts ?key= for backward compatibility.
+            // The key rides in the URL (?key=…) so the bare URL can be pasted
+            // into a hosting panel's URL-cron field or a scheduler service by
+            // operators without shell access; the crontab lines wrap the same
+            // URL for those who have one. cron.php also still accepts the key
+            // via the X-CRON-KEY header, so schedulers set up from the older
+            // header-based line keep working untouched.
             Auth::requireAdmin();
             $key = Config::get('cron_key');
             if (!$key) {
@@ -625,16 +628,16 @@ if (isset($_GET['api'])) {
                 Config::set('cron_key', $key);
             }
             $baseUrl = Urls::cron();
-            $swapsBaseUrl = $baseUrl . '?only=swaps';
-            $headerArg = "-H 'X-CRON-KEY: " . $key . "'";
+            $keyedUrl = Urls::withCronKey($baseUrl, $key);
+            $keyedSwapsUrl = Urls::withCronKey($baseUrl, $key, ['only' => 'swaps']);
             $now = time();
             $fullSeenAt = (int) Config::get('last_external_cron_at', 0);
             $swapsSeenAt = (int) Config::get('last_external_cron_swaps_at', 0);
             echo json_encode([
-                'url' => $baseUrl,
-                'swaps_url' => $swapsBaseUrl,
-                'crontab' => '* * * * * curl -fsS ' . $headerArg . ' ' . $baseUrl . ' > /dev/null',
-                'crontab_swaps' => "* * * * * for i in 0 10 20 30 40 50; do curl -fsS " . $headerArg . " '" . $swapsBaseUrl . "' > /dev/null & sleep 10; done",
+                'url' => $keyedUrl,
+                'swaps_url' => $keyedSwapsUrl,
+                'crontab' => "* * * * * curl -fsS '" . $keyedUrl . "' > /dev/null",
+                'crontab_swaps' => "* * * * * for i in 0 10 20 30 40 50; do curl -fsS '" . $keyedSwapsUrl . "' > /dev/null & sleep 10; done",
                 'last_full_seen_ago_sec' => $fullSeenAt > 0 ? ($now - $fullSeenAt) : null,
                 'last_swaps_seen_ago_sec' => $swapsSeenAt > 0 ? ($now - $swapsSeenAt) : null,
             ]);
@@ -652,16 +655,18 @@ if (isset($_GET['api'])) {
             $dismissed = (bool)Config::get('updater_banner_dismissed', true);
             // Recommended dedicated cron line for the isolated updater. Built
             // here (admin-only) so the operator can copy it straight from the
-            // Auto-update card. Key travels via the X-CRON-KEY header, same as
-            // the main cron line, so it doesn't leak through access logs.
+            // Auto-update card. Key travels in the URL (?key=…), same as the
+            // main cron line, so the bare URL works in a hosting panel too.
             $updKey = Config::get('cron_key');
             $updUrl = rtrim(Config::getBaseUrl(), '/') . '/update.php';
-            $recommendedCron = $updKey
-                ? "*/15 * * * * curl -fsS -H 'X-CRON-KEY: " . $updKey . "' " . $updUrl . ' > /dev/null'
+            $updKeyedUrl = $updKey ? Urls::withCronKey($updUrl, $updKey) : null;
+            $recommendedCron = $updKeyedUrl
+                ? "*/15 * * * * curl -fsS '" . $updKeyedUrl . "' > /dev/null"
                 : null;
             echo json_encode([
                 'channel' => Updater::getChannel(),
                 'recommended_cron' => $recommendedCron,
+                'recommended_cron_url' => $updKeyedUrl,
                 'current_version' => $info['VERSION'] ?? CASHUPAY_VERSION,
                 'current_sha' => $info['COMMIT_SHA'] ?? '',
                 'last_update' => $last,
@@ -5214,7 +5219,11 @@ header('Cache-Control: no-cache, must-revalidate');
             border-radius: 20px;
             padding: 1.5rem;
             margin-bottom: 1.5rem;
-            color: white;
+            /* Black on the orange gradient: white text washed out against
+               the lighter end of the ramp. Every child (label, amount, unit,
+               notes, buttons) inherits or sets #000 so the card reads as
+               one block. */
+            color: #000;
         }
 
         .balance-label {
@@ -5251,7 +5260,7 @@ header('Cache-Control: no-cache, must-revalidate');
             background: rgba(255, 255, 255, 0.2);
             border: none;
             border-radius: 12px;
-            color: white;
+            color: #000;
             font-size: 0.875rem;
             font-weight: 500;
             cursor: pointer;
@@ -8051,12 +8060,14 @@ header('Cache-Control: no-cache, must-revalidate');
                 </div>
 
                 <!--
-                    Cron URL — surfaces the operator-facing curl command so an
-                    admin can set up a system cron entry. The key is auto-
-                    generated lazily by the cron-url admin action; the
-                    same key authenticates `?key=...` in cron.php. Optional —
-                    background tasks also fire opportunistically from admin
-                    page-loads (5-min gate) and checkout views.
+                    Cron URL — surfaces the operator-facing keyed URL (for
+                    hosting panels / scheduler services) and the matching curl
+                    crontab line (for shell users). The key is auto-generated
+                    lazily by the cron-url admin action; the same key
+                    authenticates `?key=...` (or the X-CRON-KEY header) in
+                    cron.php. Optional — background tasks also fire
+                    opportunistically from admin page-loads (5-min gate) and
+                    checkout views.
                 -->
                 <div class="card collapsible collapsed" data-admin-only="true" id="card-cron-url">
                     <div class="card-header">
@@ -8064,17 +8075,25 @@ header('Cache-Control: no-cache, must-revalidate');
                     </div>
                     <div class="card-body">
                         <p style="font-size: 0.85rem; color: var(--text-secondary); margin: 0 0 0.75rem 0;">
-                            Optional but recommended. Adding the line below to your hosting's system
-                            cron makes invoice polling, auto-cashout, and fee settlement run on a
+                            Optional but recommended. Scheduling a visit to the URL below every
+                            minute makes invoice polling, auto-cashout, and fee settlement run on a
                             tight, predictable schedule. Without it, background tasks fire
                             opportunistically when an admin or customer loads a page.
+                            Your hosting panel's cron tool, a free scheduler service, or an uptime
+                            monitor can all do this &mdash; no special headers needed.
+                            The key is part of the URL, so treat it like a password and don't share it.
                         </p>
                         <div class="form-group">
-                            <label class="form-label">Main cron (every minute)</label>
-                            <code id="cron-url-display" style="display: block; background: rgba(0,0,0,0.2); padding: 0.75rem; border-radius: 8px; font-size: 0.85rem; word-break: break-all; user-select: all;">Loading…</code>
+                            <label class="form-label">Cron URL (visit every minute)</label>
+                            <code id="cron-plain-url-display" style="display: block; background: rgba(0,0,0,0.2); padding: 0.75rem; border-radius: 8px; font-size: 0.85rem; word-break: break-all; user-select: all;">Loading…</code>
                             <p class="form-help" id="cron-url-status" style="margin-top: 0.4rem;">Checking…</p>
                         </div>
-                        <button class="btn btn-secondary btn-full" id="btn-copy-cron-url">Copy</button>
+                        <button class="btn btn-secondary btn-full" id="btn-copy-cron-plain-url">Copy URL</button>
+                        <div class="form-group" style="margin-top: 1rem;">
+                            <label class="form-label">Crontab line (if you have shell access)</label>
+                            <code id="cron-url-display" style="display: block; background: rgba(0,0,0,0.2); padding: 0.75rem; border-radius: 8px; font-size: 0.85rem; word-break: break-all; user-select: all;">Loading…</code>
+                        </div>
+                        <button class="btn btn-secondary btn-full" id="btn-copy-cron-url">Copy crontab line</button>
 
                         <hr style="border: 0; border-top: 1px solid var(--border); margin: 1rem 0;">
 
@@ -8088,11 +8107,16 @@ header('Cache-Control: no-cache, must-revalidate');
                             Skip this entirely if you don't use submarine swaps.
                         </p>
                         <div class="form-group">
-                            <label class="form-label">Swap fast-lane cron (every 10 seconds)</label>
-                            <code id="cron-swaps-url-display" style="display: block; background: rgba(0,0,0,0.2); padding: 0.75rem; border-radius: 8px; font-size: 0.85rem; word-break: break-all; user-select: all;">Loading…</code>
+                            <label class="form-label">Swap fast-lane URL (visit every 10 seconds)</label>
+                            <code id="cron-swaps-plain-url-display" style="display: block; background: rgba(0,0,0,0.2); padding: 0.75rem; border-radius: 8px; font-size: 0.85rem; word-break: break-all; user-select: all;">Loading…</code>
                             <p class="form-help" id="cron-swaps-url-status" style="margin-top: 0.4rem;">Checking…</p>
                         </div>
-                        <button class="btn btn-secondary btn-full" id="btn-copy-cron-swaps-url">Copy</button>
+                        <button class="btn btn-secondary btn-full" id="btn-copy-cron-swaps-plain-url">Copy URL</button>
+                        <div class="form-group" style="margin-top: 1rem;">
+                            <label class="form-label">Crontab line (if you have shell access)</label>
+                            <code id="cron-swaps-url-display" style="display: block; background: rgba(0,0,0,0.2); padding: 0.75rem; border-radius: 8px; font-size: 0.85rem; word-break: break-all; user-select: all;">Loading…</code>
+                        </div>
+                        <button class="btn btn-secondary btn-full" id="btn-copy-cron-swaps-url">Copy crontab line</button>
                     </div>
                 </div>
 
@@ -8167,14 +8191,19 @@ header('Cache-Control: no-cache, must-revalidate');
                         <button class="btn btn-secondary btn-full" id="btn-rollback-update" style="margin-bottom: 0.25rem;">Roll back to previous version</button>
                         <p class="form-help" id="auto-update-rollback-help">Restores the most recent backup. Disabled if no backup is available.</p>
                         <div class="form-group" style="margin-top: 1rem;">
-                            <label class="form-label">Dedicated updater cron line (recommended)</label>
-                            <code id="auto-update-cron-line" style="display: block; background: rgba(0,0,0,0.2); padding: 0.6rem; border-radius: 8px; font-size: 0.8rem; word-break: break-all; user-select: all;">Loading…</code>
+                            <label class="form-label">Dedicated updater URL (recommended, visit every 15 minutes)</label>
+                            <code id="auto-update-cron-url" style="display: block; background: rgba(0,0,0,0.2); padding: 0.6rem; border-radius: 8px; font-size: 0.8rem; word-break: break-all; user-select: all;">Loading…</code>
                             <p class="form-help">
-                                Optional but recommended: a second cron line that hits the isolated
-                                update.php directly, so updates keep working even if a bad build
-                                crashes the main app. The main cron line already nudges it as a
-                                fallback. Harmless until you enable auto-update.
+                                Optional but recommended: a second scheduled visit that hits the
+                                isolated update.php directly, so updates keep working even if a bad
+                                build crashes the main app. The main cron already nudges it as a
+                                fallback. Harmless until you enable auto-update. Same key as the
+                                main cron URL, so keep it private.
                             </p>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Crontab line (if you have shell access)</label>
+                            <code id="auto-update-cron-line" style="display: block; background: rgba(0,0,0,0.2); padding: 0.6rem; border-radius: 8px; font-size: 0.8rem; word-break: break-all; user-select: all;">Loading…</code>
                         </div>
                     </div>
                 </div>
@@ -9631,6 +9660,14 @@ header('Cache-Control: no-cache, must-revalidate');
             if (copyCronBtn) copyCronBtn.addEventListener('click', copyCronUrl);
             const copyCronSwapsBtn = document.getElementById('btn-copy-cron-swaps-url');
             if (copyCronSwapsBtn) copyCronSwapsBtn.addEventListener('click', copyCronSwapsUrl);
+            const copyCronPlainBtn = document.getElementById('btn-copy-cron-plain-url');
+            if (copyCronPlainBtn) copyCronPlainBtn.addEventListener('click', function () {
+                copyCronPlainUrl('cron-plain-url-display', 'Cron URL');
+            });
+            const copyCronSwapsPlainBtn = document.getElementById('btn-copy-cron-swaps-plain-url');
+            if (copyCronSwapsPlainBtn) copyCronSwapsPlainBtn.addEventListener('click', function () {
+                copyCronPlainUrl('cron-swaps-plain-url-display', 'Swap fast-lane URL');
+            });
             const saveChannelBtn = document.getElementById('btn-save-update-channel');
             if (saveChannelBtn) saveChannelBtn.addEventListener('click', saveUpdateChannel);
             const autoUpdateToggle = document.getElementById('auto-update-enabled');
@@ -10332,7 +10369,7 @@ header('Cache-Control: no-cache, must-revalidate');
                 // Show mint status warning if unreachable
                 const balanceLabel = document.querySelector('.balance-label');
                 if (dashboardData.mintUnreachable) {
-                    balanceLabel.innerHTML = 'Balance stored in Cashu Mint <span style="color: #f59e0b; font-size: 0.75rem;">(mint offline - cached)</span>';
+                    balanceLabel.innerHTML = 'Balance stored in Cashu Mint <span style="color: #000; font-size: 0.75rem;">(mint offline - cached)</span>';
                     // Disable withdraw/export buttons when mint is unreachable
                     document.querySelectorAll('.withdraw-btn, .export-btn').forEach(btn => {
                         btn.disabled = true;
@@ -15932,7 +15969,9 @@ header('Cache-Control: no-cache, must-revalidate');
         // the best we can do.
         async function loadCronUrl() {
             const code = document.getElementById('cron-url-display');
+            const plainUrl = document.getElementById('cron-plain-url-display');
             const codeSwaps = document.getElementById('cron-swaps-url-display');
+            const plainSwapsUrl = document.getElementById('cron-swaps-plain-url-display');
             const status = document.getElementById('cron-url-status');
             const statusSwaps = document.getElementById('cron-swaps-url-status');
             if (!code) return;
@@ -15944,13 +15983,20 @@ header('Cache-Control: no-cache, must-revalidate');
                 } else {
                     code.textContent = 'Unable to load cron URL';
                 }
+                if (plainUrl) {
+                    plainUrl.textContent = (data && data.url) || 'Unable to load cron URL';
+                }
                 if (codeSwaps) {
                     codeSwaps.textContent = data.crontab_swaps || 'Unable to load swaps cron URL';
+                }
+                if (plainSwapsUrl) {
+                    plainSwapsUrl.textContent = data.swaps_url || 'Unable to load swaps cron URL';
                 }
                 if (status) status.innerHTML = formatCronSeenAgo(data.last_full_seen_ago_sec, 90);
                 if (statusSwaps) statusSwaps.innerHTML = formatCronSeenAgo(data.last_swaps_seen_ago_sec, 30);
             } catch (e) {
                 code.textContent = 'Unable to load cron URL';
+                if (plainUrl) plainUrl.textContent = 'Unable to load cron URL';
             }
         }
 
@@ -15978,6 +16024,19 @@ header('Cache-Control: no-cache, must-revalidate');
             try {
                 await navigator.clipboard.writeText(code.textContent);
                 showToast('Cron entry copied to clipboard', 'success');
+            } catch (e) {
+                showToast('Copy failed — select the text manually', 'error');
+            }
+        }
+
+        // Copies one of the bare keyed URLs (main / swap fast-lane) — the
+        // form a hosting panel or scheduler service takes.
+        async function copyCronPlainUrl(elementId, label) {
+            const code = document.getElementById(elementId);
+            if (!code) return;
+            try {
+                await navigator.clipboard.writeText(code.textContent);
+                showToast(label + ' copied to clipboard', 'success');
             } catch (e) {
                 showToast('Copy failed — select the text manually', 'error');
             }
@@ -16274,6 +16333,10 @@ header('Cache-Control: no-cache, must-revalidate');
                 const cronLine = document.getElementById('auto-update-cron-line');
                 if (cronLine) {
                     cronLine.textContent = data.recommended_cron || 'Unavailable (set up the main cron first).';
+                }
+                const cronUrl = document.getElementById('auto-update-cron-url');
+                if (cronUrl) {
+                    cronUrl.textContent = data.recommended_cron_url || 'Unavailable (set up the main cron first).';
                 }
                 const hasBackup = Array.isArray(data.backups) && data.backups.length > 0;
                 if (rollbackBtn) rollbackBtn.disabled = !hasBackup;

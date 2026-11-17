@@ -85,6 +85,7 @@ assert_true(str_contains((string)($r['headers']['location'] ?? ''), 'admin'), 'r
 assert_null(cfg('auto_update_enabled'), 'the auto-update opt-in was NOT written');
 assert_false(str_contains($r['body'], $cronKey), 'the cron key is not in the body');
 assert_false(str_contains($r['body'], 'X-CRON-KEY'), 'no cron line in the body');
+assert_false(str_contains($r['body'], 'cron.php?key='), 'no keyed cron URL in the body');
 
 foreach (['cron', 'done'] as $tail) {
     $r = $srv->post('/setup.php', ['step' => $tail]);
