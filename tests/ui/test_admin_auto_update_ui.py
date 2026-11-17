@@ -104,5 +104,10 @@ def test_recommended_cron_line_is_shown(
         " return c && c.textContent.includes('update.php'); }"
     )
     line = page.inner_text("#auto-update-cron-line")
-    assert "update.php" in line
-    assert "X-CRON-KEY" in line
+    assert "update.php?key=" in line
+    assert "X-CRON-KEY" not in line, "the key rides in the URL, not a header"
+    # The bare keyed URL sits above the crontab line for panel / scheduler
+    # users, and the crontab line wraps that same URL.
+    url = page.inner_text("#auto-update-cron-url")
+    assert url.startswith("http") and "/update.php?key=" in url
+    assert f"'{url}'" in line

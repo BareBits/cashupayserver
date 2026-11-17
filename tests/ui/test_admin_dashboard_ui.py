@@ -105,3 +105,39 @@ def test_dashboard_balance_and_invoice_button_labels(
         page.locator("#modal-cart .modal-title").inner_text().strip()
         == "Create invoice"
     )
+
+
+def test_balance_card_text_is_black(
+    shared_configured: ConfiguredPayserver, page,
+) -> None:
+    """The orange balance card renders every piece of text in black: label,
+    amount, unit, and the three action buttons (whose icons inherit via
+    currentColor). Asserted on computed styles after the dashboard fetch so a
+    JS re-render can't put the old white back."""
+    configured = shared_configured
+    page.set_default_timeout(15000)
+    page.goto(f"{configured.handle.url}/admin")
+    page.fill("#password-input", configured.admin_password)
+    page.click("#password-submit")
+    page.wait_for_selector("#app", state="visible")
+    page.wait_for_function(
+        "() => document.querySelector('.balance-label').textContent.trim()"
+        " === 'Balance stored in Cashu Mint'"
+    )
+
+    colors = page.evaluate(
+        """() => {
+            const c = (sel) => getComputedStyle(document.querySelector(sel)).color;
+            return {
+                label: c('.balance-label'),
+                amount: c('#balance-amount'),
+                unit: c('#balance-unit'),
+                withdraw: c('#btn-withdraw'),
+                request: c('#btn-request'),
+                requestSimple: c('#btn-request-simple'),
+                icon: getComputedStyle(document.querySelector('#btn-withdraw svg')).stroke,
+            };
+        }"""
+    )
+    for name, value in colors.items():
+        assert value == "rgb(0, 0, 0)", f"{name} is {value}, expected black"
