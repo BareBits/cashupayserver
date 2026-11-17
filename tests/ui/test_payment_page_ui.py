@@ -106,9 +106,24 @@ def test_payment_page_qr_size_and_button_row(
         }"""
     ), "header order must be store name, 'powered by', logo"
     name_box = header.locator(".merchant-name").bounding_box()
+    by_box = header.locator(".powered-by").bounding_box()
     logo_box = header.locator("img.logo").bounding_box()
-    assert name_box["x"] + name_box["width"] <= logo_box["x"] + 1
-    assert abs(name_box["y"] + name_box["height"] / 2 - (logo_box["y"] + logo_box["height"] / 2)) < 6
+    # "powered by" and the logo always share a row, vertically centred on
+    # each other.
+    assert abs(by_box["y"] + by_box["height"] / 2 - (logo_box["y"] + logo_box["height"] / 2)) < 6
+    assert by_box["x"] + by_box["width"] <= logo_box["x"] + 1
+    # The store name sits to their left on the same row when it fits. A long
+    # name (this test's store is named after the test) is allowed to wrap
+    # and push the "powered by" pair onto its own row beneath it, instead of
+    # shoving the logo past the card edge (phone-width rule, PR #202).
+    name_right = name_box["x"] + name_box["width"]
+    name_bottom = name_box["y"] + name_box["height"]
+    same_row = abs(name_box["y"] + name_box["height"] / 2 - (logo_box["y"] + logo_box["height"] / 2)) < 6
+    if same_row:
+        assert name_right <= logo_box["x"] + 1
+    else:
+        assert name_bottom <= logo_box["y"] + 1, "wrapped name must sit above the powered-by row"
+        assert name_bottom <= by_box["y"] + 1
     # The Lightning-network blurb is gone from the notice line.
     notice = page.locator(".barebits-notice").inner_text()
     assert "Powered by the Bitcoin Lightning Network" not in notice
