@@ -231,6 +231,33 @@ per-store **public fallback** opt-in, in which case mempool.space and blockstrea
 queried (in that order, for chain watching, fee estimates and swap-claim broadcasts) only
 while your own endpoint is unreachable.
 
+### eCash (ECX) price — CoinMarketCap
+
+A store that accepts eCash (ECX, the 2026 Drivechain fork of Bitcoin at ecash.com) needs an
+ECX price to quote invoices in szats. The regular exchange-rate providers above do not quote
+ECX yet, so the server reads the ECX/USD price from
+[CoinMarketCap](https://coinmarketcap.com) ([Terms](https://coinmarketcap.com/terms/) ·
+[Privacy](https://coinmarketcap.com/privacy/)) — the same public web endpoint
+CoinMarketCap's own site uses, without an account or API key. The request carries no store
+data at all (only the fixed eCash listing id and the USD convert id); CoinMarketCap sees your
+server's IP address and request timing. Other currencies are derived from that USD price with
+the Bitcoin providers' rates, so no further request is made. Results are cached for five
+minutes, and when no price is available (live or cached) the eCash option is simply left off
+new invoices. Stores without the eCash rail configured never contact CoinMarketCap.
+
+### eCash (ECX) block explorers — explorer.ecash.com, esplora.ecash.ninja
+
+The eCash rail watches for payments exactly like the Bitcoin rail, against the ECX chain:
+it queries [explorer.ecash.com](https://explorer.ecash.com) (operated by the eCash project,
+ecash.com) and fails over to the independently operated
+[esplora.ecash.ninja](https://esplora.ecash.ninja) when the first is unreachable or returns
+unusable data. Whichever explorer is queried sees your server's IP address and **the
+individual ECX receiving addresses your store generates** (your extended public key is never
+transmitted), queried repeatedly while an invoice is pending. The same per-store controls as
+for Bitcoin apply: you can point the rail at your own ECX Esplora instance, in which case it
+is used exclusively unless you tick the public-fallback opt-in. Stores without the eCash rail
+configured never contact these explorers.
+
 ### Submarine swap providers — Zeus, Boltz
 
 If you enable swaps (off by default; converts Lightning receipts to on-chain funds), the

@@ -508,6 +508,49 @@ if (isset($_GET['api'])) {
                 })(),
             ];
 
+            // eCash (ECX) payment settings — the second chain-watched rail
+            // (includes/ecx/ecx.php). Same shape as $onchain; one network.
+            require_once __DIR__ . '/includes/ecx/ecx.php';
+            $ecxXpub = $store['ecx_xpub'] ?? '';
+            $ecxMode = $store['ecx_address_mode'] ?? 'xpub';
+            $ecxStaticAddress = $store['ecx_static_address'] ?? '';
+            $ecxPriceUsd = EcxRates::getEcxUsd();
+            $ecxSettings = [
+                'enabled' => EcxConfig::isConfigured($store),
+                'offerEnabled' => (int)($store['ecx_offer_enabled'] ?? 1) === 1,
+                'offered' => EcxConfig::isOffered($store),
+                'mode' => $ecxMode,
+                'xpub' => $ecxXpub,
+                // Convenience for the "use my Bitcoin xpub" shortcut.
+                'btcXpub' => $onchainMode === 'static' ? '' : $onchainXpub,
+                'btcAddressType' => $store['onchain_address_type'] ?? 'P2WPKH',
+                'sameAsBtc' => $ecxXpub !== '' && $ecxXpub === $onchainXpub,
+                'staticAddress' => $ecxStaticAddress,
+                'staticTweakRange' => (int)($store['ecx_static_tweak_range'] ?? 1000),
+                'addressType' => $store['ecx_address_type'] ?? 'P2WPKH',
+                'minConfs' => (int)($store['ecx_min_confs'] ?? 1),
+                'confirmTimeoutSec' => (int)($store['ecx_confirm_timeout_sec'] ?? 86400),
+                // The Bitcoin card's policy, offered as the default for a
+                // first ECX save (operator decision: same settings, editable).
+                'btcMinConfs' => (int)($store['onchain_min_confs'] ?? 1),
+                'btcConfirmTimeoutSec' => (int)($store['onchain_confirm_timeout_sec'] ?? 86400),
+                'nextIndex' => (int)($store['ecx_next_index'] ?? 0),
+                'providerUrl' => $store['ecx_provider_url'] ?? '',
+                'providerFallback' => (int)($store['ecx_provider_fallback'] ?? 0) === 1,
+                'publicExplorers' => Chain::ecx()->esploraDefaults('mainnet'),
+                'needsManualConfirmation' => OnchainPayments::countNeedingManualConfirmation($storeId, Chain::ecx()),
+                // Hosting-fee ECX destination (deployer's xpub); the fee is
+                // redirect-only, so without it hosting fees in ECX only accrue.
+                'hostingFeeXpub' => $store['hosting_fee_ecx_xpub'] ?? '',
+                'hostingFeeAddressType' => $store['hosting_fee_ecx_address_type'] ?? 'P2WPKH',
+                // Live-or-cached ECX/USD; null = eCash is not offered right now.
+                'priceUsd' => $ecxPriceUsd,
+                'priceAvailable' => $ecxPriceUsd !== null,
+                'lastGoodPriceUsd' => EcxRates::lastGoodUsd(),
+                'unit' => Chain::ecx()->unit,
+                'unitPlural' => Chain::ecx()->unitPlural,
+            ];
+
             // Calculate balance in sats for fiat mints (uses cached exchange rates)
             $balanceInSats = null;
             if ($storeConfigured && $balance > 0) {
@@ -580,6 +623,7 @@ if (isset($_GET['api'])) {
                     'hideNote' => (int)($store['hide_note_on_invoice'] ?? 0) === 1,
                 ],
                 'onchain' => $onchain,
+                'ecx' => $ecxSettings,
                 'swaps' => $storeSwaps,
                 'selfserve' => $storeSelfServe,
                 'reliability' => (function() {
@@ -817,6 +861,37 @@ if (isset($_GET['api'])) {
                 ];
             }
 
+            // eCash (ECX) leg: same shape as the on-chain block, in szats.
+            $ecxDetail = null;
+            if (!empty($row['ecx_address'])) {
+                $ecxPays = [];
+                foreach (Database::fetchAll(
+                    "SELECT txid, vout, amount_sat, confirmations, block_height, first_seen_at
+                       FROM ecx_payments WHERE invoice_id = ? ORDER BY first_seen_at ASC, id ASC",
+                    [$invoiceId]
+                ) as $p) {
+                    $ecxPays[] = [
+                        'txid' => $p['txid'],
+                        'vout' => (int)$p['vout'],
+                        'amountSzat' => (int)$p['amount_sat'],
+                        'confirmations' => (int)$p['confirmations'],
+                        'blockHeight' => $intOrNull($p['block_height']),
+                        'firstSeenAt' => (int)$p['first_seen_at'],
+                    ];
+                }
+                $ecxDetail = [
+                    'address' => $row['ecx_address'],
+                    'amountSzat' => $intOrNull($row['ecx_amount_szat'] ?? null),
+                    'tweakSzats' => $intOrNull($row['ecx_amount_tweak_szats'] ?? null),
+                    'rate' => $row['ecx_exchange_rate'] ?? null,
+                    'firstSeenAt' => $intOrNull($row['ecx_first_seen_at'] ?? null),
+                    'needsManualConfirmation' => !empty($row['ecx_needs_manual_confirmation']),
+                    'feeNote' => $row['ecx_fee_note'] ?? null,
+                    'feeDestination' => $row['ecx_fee_destination'] ?? null,
+                    'payments' => $ecxPays,
+                ];
+            }
+
             $swapDetail = null;
             $sa = Database::fetchOne(
                 "SELECT provider, network, status, lockup_txid, claim_txid, merchant_address,
@@ -869,6 +944,7 @@ if (isset($_GET['api'])) {
                     'cashuOfflineAllowAnyMint' => !empty($row['cashu_offline_allow_any_mint']),
                     'cashuOfflineFailReason' => $row['cashu_offline_fail_reason'] ?? null,
                     'onchain' => $onchainDetail,
+                    'ecx' => $ecxDetail,
                     'swap' => $swapDetail,
                 ],
                 'items' => $items,
@@ -2174,6 +2250,25 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     }
                     $updates['hosting_fee_destination'] = $dest === '' ? null : $dest;
                 }
+                // Hosting fee in eCash (ECX): the deployer's xpub the fee
+                // redirect derives ECX addresses from. Mainnet key; the
+                // address type follows the SLIP-32 prefix (ypub -> wrapped
+                // segwit, else native segwit). Empty clears it.
+                if (isset($_POST['hosting_fee_ecx_xpub'])) {
+                    $hx = trim((string) $_POST['hosting_fee_ecx_xpub']);
+                    if ($hx === '') {
+                        $updates['hosting_fee_ecx_xpub'] = null;
+                    } else {
+                        require_once __DIR__ . '/includes/onchain/wallet.php';
+                        $hxType = strtolower(substr($hx, 0, 4)) === 'ypub' ? 'P2SH-P2WPKH' : 'P2WPKH';
+                        $hxCheck = OnchainWallet::validateXpub($hx, 'mainnet', $hxType);
+                        if (!$hxCheck['valid']) {
+                            throw new Exception('Hosting fee ECX xpub: ' . ($hxCheck['error'] ?: 'invalid xpub'));
+                        }
+                        $updates['hosting_fee_ecx_xpub'] = $hx;
+                        $updates['hosting_fee_ecx_address_type'] = $hxType;
+                    }
+                }
 
                 // Changing the mint URL or unit points the store at a new
                 // wallet namespace (hash(mint_url, unit)); the funds at the
@@ -3044,6 +3139,194 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
             break;
 
+        case 'save_ecx_offer':
+            Auth::requireAdmin();
+            // Toggle whether the eCash (ECX) tab is OFFERED to customers,
+            // independent of whether an ECX xpub / static address is saved.
+            try {
+                $storeId = $_POST['store_id'] ?? '';
+                if (empty($storeId)) {
+                    throw new Exception('Store ID required');
+                }
+                $raw = (string)($_POST['offer_enabled'] ?? '1');
+                if (!in_array($raw, ['0', '1'], true)) {
+                    throw new Exception('Invalid eCash offer value');
+                }
+                Database::update('stores', ['ecx_offer_enabled' => (int)$raw], 'id = ?', [$storeId]);
+                require_once __DIR__ . '/includes/ecx/ecx.php';
+                $row = Config::getStore($storeId) ?? [];
+                echo json_encode([
+                    'success' => true,
+                    'offerEnabled' => (int)($row['ecx_offer_enabled'] ?? 1) === 1,
+                    'offered' => EcxConfig::isOffered($row),
+                ]);
+            } catch (Throwable $e) {
+                http_response_code(400);
+                echo json_encode(['success' => false, 'error' => $e->getMessage()]);
+            }
+            break;
+
+        case 'save_ecx':
+            Auth::requireAdmin();
+            // Persist a store's eCash (ECX) payment configuration. The twin of
+            // save_onchain for the ECX rail: 'xpub' (fresh address per invoice)
+            // or 'static' (one address, per-invoice szat tweak); ECX has a
+            // single network (mainnet) and is Esplora-only. The address
+            // derivation is Bitcoin's, so the same validation applies; the
+            // shared per-xpub counter means re-using the Bitcoin xpub here
+            // never hands out an address both chains have shown.
+            try {
+                $storeId = $_POST['store_id'] ?? '';
+                if (empty($storeId)) {
+                    throw new Exception('Store ID required');
+                }
+                $mode = $_POST['mode'] ?? 'xpub';
+                if (!in_array($mode, ['xpub', 'static'], true)) {
+                    throw new Exception('Invalid mode');
+                }
+                $network = Chain::ECX_NETWORK;
+                $type = $_POST['address_type'] ?? 'P2WPKH';
+                $minConfs = max(0, (int)($_POST['min_confs'] ?? 1));
+                $confirmTimeoutSec = max(60, (int)($_POST['confirm_timeout_sec'] ?? 86400));
+                $providerUrlRaw = trim($_POST['provider_url'] ?? '');
+                $providerFallback = in_array(
+                    strtolower((string)($_POST['provider_fallback'] ?? '')), ['1', 'true', 'on', 'yes'], true
+                ) ? 1 : 0;
+
+                require_once __DIR__ . '/includes/onchain/wallet.php';
+                require_once __DIR__ . '/includes/onchain/provider.php';
+                require_once __DIR__ . '/includes/ecx/ecx.php';
+
+                // Same custom-explorer rule as save_onchain: static checks on
+                // every save, a live tip probe only when the URL changes.
+                $providerUrl = '';
+                $providerProbe = null;
+                if ($providerUrlRaw !== '') {
+                    $providerUrl = EsploraProvider::normalizeCustomUrl($providerUrlRaw);
+                    $prevRow = Database::fetchOne("SELECT ecx_provider_url FROM stores WHERE id = ?", [$storeId]);
+                    $prevUrl = rtrim(trim((string)($prevRow['ecx_provider_url'] ?? '')), '/');
+                    if ($providerUrl !== $prevUrl) {
+                        $tip = EsploraProvider::probeCustomUrl($providerUrl);
+                        $providerProbe = ['url' => $providerUrl, 'tipHeight' => $tip];
+                    }
+                } else {
+                    $providerFallback = 0;
+                }
+
+                $policy = [
+                    'ecx_min_confs' => $minConfs,
+                    'ecx_confirm_timeout_sec' => $confirmTimeoutSec,
+                    'ecx_provider_url' => $providerUrl !== '' ? $providerUrl : null,
+                    'ecx_provider_fallback' => $providerFallback,
+                ];
+
+                if ($mode === 'static') {
+                    $staticAddress = trim($_POST['static_address'] ?? '');
+                    $tweakRange = max(100, min(100000, (int)($_POST['static_tweak_range'] ?? 1000)));
+                    if ($staticAddress === '') {
+                        Database::update('stores', [
+                            'ecx_address_mode' => 'static',
+                            'ecx_static_address' => null,
+                            'ecx_xpub' => null,
+                        ] + $policy, 'id = ?', [$storeId]);
+                        echo json_encode(['success' => true, 'providerProbe' => $providerProbe, 'disabled' => true]);
+                        break;
+                    }
+                    $check = OnchainWallet::validateAddress($staticAddress, $network);
+                    if (!$check['valid']) {
+                        throw new Exception($check['error'] ?: 'Invalid address');
+                    }
+                    Database::update('stores', [
+                        'ecx_address_mode' => 'static',
+                        'ecx_static_address' => $staticAddress,
+                        'ecx_static_tweak_range' => $tweakRange,
+                        'ecx_xpub' => null,
+                    ] + $policy, 'id = ?', [$storeId]);
+                    echo json_encode([
+                        'success' => true,
+                        'providerProbe' => $providerProbe,
+                        'mode' => 'static',
+                        'staticAddress' => $staticAddress,
+                        'tweakRange' => $tweakRange,
+                    ]);
+                    break;
+                }
+
+                $xpub = trim($_POST['xpub'] ?? '');
+                if ($xpub === '') {
+                    Database::update('stores', [
+                        'ecx_address_mode' => 'xpub',
+                        'ecx_xpub' => null,
+                        'ecx_static_address' => null,
+                    ] + $policy, 'id = ?', [$storeId]);
+                    echo json_encode(['success' => true, 'providerProbe' => $providerProbe, 'disabled' => true]);
+                    break;
+                }
+                $check = OnchainWallet::validateXpub($xpub, $network, $type);
+                if (!$check['valid']) {
+                    throw new Exception($check['error'] ?: 'Invalid xpub');
+                }
+                $existing = Database::fetchOne("SELECT ecx_xpub FROM stores WHERE id = ?", [$storeId]);
+                $xpubChanged = $existing && ($existing['ecx_xpub'] ?? null) !== $xpub;
+                $update = [
+                    'ecx_address_mode' => 'xpub',
+                    'ecx_xpub' => $xpub,
+                    'ecx_static_address' => null,
+                    'ecx_address_type' => $type,
+                ] + $policy;
+                // The counter is per xpub and shared with the Bitcoin rail, so
+                // the displayed next index is wherever that key already is.
+                $resumedIndex = null;
+                if ($xpubChanged) {
+                    $row = Database::fetchOne(
+                        "SELECT next_index FROM onchain_xpub_state WHERE xpub_hash = ?",
+                        [hash('sha256', $xpub)]
+                    );
+                    $resumedIndex = $row ? (int)$row['next_index'] : 0;
+                    $update['ecx_next_index'] = $resumedIndex;
+                }
+                Database::update('stores', $update, 'id = ?', [$storeId]);
+                echo json_encode([
+                    'success' => true,
+                    'providerProbe' => $providerProbe,
+                    'warnings' => $check['warnings'],
+                    'xpubChanged' => $xpubChanged,
+                    'resumedIndex' => $resumedIndex,
+                    'priceAvailable' => EcxRates::getEcxUsd() !== null,
+                ]);
+            } catch (Throwable $e) {
+                cashupay_status(400);
+                echo json_encode(['error' => $e->getMessage()]);
+            }
+            break;
+
+        case 'test_ecx_xpub':
+            Auth::requireAdmin();
+            // Next ECX address at the shared per-xpub counter, not consumed.
+            try {
+                require_once __DIR__ . '/includes/onchain/wallet.php';
+                $storeId = $_POST['store_id'] ?? '';
+                $store = Database::fetchOne(
+                    "SELECT ecx_xpub, ecx_address_type FROM stores WHERE id = ?", [$storeId]
+                );
+                if (!$store || empty($store['ecx_xpub'])) {
+                    throw new Exception('No eCash xpub configured for this store');
+                }
+                $state = Database::fetchOne(
+                    "SELECT next_index FROM onchain_xpub_state WHERE xpub_hash = ?",
+                    [hash('sha256', $store['ecx_xpub'])]
+                );
+                $idx = $state ? (int)$state['next_index'] : 0;
+                $addr = OnchainWallet::deriveAddress(
+                    $store['ecx_xpub'], $store['ecx_address_type'] ?: 'P2WPKH', Chain::ECX_NETWORK, $idx
+                );
+                echo json_encode(['address' => $addr, 'index' => $idx]);
+            } catch (Throwable $e) {
+                cashupay_status(400);
+                echo json_encode(['error' => $e->getMessage()]);
+            }
+            break;
+
         case 'validate_onchain_xpub':
             Auth::requireAdmin();
             // Used by the admin store-settings form to validate + preview
@@ -3122,24 +3405,31 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if ($storeId) {
                     $storeIds = [$storeId];
                 }
-                $rows = OnchainPayments::listNeedingManualConfirmation($storeIds);
+                // Both chain-watched rails: Bitcoin static addresses and
+                // eCash (ECX) static addresses can each produce ambiguity.
                 $out = [];
-                foreach ($rows as $r) {
-                    $out[] = [
-                        'id' => $r['id'],
-                        'store_id' => $r['store_id'],
-                        'amount' => $r['amount'],
-                        'currency' => $r['currency'],
-                        'onchain_address' => $r['onchain_address'],
-                        'onchain_amount_sat' => (int)($r['onchain_amount_sat'] ?? 0),
-                        'onchain_amount_tweak_sats' => isset($r['onchain_amount_tweak_sats'])
-                            ? (int)$r['onchain_amount_tweak_sats'] : null,
-                        'created_at' => $r['created_at'],
-                        'expiration_time' => $r['expiration_time'],
-                        'status' => $r['status'],
-                        'candidates' => $r['onchain_manual_candidates_decoded'],
-                    ];
+                foreach (Chain::all() as $chain) {
+                    $rows = OnchainPayments::listNeedingManualConfirmation($storeIds, $chain);
+                    foreach ($rows as $r) {
+                        $out[] = [
+                            'id' => $r['id'],
+                            'store_id' => $r['store_id'],
+                            'amount' => $r['amount'],
+                            'currency' => $r['currency'],
+                            'chain' => $chain->id,
+                            'unit' => $chain->unitPlural,
+                            'onchain_address' => $r[$chain->inv['address']],
+                            'onchain_amount_sat' => (int)($r[$chain->inv['amount']] ?? 0),
+                            'onchain_amount_tweak_sats' => isset($r[$chain->inv['tweak']])
+                                ? (int)$r[$chain->inv['tweak']] : null,
+                            'created_at' => $r['created_at'],
+                            'expiration_time' => $r['expiration_time'],
+                            'status' => $r['status'],
+                            'candidates' => $r['onchain_manual_candidates_decoded'],
+                        ];
+                    }
                 }
+                usort($out, static fn($a, $b) => ($b['created_at'] <=> $a['created_at']));
                 echo json_encode(['invoices' => $out]);
             } catch (Exception $e) {
                 cashupay_status(400);
@@ -3159,7 +3449,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if ($invoiceId === '' || $txid === '') {
                     throw new Exception('invoice_id and txid required');
                 }
-                OnchainPayments::manuallyAttribute($invoiceId, $txid, $vout);
+                // 'btc' (default) | 'ecx': which chain's candidate list.
+                $chainId = (string)($_POST['chain'] ?? Chain::BTC);
+                if (!in_array($chainId, [Chain::BTC, Chain::ECX], true)) {
+                    throw new Exception('Invalid chain');
+                }
+                OnchainPayments::manuallyAttribute($invoiceId, $txid, $vout, Chain::get($chainId));
                 echo json_encode(['success' => true]);
             } catch (Exception $e) {
                 cashupay_status(400);
@@ -7699,6 +7994,148 @@ header('Cache-Control: no-cache, must-revalidate');
                         </div>
                     </div>
 
+                    <!-- eCash (ECX) payments: the second chain-watched rail. ECX is
+                         the 2026 Drivechain hard fork of Bitcoin; addresses and xpubs
+                         are identical to Bitcoin's, so the card mirrors the on-chain
+                         card (xpub or static address, confirmation policy, own
+                         explorer) and offers the Bitcoin xpub as a one-click shortcut.
+                         Backed by save_ecx / save_ecx_offer / test_ecx_xpub. -->
+                    <div class="card collapsible collapsed" id="card-store-ecx">
+                        <div class="card-header">
+                            <div class="card-title">eCash (ECX) payments</div>
+                        </div>
+                        <div class="card-body">
+                            <p class="form-help" style="margin-bottom: 1rem;">
+                                Accept <a href="https://ecash.com" target="_blank" rel="noopener noreferrer">eCash (ECX)</a>,
+                                the Drivechain fork of Bitcoin, alongside your Bitcoin and Lightning options. ECX
+                                addresses and xpubs are the same format as Bitcoin&rsquo;s, so you can reuse your
+                                Bitcoin xpub or give a separate one &mdash; every invoice gets a fresh address and
+                                an address is never shown for both chains. Amounts are quoted in
+                                <strong>szats</strong> (1 ECX = 100,000,000 szats) at the CoinMarketCap price;
+                                when no price is available the eCash option is left off the invoice.
+                                Payments land straight in your ECX wallet; the dev fee and any hosting fee on
+                                eCash revenue are owed in ECX and collected only by occasionally routing an
+                                invoice&rsquo;s eCash address to the fee payee (the Bitcoin and Lightning options
+                                on that invoice stay yours).
+                            </p>
+                            <?php if ($gmpEnvError !== null): ?>
+                                <div style="margin-bottom:1rem; padding:0.75rem; border-radius:8px; background:rgba(245,158,11,0.12); border:1px solid rgba(245,158,11,0.35); font-size:0.85rem;">
+                                    <strong>&#9888; Xpub mode is unavailable on this server.</strong>
+                                    <?= htmlspecialchars($gmpEnvError) ?>
+                                    A single static address still works.
+                                </div>
+                            <?php endif; ?>
+                            <p class="form-help" id="ecx-price-line" style="margin-bottom: 1rem;">ECX price: &mdash;</p>
+
+                            <div class="form-group">
+                                <label class="form-label">Offer eCash to customers</label>
+                                <select class="form-input" id="ecx-offer-override" onchange="ecxOfferChanged()">
+                                    <option value="1">On for this store</option>
+                                    <option value="0">Off &mdash; keep the settings, hide the eCash tab</option>
+                                </select>
+                                <p class="form-help">
+                                    Currently effective: <strong id="ecx-offer-effective">&mdash;</strong>.
+                                </p>
+                            </div>
+
+                            <div class="form-group">
+                                <label class="form-label">Address source</label>
+                                <select class="form-input" id="ecx-mode">
+                                    <option value="xpub">Extended public key (recommended)</option>
+                                    <option value="static">Single static address (not recommended)</option>
+                                </select>
+                            </div>
+                            <div id="ecx-static-warning" style="display:none; margin-bottom:1rem; padding:0.75rem; border-radius:8px; background:rgba(245,158,11,0.12); border:1px solid rgba(245,158,11,0.35); font-size:0.85rem;">
+                                <strong>&#9888; Static address re-use is strongly discouraged.</strong>
+                                Each invoice gets a unique szat-tweak so totals don&rsquo;t collide; customers must
+                                pay the exact amount in a single transaction, and multi-part payments cannot be
+                                attributed.
+                            </div>
+                            <div class="form-group" id="ecx-xpub-row">
+                                <label class="form-label">Extended public key (xpub / zpub / ypub)</label>
+                                <textarea class="form-input" id="ecx-xpub" rows="2"
+                                          style="font-family: monospace; font-size: 0.85rem;"
+                                          placeholder="xpub... or zpub..."></textarea>
+                                <p class="form-help" id="ecx-xpub-meta"></p>
+                                <button type="button" class="btn btn-secondary" id="btn-ecx-use-btc-xpub" style="margin-top: 0.5rem;">
+                                    Use my Bitcoin xpub
+                                </button>
+                                <p class="form-help" id="ecx-use-btc-help" style="margin-top: 0.35rem;"></p>
+                            </div>
+                            <div class="form-group" id="ecx-static-address-row" style="display:none;">
+                                <label class="form-label">Static receive address</label>
+                                <input type="text" class="form-input" id="ecx-static-address"
+                                       style="font-family: monospace; font-size: 0.85rem;"
+                                       placeholder="bc1q... / 3... / 1...">
+                                <p class="form-help" id="ecx-static-address-meta">
+                                    Paste a single address from your ECX wallet. The server will reuse it for
+                                    every invoice. Leave blank to disable eCash payments.
+                                </p>
+                            </div>
+                            <div class="subsection collapsed" id="ecx-advanced">
+                            <div class="subsection-toggle">Advanced</div>
+                            <div class="subsection-body">
+                            <div class="form-group" id="ecx-static-tweak-row" style="display:none;">
+                                <label class="form-label">Tweak range (number of unique szat-offsets; each open invoice consumes one slot)</label>
+                                <input type="number" class="form-input" id="ecx-static-tweak-range" min="100" max="100000" value="1000">
+                            </div>
+                            <div class="form-group" id="ecx-address-type-row">
+                                <label class="form-label">Address type</label>
+                                <select class="form-input" id="ecx-address-type">
+                                    <option value="P2WPKH">P2WPKH (native segwit, recommended)</option>
+                                    <option value="P2SH-P2WPKH">P2SH-P2WPKH (wrapped segwit)</option>
+                                </select>
+                                <p class="form-help">The xpub prefix doesn&rsquo;t pin a script type &mdash; pick the one your ECX wallet uses.</p>
+                            </div>
+                            <p class="form-help" id="ecx-address-type-inferred" style="display:none;"></p>
+                            <div class="form-group">
+                                <label class="form-label">
+                                    Required confirmations (0 = accept zero-conf)
+                                    <span class="info-tip" tabindex="0" aria-label="More info">i<span class="info-tip-text">
+                                        Defaults to the value chosen for Bitcoin on first save; change it here for
+                                        eCash only. ECX retargets difficulty every 288 blocks, so block times vary
+                                        more than Bitcoin&rsquo;s. Payments that signal replace-by-fee wait for one
+                                        confirmation regardless.
+                                    </span></span>
+                                </label>
+                                <input type="number" class="form-input" id="ecx-min-confs" min="0" max="100" value="1">
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">Confirmation window (seconds; how long to wait once a tx appears in the mempool)</label>
+                                <input type="number" class="form-input" id="ecx-confirm-timeout" min="60" value="86400">
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">Explorer API URL (optional &mdash; leave blank for explorer.ecash.com with automatic esplora.ecash.ninja fallback)</label>
+                                <input type="text" class="form-input" id="ecx-provider-url"
+                                       placeholder="https://explorer.ecash.com/api">
+                                <p class="form-help">
+                                    The API base of your own ECX Esplora instance. It is checked when you save
+                                    (it must answer <code>/blocks/tip/height</code>). A LAN or localhost
+                                    address additionally needs private endpoints enabled on this server.
+                                </p>
+                                <label style="display:block; margin-top: 0.6rem; font-size: 0.9rem;">
+                                    <input type="checkbox" id="ecx-provider-fallback">
+                                    If my explorer is unreachable, fall back to the public ECX explorers
+                                    (explorer.ecash.com, then esplora.ecash.ninja)
+                                </label>
+                            </div>
+                            </div><!-- /.subsection-body -->
+                            </div><!-- /#ecx-advanced -->
+                            <div id="ecx-validation-box" style="display:none; margin: 0.75rem 0; padding: 0.75rem; border-radius: 8px; font-size: 0.85rem;"></div>
+                            <div id="ecx-xpub-buttons">
+                                <button class="btn btn-secondary btn-full" id="btn-validate-ecx" style="margin-top: 0.5rem;">
+                                    Validate &amp; preview first 3 addresses
+                                </button>
+                                <button class="btn btn-secondary btn-full" id="btn-test-ecx" style="margin-top: 0.5rem;">
+                                    Test current next address (m/0/<span id="ecx-current-index">0</span>)
+                                </button>
+                            </div>
+                            <button class="btn btn-full" id="btn-save-ecx" style="margin-top: 0.5rem;">
+                                Save eCash settings
+                            </button>
+                        </div>
+                    </div>
+
                     <!-- Per-store submarine-swap settings (there is no
                          site-wide layer; every knob lives on the store). -->
                     <div class="card collapsible collapsed" id="card-store-swaps">
@@ -8128,6 +8565,17 @@ header('Cache-Control: no-cache, must-revalidate');
                                 <input type="text" class="form-input" id="hosting-fee-destination"
                                        placeholder="you@yourdomain.com">
                                 <p class="form-help">Lightning address where the hosting fee is sent.</p>
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">Hosting Fee eCash (ECX) xpub</label>
+                                <textarea class="form-input" id="hosting-fee-ecx-xpub" rows="2"
+                                          style="font-family: monospace; font-size: 0.85rem;"
+                                          placeholder="xpub... or zpub... (optional)"></textarea>
+                                <p class="form-help">
+                                    Hosting fees on eCash (ECX) revenue are owed in ECX and can only be collected by
+                                    routing an invoice&rsquo;s eCash address to this xpub. Leave blank and ECX
+                                    hosting fees only accrue.
+                                </p>
                             </div>
                             <button class="btn btn-full" id="btn-save-hosting-fee">Save Hosting Fee</button>
                         </div>
@@ -8877,7 +9325,8 @@ header('Cache-Control: no-cache, must-revalidate');
                     <div class="card-body">
                         <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1rem;">
                             <div>
-                                <div class="stats-stat-row"><span class="stats-stat-label">Total revenue</span><span class="stats-stat-value" id="stats-revenue">—</span></div>
+                                <div class="stats-stat-row" title="Bitcoin and Lightning revenue in sats plus eCash (ECX) revenue converted at the current ECX price."><span class="stats-stat-label">Total revenue</span><span class="stats-stat-value" id="stats-revenue">—</span></div>
+                                <div class="stats-stat-row hidden" id="stats-ecx-revenue-row" title="Invoices paid in eCash (ECX), in szats, with the fiat value at the current ECX price. Included in Total revenue above."><span class="stats-stat-label">eCash (ECX) revenue</span><span class="stats-stat-value" id="stats-ecx-revenue">—</span></div>
                                 <div class="stats-stat-row"><span class="stats-stat-label">Total invoices</span><span class="stats-stat-value" id="stats-invoice-count">—</span></div>
                                 <div class="stats-stat-row"><span class="stats-stat-label">Total fees paid</span><span class="stats-stat-value" id="stats-total-fees">—</span></div>
                                 <div class="stats-stat-row"><span class="stats-stat-label">Total profit</span><span class="stats-stat-value" id="stats-profit">—</span></div>
@@ -8916,8 +9365,15 @@ header('Cache-Control: no-cache, must-revalidate');
                                 <div class="stats-stat-row" title="Submarine-swap fees paid by customers on swap-rail invoices (provider percentage + on-chain lockup miner fee, bundled into each LN invoice the customer paid).">
                                     <span class="stats-stat-label">Swap fees</span><span class="stats-stat-value" id="stats-fee-swap-paid">—</span>
                                 </div>
+                                <div class="stats-stat-row hidden" id="stats-fee-ecx-dev-row" title="Dev fee on eCash (ECX) revenue, owed and paid in ECX (collected by routing an invoice's eCash address to the fee payee). Shown in szats with the fiat value at the current ECX price.">
+                                    <span class="stats-stat-label">Dev fee (eCash)</span><span class="stats-stat-value" id="stats-fee-ecx-dev-paid">—</span>
+                                </div>
+                                <div class="stats-stat-row hidden" id="stats-fee-ecx-hosting-row" title="Hosting fee on eCash (ECX) revenue, owed and paid in ECX.">
+                                    <span class="stats-stat-label">Hosting fee (eCash)</span><span class="stats-stat-value" id="stats-fee-ecx-hosting-paid">—</span>
+                                </div>
                                 <hr style="border: 0; border-top: 1px solid var(--border); margin: 0.5rem 0;">
-                                <div class="stats-stat-row"><span class="stats-stat-label">Total fees owed</span><span class="stats-stat-value" id="stats-fees-owed">—</span></div>
+                                <div class="stats-stat-row" title="Dev + hosting fees still owed in sats, plus eCash fees owed converted at the current ECX price."><span class="stats-stat-label">Total fees owed</span><span class="stats-stat-value" id="stats-fees-owed">—</span></div>
+                                <div class="stats-stat-row hidden" id="stats-ecx-owed-row" title="Fees owed in eCash (ECX): dev + hosting, in szats. Collected only via the eCash fee redirect."><span class="stats-stat-label">Fees owed (eCash)</span><span class="stats-stat-value" id="stats-ecx-owed">—</span></div>
                                 <div class="stats-stat-row"><span class="stats-stat-label">Total fees paid</span><span class="stats-stat-value" id="stats-fees-paid">—</span></div>
                                 <div class="stats-stat-row" title="Total fees paid divided by total revenue, expressed as a percentage. Uses fees that actually settled, not amounts still owed.">
                                     <span class="stats-stat-label">Effective fee % (paid &divide; revenue)</span>
@@ -10082,6 +10538,13 @@ header('Cache-Control: no-cache, must-revalidate');
             document.getElementById('btn-save-onchain').addEventListener('click', saveOnchain);
             document.getElementById('onchain-xpub').addEventListener('input', applyOnchainAddressTypeVisibility);
             document.getElementById('onchain-mode').addEventListener('change', applyOnchainModeVisibility);
+            document.getElementById('btn-validate-ecx').addEventListener('click', validateEcxXpub);
+            document.getElementById('btn-test-ecx').addEventListener('click', testEcxCurrent);
+            document.getElementById('btn-save-ecx').addEventListener('click', saveEcx);
+            document.getElementById('btn-ecx-use-btc-xpub').addEventListener('click', useBtcXpubForEcx);
+            document.getElementById('ecx-xpub').addEventListener('input', applyEcxAddressTypeVisibility);
+            document.getElementById('ecx-mode').addEventListener('change', applyEcxModeVisibility);
+            document.getElementById('ecx-provider-url').addEventListener('input', syncEcxProviderFallbackState);
             document.getElementById('btn-save-exchange-settings').addEventListener('click', saveExchangeSettings);
             document.getElementById('btn-save-hosting-fee').addEventListener('click', saveHostingFee);
             const copyCronBtn = document.getElementById('btn-copy-cron-url');
@@ -10844,6 +11307,7 @@ header('Cache-Control: no-cache, must-revalidate');
                 if (thresholdLabel) thresholdLabel.textContent = `Threshold (${unitLabel})`;
 
                 renderOnchainDashboard();
+                renderEcxDashboard();
 
                 // Update auto-melt settings (per-store)
                 if (dashboardData.autoMelt) {
@@ -10895,7 +11359,7 @@ header('Cache-Control: no-cache, must-revalidate');
                 // Static-address manual-confirmation banner. Visible on every
                 // admin view (it lives above the view containers) but the
                 // detailed queue lives on the invoices view.
-                updateOnchainManualBanner(dashboardData.onchain);
+                updateOnchainManualBanner(dashboardData.onchain, dashboardData.ecx);
                 loadOnchainManualList();
 
                 // Update-available banner (admin-only). Reads the cached
@@ -11272,8 +11736,42 @@ header('Cache-Control: no-cache, must-revalidate');
             }
         }
 
+        // eCash (ECX) figure: "12,345 szats (0.00012345 ECX)" plus the fiat
+        // value at the ECX price the summary carries (omitted when there is
+        // no price).
+        function formatEcxAmount(szats, ecx) {
+            const n = Number(szats || 0);
+            const coin = (n / 100_000_000).toFixed(8).replace(/\.?0+$/, '') || '0';
+            let out = `${n.toLocaleString()} ${n === 1 ? 'szat' : 'szats'} (${coin} ECX)`;
+            const summary = statsState.summary || {};
+            const currency = summary.currency || 'USD';
+            if (ecx && ecx.ecx_price && n > 0) {
+                const fiat = (n / 100_000_000) * Number(ecx.ecx_price);
+                const formattedFiat = fiat.toLocaleString(undefined, {
+                    style: 'currency', currency: currency, maximumFractionDigits: fiat >= 100 ? 0 : 2,
+                });
+                out += ` <span class="stats-stat-fiat">(${formattedFiat})</span>`;
+            }
+            return out;
+        }
+
         function renderStatsSummary(s) {
-            document.getElementById('stats-revenue').innerHTML = formatStatsAmount(s.revenue_sats);
+            // Headline totals carry the eCash ledger folded in (sats equivalent
+            // at the current ECX price); the per-source rows stay in sats.
+            document.getElementById('stats-revenue').innerHTML = formatStatsAmount(s.revenue_total_sats ?? s.revenue_sats);
+            const ecx = s.ecx || null;
+            const showEcx = !!(ecx && (ecx.revenue_szats > 0 || ecx.fees_paid.total > 0 || ecx.fees_owed.total > 0));
+            const ecxRow = (id, show, html) => {
+                const row = document.getElementById(id);
+                if (!row) return;
+                row.classList.toggle('hidden', !show);
+                if (show) row.querySelector('.stats-stat-value').innerHTML = html;
+            };
+            ecxRow('stats-ecx-revenue-row', showEcx, ecx ? formatEcxAmount(ecx.revenue_szats, ecx) : '');
+            ecxRow('stats-fee-ecx-dev-row', showEcx, ecx ? formatEcxAmount(ecx.fees_paid.dev, ecx) : '');
+            ecxRow('stats-fee-ecx-hosting-row', showEcx, ecx ? formatEcxAmount(ecx.fees_paid.hosting, ecx) : '');
+            ecxRow('stats-ecx-owed-row', showEcx, ecx ? formatEcxAmount(ecx.fees_owed.total, ecx)
+                + (ecx.price_available ? '' : ' <span class="stats-stat-fiat">(no ECX price — not included in the total above)</span>') : '');
             document.getElementById('stats-invoice-count').textContent = (s.invoice_count || 0).toLocaleString();
             document.getElementById('stats-total-fees').innerHTML = formatStatsAmount(s.fees_paid.total);
             document.getElementById('stats-profit').innerHTML = formatStatsAmount(s.profit_sats);
@@ -11860,6 +12358,10 @@ header('Cache-Control: no-cache, must-revalidate');
         // network. Regtest has no public explorer; we still return a mainnet
         // URL so operators get *something* clickable — they know it'll 404.
         function mempoolUrl(kind, value, network) {
+            // network 'ecx' = the eCash (ECX) chain's public explorer.
+            if (network === 'ecx') {
+                return `https://explorer.ecash.com/${kind}/${encodeURIComponent(value)}`;
+            }
             const base = network === 'testnet' ? 'https://mempool.space/testnet'
                        : network === 'signet'  ? 'https://mempool.space/signet'
                        : 'https://mempool.space';
@@ -11935,6 +12437,7 @@ header('Cache-Control: no-cache, must-revalidate');
                 mint:    { icon: '⚡', label: 'Lightning (cashu)' },
                 strike:  { icon: '⚡', label: 'Lightning (Strike)' },
                 onchain: { icon: '🔗', label: 'On-chain' },
+                ecx:     { icon: '🪙', label: 'eCash (ECX)' },
                 swap:    { icon: '🔄', label: 'Swap' },
                 cashu:   { icon: '🥜', label: 'Cashu' },
             };
@@ -12032,14 +12535,14 @@ header('Cache-Control: no-cache, must-revalidate');
                 const destCell = inv.destination
                     ? `<span class="inv-mono">${inv.destinationIsLightning
                         ? renderCopyMono(inv.destination, 'Lightning destination')
-                        : renderMonoLink('address', inv.destination, network)}${strikeIdPart}${strikeRrPart}</span>`
+                        : renderMonoLink('address', inv.destination, inv.destinationChain === 'ecx' ? 'ecx' : network)}${strikeIdPart}${strikeRrPart}</span>`
                     : (inv.strikeInvoiceId
                         ? `<span class="inv-mono">${renderCopyMono(inv.strikeInvoiceId, 'Strike invoice ID')}</span>`
                         : '<span style="color: var(--text-secondary);">—</span>');
                 const txidCell = inv.txid
                     ? `<span class="inv-mono">${inv.txidIsLightning
                         ? renderCopyMono(inv.txid, 'Lightning invoice (bolt11)')
-                        : renderMonoLink('tx', inv.txid, network, inv.claimTxid ? 'Claim: ' + inv.claimTxid : null)}</span>`
+                        : renderMonoLink('tx', inv.txid, inv.txidChain === 'ecx' ? 'ecx' : network, inv.claimTxid ? 'Claim: ' + inv.claimTxid : null)}</span>`
                     : '<span style="color: var(--text-secondary);">—</span>';
 
                 // Display label for the status chip: "Settled" reads as
@@ -12926,6 +13429,287 @@ header('Cache-Control: no-cache, must-revalidate');
             renderOnchainSourceOrder();
             updateOnchainOfferWarning();
             applyOnchainModeVisibility();
+        }
+
+        // ---- eCash (ECX) payments card ----
+        // The twin of the on-chain card for the ECX rail (dashboardData.ecx,
+        // save_ecx / save_ecx_offer / test_ecx_xpub). Same derivation as
+        // Bitcoin, one network, szat units.
+        function applyEcxAddressTypeVisibility() {
+            const row = document.getElementById('ecx-address-type-row');
+            const inferredLine = document.getElementById('ecx-address-type-inferred');
+            const select = document.getElementById('ecx-address-type');
+            const typed = document.getElementById('ecx-xpub').value.trim();
+            let inferred = typed ? inferOnchainTypeFromXpub(typed) : null;
+            if (!inferred && !typed && dashboardData?.ecx?.enabled) {
+                inferred = inferOnchainTypeFromXpub(dashboardData.ecx.xpub || '');
+            }
+            if (inferred) {
+                select.value = inferred.type;
+                row.style.display = 'none';
+                inferredLine.style.display = 'block';
+                inferredLine.textContent = 'Address type: ' + inferred.type + ' (auto-detected from ' + inferred.prefix + ' prefix)';
+            } else {
+                row.style.display = '';
+                inferredLine.style.display = 'none';
+            }
+        }
+
+        function applyEcxModeVisibility() {
+            const isStatic = document.getElementById('ecx-mode').value === 'static';
+            document.getElementById('ecx-static-warning').style.display = isStatic ? 'block' : 'none';
+            document.getElementById('ecx-xpub-row').style.display = isStatic ? 'none' : '';
+            document.getElementById('ecx-static-address-row').style.display = isStatic ? '' : 'none';
+            document.getElementById('ecx-static-tweak-row').style.display = isStatic ? '' : 'none';
+            document.getElementById('ecx-xpub-buttons').style.display = isStatic ? 'none' : '';
+            const atRow = document.getElementById('ecx-address-type-row');
+            const atInf = document.getElementById('ecx-address-type-inferred');
+            if (isStatic) {
+                atRow.style.display = 'none';
+                atInf.style.display = 'none';
+            } else {
+                applyEcxAddressTypeVisibility();
+            }
+        }
+
+        function syncEcxProviderFallbackState() {
+            const url = document.getElementById('ecx-provider-url').value.trim();
+            const cb = document.getElementById('ecx-provider-fallback');
+            cb.disabled = url === '';
+            cb.parentElement.style.opacity = url === '' ? '0.55' : '';
+        }
+
+        function renderEcxDashboard() {
+            if (!dashboardData?.ecx) return;
+            const ex = dashboardData.ecx;
+            document.getElementById('ecx-mode').value = ex.mode || 'xpub';
+            document.getElementById('ecx-address-type').value = ex.addressType || 'P2WPKH';
+            // Operator decision: a not-yet-configured eCash rail starts from
+            // the Bitcoin card's confirmation policy; once saved, its own.
+            document.getElementById('ecx-min-confs').value = ex.enabled ? (ex.minConfs ?? 1) : (ex.btcMinConfs ?? 1);
+            document.getElementById('ecx-confirm-timeout').value = ex.enabled ? (ex.confirmTimeoutSec ?? 86400) : (ex.btcConfirmTimeoutSec ?? 86400);
+            document.getElementById('ecx-provider-url').value = ex.providerUrl || '';
+            document.getElementById('ecx-provider-fallback').checked = !!ex.providerFallback;
+            syncEcxProviderFallbackState();
+            document.getElementById('ecx-current-index').textContent = ex.nextIndex ?? 0;
+            document.getElementById('ecx-static-address').value = ex.staticAddress || '';
+            document.getElementById('ecx-static-tweak-range').value = ex.staticTweakRange ?? 1000;
+            const meta = document.getElementById('ecx-xpub-meta');
+            const xpubInput = document.getElementById('ecx-xpub');
+            if (ex.mode !== 'static' && ex.enabled) {
+                meta.innerHTML = 'Currently configured: <code style="word-break:break-all; font-size:0.8rem;">'
+                    + escapeHtml(ex.xpub || '(set)') + '</code>'
+                    + (ex.sameAsBtc ? ' (same as your Bitcoin xpub)' : '')
+                    + '<br>Paste a new xpub above to replace it.';
+                xpubInput.placeholder = '(unchanged — paste new xpub to replace)';
+            } else {
+                meta.textContent = '';
+                xpubInput.placeholder = 'xpub... or zpub...';
+            }
+            const useBtn = document.getElementById('btn-ecx-use-btc-xpub');
+            const useHelp = document.getElementById('ecx-use-btc-help');
+            if (ex.btcXpub) {
+                useBtn.style.display = '';
+                useHelp.textContent = 'Fills in the xpub configured on the Bitcoin tab. Addresses are shared per xpub, so no address is ever shown for both chains.';
+            } else {
+                useBtn.style.display = 'none';
+                useHelp.textContent = 'No Bitcoin xpub is configured on this store, so there is nothing to reuse — paste an xpub from your ECX wallet.';
+            }
+            const staticMeta = document.getElementById('ecx-static-address-meta');
+            if (ex.mode === 'static' && ex.enabled) {
+                staticMeta.innerHTML = 'Currently configured: <code style="word-break:break-all; font-size:0.8rem;">'
+                    + escapeHtml(ex.staticAddress || '(set)') + '</code>. Edit above to replace, or clear to disable.';
+            } else {
+                staticMeta.textContent = 'Paste a single address from your ECX wallet. The server will reuse it for every invoice. Leave blank to disable eCash payments.';
+            }
+            const offerSel = document.getElementById('ecx-offer-override');
+            const offerEff = document.getElementById('ecx-offer-effective');
+            if (offerSel) offerSel.value = ex.offerEnabled ? '1' : '0';
+            if (offerEff) {
+                offerEff.textContent = !ex.enabled ? 'off (no address source saved)'
+                    : (!ex.offerEnabled ? 'off' : (ex.priceAvailable ? 'on' : 'on, but hidden until an ECX price is available'));
+            }
+            const priceLine = document.getElementById('ecx-price-line');
+            if (priceLine) {
+                if (ex.priceAvailable) {
+                    priceLine.textContent = 'ECX price: $' + Number(ex.priceUsd).toLocaleString(undefined, {maximumFractionDigits: 4}) + ' (CoinMarketCap).';
+                } else {
+                    priceLine.textContent = 'ECX price: unavailable right now'
+                        + (ex.lastGoodPriceUsd ? ' (last seen $' + Number(ex.lastGoodPriceUsd).toLocaleString(undefined, {maximumFractionDigits: 4}) + ')' : '')
+                        + ' — eCash is not offered on new invoices until CoinMarketCap answers again.';
+                }
+            }
+            const hostingEcx = document.getElementById('hosting-fee-ecx-xpub');
+            if (hostingEcx) hostingEcx.value = ex.hostingFeeXpub || '';
+            applyEcxModeVisibility();
+        }
+
+        function useBtcXpubForEcx() {
+            const btc = dashboardData?.ecx?.btcXpub || '';
+            if (!btc) { showToast('No Bitcoin xpub configured on this store', 'error'); return; }
+            document.getElementById('ecx-mode').value = 'xpub';
+            document.getElementById('ecx-xpub').value = btc;
+            const t = dashboardData?.ecx?.btcAddressType;
+            if (t) document.getElementById('ecx-address-type').value = t;
+            applyEcxModeVisibility();
+            showToast('Bitcoin xpub filled in — validate, then save', 'success');
+        }
+
+        async function ecxOfferChanged() {
+            if (!currentStoreId) return;
+            const enabled = document.getElementById('ecx-offer-override').value;
+            try {
+                const resp = await postWithCsrf(adminUrl,
+                    `action=save_ecx_offer&store_id=${encodeURIComponent(currentStoreId)}&offer_enabled=${encodeURIComponent(enabled)}`);
+                const data = await resp.json();
+                if (resp.ok && data.success) {
+                    showToast('eCash offer setting saved', 'success');
+                    loadDashboard();
+                } else {
+                    showToast(data.error || 'Failed to save eCash setting', 'error');
+                }
+            } catch (e) {
+                showToast('Failed to save eCash setting', 'error');
+            }
+        }
+
+        function ecxBox(ok) {
+            const box = document.getElementById('ecx-validation-box');
+            box.style.display = 'block';
+            box.style.background = ok ? 'rgba(72, 187, 120, 0.1)' : 'rgba(245, 101, 101, 0.15)';
+            box.style.border = '1px solid ' + (ok ? 'rgba(72, 187, 120, 0.3)' : 'rgba(245, 101, 101, 0.3)');
+            return box;
+        }
+
+        async function validateEcxXpub() {
+            const xpub = document.getElementById('ecx-xpub').value.trim();
+            if (!xpub) { ecxBox(false).textContent = 'Paste an xpub first.'; return; }
+            const type = document.getElementById('ecx-address-type').value;
+            let res;
+            try {
+                res = await readJsonResponse(await postWithCsrf(adminUrl,
+                    `action=validate_onchain_xpub&xpub=${encodeURIComponent(xpub)}&network=mainnet&address_type=${type}`));
+            } catch (e) {
+                ecxBox(false).textContent = 'Could not reach the server. Check your connection and try again.';
+                return;
+            }
+            const data = res.data;
+            if (!res.ok || !data.valid) {
+                const box = ecxBox(false);
+                box.innerHTML = '<strong>Invalid: </strong>';
+                box.appendChild(document.createTextNode(data.error || (res.ok ? 'unknown' : `server error (HTTP ${res.status})`)));
+                return;
+            }
+            const box = ecxBox(true);
+            box.innerHTML = '<strong>Valid. </strong>Verify these match your ECX wallet\'s first 3 receive addresses:<br>';
+            const pre = document.createElement('pre');
+            pre.style.cssText = 'margin:0.5rem 0 0; font-size:0.85rem;';
+            pre.textContent = (data.preview || []).map((a, i) => 'm/0/' + i + ' = ' + a).join('\n');
+            box.appendChild(pre);
+            (data.warnings || []).forEach(w => {
+                const warn = document.createElement('div');
+                warn.style.cssText = 'margin-top:0.5rem; color:#f6ad55;';
+                warn.textContent = '⚠ ' + w;
+                box.appendChild(warn);
+            });
+        }
+
+        async function testEcxCurrent() {
+            if (!currentStoreId) { showToast('No store selected', 'error'); return; }
+            let res;
+            try {
+                res = await readJsonResponse(await postWithCsrf(adminUrl,
+                    `action=test_ecx_xpub&store_id=${encodeURIComponent(currentStoreId)}`));
+            } catch (e) {
+                ecxBox(false).textContent = 'Test failed: could not reach the server.';
+                return;
+            }
+            const data = res.data;
+            if (!res.ok || data.error) {
+                const box = ecxBox(false);
+                box.innerHTML = '<strong>Test failed:</strong> ';
+                box.appendChild(document.createTextNode(data.error || `server error (HTTP ${res.status})`));
+                return;
+            }
+            ecxBox(true).innerHTML = 'Current next address (m/0/' + data.index + '): <code>' + escapeHtml(data.address) + '</code>';
+        }
+
+        async function saveEcx() {
+            if (!currentStoreId) {
+                ecxBox(false).innerHTML = '<strong>No store selected.</strong> Pick a store from the dropdown at the top of the page first.';
+                showToast('No store selected', 'error');
+                return;
+            }
+            const mode = document.getElementById('ecx-mode').value;
+            const minConfs = document.getElementById('ecx-min-confs').value;
+            const timeout = document.getElementById('ecx-confirm-timeout').value;
+            const providerUrl = document.getElementById('ecx-provider-url').value.trim();
+            const providerFallback = (providerUrl !== '' && document.getElementById('ecx-provider-fallback').checked) ? '1' : '0';
+            const prevMode = dashboardData?.ecx?.mode || 'xpub';
+            const prevEnabled = !!dashboardData?.ecx?.enabled;
+            let body;
+            if (mode === 'static') {
+                const staticAddress = document.getElementById('ecx-static-address').value.trim();
+                const tweakRange = document.getElementById('ecx-static-tweak-range').value;
+                if (staticAddress === '' && prevEnabled) {
+                    const ok = await confirmOnchain('Disable eCash payments?',
+                        'Saving with an empty static address will disable eCash (ECX) payments for this store.');
+                    if (!ok) { ecxBox(false).innerHTML = '<strong>Cancelled.</strong> No changes saved.'; return; }
+                } else if (prevMode === 'xpub' && prevEnabled) {
+                    const ok = await confirmOnchain('Switch to static address mode?',
+                        'This will clear the currently configured eCash xpub. Static address re-use reduces privacy and prevents detecting multi-transaction payments.');
+                    if (!ok) { ecxBox(false).innerHTML = '<strong>Cancelled.</strong> No changes saved.'; return; }
+                }
+                body = `action=save_ecx&store_id=${encodeURIComponent(currentStoreId)}&mode=static&static_address=${encodeURIComponent(staticAddress)}&static_tweak_range=${encodeURIComponent(tweakRange)}&min_confs=${minConfs}&confirm_timeout_sec=${timeout}&provider_url=${encodeURIComponent(providerUrl)}&provider_fallback=${providerFallback}`;
+            } else {
+                const xpub = document.getElementById('ecx-xpub').value.trim();
+                const type = document.getElementById('ecx-address-type').value;
+                if (xpub === '' && prevEnabled && prevMode === 'xpub') {
+                    const ok = await confirmOnchain('Disable eCash payments?',
+                        'Saving with an empty xpub will disable eCash (ECX) payments for this store.');
+                    if (!ok) { ecxBox(false).innerHTML = '<strong>Cancelled.</strong> No changes saved.'; return; }
+                } else if (xpub !== '' && prevEnabled && prevMode === 'xpub' && xpub !== (dashboardData?.ecx?.xpub || '')) {
+                    const ok = await confirmOnchain('Switch to a different xpub?',
+                        'Replace the currently configured eCash xpub with the one you just pasted.');
+                    if (!ok) { ecxBox(false).innerHTML = '<strong>Cancelled.</strong> No changes saved.'; return; }
+                } else if (prevMode === 'static' && prevEnabled) {
+                    const ok = await confirmOnchain('Switch from static address to xpub?',
+                        'This will clear the currently configured eCash static address.');
+                    if (!ok) { ecxBox(false).innerHTML = '<strong>Cancelled.</strong> No changes saved.'; return; }
+                }
+                body = `action=save_ecx&store_id=${encodeURIComponent(currentStoreId)}&mode=xpub&xpub=${encodeURIComponent(xpub)}&address_type=${type}&min_confs=${minConfs}&confirm_timeout_sec=${timeout}&provider_url=${encodeURIComponent(providerUrl)}&provider_fallback=${providerFallback}`;
+            }
+            let res;
+            try {
+                res = await readJsonResponse(await postWithCsrf(adminUrl, body));
+            } catch (e) {
+                ecxBox(false).innerHTML = '<strong>Save failed:</strong> could not reach the server. Check your connection and try again.';
+                showToast('Could not reach the server', 'error');
+                return;
+            }
+            const data = res.data;
+            if (res.ok) {
+                let suffix = '';
+                if (data.disabled) {
+                    suffix = ' (eCash disabled)';
+                } else if (data.xpubChanged) {
+                    suffix = data.resumedIndex > 0 ? ' — continues at index ' + data.resumedIndex : ' — starts at index 0';
+                }
+                if (data.providerProbe && data.providerProbe.tipHeight) {
+                    suffix += ' &mdash; explorer at ' + escapeHtml(data.providerProbe.url)
+                        + ' verified (block height ' + Number(data.providerProbe.tipHeight).toLocaleString() + ')';
+                }
+                if (!data.disabled && data.priceAvailable === false) {
+                    suffix += ' &mdash; <strong>no ECX price is available right now</strong>, so eCash stays off new invoices until CoinMarketCap answers';
+                }
+                ecxBox(true).innerHTML = '<strong>&#10003; Saved' + suffix + '.</strong>';
+                showToast('eCash settings saved' + (data.disabled ? ' (disabled)' : ''), 'success');
+                loadDashboard();
+            } else {
+                const err = data.error || `Failed to save (HTTP ${res.status})`;
+                ecxBox(false).innerHTML = '<strong>Save failed:</strong> ' + escapeHtml(err);
+                showToast(err, 'error');
+            }
         }
 
         // ---- On-chain address source priority (strike vs local) ----
@@ -15105,13 +15889,14 @@ header('Cache-Control: no-cache, must-revalidate');
         async function saveHostingFee() {
             const pct = document.getElementById('hosting-fee-percent').value;
             const dest = document.getElementById('hosting-fee-destination').value.trim();
+            const ecxXpub = (document.getElementById('hosting-fee-ecx-xpub')?.value || '').trim();
             if (!currentStoreId) {
                 showToast('No store selected', 'error');
                 return;
             }
             try {
                 const response = await postWithCsrf(adminUrl,
-                    `action=update_store&store_id=${encodeURIComponent(currentStoreId)}&hosting_fee_percent=${encodeURIComponent(pct)}&hosting_fee_destination=${encodeURIComponent(dest)}`
+                    `action=update_store&store_id=${encodeURIComponent(currentStoreId)}&hosting_fee_percent=${encodeURIComponent(pct)}&hosting_fee_destination=${encodeURIComponent(dest)}&hosting_fee_ecx_xpub=${encodeURIComponent(ecxXpub)}`
                 );
                 const result = await response.json();
                 if (response.ok) {
@@ -17215,14 +18000,18 @@ header('Cache-Control: no-cache, must-revalidate');
             }
         }
 
-        function updateOnchainManualBanner(onchain) {
+        function updateOnchainManualBanner(onchain, ecx) {
             const banner = document.getElementById('onchain-manual-banner');
             const text = document.getElementById('onchain-manual-banner-text');
             if (!banner || !text) return;
-            const n = (onchain && onchain.needsManualConfirmation) || 0;
+            // Bitcoin static-address ambiguities plus eCash (ECX) ones.
+            const nBtc = (onchain && onchain.needsManualConfirmation) || 0;
+            const nEcx = (ecx && ecx.needsManualConfirmation) || 0;
+            const n = nBtc + nEcx;
             if (n > 0) {
+                const what = nBtc && nEcx ? 'on-chain / eCash payment' : (nEcx ? 'eCash payment' : 'on-chain payment');
                 text.textContent =
-                    n + ' on-chain payment' + (n === 1 ? '' : 's') + ' need' + (n === 1 ? 's' : '') + ' manual confirmation.';
+                    n + ' ' + what + (n === 1 ? '' : 's') + ' need' + (n === 1 ? 's' : '') + ' manual confirmation.';
                 banner.classList.remove('hidden');
             } else {
                 banner.classList.add('hidden');
@@ -17258,7 +18047,8 @@ header('Cache-Control: no-cache, must-revalidate');
                             const resp = await postWithCsrf(adminUrl,
                                 'action=resolve_onchain_manual&invoice_id=' + encodeURIComponent(invoiceId) +
                                 '&txid=' + encodeURIComponent(txid) +
-                                '&vout=' + encodeURIComponent(vout));
+                                '&vout=' + encodeURIComponent(vout) +
+                                '&chain=' + encodeURIComponent(btn.dataset.chain || 'btc'));
                             const result = await resp.json();
                             if (resp.ok) {
                                 showToast('Attributed and settled', 'success');
@@ -17279,17 +18069,21 @@ header('Cache-Control: no-cache, must-revalidate');
         }
 
         function renderManualInvoiceBlock(inv) {
+            // Bitcoin candidates are in sats, eCash (ECX) ones in szats.
+            const unit = inv.unit || (inv.chain === 'ecx' ? 'szats' : 'sats');
+            const chainTag = inv.chain === 'ecx' ? ' <span class="inv-chip">eCash (ECX)</span>' : '';
             const candidates = (inv.candidates || []).map(c => {
                 const conf = (c.confirmations || 0);
                 return `
                     <li style="margin-bottom: 0.5rem; padding: 0.5rem; background: rgba(0,0,0,0.08); border-radius: 6px;">
                         <div style="font-family: monospace; font-size: 0.78rem; word-break: break-all;">${escapeHtml(c.txid)}:${c.vout}</div>
                         <div style="font-size: 0.8rem; color: var(--text-secondary); margin: 0.25rem 0;">
-                            ${c.amount_sat} sats &middot; ${conf} confirmation${conf === 1 ? '' : 's'}
+                            ${c.amount_sat} ${unit} &middot; ${conf} confirmation${conf === 1 ? '' : 's'}${chainTag}
                         </div>
                         <button class="btn btn-secondary" style="padding: 0.25rem 0.75rem; font-size: 0.8rem;"
                                 data-manual-action="attribute"
                                 data-invoice-id="${escapeAttr(inv.id)}"
+                                data-chain="${escapeAttr(inv.chain || 'btc')}"
                                 data-txid="${escapeAttr(c.txid)}"
                                 data-vout="${c.vout}">
                             Attribute to this invoice
@@ -18046,7 +18840,7 @@ header('Cache-Control: no-cache, must-revalidate');
 
         const ATTEMPT_RAIL_LABELS = {
             strike: 'Strike', lnurl: 'Lightning address', nwc: 'NWC wallet', noffer: 'CLINK noffer',
-            swap: 'Submarine swap', mint: 'Cashu mint', onchain: 'On-chain address', fee: 'Fee redirect',
+            swap: 'Submarine swap', mint: 'Cashu mint', onchain: 'On-chain address', ecx: 'eCash (ECX) address', fee: 'Fee redirect',
         };
         const ATTEMPT_CONTEXT_LABELS = {
             checkout: 'Invoice creation', refresh: 'Lightning refresh', poll: 'Settlement checks',
@@ -18126,7 +18920,7 @@ header('Cache-Control: no-cache, must-revalidate');
             }
             const destination = inv.destination
                 ? (inv.destinationIsLightning ? invdMono(inv.destination, 'Lightning destination')
-                    : `${renderMonoLink('address', inv.destination, network)}${invdCopy(inv.destination, 'Address')}`)
+                    : `${renderMonoLink('address', inv.destination, inv.destinationChain === 'ecx' ? 'ecx' : network)}${invdCopy(inv.destination, 'Address')}`)
                 : '';
             const feeRedirect = inv.feeRedirect
                 ? `${escapeHtml(inv.feeRedirect.label || 'fees')}${inv.feeRedirect.destination ? ' → <span class="invd-mono">' + escapeHtml(inv.feeRedirect.destination) + '</span>' : ''}`
@@ -18189,6 +18983,28 @@ header('Cache-Control: no-cache, must-revalidate');
                     ${invdRow('Manual confirmation', oc.needsManualConfirmation ? '<span style="color:#f59e0b;">awaiting operator attribution</span>' : '')}
                 </dl>`;
                 methods += `<div class="invd-group-title">🔗 On-chain</div>${ocGrid}${pays ? `<div class="invd-note" style="margin-top:0.4rem;">Transactions seen</div>${pays}` : ''}`;
+            }
+            if (det.ecx) {
+                // eCash (ECX): same layout as on-chain, szat units, ECX explorer.
+                const ex = det.ecx;
+                const ecxCoin = (szats) => (Number(szats || 0) / 100_000_000).toFixed(8).replace(/\.?0+$/, '') || '0';
+                const epays = (ex.payments || []).map(p => `<div class="invd-attempt">
+                        <div class="invd-attempt-time">${invdTime(p.firstSeenAt)}</div>
+                        <div class="invd-attempt-body">
+                            <span class="invd-mono">${renderMonoLink('tx', p.txid, 'ecx')}</span>:${escapeHtml(String(p.vout))}${invdCopy(p.txid, 'Transaction ID')}
+                            <div class="invd-attempt-label">${escapeHtml(String(p.amountSzat))} szats · ${escapeHtml(String(p.confirmations))} confirmation${p.confirmations === 1 ? '' : 's'}${p.blockHeight ? ' · block ' + escapeHtml(String(p.blockHeight)) : ''}</div>
+                        </div>
+                    </div>`).join('');
+                const feeLabel = ex.feeNote ? ({DEV_FEE: 'dev fee', HOSTING_FEE: 'hosting fee'}[ex.feeNote] || 'fees') : '';
+                const exGrid = `<dl class="invd-grid">
+                    ${invdRow('Address', `${renderMonoLink('address', ex.address, 'ecx')} <span class="invd-mono">${escapeHtml(ex.address)}</span>${invdCopy(ex.address, 'Address')}`)}
+                    ${invdRow('Expected', ex.amountSzat !== null && ex.amountSzat !== undefined ? `${escapeHtml(String(ex.amountSzat))} szats (${ecxCoin(ex.amountSzat)} ECX)${ex.tweakSzats ? ' <span style="color:var(--text-secondary); font-size:0.78rem;">(static address, includes ' + escapeHtml(String(ex.tweakSzats)) + ' szat uniqueness tweak)</span>' : ''}` : '')}
+                    ${invdRow('ECX rate', ex.rate ? escapeHtml(String(ex.rate)) + ' ' + escapeHtml(String(inv.currency || '')) + ' per ECX' : '')}
+                    ${invdRow('Routed to', ex.feeNote ? `<span style="color:#f59e0b;">${escapeHtml(feeLabel)} (ECX ledger)</span>` : '')}
+                    ${invdRow('First seen', invdTime(ex.firstSeenAt))}
+                    ${invdRow('Manual confirmation', ex.needsManualConfirmation ? '<span style="color:#f59e0b;">awaiting operator attribution</span>' : '')}
+                </dl>`;
+                methods += `<div class="invd-group-title">🪙 eCash (ECX)</div>${exGrid}${epays ? `<div class="invd-note" style="margin-top:0.4rem;">Transactions seen</div>${epays}` : ''}`;
             }
             if (det.swap) {
                 const sw = det.swap;

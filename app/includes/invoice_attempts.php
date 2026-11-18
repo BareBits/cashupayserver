@@ -52,7 +52,7 @@ class InvoiceAttempts {
     public const SKIPPED = 'skipped';
     public const OUTCOMES = [self::OK, self::FAILED, self::SKIPPED];
 
-    public const RAILS = ['strike', 'lnurl', 'nwc', 'noffer', 'swap', 'mint', 'onchain', 'fee'];
+    public const RAILS = ['strike', 'lnurl', 'nwc', 'noffer', 'swap', 'mint', 'onchain', 'ecx', 'fee'];
 
     /** Rows kept per invoice; the oldest beyond it are pruned on insert. */
     public const PER_INVOICE_CAP = 300;

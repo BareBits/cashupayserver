@@ -10,6 +10,7 @@
 require_once __DIR__ . '/../database.php';
 require_once __DIR__ . '/../safe_http.php';
 require_once __DIR__ . '/../endpoint_health.php';
+require_once __DIR__ . '/chain.php';
 
 /**
  * A single transaction output observed paying a given watch address.
@@ -74,14 +75,9 @@ interface BlockchainProvider {
  * Per-network defaults can be obtained via defaultUrlsForNetwork().
  */
 final class EsploraProvider implements BlockchainProvider {
-    private const DEFAULTS = [
-        'mainnet' => ['https://mempool.space/api', 'https://blockstream.info/api'],
-        'testnet' => ['https://mempool.space/testnet/api', 'https://blockstream.info/testnet/api'],
-        // blockstream.info has no public signet instance.
-        'signet'  => ['https://mempool.space/signet/api'],
-        // No public regtest API exists; users must self-host or use BitcoindRpcProvider.
-        'regtest' => null,
-    ];
+    // The built-in public host chains live on the Chain descriptors (see
+    // chain.php): Bitcoin = mempool.space then blockstream.info; ECX =
+    // explorer.ecash.com then esplora.ecash.ninja.
 
     /** @var string[] */
     private readonly array $baseUrls;
@@ -97,34 +93,37 @@ final class EsploraProvider implements BlockchainProvider {
         $this->baseUrls = $urls;
     }
 
-    public static function defaultUrlForNetwork(string $network): ?string {
-        return self::DEFAULTS[$network][0] ?? null;
+    public static function defaultUrlForNetwork(string $network, ?Chain $chain = null): ?string {
+        return ($chain ?? Chain::btc())->esploraDefaults($network)[0] ?? null;
     }
 
     /**
-     * The full default failover chain for a network, primary first.
+     * The full default failover chain for a network, primary first. $chain
+     * picks the rail (Bitcoin when null).
      * @return string[]|null
      */
-    public static function defaultUrlsForNetwork(string $network): ?array {
-        $override = self::publicDefaultsOverride();
+    public static function defaultUrlsForNetwork(string $network, ?Chain $chain = null): ?array {
+        $chain = $chain ?? Chain::btc();
+        $override = self::publicDefaultsOverride($chain);
         if ($override !== null) {
             return $override;
         }
-        return self::DEFAULTS[$network] ?? null;
+        return $chain->esploraDefaults($network);
     }
 
     /**
      * Test / rig seam for the built-in public explorer chain: a comma-
-     * separated list of base URLs in CASHUPAY_ESPLORA_DEFAULT_URLS replaces
-     * the defaults of EVERY network. Only honoured while private endpoints
+     * separated list of base URLs in CASHUPAY_ESPLORA_DEFAULT_URLS (Bitcoin)
+     * or CASHUPAY_ECX_ESPLORA_DEFAULT_URLS (ECX) replaces the defaults of
+     * EVERY network of that chain. Only honoured while private endpoints
      * are allowed (the same opt-in the e2e rigs and LAN deployments set), so
      * a stray environment variable on a stock deployment can never redirect
      * chain watching to an attacker-chosen host. Null = no override.
      *
      * @return string[]|null
      */
-    public static function publicDefaultsOverride(): ?array {
-        $env = getenv('CASHUPAY_ESPLORA_DEFAULT_URLS');
+    public static function publicDefaultsOverride(?Chain $chain = null): ?array {
+        $env = getenv(($chain ?? Chain::btc())->esploraOverrideEnv);
         if ($env === false || trim($env) === '') {
             return null;
         }
@@ -156,20 +155,24 @@ final class EsploraProvider implements BlockchainProvider {
      * network has no public explorer (regtest) and nothing was configured.
      *
      * @param array $store stores row (onchain_provider, onchain_provider_url,
-     *                     onchain_provider_fallback, onchain_network)
+     *                     onchain_provider_fallback, onchain_network — or the
+     *                     ecx_* equivalents when $chain is the ECX rail)
      * @param ?string $network overrides the store's network (swap rows carry
      *                         their own)
+     * @param ?Chain $chain which rail's columns + public defaults to use
+     *                      (Bitcoin when null)
      * @return string[]
      */
-    public static function chainForStore(array $store, ?string $network = null): array {
-        $network = $network ?? ($store['onchain_network'] ?? 'mainnet');
-        $kind = $store['onchain_provider'] ?? 'esplora';
-        $url = trim((string)($store['onchain_provider_url'] ?? ''));
-        $public = self::defaultUrlsForNetwork($network) ?? [];
+    public static function chainForStore(array $store, ?string $network = null, ?Chain $chain = null): array {
+        $chain = $chain ?? Chain::btc();
+        $network = $network ?? $chain->network($store);
+        $kind = $store[$chain->store['provider']] ?? 'esplora';
+        $url = trim((string)($store[$chain->store['provider_url']] ?? ''));
+        $public = self::defaultUrlsForNetwork($network, $chain) ?? [];
         if ($kind === 'bitcoind' || $kind === 'bitcoind-rpc' || $url === '') {
             return $public;
         }
-        $fallback = (int)($store['onchain_provider_fallback'] ?? 0) === 1;
+        $fallback = (int)($store[$chain->store['provider_fallback']] ?? 0) === 1;
         if (!$fallback) {
             return [$url];
         }
@@ -697,15 +700,17 @@ final class OnchainProviderFactory {
      */
     public static ?BlockchainProvider $testProvider = null;
 
-    public static function forStore(array $store): BlockchainProvider {
+    public static function forStore(array $store, ?Chain $chain = null): BlockchainProvider {
         if (self::$testProvider !== null) {
             return self::$testProvider;
         }
-        $kind = $store['onchain_provider'] ?? 'esplora';
-        $network = $store['onchain_network'] ?? 'mainnet';
-        $url = $store['onchain_provider_url'] ?: null;
+        $chain = $chain ?? Chain::btc();
+        $kind = $store[$chain->store['provider']] ?? 'esplora';
+        $network = $chain->network($store);
+        $url = ($store[$chain->store['provider_url']] ?? null) ?: null;
 
-        if ($kind === 'bitcoind' || $kind === 'bitcoind-rpc') {
+        // Only the Bitcoin rail can talk to a local bitcoind; ECX is Esplora-only.
+        if ($chain->isBtc() && ($kind === 'bitcoind' || $kind === 'bitcoind-rpc')) {
             if (!$url) {
                 throw new RuntimeException('bitcoind provider requires onchain_provider_url');
             }
@@ -715,11 +720,11 @@ final class OnchainProviderFactory {
         // Default: Esplora HTTP. The host chain is the store's custom URL
         // (exclusively, unless the operator opted in to the public fallback)
         // or the built-in public chain — see EsploraProvider::chainForStore.
-        $urls = EsploraProvider::chainForStore($store, $network);
+        $urls = EsploraProvider::chainForStore($store, $network, $chain);
         if ($urls === []) {
             throw new RuntimeException(
-                "No default Esplora URL for network '{$network}'. "
-                . "Set onchain_provider_url in the store config."
+                "No default Esplora URL for network '{$network}' ({$chain->ticker}). "
+                . "Set {$chain->store['provider_url']} in the store config."
             );
         }
         return new EsploraProvider($urls);

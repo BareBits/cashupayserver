@@ -328,6 +328,8 @@ class Config {
         'smtp_password',
         'onchain_xpub',
         'hosting_fee_onchain_xpub',
+        'ecx_xpub',
+        'hosting_fee_ecx_xpub',
     ];
 
     /**

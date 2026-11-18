@@ -373,11 +373,14 @@ class DevFee {
         // Revenue: sum of paid invoices' sat value created after the
         // migration timestamp. amount_sats may be null on legacy rows; those
         // are excluded by the filter.
+        // Invoices paid in eCash (settled_rail = 'ecx') are NOT sats revenue:
+        // their fee is owed in ECX on the separate ECX ledger (EcxFees).
         $revenue = (int) Database::fetchOne(
             "SELECT COALESCE(SUM(amount_sats), 0) AS s
              FROM invoices
              WHERE store_id = ? AND status = 'Settled'
                AND amount_sats IS NOT NULL
+               AND (settled_rail IS NULL OR settled_rail != 'ecx')
                AND created_at >= ?",
             [$storeId, $start]
         )['s'];

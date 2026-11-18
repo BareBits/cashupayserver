@@ -23,6 +23,7 @@ BareBits can create invoices, receive payments, and be used as a point-of-sale s
 - **Tip Jar** - Let customers make their own payments using a shared link. Links can be generic (any amount) or for specific products.
 - **E-commerce integration** - Plugin for WooCommerce. On magneto, shopify, or another platform? Use the BTCPay plugin and point it to your BareBits URL.
 - **On-chain payments** to an off-server wallet using xpub addresses or even a single address
+- **eCash (ECX) payments** - optionally accept [eCash](https://ecash.com), the Drivechain fork of Bitcoin, alongside Bitcoin and Lightning: same xpub format, fresh address per invoice, amounts in szats at the CoinMarketCap price. See [docs/ecx.md](docs/ecx.md).
 - **Lightning payments** to your off-server wallet via LNURL lightning address, CLINK noffer, or NWC (nostr wallet connect), or Strike API. Also supports using a cashu mint (no need to manage liquidity). We suggest ([Electrum](https://electrum.org/) for self-custody setups). Multiple wallets and connection types are supported so payments gracefully fall back to whichever wallet is online + has sufficient inbound liquidity.
 - **User management** - Admin users can modify store settings and products and withdraw funds, regular users can only take payments.
 - **Product management** - Add commonly-used products to your store to make invoicing fast and clear

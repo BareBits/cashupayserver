@@ -110,6 +110,17 @@ class PaymentPathDebug
         return self::withDest('On-chain (' . $mode . ')', $address);
     }
 
+    /** eCash (ECX) address source: fee payee, static address or xpub-derived. */
+    public static function ecxLabel(array $invoice, ?string $ecxMode): string
+    {
+        $address = (string)($invoice['ecx_address'] ?? '');
+        if (!empty($invoice['ecx_fee_note'])) {
+            return self::withDest('Fee-redirect eCash (xpub-derived)', $address);
+        }
+        $mode = ($ecxMode === 'static') ? 'static address' : 'xpub-derived';
+        return self::withDest('eCash ECX (' . $mode . ')', $address);
+    }
+
     /**
      * Label for the Cashu ecash (NUT-18) method block. This block is offered
      * independently of the rail above; the request is built against the store's
