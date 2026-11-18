@@ -36,11 +36,13 @@ def test_invoice_falls_over_to_backup_when_primary_is_dead(
     mint: MintHandle,
     backup_mint: MintHandle,
 ) -> None:
-    # Add the real (working) mint as a backup before nuking primary.
-    _add_backup_mint(shared_configured, mint.url, priority=100)
-    # Point primary at a TCP port that nothing is listening on.
+    # Point primary at a TCP port that nothing is listening on, THEN add the
+    # real (working) mint as a backup: add_backup_mint refuses a backup equal
+    # to the store's current main mint (PR #216), and the wizard made `mint`
+    # the primary.
     dead_url = "http://127.0.0.1:1"
     _set_primary_mint_url(shared_configured, dead_url)
+    _add_backup_mint(shared_configured, mint.url, priority=100)
 
     invoice = shared_configured.greenfield.create_invoice(
         shared_configured.store_id, amount="500", currency="sat"

@@ -290,14 +290,20 @@ def _txid(prefix: str = "e") -> str:
 
 
 def _seed_ecx_revenue(cfg: ConfiguredPayserver, szats: int) -> None:
-    """A settled eCash invoice written directly: the ECX ledger's revenue base."""
+    """A settled eCash invoice written directly: the ECX ledger's revenue base.
+
+    created_at is NOW, not in the past: EcxFees::computeOwed only counts
+    invoices created at or after `fee_tracking_start_at`, which the module's
+    fresh database stamps at install time — a back-dated seed falls outside
+    the window whenever the module reaches this point within that many
+    seconds of start-up (the CI flake of 2026-11-18)."""
     now = int(time.time())
     with cfg.handle.db() as db:
         db.execute(
             "INSERT INTO invoices (id, store_id, status, settled_rail, amount, currency, amount_sats,"
             " ecx_address, ecx_amount_szat, created_at, expiration_time, paid_at)"
             " VALUES (?, ?, 'Settled', 'ecx', '1', 'USD', 1, 'bc1qseededrevenue', ?, ?, ?, ?)",
-            (f"seed_{cfg.store_id[-6:]}_{now}_{szats}", cfg.store_id, szats, now - 60, now + 3600, now - 30),
+            (f"seed_{cfg.store_id[-6:]}_{now}_{szats}", cfg.store_id, szats, now, now + 3600, now),
         )
 
 
