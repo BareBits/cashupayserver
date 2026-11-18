@@ -12,7 +12,8 @@
  *   - product names                -> kept as product_id only
  *   - invoice notes / metadata     -> omitted
  *   - txids, preimages, bolt11,
- *     on-chain / lightning addrs   -> omitted, and scrubbed from free text
+ *     on-chain / eCash (ECX) /
+ *     lightning addrs              -> omitted, and scrubbed from free text
  *   - notification recipient,
  *     subject and body             -> omitted
  *   - real invoice ids             -> replaced with per-report surrogates
@@ -100,12 +101,19 @@ class Diagnostics {
         'onchain_address_index', 'onchain_amount_sat', 'onchain_amount_tweak_sats',
         'onchain_first_seen_at', 'onchain_created_tip_height',
         'onchain_needs_manual_confirmation', 'cart_purchase_counted',
+        // eCash (ECX) leg: amounts in szats, chain state, the rate it was
+        // quoted at and whether the address pointed at a fee payee. The
+        // address and destination themselves are PII (below).
+        'ecx_address_index', 'ecx_amount_szat', 'ecx_amount_tweak_szats',
+        'ecx_amount_floor_szat', 'ecx_first_seen_at', 'ecx_created_tip_height',
+        'ecx_needs_manual_confirmation', 'ecx_exchange_rate', 'ecx_fee_note',
     ];
 
     /** Extra invoice columns added only when NOT anonymizing. */
     private const INVOICE_PII_COLS = [
         'quote_id', 'bolt11', 'metadata', 'checkout_config',
         'onchain_address', 'onchain_manual_candidates', 'fee_redirect_destination',
+        'ecx_address', 'ecx_manual_candidates', 'ecx_fee_destination',
     ];
 
     /** Invoice-item columns kept in the anonymized report. */
@@ -126,6 +134,22 @@ class Diagnostics {
 
     /** Extra melt columns added only when NOT anonymizing. */
     private const MELT_PII_COLS = ['destination', 'preimage', 'note'];
+
+    /**
+     * Chain observation columns (onchain_payments / ecx_payments) kept in the
+     * anonymized report; txid is the payment identifier and is PII.
+     */
+    private const CHAIN_PAYMENT_SAFE_COLS = [
+        'id', 'invoice_id', 'vout', 'amount_sat', 'confirmations', 'block_height',
+        'first_seen_at', 'last_seen_at',
+    ];
+    private const CHAIN_PAYMENT_PII_COLS = ['txid'];
+
+    /** ecx_fee_credits columns kept in the anonymized report (fees paid in ECX). */
+    private const ECX_FEE_CREDIT_SAFE_COLS = [
+        'id', 'store_id', 'invoice_id', 'note', 'amount_szat', 'created_at',
+    ];
+    private const ECX_FEE_CREDIT_PII_COLS = ['destination'];
 
     /** Maps a real invoice id to a stable per-report surrogate. */
     private array $invoiceIdMap = [];
@@ -157,6 +181,11 @@ class Diagnostics {
         $this->writeArray($out, 'invoices', $this->invoiceRows());
         $this->writeArray($out, 'invoice_items', $this->invoiceItemRows());
         $this->writeArray($out, 'melts', $this->meltRows());
+        // Chain observations for both pay-to-address rails, and the fees paid
+        // in ECX (the eCash counterpart of fee melts).
+        $this->writeArray($out, 'onchain_payments', $this->chainPaymentRows('onchain_payments'));
+        $this->writeArray($out, 'ecx_payments', $this->chainPaymentRows('ecx_payments'));
+        $this->writeArray($out, 'ecx_fee_credits', $this->ecxFeeCreditRows());
 
         fwrite($out, '}');
     }
@@ -255,12 +284,35 @@ class Diagnostics {
                 'network_fee_sats' => (int) $m['fee_sats'],
             ];
         }
+        // eCash (ECX) ledger: revenue settled over the ECX rail (szats) and
+        // the fee credits paid in ECX, by fee type — the szat-side view of
+        // invoices_by_rail / melts_by_type above.
+        $ecxRevenue = Database::fetchOne(
+            "SELECT COUNT(*) AS n, COALESCE(SUM(ecx_amount_szat),0) AS szats
+             FROM invoices{$where}" . ($where === '' ? ' WHERE ' : ' AND ') . "status = 'Settled' AND settled_rail = 'ecx'",
+            $params
+        );
+        $ecxCredits = Database::fetchAll(
+            "SELECT note, COUNT(*) AS n, COALESCE(SUM(amount_szat),0) AS szats
+             FROM ecx_fee_credits{$where} GROUP BY note", $params);
+        $ecxCreditsByType = [];
+        foreach ($ecxCredits as $c) {
+            $ecxCreditsByType[$this->meltType($c['note'])] = [
+                'count' => (int) $c['n'],
+                'amount_szats' => (int) $c['szats'],
+            ];
+        }
 
         return [
             'invoices_by_status'   => $byStatus,
             'invoices_by_rail'     => $byRail,
             'invoices_by_currency' => $byCurrency,
             'melts_by_type'        => $meltsByType,
+            'ecx' => [
+                'settled_count'        => (int) ($ecxRevenue['n'] ?? 0),
+                'revenue_szats'        => (int) ($ecxRevenue['szats'] ?? 0),
+                'fee_credits_by_type'  => $ecxCreditsByType,
+            ],
         ];
     }
 
@@ -350,6 +402,39 @@ class Diagnostics {
             if (array_key_exists('invoice_id', $out) && $out['invoice_id'] !== null) {
                 $out['invoice_id'] = $this->surrogate($out['invoice_id']);
             }
+            yield $out;
+        }
+    }
+
+    /**
+     * Observed (txid, vout) outputs for one pay-to-address rail. The rows join
+     * invoices through the surrogate id; the txid is dropped when anonymizing
+     * (it identifies the payment on a public chain).
+     */
+    private function chainPaymentRows(string $table): \Generator {
+        $startTs = $this->range !== null ? Stats::rangeStart($this->range) : null;
+        [$where, $params] = $this->rangeClause($startTs, 'first_seen_at');
+        foreach (Database::fetchAll(
+            "SELECT * FROM {$table}{$where} ORDER BY first_seen_at ASC, id ASC", $params) as $r) {
+            $cols = self::CHAIN_PAYMENT_SAFE_COLS;
+            if (!$this->anonymize) $cols = array_merge($cols, self::CHAIN_PAYMENT_PII_COLS);
+            $out = $this->project($r, $cols);
+            $out['invoice_id'] = $this->surrogate($r['invoice_id']);
+            yield $out;
+        }
+    }
+
+    /** Fees paid in ECX (one row per fee-routed eCash settlement). */
+    private function ecxFeeCreditRows(): \Generator {
+        $startTs = $this->range !== null ? Stats::rangeStart($this->range) : null;
+        [$where, $params] = $this->rangeClause($startTs, 'created_at');
+        foreach (Database::fetchAll(
+            "SELECT * FROM ecx_fee_credits{$where} ORDER BY created_at ASC, id ASC", $params) as $r) {
+            $cols = self::ECX_FEE_CREDIT_SAFE_COLS;
+            if (!$this->anonymize) $cols = array_merge($cols, self::ECX_FEE_CREDIT_PII_COLS);
+            $out = $this->project($r, $cols);
+            $out['type'] = $this->meltType($r['note'] ?? null);
+            $out['invoice_id'] = $this->surrogate($r['invoice_id']);
             yield $out;
         }
     }

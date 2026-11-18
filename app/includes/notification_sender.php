@@ -77,6 +77,13 @@ class NotificationSender {
         $satsLine = $amountSats !== null
             ? number_format((int)$amountSats) . ' sats'
             : '(sats amount unavailable)';
+        // Paid in eCash (ECX): the merchant received szats, not sats — the
+        // sats figure is only what the invoice was quoted at. Lead with what
+        // actually arrived.
+        $ecxLine = self::ecxAmountLine($invoice);
+        if ($ecxLine !== null) {
+            $satsLine = $ecxLine;
+        }
 
         // amount/currency reflect what the customer was billed (e.g. "12.50 USD"
         // for a fiat-priced invoice, or "1500 sat" for a sats-priced one).
@@ -91,8 +98,32 @@ class NotificationSender {
               . "Invoice ID:  {$invoiceId}\n"
               . "Amount:      {$satsLine}\n"
               . "Amount (fiat): {$fiatLine}\n";
+        if ($ecxLine !== null) {
+            $body .= "Paid via:    " . self::paymentMethodLabel('ecx') . "\n";
+            foreach (self::railDetailLines($invoice, 'ecx') as $detail) {
+                $body .= $detail . "\n";
+            }
+        }
 
         self::enqueue($storeId, self::EVENT_INVOICE_PAID, $recipient, $subject, $body, null, $invoiceId);
+    }
+
+    /**
+     * "25,000,000 szats (0.25 ECX)" for an invoice settled over its eCash
+     * (ECX) address; null for every other settlement. Shared by the merchant
+     * notification and the payer receipt so both name the asset that moved.
+     */
+    public static function ecxAmountLine(array $invoice): ?string {
+        if (($invoice['settled_rail'] ?? '') !== 'ecx') {
+            return null;
+        }
+        $szats = (int)($invoice['ecx_amount_szat'] ?? 0);
+        if ($szats <= 0) {
+            return null;
+        }
+        require_once __DIR__ . '/onchain/chain.php';
+        $ch = Chain::ecx();
+        return $ch->formatUnits($szats) . ' (' . $ch->formatCoin($szats) . ' ' . $ch->ticker . ')';
     }
 
     /**
@@ -223,6 +254,9 @@ class NotificationSender {
         $satsLine = $amountSats !== null
             ? number_format((int)$amountSats) . ' sats'
             : '(sats amount unavailable)';
+        // An eCash (ECX) payment is a szat amount on the ECX chain; the sats
+        // figure was only the quote. Show the payer what they actually sent.
+        $satsLine = self::ecxAmountLine($invoice) ?? $satsLine;
 
         $currency = strtoupper((string)($invoice['currency'] ?? ''));
         $amount = $invoice['amount'] ?? null;
@@ -272,6 +306,7 @@ class NotificationSender {
         }
         switch ($rail) {
             case 'onchain':   return 'On-chain Bitcoin';
+            case 'ecx':       return 'eCash (ECX)';
             case 'swap':      return 'Lightning → submarine swap to on-chain';
             case 'lnaddress': return 'Lightning (LNURL)';
             case 'strike':    return 'Lightning (Strike API)';
@@ -300,6 +335,22 @@ class NotificationSender {
             }
             $rows = Database::fetchAll(
                 "SELECT txid, vout, amount_sat FROM onchain_payments
+                 WHERE invoice_id = ? ORDER BY first_seen_at ASC",
+                [$invoiceId]
+            );
+            foreach ($rows as $row) {
+                $lines[] = "Txid:           {$row['txid']}:{$row['vout']}";
+            }
+        } elseif ($rail === 'ecx') {
+            // eCash (ECX): the same kind of address and txid, on the ECX
+            // chain (ecx_payments), so the payer can look them up on the
+            // ECX explorer rather than mempool.space.
+            $addr = (string)($invoice['ecx_address'] ?? '');
+            if ($addr !== '') {
+                $lines[] = "Receiving addr: {$addr} (ECX chain)";
+            }
+            $rows = Database::fetchAll(
+                "SELECT txid, vout, amount_sat FROM ecx_payments
                  WHERE invoice_id = ? ORDER BY first_seen_at ASC",
                 [$invoiceId]
             );
