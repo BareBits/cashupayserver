@@ -65,7 +65,7 @@ try {
         'metadata' => ['itemDesc' => '2x Latte', 'orderId' => '555'],
     ]);
     assert_eq('nwc', $inv['payment_rail'], 'invoice rides the nwc rail');
-    assert_eq('lnbc10000n1mockinvoice0000000', $inv['bolt11'], 'wallet bolt11 stored (1000 sats)');
+    assert_eq('lnbc10000n1m0ckvnv0ce0000000', $inv['bolt11'], 'wallet bolt11 stored (1000 sats)');
     assert_eq(hash('sha256', $inv['bolt11']), $inv['nwc_payment_hash'], 'payment hash persisted for the pollers');
     assert_eq($uri, $inv['nwc_uri'], 'connection URI persisted server-side for lookups');
     assert_true(strpos((string)$inv['ln_destination'], $clientSk) === false, 'ln_destination is masked');
@@ -90,7 +90,7 @@ $mSk = $key->generatePrivateKey();
 $mPk = $key->getPublicKey($mSk);
 [$proc, $port] = start_mock('mock_clink_relay.php', 'MOCK_CLINK_PORT', [
     'MOCK_CLINK_MERCHANT_SK' => $mSk,
-    'MOCK_CLINK_BOLT11' => 'lnbc100n1mockinvoice0000000',
+    'MOCK_CLINK_BOLT11' => 'lnbc100n1m0ckvnv0ce0000000',
 ]);
 try {
     $noffer = ClinkNoffer::encode([
@@ -109,7 +109,7 @@ try {
 
     $inv = Invoice::create($store, ['amount' => 1000, 'currency' => 'sat']);
     assert_eq('noffer', $inv['payment_rail'], 'dead NWC falls through to the noffer');
-    assert_eq('lnbc100n1mockinvoice0000000', $inv['bolt11'], 'noffer bolt11 stored');
+    assert_eq('lnbc100n1m0ckvnv0ce0000000', $inv['bolt11'], 'noffer bolt11 stored');
     assert_null($inv['nwc_uri'], 'no nwc context persisted on the fallback rail');
 } finally {
     if (is_resource($proc)) { proc_terminate($proc); }

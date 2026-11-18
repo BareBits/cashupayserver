@@ -24,6 +24,42 @@ $threw = false;
 try { EcxRates::parseCmcUsd('<html>nope</html>'); } catch (RuntimeException $e) { $threw = true; }
 assert_true($threw, 'malformed JSON throws (provider failure, cooldown)');
 
+// Hostile shapes: a price that is present but not a plain decimal is a
+// malformed body (throw -> cooldown), never silently 0/1/INF; wrong types
+// elsewhere are skipped without PHP warnings; nulls mean "no price yet".
+$row = fn(array $quote) => json_encode(['data' => [['id' => 42032, 'quotes' => [$quote]]]]);
+foreach (['[41.78]', '{"v":41.78}', 'true', '"1e400"', '"1e2"', '" 41.78"', '"41.78\\n"', '"-41.78"', '"0x29"'] as $bad) {
+    $threw = false;
+    try { EcxRates::parseCmcUsd(str_replace('"__P__"', $bad, $row(['name' => '2781', 'price' => '__P__']))); } catch (RuntimeException $e) { $threw = true; }
+    assert_true($threw, "non-decimal price {$bad} is malformed");
+}
+assert_null(EcxRates::parseCmcUsd($row(['name' => '2781', 'price' => null])), 'null price = no price yet');
+assert_eq(41.78, EcxRates::parseCmcUsd($row(['name' => 2781, 'price' => '41.78'])), 'integer convert id + string price accepted');
+assert_null(EcxRates::parseCmcUsd($row(['name' => ['2781'], 'price' => 5])), 'array convert id is skipped (no Array-to-string warning)');
+assert_null(EcxRates::parseCmcUsd(json_encode(['data' => [['id' => [42032], 'quotes' => [['name' => '2781', 'price' => 5]]]]])), 'array coin id is skipped');
+assert_null(EcxRates::parseCmcUsd(json_encode(['data' => [['id' => 42032, 'quotes' => 'nope']]])), 'quotes not a list -> no price');
+assert_null(EcxRates::parseCmcUsd(json_encode(['data' => [['id' => 42032, 'quotes' => ['nope']]]])), 'quote not an object -> no price');
+assert_null(EcxRates::parseCmcUsd(json_encode(['data' => 'nope'])), 'data not a list -> no price');
+assert_null(EcxRates::parseCmcUsd(json_encode(['data' => [['id' => 42032.5, 'quotes' => [['name' => '2781', 'price' => 5]]]]])), 'fractional id does not match');
+$threw = false;
+try { EcxRates::parseCmcUsd(str_repeat('[', 40) . '1' . str_repeat(']', 40)); } catch (RuntimeException $e) { $threw = true; }
+assert_true($threw, 'deep nesting is malformed');
+$threw = false;
+try { EcxRates::parseCmcUsd("\x1b[31m" . $row(['name' => '2781', 'price' => 41.78])); } catch (RuntimeException $e) { $threw = true; }
+assert_true($threw, 'escape-prefixed body is malformed');
+
+// Cache rows of the wrong shape are ignored (and never fatal).
+foreach (['abc', ['x' => 1], true, '1e3', -1, 0] as $garbage) {
+    Config::set('rate_ECX_USD', ['rate' => $garbage, 'timestamp' => time(), 'provider' => 'test']);
+    Config::set('rate_lastgood_ECX_USD', ['rate' => $garbage, 'timestamp' => time(), 'provider' => 'test']);
+    assert_null(EcxRates::lastGoodUsd(), 'garbage last-good ' . json_encode($garbage) . ' ignored');
+}
+Config::set('rate_ECX_USD', ['rate' => 40.0, 'timestamp' => 'yesterday', 'provider' => 'test']);
+Config::set('rate_lastgood_ECX_USD', 'not-an-object');
+assert_null(EcxRates::lastGoodUsd(), 'non-object last-good row ignored');
+Config::set('rate_ECX_USD', null);
+Config::set('rate_lastgood_ECX_USD', null);
+
 // ---- quote URL + env seam gate -------------------------------------------------
 assert_eq('https://api.coinmarketcap.com/data-api/v3/cryptocurrency/quote/latest?id=42032&convertId=2781',
     EcxRates::quoteUrl());

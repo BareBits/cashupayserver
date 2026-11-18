@@ -60,7 +60,7 @@ $dump = tempnam(sys_get_temp_dir(), 'nwc-dump-');
 try {
     $uri = wallet_uri($walletPk, $port, $clientSk);
     $res = NwcClient::makeInvoice($uri, 21, 'test memo', 600, 8);
-    assert_eq('lnbc210n1mockinvoice0000000', $res['bolt11'], 'bolt11 for 21 sats returned');
+    assert_eq('lnbc210n1m0ckvnv0ce0000000', $res['bolt11'], 'bolt11 for 21 sats returned');
     assert_eq(64, strlen($res['payment_hash']), 'payment_hash captured');
     assert_eq($walletPk, $res['pubkey'], 'wallet pubkey echoed');
 
@@ -86,7 +86,7 @@ $dump = tempnam(sys_get_temp_dir(), 'nwc-dump-');
 try {
     $uri = wallet_uri($walletPk, $port, $clientSk);
     $res = NwcClient::makeInvoice($uri, 5, null, null, 8);
-    assert_eq('lnbc50n1mockinvoice0000000', $res['bolt11'], 'nip44 round trip returns bolt11');
+    assert_eq('lnbc50n1m0ckvnv0ce0000000', $res['bolt11'], 'nip44 round trip returns bolt11');
     $lines = array_values(array_filter(explode("\n", (string)file_get_contents($dump))));
     $sent = json_decode(end($lines), true);
     assert_eq('nip44', $sent['scheme'], 'advertised nip44_v2 -> client used nip44');
@@ -98,7 +98,7 @@ try {
 // ---------- amount-mismatch rejection ----------
 [$proc, $port] = start_wallet([
     'MOCK_NWC_WALLET_SK' => $walletSk,
-    'MOCK_NWC_BOLT11' => 'lnbc990n1mockinvoice0000000', // 99 sats, whatever was asked
+    'MOCK_NWC_BOLT11' => 'lnbc990n1m0ckvnv0ce0000000', // 99 sats, whatever was asked
 ]);
 try {
     $uri = wallet_uri($walletPk, $port, $clientSk);

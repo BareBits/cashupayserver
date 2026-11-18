@@ -46,7 +46,7 @@ if (\$rawPath === '/cb') {
     header('Content-Type: application/json');
     parse_str(\$_SERVER['QUERY_STRING'] ?? '', \$q);
     \$amt = (int)(\$q['amount'] ?? 0);
-    \$resp = ['pr' => 'lnbc' . dechex(\$amt) . 'pretend'];
+    \$resp = ['pr' => 'lnbc' . intdiv(\$amt, 100) . 'n1pretend'];
     if ('$mode' === 'lud21') {
         \$resp['verify'] = "http://127.0.0.1:$port/verify/" . bin2hex(random_bytes(8));
     }

@@ -48,7 +48,7 @@ function stop_relay($proc): void {
 }
 
 // ---------- success: fetch a bolt11 ----------
-$bolt11 = 'lnbc100n1mockinvoice0000000';
+$bolt11 = 'lnbc100n1m0ckvnv0ce0000000';
 [$proc, $pipes, $port] = start_relay([
     'MOCK_CLINK_MERCHANT_SK' => $mSk,
     'MOCK_CLINK_BOLT11' => $bolt11,

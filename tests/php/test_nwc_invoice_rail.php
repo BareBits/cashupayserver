@@ -54,7 +54,7 @@ function insert_nwc_invoice(string $id, string $store, string $uri, string $hash
         'amount' => '21',
         'currency' => 'sat',
         'amount_sats' => 21,
-        'bolt11' => 'lnbc210n1mockinvoice0000000',
+        'bolt11' => 'lnbc210n1m0ckvnv0ce0000000',
         'payment_rail' => 'nwc',
         'ln_destination' => 'NWC wallet test… via 127.0.0.1',
         'nwc_uri' => $uri,

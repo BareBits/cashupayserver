@@ -10,6 +10,7 @@ require_once __DIR__ . '/database.php';
 require_once __DIR__ . '/config.php';
 require_once __DIR__ . '/safe_http.php';
 require_once __DIR__ . '/endpoint_health.php';
+require_once __DIR__ . '/response_shape.php';
 
 /**
  * Price provider interface.
@@ -52,16 +53,32 @@ class CoinGeckoProvider implements PriceProvider {
         ]);
 
         if ($result['error'] !== '' || $result['status'] !== 200 || $result['body'] === '') {
-            throw new RuntimeException("HTTP {$result['status']}: " . ($result['error'] ?: substr($result['body'], 0, 120)));
+            throw new RuntimeException("HTTP {$result['status']}: " . ($result['error'] ?: \SafeHttp::logExcerpt($result['body'])));
         }
+        return self::parsePrice($result['body'], $currency);
+    }
 
-        $data = json_decode($result['body'], true);
-        if (!is_array($data)) {
-            throw new RuntimeException('malformed JSON response');
+    /**
+     * Parse a /simple/price body. Shape: {"bitcoin":{"usd":95000.12}}.
+     * Public (and static) so the unit tests can feed it hostile bodies.
+     *
+     * - not a JSON object / "bitcoin" not an object  -> throw (malformed)
+     * - currency key absent                           -> null (not listed)
+     * - currency present but not a sane decimal       -> throw (malformed)
+     */
+    public static function parsePrice(string $body, string $currency): ?float {
+        $currency = strtolower($currency);
+        $data = ExchangeRates::requireObject($body);
+        $btc = $data['bitcoin'] ?? null;
+        // Must be a currency->price map ({} for "nothing listed" is fine; a
+        // list such as [95000] is not the documented shape).
+        if (!is_array($btc) || ($btc !== [] && array_is_list($btc))) {
+            throw new RuntimeException('malformed response: no bitcoin object');
         }
-        // Missing key on a valid response = currency not listed, not an outage.
-        $rate = $data['bitcoin'][$currency] ?? null;
-        return is_numeric($rate) ? (float)$rate : null;
+        if (!array_key_exists($currency, $btc)) {
+            return null;
+        }
+        return ExchangeRates::requireRate($btc[$currency], 'coingecko price');
     }
 }
 
@@ -107,14 +124,25 @@ class BinanceProvider implements PriceProvider {
         // The symbol comes from our own fixed map, so any HTTP failure here is
         // a provider problem, not an unknown-currency response.
         if ($result['error'] !== '' || $result['status'] !== 200 || $result['body'] === '') {
-            throw new RuntimeException("HTTP {$result['status']}: " . ($result['error'] ?: substr($result['body'], 0, 120)));
+            throw new RuntimeException("HTTP {$result['status']}: " . ($result['error'] ?: \SafeHttp::logExcerpt($result['body'])));
         }
+        return self::parsePrice($result['body'], $symbol);
+    }
 
-        $data = json_decode($result['body'], true);
-        if (!is_array($data)) {
-            throw new RuntimeException('malformed JSON response');
+    /**
+     * Parse a /ticker/price body. Shape: {"symbol":"BTCUSDT","price":"95000.00000000"}.
+     * The echoed symbol, when present, must be the one we asked for; a body
+     * quoting another pair is treated as malformed rather than priced.
+     */
+    public static function parsePrice(string $body, string $symbol): ?float {
+        $data = ExchangeRates::requireObject($body);
+        if (array_key_exists('symbol', $data) && $data['symbol'] !== $symbol) {
+            throw new RuntimeException('malformed response: unexpected symbol');
         }
-        return isset($data['price']) && is_numeric($data['price']) ? (float)$data['price'] : null;
+        if (!array_key_exists('price', $data)) {
+            return null;
+        }
+        return ExchangeRates::requireRate($data['price'], 'binance price');
     }
 }
 
@@ -159,30 +187,51 @@ class KrakenProvider implements PriceProvider {
         // The pair comes from our own fixed map, so any HTTP failure here is
         // a provider problem, not an unknown-currency response.
         if ($result['error'] !== '' || $result['status'] !== 200 || $result['body'] === '') {
-            throw new RuntimeException("HTTP {$result['status']}: " . ($result['error'] ?: substr($result['body'], 0, 120)));
+            throw new RuntimeException("HTTP {$result['status']}: " . ($result['error'] ?: \SafeHttp::logExcerpt($result['body'])));
         }
+        return self::parsePrice($result['body']);
+    }
 
-        $data = json_decode($result['body'], true);
-        if (!is_array($data)) {
-            throw new RuntimeException('malformed JSON response');
-        }
-
+    /**
+     * Parse a /public/Ticker body. Shape:
+     *   {"error":[],"result":{"XXBTZUSD":{"c":["95000.1","0.05"], ...}}}
+     * Kraken names the result key in its own notation (XXBTZUSD for XBTUSD),
+     * so instead of matching the key we require exactly ONE pair in the
+     * result: that is what a single-pair query returns, and anything else
+     * is ambiguous.
+     */
+    public static function parsePrice(string $body): ?float {
+        $data = ExchangeRates::requireObject($body);
         if (!empty($data['error'])) {
             // Kraken's in-band errors (rate limits, service unavailable) are
             // provider-side failures — the pair itself is from our fixed map.
-            throw new RuntimeException('Kraken error: ' . json_encode($data['error']));
+            $errors = is_array($data['error']) ? $data['error'] : [$data['error']];
+            $text = implode(', ', array_map(
+                fn($e) => \SafeHttp::logExcerpt(is_scalar($e) ? (string)$e : (string)json_encode($e), 80),
+                array_slice($errors, 0, 5)
+            ));
+            throw new RuntimeException('Kraken error: ' . $text);
         }
-
-        // Kraken returns nested result with pair name as key
-        $result = $data['result'] ?? [];
-        foreach ($result as $pairData) {
-            // 'c' is the last trade closed [price, lot-volume]
-            if (isset($pairData['c'][0])) {
-                return (float)$pairData['c'][0];
-            }
+        $pairs = $data['result'] ?? null;
+        if ($pairs === null || $pairs === []) {
+            return null; // nothing quoted for this pair
         }
-
-        return null;
+        if (!is_array($pairs) || count($pairs) !== 1) {
+            throw new RuntimeException('malformed response: expected exactly one pair');
+        }
+        $pairData = reset($pairs);
+        if (!is_array($pairData)) {
+            throw new RuntimeException('malformed response: pair is not an object');
+        }
+        // 'c' is the last trade closed [price, lot-volume]
+        if (!array_key_exists('c', $pairData)) {
+            return null;
+        }
+        $close = $pairData['c'];
+        if (!is_array($close) || !array_key_exists(0, $close)) {
+            throw new RuntimeException('malformed response: close price is not a list');
+        }
+        return ExchangeRates::requireRate($close[0], 'kraken close price');
     }
 }
 
@@ -336,13 +385,73 @@ class ExchangeRates {
     }
 
     /**
-     * A usable BTC price must be a positive, finite number. Anything else
-     * (0, negative, NaN, INF — all observed from flaky upstreams) would corrupt
-     * pricing (0-sat invoices, divide-by-zero), so we reject it and fall through
-     * to the next provider / cache.
+     * Bounds a BTC price (in any fiat) must fall within to be used. The lower
+     * bound rejects 0 / sub-dust garbage; the upper bound (10^13) rejects
+     * absurd values AND keeps every accepted rate representable by fmt()
+     * without scientific notation, which bcmath would refuse. 10^13 still
+     * covers BTC quoted in the weakest fiat currencies.
      */
-    private static function isSaneRate(float $rate): bool {
-        return is_finite($rate) && $rate > 0;
+    public const MIN_SANE_RATE = 0.000001;
+    public const MAX_SANE_RATE = 10000000000000.0; // 1e13
+
+    /**
+     * A usable BTC price must be a finite number inside
+     * [MIN_SANE_RATE, MAX_SANE_RATE]. Anything else (0, negative, NaN, INF,
+     * 1e300 — all possible from flaky or hostile upstreams) would corrupt
+     * pricing (0-sat invoices, divide-by-zero, bcmath errors), so we reject
+     * it and fall through to the next provider / cache.
+     */
+    public static function isSaneRate(float $rate): bool {
+        return is_finite($rate) && $rate >= self::MIN_SANE_RATE && $rate <= self::MAX_SANE_RATE;
+    }
+
+    /**
+     * Decode a provider body that must be a JSON object. Scalars, invalid
+     * JSON, over-deep nesting and non-empty lists all throw (malformed);
+     * `{}` is returned as an empty array for the caller to treat as "not
+     * listed".
+     */
+    public static function requireObject(string $body): array {
+        $data = ResponseShape::decodeJsonArray($body);
+        if ($data === null || ($data !== [] && array_is_list($data))) {
+            throw new RuntimeException('malformed JSON response');
+        }
+        return $data;
+    }
+
+    /**
+     * Read a price field out of a provider response. Returns the finite
+     * float or throws when the value is not a plain decimal (array, bool,
+     * exponent string, negative, NaN...) — that is a malformed body, which
+     * earns the provider a cooldown. Range sanity is checked separately by
+     * the caller so an in-range-but-wrong 0 is logged as "insane", not as
+     * "malformed".
+     */
+    public static function requireRate(mixed $value, string $what): float {
+        $rate = ResponseShape::decimal($value);
+        if ($rate === null) {
+            throw new RuntimeException("malformed response: {$what} is not a decimal number");
+        }
+        return $rate;
+    }
+
+    /**
+     * A rate read back from our own cache/config rows: must be a plain
+     * decimal AND inside the sane band, else null (the row is ignored).
+     */
+    public static function sanitizeRate(mixed $value): ?float {
+        $rate = ResponseShape::decimal($value);
+        return ($rate !== null && self::isSaneRate($rate)) ? $rate : null;
+    }
+
+    /**
+     * Non-scientific decimal spelling of a rate for bcmath. PHP's (string)
+     * cast switches to "1.0E-5" / "1.0E+15" outside roughly [1e-4, 1e15),
+     * which bcdiv/bcmul reject with a ValueError.
+     */
+    public static function fmt(float $v): string {
+        $s = rtrim(rtrim(number_format($v, 12, '.', ''), '0'), '.');
+        return $s === '' ? '0' : $s;
     }
 
     /**
@@ -352,11 +461,10 @@ class ExchangeRates {
      */
     private static function getLastGood(string $currency): ?float {
         $data = Config::get('rate_lastgood_' . strtolower($currency));
-        if ($data === null || !isset($data['rate'])) {
+        if (!is_array($data) || !array_key_exists('rate', $data)) {
             return null;
         }
-        $rate = (float)$data['rate'];
-        return self::isSaneRate($rate) ? $rate : null;
+        return self::sanitizeRate($data['rate']);
     }
 
     /**
@@ -431,7 +539,7 @@ class ExchangeRates {
             throw new Exception("Cannot get exchange rate for {$currency}");
         }
 
-        return bcdiv($amount, (string)$btcPrice, 8);
+        return bcdiv($amount, self::fmt($btcPrice), 8);
     }
 
     /**
@@ -458,7 +566,7 @@ class ExchangeRates {
             throw new Exception("Cannot get exchange rate for {$currency}");
         }
 
-        return bcmul($btcAmount, (string)$btcPrice, 8);
+        return bcmul($btcAmount, self::fmt($btcPrice), 8);
     }
 
     /**
@@ -518,7 +626,7 @@ class ExchangeRates {
             throw new Exception("Cannot get exchange rate for {$currency}");
         }
 
-        $btcAmount = bcdiv($amount, (string)$btcPrice, 8);
+        $btcAmount = bcdiv($amount, self::fmt($btcPrice), 8);
         $sats = bcmul($btcAmount, '100000000', 0);
 
         return (int)$sats;
@@ -540,7 +648,7 @@ class ExchangeRates {
         }
 
         $btcAmount = bcdiv((string)$sats, '100000000', 8);
-        $fiatAmount = bcmul($btcAmount, (string)$btcPrice, 2);
+        $fiatAmount = bcmul($btcAmount, self::fmt($btcPrice), 2);
 
         return $fiatAmount;
     }
@@ -552,17 +660,20 @@ class ExchangeRates {
         $key = 'rate_' . $currency;
         $data = Config::get($key);
 
-        if ($data === null) {
+        // The row is ours, but it is still data read back from storage: an
+        // unexpected shape (string rate, missing timestamp, array) must be
+        // ignored, never TypeError a checkout.
+        if (!is_array($data) || !array_key_exists('rate', $data)) {
             return null;
         }
 
         $maxAge = $allowStale ? self::STALE_TTL : self::CACHE_TTL;
-
-        if (time() - ($data['timestamp'] ?? 0) > $maxAge) {
+        $timestamp = ResponseShape::integer($data['timestamp'] ?? null);
+        if ($timestamp === null || time() - $timestamp > $maxAge) {
             return null;
         }
 
-        return $data['rate'] ?? null;
+        return self::sanitizeRate($data['rate']);
     }
 
     /**

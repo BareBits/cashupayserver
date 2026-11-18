@@ -425,13 +425,23 @@ def test_next_address_preview_sits_at_the_shared_counter(cfg: ConfiguredPayserve
     assert r.status_code == 400 and "No eCash xpub" in r.json()["error"]
 
 
-def test_no_ecx_price_withholds_the_ecash_option(cfg: ConfiguredPayserver, cmc: MockCmc) -> None:
+@pytest.mark.parametrize("outage", ["down", "garbage", "hostile"])
+def test_no_ecx_price_withholds_the_ecash_option(cfg: ConfiguredPayserver, cmc: MockCmc, outage: str) -> None:
+    """No USABLE price -> no eCash on the invoice. "down" is an HTTP 500;
+    "garbage" is a 200 whose price is an exponent string (PHP would cast it
+    to INF); "hostile" is a 200 body of escape sequences and forged log
+    lines. The last two must be refused as malformed, never priced, and the
+    server must stay healthy (no fatal from the parser, nothing stored)."""
     assert _save_ecx(cfg, ECX_ONLY_XPUB).status_code == 200
-    cmc.mode = "down"
+    cmc.mode = outage
     _clear_ecx_price_cache(cfg)
     try:
         ex = _dashboard(cfg)["ecx"]
         assert ex["enabled"] and ex["offerEnabled"] and ex["priceAvailable"] is False
+        assert ex["lastGoodPriceUsd"] is None, "a malformed quote must never become the last-good price"
+        with cfg.handle.db() as db:
+            rows = db.execute("SELECT key FROM config WHERE key IN ('rate_ECX_USD', 'rate_lastgood_ECX_USD')").fetchall()
+        assert rows == [], f"nothing cached from a {outage} quote: {rows}"
         inv = _usd_invoice(cfg)
         assert "ECX-OnChain" not in inv["checkout"]["paymentMethods"], "no price -> no eCash on the invoice"
         row = _invoice_row(cfg, inv["id"])

@@ -56,7 +56,7 @@ if (\$rawPath === '/cb') {
     ];
     file_put_contents('$serverDir/last_request.json', json_encode(\$record));
     // Return a fake (invalid) BOLT-11 so the caller gets to the melt step.
-    echo json_encode(['pr' => 'lnbc1pretend']);
+    echo json_encode(['pr' => 'lnbc' . intdiv((int)(\$q['amount'] ?? 0), 100) . 'n1pretend']);
     return;
 }
 http_response_code(404);

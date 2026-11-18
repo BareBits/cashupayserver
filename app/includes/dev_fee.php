@@ -39,6 +39,7 @@ require_once __DIR__ . '/lightning_address.php';
 require_once __DIR__ . '/free_trial.php';
 require_once __DIR__ . '/stuck_funds.php';
 require_once __DIR__ . '/safe_http.php';
+require_once __DIR__ . '/response_shape.php';
 require_once __DIR__ . '/../cashu-wallet-php/CashuWallet.php';
 
 use Cashu\Wallet;
@@ -576,14 +577,16 @@ class LnurlPay {
         if ($result['status'] !== 200 || $result['body'] === '') {
             return null;
         }
-        $data = json_decode($result['body'], true);
-        if (!is_array($data) || !isset($data['callback'], $data['minSendable'], $data['maxSendable'])) {
+        $data = ResponseShape::decodeJsonArray($result['body']);
+        if ($data === null || !is_string($data['callback'] ?? null) || ($data['callback'] ?? '') === ''
+            || ResponseShape::integer($data['minSendable'] ?? null) === null
+            || ResponseShape::integer($data['maxSendable'] ?? null) === null) {
             return null;
         }
         return [
             'callback' => $data['callback'],
-            'minSendable' => (int)$data['minSendable'],
-            'maxSendable' => (int)$data['maxSendable'],
+            'minSendable' => ResponseShape::integer($data['minSendable']),
+            'maxSendable' => ResponseShape::integer($data['maxSendable']),
             'commentAllowed' => (int)($data['commentAllowed'] ?? 0),
             'payerData' => $data['payerData'] ?? null,
         ];
@@ -631,12 +634,22 @@ class LnurlPay {
         if ($result['status'] !== 200 || $result['body'] === '') {
             throw new Exception("LNURL callback failed (HTTP {$result['status']})");
         }
-        $data = json_decode($result['body'], true);
-        if (!is_array($data) || !isset($data['pr'])) {
+        $data = ResponseShape::decodeJsonArray($result['body']);
+        if ($data === null || !isset($data['pr'])) {
             $err = $data['reason'] ?? $data['message'] ?? 'no pr field';
+            $err = is_string($err) ? \SafeHttp::logExcerpt($err, 120) : 'no pr field';
             throw new Exception("LNURL callback error: {$err}");
         }
-        return (string) $data['pr'];
+        // We are about to melt our own funds to this invoice: it must be
+        // BOLT11-shaped and encode exactly the amount we asked for (LUD-06).
+        $bolt11 = ResponseShape::bolt11($data['pr']);
+        if ($bolt11 === null) {
+            throw new Exception('LNURL callback returned a malformed invoice');
+        }
+        if (ResponseShape::bolt11AmountMsat($bolt11) !== $amountMsats) {
+            throw new Exception('LNURL callback returned an invoice for a different amount');
+        }
+        return $bolt11;
     }
 
     /**

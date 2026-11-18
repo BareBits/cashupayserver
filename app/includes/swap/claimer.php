@@ -15,6 +15,7 @@
 require_once __DIR__ . '/../database.php';
 require_once __DIR__ . '/../config.php';
 require_once __DIR__ . '/../safe_http.php';
+require_once __DIR__ . '/../response_shape.php';
 require_once __DIR__ . '/../onchain/wallet.php';
 require_once __DIR__ . '/../onchain/provider.php';
 require_once __DIR__ . '/../crypto/secp256k1.php';
@@ -350,7 +351,7 @@ final class SwapClaimer {
             if (self::isAlreadyKnownError($result['body'])) {
                 return $expectedTxid;
             }
-            error_log("swap broadcast via esplora ({$esploraUrl}) failed: HTTP {$result['status']}: " . substr($result['body'], 0, 200));
+            error_log("swap broadcast via esplora ({$esploraUrl}) failed: HTTP {$result['status']}: " . \SafeHttp::logExcerpt($result['body'], 200));
         }
         throw new RuntimeException('All broadcast paths failed for swap claim');
     }
@@ -428,19 +429,23 @@ final class SwapClaimer {
         if ($result['error'] !== '' || $result['status'] < 200 || $result['status'] >= 300) {
             return null;
         }
-        $data = json_decode($result['body'], true);
-        if (!is_array($data)) {
+        $data = ResponseShape::decodeJsonArray($result['body']);
+        if ($data === null) {
             return null;
         }
+        // Plain positive decimals only (no "1e400", arrays or booleans); the
+        // caller still clamps the result to [FEERATE_MIN, FEERATE_MAX].
         foreach (['3', '2', '1'] as $target) {
-            if (isset($data[$target]) && is_numeric($data[$target]) && (float)$data[$target] > 0) {
-                return (float)$data[$target];
+            $rate = ResponseShape::decimal($data[$target] ?? null);
+            if ($rate !== null && $rate > 0) {
+                return $rate;
             }
         }
         // No standard target present — take any positive estimate.
         foreach ($data as $v) {
-            if (is_numeric($v) && (float)$v > 0) {
-                return (float)$v;
+            $rate = ResponseShape::decimal($v);
+            if ($rate !== null && $rate > 0) {
+                return $rate;
             }
         }
         return null;
