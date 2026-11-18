@@ -17,6 +17,30 @@ const ANALYTICS_MAX_BODY_BYTES      = 16384;   // a level-3 report is ~1.5 KB
 const ANALYTICS_RATE_LIMIT_PER_HOUR = 120;     // many installs may share one egress IP
 const ANALYTICS_RATE_WINDOW_SEC     = 3600;
 const ANALYTICS_IP_RETENTION_SEC    = 7200;    // rate-limit rows purged after this
+// How long a report row is kept after it was last received. The `reports` table
+// had no retention at all: only `recent_requests` was ever purged, so rows
+// accumulated forever.
+//
+// That is a problem beyond disk. `install_id` is chosen by the CLIENT (it has to
+// be -- it is the only thing making a report repeatable rather than a new
+// install every week), and nothing authenticates a report, so anyone can mint
+// install ids and insert rows at the rate limit. Unbounded retention turned that
+// into unbounded storage AND permanently skewed figures.
+//
+// 180 days is well past the weekly report interval, so an install that merely
+// goes quiet for a while is not forgotten, while one that is gone eventually
+// leaves. A row is refreshed by its own next report, so an active install never
+// ages out.
+const ANALYTICS_REPORT_RETENTION_SEC = 180 * 86400;
+// Hard ceiling on stored report rows, enforced on insert. Retention alone bounds
+// the table only at the rate reports arrive honestly; this bounds it against
+// someone inserting as fast as the rate limit allows. Oldest-received rows are
+// dropped first.
+//
+// Sized far above any plausible real population, so it is a backstop rather than
+// a quota: reaching it means something is wrong, and the log line it writes is
+// how an operator finds out.
+const ANALYTICS_MAX_REPORT_ROWS      = 250000;
 // Set to the $_SERVER key carrying the real client IP when the site sits
 // behind a proxy or CDN you trust (e.g. 'HTTP_CF_CONNECTING_IP' on
 // Cloudflare). Leave empty to use REMOTE_ADDR directly.
@@ -121,6 +145,44 @@ function analytics_json(int $status, array $payload): void {
 /** Drop rate-limit rows past the retention window. Runs on every request. */
 function analytics_purge_ips(PDO $pdo, int $now): void {
     $pdo->prepare('DELETE FROM recent_requests WHERE at < ?')->execute([$now - ANALYTICS_IP_RETENTION_SEC]);
+}
+
+/**
+ * Enforce the report table's bounds: drop rows past the retention window, then
+ * drop the oldest-received rows beyond the row ceiling.
+ *
+ * Called from inside report.php's store transaction, so the table cannot be
+ * grown past its ceiling by concurrent inserts racing the purge.
+ *
+ * Returns how many rows were deleted, so the caller can log a ceiling hit --
+ * retention deletions are routine and expected, but reaching the ceiling means
+ * rows are arriving faster than they age out, which is worth knowing about.
+ *
+ * @return array{retention: int, ceiling: int}
+ */
+function analytics_purge_reports(PDO $pdo, int $now): array {
+    $stmt = $pdo->prepare('DELETE FROM reports WHERE received_at < ?');
+    $stmt->execute([$now - ANALYTICS_REPORT_RETENTION_SEC]);
+    $byRetention = $stmt->rowCount();
+
+    // Only count when there is a plausible chance of being over, so the common
+    // path is one cheap COUNT and no sort.
+    $total = (int)$pdo->query('SELECT COUNT(*) FROM reports')->fetchColumn();
+    $byCeiling = 0;
+    if ($total > ANALYTICS_MAX_REPORT_ROWS) {
+        $excess = $total - ANALYTICS_MAX_REPORT_ROWS;
+        // Oldest received first. Deliberately NOT "oldest first_seen_at": an
+        // install that keeps reporting is live however long ago it appeared,
+        // and evicting long-standing installs in favour of freshly-minted ids
+        // is exactly backwards if the rows are being manufactured.
+        $del = $pdo->prepare(
+            'DELETE FROM reports WHERE install_id IN (
+                 SELECT install_id FROM reports ORDER BY received_at ASC LIMIT ?
+             )');
+        $del->execute([$excess]);
+        $byCeiling = $del->rowCount();
+    }
+    return ['retention' => $byRetention, 'ceiling' => $byCeiling];
 }
 
 /**
