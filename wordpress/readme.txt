@@ -4,7 +4,7 @@ Tags: bitcoin, lightning, payments, woocommerce, btcpay
 Requires at least: 6.0
 Tested up to: 7.1
 Requires PHP: 8.0
-Stable tag: 1.9.1
+Stable tag: 1.10
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -74,6 +74,9 @@ During onboarding the plugin installs and activates the "BTCPay for WooCommerce"
 The full plugin build distributed on the project's GitHub releases page can additionally install a BareBits server alongside WordPress. That flow fetches release metadata from api.github.com and downloads the release archive and its checksums from github.com. The build distributed on wordpress.org does not include this component and never contacts GitHub. GitHub terms of service: https://docs.github.com/en/site-policy/github-terms/github-terms-of-service — privacy statement: https://docs.github.com/en/site-policy/privacy-policies/github-general-privacy-statement
 
 == Changelog ==
+
+= 1.10 =
+* Server-side (for installs updating the companion BareBits server): eCash (ECX) pay-to-address rail alongside Bitcoin on-chain and Lightning (xpub or static address, CoinMarketCap pricing with eCash withheld when no price is available, fees in szats on their own ledger, admin card, payment-page tab, API method ECX-OnChain); the six Lightning payment paths — Strike, Lightning address, NWC, CLINK, submarine swap, Cashu mint — are orderable per store and a backup mint can be added from store settings; an invoice detail modal with products and a per-invoice payment-attempt log; every value read from price feeds, Lightning rails, swap providers and explorers is shape-validated before use and remote response excerpts are sanitized before logging; cron surfaces show the keyed cron.php URL first; balance card text is black.
 
 = 1.9.1 =
 * Server-side (for installs updating the companion BareBits server): on the payment page, a long store name no longer strands the "powered by" label on its own row with the BareBits logo beneath it; the pair now wraps together.
