@@ -30,6 +30,7 @@ require_once __DIR__ . '/nwc/client.php';
 require_once __DIR__ . '/strike/client.php';
 require_once __DIR__ . '/fee_redirect.php';
 require_once __DIR__ . '/admin_log.php';
+require_once __DIR__ . '/invoice_attempts.php';
 require_once __DIR__ . '/store_safety.php';
 require_once __DIR__ . '/transfer.php';
 
@@ -497,6 +498,20 @@ class Invoice {
         // rail can stamp it into the Strike invoice's correlationId, letting
         // the merchant match the two in Strike's dashboard.
         $invoiceId = Database::generateId('inv');
+        // Attempt log rows are queued until the invoice row exists (FK).
+        InvoiceAttempts::beginBuffer($invoiceId);
+        // A fee payee owning a rail is itself a sourcing decision: log it so
+        // the invoice detail explains why the merchant chain was not walked.
+        if ($feeLightning !== null) {
+            InvoiceAttempts::record($invoiceId, $storeId, InvoiceAttempts::CONTEXT_CHECKOUT, 'fee',
+                $feeLightning['destination'] ?? $feeDestination, InvoiceAttempts::OK, null,
+                'Lightning rail routed to the fee payee (' . ($feeNote ?? 'fee') . '); merchant destinations not tried');
+        }
+        if ($feeOnchain !== null) {
+            InvoiceAttempts::record($invoiceId, $storeId, InvoiceAttempts::CONTEXT_CHECKOUT, 'fee',
+                $feeOnchain['destination'] ?? $feeDestination, InvoiceAttempts::OK, null,
+                'On-chain rail routed to the fee payee (' . ($feeNote ?? 'fee') . '); merchant address not allocated');
+        }
         $lnurlTargetSats = (int) ExchangeRates::convertToSats((string)$amount, $currency, 'sat');
 
         // Strict no-mint-fallback bookkeeping: set when a swap failed under
@@ -582,6 +597,7 @@ class Invoice {
                 $swapAttempt = self::trySwapCreate(
                     $storeId, $store, $targetSats, $swapFailures, $feeMaxPct, $feeMaxSats
                 );
+                self::recordSwapAttempts($invoiceId, $storeId, $swapFailures, $swapAttempt, $strict);
                 if ($swapAttempt === null && $strict) {
                     // Strict mode forbids the MINT fallback, not the other
                     // paths: later destinations in the order are still walked
@@ -611,10 +627,18 @@ class Invoice {
                 // mints (primary, then backups). Skipped under a strict swap
                 // failure (see above).
                 if (!$cashuConfigured || $strictMintFallbackBlocked) {
+                    if ($cashuConfigured && $strictMintFallbackBlocked) {
+                        InvoiceAttempts::record($invoiceId, $storeId, InvoiceAttempts::CONTEXT_CHECKOUT, 'mint',
+                            null, InvoiceAttempts::SKIPPED, 'strict mode forbids the Cashu mint fallback',
+                            'Cashu mint fallback skipped: the swap failed and strict mode (no mint fallback) is on');
+                    }
                     continue;
                 }
                 $mintAttempted = true;
-                $mq = self::sourceMintQuote($storeId, $store, (string)$amount, $currency, $onchainConfigured);
+                $mq = self::sourceMintQuote(
+                    $storeId, $store, (string)$amount, $currency, $onchainConfigured, null,
+                    $invoiceId, InvoiceAttempts::CONTEXT_CHECKOUT
+                );
                 $quote = $mq['quote'];
                 $usedMintUrl = $mq['mint_url'];
                 $amountInMintUnit = $mq['amount'];
@@ -649,7 +673,7 @@ class Invoice {
             // With an on-chain address on offer the invoice must still come
             // out payable (on-chain only): a Lightning-path failure never
             // aborts creation while another rail can serve.
-            AdminLog::log('swap', 'checkout', $storeId, null, null,
+            AdminLog::log('swap', 'checkout', $storeId, $invoiceId, null,
                 'strict mode: no swap provider accepted the ' . $strictSwapFailure['target']
                 . ' sat target; invoice created on-chain only.' . $strictSwapFailure['detail']);
         }
@@ -741,11 +765,17 @@ class Invoice {
                                 'type' => 'strike',
                                 'reason' => StrikeClient::describeFailure($e),
                             ];
-                            AdminLog::log('strike', 'onchain', $storeId, null,
+                            AdminLog::log('strike', 'onchain', $storeId, $invoiceId,
                                 StrikeClient::maskKey($skey), $e->getMessage());
+                            InvoiceAttempts::record($invoiceId, $storeId, InvoiceAttempts::CONTEXT_CHECKOUT, 'onchain',
+                                'Strike ' . StrikeClient::maskKey($skey), InvoiceAttempts::FAILED,
+                                StrikeClient::describeFailure($e), 'on-chain receive request: ' . $e->getMessage());
                             continue;
                         }
                         $onchainAddress = $made['address'];
+                        InvoiceAttempts::record($invoiceId, $storeId, InvoiceAttempts::CONTEXT_CHECKOUT, 'onchain',
+                            'Strike ' . StrikeClient::maskKey($skey), InvoiceAttempts::OK, null,
+                            'on-chain address ' . $made['address'] . ' minted via Strike receive request ' . $made['receive_request_id']);
                         $onchainIndex = null;
                         $onchainAmountTweakSats = null;
                         $onchainAmountSat = $baseAmountSat;
@@ -770,10 +800,17 @@ class Invoice {
                         '[onchain] local address allocation failed store=%s: %s',
                         $storeId, $e->getMessage()
                     ));
+                    InvoiceAttempts::record($invoiceId, $storeId, InvoiceAttempts::CONTEXT_CHECKOUT, 'onchain',
+                        'local address', InvoiceAttempts::FAILED,
+                        'an on-chain address could not be allocated', $e->getMessage());
                     $localAllocationError = $e;
                     continue;
                 }
                 if ($allocation !== null) {
+                    InvoiceAttempts::record($invoiceId, $storeId, InvoiceAttempts::CONTEXT_CHECKOUT, 'onchain',
+                        'local address', InvoiceAttempts::OK, null,
+                        'on-chain address ' . $allocation['address']
+                        . (($allocation['tweak'] ?? null) !== null ? ' (static address, amount tweak ' . (int)$allocation['tweak'] . ' sat)' : ' (xpub-derived)'));
                     $onchainAddress = $allocation['address'];
                     $onchainIndex = $allocation['index'];
                     $onchainCreatedTipHeight = $allocation['tip_height'] ?? null;
@@ -1022,6 +1059,8 @@ class Invoice {
         if ($swapAttempt !== null) {
             self::persistSwapAttempt($invoiceId, $storeId, $swapAttempt, $now);
         }
+        // Same for the queued payment-path attempt rows.
+        InvoiceAttempts::flush($invoiceId);
 
         $invoice = self::getById($invoiceId);
 
@@ -1113,7 +1152,8 @@ class Invoice {
         int $lnurlTargetSats,
         ?array $metadata,
         string $invoiceId,
-        array &$receiveErrors
+        array &$receiveErrors,
+        string $context = InvoiceAttempts::CONTEXT_CHECKOUT
     ): ?array {
         $strikeAttempt = null;
         $nofferAttempt = null;
@@ -1147,9 +1187,13 @@ class Invoice {
                         $storeId, $priority, StrikeClient::maskKey($dest['value']), $e->getMessage()
                     ));
                     $receiveErrors[] = ['type' => 'strike', 'reason' => StrikeClient::describeFailure($e)];
-                    AdminLog::log('strike', 'checkout', $storeId, null, StrikeClient::maskKey($dest['value']), $e->getMessage());
+                    AdminLog::log('strike', $context, $storeId, $invoiceId, StrikeClient::maskKey($dest['value']), $e->getMessage());
+                    InvoiceAttempts::record($invoiceId, $storeId, $context, 'strike', StrikeClient::maskKey($dest['value']),
+                        InvoiceAttempts::FAILED, StrikeClient::describeFailure($e), $e->getMessage());
                     continue;
                 }
+                InvoiceAttempts::record($invoiceId, $storeId, $context, 'strike', StrikeClient::maskKey($dest['value']),
+                    InvoiceAttempts::OK, null, 'Strike invoice ' . $made['invoice_id'] . ' quoted for ' . $lnurlTargetSats . ' sat');
                 $strikeAttempt = [
                     'bolt11' => $made['bolt11'],
                     'amount_sats' => $lnurlTargetSats,
@@ -1183,9 +1227,13 @@ class Invoice {
                         $storeId, $priority, $e->getMessage()
                     ));
                     $receiveErrors[] = ['type' => 'noffer', 'reason' => self::describeNofferFailure($e)];
-                    AdminLog::log('noffer', 'checkout', $storeId, null, $dest['value'], $e->getMessage());
+                    AdminLog::log('noffer', $context, $storeId, $invoiceId, $dest['value'], $e->getMessage());
+                    InvoiceAttempts::record($invoiceId, $storeId, $context, 'noffer', $dest['value'],
+                        InvoiceAttempts::FAILED, self::describeNofferFailure($e), $e->getMessage());
                     continue;
                 }
+                InvoiceAttempts::record($invoiceId, $storeId, $context, 'noffer', $dest['value'],
+                    InvoiceAttempts::OK, null, 'bolt11 for ' . $lnurlTargetSats . ' sat received via relay ' . $resolved['relay']);
                 $nofferAttempt = [
                     'bolt11' => $resolved['bolt11'],
                     'amount_sats' => $lnurlTargetSats,
@@ -1229,9 +1277,13 @@ class Invoice {
                         $storeId, $priority, NwcUri::displayLabel($dest['value']), $e->getMessage()
                     ));
                     $receiveErrors[] = ['type' => 'nwc', 'reason' => self::describeNwcFailure($e)];
-                    AdminLog::log('nwc', 'checkout', $storeId, null, NwcUri::displayLabel($dest['value']), $e->getMessage());
+                    AdminLog::log('nwc', $context, $storeId, $invoiceId, NwcUri::displayLabel($dest['value']), $e->getMessage());
+                    InvoiceAttempts::record($invoiceId, $storeId, $context, 'nwc', NwcUri::displayLabel($dest['value']),
+                        InvoiceAttempts::FAILED, self::describeNwcFailure($e), $e->getMessage());
                     continue;
                 }
+                InvoiceAttempts::record($invoiceId, $storeId, $context, 'nwc', NwcUri::displayLabel($dest['value']),
+                    InvoiceAttempts::OK, null, 'wallet issued a bolt11 for ' . $lnurlTargetSats . ' sat');
                 $nwcAttempt = [
                     'bolt11' => $made['bolt11'],
                     'amount_sats' => $lnurlTargetSats,
@@ -1251,7 +1303,9 @@ class Invoice {
                     $storeId, $priority, $dest['value']
                 ));
                 $receiveErrors[] = ['type' => 'lnurl', 'reason' => 'the configured Lightning address is malformed'];
-                AdminLog::log('lnurl', 'checkout', $storeId, null, $dest['value'], 'malformed Lightning address configured');
+                AdminLog::log('lnurl', $context, $storeId, $invoiceId, $dest['value'], 'malformed Lightning address configured');
+                InvoiceAttempts::record($invoiceId, $storeId, $context, 'lnurl', $dest['value'],
+                    InvoiceAttempts::FAILED, 'the configured Lightning address is malformed', 'malformed Lightning address configured');
                 continue;
             }
             $lnurlFailReason = null;
@@ -1274,6 +1328,9 @@ class Invoice {
                     // where a lightning payment was sent.
                     'address' => $dest['value'],
                 ];
+                InvoiceAttempts::record($invoiceId, $storeId, $context, 'lnurl', $dest['value'],
+                    InvoiceAttempts::OK, null, 'bolt11 for ' . $lnurlTargetSats . ' sat fetched'
+                    . (!empty($probed['verify_url']) ? ' (LUD-21 verify supported)' : ''));
                 if ($priority > 0) {
                     error_log(sprintf(
                         '[lnurl-receive] using fallback address store=%s priority=%d address=%s',
@@ -1291,7 +1348,10 @@ class Invoice {
                 'type' => 'lnurl',
                 'reason' => $lnurlFailReason ?? 'the Lightning address could not produce an invoice',
             ];
-            AdminLog::log('lnurl', 'checkout', $storeId, null, $dest['value'],
+            AdminLog::log('lnurl', $context, $storeId, $invoiceId, $dest['value'],
+                $lnurlFailReason ?? 'probe failed');
+            InvoiceAttempts::record($invoiceId, $storeId, $context, 'lnurl', $dest['value'],
+                InvoiceAttempts::FAILED, $lnurlFailReason ?? 'the Lightning address could not produce an invoice',
                 $lnurlFailReason ?? 'probe failed');
         }
         error_log(sprintf(
@@ -1318,7 +1378,9 @@ class Invoice {
         string $amount,
         string $currency,
         bool $onchainConfigured,
-        ?int $fixedAmount = null
+        ?int $fixedAmount = null,
+        ?string $invoiceId = null,
+        string $context = InvoiceAttempts::CONTEXT_CHECKOUT
     ): array {
         $mintUnit = $store['mint_unit'];
         $exchangeFee = (float)($store['exchange_fee_percent'] ?? 0);
@@ -1345,6 +1407,10 @@ class Invoice {
                 '[mint] unit conversion failed for store=%s (%s -> %s): %s; skipping mint path',
                 $storeId, $currency, (string)$mintUnit, $e->getMessage()
             ));
+            if ($invoiceId !== null) {
+                InvoiceAttempts::record($invoiceId, $storeId, $context, 'mint', null, InvoiceAttempts::FAILED,
+                    'the amount could not be converted to the mint unit (rate lookup failed)', $e->getMessage());
+            }
             $amountInMintUnit = null;
         }
         if ($amountInMintUnit !== null) {
@@ -1362,17 +1428,29 @@ class Invoice {
                     if ($wallet->requiresRecovery()) {
                         $recoveringMints[] = $tryMintUrl;
                         error_log("Mint {$tryMintUrl} skipped for store {$storeId}: wallet recovery in progress");
+                        if ($invoiceId !== null) {
+                            InvoiceAttempts::record($invoiceId, $storeId, $context, 'mint', $tryMintUrl,
+                                InvoiceAttempts::SKIPPED, 'the mint wallet is still being prepared (recovery in progress)', null);
+                        }
                         continue;
                     }
                     $quote = $wallet->requestMintQuote($amountInMintUnit);
                     $usedMintUrl = $tryMintUrl;
                     MintReliability::recordQuoteSuccess($tryMintUrl, $storeId);
+                    if ($invoiceId !== null) {
+                        InvoiceAttempts::record($invoiceId, $storeId, $context, 'mint', $tryMintUrl,
+                            InvoiceAttempts::OK, null, 'mint quote ' . ($quote->quote ?? '') . ' for ' . $amountInMintUnit . ' ' . $mintUnit);
+                    }
                     break;
                 } catch (Exception $e) {
                     $lastError = $e;
                     error_log("Mint quote failed for $tryMintUrl: " . $e->getMessage());
                     $kind = MintReliability::classifyException($e, 'requestMintQuote');
                     MintReliability::recordQuoteFailure($tryMintUrl, $storeId, $kind, $e->getMessage());
+                    if ($invoiceId !== null) {
+                        InvoiceAttempts::record($invoiceId, $storeId, $context, 'mint', $tryMintUrl,
+                            InvoiceAttempts::FAILED, 'the mint could not issue a Lightning invoice', $e->getMessage());
+                    }
                     continue;
                 }
             }
@@ -1384,6 +1462,38 @@ class Invoice {
             'recovering' => $recoveringMints,
             'last_error' => $lastError,
         ];
+    }
+
+    /**
+     * Log the outcome of a swap step for the invoice detail: one failed row
+     * per provider reason trySwapCreate collected ("Boltz: 1000 sat outside
+     * range [...]" — the provider name is split off as the label) and an ok
+     * row for the provider that created the swap.
+     */
+    private static function recordSwapAttempts(
+        string $invoiceId,
+        string $storeId,
+        array $failures,
+        ?array $swapAttempt,
+        bool $strict
+    ): void {
+        foreach ($failures as $f) {
+            $label = null;
+            $f = (string)$f;
+            if (preg_match('/^([A-Za-z0-9_.-]+): /', $f, $m)) {
+                $label = $m[1];
+            }
+            InvoiceAttempts::record($invoiceId, $storeId, InvoiceAttempts::CONTEXT_CHECKOUT, 'swap', $label,
+                InvoiceAttempts::FAILED, 'a Lightning invoice could not be created for this amount',
+                $f . ($strict ? ' [strict mode: no mint fallback]' : ''));
+        }
+        if ($swapAttempt !== null) {
+            InvoiceAttempts::record($invoiceId, $storeId, InvoiceAttempts::CONTEXT_CHECKOUT, 'swap',
+                (string)($swapAttempt['provider'] ?? ''), InvoiceAttempts::OK, null,
+                sprintf('swap created: lockup fee %d sat, percent fee %d sat, settles to %s',
+                    (int)($swapAttempt['lockup_fee_sats'] ?? 0), (int)($swapAttempt['percent_fee_sats'] ?? 0),
+                    (string)($swapAttempt['merchant_address'] ?? '')));
+        }
     }
 
     /**
@@ -2225,7 +2335,7 @@ class Invoice {
                 }
             } catch (Throwable $e) {
                 error_log("[lnurl-receive] poll failed for invoice {$invoice['id']}: " . $e->getMessage());
-                AdminLog::log('lnurl', 'poll', $invoice['store_id'], $invoice['id'],
+                InvoiceAttempts::pollFailure($invoice['id'], $invoice['store_id'], 'lnurl',
                     $invoice['ln_destination'] ?? null, $e->getMessage());
             }
         }
@@ -2273,7 +2383,7 @@ class Invoice {
             }
         } catch (Throwable $e) {
             error_log("[lnurl-receive] single poll failed for {$invoiceId}: " . $e->getMessage());
-            AdminLog::log('lnurl', 'poll', $invoice['store_id'], $invoiceId,
+            InvoiceAttempts::pollFailure($invoiceId, $invoice['store_id'], 'lnurl',
                 $invoice['ln_destination'] ?? null, $e->getMessage());
         }
     }
@@ -2371,7 +2481,7 @@ class Invoice {
                 self::checkNwcSettlement($invoice);
             } catch (Throwable $e) {
                 error_log("[nwc-receive] cron poll failed for invoice {$invoice['id']}: " . $e->getMessage());
-                AdminLog::log('nwc', 'poll', $invoice['store_id'], $invoice['id'],
+                InvoiceAttempts::pollFailure($invoice['id'], $invoice['store_id'], 'nwc',
                     $invoice['ln_destination'] ?? null, $e->getMessage());
             }
         }
@@ -2426,7 +2536,7 @@ class Invoice {
             }
         } catch (Throwable $e) {
             error_log("[nwc-receive] single poll failed for {$invoiceId}: " . $e->getMessage());
-            AdminLog::log('nwc', 'poll', $invoice['store_id'], $invoiceId,
+            InvoiceAttempts::pollFailure($invoiceId, $invoice['store_id'], 'nwc',
                 $invoice['ln_destination'] ?? null, $e->getMessage());
         }
     }
@@ -2526,7 +2636,7 @@ class Invoice {
                 self::checkStrikeSettlement($invoice);
             } catch (Throwable $e) {
                 error_log("[strike-receive] cron poll failed for invoice {$invoice['id']}: " . $e->getMessage());
-                AdminLog::log('strike', 'poll', $invoice['store_id'], $invoice['id'],
+                InvoiceAttempts::pollFailure($invoice['id'], $invoice['store_id'], 'strike',
                     $invoice['ln_destination'] ?? null, $e->getMessage());
             }
         }
@@ -2579,7 +2689,7 @@ class Invoice {
             }
         } catch (Throwable $e) {
             error_log("[strike-receive] single poll failed for {$invoiceId}: " . $e->getMessage());
-            AdminLog::log('strike', 'poll', $invoice['store_id'], $invoiceId,
+            InvoiceAttempts::pollFailure($invoiceId, $invoice['store_id'], 'strike',
                 $invoice['ln_destination'] ?? null, $e->getMessage());
         }
     }
@@ -2711,7 +2821,7 @@ class Invoice {
                 }
             } catch (Throwable $e) {
                 error_log("[clink-receive] cron poll failed for invoice {$invoice['id']}: " . $e->getMessage());
-                AdminLog::log('noffer', 'poll', $invoice['store_id'], $invoice['id'],
+                InvoiceAttempts::pollFailure($invoice['id'], $invoice['store_id'], 'noffer',
                     $invoice['ln_destination'] ?? null, $e->getMessage());
             }
         }
@@ -2773,7 +2883,7 @@ class Invoice {
             }
         } catch (Throwable $e) {
             error_log("[clink-receive] single poll failed for {$invoiceId}: " . $e->getMessage());
-            AdminLog::log('noffer', 'poll', $invoice['store_id'], $invoiceId,
+            InvoiceAttempts::pollFailure($invoiceId, $invoice['store_id'], 'noffer',
                 $invoice['ln_destination'] ?? null, $e->getMessage());
         }
     }
@@ -3224,7 +3334,8 @@ class Invoice {
                     continue;
                 }
                 $direct = self::sourceDirectReceive(
-                    $storeId, $store, $step['destinations'], $directSats, self::metadataOf($invoice), $invoiceId, $receiveErrors
+                    $storeId, $store, $step['destinations'], $directSats, self::metadataOf($invoice), $invoiceId, $receiveErrors,
+                    InvoiceAttempts::CONTEXT_REFRESH
                 );
                 if ($direct !== null) {
                     $sourced = self::lightningFieldsFromAttempt($direct['type'], $direct['attempt']);
@@ -3242,6 +3353,9 @@ class Invoice {
                         '[long-lived] strict mode: mint fallback skipped on refresh invoice=%s store=%s',
                         $invoiceId, $storeId
                     ));
+                    InvoiceAttempts::record($invoiceId, $storeId, InvoiceAttempts::CONTEXT_REFRESH, 'mint', null,
+                        InvoiceAttempts::SKIPPED, 'strict mode forbids the Cashu mint fallback',
+                        'Cashu mint skipped on refresh: swaps enabled with strict mode (no mint fallback)');
                 }
                 continue;
             }
@@ -3251,9 +3365,13 @@ class Invoice {
             $fixed = (!$requote && $currentRail === 'mint' && !empty($invoice['bolt11']))
                 ? (int)$invoice['amount_sats'] : null;
             try {
-                $mq = self::sourceMintQuote($storeId, $store, $amount, $currency, true, $fixed);
+                $mq = self::sourceMintQuote(
+                    $storeId, $store, $amount, $currency, true, $fixed, $invoiceId, InvoiceAttempts::CONTEXT_REFRESH
+                );
             } catch (Throwable $e) {
                 $mq = ['quote' => null, 'last_error' => $e];
+                InvoiceAttempts::record($invoiceId, $storeId, InvoiceAttempts::CONTEXT_REFRESH, 'mint', null,
+                    InvoiceAttempts::FAILED, 'no configured mint could issue a Lightning invoice', $e->getMessage());
             }
             if (!empty($mq['quote'])) {
                 $q = $mq['quote'];
@@ -3342,14 +3460,19 @@ class Invoice {
                 (string)$invoice['id'], $address, $sats
             ));
             $receiveErrors[] = ['type' => 'lnurl', 'reason' => 'the Lightning address could not produce an invoice'];
+            InvoiceAttempts::record((string)$invoice['id'], (string)$invoice['store_id'], InvoiceAttempts::CONTEXT_REFRESH,
+                'fee', $address !== '' ? $address : null, InvoiceAttempts::FAILED,
+                'the Lightning address could not produce an invoice', 'fee-routed invoice has no fee LNURL / amount to re-source from');
             return null;
         }
         $failReason = null;
+        $thrown = null;
         try {
             $probed = LnUrlReceive::probeAndFetchInvoice($address, $sats, null, $failReason);
         } catch (Throwable $e) {
             error_log("[long-lived] fee LNURL probe threw for invoice {$invoice['id']}: " . $e->getMessage());
             $probed = null;
+            $thrown = $e->getMessage();
             $failReason = 'the Lightning address service could not be reached';
         }
         if ($probed === null) {
@@ -3357,8 +3480,13 @@ class Invoice {
                 'type' => 'lnurl',
                 'reason' => $failReason ?? 'the Lightning address could not produce an invoice',
             ];
+            InvoiceAttempts::record((string)$invoice['id'], (string)$invoice['store_id'], InvoiceAttempts::CONTEXT_REFRESH,
+                'fee', $address, InvoiceAttempts::FAILED,
+                $failReason ?? 'the Lightning address could not produce an invoice', $thrown ?? ($failReason ?? 'probe failed'));
             return null;
         }
+        InvoiceAttempts::record((string)$invoice['id'], (string)$invoice['store_id'], InvoiceAttempts::CONTEXT_REFRESH,
+            'fee', $address, InvoiceAttempts::OK, null, 'fee payee re-issued a bolt11 for ' . $sats . ' sat');
         return self::lightningFieldsFromAttempt('lnurl', [
             'bolt11' => $probed['bolt11'],
             'verify_url' => $probed['verify_url'],

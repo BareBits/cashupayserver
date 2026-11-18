@@ -2212,6 +2212,28 @@ HTACCESS;
             ");
         }
 
+        // Per-invoice payment-path attempt log (includes/invoice_attempts.php):
+        // one row per rail tried while sourcing an invoice's payment methods
+        // (creation + long-lived refresh) and per settlement-check failure.
+        // Read by the admin invoice detail. Cascades with the invoice.
+        if (!self::tableExists($pdo, 'invoice_rail_attempts')) {
+            $pdo->exec("
+                CREATE TABLE invoice_rail_attempts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    invoice_id TEXT NOT NULL REFERENCES invoices(id) ON DELETE CASCADE,
+                    store_id TEXT,
+                    timestamp INTEGER NOT NULL,
+                    context TEXT NOT NULL,
+                    rail TEXT NOT NULL,
+                    label TEXT,
+                    outcome TEXT NOT NULL,
+                    reason TEXT,
+                    detail TEXT
+                );
+            ");
+            $pdo->exec("CREATE INDEX idx_invoice_rail_attempts_invoice ON invoice_rail_attempts(invoice_id, timestamp);");
+        }
+
         // One-off: PENDING used to mean two different things — "reserved by an
         // in-flight melt" and "handed out as an exported token". Recovery
         // read the first meaning, so an unredeemed export was returned to the

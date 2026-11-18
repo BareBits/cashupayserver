@@ -750,16 +750,130 @@ if (isset($_GET['api'])) {
             ]);
             break;
 
-        // Cart line items for an invoice — used by the admin invoice detail.
-        case 'invoice_items':
-            $invoiceId = $_GET['id'] ?? '';
+        // Full invoice detail for the admin invoice modal: the API view of
+        // the invoice plus the rail bookkeeping formatForApi leaves out, the
+        // cart line items, and the payment-path attempt log. Reachable by
+        // the non-admin ROLE_USER like the invoice list itself; the raw
+        // error text (attempt detail, last poll error) is admin-only.
+        // Secret-bearing columns (nwc_uri, strike_api_key, noffer_ephemeral_sk,
+        // cashu_offline_token, lnurl_preimage) never ride this payload.
+        case 'invoice_detail':
+            $invoiceId = (string)($_GET['id'] ?? '');
             if ($invoiceId === '') {
                 cashupay_status(400);
                 echo json_encode(['error' => 'id required']);
                 break;
             }
+            $row = Invoice::getById($invoiceId);
+            if (!$row) {
+                cashupay_status(404);
+                echo json_encode(['error' => 'Invoice not found']);
+                break;
+            }
+            require_once __DIR__ . '/includes/invoice_attempts.php';
+            $isAdminViewer = Auth::isAdmin();
+            $detailStore = Config::getStore($row['store_id']);
+            $decodeJson = static function ($v) {
+                if ($v === null || $v === '') { return null; }
+                $d = json_decode((string)$v, true);
+                return is_array($d) ? $d : null;
+            };
+            $intOrNull = static fn($v) => ($v === null || $v === '') ? null : (int)$v;
+
+            $formatted = Invoice::formatForApi($row);
+            $items = Cart::formatItemsForApi(Cart::getItems($invoiceId));
+            $formatted['hasItems'] = $items !== [];
+
+            $attemptRows = InvoiceAttempts::listForInvoice($invoiceId);
+            $attemptsLegacy = $attemptRows === [];
+            $attempts = $attemptsLegacy
+                ? InvoiceAttempts::legacyFromInvoice($row)
+                : InvoiceAttempts::formatForApi($attemptRows, $isAdminViewer);
+
+            $onchainDetail = null;
+            if (!empty($row['onchain_address'])) {
+                $payments = [];
+                foreach (Database::fetchAll(
+                    "SELECT txid, vout, amount_sat, confirmations, block_height, first_seen_at
+                       FROM onchain_payments WHERE invoice_id = ? ORDER BY first_seen_at ASC, id ASC",
+                    [$invoiceId]
+                ) as $p) {
+                    $payments[] = [
+                        'txid' => $p['txid'],
+                        'vout' => (int)$p['vout'],
+                        'amountSat' => (int)$p['amount_sat'],
+                        'confirmations' => (int)$p['confirmations'],
+                        'blockHeight' => $intOrNull($p['block_height']),
+                        'firstSeenAt' => (int)$p['first_seen_at'],
+                    ];
+                }
+                $onchainDetail = [
+                    'address' => $row['onchain_address'],
+                    'amountSat' => $intOrNull($row['onchain_amount_sat'] ?? null),
+                    'tweakSats' => $intOrNull($row['onchain_amount_tweak_sats'] ?? null),
+                    'firstSeenAt' => $intOrNull($row['onchain_first_seen_at'] ?? null),
+                    'needsManualConfirmation' => !empty($row['onchain_needs_manual_confirmation']),
+                    'payments' => $payments,
+                ];
+            }
+
+            $swapDetail = null;
+            $sa = Database::fetchOne(
+                "SELECT provider, network, status, lockup_txid, claim_txid, merchant_address,
+                        target_onchain_amount_sats, invoice_amount_sats, swap_lockup_fee_sats,
+                        swap_percent_fee_sats, error_message, created_at, updated_at
+                   FROM swap_attempts WHERE invoice_id = ? ORDER BY id DESC LIMIT 1",
+                [$invoiceId]
+            );
+            if ($sa) {
+                $swapDetail = [
+                    'provider' => $sa['provider'],
+                    'network' => $sa['network'],
+                    'status' => $sa['status'],
+                    'lockupTxid' => $sa['lockup_txid'],
+                    'claimTxid' => $sa['claim_txid'],
+                    'merchantAddress' => $sa['merchant_address'],
+                    'targetSats' => (int)$sa['target_onchain_amount_sats'],
+                    'invoiceSats' => (int)$sa['invoice_amount_sats'],
+                    'lockupFeeSats' => (int)$sa['swap_lockup_fee_sats'],
+                    'percentFeeSats' => (int)$sa['swap_percent_fee_sats'],
+                    'errorMessage' => $isAdminViewer ? $sa['error_message'] : null,
+                ];
+            }
+
             echo json_encode([
-                'items' => Cart::formatItemsForApi(Cart::getItems($invoiceId)),
+                'invoice' => $formatted,
+                'storeName' => $detailStore['name'] ?? null,
+                'isAdmin' => $isAdminViewer,
+                'detail' => [
+                    // The rail chosen at creation vs. the one that moved funds
+                    // (formatForApi's paymentRail already prefers the latter).
+                    'paymentRailChosen' => $row['payment_rail'] ?? null,
+                    'settledRail' => $row['settled_rail'] ?? null,
+                    'bolt11' => $row['bolt11'] ?? null,
+                    'lnDestination' => $row['ln_destination'] ?? null,
+                    'nofferRelay' => $row['noffer_relay'] ?? null,
+                    'lnExpiresAt' => $intOrNull($row['ln_expires_at'] ?? null),
+                    'lnRefreshedAt' => $intOrNull($row['ln_refreshed_at'] ?? null),
+                    'requotedAt' => $intOrNull($row['requoted_at'] ?? null),
+                    'lastPolledAt' => $intOrNull($row['last_polled_at'] ?? null),
+                    'lastPollState' => $row['last_poll_state'] ?? null,
+                    'lastPollError' => $isAdminViewer ? ($row['last_poll_error'] ?? null) : null,
+                    'lnurlOverrideReason' => $row['lnurl_override_reason'] ?? null,
+                    'strikeInvoiceId' => $row['strike_invoice_id'] ?? null,
+                    'strikeReceiveRequestId' => $row['strike_receive_request_id'] ?? null,
+                    'receiveErrors' => $decodeJson($row['receive_errors'] ?? null) ?? [],
+                    'metadata' => $decodeJson($row['metadata'] ?? null),
+                    'checkoutConfig' => $decodeJson($row['checkout_config'] ?? null),
+                    'payerReceiptRequested' => !empty($row['payer_receipt_requested']),
+                    'cashuOfflineAllowAnyMint' => !empty($row['cashu_offline_allow_any_mint']),
+                    'cashuOfflineFailReason' => $row['cashu_offline_fail_reason'] ?? null,
+                    'onchain' => $onchainDetail,
+                    'swap' => $swapDetail,
+                ],
+                'items' => $items,
+                'attempts' => $attempts,
+                'attemptsLegacy' => $attemptsLegacy,
             ]);
             break;
 
@@ -6270,6 +6384,160 @@ header('Cache-Control: no-cache, must-revalidate');
         .inv-table tbody tr:hover {
             background: var(--bg-hover, rgba(255,255,255,0.02));
         }
+        /* Every invoice row opens the invoice detail modal. */
+        .inv-table tbody tr.inv-row {
+            cursor: pointer;
+        }
+
+        /* Invoice detail modal (#modal-invoice-detail) */
+        .invd-head {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            flex-wrap: wrap;
+            margin: -0.5rem 0 0.25rem;
+        }
+        .invd-id {
+            font-family: monospace;
+            font-size: 0.78rem;
+            color: var(--text-secondary);
+            word-break: break-all;
+        }
+        .invd-section {
+            margin-top: 1rem;
+        }
+        .invd-section-title {
+            font-size: 0.75rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+            color: var(--text-secondary);
+            margin-bottom: 0.4rem;
+            padding-bottom: 0.25rem;
+            border-bottom: 1px solid var(--border);
+        }
+        .invd-grid {
+            display: grid;
+            grid-template-columns: minmax(110px, 32%) 1fr;
+            gap: 0.3rem 0.75rem;
+            font-size: 0.85rem;
+            margin: 0;
+        }
+        .invd-grid dt {
+            color: var(--text-secondary);
+        }
+        .invd-grid dd {
+            margin: 0;
+            min-width: 0;
+            word-break: break-word;
+        }
+        .invd-mono {
+            font-family: monospace;
+            font-size: 0.78rem;
+            word-break: break-all;
+        }
+        .invd-grid a,
+        .invd-attempt a {
+            color: var(--accent, #60a5fa);
+        }
+        .invd-copy {
+            font-size: 0.72rem;
+            margin-left: 0.3rem;
+            white-space: nowrap;
+            color: var(--accent, #60a5fa);
+        }
+        .invd-group-title {
+            font-size: 0.8rem;
+            font-weight: 600;
+            margin: 0.6rem 0 0.15rem;
+        }
+        .invd-attempt {
+            display: flex;
+            gap: 0.6rem;
+            align-items: flex-start;
+            padding: 0.4rem 0;
+            border-bottom: 1px solid var(--border);
+            font-size: 0.82rem;
+        }
+        .invd-attempt:last-child {
+            border-bottom: none;
+        }
+        .invd-attempt-time {
+            color: var(--text-secondary);
+            font-size: 0.72rem;
+            white-space: nowrap;
+            min-width: 7.5rem;
+        }
+        .invd-attempt-body {
+            flex: 1;
+            min-width: 0;
+        }
+        .invd-attempt-label {
+            color: var(--text-secondary);
+            font-size: 0.75rem;
+            word-break: break-all;
+        }
+        .invd-attempt-reason {
+            font-size: 0.8rem;
+            margin-top: 0.1rem;
+        }
+        .invd-attempt-detail {
+            color: var(--text-secondary);
+            font-size: 0.73rem;
+            margin-top: 0.1rem;
+            word-break: break-word;
+        }
+        .invd-outcome {
+            display: inline-block;
+            padding: 0.05rem 0.45rem;
+            border-radius: 999px;
+            font-size: 0.68rem;
+            font-weight: 600;
+            white-space: nowrap;
+            margin-top: 0.1rem;
+        }
+        .invd-outcome.ok {
+            background: rgba(72, 187, 120, 0.18);
+            color: var(--success, #48bb78);
+        }
+        .invd-outcome.failed {
+            background: rgba(239, 68, 68, 0.18);
+            color: #ef4444;
+        }
+        .invd-outcome.skipped {
+            background: rgba(247, 147, 26, 0.18);
+            color: var(--accent, #f7931a);
+        }
+        .invd-note {
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            margin: 0.25rem 0 0;
+        }
+        details.invd-raw summary {
+            cursor: pointer;
+            font-size: 0.78rem;
+            color: var(--text-secondary);
+        }
+        details.invd-raw pre {
+            font-size: 0.72rem;
+            overflow-x: auto;
+            background: rgba(0, 0, 0, 0.25);
+            padding: 0.5rem;
+            border-radius: 6px;
+            margin: 0.4rem 0 0;
+        }
+        @media (max-width: 500px) {
+            .invd-grid {
+                grid-template-columns: 1fr;
+                gap: 0.1rem 0;
+            }
+            .invd-grid dt {
+                margin-top: 0.35rem;
+            }
+            .invd-attempt {
+                flex-wrap: wrap;
+            }
+        }
         .inv-table td.inv-amount {
             text-align: right;
             white-space: nowrap;
@@ -9016,13 +9284,14 @@ header('Cache-Control: no-cache, must-revalidate');
         </div>
     </div>
 
-    <!-- Admin invoice line-item detail -->
+    <!-- Invoice detail: opened from any invoice row (All Invoices table,
+         dashboard Recent invoices, Log tab). Filled by openInvoiceDetail. -->
     <div class="modal-overlay" id="modal-invoice-detail">
-        <div class="modal">
+        <div class="modal" style="max-width: 720px;">
             <div class="modal-handle"></div>
-            <div class="modal-title">Invoice items</div>
+            <div class="modal-title" id="invoice-detail-title">Invoice</div>
             <div id="invoice-detail-content"><div class="loading"><div class="spinner"></div></div></div>
-            <button class="btn btn-secondary btn-full" style="margin-top:0.5rem;" onclick="closeModal('modal-invoice-detail')">Close</button>
+            <button class="btn btn-secondary btn-full" style="margin-top:0.75rem;" onclick="closeModal('modal-invoice-detail')">Close</button>
         </div>
     </div>
 
@@ -11569,7 +11838,7 @@ header('Cache-Control: no-cache, must-revalidate');
                 const feeBadge = inv.feeRedirect ? feeRedirectBadge(inv.feeRedirect) : '';
 
                 return `
-                    <div class="list-item">
+                    <div class="list-item" data-invoice-id="${escapeAttr(inv.id)}">
                         <div class="list-icon ${statusClass}">${icon}</div>
                         <div class="list-content">
                             <div class="list-title">${description ? escapeHtml(description) : inv.id}${feeBadge}</div>
@@ -11582,6 +11851,7 @@ header('Cache-Control: no-cache, must-revalidate');
                     </div>
                 `;
             }).join('');
+            bindInvoiceRowClicks(container);
         }
 
         // ---- Detailed invoice table (All Invoices view) ----
@@ -11734,9 +12004,10 @@ header('Cache-Control: no-cache, must-revalidate');
                 // swap-status badge appended when the swap isn't fully settled.
                 // Em-dash when there's neither a description nor a badge.
                 const feeBadge = inv.feeRedirect ? feeRedirectBadge(inv.feeRedirect) : '';
-                // Cart invoices get an inline link to their itemized breakdown.
+                // Cart invoices flag their itemized breakdown; the row click
+                // opens the invoice detail, which lists the items.
                 const itemsLink = inv.hasItems
-                    ? ` <a href="#" onclick="openInvoiceItems('${idEsc}'); return false;" style="font-size:0.78rem; color:var(--accent,#60a5fa); white-space:nowrap;">🛒 items</a>`
+                    ? ` <span class="inv-chip" title="Cart line items — open the invoice for the itemized list" style="white-space:nowrap;">🛒 items</span>`
                     : '';
                 const noteCell = (description || swapBadge || itemsLink || feeBadge)
                     ? `<div>${description ? escapeHtml(description) : ''}${swapBadge}${itemsLink}${feeBadge}</div>`
@@ -11777,7 +12048,7 @@ header('Cache-Control: no-cache, must-revalidate');
                 // state machine.
                 const statusLabel = inv.status === 'Settled' ? 'Paid' : inv.status;
                 return `
-                    <tr>
+                    <tr class="inv-row" data-invoice-id="${escapeAttr(inv.id)}">
                         <td><span class="inv-chip status-${escapeHtml(inv.status)}">${escapeHtml(statusLabel)}</span></td>
                         <td>${renderPaymentMethod(inv.paymentRail, inv.mintUrl)}</td>
                         <td>${idCell}</td>
@@ -11811,6 +12082,22 @@ header('Cache-Control: no-cache, must-revalidate');
                     </table>
                 </div>
             `;
+            bindInvoiceRowClicks(container);
+        }
+
+        // Row click -> invoice detail modal. Delegated on the list container
+        // (assigned, not added, so re-renders don't stack handlers). Clicks
+        // on the row's own interactive bits — explorer / copy links, the id
+        // tooltip, buttons — keep their own behaviour.
+        function bindInvoiceRowClicks(container) {
+            if (!container) return;
+            container.onclick = (e) => {
+                if (e.target.closest('a, button, input, select, .inv-id-tip')) return;
+                const row = e.target.closest('[data-invoice-id]');
+                if (row && container.contains(row)) {
+                    openInvoiceDetail(row.getAttribute('data-invoice-id'));
+                }
+            };
         }
 
         // Actions
@@ -14487,14 +14774,17 @@ header('Cache-Control: no-cache, must-revalidate');
             const rows = entries.map(e => {
                 const cat = LOG_CATEGORY_LABELS[e.category] || e.category;
                 const store = e.storeId ? (logStoreNames[e.storeId] || e.storeId) : '';
-                // Deep-link the invoice id into the invoices view is overkill
-                // here; show a short prefix so the operator can find it.
+                // The invoice id opens the invoice detail modal (full id in
+                // the tooltip, short prefix in the cell).
                 const inv = e.invoiceId ? e.invoiceId.substring(0, 12) : '';
+                const invLink = inv
+                    ? `<br><a href="#" class="log-invoice-link" title="${escapeAttr(e.invoiceId)}" style="color: var(--accent, #60a5fa);" onclick="openInvoiceDetail('${escapeAttr(e.invoiceId)}'); return false;">inv ${escapeHtml(inv)}&hellip;</a>`
+                    : '';
                 return `<tr>
                     <td style="white-space: nowrap; vertical-align: top;">${escapeHtml(fmtTimestamp(e.timestamp))}</td>
                     <td style="vertical-align: top;"><code style="font-size: 0.75rem;">${escapeHtml(cat)}</code></td>
                     <td style="vertical-align: top;">${escapeHtml(store)}</td>
-                    <td style="vertical-align: top; word-break: break-all; font-size: 0.75rem;">${escapeHtml(e.ref || '')}${inv ? '<br><span style="color: var(--text-secondary);">inv ' + escapeHtml(inv) + '&hellip;</span>' : ''}</td>
+                    <td style="vertical-align: top; word-break: break-all; font-size: 0.75rem;">${escapeHtml(e.ref || '')}${invLink}</td>
                     <td style="vertical-align: top; word-break: break-word; font-size: 0.75rem;">${escapeHtml(e.message)}</td>
                 </tr>`;
             }).join('');
@@ -17747,35 +18037,246 @@ header('Cache-Control: no-cache, must-revalidate');
             offerEnableSelfServe();
         }
 
-        // ---- Admin invoice line-item detail ----
+        // ---- Invoice detail modal ----
+        // Opened from any invoice row (All Invoices table, dashboard Recent
+        // invoices, Log tab). Loads ?api=invoice_detail and renders the
+        // invoice summary, the payment methods it carried, the cart line
+        // items, and the payment-path attempt log: which rails were tried,
+        // in order, and how each attempt ended.
 
-        async function openInvoiceItems(invoiceId) {
+        const ATTEMPT_RAIL_LABELS = {
+            strike: 'Strike', lnurl: 'Lightning address', nwc: 'NWC wallet', noffer: 'CLINK noffer',
+            swap: 'Submarine swap', mint: 'Cashu mint', onchain: 'On-chain address', fee: 'Fee redirect',
+        };
+        const ATTEMPT_CONTEXT_LABELS = {
+            checkout: 'Invoice creation', refresh: 'Lightning refresh', poll: 'Settlement checks',
+        };
+        const ATTEMPT_OUTCOME_LABELS = { ok: 'OK', failed: 'Failed', skipped: 'Skipped' };
+
+        function invdCopy(value, hint) {
+            return `<a href="#" class="invd-copy inv-copy" title="${escapeAttr((hint ? hint + '\n' : '') + '(click to copy)')}" data-copy="${escapeAttr(value)}" onclick="copyMono(event, this); return false;">copy</a>`;
+        }
+        function invdMono(value, hint) {
+            if (!value) return '';
+            return `<span class="invd-mono">${escapeHtml(value)}</span>${invdCopy(value, hint)}`;
+        }
+        function invdRow(label, valueHtml) {
+            if (valueHtml === null || valueHtml === undefined || valueHtml === '') return '';
+            return `<dt>${escapeHtml(label)}</dt><dd>${valueHtml}</dd>`;
+        }
+        function invdTime(ts) {
+            return ts ? escapeHtml(new Date(ts * 1000).toLocaleString()) : '';
+        }
+        function invdSection(title, bodyHtml) {
+            if (!bodyHtml) return '';
+            return `<div class="invd-section"><div class="invd-section-title">${escapeHtml(title)}</div>${bodyHtml}</div>`;
+        }
+
+        async function openInvoiceDetail(invoiceId) {
             const content = document.getElementById('invoice-detail-content');
+            const title = document.getElementById('invoice-detail-title');
+            title.textContent = 'Invoice';
             content.innerHTML = '<div class="loading"><div class="spinner"></div></div>';
             document.getElementById('modal-invoice-detail').classList.add('visible');
             try {
-                const r = await fetch(`${adminUrl}?api=invoice_items&id=${encodeURIComponent(invoiceId)}`, { credentials: 'same-origin' });
+                const r = await fetch(`${adminUrl}?api=invoice_detail&id=${encodeURIComponent(invoiceId)}`, { credentials: 'same-origin' });
                 const d = await r.json();
-                const items = d.items || [];
-                if (!items.length) {
-                    content.innerHTML = '<p style="color:var(--text-secondary);">This invoice has no cart line items.</p>';
+                if (!r.ok || !d.invoice) {
+                    content.innerHTML = `<p style="color:#ef4444;">${escapeHtml(d.error || 'Failed to load invoice.')}</p>`;
                     return;
                 }
+                content.innerHTML = renderInvoiceDetail(d);
+            } catch (e) {
+                content.innerHTML = '<p style="color:#ef4444;">Failed to load invoice.</p>';
+            }
+        }
+
+        function renderInvoiceDetail(d) {
+            const inv = d.invoice;
+            const det = d.detail || {};
+            const meta = det.metadata || {};
+            const network = inv.network || 'mainnet';
+            const statusLabel = inv.status === 'Settled' ? 'Paid' : inv.status;
+
+            // ---- header ----
+            const head = `
+                <div class="invd-head">
+                    <span class="inv-chip status-${escapeHtml(inv.status)}">${escapeHtml(statusLabel)}</span>
+                    ${renderPaymentMethod(inv.paymentRail, inv.mintUrl)}
+                    ${d.storeName ? `<span class="inv-chip">${escapeHtml(d.storeName)}</span>` : ''}
+                </div>
+                <div class="invd-id" id="invoice-detail-id">${escapeHtml(inv.id)}${invdCopy(inv.id, 'Invoice ID')}</div>`;
+
+            // ---- summary ----
+            let amount = `${escapeHtml(String(inv.amount))} ${escapeHtml(String(inv.currency))}`;
+            if (inv.amountInMintUnit !== undefined && inv.amountInMintUnit !== null
+                && String(inv.mintUnit || 'sat').toLowerCase() !== String(inv.currency).toLowerCase()) {
+                amount += ` <span style="color:var(--text-secondary);">(${escapeHtml(String(inv.amountInMintUnit))} ${escapeHtml(String(inv.mintUnit || 'sat'))})</span>`;
+            }
+            if (inv.exchangeRate && inv.exchangeRate.rate) {
+                amount += ` <span style="color:var(--text-secondary); font-size:0.78rem;">@ ${escapeHtml(String(inv.exchangeRate.rate))} ${escapeHtml(String(inv.exchangeRate.currency))}</span>`;
+            }
+            let statusCell = `<span class="inv-chip status-${escapeHtml(inv.status)}">${escapeHtml(statusLabel)}</span>`;
+            if (inv.additionalStatus && inv.additionalStatus !== 'None') {
+                statusCell += ` <span style="color:var(--text-secondary); font-size:0.8rem;">${escapeHtml(inv.additionalStatus)}</span>`;
+            }
+            let method = renderPaymentMethod(inv.paymentRail, inv.mintUrl);
+            if (det.paymentRailChosen && det.settledRail && det.paymentRailChosen !== det.settledRail) {
+                method += ` <span style="color:var(--text-secondary); font-size:0.78rem;">(created on ${escapeHtml(det.paymentRailChosen)}, paid via ${escapeHtml(det.settledRail)})</span>`;
+            }
+            const destination = inv.destination
+                ? (inv.destinationIsLightning ? invdMono(inv.destination, 'Lightning destination')
+                    : `${renderMonoLink('address', inv.destination, network)}${invdCopy(inv.destination, 'Address')}`)
+                : '';
+            const feeRedirect = inv.feeRedirect
+                ? `${escapeHtml(inv.feeRedirect.label || 'fees')}${inv.feeRedirect.destination ? ' → <span class="invd-mono">' + escapeHtml(inv.feeRedirect.destination) + '</span>' : ''}`
+                  + `${inv.feeRedirect.rails && inv.feeRedirect.rails.length ? ' <span style="color:var(--text-secondary); font-size:0.78rem;">(' + escapeHtml(inv.feeRedirect.rails.join(', ')) + ')</span>' : ''}`
+                  + `${inv.feeRedirect.settled ? (inv.feeRedirect.settledToFee ? ' — paid to the fee payee' : ' — paid to the merchant') : ''}`
+                : '';
+            const email = inv.customerEmail
+                ? `${escapeHtml(inv.customerEmail)}${inv.newsletterOptIn ? ' <span title="Subscribed to newsletter" style="color: var(--success, #48bb78);">✓ newsletter</span>' : ''}`
+                : '';
+            const expires = inv.expirationTime
+                ? `${invdTime(inv.expirationTime)}${inv.longLived ? ' <span class="inv-chip" title="Shareable long-lived payment request">long-lived</span>' : ''}`
+                : '';
+            const summary = `<dl class="invd-grid">
+                ${invdRow('Amount', amount)}
+                ${invdRow('Status', statusCell)}
+                ${invdRow('Created', invdTime(inv.createdTime))}
+                ${invdRow('Expires', expires)}
+                ${invdRow('Paid', invdTime(inv.paidTime))}
+                ${invdRow('Method', method)}
+                ${invdRow('Destination', destination)}
+                ${invdRow('Note', meta.itemDesc ? escapeHtml(String(meta.itemDesc)) : '')}
+                ${invdRow('Order reference', meta.orderId ? escapeHtml(String(meta.orderId)) : '')}
+                ${invdRow('Customer', email)}
+                ${invdRow('Receipt requested', det.payerReceiptRequested ? 'yes (sent when the payment settles)' : '')}
+                ${invdRow('Fee redirect', feeRedirect)}
+                ${invdRow('Payment link', inv.checkoutLink ? `<a href="${escapeAttr(inv.checkoutLink)}" target="_blank" rel="noopener noreferrer" class="invd-mono">${escapeHtml(inv.checkoutLink)}</a>${invdCopy(inv.checkoutLink, 'Payment link')}` : '')}
+            </dl>`;
+
+            // ---- payment methods offered ----
+            let methods = '';
+            if (det.bolt11) {
+                let ln = `<dl class="invd-grid">
+                    ${invdRow('Invoice (bolt11)', invdMono(det.bolt11, 'Lightning invoice (bolt11)'))}
+                    ${invdRow('Destination', det.lnDestination ? invdMono(det.lnDestination, 'Lightning destination') : (inv.paymentRail === 'mint' && inv.mintUrl ? escapeHtml(mintHost(inv.mintUrl)) + ' (mint quote)' : ''))}
+                    ${invdRow('Relay', det.nofferRelay ? escapeHtml(det.nofferRelay) : '')}
+                    ${invdRow('Strike invoice', det.strikeInvoiceId ? invdMono(det.strikeInvoiceId, 'Strike invoice ID') : '')}
+                    ${invdRow('Lightning expires', invdTime(det.lnExpiresAt))}
+                    ${invdRow('Last refreshed', invdTime(det.lnRefreshedAt))}
+                    ${invdRow('Last re-quoted', invdTime(det.requotedAt))}
+                    ${invdRow('Last checked', det.lastPolledAt ? `${invdTime(det.lastPolledAt)}${det.lastPollState ? ' — ' + escapeHtml(det.lastPollState) : ''}` : '')}
+                    ${invdRow('Last check error', det.lastPollError ? `<span style="color:#ef4444;">${escapeHtml(det.lastPollError)}</span>` : '')}
+                    ${invdRow('LNURL note', det.lnurlOverrideReason ? escapeHtml(det.lnurlOverrideReason) : '')}
+                </dl>`;
+                methods += `<div class="invd-group-title">⚡ Lightning</div>${ln}`;
+            }
+            if (det.onchain) {
+                const oc = det.onchain;
+                const pays = (oc.payments || []).map(p => `<div class="invd-attempt">
+                        <div class="invd-attempt-time">${invdTime(p.firstSeenAt)}</div>
+                        <div class="invd-attempt-body">
+                            <span class="invd-mono">${renderMonoLink('tx', p.txid, network)}</span>:${escapeHtml(String(p.vout))}${invdCopy(p.txid, 'Transaction ID')}
+                            <div class="invd-attempt-label">${escapeHtml(String(p.amountSat))} sat · ${escapeHtml(String(p.confirmations))} confirmation${p.confirmations === 1 ? '' : 's'}${p.blockHeight ? ' · block ' + escapeHtml(String(p.blockHeight)) : ''}</div>
+                        </div>
+                    </div>`).join('');
+                const ocGrid = `<dl class="invd-grid">
+                    ${invdRow('Address', `${renderMonoLink('address', oc.address, network)} <span class="invd-mono">${escapeHtml(oc.address)}</span>${invdCopy(oc.address, 'Address')}`)}
+                    ${invdRow('Expected', oc.amountSat !== null && oc.amountSat !== undefined ? `${escapeHtml(String(oc.amountSat))} sat${oc.tweakSats ? ' <span style="color:var(--text-secondary); font-size:0.78rem;">(static address, includes ' + escapeHtml(String(oc.tweakSats)) + ' sat uniqueness tweak)</span>' : ''}` : '')}
+                    ${invdRow('Strike receive request', det.strikeReceiveRequestId ? invdMono(det.strikeReceiveRequestId, 'Strike receive request ID') : '')}
+                    ${invdRow('First seen', invdTime(oc.firstSeenAt))}
+                    ${invdRow('Manual confirmation', oc.needsManualConfirmation ? '<span style="color:#f59e0b;">awaiting operator attribution</span>' : '')}
+                </dl>`;
+                methods += `<div class="invd-group-title">🔗 On-chain</div>${ocGrid}${pays ? `<div class="invd-note" style="margin-top:0.4rem;">Transactions seen</div>${pays}` : ''}`;
+            }
+            if (det.swap) {
+                const sw = det.swap;
+                const swGrid = `<dl class="invd-grid">
+                    ${invdRow('Provider', escapeHtml(sw.provider || ''))}
+                    ${invdRow('Swap status', `${escapeHtml(sw.status || '')}${renderSwapBadge(sw.status)}`)}
+                    ${invdRow('Target', `${escapeHtml(String(sw.targetSats))} sat on-chain for a ${escapeHtml(String(sw.invoiceSats))} sat Lightning invoice`)}
+                    ${invdRow('Fees', `lockup ${escapeHtml(String(sw.lockupFeeSats))} sat · percent ${escapeHtml(String(sw.percentFeeSats))} sat`)}
+                    ${invdRow('Merchant address', sw.merchantAddress ? `${renderMonoLink('address', sw.merchantAddress, network)}${invdCopy(sw.merchantAddress, 'Address')}` : '')}
+                    ${invdRow('Lockup tx', sw.lockupTxid ? `${renderMonoLink('tx', sw.lockupTxid, network)}${invdCopy(sw.lockupTxid, 'Lockup txid')}` : '')}
+                    ${invdRow('Claim tx', sw.claimTxid ? `${renderMonoLink('tx', sw.claimTxid, network)}${invdCopy(sw.claimTxid, 'Claim txid')}` : '')}
+                    ${invdRow('Error', sw.errorMessage ? `<span style="color:#ef4444;">${escapeHtml(sw.errorMessage)}</span>` : '')}
+                </dl>`;
+                methods += `<div class="invd-group-title">🔄 Submarine swap</div>${swGrid}`;
+            }
+            if (det.cashuOfflineFailReason) {
+                methods += `<div class="invd-group-title">🥜 Cashu token</div><dl class="invd-grid">${invdRow('Last token error', `<span style="color:#ef4444;">${escapeHtml(det.cashuOfflineFailReason)}</span>`)}</dl>`;
+            }
+            if (!methods) {
+                methods = '<p class="invd-note">No payment method is attached to this invoice.</p>';
+            }
+
+            // ---- items ----
+            const items = d.items || [];
+            let itemsHtml;
+            if (items.length) {
                 let totalSats = 0;
-                content.innerHTML = items.map(it => {
+                itemsHtml = items.map(it => {
                     totalSats += it.amountSats;
                     const paren = (it.displayAmount && it.displayCurrency && String(it.displayCurrency).toUpperCase() !== 'SAT')
                         ? ` <span style="color:var(--text-secondary);">(${escapeHtml(formatMoney(it.displayAmount, it.displayCurrency))})</span>` : '';
-                    return `<div style="display:flex; align-items:center; gap:0.6rem; padding:0.45rem 0; border-bottom:1px solid var(--border, rgba(255,255,255,0.06));">
+                    return `<div class="invd-item" style="display:flex; align-items:center; gap:0.6rem; padding:0.45rem 0; border-bottom:1px solid var(--border, rgba(255,255,255,0.06));">
                         ${productImageHtml(it.imageType, it.imageValue, it.imageUrl, 34)}
                         <div style="flex:1;"><div style="font-weight:500;">${escapeHtml(it.title)}</div>
-                        <div style="font-size:0.8rem; color:var(--text-secondary);">×${it.quantity}</div></div>
+                        <div style="font-size:0.8rem; color:var(--text-secondary);">×${escapeHtml(String(it.quantity))}${it.unitPrice ? ' · ' + escapeHtml(String(it.unitPrice)) + ' ' + escapeHtml(String(it.unitCurrency || '')) + ' each' : ''}</div></div>
                         <div style="text-align:right;">${it.amountSats.toLocaleString()} sats${paren}</div>
                     </div>`;
                 }).join('') + `<div style="text-align:right; font-weight:600; margin-top:0.5rem;">Total: ${totalSats.toLocaleString()} sats</div>`;
-            } catch (e) {
-                content.innerHTML = '<p style="color:#ef4444;">Failed to load items.</p>';
+            } else if (meta.orderId) {
+                itemsHtml = `<p class="invd-note">No line items were snapshotted for this invoice. It references order <strong>${escapeHtml(String(meta.orderId))}</strong>; the products are in that order on the shop side.</p>`;
+            } else {
+                itemsHtml = '<p class="invd-note">No products were attached when this invoice was created.</p>';
             }
+
+            // ---- attempts ----
+            const attempts = d.attempts || [];
+            let attemptsHtml;
+            if (!attempts.length) {
+                attemptsHtml = '<p class="invd-note">No payment-path attempts were recorded for this invoice.</p>';
+            } else {
+                const groups = {};
+                attempts.forEach(a => { (groups[a.context] = groups[a.context] || []).push(a); });
+                attemptsHtml = Object.keys(ATTEMPT_CONTEXT_LABELS).filter(k => groups[k]).map(k => {
+                    const rows = groups[k].map(a => {
+                        const rail = ATTEMPT_RAIL_LABELS[a.rail] || a.rail;
+                        const outcome = ATTEMPT_OUTCOME_LABELS[a.outcome] || a.outcome;
+                        return `<div class="invd-attempt" data-rail="${escapeAttr(a.rail)}" data-outcome="${escapeAttr(a.outcome)}">
+                            <div class="invd-attempt-time">${invdTime(a.timestamp)}</div>
+                            <div class="invd-attempt-body">
+                                <div><strong>${escapeHtml(rail)}</strong>${a.label ? ` <span class="invd-attempt-label">${escapeHtml(a.label)}</span>` : ''}</div>
+                                ${a.reason ? `<div class="invd-attempt-reason">${escapeHtml(a.reason)}</div>` : ''}
+                                ${a.detail && a.detail !== a.reason ? `<div class="invd-attempt-detail">${escapeHtml(a.detail)}</div>` : ''}
+                            </div>
+                            <span class="invd-outcome ${escapeAttr(a.outcome)}">${escapeHtml(outcome)}</span>
+                        </div>`;
+                    }).join('');
+                    return `<div class="invd-group-title">${escapeHtml(ATTEMPT_CONTEXT_LABELS[k])}</div>${rows}`;
+                }).join('');
+                if (d.attemptsLegacy) {
+                    attemptsHtml += '<p class="invd-note">Reconstructed from the invoice record — this invoice predates the attempt log, so timing is the creation time and destinations are not available.</p>';
+                }
+            }
+
+            // ---- raw ----
+            let raw = '';
+            if (det.metadata) {
+                raw += `<details class="invd-raw"><summary>Metadata (raw)</summary><pre>${escapeHtml(JSON.stringify(det.metadata, null, 2))}</pre></details>`;
+            }
+            if (det.checkoutConfig) {
+                raw += `<details class="invd-raw" style="margin-top:0.4rem;"><summary>Checkout options (raw)</summary><pre>${escapeHtml(JSON.stringify(det.checkoutConfig, null, 2))}</pre></details>`;
+            }
+
+            return head
+                + invdSection('Summary', summary)
+                + invdSection('Payment methods', methods)
+                + invdSection('Products', itemsHtml)
+                + invdSection('Payment attempts', attemptsHtml)
+                + (raw ? `<div class="invd-section">${raw}</div>` : '');
         }
 
         function openModal(id) {
