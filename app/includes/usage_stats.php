@@ -15,7 +15,9 @@
  *   2  Features   — store count, which payment rails are enabled and how many
  *                   stores use each, auto-update on/off, product and API-key
  *                   counts, whether the WordPress plugin is connected.
- *   3  Volume     — last-30-day invoice counts and settled sats, by rail.
+ *   3  Volume     — last-30-day invoice counts and settled sats, by rail
+ *                   (an eCash/ECX settlement counts the sats the invoice was
+ *                   quoted at — never a szat figure or an ECX address).
  *
  * Never included, at any level: deployment_id (so a report can never be
  * joined to a fee payment), base URL, store names, mint URLs or any other
@@ -96,10 +98,10 @@ final class UsageStats {
      * order they appear. Fixed so every level-3 report carries the same keys
      * (zeros included) and a column store never sees a ragged schema.
      */
-    public const VOLUME_RAILS = ['mint', 'lnaddress', 'nwc', 'noffer', 'strike', 'swap', 'onchain'];
+    public const VOLUME_RAILS = ['mint', 'lnaddress', 'nwc', 'noffer', 'strike', 'swap', 'onchain', 'ecx'];
 
     /** Rails a store can have enabled, in report order. */
-    public const FEATURE_RAILS = ['mint', 'lnaddress', 'nwc', 'noffer', 'strike', 'onchain', 'swaps'];
+    public const FEATURE_RAILS = ['mint', 'lnaddress', 'nwc', 'noffer', 'strike', 'onchain', 'swaps', 'ecx'];
 
     /**
      * The complete property allowlist per level — the contract between this
@@ -116,7 +118,7 @@ final class UsageStats {
             'store_count', 'rails_enabled',
             'stores_with_mint', 'stores_with_lnaddress', 'stores_with_nwc',
             'stores_with_noffer', 'stores_with_strike', 'stores_with_onchain',
-            'stores_with_swaps',
+            'stores_with_swaps', 'stores_with_ecx',
             'auto_update_enabled', 'products_count', 'api_keys_count',
             'wordpress_connected',
         ],
@@ -349,7 +351,8 @@ final class UsageStats {
     private static function featureProperties(): array {
         $stores = Database::fetchAll(
             "SELECT id, mint_url, onchain_address_mode, onchain_xpub, onchain_static_address,
-                    onchain_strike_enabled, swaps_enabled
+                    onchain_strike_enabled, swaps_enabled,
+                    ecx_address_mode, ecx_xpub, ecx_static_address
                FROM stores"
         );
         $counts = array_fill_keys(self::FEATURE_RAILS, 0);
@@ -381,6 +384,15 @@ final class UsageStats {
             if (SwapsConfig::isEnabledForStore($sid)) {
                 $counts['swaps']++;
             }
+            // eCash (ECX) pay-to-address rail: same configured-or-not rule as
+            // Bitcoin on-chain (an xpub in xpub mode, an address in static
+            // mode); the offer toggle does not change whether it is set up.
+            $ecxXpub = trim((string)($s['ecx_xpub'] ?? '')) !== '';
+            $ecxStatic = trim((string)($s['ecx_static_address'] ?? '')) !== '';
+            $ecxMode = ($s['ecx_address_mode'] ?? 'xpub') === 'static' ? 'static' : 'xpub';
+            if ($ecxMode === 'static' ? $ecxStatic : $ecxXpub) {
+                $counts['ecx']++;
+            }
         }
         $enabled = [];
         foreach (self::FEATURE_RAILS as $rail) {
@@ -403,6 +415,7 @@ final class UsageStats {
             'stores_with_strike'    => $counts['strike'],
             'stores_with_onchain'   => $counts['onchain'],
             'stores_with_swaps'     => $counts['swaps'],
+            'stores_with_ecx'       => $counts['ecx'],
             'auto_update_enabled'   => Updater::isAutoUpdateEnabled(),
             'products_count'        => (int)(Database::fetchOne("SELECT COUNT(*) AS c FROM products")['c'] ?? 0),
             'api_keys_count'        => (int)(Database::fetchOne("SELECT COUNT(*) AS c FROM api_keys")['c'] ?? 0),

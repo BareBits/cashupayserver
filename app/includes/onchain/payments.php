@@ -212,6 +212,25 @@ class OnchainPayments {
         return null;
     }
 
+    /**
+     * The index the shared per-xpub counter will hand out next for $xpub, or
+     * $fallback when the key has never allocated. The counter lives in
+     * onchain_xpub_state and is shared by every chain (and every store) using
+     * the key, so this — not the per-store mirror column — is what the admin
+     * "next address" previews and the cards' m/0/<n> labels must read: after
+     * an eCash allocation the Bitcoin mirror column is behind by one.
+     */
+    public static function nextIndexForXpub(?string $xpub, int $fallback = 0): int {
+        if ($xpub === null || trim($xpub) === '') {
+            return $fallback;
+        }
+        $row = Database::fetchOne(
+            "SELECT next_index FROM onchain_xpub_state WHERE xpub_hash = ?",
+            [hash('sha256', $xpub)]
+        );
+        return $row ? (int)$row['next_index'] : $fallback;
+    }
+
     /** Public: Invoice::create also stamps a Strike-minted address with the
      *  allocation-time tip, using the same best-effort semantics. */
     public static function currentTipBestEffort(array $store, ?Chain $chain = null): ?int {

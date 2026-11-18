@@ -105,6 +105,30 @@ out on its own rows: **eCash (ECX) revenue**, **Dev fee (eCash)**,
 value. Without an ECX price the eCash figures are shown but not folded in.
 Charts gain an **eCash** series.
 
+## Notifications, reports and statistics
+
+- The merchant **"invoice paid" email** and the payer **receipt** for an
+  invoice settled in eCash name what actually moved — `25,000,000 szats
+  (0.25 ECX)` — alongside the fiat amount billed, label the rail
+  `eCash (ECX)` and list the ECX receiving address and txid(s). The sats
+  figure of such an invoice is only the quote and is not presented as what
+  was received.
+- The **diagnostic report** (Settings → Diagnostics) exports the
+  `ecx_payments` and `ecx_fee_credits` tables, the ECX leg of each invoice
+  and an `aggregates.ecx` block. Anonymized reports drop the ECX address, fee
+  destination, manual candidates and txids exactly as they do for Bitcoin.
+- **Anonymous usage statistics** (opt-in, see PRIVACY.md §1a) count stores
+  with eCash configured (`stores_with_ecx`, rail `ecx`) and, at the Volume
+  level, eCash settlements at the **sats they were quoted at**
+  (`settled_30d_ecx_count` / `_sats`); no szat figure or address is ever
+  reported. The collector in `scripts/analytics-endpoint/` must be deployed
+  before a release carrying these fields, or level 2/3 reports are refused
+  until it is.
+
+Manual confirmation (static-address ambiguities) is listed per chain on the
+Invoices view; eCash rows carry an `eCash (ECX)` chip, szat amounts and resolve
+on the ECX chain (`resolve_onchain_manual` with `chain=ecx`).
+
 ## API
 
 An invoice with an eCash address carries an `ECX-OnChain` payment method:
@@ -130,3 +154,25 @@ block (`amountSzat`, `rate`, `settledToFee`). Webhooks are unchanged.
   endpoints are allowed).
 - `CASHUPAY_CMC_API_BASE` — CoinMarketCap base URL for a local mock (same
   gate).
+- `EcxRates::$testEcxUsd` — in-process price override for PHP unit tests
+  (`0.0` simulates "no price").
+
+## Tests
+
+PHP unit tests (`tests/php/test_ecx_*.php`): chain descriptor, rates (seam
+and live CoinMarketCap stub: cache / stale / cooldown / sanity), invoice
+creation, poll and settle, shared counter, fee ledger, hosting-fee redirect,
+stats, notifications, diagnostics export, expiry window, static-address
+manual attribution (incl. a transaction replayed on both chains) and the
+schema migration of a populated pre-ECX install.
+
+End to end (`tests/e2e/test_ecx_payments.py`): the rig runs **two**
+independent mock explorers — one for the Bitcoin chain, one for the ECX
+chain — and a CoinMarketCap mock, so it can prove that each poller watches
+its own chain and that BTC sent to an eCash address (or ECX sent to a Bitcoin
+address) never settles an invoice. It covers the admin card (validation,
+previews, custom explorer, offer toggle), allocation, settlement, webhooks,
+emails, static-address collisions resolved per chain, the hosting-fee
+redirect in ECX, and the Playwright flows (payment page tab / QR / live
+confirmation copy, admin invoice list, detail modal, stats rows and the
+manual-confirmation banner).

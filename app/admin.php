@@ -481,7 +481,10 @@ if (isset($_GET['api'])) {
                 'addressType' => $store['onchain_address_type'] ?? 'P2WPKH',
                 'minConfs' => (int)($store['onchain_min_confs'] ?? 1),
                 'confirmTimeoutSec' => (int)($store['onchain_confirm_timeout_sec'] ?? 86400),
-                'nextIndex' => (int)($store['onchain_next_index'] ?? 0),
+                // The per-xpub counter is shared across chains (an eCash
+                // allocation on the same key advances it too), so read it
+                // rather than the per-store mirror column.
+                'nextIndex' => OnchainPayments::nextIndexForXpub($onchainXpub ?: null, (int)($store['onchain_next_index'] ?? 0)),
                 'providerUrl' => $store['onchain_provider_url'] ?? '',
                 // Opt-in: fall back to the public explorers when the custom
                 // URL above is unreachable (ignored without a custom URL).
@@ -534,7 +537,7 @@ if (isset($_GET['api'])) {
                 // first ECX save (operator decision: same settings, editable).
                 'btcMinConfs' => (int)($store['onchain_min_confs'] ?? 1),
                 'btcConfirmTimeoutSec' => (int)($store['onchain_confirm_timeout_sec'] ?? 86400),
-                'nextIndex' => (int)($store['ecx_next_index'] ?? 0),
+                'nextIndex' => OnchainPayments::nextIndexForXpub($ecxXpub ?: null, (int)($store['ecx_next_index'] ?? 0)),
                 'providerUrl' => $store['ecx_provider_url'] ?? '',
                 'providerFallback' => (int)($store['ecx_provider_fallback'] ?? 0) === 1,
                 'publicExplorers' => Chain::ecx()->esploraDefaults('mainnet'),
@@ -1572,6 +1575,52 @@ if (isset($_GET['api'])) {
             ]);
             break;
 
+        case 'list_onchain_manual':
+            Auth::requireAdmin();
+            // List invoices awaiting manual confirmation. Scoped to a single
+            // store if store_id is provided; otherwise lists across every
+            // store the (admin) user can see. A GET ?api= endpoint (the
+            // Invoices view fetches it that way); it used to sit in the POST
+            // action switch, where no request ever reached it.
+            try {
+                require_once __DIR__ . '/includes/onchain/payments.php';
+                $storeIds = null;
+                $storeId = $_GET['store_id'] ?? null;
+                if ($storeId) {
+                    $storeIds = [$storeId];
+                }
+                // Both chain-watched rails: Bitcoin static addresses and
+                // eCash (ECX) static addresses can each produce ambiguity.
+                $out = [];
+                foreach (Chain::all() as $chain) {
+                    $rows = OnchainPayments::listNeedingManualConfirmation($storeIds, $chain);
+                    foreach ($rows as $r) {
+                        $out[] = [
+                            'id' => $r['id'],
+                            'store_id' => $r['store_id'],
+                            'amount' => $r['amount'],
+                            'currency' => $r['currency'],
+                            'chain' => $chain->id,
+                            'unit' => $chain->unitPlural,
+                            'onchain_address' => $r[$chain->inv['address']],
+                            'onchain_amount_sat' => (int)($r[$chain->inv['amount']] ?? 0),
+                            'onchain_amount_tweak_sats' => isset($r[$chain->inv['tweak']])
+                                ? (int)$r[$chain->inv['tweak']] : null,
+                            'created_at' => $r['created_at'],
+                            'expiration_time' => $r['expiration_time'],
+                            'status' => $r['status'],
+                            'candidates' => $r['onchain_manual_candidates_decoded'],
+                        ];
+                    }
+                }
+                usort($out, static fn($a, $b) => ($b['created_at'] <=> $a['created_at']));
+                echo json_encode(['invoices' => $out]);
+            } catch (Exception $e) {
+                cashupay_status(400);
+                echo json_encode(['error' => $e->getMessage()]);
+            }
+            break;
+
         default:
             cashupay_status(404);
             echo json_encode(['error' => 'Unknown action']);
@@ -2254,10 +2303,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 // redirect derives ECX addresses from. Mainnet key; the
                 // address type follows the SLIP-32 prefix (ypub -> wrapped
                 // segwit, else native segwit). Empty clears it.
+                // Written with Database::update after the main save (below):
+                // Config::updateStore's column allowlist is deliberately tight
+                // and silently drops keys it does not know, which is how this
+                // field failed to persist at all in the first eCash release.
+                $ecxHostingUpdates = null;
                 if (isset($_POST['hosting_fee_ecx_xpub'])) {
                     $hx = trim((string) $_POST['hosting_fee_ecx_xpub']);
                     if ($hx === '') {
-                        $updates['hosting_fee_ecx_xpub'] = null;
+                        $ecxHostingUpdates = ['hosting_fee_ecx_xpub' => null];
                     } else {
                         require_once __DIR__ . '/includes/onchain/wallet.php';
                         $hxType = strtolower(substr($hx, 0, 4)) === 'ypub' ? 'P2SH-P2WPKH' : 'P2WPKH';
@@ -2265,8 +2319,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         if (!$hxCheck['valid']) {
                             throw new Exception('Hosting fee ECX xpub: ' . ($hxCheck['error'] ?: 'invalid xpub'));
                         }
-                        $updates['hosting_fee_ecx_xpub'] = $hx;
-                        $updates['hosting_fee_ecx_address_type'] = $hxType;
+                        $ecxHostingUpdates = ['hosting_fee_ecx_xpub' => $hx, 'hosting_fee_ecx_address_type' => $hxType];
                     }
                 }
 
@@ -2335,6 +2388,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 }
 
                 Config::updateStore($storeId, $updates, $wouldStrand && $confirmStranding);
+                if ($ecxHostingUpdates !== null) {
+                    Database::update('stores', $ecxHostingUpdates, 'id = ?', [$storeId]);
+                }
 
                 // The store now points at a namespace its seed may have used
                 // before (the operator may be returning to an old mint):
@@ -3312,11 +3368,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if (!$store || empty($store['ecx_xpub'])) {
                     throw new Exception('No eCash xpub configured for this store');
                 }
-                $state = Database::fetchOne(
-                    "SELECT next_index FROM onchain_xpub_state WHERE xpub_hash = ?",
-                    [hash('sha256', $store['ecx_xpub'])]
-                );
-                $idx = $state ? (int)$state['next_index'] : 0;
+                require_once __DIR__ . '/includes/onchain/payments.php';
+                $idx = OnchainPayments::nextIndexForXpub($store['ecx_xpub']);
                 $addr = OnchainWallet::deriveAddress(
                     $store['ecx_xpub'], $store['ecx_address_type'] ?: 'P2WPKH', Chain::ECX_NETWORK, $idx
                 );
@@ -3364,11 +3417,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         case 'test_onchain_xpub':
             Auth::requireAdmin();
-            // "Test xpub" button: derive the address at the current
-            // onchain_next_index without consuming it, so the user can
-            // confirm derivation matches their signing wallet.
+            // "Test xpub" button: derive the address at the shared per-xpub
+            // counter's next index without consuming it, so the user can
+            // confirm derivation matches their signing wallet. The counter
+            // (not stores.onchain_next_index) is read because an eCash
+            // allocation on the same key advances it too.
             try {
                 require_once __DIR__ . '/includes/onchain/wallet.php';
+                require_once __DIR__ . '/includes/onchain/payments.php';
                 $storeId = $_POST['store_id'] ?? '';
                 $store = Database::fetchOne(
                     "SELECT onchain_xpub, onchain_address_type, onchain_network, onchain_next_index
@@ -3378,7 +3434,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if (!$store || empty($store['onchain_xpub'])) {
                     throw new Exception('No xpub configured for this store');
                 }
-                $idx = (int)$store['onchain_next_index'];
+                $idx = OnchainPayments::nextIndexForXpub($store['onchain_xpub'], (int)$store['onchain_next_index']);
                 $addr = OnchainWallet::deriveAddress(
                     $store['onchain_xpub'],
                     $store['onchain_address_type'] ?: 'P2WPKH',
@@ -3388,50 +3444,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 echo json_encode(['address' => $addr, 'index' => $idx]);
             } catch (Throwable $e) {
                 // Throwable for the same GMP-less-host reason as save_onchain.
-                cashupay_status(400);
-                echo json_encode(['error' => $e->getMessage()]);
-            }
-            break;
-
-        case 'list_onchain_manual':
-            Auth::requireAdmin();
-            // List invoices awaiting manual confirmation. Scoped to a single
-            // store if store_id is provided; otherwise lists across every
-            // store the (admin) user can see.
-            try {
-                require_once __DIR__ . '/includes/onchain/payments.php';
-                $storeIds = null;
-                $storeId = $_GET['store_id'] ?? null;
-                if ($storeId) {
-                    $storeIds = [$storeId];
-                }
-                // Both chain-watched rails: Bitcoin static addresses and
-                // eCash (ECX) static addresses can each produce ambiguity.
-                $out = [];
-                foreach (Chain::all() as $chain) {
-                    $rows = OnchainPayments::listNeedingManualConfirmation($storeIds, $chain);
-                    foreach ($rows as $r) {
-                        $out[] = [
-                            'id' => $r['id'],
-                            'store_id' => $r['store_id'],
-                            'amount' => $r['amount'],
-                            'currency' => $r['currency'],
-                            'chain' => $chain->id,
-                            'unit' => $chain->unitPlural,
-                            'onchain_address' => $r[$chain->inv['address']],
-                            'onchain_amount_sat' => (int)($r[$chain->inv['amount']] ?? 0),
-                            'onchain_amount_tweak_sats' => isset($r[$chain->inv['tweak']])
-                                ? (int)$r[$chain->inv['tweak']] : null,
-                            'created_at' => $r['created_at'],
-                            'expiration_time' => $r['expiration_time'],
-                            'status' => $r['status'],
-                            'candidates' => $r['onchain_manual_candidates_decoded'],
-                        ];
-                    }
-                }
-                usort($out, static fn($a, $b) => ($b['created_at'] <=> $a['created_at']));
-                echo json_encode(['invoices' => $out]);
-            } catch (Exception $e) {
                 cashupay_status(400);
                 echo json_encode(['error' => $e->getMessage()]);
             }
@@ -18094,7 +18106,7 @@ header('Cache-Control: no-cache, must-revalidate');
                 <div style="margin-bottom: 1rem; padding: 0.75rem; border: 1px solid var(--border); border-radius: 8px;">
                     <div style="display: flex; justify-content: space-between; align-items: baseline; flex-wrap: wrap; gap: 0.5rem;">
                         <div><strong>${escapeHtml(inv.id)}</strong>
-                            <span style="color: var(--text-secondary); font-size: 0.85rem;"> &middot; ${escapeHtml(inv.amount)} ${escapeHtml(inv.currency)} &middot; expected ${inv.onchain_amount_sat} sats</span>
+                            <span style="color: var(--text-secondary); font-size: 0.85rem;"> &middot; ${escapeHtml(inv.amount)} ${escapeHtml(inv.currency)} &middot; expected ${inv.onchain_amount_sat} ${unit}</span>
                         </div>
                         <span style="font-size: 0.8rem; color: var(--text-secondary);">${escapeHtml(inv.status)}</span>
                     </div>
