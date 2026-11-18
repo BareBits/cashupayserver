@@ -72,8 +72,21 @@ $activeDays = max(1, min(3650, (int)($_GET['active_days'] ?? 14)));
 $activeCutoff = $now - $activeDays * 86400;
 $format = (string)($_GET['format'] ?? 'html');
 
+// Bounded fetch. The aggregations below are computed in PHP (they read
+// per-report JSON properties, which is awkward to do in SQL portably), so the
+// whole result set is held in memory -- and the table is fed by an
+// unauthenticated endpoint. report.php now caps the table itself, and this LIMIT
+// is the second, independent bound: a dashboard that cannot be made to exhaust
+// memory even if the writer's ceiling were ever raised or bypassed.
+//
+// Newest-received first, so if the limit ever does bite it is the freshest
+// reports that are summarised -- which is what the active-window figures are
+// about anyway.
+$rowLimit = ANALYTICS_MAX_REPORT_ROWS;
+$rowStmt = $pdo->prepare('SELECT * FROM reports ORDER BY received_at DESC LIMIT ?');
+$rowStmt->execute([$rowLimit]);
 $rows = [];
-foreach ($pdo->query('SELECT * FROM reports ORDER BY received_at DESC') as $r) {
+foreach ($rowStmt as $r) {
     $decoded = json_decode((string)$r['payload'], true);
     $props = is_array($decoded) && is_array($decoded['properties'] ?? null) ? $decoded['properties'] : [];
     $rows[] = [
@@ -86,6 +99,7 @@ foreach ($pdo->query('SELECT * FROM reports ORDER BY received_at DESC') as $r) {
         'p'             => $props,
     ];
 }
+$rowsTruncated = count($rows) >= $rowLimit;
 
 // ---- CSV: one row per install ------------------------------------------------
 if ($format === 'csv') {
@@ -117,6 +131,8 @@ $agg = [
     'generated_at_utc' => gmdate('c', $now),
     'active_days'      => $activeDays,
     'installs_total'   => count($rows),
+    // So a truncated page is never mistaken for the whole population.
+    'rows_truncated'   => $rowsTruncated,
     'installs_active'  => count($active),
     'by_level'         => summary_group($active, 'level'),
     'by_version'       => summary_group($active, '', static fn($r) => $r['p']['version'] ?? null),
@@ -214,6 +230,12 @@ small { color: #666; }
 · <a href="?format=json<?= ANALYTICS_ACCESS_TOKEN !== '' && isset($_GET['token']) ? '&amp;token=' . summary_h((string)$_GET['token']) : '' ?>">JSON</a>
 · <a href="?format=csv<?= ANALYTICS_ACCESS_TOKEN !== '' && isset($_GET['token']) ? '&amp;token=' . summary_h((string)$_GET['token']) : '' ?>">CSV export</a>
 · geo table: <?= $agg['geo_table_loaded_at'] ? 'loaded ' . summary_h($agg['geo_table_loaded_at']) : 'not loaded (run import-geo.php)' ?></small></p>
+
+<?php if ($rowsTruncated): ?>
+<p><small><strong>Note:</strong> this page summarises the newest
+  <?= (int)$rowLimit ?> reports only &mdash; the stored set reached that limit,
+  so the figures below are not the whole population.</small></p>
+<?php endif; ?>
 
 <div class="kpi"><b><?= (int)$agg['installs_total'] ?></b>installs ever seen</div>
 <div class="kpi"><b><?= (int)$agg['installs_active'] ?></b>active installs</div>
