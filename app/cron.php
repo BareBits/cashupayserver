@@ -434,6 +434,20 @@ if (!$swapOnly) {
     } catch (\Throwable $e) {
         $results['tasks']['poll_onchain'] = 'error: ' . $e->getMessage();
     }
+    // The eCash (ECX) addresses: same engine, its own chain / explorer / columns.
+    try {
+        $ecxResults = OnchainPayments::pollPending(60, 20, Chain::ecx());
+        $polled = count($ecxResults);
+        $errored = 0;
+        foreach ($ecxResults as $r) {
+            if (isset($r['error'])) {
+                $errored++;
+            }
+        }
+        $results['tasks']['poll_ecx'] = "polled {$polled} invoice(s)" . ($errored ? ", {$errored} errored" : '');
+    } catch (\Throwable $e) {
+        $results['tasks']['poll_ecx'] = 'error: ' . $e->getMessage();
+    }
 }
 
 // Task 4c: Drive in-flight submarine swaps through their lifecycle. Same

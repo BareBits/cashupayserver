@@ -35,6 +35,7 @@ require_once __DIR__ . '/database.php';
 require_once __DIR__ . '/config.php';
 require_once __DIR__ . '/dev_fee.php';
 require_once __DIR__ . '/safe_http.php';
+require_once __DIR__ . '/response_shape.php';
 
 // Wall-clock budget for the LNURL probe at invoice creation. The probe is
 // two HTTP round-trips (well-known + callback). 5 seconds keeps invoice
@@ -90,23 +91,19 @@ class LnUrlReceive {
             $failReason = 'the Lightning address service could not be reached';
             return null;
         }
-        $meta = json_decode($metaResp, true);
-        if (!is_array($meta)
-            || !isset($meta['callback'], $meta['minSendable'], $meta['maxSendable'])
-        ) {
+        $meta = self::parsePayRequestMeta($metaResp);
+        if ($meta === null) {
             $failReason = 'the Lightning address service returned an invalid response';
             return null;
         }
 
         $amountMsats = $amountSats * 1000;
-        if ($amountMsats < (int)$meta['minSendable']
-            || $amountMsats > (int)$meta['maxSendable']
-        ) {
+        if ($amountMsats < $meta['minSendable'] || $amountMsats > $meta['maxSendable']) {
             $failReason = 'the amount is outside the range the Lightning address accepts';
             return null;
         }
 
-        $callback = (string)$meta['callback'];
+        $callback = $meta['callback'];
         $sep = (strpos($callback, '?') !== false) ? '&' : '?';
         $callbackUrl = $callback . $sep . 'amount=' . $amountMsats;
 
@@ -115,9 +112,22 @@ class LnUrlReceive {
             $failReason = 'the Lightning address service could not be reached';
             return null;
         }
-        $inv = json_decode($invResp, true);
-        if (!is_array($inv) || !isset($inv['pr'])) {
+        $inv = ResponseShape::decodeJsonArray($invResp);
+        if ($inv === null || !isset($inv['pr'])) {
             $failReason = 'the Lightning address service returned no invoice';
+            return null;
+        }
+        // The invoice becomes the payer's QR code: it must be BOLT11-shaped
+        // and (LUD-06) carry exactly the amount we asked for. A service that
+        // hands back a different amount — or an amountless invoice — would
+        // let the payer pay something other than the invoice total.
+        $bolt11 = ResponseShape::bolt11($inv['pr']);
+        if ($bolt11 === null) {
+            $failReason = 'the Lightning address service returned a malformed invoice';
+            return null;
+        }
+        if (ResponseShape::bolt11AmountMsat($bolt11) !== $amountMsats) {
+            $failReason = 'the Lightning address service returned an invoice for a different amount';
             return null;
         }
         // LUD-21: the callback response must include a `verify` URL. Without
@@ -129,10 +139,10 @@ class LnUrlReceive {
         }
 
         return [
-            'bolt11' => (string)$inv['pr'],
+            'bolt11' => $bolt11,
             'verify_url' => (string)$inv['verify'],
-            'min_sendable_msats' => (int)$meta['minSendable'],
-            'max_sendable_msats' => (int)$meta['maxSendable'],
+            'min_sendable_msats' => $meta['minSendable'],
+            'max_sendable_msats' => $meta['maxSendable'],
         ];
     }
 
@@ -163,23 +173,21 @@ class LnUrlReceive {
         if ($resp === null) {
             return null;
         }
-        $meta = json_decode($resp, true);
-        if (!is_array($meta)
-            || !isset($meta['callback'], $meta['minSendable'], $meta['maxSendable'])
-        ) {
+        $meta = self::parsePayRequestMeta($resp);
+        if ($meta === null) {
             return null;
         }
 
         // Use min(maxSendable, max(minSendable, 1000 sat in msat)) so the
         // canary amount lies inside the host's accepted range even for
         // unusual LNURL hosts with huge minimums.
-        $minMsat = (int)$meta['minSendable'];
-        $maxMsat = (int)$meta['maxSendable'];
+        $minMsat = $meta['minSendable'];
+        $maxMsat = $meta['maxSendable'];
         $canaryMsat = max($minMsat, 1000 * 1000);
         if ($canaryMsat > $maxMsat) {
             $canaryMsat = $maxMsat;
         }
-        $callback = (string)$meta['callback'];
+        $callback = $meta['callback'];
         $sep = (strpos($callback, '?') !== false) ? '&' : '?';
         $callbackUrl = $callback . $sep . 'amount=' . $canaryMsat;
 
@@ -187,12 +195,33 @@ class LnUrlReceive {
         if ($invResp === null) {
             return null;
         }
-        $inv = json_decode($invResp, true);
-        if (!is_array($inv) || !isset($inv['pr'])) {
+        $inv = ResponseShape::decodeJsonArray($invResp);
+        if ($inv === null || !isset($inv['pr']) || ResponseShape::bolt11($inv['pr']) === null) {
             return null;
         }
         return (isset($inv['verify']) && is_string($inv['verify']) && $inv['verify'] !== '')
             ? 1 : 0;
+    }
+
+    /**
+     * Parse a LUD-06 payRequest metadata body into
+     * ['callback' => string, 'minSendable' => int, 'maxSendable' => int].
+     * Null when any of the three is missing or not of its documented type
+     * (the sendable bounds are integer millisats; a float, array or
+     * exponent string there is a malformed service, not a range).
+     */
+    public static function parsePayRequestMeta(string $body): ?array {
+        $meta = ResponseShape::decodeJsonArray($body);
+        if ($meta === null) {
+            return null;
+        }
+        $callback = $meta['callback'] ?? null;
+        $min = ResponseShape::integer($meta['minSendable'] ?? null);
+        $max = ResponseShape::integer($meta['maxSendable'] ?? null);
+        if (!is_string($callback) || $callback === '' || $min === null || $max === null || $min > $max) {
+            return null;
+        }
+        return ['callback' => $callback, 'minSendable' => $min, 'maxSendable' => $max];
     }
 
     /**
@@ -217,15 +246,15 @@ class LnUrlReceive {
             ));
             return ['state' => 'error', 'preimage' => null];
         }
-        $data = json_decode($resp, true);
-        if (!is_array($data)) {
+        $data = ResponseShape::decodeJsonArray($resp);
+        if ($data === null) {
             return ['state' => 'error', 'preimage' => null];
         }
-        $settled = !empty($data['settled']);
+        $settled = ($data['settled'] ?? null) === true;
         if ($settled) {
-            $preimage = isset($data['preimage']) && is_string($data['preimage'])
-                ? (string)$data['preimage']
-                : '';
+            // The preimage is stored as the settlement receipt: 32 bytes of
+            // hex or nothing — never an arbitrary string from the host.
+            $preimage = ResponseShape::hex($data['preimage'] ?? null, 32) ?? '';
             // Even if preimage is missing, settled=true is the host's
             // assertion that payment landed. Record what we have.
             return ['state' => 'paid', 'preimage' => $preimage];

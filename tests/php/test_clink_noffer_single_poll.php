@@ -62,7 +62,7 @@ function insert_noffer_invoice(string $id, string $store, string $relay, string 
         'amount' => '21',
         'currency' => 'sat',
         'amount_sats' => 21,
-        'bolt11' => 'lnbc210n1mockinvoice0000000',
+        'bolt11' => 'lnbc210n1m0ckvnv0ce0000000',
         'payment_rail' => 'noffer',
         'ln_destination' => 'noffer test',
         'noffer_relay' => $relay,

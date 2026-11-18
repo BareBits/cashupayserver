@@ -16,7 +16,10 @@
  *     destination has failed;
  *   - refused when the store is already mint-configured, when the mint is
  *     unreachable (nothing persisted), when the mint doesn't offer the
- *     picked unit, on an unknown unit, and on a missing store.
+ *     picked unit, on an unknown unit, and on a missing store;
+ *   - an optional backup_mint_url is validated BEFORE anything persists
+ *     (must differ from the primary, be reachable, offer the unit) and is
+ *     then stored as a store_mints row (reported back as backupMint).
  *
  * admin.php echoes and exits, so each call runs in a subprocess whose driver
  * fakes a logged-in admin session + CSRF token before requiring admin.php
@@ -30,9 +33,12 @@ require_once dirname(__DIR__, 2) . '/app/includes/config.php';
 
 // ---------------------------------------------------------------- mock mint
 
-function start_mint_stub(): array {
+function start_mint_stub(array $units = ['sat', 'usd']): array {
     $dir = sys_get_temp_dir() . '/mint_stub_' . bin2hex(random_bytes(4));
     mkdir($dir, 0750, true);
+    // Units the stub advertises (default sat + usd; eur deliberately absent
+    // for the unit-support refusal case).
+    file_put_contents($dir . '/units.json', json_encode(array_values($units)));
     $router = <<<'PHP'
 <?php
 header('Content-Type: application/json');
@@ -46,11 +52,11 @@ if ($path === '/v1/info') {
     exit;
 }
 if ($path === '/v1/keysets') {
-    // sat + usd offered; eur deliberately absent (unit-support refusal case).
-    echo json_encode(['keysets' => [
-        ['id' => '00stubsat0000001', 'unit' => 'sat', 'active' => true, 'input_fee_ppk' => 0],
-        ['id' => '00stubusd0000001', 'unit' => 'usd', 'active' => true, 'input_fee_ppk' => 0],
-    ]]);
+    $keysets = [];
+    foreach (json_decode((string)file_get_contents(__DIR__ . '/units.json'), true) ?: ['sat'] as $u) {
+        $keysets[] = ['id' => '00stub' . $u . '0000001', 'unit' => $u, 'active' => true, 'input_fee_ppk' => 0];
+    }
+    echo json_encode(['keysets' => $keysets]);
     exit;
 }
 http_response_code(404);
@@ -279,5 +285,121 @@ $res = admin_post([
 assert_eq(400, $res['status'], 'unknown store refused');
 assert_true(stripos((string)($res['json']['error'] ?? ''), 'not found') !== false,
     'unknown store refusal: ' . json_encode($res['json']));
+
+// --- optional backup mint ------------------------------------------------------
+
+[$backupPid, $backupPort] = start_mint_stub();
+$backupUrl = "http://127.0.0.1:{$backupPort}";
+
+function backup_rows(string $storeId): array {
+    return Database::fetchAll(
+        "SELECT mint_url, unit, enabled FROM store_mints WHERE store_id = ? ORDER BY priority, id",
+        [$storeId]
+    );
+}
+
+// Backup equal to the primary → refused, nothing persisted.
+Database::insert('stores', [
+    'id' => 'store_backup',
+    'name' => 'backup',
+    'created_at' => Database::timestamp(),
+]);
+$res = admin_post([
+    'action' => 'enable_store_mint',
+    'store_id' => 'store_backup',
+    'mint_url' => $stubUrl,
+    'backup_mint_url' => $stubUrl . '/',
+    'mint_unit' => 'sat',
+]);
+assert_eq(400, $res['status'], 'backup == primary refused');
+assert_true(stripos((string)($res['json']['error'] ?? ''), 'different') !== false,
+    'refusal explains the backup must differ: ' . json_encode($res['json']));
+assert_null(raw_store('store_backup')['mint_url'], 'primary not persisted when the backup is refused');
+assert_eq([], backup_rows('store_backup'), 'no backup row after refusal');
+
+// Unreachable backup → refused, nothing persisted.
+$res = admin_post([
+    'action' => 'enable_store_mint',
+    'store_id' => 'store_backup',
+    'mint_url' => $stubUrl,
+    'backup_mint_url' => 'http://127.0.0.1:1/',
+    'mint_unit' => 'sat',
+]);
+assert_eq(400, $res['status'], 'unreachable backup refused');
+assert_true(stripos((string)($res['json']['error'] ?? ''), 'backup mint') !== false,
+    'refusal names the backup mint: ' . json_encode($res['json']));
+assert_null(raw_store('store_backup')['mint_url'], 'primary not persisted when the backup is unreachable');
+assert_null(raw_store('store_backup')['seed_phrase'], 'no seed generated when the backup is refused');
+
+// Backup lacking the picked unit → refused, nothing persisted (primary stub
+// offers sat + usd; this backup stub offers sat only).
+[$satOnlyPid, $satOnlyPort] = start_mint_stub(['sat']);
+$res = admin_post([
+    'action' => 'enable_store_mint',
+    'store_id' => 'store_backup',
+    'mint_url' => $stubUrl,
+    'backup_mint_url' => "http://127.0.0.1:{$satOnlyPort}",
+    'mint_unit' => 'usd',
+]);
+assert_eq(400, $res['status'], 'backup lacking the unit refused');
+assert_true(stripos((string)($res['json']['error'] ?? ''), 'support usd') !== false,
+    'refusal names the missing unit: ' . json_encode($res['json']));
+assert_null(raw_store('store_backup')['mint_url'], 'primary not persisted when the backup lacks the unit');
+assert_eq([], backup_rows('store_backup'), 'no backup row when the backup lacks the unit');
+
+// Valid backup → primary + backup persisted, reported back.
+$res = admin_post([
+    'action' => 'enable_store_mint',
+    'store_id' => 'store_backup',
+    'mint_url' => $stubUrl,
+    'backup_mint_url' => $backupUrl . '/',
+    'mint_unit' => 'sat',
+]);
+assert_eq(200, $res['status'], 'enable with a backup succeeds: ' . json_encode($res['json']));
+assert_eq($stubUrl, raw_store('store_backup')['mint_url'], 'primary persisted');
+$rows = backup_rows('store_backup');
+assert_eq(1, count($rows), 'exactly one backup row');
+assert_eq($backupUrl, $rows[0]['mint_url'], 'backup URL stored without the trailing slash');
+assert_eq('sat', $rows[0]['unit'], 'backup stored with the primary\'s unit');
+$bm = $res['json']['backupMint'] ?? null;
+assert_true(is_array($bm), 'response carries the backup mint: ' . json_encode($res['json']));
+assert_eq($backupUrl, $bm['mint_url'] ?? null, 'response names the backup URL');
+assert_true(in_array($bm['walletRecovery'] ?? '', ['ready', 'pending', 'error'], true),
+    'response reports the backup recovery status: ' . json_encode($bm));
+
+// No backup given → response says so (null), no row.
+make_store('store_nobackup', null, 'sat');
+$res = admin_post([
+    'action' => 'enable_store_mint',
+    'store_id' => 'store_nobackup',
+    'mint_url' => $stubUrl,
+    'mint_unit' => 'sat',
+]);
+assert_eq(200, $res['status'], 'enable without a backup still succeeds');
+assert_true(array_key_exists('backupMint', $res['json']) && $res['json']['backupMint'] === null,
+    'backupMint is null when none was given');
+assert_eq([], backup_rows('store_nobackup'), 'no backup row when none was given');
+
+// --- add_backup_mint refusals: same as primary / duplicate -------------------
+
+$res = admin_post([
+    'action' => 'add_backup_mint',
+    'store_id' => 'store_backup',
+    'mint_url' => $stubUrl . '/',
+    'unit' => 'sat',
+]);
+assert_eq(400, $res['status'], 'adding the primary as a backup is refused');
+assert_true(stripos((string)($res['json']['error'] ?? ''), 'main mint') !== false,
+    'refusal says it is the main mint: ' . json_encode($res['json']));
+$res = admin_post([
+    'action' => 'add_backup_mint',
+    'store_id' => 'store_backup',
+    'mint_url' => $backupUrl,
+    'unit' => 'sat',
+]);
+assert_eq(400, $res['status'], 'adding an existing backup again is refused');
+assert_true(stripos((string)($res['json']['error'] ?? ''), 'already') !== false,
+    'refusal says it is already listed: ' . json_encode($res['json']));
+assert_eq(1, count(backup_rows('store_backup')), 'still exactly one backup row');
 
 echo "test_enable_store_mint: OK\n";

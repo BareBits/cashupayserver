@@ -117,7 +117,8 @@ def test_setup_wizard_completes_in_browser(
     # cron reminder (with a Back link), then completion.
     page.wait_for_selector("h2:has-text('Enable cron')")
     assert page.locator("#wizard-back-link").is_visible(), "the cron screen has a Back link"
-    assert "X-CRON-KEY" in page.content(), "the cron screen should show a ready-made crontab line"
+    assert "cron.php?key=" in page.content(), "the cron screen should show the keyed cron URL"
+    assert "X-CRON-KEY" not in page.content(), "operators are no longer asked to send a custom header"
     page.click("button:has-text('Continue')")
     page.wait_for_selector("h2:has-text(\"You're all set!\")")
     assert page.locator(".seed-display").count() == 0, "the phrase lives on its own screen now"

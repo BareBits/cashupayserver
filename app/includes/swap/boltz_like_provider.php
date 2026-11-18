@@ -8,6 +8,7 @@
 
 require_once __DIR__ . '/provider.php';
 require_once __DIR__ . '/../safe_http.php';
+require_once __DIR__ . '/../response_shape.php';
 
 abstract class BoltzLikeProvider implements SwapProvider {
     protected int $timeoutSec = 15;
@@ -96,25 +97,49 @@ abstract class BoltzLikeProvider implements SwapProvider {
             || !ctype_xdigit($refundOutHex) || strlen($refundOutHex) % 2 !== 0) {
             throw new RuntimeException($this->getName() . ': swapTree leaf output is not valid hex');
         }
-        $refundPubHex = (string)$resp['refundPublicKey'];
-        if (!ctype_xdigit($refundPubHex) || strlen($refundPubHex) !== 66) {
+        $refundPubHex = ResponseShape::hex($resp['refundPublicKey'], 33);
+        if ($refundPubHex === null) {
             throw new RuntimeException($this->getName() . ': refundPublicKey is not a 33-byte hex key');
+        }
+        // Everything below is persisted and later shown to the operator /
+        // spliced into URLs / shown to the payer as a QR, so each field must
+        // have the shape its role implies — not merely be present.
+        $swapId = ResponseShape::token($resp['id'], 64);
+        if ($swapId === null) {
+            throw new RuntimeException($this->getName() . ': swap id is not a plain token');
+        }
+        $invoice = ResponseShape::bolt11($resp['invoice']);
+        if ($invoice === null) {
+            throw new RuntimeException($this->getName() . ': invoice is not BOLT11-shaped');
+        }
+        $lockupAddress = ResponseShape::addressToken($resp['lockupAddress']);
+        if ($lockupAddress === null) {
+            throw new RuntimeException($this->getName() . ': lockupAddress is not an address');
+        }
+        $timeoutBlockHeight = ResponseShape::integer($resp['timeoutBlockHeight']);
+        if ($timeoutBlockHeight === null || $timeoutBlockHeight <= 0) {
+            throw new RuntimeException($this->getName() . ': timeoutBlockHeight is not a positive integer');
         }
 
         // Boltz returns the actual LN invoice amount in the response, but the
         // field name varies. We decode it from the BOLT11 if not present.
-        $invoiceAmount = isset($resp['invoiceAmount'])
-            ? (int)$resp['invoiceAmount']
-            : $this->decodeBolt11AmountSats((string)$resp['invoice']);
+        if (isset($resp['invoiceAmount'])) {
+            $invoiceAmount = ResponseShape::integer($resp['invoiceAmount']);
+            if ($invoiceAmount === null) {
+                throw new RuntimeException($this->getName() . ': invoiceAmount is not an integer');
+            }
+        } else {
+            $invoiceAmount = $this->decodeBolt11AmountSats($invoice);
+        }
 
         return new SwapCreateResult(
-            swapId: (string)$resp['id'],
-            invoice: (string)$resp['invoice'],
+            swapId: $swapId,
+            invoice: $invoice,
             invoiceAmountSats: $invoiceAmount,
             onchainAmountSats: $onchainAmountSats,
-            lockupAddress: (string)$resp['lockupAddress'],
-            refundPublicKeyHex: (string)$resp['refundPublicKey'],
-            timeoutBlockHeight: (int)$resp['timeoutBlockHeight'],
+            lockupAddress: $lockupAddress,
+            refundPublicKeyHex: $refundPubHex,
+            timeoutBlockHeight: $timeoutBlockHeight,
             claimLeafScript: hex2bin($claimOutHex),
             refundLeafScript: hex2bin($refundOutHex),
             rawResponse: $resp,
@@ -130,20 +155,32 @@ abstract class BoltzLikeProvider implements SwapProvider {
             }
             throw $e;
         }
+        // A lockup tx that is present but not hex can never be claimed; fail
+        // loudly now rather than on every later claim attempt.
+        $lockupTxHex = null;
+        if (isset($resp['transaction']['hex'])) {
+            $lockupTxHex = ResponseShape::hex($resp['transaction']['hex']);
+            if ($lockupTxHex === null) {
+                throw new RuntimeException($this->getName() . ': lockup transaction hex is malformed');
+            }
+        }
         return new SwapStatus(
-            status: (string)($resp['status'] ?? ''),
-            lockupTxHex: $resp['transaction']['hex'] ?? null,
-            preimage: $resp['preimage'] ?? null,
+            // Status names are dotted lowercase words (transaction.mempool);
+            // anything else is treated as "unknown" rather than stored/logged raw.
+            status: ResponseShape::token($resp['status'] ?? null, 64) ?? '',
+            lockupTxHex: $lockupTxHex,
+            preimage: isset($resp['preimage']) ? ResponseShape::hex($resp['preimage'], 32) : null,
             raw: $resp,
         );
     }
 
     public function broadcastTx(string $network, string $rawTxHex): string {
         $resp = $this->httpPostJson($network, '/v2/chain/BTC/transaction', ['hex' => $rawTxHex]);
-        if (!isset($resp['id'])) {
-            throw new RuntimeException($this->getName() . ': broadcast response missing id');
+        $txid = ResponseShape::hex($resp['id'] ?? null, 32);
+        if ($txid === null) {
+            throw new RuntimeException($this->getName() . ': broadcast response has no txid');
         }
-        return (string)$resp['id'];
+        return $txid;
     }
 
     public function cancelInvoice(string $network, string $swapId): void {
@@ -177,10 +214,10 @@ abstract class BoltzLikeProvider implements SwapProvider {
             throw new RuntimeException($this->getName() . " GET {$path} failed: {$result['error']}");
         }
         if ($result['status'] >= 400) {
-            throw new RuntimeException($this->getName() . " GET {$path} -> HTTP {$result['status']}: " . substr($result['body'], 0, 200));
+            throw new RuntimeException($this->getName() . " GET {$path} -> HTTP {$result['status']}: " . \SafeHttp::logExcerpt($result['body'], 200));
         }
-        $decoded = json_decode($result['body'], true);
-        if (!is_array($decoded)) {
+        $decoded = ResponseShape::decodeJsonArray($result['body']);
+        if ($decoded === null) {
             throw new RuntimeException($this->getName() . " GET {$path}: malformed JSON");
         }
         return $decoded;
@@ -208,12 +245,12 @@ abstract class BoltzLikeProvider implements SwapProvider {
         if ($result['error'] !== '') {
             throw new RuntimeException($this->getName() . " POST {$path} failed: {$result['error']}");
         }
-        $decoded = json_decode($result['body'], true);
+        $decoded = ResponseShape::decodeJsonArray($result['body']);
         if ($result['status'] >= 400) {
-            $msg = $decoded['error'] ?? substr($result['body'], 0, 200);
-            throw new RuntimeException($this->getName() . " POST {$path} -> HTTP {$result['status']}: {$msg}");
+            $msg = is_string($decoded['error'] ?? null) ? $decoded['error'] : $result['body'];
+            throw new RuntimeException($this->getName() . " POST {$path} -> HTTP {$result['status']}: " . \SafeHttp::logExcerpt($msg, 200));
         }
-        if (!is_array($decoded)) {
+        if ($decoded === null) {
             throw new RuntimeException($this->getName() . " POST {$path}: malformed JSON");
         }
         return $decoded;

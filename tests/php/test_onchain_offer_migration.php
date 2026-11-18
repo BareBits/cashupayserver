@@ -44,9 +44,12 @@ function has_table(string $table): bool {
     return (int)($r['n'] ?? 0) > 0;
 }
 
-// A fresh install has the newest marker artifact (the
-// stores.onchain_provider_fallback column) AND the older migration artifacts.
-assert_true(has_col('stores', 'onchain_provider_fallback'), 'fresh install has the current marker column');
+// A fresh install has the newest marker artifact (the stores.ecx_xpub
+// column, eCash ECX rail) AND the older migration artifacts.
+assert_true(has_col('stores', 'ecx_xpub'), 'fresh install has the current marker column');
+assert_true(has_table('ecx_payments'), 'fresh install has the ECX observations table');
+assert_true(has_table('ecx_fee_credits'), 'fresh install has the ECX fee ledger');
+assert_true(has_col('stores', 'onchain_provider_fallback'), 'fresh install has the previous marker column');
 assert_true(has_col('stores', 'wallet_tabs'), 'fresh install has the previous marker column');
 assert_true(has_col('invoices', 'ln_expires_at'), 'fresh install has the previous marker column');
 assert_true(has_col('invoices', 'long_lived'), 'fresh install has the long-lived flag');
@@ -70,6 +73,9 @@ assert_true(has_col('melts', 'melt_quote_id'), 'fresh install has older migratio
 // Simulate a pre-merge install: the newest artifacts are missing, but older
 // ones are still present — exactly the state of a running instance when it
 // pulls code that adds a new migration.
+Database::getInstance()->exec("ALTER TABLE stores DROP COLUMN ecx_xpub");
+Database::getInstance()->exec("DROP TABLE ecx_payments");
+Database::getInstance()->exec("DROP TABLE ecx_fee_credits");
 Database::getInstance()->exec("ALTER TABLE stores DROP COLUMN onchain_provider_fallback");
 Database::getInstance()->exec("ALTER TABLE stores DROP COLUMN wallet_tabs");
 Database::getInstance()->exec("ALTER TABLE invoices DROP COLUMN ln_expires_at");

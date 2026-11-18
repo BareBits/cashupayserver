@@ -56,7 +56,7 @@ putenv("CASHUPAY_STRIKE_API_BASE=http://127.0.0.1:{$port}/v1");
 try {
     // ---------- 2. create + quote happy path ----------
     $made = StrikeClient::createInvoiceWithQuote($KEY, 100, 'Test Store - Order 42', 'inv_abc123');
-    assert_true(str_starts_with($made['bolt11'], 'lnbcmock'), 'bolt11 from the quote');
+    assert_true(str_contains($made['bolt11'], 'm0ckstr'), 'bolt11 from the quote');
     assert_true($made['invoice_id'] !== '', 'invoice id returned');
     assert_eq(300, $made['expiration_in_sec'], 'quote expiration surfaced');
 
@@ -133,6 +133,26 @@ try {
         assert_eq('the Strike API could not be reached', StrikeClient::describeFailure($e), 'transport phrase');
     }
     putenv("CASHUPAY_STRIKE_API_BASE=http://127.0.0.1:{$port}/v1");
+
+    // ---------- 5a. malformed-invoice refusal ----------
+    // Whatever the quote hands back goes straight into the customer's QR, so
+    // a value that is not BOLT11-shaped (wrong alphabet, no separator, escape
+    // bytes, an address) is refused — never stored or shown.
+    foreach (["lnbcmock\x1b[31m", 'lnbc1mockinvoice', 'bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4', 'lnbc1Pretend', str_repeat('lnbc1qqqqqq', 300)] as $badInvoice) {
+        file_put_contents($dir . '/quote_invoice_override', $badInvoice);
+        try {
+            StrikeClient::createInvoiceWithQuote($KEY, 100);
+            fail('malformed lnInvoice must throw: ' . json_encode($badInvoice));
+        } catch (StrikeException $e) {
+            assert_true(str_contains($e->getMessage(), 'malformed Lightning invoice'), 'malformed invoice is named as such');
+            assert_false(str_contains($e->getMessage(), "\x1b"), 'no raw invoice bytes in the message');
+        }
+    }
+    unlink($dir . '/quote_invoice_override');
+    // A legitimately uppercase BOLT11 is fine (bech32 allows all-caps).
+    file_put_contents($dir . '/quote_invoice_override', 'LNBC1000N1QQQQQQ');
+    assert_eq('LNBC1000N1QQQQQQ', StrikeClient::createInvoiceWithQuote($KEY, 100)['bolt11'], 'uppercase bolt11 accepted as-is');
+    unlink($dir . '/quote_invoice_override');
 
     // ---------- 5. amount-mismatch refusal ----------
     file_put_contents($dir . '/quote_btc_override', '0.00000099');

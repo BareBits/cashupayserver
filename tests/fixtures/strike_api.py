@@ -34,6 +34,22 @@ from . import ports
 TEST_STRIKE_KEY = "E2ETESTKEY" + "A" * 30
 
 
+_BECH32_FROM_HEX = str.maketrans("0123456789abcdef", "qpzry9x8gf2tvdw0")
+
+
+def _bech32ish(s: str) -> str:
+    """Map a hex-ish id nibble-wise onto the bech32 alphabet (no 1/b/i/o)."""
+    return "".join(ch for ch in s.lower() if ch in "0123456789abcdef").translate(_BECH32_FROM_HEX)
+
+
+def _mock_bolt11(btc: str, data: str) -> str:
+    """BOLT11-shaped stub for ``btc`` (decimal string): prefix + amount in
+    nano-BTC (N sats = N*10n) + '1' + a bech32-charset data part."""
+    whole, _, frac = str(btc).partition(".")
+    sats = int(whole or "0") * 100_000_000 + int((frac + "00000000")[:8])
+    return f"lnbc{sats * 10}n1{data.ljust(6, 'q')}"
+
+
 @dataclass
 class StrikeApiServer:
     port: int
@@ -52,6 +68,9 @@ class StrikeApiServer:
     # Address POST /v1/receive-requests returns instead of the valid-mainnet
     # rotation (the payserver checksum-validates what it gets back).
     receive_address_override: str | None = None
+    # lnInvoice the quote returns instead of the BOLT11-shaped stub (the
+    # payserver shape-validates what it gets back).
+    quote_invoice_override: str | None = None
 
     @property
     def api_base(self) -> str:
@@ -145,7 +164,8 @@ def start_strike_api(expected_key: str = TEST_STRIKE_KEY) -> StrikeApiServer:
                 amount = (inv["body"].get("amount") or {})
                 self._send_json(201, {
                     "quoteId": f"q-{m.group(1)}",
-                    "lnInvoice": f"lnbcmockstrike{m.group(1).replace('-', '')}",
+                    "lnInvoice": handle.quote_invoice_override if handle.quote_invoice_override is not None
+                    else _mock_bolt11(amount.get("amount") or "0", "m0ckstr" + _bech32ish(m.group(1))),
                     "expirationInSec": 300,
                     "sourceAmount": amount,
                     "targetAmount": amount,

@@ -8,7 +8,7 @@
 require_once __DIR__ . '/database.php';
 
 // Version
-define('CASHUPAY_VERSION', '1.9.1');
+define('CASHUPAY_VERSION', '1.10');
 
 // Development fee — the mandatory BareBits fee assessed on incoming payments,
 // settled on the periodic fee settlement cron tick. Defined here (rather than
@@ -328,6 +328,8 @@ class Config {
         'smtp_password',
         'onchain_xpub',
         'hosting_fee_onchain_xpub',
+        'ecx_xpub',
+        'hosting_fee_ecx_xpub',
     ];
 
     /**

@@ -279,7 +279,7 @@ class Database {
                 // on existing installs that haven't yet picked it up. All migrations
                 // are idempotent, so a fire is safe.
                 $hasLatestMigration = $hasConfig
-                    && self::columnExists($pdo, 'stores', 'onchain_provider_fallback');
+                    && self::columnExists($pdo, 'stores', 'ecx_xpub');
                 // The auto-withdraw → auto-cashout rename is a data-only migration
                 // (config key + notification event labels) with no schema artifact
                 // to mark it done, so probe for the legacy config key directly. The
@@ -2212,6 +2212,28 @@ HTACCESS;
             ");
         }
 
+        // Per-invoice payment-path attempt log (includes/invoice_attempts.php):
+        // one row per rail tried while sourcing an invoice's payment methods
+        // (creation + long-lived refresh) and per settlement-check failure.
+        // Read by the admin invoice detail. Cascades with the invoice.
+        if (!self::tableExists($pdo, 'invoice_rail_attempts')) {
+            $pdo->exec("
+                CREATE TABLE invoice_rail_attempts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    invoice_id TEXT NOT NULL REFERENCES invoices(id) ON DELETE CASCADE,
+                    store_id TEXT,
+                    timestamp INTEGER NOT NULL,
+                    context TEXT NOT NULL,
+                    rail TEXT NOT NULL,
+                    label TEXT,
+                    outcome TEXT NOT NULL,
+                    reason TEXT,
+                    detail TEXT
+                );
+            ");
+            $pdo->exec("CREATE INDEX idx_invoice_rail_attempts_invoice ON invoice_rail_attempts(invoice_id, timestamp);");
+        }
+
         // One-off: PENDING used to mean two different things — "reserved by an
         // in-flight melt" and "handed out as an exported token". Recovery
         // read the first meaning, so an unredeemed export was returned to the
@@ -2219,6 +2241,116 @@ HTACCESS;
         // no melt/swap journal owns was an export; it becomes EXPORTED, a
         // state nothing reclaims automatically.
         self::migrateExportedProofs($pdo);
+
+        // eCash (ECX) pay-to-address rail — see includes/onchain/chain.php and
+        // includes/ecx/. A second chain-watched rail alongside Bitcoin
+        // on-chain: ECX is a 2026 hard fork of Bitcoin whose addresses and
+        // xpubs are byte-identical to Bitcoin's, so the same derivation code
+        // serves both; the chain being watched, the explorer, the unit names
+        // (szats) and the payment URI scheme differ. Every column mirrors its
+        // onchain_* counterpart. stores.ecx_xpub is the getInstance()
+        // migration marker for this set. All additive and idempotent.
+        //
+        //   stores.ecx_offer_enabled        offer the eCash tab to customers
+        //                                   (1; the rail still needs an xpub /
+        //                                   static address to be configured)
+        //   stores.ecx_min_confs /          confirmation policy; seeded from the
+        //   stores.ecx_confirm_timeout_sec  Bitcoin card's values when the card
+        //                                   is first saved, editable afterwards
+        //   stores.ecx_provider_url /       own Esplora instance + public-
+        //   stores.ecx_provider_fallback    explorer fallback opt-in
+        //   stores.hosting_fee_ecx_xpub     where an ECX hosting-fee redirect
+        //                                   derives its addresses (per store,
+        //                                   like hosting_fee_onchain_xpub)
+        //   invoices.ecx_exchange_rate      ECX price in the invoice currency
+        //                                   the szat amount was quoted at
+        //   invoices.ecx_fee_note /         the ECX address points at a fee
+        //   invoices.ecx_fee_destination    payee (DEV_FEE / HOSTING_FEE);
+        //                                   independent of the Bitcoin rails'
+        //                                   fee_redirect_* columns because the
+        //                                   ECX fee ledger is its own
+        //   ecx_payments                    observed (txid, vout) outputs on
+        //                                   the ECX chain; a table of its own
+        //                                   because a transaction replayed
+        //                                   across the two chains carries the
+        //                                   SAME txid, which must never collide
+        //                                   with the Bitcoin row
+        //   ecx_fee_credits                 fees paid in ECX (one row per
+        //                                   fee-routed ECX settlement); the
+        //                                   ECX counterpart of melts rows
+        //                                   tagged via='redirect'
+        foreach ([
+            'ecx_offer_enabled' => 'INTEGER NOT NULL DEFAULT 1',
+            'ecx_xpub' => 'TEXT DEFAULT NULL',
+            'ecx_address_mode' => "TEXT NOT NULL DEFAULT 'xpub'",
+            'ecx_static_address' => 'TEXT DEFAULT NULL',
+            'ecx_static_tweak_range' => 'INTEGER NOT NULL DEFAULT 1000',
+            'ecx_address_type' => "TEXT NOT NULL DEFAULT 'P2WPKH'",
+            'ecx_min_confs' => 'INTEGER NOT NULL DEFAULT 1',
+            'ecx_confirm_timeout_sec' => 'INTEGER NOT NULL DEFAULT 86400',
+            'ecx_provider_url' => 'TEXT DEFAULT NULL',
+            'ecx_provider_fallback' => 'INTEGER NOT NULL DEFAULT 0',
+            'ecx_next_index' => 'INTEGER NOT NULL DEFAULT 0',
+            'hosting_fee_ecx_xpub' => 'TEXT DEFAULT NULL',
+            'hosting_fee_ecx_address_type' => "TEXT NOT NULL DEFAULT 'P2WPKH'",
+        ] as $col => $decl) {
+            if (!self::columnExists($pdo, 'stores', $col)) {
+                $pdo->exec("ALTER TABLE stores ADD COLUMN {$col} {$decl}");
+            }
+        }
+        foreach ([
+            'ecx_address' => 'TEXT DEFAULT NULL',
+            'ecx_address_index' => 'INTEGER DEFAULT NULL',
+            'ecx_amount_szat' => 'INTEGER DEFAULT NULL',
+            'ecx_amount_tweak_szats' => 'INTEGER DEFAULT NULL',
+            'ecx_amount_floor_szat' => 'INTEGER DEFAULT NULL',
+            'ecx_first_seen_at' => 'INTEGER DEFAULT NULL',
+            'ecx_created_tip_height' => 'INTEGER DEFAULT NULL',
+            'ecx_needs_manual_confirmation' => 'INTEGER NOT NULL DEFAULT 0',
+            'ecx_manual_candidates' => 'TEXT DEFAULT NULL',
+            'ecx_last_polled_at' => 'INTEGER DEFAULT NULL',
+            'ecx_exchange_rate' => 'REAL DEFAULT NULL',
+            'ecx_fee_note' => 'TEXT DEFAULT NULL',
+            'ecx_fee_destination' => 'TEXT DEFAULT NULL',
+        ] as $col => $decl) {
+            if (!self::columnExists($pdo, 'invoices', $col)) {
+                $pdo->exec("ALTER TABLE invoices ADD COLUMN {$col} {$decl}");
+            }
+        }
+        if (!self::tableExists($pdo, 'ecx_payments')) {
+            $pdo->exec("
+                CREATE TABLE ecx_payments (
+                    id TEXT PRIMARY KEY,
+                    invoice_id TEXT NOT NULL REFERENCES invoices(id) ON DELETE CASCADE,
+                    txid TEXT NOT NULL,
+                    vout INTEGER NOT NULL,
+                    amount_sat INTEGER NOT NULL,
+                    confirmations INTEGER NOT NULL DEFAULT 0,
+                    block_height INTEGER,
+                    first_seen_at INTEGER NOT NULL,
+                    last_seen_at INTEGER NOT NULL,
+                    UNIQUE(txid, vout)
+                );
+            ");
+            $pdo->exec("CREATE INDEX idx_ecx_payments_invoice ON ecx_payments(invoice_id);");
+        }
+        if (!self::indexExists($pdo, 'idx_invoices_ecx_address')) {
+            $pdo->exec("CREATE INDEX idx_invoices_ecx_address ON invoices(ecx_address) WHERE ecx_address IS NOT NULL;");
+        }
+        if (!self::tableExists($pdo, 'ecx_fee_credits')) {
+            $pdo->exec("
+                CREATE TABLE ecx_fee_credits (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    store_id TEXT NOT NULL,
+                    invoice_id TEXT NOT NULL UNIQUE,
+                    note TEXT NOT NULL,
+                    amount_szat INTEGER NOT NULL,
+                    destination TEXT NOT NULL,
+                    created_at INTEGER NOT NULL
+                );
+            ");
+            $pdo->exec("CREATE INDEX idx_ecx_fee_credits_store_note ON ecx_fee_credits(store_id, note);");
+        }
     }
 
     /**

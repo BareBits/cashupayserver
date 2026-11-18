@@ -38,7 +38,7 @@ use WebSocket\Message\Text;
 
 $port = (int)(getenv('MOCK_CLINK_PORT') ?: 0);
 $merchantSk = (string)getenv('MOCK_CLINK_MERCHANT_SK');
-$bolt11 = (string)(getenv('MOCK_CLINK_BOLT11') ?: 'lnbc10n1mockinvoice');
+$bolt11 = (string)(getenv('MOCK_CLINK_BOLT11') ?: 'lnbc10n1m0ckvnv0ce');
 $errorCode = getenv('MOCK_CLINK_ERROR_CODE');
 $sendReceipt = getenv('MOCK_CLINK_SEND_RECEIPT') === '1';
 $receiptAfterEose = getenv('MOCK_CLINK_RECEIPT_AFTER_EOSE') === '1';

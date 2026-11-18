@@ -7,7 +7,9 @@
  * math. addressTransactions() must:
  *   - treat a confirmed tx whose block_height is <=0 or > tip as UNCONFIRMED
  *     (confirmations = 0, blockHeight = null), and
- *   - floor a negative vout value to 0.
+ *   - drop an output whose value is not a non-negative integer (a negative
+ *     value used to be floored to 0; since the response-shape hardening the
+ *     malformed output is not observed at all — see test_esplora_value_shape).
  */
 declare(strict_types=1);
 require __DIR__ . '/harness.php';
@@ -98,9 +100,7 @@ assert_true(isset($byTxid[$future]), 'future-height tx observed');
 assert_eq(0, $byTxid[$future]->confirmations, 'future-height tx forced to 0 confs');
 assert_null($byTxid[$future]->blockHeight, 'future-height tx blockHeight nulled');
 
-assert_true(isset($byTxid[$negval]), 'negative-value tx observed');
-assert_eq(0, $byTxid[$negval]->amountSat, 'negative value floored to 0');
-assert_eq(101, $byTxid[$negval]->confirmations, 'valid-height confs = tip - h + 1');
+assert_false(isset($byTxid[$negval]), 'negative-value output is dropped, not observed');
 
 assert_true(isset($byTxid[$good]), 'good tx observed');
 assert_eq(1234, $byTxid[$good]->amountSat, 'good value preserved');

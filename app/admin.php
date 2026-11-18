@@ -383,8 +383,9 @@ if (isset($_GET['api'])) {
             $autoMelt = [
                 // Ordered list of {address, lud21Support}; priority = array order.
                 'addresses' => $autoMeltAddresses,
-                // Configurable order the four destination types are tried in
-                // (permutation of strike,lnaddress,nwc,noffer; see RailOrder).
+                // Configurable order the Lightning paths are tried in
+                // (permutation of strike,lnaddress,nwc,noffer,swap,cashu; see
+                // RailOrder).
                 'railOrder' => RailOrder::lnOrderFromRow($store),
                 'enabled' => (bool)($store['auto_melt_enabled'] ?? 0),
                 'threshold' => (int)($store['auto_melt_threshold'] ?? 2000),
@@ -480,7 +481,10 @@ if (isset($_GET['api'])) {
                 'addressType' => $store['onchain_address_type'] ?? 'P2WPKH',
                 'minConfs' => (int)($store['onchain_min_confs'] ?? 1),
                 'confirmTimeoutSec' => (int)($store['onchain_confirm_timeout_sec'] ?? 86400),
-                'nextIndex' => (int)($store['onchain_next_index'] ?? 0),
+                // The per-xpub counter is shared across chains (an eCash
+                // allocation on the same key advances it too), so read it
+                // rather than the per-store mirror column.
+                'nextIndex' => OnchainPayments::nextIndexForXpub($onchainXpub ?: null, (int)($store['onchain_next_index'] ?? 0)),
                 'providerUrl' => $store['onchain_provider_url'] ?? '',
                 // Opt-in: fall back to the public explorers when the custom
                 // URL above is unreachable (ignored without a custom URL).
@@ -505,6 +509,49 @@ if (isset($_GET['api'])) {
                     }
                     return false;
                 })(),
+            ];
+
+            // eCash (ECX) payment settings — the second chain-watched rail
+            // (includes/ecx/ecx.php). Same shape as $onchain; one network.
+            require_once __DIR__ . '/includes/ecx/ecx.php';
+            $ecxXpub = $store['ecx_xpub'] ?? '';
+            $ecxMode = $store['ecx_address_mode'] ?? 'xpub';
+            $ecxStaticAddress = $store['ecx_static_address'] ?? '';
+            $ecxPriceUsd = EcxRates::getEcxUsd();
+            $ecxSettings = [
+                'enabled' => EcxConfig::isConfigured($store),
+                'offerEnabled' => (int)($store['ecx_offer_enabled'] ?? 1) === 1,
+                'offered' => EcxConfig::isOffered($store),
+                'mode' => $ecxMode,
+                'xpub' => $ecxXpub,
+                // Convenience for the "use my Bitcoin xpub" shortcut.
+                'btcXpub' => $onchainMode === 'static' ? '' : $onchainXpub,
+                'btcAddressType' => $store['onchain_address_type'] ?? 'P2WPKH',
+                'sameAsBtc' => $ecxXpub !== '' && $ecxXpub === $onchainXpub,
+                'staticAddress' => $ecxStaticAddress,
+                'staticTweakRange' => (int)($store['ecx_static_tweak_range'] ?? 1000),
+                'addressType' => $store['ecx_address_type'] ?? 'P2WPKH',
+                'minConfs' => (int)($store['ecx_min_confs'] ?? 1),
+                'confirmTimeoutSec' => (int)($store['ecx_confirm_timeout_sec'] ?? 86400),
+                // The Bitcoin card's policy, offered as the default for a
+                // first ECX save (operator decision: same settings, editable).
+                'btcMinConfs' => (int)($store['onchain_min_confs'] ?? 1),
+                'btcConfirmTimeoutSec' => (int)($store['onchain_confirm_timeout_sec'] ?? 86400),
+                'nextIndex' => OnchainPayments::nextIndexForXpub($ecxXpub ?: null, (int)($store['ecx_next_index'] ?? 0)),
+                'providerUrl' => $store['ecx_provider_url'] ?? '',
+                'providerFallback' => (int)($store['ecx_provider_fallback'] ?? 0) === 1,
+                'publicExplorers' => Chain::ecx()->esploraDefaults('mainnet'),
+                'needsManualConfirmation' => OnchainPayments::countNeedingManualConfirmation($storeId, Chain::ecx()),
+                // Hosting-fee ECX destination (deployer's xpub); the fee is
+                // redirect-only, so without it hosting fees in ECX only accrue.
+                'hostingFeeXpub' => $store['hosting_fee_ecx_xpub'] ?? '',
+                'hostingFeeAddressType' => $store['hosting_fee_ecx_address_type'] ?? 'P2WPKH',
+                // Live-or-cached ECX/USD; null = eCash is not offered right now.
+                'priceUsd' => $ecxPriceUsd,
+                'priceAvailable' => $ecxPriceUsd !== null,
+                'lastGoodPriceUsd' => EcxRates::lastGoodUsd(),
+                'unit' => Chain::ecx()->unit,
+                'unitPlural' => Chain::ecx()->unitPlural,
             ];
 
             // Calculate balance in sats for fiat mints (uses cached exchange rates)
@@ -579,6 +626,7 @@ if (isset($_GET['api'])) {
                     'hideNote' => (int)($store['hide_note_on_invoice'] ?? 0) === 1,
                 ],
                 'onchain' => $onchain,
+                'ecx' => $ecxSettings,
                 'swaps' => $storeSwaps,
                 'selfserve' => $storeSelfServe,
                 'reliability' => (function() {
@@ -612,12 +660,15 @@ if (isset($_GET['api'])) {
             break;
 
         case 'cron_url':
-            // Surfaces the operator-facing cron URL with key. The key is seeded
+            // Surfaces the operator-facing cron URLs with key. The key is seeded
             // at install time (Database::initialize) and lazily regenerated
             // here for the rare case of an install that predates seeding.
-            // Crontab is rendered with the key passed via the X-CRON-KEY
-            // header instead of ?key= so it doesn't leak through access logs.
-            // cron.php still accepts ?key= for backward compatibility.
+            // The key rides in the URL (?key=…) so the bare URL can be pasted
+            // into a hosting panel's URL-cron field or a scheduler service by
+            // operators without shell access; the crontab lines wrap the same
+            // URL for those who have one. cron.php also still accepts the key
+            // via the X-CRON-KEY header, so schedulers set up from the older
+            // header-based line keep working untouched.
             Auth::requireAdmin();
             $key = Config::get('cron_key');
             if (!$key) {
@@ -625,16 +676,16 @@ if (isset($_GET['api'])) {
                 Config::set('cron_key', $key);
             }
             $baseUrl = Urls::cron();
-            $swapsBaseUrl = $baseUrl . '?only=swaps';
-            $headerArg = "-H 'X-CRON-KEY: " . $key . "'";
+            $keyedUrl = Urls::withCronKey($baseUrl, $key);
+            $keyedSwapsUrl = Urls::withCronKey($baseUrl, $key, ['only' => 'swaps']);
             $now = time();
             $fullSeenAt = (int) Config::get('last_external_cron_at', 0);
             $swapsSeenAt = (int) Config::get('last_external_cron_swaps_at', 0);
             echo json_encode([
-                'url' => $baseUrl,
-                'swaps_url' => $swapsBaseUrl,
-                'crontab' => '* * * * * curl -fsS ' . $headerArg . ' ' . $baseUrl . ' > /dev/null',
-                'crontab_swaps' => "* * * * * for i in 0 10 20 30 40 50; do curl -fsS " . $headerArg . " '" . $swapsBaseUrl . "' > /dev/null & sleep 10; done",
+                'url' => $keyedUrl,
+                'swaps_url' => $keyedSwapsUrl,
+                'crontab' => "* * * * * curl -fsS '" . $keyedUrl . "' > /dev/null",
+                'crontab_swaps' => "* * * * * for i in 0 10 20 30 40 50; do curl -fsS '" . $keyedSwapsUrl . "' > /dev/null & sleep 10; done",
                 'last_full_seen_ago_sec' => $fullSeenAt > 0 ? ($now - $fullSeenAt) : null,
                 'last_swaps_seen_ago_sec' => $swapsSeenAt > 0 ? ($now - $swapsSeenAt) : null,
             ]);
@@ -652,16 +703,18 @@ if (isset($_GET['api'])) {
             $dismissed = (bool)Config::get('updater_banner_dismissed', true);
             // Recommended dedicated cron line for the isolated updater. Built
             // here (admin-only) so the operator can copy it straight from the
-            // Auto-update card. Key travels via the X-CRON-KEY header, same as
-            // the main cron line, so it doesn't leak through access logs.
+            // Auto-update card. Key travels in the URL (?key=…), same as the
+            // main cron line, so the bare URL works in a hosting panel too.
             $updKey = Config::get('cron_key');
             $updUrl = rtrim(Config::getBaseUrl(), '/') . '/update.php';
-            $recommendedCron = $updKey
-                ? "*/15 * * * * curl -fsS -H 'X-CRON-KEY: " . $updKey . "' " . $updUrl . ' > /dev/null'
+            $updKeyedUrl = $updKey ? Urls::withCronKey($updUrl, $updKey) : null;
+            $recommendedCron = $updKeyedUrl
+                ? "*/15 * * * * curl -fsS '" . $updKeyedUrl . "' > /dev/null"
                 : null;
             echo json_encode([
                 'channel' => Updater::getChannel(),
                 'recommended_cron' => $recommendedCron,
+                'recommended_cron_url' => $updKeyedUrl,
                 'current_version' => $info['VERSION'] ?? CASHUPAY_VERSION,
                 'current_sha' => $info['COMMIT_SHA'] ?? '',
                 'last_update' => $last,
@@ -744,16 +797,162 @@ if (isset($_GET['api'])) {
             ]);
             break;
 
-        // Cart line items for an invoice — used by the admin invoice detail.
-        case 'invoice_items':
-            $invoiceId = $_GET['id'] ?? '';
+        // Full invoice detail for the admin invoice modal: the API view of
+        // the invoice plus the rail bookkeeping formatForApi leaves out, the
+        // cart line items, and the payment-path attempt log. Reachable by
+        // the non-admin ROLE_USER like the invoice list itself; the raw
+        // error text (attempt detail, last poll error) is admin-only.
+        // Secret-bearing columns (nwc_uri, strike_api_key, noffer_ephemeral_sk,
+        // cashu_offline_token, lnurl_preimage) never ride this payload.
+        case 'invoice_detail':
+            $invoiceId = (string)($_GET['id'] ?? '');
             if ($invoiceId === '') {
                 cashupay_status(400);
                 echo json_encode(['error' => 'id required']);
                 break;
             }
+            $row = Invoice::getById($invoiceId);
+            if (!$row) {
+                cashupay_status(404);
+                echo json_encode(['error' => 'Invoice not found']);
+                break;
+            }
+            require_once __DIR__ . '/includes/invoice_attempts.php';
+            $isAdminViewer = Auth::isAdmin();
+            $detailStore = Config::getStore($row['store_id']);
+            $decodeJson = static function ($v) {
+                if ($v === null || $v === '') { return null; }
+                $d = json_decode((string)$v, true);
+                return is_array($d) ? $d : null;
+            };
+            $intOrNull = static fn($v) => ($v === null || $v === '') ? null : (int)$v;
+
+            $formatted = Invoice::formatForApi($row);
+            $items = Cart::formatItemsForApi(Cart::getItems($invoiceId));
+            $formatted['hasItems'] = $items !== [];
+
+            $attemptRows = InvoiceAttempts::listForInvoice($invoiceId);
+            $attemptsLegacy = $attemptRows === [];
+            $attempts = $attemptsLegacy
+                ? InvoiceAttempts::legacyFromInvoice($row)
+                : InvoiceAttempts::formatForApi($attemptRows, $isAdminViewer);
+
+            $onchainDetail = null;
+            if (!empty($row['onchain_address'])) {
+                $payments = [];
+                foreach (Database::fetchAll(
+                    "SELECT txid, vout, amount_sat, confirmations, block_height, first_seen_at
+                       FROM onchain_payments WHERE invoice_id = ? ORDER BY first_seen_at ASC, id ASC",
+                    [$invoiceId]
+                ) as $p) {
+                    $payments[] = [
+                        'txid' => $p['txid'],
+                        'vout' => (int)$p['vout'],
+                        'amountSat' => (int)$p['amount_sat'],
+                        'confirmations' => (int)$p['confirmations'],
+                        'blockHeight' => $intOrNull($p['block_height']),
+                        'firstSeenAt' => (int)$p['first_seen_at'],
+                    ];
+                }
+                $onchainDetail = [
+                    'address' => $row['onchain_address'],
+                    'amountSat' => $intOrNull($row['onchain_amount_sat'] ?? null),
+                    'tweakSats' => $intOrNull($row['onchain_amount_tweak_sats'] ?? null),
+                    'firstSeenAt' => $intOrNull($row['onchain_first_seen_at'] ?? null),
+                    'needsManualConfirmation' => !empty($row['onchain_needs_manual_confirmation']),
+                    'payments' => $payments,
+                ];
+            }
+
+            // eCash (ECX) leg: same shape as the on-chain block, in szats.
+            $ecxDetail = null;
+            if (!empty($row['ecx_address'])) {
+                $ecxPays = [];
+                foreach (Database::fetchAll(
+                    "SELECT txid, vout, amount_sat, confirmations, block_height, first_seen_at
+                       FROM ecx_payments WHERE invoice_id = ? ORDER BY first_seen_at ASC, id ASC",
+                    [$invoiceId]
+                ) as $p) {
+                    $ecxPays[] = [
+                        'txid' => $p['txid'],
+                        'vout' => (int)$p['vout'],
+                        'amountSzat' => (int)$p['amount_sat'],
+                        'confirmations' => (int)$p['confirmations'],
+                        'blockHeight' => $intOrNull($p['block_height']),
+                        'firstSeenAt' => (int)$p['first_seen_at'],
+                    ];
+                }
+                $ecxDetail = [
+                    'address' => $row['ecx_address'],
+                    'amountSzat' => $intOrNull($row['ecx_amount_szat'] ?? null),
+                    'tweakSzats' => $intOrNull($row['ecx_amount_tweak_szats'] ?? null),
+                    'rate' => $row['ecx_exchange_rate'] ?? null,
+                    'firstSeenAt' => $intOrNull($row['ecx_first_seen_at'] ?? null),
+                    'needsManualConfirmation' => !empty($row['ecx_needs_manual_confirmation']),
+                    'feeNote' => $row['ecx_fee_note'] ?? null,
+                    'feeDestination' => $row['ecx_fee_destination'] ?? null,
+                    'payments' => $ecxPays,
+                ];
+            }
+
+            $swapDetail = null;
+            $sa = Database::fetchOne(
+                "SELECT provider, network, status, lockup_txid, claim_txid, merchant_address,
+                        target_onchain_amount_sats, invoice_amount_sats, swap_lockup_fee_sats,
+                        swap_percent_fee_sats, error_message, created_at, updated_at
+                   FROM swap_attempts WHERE invoice_id = ? ORDER BY id DESC LIMIT 1",
+                [$invoiceId]
+            );
+            if ($sa) {
+                $swapDetail = [
+                    'provider' => $sa['provider'],
+                    'network' => $sa['network'],
+                    'status' => $sa['status'],
+                    'lockupTxid' => $sa['lockup_txid'],
+                    'claimTxid' => $sa['claim_txid'],
+                    'merchantAddress' => $sa['merchant_address'],
+                    'targetSats' => (int)$sa['target_onchain_amount_sats'],
+                    'invoiceSats' => (int)$sa['invoice_amount_sats'],
+                    'lockupFeeSats' => (int)$sa['swap_lockup_fee_sats'],
+                    'percentFeeSats' => (int)$sa['swap_percent_fee_sats'],
+                    'errorMessage' => $isAdminViewer ? $sa['error_message'] : null,
+                ];
+            }
+
             echo json_encode([
-                'items' => Cart::formatItemsForApi(Cart::getItems($invoiceId)),
+                'invoice' => $formatted,
+                'storeName' => $detailStore['name'] ?? null,
+                'isAdmin' => $isAdminViewer,
+                'detail' => [
+                    // The rail chosen at creation vs. the one that moved funds
+                    // (formatForApi's paymentRail already prefers the latter).
+                    'paymentRailChosen' => $row['payment_rail'] ?? null,
+                    'settledRail' => $row['settled_rail'] ?? null,
+                    'bolt11' => $row['bolt11'] ?? null,
+                    'lnDestination' => $row['ln_destination'] ?? null,
+                    'nofferRelay' => $row['noffer_relay'] ?? null,
+                    'lnExpiresAt' => $intOrNull($row['ln_expires_at'] ?? null),
+                    'lnRefreshedAt' => $intOrNull($row['ln_refreshed_at'] ?? null),
+                    'requotedAt' => $intOrNull($row['requoted_at'] ?? null),
+                    'lastPolledAt' => $intOrNull($row['last_polled_at'] ?? null),
+                    'lastPollState' => $row['last_poll_state'] ?? null,
+                    'lastPollError' => $isAdminViewer ? ($row['last_poll_error'] ?? null) : null,
+                    'lnurlOverrideReason' => $row['lnurl_override_reason'] ?? null,
+                    'strikeInvoiceId' => $row['strike_invoice_id'] ?? null,
+                    'strikeReceiveRequestId' => $row['strike_receive_request_id'] ?? null,
+                    'receiveErrors' => $decodeJson($row['receive_errors'] ?? null) ?? [],
+                    'metadata' => $decodeJson($row['metadata'] ?? null),
+                    'checkoutConfig' => $decodeJson($row['checkout_config'] ?? null),
+                    'payerReceiptRequested' => !empty($row['payer_receipt_requested']),
+                    'cashuOfflineAllowAnyMint' => !empty($row['cashu_offline_allow_any_mint']),
+                    'cashuOfflineFailReason' => $row['cashu_offline_fail_reason'] ?? null,
+                    'onchain' => $onchainDetail,
+                    'ecx' => $ecxDetail,
+                    'swap' => $swapDetail,
+                ],
+                'items' => $items,
+                'attempts' => $attempts,
+                'attemptsLegacy' => $attemptsLegacy,
             ]);
             break;
 
@@ -1374,6 +1573,52 @@ if (isset($_GET['api'])) {
                 'unit' => Config::getStoreMintUnit($storeId),
                 'mints' => OfflineCashu::allowlist($storeId),
             ]);
+            break;
+
+        case 'list_onchain_manual':
+            Auth::requireAdmin();
+            // List invoices awaiting manual confirmation. Scoped to a single
+            // store if store_id is provided; otherwise lists across every
+            // store the (admin) user can see. A GET ?api= endpoint (the
+            // Invoices view fetches it that way); it used to sit in the POST
+            // action switch, where no request ever reached it.
+            try {
+                require_once __DIR__ . '/includes/onchain/payments.php';
+                $storeIds = null;
+                $storeId = $_GET['store_id'] ?? null;
+                if ($storeId) {
+                    $storeIds = [$storeId];
+                }
+                // Both chain-watched rails: Bitcoin static addresses and
+                // eCash (ECX) static addresses can each produce ambiguity.
+                $out = [];
+                foreach (Chain::all() as $chain) {
+                    $rows = OnchainPayments::listNeedingManualConfirmation($storeIds, $chain);
+                    foreach ($rows as $r) {
+                        $out[] = [
+                            'id' => $r['id'],
+                            'store_id' => $r['store_id'],
+                            'amount' => $r['amount'],
+                            'currency' => $r['currency'],
+                            'chain' => $chain->id,
+                            'unit' => $chain->unitPlural,
+                            'onchain_address' => $r[$chain->inv['address']],
+                            'onchain_amount_sat' => (int)($r[$chain->inv['amount']] ?? 0),
+                            'onchain_amount_tweak_sats' => isset($r[$chain->inv['tweak']])
+                                ? (int)$r[$chain->inv['tweak']] : null,
+                            'created_at' => $r['created_at'],
+                            'expiration_time' => $r['expiration_time'],
+                            'status' => $r['status'],
+                            'candidates' => $r['onchain_manual_candidates_decoded'],
+                        ];
+                    }
+                }
+                usort($out, static fn($a, $b) => ($b['created_at'] <=> $a['created_at']));
+                echo json_encode(['invoices' => $out]);
+            } catch (Exception $e) {
+                cashupay_status(400);
+                echo json_encode(['error' => $e->getMessage()]);
+            }
             break;
 
         default:
@@ -2054,6 +2299,29 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     }
                     $updates['hosting_fee_destination'] = $dest === '' ? null : $dest;
                 }
+                // Hosting fee in eCash (ECX): the deployer's xpub the fee
+                // redirect derives ECX addresses from. Mainnet key; the
+                // address type follows the SLIP-32 prefix (ypub -> wrapped
+                // segwit, else native segwit). Empty clears it.
+                // Written with Database::update after the main save (below):
+                // Config::updateStore's column allowlist is deliberately tight
+                // and silently drops keys it does not know, which is how this
+                // field failed to persist at all in the first eCash release.
+                $ecxHostingUpdates = null;
+                if (isset($_POST['hosting_fee_ecx_xpub'])) {
+                    $hx = trim((string) $_POST['hosting_fee_ecx_xpub']);
+                    if ($hx === '') {
+                        $ecxHostingUpdates = ['hosting_fee_ecx_xpub' => null];
+                    } else {
+                        require_once __DIR__ . '/includes/onchain/wallet.php';
+                        $hxType = strtolower(substr($hx, 0, 4)) === 'ypub' ? 'P2SH-P2WPKH' : 'P2WPKH';
+                        $hxCheck = OnchainWallet::validateXpub($hx, 'mainnet', $hxType);
+                        if (!$hxCheck['valid']) {
+                            throw new Exception('Hosting fee ECX xpub: ' . ($hxCheck['error'] ?: 'invalid xpub'));
+                        }
+                        $ecxHostingUpdates = ['hosting_fee_ecx_xpub' => $hx, 'hosting_fee_ecx_address_type' => $hxType];
+                    }
+                }
 
                 // Changing the mint URL or unit points the store at a new
                 // wallet namespace (hash(mint_url, unit)); the funds at the
@@ -2120,6 +2388,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 }
 
                 Config::updateStore($storeId, $updates, $wouldStrand && $confirmStranding);
+                if ($ecxHostingUpdates !== null) {
+                    Database::update('stores', $ecxHostingUpdates, 'id = ?', [$storeId]);
+                }
 
                 // The store now points at a namespace its seed may have used
                 // before (the operator may be returning to an old mint):
@@ -2203,6 +2474,30 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         'This mint doesn\'t offer ' . $mintUnit . '. Pick a different mint or unit.'
                     );
                 }
+                // Optional backup mint (same contract as setup's mints screen,
+                // minus the requirement): must differ from the primary and
+                // offer the same unit. Checked BEFORE anything is persisted so
+                // a bad backup leaves the store exactly as it was.
+                $backupUrl = rtrim(trim((string)($_POST['backup_mint_url'] ?? '')), '/');
+                if ($backupUrl !== '') {
+                    $backupUrl = Config::validateMintUrl($backupUrl);
+                    if (strcasecmp($backupUrl, $mintUrl) === 0) {
+                        throw new Exception(
+                            'Your backup mint needs to be different from your main one — that\'s the whole point of a backup.'
+                        );
+                    }
+                    try {
+                        $backupUnits = \Cashu\Wallet::getSupportedUnits($backupUrl);
+                    } catch (Exception $e) {
+                        throw new Exception('Cannot connect to the backup mint: ' . $e->getMessage());
+                    }
+                    if (empty($backupUnits) || !isset($backupUnits[$mintUnit])) {
+                        throw new Exception(
+                            'Your backup mint needs to support ' . $mintUnit
+                            . ', same as your main mint. This one doesn\'t.'
+                        );
+                    }
+                }
                 $seedPhrase = $store['seed_phrase'] ?? null;
                 $generatedSeed = null;
                 if (empty($seedPhrase)) {
@@ -2247,13 +2542,41 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
                 // Mintless setup pinned strict-no-mint-fallback FORCE_ON so a
                 // mint couldn't be acquired later without an explicit decision
-                // — this dialog IS that decision, so clear the pin. The mint
-                // stays the lowest-priority path regardless: invoices only
-                // fall back to it after every Lightning destination (Strike,
-                // LNURL, NWC, noffer) and any swap attempt have failed. The
+                // — this dialog IS that decision, so clear the pin. By default
+                // the mint stays the lowest-priority path: invoices only fall
+                // back to it after every Lightning destination (Strike, LNURL,
+                // NWC, noffer) and any swap attempt have failed — unless the
+                // operator moves it up in the payment path priority. The
                 // operator can re-pin strict mode in the Submarine Swaps card.
                 require_once __DIR__ . '/includes/swap/config.php';
                 SwapsConfig::setStoreStrictOverride($storeId, SwapsConfig::FORCE_OFF);
+
+                // Backup mint: added after the primary (validated above). A
+                // row the trusted-list applier already seeded is reused
+                // rather than tripping the (store_id, mint_url) unique
+                // constraint. Same seed-binding + bounded recovery step as
+                // add_backup_mint.
+                $backupResult = null;
+                if ($backupUrl !== '') {
+                    $backupId = null;
+                    foreach (Config::getStoreBackupMints($storeId) as $existing) {
+                        if (strcasecmp(rtrim((string)$existing['mint_url'], '/'), $backupUrl) === 0) {
+                            $backupId = (int)$existing['id'];
+                            break;
+                        }
+                    }
+                    if ($backupId === null) {
+                        $backupId = Config::addStoreBackupMint($storeId, $backupUrl, $mintUnit, 100);
+                    }
+                    $recovery = cashupay_recover_backup_mint($storeId, $backupUrl, $mintUnit, $backupId);
+                    $backupResult = [
+                        'id' => $backupId,
+                        'mint_url' => $backupUrl,
+                        'walletRecovery' => $recovery['status'],
+                        'enabled' => $recovery['enabled'],
+                        'message' => $recovery['message'],
+                    ];
+                }
 
                 echo json_encode([
                     'success' => true,
@@ -2262,6 +2585,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     // the one-time backup panel.
                     'seedPhrase' => $generatedSeed,
                     'walletRecovery' => $walletRecovery,
+                    // null when no backup mint was given.
+                    'backupMint' => $backupResult,
                 ]);
             } catch (Exception $e) {
                 cashupay_status(400);
@@ -2870,6 +3195,191 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
             break;
 
+        case 'save_ecx_offer':
+            Auth::requireAdmin();
+            // Toggle whether the eCash (ECX) tab is OFFERED to customers,
+            // independent of whether an ECX xpub / static address is saved.
+            try {
+                $storeId = $_POST['store_id'] ?? '';
+                if (empty($storeId)) {
+                    throw new Exception('Store ID required');
+                }
+                $raw = (string)($_POST['offer_enabled'] ?? '1');
+                if (!in_array($raw, ['0', '1'], true)) {
+                    throw new Exception('Invalid eCash offer value');
+                }
+                Database::update('stores', ['ecx_offer_enabled' => (int)$raw], 'id = ?', [$storeId]);
+                require_once __DIR__ . '/includes/ecx/ecx.php';
+                $row = Config::getStore($storeId) ?? [];
+                echo json_encode([
+                    'success' => true,
+                    'offerEnabled' => (int)($row['ecx_offer_enabled'] ?? 1) === 1,
+                    'offered' => EcxConfig::isOffered($row),
+                ]);
+            } catch (Throwable $e) {
+                http_response_code(400);
+                echo json_encode(['success' => false, 'error' => $e->getMessage()]);
+            }
+            break;
+
+        case 'save_ecx':
+            Auth::requireAdmin();
+            // Persist a store's eCash (ECX) payment configuration. The twin of
+            // save_onchain for the ECX rail: 'xpub' (fresh address per invoice)
+            // or 'static' (one address, per-invoice szat tweak); ECX has a
+            // single network (mainnet) and is Esplora-only. The address
+            // derivation is Bitcoin's, so the same validation applies; the
+            // shared per-xpub counter means re-using the Bitcoin xpub here
+            // never hands out an address both chains have shown.
+            try {
+                $storeId = $_POST['store_id'] ?? '';
+                if (empty($storeId)) {
+                    throw new Exception('Store ID required');
+                }
+                $mode = $_POST['mode'] ?? 'xpub';
+                if (!in_array($mode, ['xpub', 'static'], true)) {
+                    throw new Exception('Invalid mode');
+                }
+                $network = Chain::ECX_NETWORK;
+                $type = $_POST['address_type'] ?? 'P2WPKH';
+                $minConfs = max(0, (int)($_POST['min_confs'] ?? 1));
+                $confirmTimeoutSec = max(60, (int)($_POST['confirm_timeout_sec'] ?? 86400));
+                $providerUrlRaw = trim($_POST['provider_url'] ?? '');
+                $providerFallback = in_array(
+                    strtolower((string)($_POST['provider_fallback'] ?? '')), ['1', 'true', 'on', 'yes'], true
+                ) ? 1 : 0;
+
+                require_once __DIR__ . '/includes/onchain/wallet.php';
+                require_once __DIR__ . '/includes/onchain/provider.php';
+                require_once __DIR__ . '/includes/ecx/ecx.php';
+
+                // Same custom-explorer rule as save_onchain: static checks on
+                // every save, a live tip probe only when the URL changes.
+                $providerUrl = '';
+                $providerProbe = null;
+                if ($providerUrlRaw !== '') {
+                    $providerUrl = EsploraProvider::normalizeCustomUrl($providerUrlRaw);
+                    $prevRow = Database::fetchOne("SELECT ecx_provider_url FROM stores WHERE id = ?", [$storeId]);
+                    $prevUrl = rtrim(trim((string)($prevRow['ecx_provider_url'] ?? '')), '/');
+                    if ($providerUrl !== $prevUrl) {
+                        $tip = EsploraProvider::probeCustomUrl($providerUrl);
+                        $providerProbe = ['url' => $providerUrl, 'tipHeight' => $tip];
+                    }
+                } else {
+                    $providerFallback = 0;
+                }
+
+                $policy = [
+                    'ecx_min_confs' => $minConfs,
+                    'ecx_confirm_timeout_sec' => $confirmTimeoutSec,
+                    'ecx_provider_url' => $providerUrl !== '' ? $providerUrl : null,
+                    'ecx_provider_fallback' => $providerFallback,
+                ];
+
+                if ($mode === 'static') {
+                    $staticAddress = trim($_POST['static_address'] ?? '');
+                    $tweakRange = max(100, min(100000, (int)($_POST['static_tweak_range'] ?? 1000)));
+                    if ($staticAddress === '') {
+                        Database::update('stores', [
+                            'ecx_address_mode' => 'static',
+                            'ecx_static_address' => null,
+                            'ecx_xpub' => null,
+                        ] + $policy, 'id = ?', [$storeId]);
+                        echo json_encode(['success' => true, 'providerProbe' => $providerProbe, 'disabled' => true]);
+                        break;
+                    }
+                    $check = OnchainWallet::validateAddress($staticAddress, $network);
+                    if (!$check['valid']) {
+                        throw new Exception($check['error'] ?: 'Invalid address');
+                    }
+                    Database::update('stores', [
+                        'ecx_address_mode' => 'static',
+                        'ecx_static_address' => $staticAddress,
+                        'ecx_static_tweak_range' => $tweakRange,
+                        'ecx_xpub' => null,
+                    ] + $policy, 'id = ?', [$storeId]);
+                    echo json_encode([
+                        'success' => true,
+                        'providerProbe' => $providerProbe,
+                        'mode' => 'static',
+                        'staticAddress' => $staticAddress,
+                        'tweakRange' => $tweakRange,
+                    ]);
+                    break;
+                }
+
+                $xpub = trim($_POST['xpub'] ?? '');
+                if ($xpub === '') {
+                    Database::update('stores', [
+                        'ecx_address_mode' => 'xpub',
+                        'ecx_xpub' => null,
+                        'ecx_static_address' => null,
+                    ] + $policy, 'id = ?', [$storeId]);
+                    echo json_encode(['success' => true, 'providerProbe' => $providerProbe, 'disabled' => true]);
+                    break;
+                }
+                $check = OnchainWallet::validateXpub($xpub, $network, $type);
+                if (!$check['valid']) {
+                    throw new Exception($check['error'] ?: 'Invalid xpub');
+                }
+                $existing = Database::fetchOne("SELECT ecx_xpub FROM stores WHERE id = ?", [$storeId]);
+                $xpubChanged = $existing && ($existing['ecx_xpub'] ?? null) !== $xpub;
+                $update = [
+                    'ecx_address_mode' => 'xpub',
+                    'ecx_xpub' => $xpub,
+                    'ecx_static_address' => null,
+                    'ecx_address_type' => $type,
+                ] + $policy;
+                // The counter is per xpub and shared with the Bitcoin rail, so
+                // the displayed next index is wherever that key already is.
+                $resumedIndex = null;
+                if ($xpubChanged) {
+                    $row = Database::fetchOne(
+                        "SELECT next_index FROM onchain_xpub_state WHERE xpub_hash = ?",
+                        [hash('sha256', $xpub)]
+                    );
+                    $resumedIndex = $row ? (int)$row['next_index'] : 0;
+                    $update['ecx_next_index'] = $resumedIndex;
+                }
+                Database::update('stores', $update, 'id = ?', [$storeId]);
+                echo json_encode([
+                    'success' => true,
+                    'providerProbe' => $providerProbe,
+                    'warnings' => $check['warnings'],
+                    'xpubChanged' => $xpubChanged,
+                    'resumedIndex' => $resumedIndex,
+                    'priceAvailable' => EcxRates::getEcxUsd() !== null,
+                ]);
+            } catch (Throwable $e) {
+                cashupay_status(400);
+                echo json_encode(['error' => $e->getMessage()]);
+            }
+            break;
+
+        case 'test_ecx_xpub':
+            Auth::requireAdmin();
+            // Next ECX address at the shared per-xpub counter, not consumed.
+            try {
+                require_once __DIR__ . '/includes/onchain/wallet.php';
+                $storeId = $_POST['store_id'] ?? '';
+                $store = Database::fetchOne(
+                    "SELECT ecx_xpub, ecx_address_type FROM stores WHERE id = ?", [$storeId]
+                );
+                if (!$store || empty($store['ecx_xpub'])) {
+                    throw new Exception('No eCash xpub configured for this store');
+                }
+                require_once __DIR__ . '/includes/onchain/payments.php';
+                $idx = OnchainPayments::nextIndexForXpub($store['ecx_xpub']);
+                $addr = OnchainWallet::deriveAddress(
+                    $store['ecx_xpub'], $store['ecx_address_type'] ?: 'P2WPKH', Chain::ECX_NETWORK, $idx
+                );
+                echo json_encode(['address' => $addr, 'index' => $idx]);
+            } catch (Throwable $e) {
+                cashupay_status(400);
+                echo json_encode(['error' => $e->getMessage()]);
+            }
+            break;
+
         case 'validate_onchain_xpub':
             Auth::requireAdmin();
             // Used by the admin store-settings form to validate + preview
@@ -2907,11 +3417,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         case 'test_onchain_xpub':
             Auth::requireAdmin();
-            // "Test xpub" button: derive the address at the current
-            // onchain_next_index without consuming it, so the user can
-            // confirm derivation matches their signing wallet.
+            // "Test xpub" button: derive the address at the shared per-xpub
+            // counter's next index without consuming it, so the user can
+            // confirm derivation matches their signing wallet. The counter
+            // (not stores.onchain_next_index) is read because an eCash
+            // allocation on the same key advances it too.
             try {
                 require_once __DIR__ . '/includes/onchain/wallet.php';
+                require_once __DIR__ . '/includes/onchain/payments.php';
                 $storeId = $_POST['store_id'] ?? '';
                 $store = Database::fetchOne(
                     "SELECT onchain_xpub, onchain_address_type, onchain_network, onchain_next_index
@@ -2921,7 +3434,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if (!$store || empty($store['onchain_xpub'])) {
                     throw new Exception('No xpub configured for this store');
                 }
-                $idx = (int)$store['onchain_next_index'];
+                $idx = OnchainPayments::nextIndexForXpub($store['onchain_xpub'], (int)$store['onchain_next_index']);
                 $addr = OnchainWallet::deriveAddress(
                     $store['onchain_xpub'],
                     $store['onchain_address_type'] ?: 'P2WPKH',
@@ -2931,43 +3444,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 echo json_encode(['address' => $addr, 'index' => $idx]);
             } catch (Throwable $e) {
                 // Throwable for the same GMP-less-host reason as save_onchain.
-                cashupay_status(400);
-                echo json_encode(['error' => $e->getMessage()]);
-            }
-            break;
-
-        case 'list_onchain_manual':
-            Auth::requireAdmin();
-            // List invoices awaiting manual confirmation. Scoped to a single
-            // store if store_id is provided; otherwise lists across every
-            // store the (admin) user can see.
-            try {
-                require_once __DIR__ . '/includes/onchain/payments.php';
-                $storeIds = null;
-                $storeId = $_GET['store_id'] ?? null;
-                if ($storeId) {
-                    $storeIds = [$storeId];
-                }
-                $rows = OnchainPayments::listNeedingManualConfirmation($storeIds);
-                $out = [];
-                foreach ($rows as $r) {
-                    $out[] = [
-                        'id' => $r['id'],
-                        'store_id' => $r['store_id'],
-                        'amount' => $r['amount'],
-                        'currency' => $r['currency'],
-                        'onchain_address' => $r['onchain_address'],
-                        'onchain_amount_sat' => (int)($r['onchain_amount_sat'] ?? 0),
-                        'onchain_amount_tweak_sats' => isset($r['onchain_amount_tweak_sats'])
-                            ? (int)$r['onchain_amount_tweak_sats'] : null,
-                        'created_at' => $r['created_at'],
-                        'expiration_time' => $r['expiration_time'],
-                        'status' => $r['status'],
-                        'candidates' => $r['onchain_manual_candidates_decoded'],
-                    ];
-                }
-                echo json_encode(['invoices' => $out]);
-            } catch (Exception $e) {
                 cashupay_status(400);
                 echo json_encode(['error' => $e->getMessage()]);
             }
@@ -2985,7 +3461,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if ($invoiceId === '' || $txid === '') {
                     throw new Exception('invoice_id and txid required');
                 }
-                OnchainPayments::manuallyAttribute($invoiceId, $txid, $vout);
+                // 'btc' (default) | 'ecx': which chain's candidate list.
+                $chainId = (string)($_POST['chain'] ?? Chain::BTC);
+                if (!in_array($chainId, [Chain::BTC, Chain::ECX], true)) {
+                    throw new Exception('Invalid chain');
+                }
+                OnchainPayments::manuallyAttribute($invoiceId, $txid, $vout, Chain::get($chainId));
                 echo json_encode(['success' => true]);
             } catch (Exception $e) {
                 cashupay_status(400);
@@ -3008,10 +3489,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     throw new Exception('Store ID required');
                 }
 
-                // Configurable order the four destination TYPES are tried in
-                // (see RailOrder). Validated up front (strict permutation of
-                // strike,lnaddress,nwc,noffer) so a bad order fails before any
-                // probe runs; persisted only after the chain saves below.
+                // Configurable order the Lightning paths are tried in (see
+                // RailOrder). Validated up front (strict permutation of
+                // strike,lnaddress,nwc,noffer,swap,cashu — or the legacy
+                // four-type shape) so a bad order fails before any probe
+                // runs; persisted only after the chain saves below.
                 // Absent = legacy caller → stored order left untouched.
                 $railOrder = isset($_POST['rail_order'])
                     ? RailOrder::parseLnOrder((string)$_POST['rail_order'])
@@ -3186,8 +3668,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if ($strikeOnchainParam !== null) {
                     OnchainConfig::setStrikeEnabled($storeId, (int)$strikeOnchainParam);
                 }
+                $strictCleared = false;
                 if ($railOrder !== null) {
                     RailOrder::setLnOrder($storeId, implode(',', $railOrder));
+                    // Strict no-mint-fallback means "when the swap fails,
+                    // never fall back to the mint" — meaningless once the
+                    // operator puts the Cashu mint AHEAD of the swap. Moving
+                    // the mint up is that decision, so the flag is cleared
+                    // here (and reported, so the UI can say so and refresh
+                    // the swaps card). The swaps card refuses to re-pin
+                    // strict while the order stays this way round.
+                    require_once __DIR__ . '/includes/swap/config.php';
+                    if (RailOrder::cashuPrecedesSwap($railOrder)
+                            && SwapsConfig::strictNoMintFallbackForStore($storeId)) {
+                        SwapsConfig::setStoreStrictOverride($storeId, SwapsConfig::FORCE_OFF);
+                        $strictCleared = true;
+                    }
                 }
 
                 echo json_encode([
@@ -3195,9 +3691,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     // Per-address LUD-21 results, in priority order.
                     'addresses' => $addressResults,
                     'strikeOnchainEnabled' => OnchainConfig::strikeEnabledForStore($storeId),
-                    // Effective type order after this save (permutation of
-                    // strike,lnaddress,nwc,noffer).
+                    // Effective path order after this save (permutation of
+                    // strike,lnaddress,nwc,noffer,swap,cashu).
                     'railOrder' => RailOrder::lnOrderForStore($storeId),
+                    // True when this save turned strict no-mint-fallback off
+                    // because the Cashu mint now precedes the swap.
+                    'strictCleared' => $strictCleared,
                 ]);
             } catch (Exception $e) {
                 cashupay_status(400);
@@ -3570,6 +4069,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     if (!in_array($rawStrict, ['0', '1'], true)) {
                         throw new Exception('Invalid mint-fallback mode');
                     }
+                    // Strict ("when the swap fails, never fall back to the
+                    // mint") has no meaning while the Cashu mint is tried
+                    // BEFORE the swap in the Lightning payment path order —
+                    // refuse rather than store a flag that can't apply.
+                    require_once __DIR__ . '/includes/rail_order.php';
+                    if ((int)$rawStrict === SwapsConfig::FORCE_ON
+                            && RailOrder::cashuPrecedesSwap(RailOrder::lnOrderForStore($storeId))) {
+                        throw new Exception(
+                            'Strict mode can\'t be turned on while the Cashu mint is ahead of the '
+                            . 'submarine swap in the payment path priority (Lightning payments card). '
+                            . 'Move the Cashu mint below the swap first.'
+                        );
+                    }
                     SwapsConfig::setStoreStrictOverride($storeId, (int)$rawStrict);
                 }
 
@@ -3887,6 +4399,25 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 }
                 if (empty($mintUrl)) {
                     throw new Exception('Mint URL required');
+                }
+                if (!Config::getStore($storeId)) {
+                    throw new Exception('Store not found');
+                }
+                // A backup that IS the primary, or one already listed, would
+                // either be a no-op (getStoreAllMintUrls drops a backup equal
+                // to the primary) or trip the (store_id, mint_url) unique
+                // constraint with an opaque SQL error — refuse up front.
+                $normalized = rtrim(trim((string)$mintUrl), '/');
+                $primaryNow = rtrim((string)(Config::getStoreMintUrl($storeId) ?? ''), '/');
+                if ($primaryNow !== '' && strcasecmp($normalized, $primaryNow) === 0) {
+                    throw new Exception(
+                        'That is already this store\'s main mint — a backup mint needs to be a different one.'
+                    );
+                }
+                foreach (Config::getStoreBackupMints($storeId) as $existing) {
+                    if (strcasecmp(rtrim((string)$existing['mint_url'], '/'), $normalized) === 0) {
+                        throw new Exception('That mint is already one of this store\'s backup mints.');
+                    }
                 }
 
                 // Test connection first
@@ -5214,7 +5745,11 @@ header('Cache-Control: no-cache, must-revalidate');
             border-radius: 20px;
             padding: 1.5rem;
             margin-bottom: 1.5rem;
-            color: white;
+            /* Black on the orange gradient: white text washed out against
+               the lighter end of the ramp. Every child (label, amount, unit,
+               notes, buttons) inherits or sets #000 so the card reads as
+               one block. */
+            color: #000;
         }
 
         .balance-label {
@@ -5251,7 +5786,7 @@ header('Cache-Control: no-cache, must-revalidate');
             background: rgba(255, 255, 255, 0.2);
             border: none;
             border-radius: 12px;
-            color: white;
+            color: #000;
             font-size: 0.875rem;
             font-weight: 500;
             cursor: pointer;
@@ -6156,6 +6691,160 @@ header('Cache-Control: no-cache, must-revalidate');
         .inv-table tbody tr:hover {
             background: var(--bg-hover, rgba(255,255,255,0.02));
         }
+        /* Every invoice row opens the invoice detail modal. */
+        .inv-table tbody tr.inv-row {
+            cursor: pointer;
+        }
+
+        /* Invoice detail modal (#modal-invoice-detail) */
+        .invd-head {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            flex-wrap: wrap;
+            margin: -0.5rem 0 0.25rem;
+        }
+        .invd-id {
+            font-family: monospace;
+            font-size: 0.78rem;
+            color: var(--text-secondary);
+            word-break: break-all;
+        }
+        .invd-section {
+            margin-top: 1rem;
+        }
+        .invd-section-title {
+            font-size: 0.75rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+            color: var(--text-secondary);
+            margin-bottom: 0.4rem;
+            padding-bottom: 0.25rem;
+            border-bottom: 1px solid var(--border);
+        }
+        .invd-grid {
+            display: grid;
+            grid-template-columns: minmax(110px, 32%) 1fr;
+            gap: 0.3rem 0.75rem;
+            font-size: 0.85rem;
+            margin: 0;
+        }
+        .invd-grid dt {
+            color: var(--text-secondary);
+        }
+        .invd-grid dd {
+            margin: 0;
+            min-width: 0;
+            word-break: break-word;
+        }
+        .invd-mono {
+            font-family: monospace;
+            font-size: 0.78rem;
+            word-break: break-all;
+        }
+        .invd-grid a,
+        .invd-attempt a {
+            color: var(--accent, #60a5fa);
+        }
+        .invd-copy {
+            font-size: 0.72rem;
+            margin-left: 0.3rem;
+            white-space: nowrap;
+            color: var(--accent, #60a5fa);
+        }
+        .invd-group-title {
+            font-size: 0.8rem;
+            font-weight: 600;
+            margin: 0.6rem 0 0.15rem;
+        }
+        .invd-attempt {
+            display: flex;
+            gap: 0.6rem;
+            align-items: flex-start;
+            padding: 0.4rem 0;
+            border-bottom: 1px solid var(--border);
+            font-size: 0.82rem;
+        }
+        .invd-attempt:last-child {
+            border-bottom: none;
+        }
+        .invd-attempt-time {
+            color: var(--text-secondary);
+            font-size: 0.72rem;
+            white-space: nowrap;
+            min-width: 7.5rem;
+        }
+        .invd-attempt-body {
+            flex: 1;
+            min-width: 0;
+        }
+        .invd-attempt-label {
+            color: var(--text-secondary);
+            font-size: 0.75rem;
+            word-break: break-all;
+        }
+        .invd-attempt-reason {
+            font-size: 0.8rem;
+            margin-top: 0.1rem;
+        }
+        .invd-attempt-detail {
+            color: var(--text-secondary);
+            font-size: 0.73rem;
+            margin-top: 0.1rem;
+            word-break: break-word;
+        }
+        .invd-outcome {
+            display: inline-block;
+            padding: 0.05rem 0.45rem;
+            border-radius: 999px;
+            font-size: 0.68rem;
+            font-weight: 600;
+            white-space: nowrap;
+            margin-top: 0.1rem;
+        }
+        .invd-outcome.ok {
+            background: rgba(72, 187, 120, 0.18);
+            color: var(--success, #48bb78);
+        }
+        .invd-outcome.failed {
+            background: rgba(239, 68, 68, 0.18);
+            color: #ef4444;
+        }
+        .invd-outcome.skipped {
+            background: rgba(247, 147, 26, 0.18);
+            color: var(--accent, #f7931a);
+        }
+        .invd-note {
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            margin: 0.25rem 0 0;
+        }
+        details.invd-raw summary {
+            cursor: pointer;
+            font-size: 0.78rem;
+            color: var(--text-secondary);
+        }
+        details.invd-raw pre {
+            font-size: 0.72rem;
+            overflow-x: auto;
+            background: rgba(0, 0, 0, 0.25);
+            padding: 0.5rem;
+            border-radius: 6px;
+            margin: 0.4rem 0 0;
+        }
+        @media (max-width: 500px) {
+            .invd-grid {
+                grid-template-columns: 1fr;
+                gap: 0.1rem 0;
+            }
+            .invd-grid dt {
+                margin-top: 0.35rem;
+            }
+            .invd-attempt {
+                flex-wrap: wrap;
+            }
+        }
         .inv-table td.inv-amount {
             text-align: right;
             white-space: nowrap;
@@ -6776,10 +7465,16 @@ header('Cache-Control: no-cache, must-revalidate');
                                 <label class="form-label">Payment path priority</label>
                                 <p class="form-help" style="margin-top:0;">
                                     Lightning payment paths are tried in this order when an
-                                    invoice is generated (and when withdrawing) &mdash; you can
-                                    use multiple paths. Use the arrows to reorder. Entries
-                                    inside each path keep their own order from the sections
-                                    below. Saved with the button at the bottom of this card.
+                                    invoice is generated &mdash; you can use multiple paths,
+                                    including the submarine swap and the store&rsquo;s Cashu
+                                    mint. Use the arrows to reorder. Entries inside each path
+                                    keep their own order from the sections below. Withdrawals
+                                    (auto-cashout of the mint balance) follow the same order
+                                    across the Strike / address / NWC / noffer paths only
+                                    &mdash; the mint is never paid out to itself. A greyed
+                                    path isn&rsquo;t active for this store yet; its position
+                                    still saves. Saved with the button at the bottom of this
+                                    card.
                                 </p>
                                 <div id="ln-rail-order-list"></div>
                             </div>
@@ -6964,6 +7659,40 @@ header('Cache-Control: no-cache, must-revalidate');
                             <div id="cashu-cashout-body"<?= $cashuEnvError !== null
                                 ? ' data-env-error="1" style="opacity: 0.5; pointer-events: none;"'
                                 : '' ?>>
+                            <!-- Mints: the store's main mint plus its backup mints
+                                 (the same store_mints rows the store details modal
+                                 manages), so a backup can be added right where the
+                                 mint was enabled. Rendered by renderCashuMintsBlock. -->
+                            <div id="cashu-mints-block" style="margin-bottom:1.25rem; padding-bottom:1rem; border-bottom:1px solid var(--border);">
+                                <label class="form-label">Mints</label>
+                                <p class="form-help" style="margin-top:0;">
+                                    The main mint issues this store&rsquo;s Lightning invoices on the
+                                    Cashu path; backup mints take over when it is unavailable. A
+                                    backup must support the same unit as the main mint.
+                                </p>
+                                <div style="margin-bottom:0.6rem;">
+                                    <span style="color: var(--text-secondary); font-size:0.85rem;">Main mint:</span>
+                                    <code id="cashu-primary-mint" style="font-size:0.8rem; word-break:break-all;"></code>
+                                </div>
+                                <div style="color: var(--text-secondary); font-size:0.85rem; margin-bottom:0.35rem;">Backup mints</div>
+                                <div id="cashu-backup-mints-list"><div class="loading"><div class="spinner"></div></div></div>
+                                <div id="cashu-add-backup-mint-form" style="display:none; margin-top:0.75rem;">
+                                    <div style="display:flex; gap:0.5rem; margin-bottom:0.5rem;">
+                                        <input type="url" id="cashu-backup-mint-url" class="form-input"
+                                               placeholder="https://mint.example.com" style="flex:1; font-size:0.85rem;">
+                                        <button type="button" class="btn btn-secondary" id="btn-cashu-discover-backup-mint"
+                                                style="width:auto; white-space:nowrap; font-size:0.8rem;">Discover</button>
+                                    </div>
+                                    <div style="display:flex; gap:0.5rem;">
+                                        <button type="button" class="btn" id="btn-cashu-add-backup-mint" style="flex:1; font-size:0.8rem;">Add</button>
+                                        <button type="button" class="btn btn-secondary" id="btn-cashu-cancel-backup-mint" style="flex:1; font-size:0.8rem;">Cancel</button>
+                                    </div>
+                                </div>
+                                <button type="button" class="btn btn-secondary btn-full" id="btn-cashu-show-add-backup-mint"
+                                        style="margin-top:0.5rem; font-size:0.85rem;">
+                                    + Add Backup Mint
+                                </button>
+                            </div>
                             <label class="form-label">Cashu automatic cashout</label>
                             <div id="aw-store" data-aw data-aw-scope="store">
                             <p class="aw-title">auto-cashout settings</p>
@@ -7273,6 +8002,148 @@ header('Cache-Control: no-cache, must-revalidate');
                             </div>
                             <button class="btn btn-full" id="btn-save-onchain" style="margin-top: 0.5rem;">
                                 Save on-chain settings
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- eCash (ECX) payments: the second chain-watched rail. ECX is
+                         the 2026 Drivechain hard fork of Bitcoin; addresses and xpubs
+                         are identical to Bitcoin's, so the card mirrors the on-chain
+                         card (xpub or static address, confirmation policy, own
+                         explorer) and offers the Bitcoin xpub as a one-click shortcut.
+                         Backed by save_ecx / save_ecx_offer / test_ecx_xpub. -->
+                    <div class="card collapsible collapsed" id="card-store-ecx">
+                        <div class="card-header">
+                            <div class="card-title">eCash (ECX) payments</div>
+                        </div>
+                        <div class="card-body">
+                            <p class="form-help" style="margin-bottom: 1rem;">
+                                Accept <a href="https://ecash.com" target="_blank" rel="noopener noreferrer">eCash (ECX)</a>,
+                                the Drivechain fork of Bitcoin, alongside your Bitcoin and Lightning options. ECX
+                                addresses and xpubs are the same format as Bitcoin&rsquo;s, so you can reuse your
+                                Bitcoin xpub or give a separate one &mdash; every invoice gets a fresh address and
+                                an address is never shown for both chains. Amounts are quoted in
+                                <strong>szats</strong> (1 ECX = 100,000,000 szats) at the CoinMarketCap price;
+                                when no price is available the eCash option is left off the invoice.
+                                Payments land straight in your ECX wallet; the dev fee and any hosting fee on
+                                eCash revenue are owed in ECX and collected only by occasionally routing an
+                                invoice&rsquo;s eCash address to the fee payee (the Bitcoin and Lightning options
+                                on that invoice stay yours).
+                            </p>
+                            <?php if ($gmpEnvError !== null): ?>
+                                <div style="margin-bottom:1rem; padding:0.75rem; border-radius:8px; background:rgba(245,158,11,0.12); border:1px solid rgba(245,158,11,0.35); font-size:0.85rem;">
+                                    <strong>&#9888; Xpub mode is unavailable on this server.</strong>
+                                    <?= htmlspecialchars($gmpEnvError) ?>
+                                    A single static address still works.
+                                </div>
+                            <?php endif; ?>
+                            <p class="form-help" id="ecx-price-line" style="margin-bottom: 1rem;">ECX price: &mdash;</p>
+
+                            <div class="form-group">
+                                <label class="form-label">Offer eCash to customers</label>
+                                <select class="form-input" id="ecx-offer-override" onchange="ecxOfferChanged()">
+                                    <option value="1">On for this store</option>
+                                    <option value="0">Off &mdash; keep the settings, hide the eCash tab</option>
+                                </select>
+                                <p class="form-help">
+                                    Currently effective: <strong id="ecx-offer-effective">&mdash;</strong>.
+                                </p>
+                            </div>
+
+                            <div class="form-group">
+                                <label class="form-label">Address source</label>
+                                <select class="form-input" id="ecx-mode">
+                                    <option value="xpub">Extended public key (recommended)</option>
+                                    <option value="static">Single static address (not recommended)</option>
+                                </select>
+                            </div>
+                            <div id="ecx-static-warning" style="display:none; margin-bottom:1rem; padding:0.75rem; border-radius:8px; background:rgba(245,158,11,0.12); border:1px solid rgba(245,158,11,0.35); font-size:0.85rem;">
+                                <strong>&#9888; Static address re-use is strongly discouraged.</strong>
+                                Each invoice gets a unique szat-tweak so totals don&rsquo;t collide; customers must
+                                pay the exact amount in a single transaction, and multi-part payments cannot be
+                                attributed.
+                            </div>
+                            <div class="form-group" id="ecx-xpub-row">
+                                <label class="form-label">Extended public key (xpub / zpub / ypub)</label>
+                                <textarea class="form-input" id="ecx-xpub" rows="2"
+                                          style="font-family: monospace; font-size: 0.85rem;"
+                                          placeholder="xpub... or zpub..."></textarea>
+                                <p class="form-help" id="ecx-xpub-meta"></p>
+                                <button type="button" class="btn btn-secondary" id="btn-ecx-use-btc-xpub" style="margin-top: 0.5rem;">
+                                    Use my Bitcoin xpub
+                                </button>
+                                <p class="form-help" id="ecx-use-btc-help" style="margin-top: 0.35rem;"></p>
+                            </div>
+                            <div class="form-group" id="ecx-static-address-row" style="display:none;">
+                                <label class="form-label">Static receive address</label>
+                                <input type="text" class="form-input" id="ecx-static-address"
+                                       style="font-family: monospace; font-size: 0.85rem;"
+                                       placeholder="bc1q... / 3... / 1...">
+                                <p class="form-help" id="ecx-static-address-meta">
+                                    Paste a single address from your ECX wallet. The server will reuse it for
+                                    every invoice. Leave blank to disable eCash payments.
+                                </p>
+                            </div>
+                            <div class="subsection collapsed" id="ecx-advanced">
+                            <div class="subsection-toggle">Advanced</div>
+                            <div class="subsection-body">
+                            <div class="form-group" id="ecx-static-tweak-row" style="display:none;">
+                                <label class="form-label">Tweak range (number of unique szat-offsets; each open invoice consumes one slot)</label>
+                                <input type="number" class="form-input" id="ecx-static-tweak-range" min="100" max="100000" value="1000">
+                            </div>
+                            <div class="form-group" id="ecx-address-type-row">
+                                <label class="form-label">Address type</label>
+                                <select class="form-input" id="ecx-address-type">
+                                    <option value="P2WPKH">P2WPKH (native segwit, recommended)</option>
+                                    <option value="P2SH-P2WPKH">P2SH-P2WPKH (wrapped segwit)</option>
+                                </select>
+                                <p class="form-help">The xpub prefix doesn&rsquo;t pin a script type &mdash; pick the one your ECX wallet uses.</p>
+                            </div>
+                            <p class="form-help" id="ecx-address-type-inferred" style="display:none;"></p>
+                            <div class="form-group">
+                                <label class="form-label">
+                                    Required confirmations (0 = accept zero-conf)
+                                    <span class="info-tip" tabindex="0" aria-label="More info">i<span class="info-tip-text">
+                                        Defaults to the value chosen for Bitcoin on first save; change it here for
+                                        eCash only. ECX retargets difficulty every 288 blocks, so block times vary
+                                        more than Bitcoin&rsquo;s. Payments that signal replace-by-fee wait for one
+                                        confirmation regardless.
+                                    </span></span>
+                                </label>
+                                <input type="number" class="form-input" id="ecx-min-confs" min="0" max="100" value="1">
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">Confirmation window (seconds; how long to wait once a tx appears in the mempool)</label>
+                                <input type="number" class="form-input" id="ecx-confirm-timeout" min="60" value="86400">
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">Explorer API URL (optional &mdash; leave blank for explorer.ecash.com with automatic esplora.ecash.ninja fallback)</label>
+                                <input type="text" class="form-input" id="ecx-provider-url"
+                                       placeholder="https://explorer.ecash.com/api">
+                                <p class="form-help">
+                                    The API base of your own ECX Esplora instance. It is checked when you save
+                                    (it must answer <code>/blocks/tip/height</code>). A LAN or localhost
+                                    address additionally needs private endpoints enabled on this server.
+                                </p>
+                                <label style="display:block; margin-top: 0.6rem; font-size: 0.9rem;">
+                                    <input type="checkbox" id="ecx-provider-fallback">
+                                    If my explorer is unreachable, fall back to the public ECX explorers
+                                    (explorer.ecash.com, then esplora.ecash.ninja)
+                                </label>
+                            </div>
+                            </div><!-- /.subsection-body -->
+                            </div><!-- /#ecx-advanced -->
+                            <div id="ecx-validation-box" style="display:none; margin: 0.75rem 0; padding: 0.75rem; border-radius: 8px; font-size: 0.85rem;"></div>
+                            <div id="ecx-xpub-buttons">
+                                <button class="btn btn-secondary btn-full" id="btn-validate-ecx" style="margin-top: 0.5rem;">
+                                    Validate &amp; preview first 3 addresses
+                                </button>
+                                <button class="btn btn-secondary btn-full" id="btn-test-ecx" style="margin-top: 0.5rem;">
+                                    Test current next address (m/0/<span id="ecx-current-index">0</span>)
+                                </button>
+                            </div>
+                            <button class="btn btn-full" id="btn-save-ecx" style="margin-top: 0.5rem;">
+                                Save eCash settings
                             </button>
                         </div>
                     </div>
@@ -7707,6 +8578,17 @@ header('Cache-Control: no-cache, must-revalidate');
                                        placeholder="you@yourdomain.com">
                                 <p class="form-help">Lightning address where the hosting fee is sent.</p>
                             </div>
+                            <div class="form-group">
+                                <label class="form-label">Hosting Fee eCash (ECX) xpub</label>
+                                <textarea class="form-input" id="hosting-fee-ecx-xpub" rows="2"
+                                          style="font-family: monospace; font-size: 0.85rem;"
+                                          placeholder="xpub... or zpub... (optional)"></textarea>
+                                <p class="form-help">
+                                    Hosting fees on eCash (ECX) revenue are owed in ECX and can only be collected by
+                                    routing an invoice&rsquo;s eCash address to this xpub. Leave blank and ECX
+                                    hosting fees only accrue.
+                                </p>
+                            </div>
                             <button class="btn btn-full" id="btn-save-hosting-fee">Save Hosting Fee</button>
                         </div>
                     </div>
@@ -8051,12 +8933,14 @@ header('Cache-Control: no-cache, must-revalidate');
                 </div>
 
                 <!--
-                    Cron URL — surfaces the operator-facing curl command so an
-                    admin can set up a system cron entry. The key is auto-
-                    generated lazily by the cron-url admin action; the
-                    same key authenticates `?key=...` in cron.php. Optional —
-                    background tasks also fire opportunistically from admin
-                    page-loads (5-min gate) and checkout views.
+                    Cron URL — surfaces the operator-facing keyed URL (for
+                    hosting panels / scheduler services) and the matching curl
+                    crontab line (for shell users). The key is auto-generated
+                    lazily by the cron-url admin action; the same key
+                    authenticates `?key=...` (or the X-CRON-KEY header) in
+                    cron.php. Optional — background tasks also fire
+                    opportunistically from admin page-loads (5-min gate) and
+                    checkout views.
                 -->
                 <div class="card collapsible collapsed" data-admin-only="true" id="card-cron-url">
                     <div class="card-header">
@@ -8064,17 +8948,25 @@ header('Cache-Control: no-cache, must-revalidate');
                     </div>
                     <div class="card-body">
                         <p style="font-size: 0.85rem; color: var(--text-secondary); margin: 0 0 0.75rem 0;">
-                            Optional but recommended. Adding the line below to your hosting's system
-                            cron makes invoice polling, auto-cashout, and fee settlement run on a
+                            Optional but recommended. Scheduling a visit to the URL below every
+                            minute makes invoice polling, auto-cashout, and fee settlement run on a
                             tight, predictable schedule. Without it, background tasks fire
                             opportunistically when an admin or customer loads a page.
+                            Your hosting panel's cron tool, a free scheduler service, or an uptime
+                            monitor can all do this &mdash; no special headers needed.
+                            The key is part of the URL, so treat it like a password and don't share it.
                         </p>
                         <div class="form-group">
-                            <label class="form-label">Main cron (every minute)</label>
-                            <code id="cron-url-display" style="display: block; background: rgba(0,0,0,0.2); padding: 0.75rem; border-radius: 8px; font-size: 0.85rem; word-break: break-all; user-select: all;">Loading…</code>
+                            <label class="form-label">Cron URL (visit every minute)</label>
+                            <code id="cron-plain-url-display" style="display: block; background: rgba(0,0,0,0.2); padding: 0.75rem; border-radius: 8px; font-size: 0.85rem; word-break: break-all; user-select: all;">Loading…</code>
                             <p class="form-help" id="cron-url-status" style="margin-top: 0.4rem;">Checking…</p>
                         </div>
-                        <button class="btn btn-secondary btn-full" id="btn-copy-cron-url">Copy</button>
+                        <button class="btn btn-secondary btn-full" id="btn-copy-cron-plain-url">Copy URL</button>
+                        <div class="form-group" style="margin-top: 1rem;">
+                            <label class="form-label">Crontab line (if you have shell access)</label>
+                            <code id="cron-url-display" style="display: block; background: rgba(0,0,0,0.2); padding: 0.75rem; border-radius: 8px; font-size: 0.85rem; word-break: break-all; user-select: all;">Loading…</code>
+                        </div>
+                        <button class="btn btn-secondary btn-full" id="btn-copy-cron-url">Copy crontab line</button>
 
                         <hr style="border: 0; border-top: 1px solid var(--border); margin: 1rem 0;">
 
@@ -8088,11 +8980,16 @@ header('Cache-Control: no-cache, must-revalidate');
                             Skip this entirely if you don't use submarine swaps.
                         </p>
                         <div class="form-group">
-                            <label class="form-label">Swap fast-lane cron (every 10 seconds)</label>
-                            <code id="cron-swaps-url-display" style="display: block; background: rgba(0,0,0,0.2); padding: 0.75rem; border-radius: 8px; font-size: 0.85rem; word-break: break-all; user-select: all;">Loading…</code>
+                            <label class="form-label">Swap fast-lane URL (visit every 10 seconds)</label>
+                            <code id="cron-swaps-plain-url-display" style="display: block; background: rgba(0,0,0,0.2); padding: 0.75rem; border-radius: 8px; font-size: 0.85rem; word-break: break-all; user-select: all;">Loading…</code>
                             <p class="form-help" id="cron-swaps-url-status" style="margin-top: 0.4rem;">Checking…</p>
                         </div>
-                        <button class="btn btn-secondary btn-full" id="btn-copy-cron-swaps-url">Copy</button>
+                        <button class="btn btn-secondary btn-full" id="btn-copy-cron-swaps-plain-url">Copy URL</button>
+                        <div class="form-group" style="margin-top: 1rem;">
+                            <label class="form-label">Crontab line (if you have shell access)</label>
+                            <code id="cron-swaps-url-display" style="display: block; background: rgba(0,0,0,0.2); padding: 0.75rem; border-radius: 8px; font-size: 0.85rem; word-break: break-all; user-select: all;">Loading…</code>
+                        </div>
+                        <button class="btn btn-secondary btn-full" id="btn-copy-cron-swaps-url">Copy crontab line</button>
                     </div>
                 </div>
 
@@ -8167,14 +9064,19 @@ header('Cache-Control: no-cache, must-revalidate');
                         <button class="btn btn-secondary btn-full" id="btn-rollback-update" style="margin-bottom: 0.25rem;">Roll back to previous version</button>
                         <p class="form-help" id="auto-update-rollback-help">Restores the most recent backup. Disabled if no backup is available.</p>
                         <div class="form-group" style="margin-top: 1rem;">
-                            <label class="form-label">Dedicated updater cron line (recommended)</label>
-                            <code id="auto-update-cron-line" style="display: block; background: rgba(0,0,0,0.2); padding: 0.6rem; border-radius: 8px; font-size: 0.8rem; word-break: break-all; user-select: all;">Loading…</code>
+                            <label class="form-label">Dedicated updater URL (recommended, visit every 15 minutes)</label>
+                            <code id="auto-update-cron-url" style="display: block; background: rgba(0,0,0,0.2); padding: 0.6rem; border-radius: 8px; font-size: 0.8rem; word-break: break-all; user-select: all;">Loading…</code>
                             <p class="form-help">
-                                Optional but recommended: a second cron line that hits the isolated
-                                update.php directly, so updates keep working even if a bad build
-                                crashes the main app. The main cron line already nudges it as a
-                                fallback. Harmless until you enable auto-update.
+                                Optional but recommended: a second scheduled visit that hits the
+                                isolated update.php directly, so updates keep working even if a bad
+                                build crashes the main app. The main cron already nudges it as a
+                                fallback. Harmless until you enable auto-update. Same key as the
+                                main cron URL, so keep it private.
                             </p>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Crontab line (if you have shell access)</label>
+                            <code id="auto-update-cron-line" style="display: block; background: rgba(0,0,0,0.2); padding: 0.6rem; border-radius: 8px; font-size: 0.8rem; word-break: break-all; user-select: all;">Loading…</code>
                         </div>
                     </div>
                 </div>
@@ -8435,7 +9337,8 @@ header('Cache-Control: no-cache, must-revalidate');
                     <div class="card-body">
                         <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1rem;">
                             <div>
-                                <div class="stats-stat-row"><span class="stats-stat-label">Total revenue</span><span class="stats-stat-value" id="stats-revenue">—</span></div>
+                                <div class="stats-stat-row" title="Bitcoin and Lightning revenue in sats plus eCash (ECX) revenue converted at the current ECX price."><span class="stats-stat-label">Total revenue</span><span class="stats-stat-value" id="stats-revenue">—</span></div>
+                                <div class="stats-stat-row hidden" id="stats-ecx-revenue-row" title="Invoices paid in eCash (ECX), in szats, with the fiat value at the current ECX price. Included in Total revenue above."><span class="stats-stat-label">eCash (ECX) revenue</span><span class="stats-stat-value" id="stats-ecx-revenue">—</span></div>
                                 <div class="stats-stat-row"><span class="stats-stat-label">Total invoices</span><span class="stats-stat-value" id="stats-invoice-count">—</span></div>
                                 <div class="stats-stat-row"><span class="stats-stat-label">Total fees paid</span><span class="stats-stat-value" id="stats-total-fees">—</span></div>
                                 <div class="stats-stat-row"><span class="stats-stat-label">Total profit</span><span class="stats-stat-value" id="stats-profit">—</span></div>
@@ -8474,8 +9377,15 @@ header('Cache-Control: no-cache, must-revalidate');
                                 <div class="stats-stat-row" title="Submarine-swap fees paid by customers on swap-rail invoices (provider percentage + on-chain lockup miner fee, bundled into each LN invoice the customer paid).">
                                     <span class="stats-stat-label">Swap fees</span><span class="stats-stat-value" id="stats-fee-swap-paid">—</span>
                                 </div>
+                                <div class="stats-stat-row hidden" id="stats-fee-ecx-dev-row" title="Dev fee on eCash (ECX) revenue, owed and paid in ECX (collected by routing an invoice's eCash address to the fee payee). Shown in szats with the fiat value at the current ECX price.">
+                                    <span class="stats-stat-label">Dev fee (eCash)</span><span class="stats-stat-value" id="stats-fee-ecx-dev-paid">—</span>
+                                </div>
+                                <div class="stats-stat-row hidden" id="stats-fee-ecx-hosting-row" title="Hosting fee on eCash (ECX) revenue, owed and paid in ECX.">
+                                    <span class="stats-stat-label">Hosting fee (eCash)</span><span class="stats-stat-value" id="stats-fee-ecx-hosting-paid">—</span>
+                                </div>
                                 <hr style="border: 0; border-top: 1px solid var(--border); margin: 0.5rem 0;">
-                                <div class="stats-stat-row"><span class="stats-stat-label">Total fees owed</span><span class="stats-stat-value" id="stats-fees-owed">—</span></div>
+                                <div class="stats-stat-row" title="Dev + hosting fees still owed in sats, plus eCash fees owed converted at the current ECX price."><span class="stats-stat-label">Total fees owed</span><span class="stats-stat-value" id="stats-fees-owed">—</span></div>
+                                <div class="stats-stat-row hidden" id="stats-ecx-owed-row" title="Fees owed in eCash (ECX): dev + hosting, in szats. Collected only via the eCash fee redirect."><span class="stats-stat-label">Fees owed (eCash)</span><span class="stats-stat-value" id="stats-ecx-owed">—</span></div>
                                 <div class="stats-stat-row"><span class="stats-stat-label">Total fees paid</span><span class="stats-stat-value" id="stats-fees-paid">—</span></div>
                                 <div class="stats-stat-row" title="Total fees paid divided by total revenue, expressed as a percentage. Uses fees that actually settled, not amounts still owed.">
                                     <span class="stats-stat-label">Effective fee % (paid &divide; revenue)</span>
@@ -8842,13 +9752,14 @@ header('Cache-Control: no-cache, must-revalidate');
         </div>
     </div>
 
-    <!-- Admin invoice line-item detail -->
+    <!-- Invoice detail: opened from any invoice row (All Invoices table,
+         dashboard Recent invoices, Log tab). Filled by openInvoiceDetail. -->
     <div class="modal-overlay" id="modal-invoice-detail">
-        <div class="modal">
+        <div class="modal" style="max-width: 720px;">
             <div class="modal-handle"></div>
-            <div class="modal-title">Invoice items</div>
+            <div class="modal-title" id="invoice-detail-title">Invoice</div>
             <div id="invoice-detail-content"><div class="loading"><div class="spinner"></div></div></div>
-            <button class="btn btn-secondary btn-full" style="margin-top:0.5rem;" onclick="closeModal('modal-invoice-detail')">Close</button>
+            <button class="btn btn-secondary btn-full" style="margin-top:0.75rem;" onclick="closeModal('modal-invoice-detail')">Close</button>
         </div>
     </div>
 
@@ -8884,13 +9795,27 @@ header('Cache-Control: no-cache, must-revalidate');
                     </div>
                 </div>
                 <div class="form-group">
+                    <label class="form-label">Backup mint URL <span style="opacity:0.7; font-weight:normal;">(optional)</span></label>
+                    <div style="display:flex; gap:0.5rem;">
+                        <input type="url" class="form-input" id="enable-mint-backup-url"
+                               placeholder="https://backup-mint.example.com" style="flex:1;">
+                        <button type="button" class="btn btn-secondary" id="btn-enable-mint-backup-discover"
+                                style="width:auto; white-space:nowrap;">Discover</button>
+                    </div>
+                    <p class="form-help">
+                        Used when the main mint is unavailable. Must be a different mint that
+                        supports the same unit. You can add or change backup mints later in the
+                        Cashu section.
+                    </p>
+                </div>
+                <div class="form-group">
                     <label class="form-label">Currency unit</label>
                     <select class="form-input" id="enable-mint-unit">
                         <option value="sat">Bitcoin (sats)</option>
                         <option value="usd">USD</option>
                         <option value="eur">EUR</option>
                     </select>
-                    <p class="form-help">The mint must support the unit you pick.</p>
+                    <p class="form-help">The mint (and the backup, if given) must support the unit you pick.</p>
                 </div>
                 <div id="enable-mint-error" class="hidden" style="margin-bottom:0.75rem; color: var(--error); font-size: 0.85rem;"></div>
                 <button class="btn btn-full" id="btn-enable-mint-save">Enable mint</button>
@@ -9625,12 +10550,27 @@ header('Cache-Control: no-cache, must-revalidate');
             document.getElementById('btn-save-onchain').addEventListener('click', saveOnchain);
             document.getElementById('onchain-xpub').addEventListener('input', applyOnchainAddressTypeVisibility);
             document.getElementById('onchain-mode').addEventListener('change', applyOnchainModeVisibility);
+            document.getElementById('btn-validate-ecx').addEventListener('click', validateEcxXpub);
+            document.getElementById('btn-test-ecx').addEventListener('click', testEcxCurrent);
+            document.getElementById('btn-save-ecx').addEventListener('click', saveEcx);
+            document.getElementById('btn-ecx-use-btc-xpub').addEventListener('click', useBtcXpubForEcx);
+            document.getElementById('ecx-xpub').addEventListener('input', applyEcxAddressTypeVisibility);
+            document.getElementById('ecx-mode').addEventListener('change', applyEcxModeVisibility);
+            document.getElementById('ecx-provider-url').addEventListener('input', syncEcxProviderFallbackState);
             document.getElementById('btn-save-exchange-settings').addEventListener('click', saveExchangeSettings);
             document.getElementById('btn-save-hosting-fee').addEventListener('click', saveHostingFee);
             const copyCronBtn = document.getElementById('btn-copy-cron-url');
             if (copyCronBtn) copyCronBtn.addEventListener('click', copyCronUrl);
             const copyCronSwapsBtn = document.getElementById('btn-copy-cron-swaps-url');
             if (copyCronSwapsBtn) copyCronSwapsBtn.addEventListener('click', copyCronSwapsUrl);
+            const copyCronPlainBtn = document.getElementById('btn-copy-cron-plain-url');
+            if (copyCronPlainBtn) copyCronPlainBtn.addEventListener('click', function () {
+                copyCronPlainUrl('cron-plain-url-display', 'Cron URL');
+            });
+            const copyCronSwapsPlainBtn = document.getElementById('btn-copy-cron-swaps-plain-url');
+            if (copyCronSwapsPlainBtn) copyCronSwapsPlainBtn.addEventListener('click', function () {
+                copyCronPlainUrl('cron-swaps-plain-url-display', 'Swap fast-lane URL');
+            });
             const saveChannelBtn = document.getElementById('btn-save-update-channel');
             if (saveChannelBtn) saveChannelBtn.addEventListener('click', saveUpdateChannel);
             const autoUpdateToggle = document.getElementById('auto-update-enabled');
@@ -9705,7 +10645,28 @@ header('Cache-Control: no-cache, must-revalidate');
 
             // Enable-a-Cashu-mint flow (greyed-out Cashu section → modal).
             document.getElementById('btn-enable-cashu-mint').addEventListener('click', openEnableMintModal);
+            // Cashu section → Mints block (backup mints for the selected store).
+            document.getElementById('btn-cashu-show-add-backup-mint').addEventListener('click', () => {
+                document.getElementById('cashu-add-backup-mint-form').style.display = 'block';
+                document.getElementById('cashu-backup-mint-url').focus();
+            });
+            document.getElementById('btn-cashu-cancel-backup-mint').addEventListener('click', () => {
+                document.getElementById('cashu-add-backup-mint-form').style.display = 'none';
+                document.getElementById('cashu-backup-mint-url').value = '';
+            });
+            document.getElementById('btn-cashu-discover-backup-mint').addEventListener('click', () => {
+                discoveryContext = 'cashu-backup';
+                discoveryCallback = (url) => {
+                    document.getElementById('cashu-backup-mint-url').value = url;
+                };
+                openMintDiscoveryModal();
+            });
+            document.getElementById('btn-cashu-add-backup-mint').addEventListener('click', () => {
+                if (!currentStoreId) return;
+                addBackupMint(currentStoreId, '', cashuMintsBlockOpts());
+            });
             document.getElementById('btn-enable-mint-discover').addEventListener('click', openEnableMintDiscovery);
+            document.getElementById('btn-enable-mint-backup-discover').addEventListener('click', openEnableMintBackupDiscovery);
             document.getElementById('btn-enable-mint-save').addEventListener('click', submitEnableMint);
             document.getElementById('btn-enable-mint-done').addEventListener('click', () => {
                 closeModal('modal-enable-mint');
@@ -10332,7 +11293,7 @@ header('Cache-Control: no-cache, must-revalidate');
                 // Show mint status warning if unreachable
                 const balanceLabel = document.querySelector('.balance-label');
                 if (dashboardData.mintUnreachable) {
-                    balanceLabel.innerHTML = 'Balance stored in Cashu Mint <span style="color: #f59e0b; font-size: 0.75rem;">(mint offline - cached)</span>';
+                    balanceLabel.innerHTML = 'Balance stored in Cashu Mint <span style="color: #000; font-size: 0.75rem;">(mint offline - cached)</span>';
                     // Disable withdraw/export buttons when mint is unreachable
                     document.querySelectorAll('.withdraw-btn, .export-btn').forEach(btn => {
                         btn.disabled = true;
@@ -10358,6 +11319,7 @@ header('Cache-Control: no-cache, must-revalidate');
                 if (thresholdLabel) thresholdLabel.textContent = `Threshold (${unitLabel})`;
 
                 renderOnchainDashboard();
+                renderEcxDashboard();
 
                 // Update auto-melt settings (per-store)
                 if (dashboardData.autoMelt) {
@@ -10409,7 +11371,7 @@ header('Cache-Control: no-cache, must-revalidate');
                 // Static-address manual-confirmation banner. Visible on every
                 // admin view (it lives above the view containers) but the
                 // detailed queue lives on the invoices view.
-                updateOnchainManualBanner(dashboardData.onchain);
+                updateOnchainManualBanner(dashboardData.onchain, dashboardData.ecx);
                 loadOnchainManualList();
 
                 // Update-available banner (admin-only). Reads the cached
@@ -10786,8 +11748,42 @@ header('Cache-Control: no-cache, must-revalidate');
             }
         }
 
+        // eCash (ECX) figure: "12,345 szats (0.00012345 ECX)" plus the fiat
+        // value at the ECX price the summary carries (omitted when there is
+        // no price).
+        function formatEcxAmount(szats, ecx) {
+            const n = Number(szats || 0);
+            const coin = (n / 100_000_000).toFixed(8).replace(/\.?0+$/, '') || '0';
+            let out = `${n.toLocaleString()} ${n === 1 ? 'szat' : 'szats'} (${coin} ECX)`;
+            const summary = statsState.summary || {};
+            const currency = summary.currency || 'USD';
+            if (ecx && ecx.ecx_price && n > 0) {
+                const fiat = (n / 100_000_000) * Number(ecx.ecx_price);
+                const formattedFiat = fiat.toLocaleString(undefined, {
+                    style: 'currency', currency: currency, maximumFractionDigits: fiat >= 100 ? 0 : 2,
+                });
+                out += ` <span class="stats-stat-fiat">(${formattedFiat})</span>`;
+            }
+            return out;
+        }
+
         function renderStatsSummary(s) {
-            document.getElementById('stats-revenue').innerHTML = formatStatsAmount(s.revenue_sats);
+            // Headline totals carry the eCash ledger folded in (sats equivalent
+            // at the current ECX price); the per-source rows stay in sats.
+            document.getElementById('stats-revenue').innerHTML = formatStatsAmount(s.revenue_total_sats ?? s.revenue_sats);
+            const ecx = s.ecx || null;
+            const showEcx = !!(ecx && (ecx.revenue_szats > 0 || ecx.fees_paid.total > 0 || ecx.fees_owed.total > 0));
+            const ecxRow = (id, show, html) => {
+                const row = document.getElementById(id);
+                if (!row) return;
+                row.classList.toggle('hidden', !show);
+                if (show) row.querySelector('.stats-stat-value').innerHTML = html;
+            };
+            ecxRow('stats-ecx-revenue-row', showEcx, ecx ? formatEcxAmount(ecx.revenue_szats, ecx) : '');
+            ecxRow('stats-fee-ecx-dev-row', showEcx, ecx ? formatEcxAmount(ecx.fees_paid.dev, ecx) : '');
+            ecxRow('stats-fee-ecx-hosting-row', showEcx, ecx ? formatEcxAmount(ecx.fees_paid.hosting, ecx) : '');
+            ecxRow('stats-ecx-owed-row', showEcx, ecx ? formatEcxAmount(ecx.fees_owed.total, ecx)
+                + (ecx.price_available ? '' : ' <span class="stats-stat-fiat">(no ECX price — not included in the total above)</span>') : '');
             document.getElementById('stats-invoice-count').textContent = (s.invoice_count || 0).toLocaleString();
             document.getElementById('stats-total-fees').innerHTML = formatStatsAmount(s.fees_paid.total);
             document.getElementById('stats-profit').innerHTML = formatStatsAmount(s.profit_sats);
@@ -11244,6 +12240,9 @@ header('Cache-Control: no-cache, must-revalidate');
                 // Load offline Cashu acceptance settings
                 loadOfflineCashu(currentStoreId);
 
+                // Mints block in the Cashu section (main + backup mints)
+                renderCashuMintsBlock(currentStoreId);
+
             } catch (e) {
                 console.error(e);
                 showToast('Failed to load store settings', 'error');
@@ -11349,7 +12348,7 @@ header('Cache-Control: no-cache, must-revalidate');
                 const feeBadge = inv.feeRedirect ? feeRedirectBadge(inv.feeRedirect) : '';
 
                 return `
-                    <div class="list-item">
+                    <div class="list-item" data-invoice-id="${escapeAttr(inv.id)}">
                         <div class="list-icon ${statusClass}">${icon}</div>
                         <div class="list-content">
                             <div class="list-title">${description ? escapeHtml(description) : inv.id}${feeBadge}</div>
@@ -11362,6 +12361,7 @@ header('Cache-Control: no-cache, must-revalidate');
                     </div>
                 `;
             }).join('');
+            bindInvoiceRowClicks(container);
         }
 
         // ---- Detailed invoice table (All Invoices view) ----
@@ -11370,6 +12370,10 @@ header('Cache-Control: no-cache, must-revalidate');
         // network. Regtest has no public explorer; we still return a mainnet
         // URL so operators get *something* clickable — they know it'll 404.
         function mempoolUrl(kind, value, network) {
+            // network 'ecx' = the eCash (ECX) chain's public explorer.
+            if (network === 'ecx') {
+                return `https://explorer.ecash.com/${kind}/${encodeURIComponent(value)}`;
+            }
             const base = network === 'testnet' ? 'https://mempool.space/testnet'
                        : network === 'signet'  ? 'https://mempool.space/signet'
                        : 'https://mempool.space';
@@ -11445,6 +12449,7 @@ header('Cache-Control: no-cache, must-revalidate');
                 mint:    { icon: '⚡', label: 'Lightning (cashu)' },
                 strike:  { icon: '⚡', label: 'Lightning (Strike)' },
                 onchain: { icon: '🔗', label: 'On-chain' },
+                ecx:     { icon: '🪙', label: 'eCash (ECX)' },
                 swap:    { icon: '🔄', label: 'Swap' },
                 cashu:   { icon: '🥜', label: 'Cashu' },
             };
@@ -11514,9 +12519,10 @@ header('Cache-Control: no-cache, must-revalidate');
                 // swap-status badge appended when the swap isn't fully settled.
                 // Em-dash when there's neither a description nor a badge.
                 const feeBadge = inv.feeRedirect ? feeRedirectBadge(inv.feeRedirect) : '';
-                // Cart invoices get an inline link to their itemized breakdown.
+                // Cart invoices flag their itemized breakdown; the row click
+                // opens the invoice detail, which lists the items.
                 const itemsLink = inv.hasItems
-                    ? ` <a href="#" onclick="openInvoiceItems('${idEsc}'); return false;" style="font-size:0.78rem; color:var(--accent,#60a5fa); white-space:nowrap;">🛒 items</a>`
+                    ? ` <span class="inv-chip" title="Cart line items — open the invoice for the itemized list" style="white-space:nowrap;">🛒 items</span>`
                     : '';
                 const noteCell = (description || swapBadge || itemsLink || feeBadge)
                     ? `<div>${description ? escapeHtml(description) : ''}${swapBadge}${itemsLink}${feeBadge}</div>`
@@ -11541,14 +12547,14 @@ header('Cache-Control: no-cache, must-revalidate');
                 const destCell = inv.destination
                     ? `<span class="inv-mono">${inv.destinationIsLightning
                         ? renderCopyMono(inv.destination, 'Lightning destination')
-                        : renderMonoLink('address', inv.destination, network)}${strikeIdPart}${strikeRrPart}</span>`
+                        : renderMonoLink('address', inv.destination, inv.destinationChain === 'ecx' ? 'ecx' : network)}${strikeIdPart}${strikeRrPart}</span>`
                     : (inv.strikeInvoiceId
                         ? `<span class="inv-mono">${renderCopyMono(inv.strikeInvoiceId, 'Strike invoice ID')}</span>`
                         : '<span style="color: var(--text-secondary);">—</span>');
                 const txidCell = inv.txid
                     ? `<span class="inv-mono">${inv.txidIsLightning
                         ? renderCopyMono(inv.txid, 'Lightning invoice (bolt11)')
-                        : renderMonoLink('tx', inv.txid, network, inv.claimTxid ? 'Claim: ' + inv.claimTxid : null)}</span>`
+                        : renderMonoLink('tx', inv.txid, inv.txidChain === 'ecx' ? 'ecx' : network, inv.claimTxid ? 'Claim: ' + inv.claimTxid : null)}</span>`
                     : '<span style="color: var(--text-secondary);">—</span>';
 
                 // Display label for the status chip: "Settled" reads as
@@ -11557,7 +12563,7 @@ header('Cache-Control: no-cache, must-revalidate');
                 // state machine.
                 const statusLabel = inv.status === 'Settled' ? 'Paid' : inv.status;
                 return `
-                    <tr>
+                    <tr class="inv-row" data-invoice-id="${escapeAttr(inv.id)}">
                         <td><span class="inv-chip status-${escapeHtml(inv.status)}">${escapeHtml(statusLabel)}</span></td>
                         <td>${renderPaymentMethod(inv.paymentRail, inv.mintUrl)}</td>
                         <td>${idCell}</td>
@@ -11591,6 +12597,22 @@ header('Cache-Control: no-cache, must-revalidate');
                     </table>
                 </div>
             `;
+            bindInvoiceRowClicks(container);
+        }
+
+        // Row click -> invoice detail modal. Delegated on the list container
+        // (assigned, not added, so re-renders don't stack handlers). Clicks
+        // on the row's own interactive bits — explorer / copy links, the id
+        // tooltip, buttons — keep their own behaviour.
+        function bindInvoiceRowClicks(container) {
+            if (!container) return;
+            container.onclick = (e) => {
+                if (e.target.closest('a, button, input, select, .inv-id-tip')) return;
+                const row = e.target.closest('[data-invoice-id]');
+                if (row && container.contains(row)) {
+                    openInvoiceDetail(row.getAttribute('data-invoice-id'));
+                }
+            };
         }
 
         // Actions
@@ -12421,6 +13443,287 @@ header('Cache-Control: no-cache, must-revalidate');
             applyOnchainModeVisibility();
         }
 
+        // ---- eCash (ECX) payments card ----
+        // The twin of the on-chain card for the ECX rail (dashboardData.ecx,
+        // save_ecx / save_ecx_offer / test_ecx_xpub). Same derivation as
+        // Bitcoin, one network, szat units.
+        function applyEcxAddressTypeVisibility() {
+            const row = document.getElementById('ecx-address-type-row');
+            const inferredLine = document.getElementById('ecx-address-type-inferred');
+            const select = document.getElementById('ecx-address-type');
+            const typed = document.getElementById('ecx-xpub').value.trim();
+            let inferred = typed ? inferOnchainTypeFromXpub(typed) : null;
+            if (!inferred && !typed && dashboardData?.ecx?.enabled) {
+                inferred = inferOnchainTypeFromXpub(dashboardData.ecx.xpub || '');
+            }
+            if (inferred) {
+                select.value = inferred.type;
+                row.style.display = 'none';
+                inferredLine.style.display = 'block';
+                inferredLine.textContent = 'Address type: ' + inferred.type + ' (auto-detected from ' + inferred.prefix + ' prefix)';
+            } else {
+                row.style.display = '';
+                inferredLine.style.display = 'none';
+            }
+        }
+
+        function applyEcxModeVisibility() {
+            const isStatic = document.getElementById('ecx-mode').value === 'static';
+            document.getElementById('ecx-static-warning').style.display = isStatic ? 'block' : 'none';
+            document.getElementById('ecx-xpub-row').style.display = isStatic ? 'none' : '';
+            document.getElementById('ecx-static-address-row').style.display = isStatic ? '' : 'none';
+            document.getElementById('ecx-static-tweak-row').style.display = isStatic ? '' : 'none';
+            document.getElementById('ecx-xpub-buttons').style.display = isStatic ? 'none' : '';
+            const atRow = document.getElementById('ecx-address-type-row');
+            const atInf = document.getElementById('ecx-address-type-inferred');
+            if (isStatic) {
+                atRow.style.display = 'none';
+                atInf.style.display = 'none';
+            } else {
+                applyEcxAddressTypeVisibility();
+            }
+        }
+
+        function syncEcxProviderFallbackState() {
+            const url = document.getElementById('ecx-provider-url').value.trim();
+            const cb = document.getElementById('ecx-provider-fallback');
+            cb.disabled = url === '';
+            cb.parentElement.style.opacity = url === '' ? '0.55' : '';
+        }
+
+        function renderEcxDashboard() {
+            if (!dashboardData?.ecx) return;
+            const ex = dashboardData.ecx;
+            document.getElementById('ecx-mode').value = ex.mode || 'xpub';
+            document.getElementById('ecx-address-type').value = ex.addressType || 'P2WPKH';
+            // Operator decision: a not-yet-configured eCash rail starts from
+            // the Bitcoin card's confirmation policy; once saved, its own.
+            document.getElementById('ecx-min-confs').value = ex.enabled ? (ex.minConfs ?? 1) : (ex.btcMinConfs ?? 1);
+            document.getElementById('ecx-confirm-timeout').value = ex.enabled ? (ex.confirmTimeoutSec ?? 86400) : (ex.btcConfirmTimeoutSec ?? 86400);
+            document.getElementById('ecx-provider-url').value = ex.providerUrl || '';
+            document.getElementById('ecx-provider-fallback').checked = !!ex.providerFallback;
+            syncEcxProviderFallbackState();
+            document.getElementById('ecx-current-index').textContent = ex.nextIndex ?? 0;
+            document.getElementById('ecx-static-address').value = ex.staticAddress || '';
+            document.getElementById('ecx-static-tweak-range').value = ex.staticTweakRange ?? 1000;
+            const meta = document.getElementById('ecx-xpub-meta');
+            const xpubInput = document.getElementById('ecx-xpub');
+            if (ex.mode !== 'static' && ex.enabled) {
+                meta.innerHTML = 'Currently configured: <code style="word-break:break-all; font-size:0.8rem;">'
+                    + escapeHtml(ex.xpub || '(set)') + '</code>'
+                    + (ex.sameAsBtc ? ' (same as your Bitcoin xpub)' : '')
+                    + '<br>Paste a new xpub above to replace it.';
+                xpubInput.placeholder = '(unchanged — paste new xpub to replace)';
+            } else {
+                meta.textContent = '';
+                xpubInput.placeholder = 'xpub... or zpub...';
+            }
+            const useBtn = document.getElementById('btn-ecx-use-btc-xpub');
+            const useHelp = document.getElementById('ecx-use-btc-help');
+            if (ex.btcXpub) {
+                useBtn.style.display = '';
+                useHelp.textContent = 'Fills in the xpub configured on the Bitcoin tab. Addresses are shared per xpub, so no address is ever shown for both chains.';
+            } else {
+                useBtn.style.display = 'none';
+                useHelp.textContent = 'No Bitcoin xpub is configured on this store, so there is nothing to reuse — paste an xpub from your ECX wallet.';
+            }
+            const staticMeta = document.getElementById('ecx-static-address-meta');
+            if (ex.mode === 'static' && ex.enabled) {
+                staticMeta.innerHTML = 'Currently configured: <code style="word-break:break-all; font-size:0.8rem;">'
+                    + escapeHtml(ex.staticAddress || '(set)') + '</code>. Edit above to replace, or clear to disable.';
+            } else {
+                staticMeta.textContent = 'Paste a single address from your ECX wallet. The server will reuse it for every invoice. Leave blank to disable eCash payments.';
+            }
+            const offerSel = document.getElementById('ecx-offer-override');
+            const offerEff = document.getElementById('ecx-offer-effective');
+            if (offerSel) offerSel.value = ex.offerEnabled ? '1' : '0';
+            if (offerEff) {
+                offerEff.textContent = !ex.enabled ? 'off (no address source saved)'
+                    : (!ex.offerEnabled ? 'off' : (ex.priceAvailable ? 'on' : 'on, but hidden until an ECX price is available'));
+            }
+            const priceLine = document.getElementById('ecx-price-line');
+            if (priceLine) {
+                if (ex.priceAvailable) {
+                    priceLine.textContent = 'ECX price: $' + Number(ex.priceUsd).toLocaleString(undefined, {maximumFractionDigits: 4}) + ' (CoinMarketCap).';
+                } else {
+                    priceLine.textContent = 'ECX price: unavailable right now'
+                        + (ex.lastGoodPriceUsd ? ' (last seen $' + Number(ex.lastGoodPriceUsd).toLocaleString(undefined, {maximumFractionDigits: 4}) + ')' : '')
+                        + ' — eCash is not offered on new invoices until CoinMarketCap answers again.';
+                }
+            }
+            const hostingEcx = document.getElementById('hosting-fee-ecx-xpub');
+            if (hostingEcx) hostingEcx.value = ex.hostingFeeXpub || '';
+            applyEcxModeVisibility();
+        }
+
+        function useBtcXpubForEcx() {
+            const btc = dashboardData?.ecx?.btcXpub || '';
+            if (!btc) { showToast('No Bitcoin xpub configured on this store', 'error'); return; }
+            document.getElementById('ecx-mode').value = 'xpub';
+            document.getElementById('ecx-xpub').value = btc;
+            const t = dashboardData?.ecx?.btcAddressType;
+            if (t) document.getElementById('ecx-address-type').value = t;
+            applyEcxModeVisibility();
+            showToast('Bitcoin xpub filled in — validate, then save', 'success');
+        }
+
+        async function ecxOfferChanged() {
+            if (!currentStoreId) return;
+            const enabled = document.getElementById('ecx-offer-override').value;
+            try {
+                const resp = await postWithCsrf(adminUrl,
+                    `action=save_ecx_offer&store_id=${encodeURIComponent(currentStoreId)}&offer_enabled=${encodeURIComponent(enabled)}`);
+                const data = await resp.json();
+                if (resp.ok && data.success) {
+                    showToast('eCash offer setting saved', 'success');
+                    loadDashboard();
+                } else {
+                    showToast(data.error || 'Failed to save eCash setting', 'error');
+                }
+            } catch (e) {
+                showToast('Failed to save eCash setting', 'error');
+            }
+        }
+
+        function ecxBox(ok) {
+            const box = document.getElementById('ecx-validation-box');
+            box.style.display = 'block';
+            box.style.background = ok ? 'rgba(72, 187, 120, 0.1)' : 'rgba(245, 101, 101, 0.15)';
+            box.style.border = '1px solid ' + (ok ? 'rgba(72, 187, 120, 0.3)' : 'rgba(245, 101, 101, 0.3)');
+            return box;
+        }
+
+        async function validateEcxXpub() {
+            const xpub = document.getElementById('ecx-xpub').value.trim();
+            if (!xpub) { ecxBox(false).textContent = 'Paste an xpub first.'; return; }
+            const type = document.getElementById('ecx-address-type').value;
+            let res;
+            try {
+                res = await readJsonResponse(await postWithCsrf(adminUrl,
+                    `action=validate_onchain_xpub&xpub=${encodeURIComponent(xpub)}&network=mainnet&address_type=${type}`));
+            } catch (e) {
+                ecxBox(false).textContent = 'Could not reach the server. Check your connection and try again.';
+                return;
+            }
+            const data = res.data;
+            if (!res.ok || !data.valid) {
+                const box = ecxBox(false);
+                box.innerHTML = '<strong>Invalid: </strong>';
+                box.appendChild(document.createTextNode(data.error || (res.ok ? 'unknown' : `server error (HTTP ${res.status})`)));
+                return;
+            }
+            const box = ecxBox(true);
+            box.innerHTML = '<strong>Valid. </strong>Verify these match your ECX wallet\'s first 3 receive addresses:<br>';
+            const pre = document.createElement('pre');
+            pre.style.cssText = 'margin:0.5rem 0 0; font-size:0.85rem;';
+            pre.textContent = (data.preview || []).map((a, i) => 'm/0/' + i + ' = ' + a).join('\n');
+            box.appendChild(pre);
+            (data.warnings || []).forEach(w => {
+                const warn = document.createElement('div');
+                warn.style.cssText = 'margin-top:0.5rem; color:#f6ad55;';
+                warn.textContent = '⚠ ' + w;
+                box.appendChild(warn);
+            });
+        }
+
+        async function testEcxCurrent() {
+            if (!currentStoreId) { showToast('No store selected', 'error'); return; }
+            let res;
+            try {
+                res = await readJsonResponse(await postWithCsrf(adminUrl,
+                    `action=test_ecx_xpub&store_id=${encodeURIComponent(currentStoreId)}`));
+            } catch (e) {
+                ecxBox(false).textContent = 'Test failed: could not reach the server.';
+                return;
+            }
+            const data = res.data;
+            if (!res.ok || data.error) {
+                const box = ecxBox(false);
+                box.innerHTML = '<strong>Test failed:</strong> ';
+                box.appendChild(document.createTextNode(data.error || `server error (HTTP ${res.status})`));
+                return;
+            }
+            ecxBox(true).innerHTML = 'Current next address (m/0/' + data.index + '): <code>' + escapeHtml(data.address) + '</code>';
+        }
+
+        async function saveEcx() {
+            if (!currentStoreId) {
+                ecxBox(false).innerHTML = '<strong>No store selected.</strong> Pick a store from the dropdown at the top of the page first.';
+                showToast('No store selected', 'error');
+                return;
+            }
+            const mode = document.getElementById('ecx-mode').value;
+            const minConfs = document.getElementById('ecx-min-confs').value;
+            const timeout = document.getElementById('ecx-confirm-timeout').value;
+            const providerUrl = document.getElementById('ecx-provider-url').value.trim();
+            const providerFallback = (providerUrl !== '' && document.getElementById('ecx-provider-fallback').checked) ? '1' : '0';
+            const prevMode = dashboardData?.ecx?.mode || 'xpub';
+            const prevEnabled = !!dashboardData?.ecx?.enabled;
+            let body;
+            if (mode === 'static') {
+                const staticAddress = document.getElementById('ecx-static-address').value.trim();
+                const tweakRange = document.getElementById('ecx-static-tweak-range').value;
+                if (staticAddress === '' && prevEnabled) {
+                    const ok = await confirmOnchain('Disable eCash payments?',
+                        'Saving with an empty static address will disable eCash (ECX) payments for this store.');
+                    if (!ok) { ecxBox(false).innerHTML = '<strong>Cancelled.</strong> No changes saved.'; return; }
+                } else if (prevMode === 'xpub' && prevEnabled) {
+                    const ok = await confirmOnchain('Switch to static address mode?',
+                        'This will clear the currently configured eCash xpub. Static address re-use reduces privacy and prevents detecting multi-transaction payments.');
+                    if (!ok) { ecxBox(false).innerHTML = '<strong>Cancelled.</strong> No changes saved.'; return; }
+                }
+                body = `action=save_ecx&store_id=${encodeURIComponent(currentStoreId)}&mode=static&static_address=${encodeURIComponent(staticAddress)}&static_tweak_range=${encodeURIComponent(tweakRange)}&min_confs=${minConfs}&confirm_timeout_sec=${timeout}&provider_url=${encodeURIComponent(providerUrl)}&provider_fallback=${providerFallback}`;
+            } else {
+                const xpub = document.getElementById('ecx-xpub').value.trim();
+                const type = document.getElementById('ecx-address-type').value;
+                if (xpub === '' && prevEnabled && prevMode === 'xpub') {
+                    const ok = await confirmOnchain('Disable eCash payments?',
+                        'Saving with an empty xpub will disable eCash (ECX) payments for this store.');
+                    if (!ok) { ecxBox(false).innerHTML = '<strong>Cancelled.</strong> No changes saved.'; return; }
+                } else if (xpub !== '' && prevEnabled && prevMode === 'xpub' && xpub !== (dashboardData?.ecx?.xpub || '')) {
+                    const ok = await confirmOnchain('Switch to a different xpub?',
+                        'Replace the currently configured eCash xpub with the one you just pasted.');
+                    if (!ok) { ecxBox(false).innerHTML = '<strong>Cancelled.</strong> No changes saved.'; return; }
+                } else if (prevMode === 'static' && prevEnabled) {
+                    const ok = await confirmOnchain('Switch from static address to xpub?',
+                        'This will clear the currently configured eCash static address.');
+                    if (!ok) { ecxBox(false).innerHTML = '<strong>Cancelled.</strong> No changes saved.'; return; }
+                }
+                body = `action=save_ecx&store_id=${encodeURIComponent(currentStoreId)}&mode=xpub&xpub=${encodeURIComponent(xpub)}&address_type=${type}&min_confs=${minConfs}&confirm_timeout_sec=${timeout}&provider_url=${encodeURIComponent(providerUrl)}&provider_fallback=${providerFallback}`;
+            }
+            let res;
+            try {
+                res = await readJsonResponse(await postWithCsrf(adminUrl, body));
+            } catch (e) {
+                ecxBox(false).innerHTML = '<strong>Save failed:</strong> could not reach the server. Check your connection and try again.';
+                showToast('Could not reach the server', 'error');
+                return;
+            }
+            const data = res.data;
+            if (res.ok) {
+                let suffix = '';
+                if (data.disabled) {
+                    suffix = ' (eCash disabled)';
+                } else if (data.xpubChanged) {
+                    suffix = data.resumedIndex > 0 ? ' — continues at index ' + data.resumedIndex : ' — starts at index 0';
+                }
+                if (data.providerProbe && data.providerProbe.tipHeight) {
+                    suffix += ' &mdash; explorer at ' + escapeHtml(data.providerProbe.url)
+                        + ' verified (block height ' + Number(data.providerProbe.tipHeight).toLocaleString() + ')';
+                }
+                if (!data.disabled && data.priceAvailable === false) {
+                    suffix += ' &mdash; <strong>no ECX price is available right now</strong>, so eCash stays off new invoices until CoinMarketCap answers';
+                }
+                ecxBox(true).innerHTML = '<strong>&#10003; Saved' + suffix + '.</strong>';
+                showToast('eCash settings saved' + (data.disabled ? ' (disabled)' : ''), 'success');
+                loadDashboard();
+            } else {
+                const err = data.error || `Failed to save (HTTP ${res.status})`;
+                ecxBox(false).innerHTML = '<strong>Save failed:</strong> ' + escapeHtml(err);
+                showToast(err, 'error');
+            }
+        }
+
         // ---- On-chain address source priority (strike vs local) ----
         // Which source mints an invoice's address first; the other is the
         // fallback. Reordering saves instantly (like the neighboring on-chain
@@ -12877,10 +14180,19 @@ header('Cache-Control: no-cache, must-revalidate');
                     showToast('Settings saved!', 'success');
                     // Re-render the priority widget from the server's effective
                     // order so the UI reflects exactly what was persisted.
-                    if (Array.isArray(result.railOrder) && result.railOrder.length === 4) {
+                    if (Array.isArray(result.railOrder) && result.railOrder.length === LN_RAIL_TYPES.length) {
                         lnRailOrder = result.railOrder.slice();
-                        renderLnRailOrder();
                     }
+                    // Moving the Cashu mint ahead of the swap turned strict
+                    // no-mint-fallback off: say so and mirror it onto the
+                    // swaps card so the two never disagree.
+                    if (result.strictCleared === true) {
+                        if (dashboardData && dashboardData.swaps) dashboardData.swaps.strict = false;
+                        const strictSel = document.getElementById('store-swaps-strict');
+                        if (strictSel) strictSel.value = '0';
+                        showToast('Strict no-mint-fallback turned off: the Cashu mint now comes before the swap.', 'success');
+                    }
+                    renderLnRailOrder();
                     // Mirror the saved Strike on-chain flag onto the on-chain
                     // card's toggle (both controls back the same store flag).
                     if (typeof result.strikeOnchainEnabled === 'boolean') {
@@ -13187,7 +14499,7 @@ header('Cache-Control: no-cache, must-revalidate');
                 .map(a => ({ label: a.address, uri: '', ref: a.ref }));
             awStrike = mapped.filter(a => a.type === 'strike')
                 .map(a => ({ label: a.address, key: '', ref: a.ref }));
-            if (am && Array.isArray(am.railOrder) && am.railOrder.length === 4) {
+            if (am && Array.isArray(am.railOrder) && am.railOrder.length === LN_RAIL_TYPES.length) {
                 lnRailOrder = am.railOrder.slice();
             }
             renderLnRailOrder();
@@ -13268,28 +14580,58 @@ header('Cache-Control: no-cache, must-revalidate');
             renderLnAddressRows();
         }
 
-        // ---- Configurable payment path (destination type) priority ----
-        // Permutation of the four types; index 0 is tried first at invoice
-        // time (and when withdrawing). Rides the Lightning payments save;
-        // the server enforces a full permutation.
+        // ---- Configurable payment path priority ----
+        // Permutation of the six Lightning paths: the four destination types
+        // plus the two order-only paths (submarine swap, Cashu mint); index 0
+        // is tried first at invoice time. Withdrawals (auto-cashout) walk
+        // only the destination types in this order — the swap and mint rows
+        // are never payout targets. Rides the Lightning payments save; the
+        // server enforces a full permutation.
         const LN_RAIL_LABELS = {
             strike: 'Strike API',
             lnaddress: 'Lightning address (LNURL)',
             nwc: 'NWC connection',
             noffer: 'CLINK noffer',
+            swap: 'Submarine swap (to on-chain)',
+            cashu: 'Cashu mint',
         };
-        let lnRailOrder = ['strike', 'lnaddress', 'nwc', 'noffer'];
+        const LN_RAIL_TYPES = ['strike', 'lnaddress', 'nwc', 'noffer', 'swap', 'cashu'];
+        let lnRailOrder = LN_RAIL_TYPES.slice();
+
+        // Per-row state notes for the Lightning widget: a path that can't run
+        // for this store is shown greyed (still reorderable — the position is
+        // saved and applies once the path is enabled); a note is shown when a
+        // save will turn strict no-mint-fallback off.
+        function lnRailHints() {
+            const hints = {};
+            const hasMint = !!(dashboardData && dashboardData.storeConfigured);
+            const sw = dashboardData && dashboardData.swaps;
+            const swapsOn = !!(sw && sw.effective);
+            if (!hasMint) hints.cashu = { inactive: true, text: 'no mint enabled' };
+            if (!swapsOn) hints.swap = { inactive: true, text: 'swaps not enabled' };
+            const cashuAt = lnRailOrder.indexOf('cashu');
+            const swapAt = lnRailOrder.indexOf('swap');
+            if (sw && sw.strict && cashuAt !== -1 && swapAt !== -1 && cashuAt < swapAt) {
+                hints.cashu = Object.assign({}, hints.cashu || {}, {
+                    note: 'saving turns off strict no-mint-fallback (Submarine swaps card)',
+                });
+            }
+            return hints;
+        }
 
         // Shared row builder for the small fixed-item priority widgets (the
         // Lightning type order and the on-chain source order). Rows carry
         // data-rail for tests; buttons get stable ids "<idPrefix>-up-<key>" /
         // "<idPrefix>-down-<key>".
-        function renderOrderWidget(listEl, order, labels, idPrefix, onMove) {
+        function renderOrderWidget(listEl, order, labels, idPrefix, onMove, hints) {
             listEl.innerHTML = '';
+            hints = hints || {};
             order.forEach((key, i) => {
+                const hint = hints[key] || null;
                 const row = document.createElement('div');
                 row.className = idPrefix + '-row';
                 row.dataset.rail = key;
+                if (hint && hint.inactive) row.dataset.inactive = '1';
                 row.style.cssText = 'display:flex; align-items:center; gap:0.4rem; margin-bottom:0.4rem;';
                 const prio = document.createElement('span');
                 prio.textContent = (i + 1) + '.';
@@ -13297,7 +14639,14 @@ header('Cache-Control: no-cache, must-revalidate');
                 row.appendChild(prio);
                 const label = document.createElement('span');
                 label.textContent = labels[key] || key;
-                label.style.cssText = 'flex:1; font-size:0.9rem;';
+                label.style.cssText = 'flex:1; font-size:0.9rem;' + (hint && hint.inactive ? ' opacity:0.5;' : '');
+                if (hint && (hint.text || hint.note)) {
+                    const note = document.createElement('span');
+                    note.className = idPrefix + '-hint';
+                    note.textContent = ' (' + [hint.text, hint.note].filter(Boolean).join('; ') + ')';
+                    note.style.cssText = 'font-size:0.8rem; opacity:0.7;';
+                    label.appendChild(note);
+                }
                 row.appendChild(label);
                 const mkBtn = (text, title, id, handler, disabled) => {
                     const b = document.createElement('button');
@@ -13322,7 +14671,7 @@ header('Cache-Control: no-cache, must-revalidate');
         function renderLnRailOrder() {
             const list = document.getElementById('ln-rail-order-list');
             if (!list) return;
-            renderOrderWidget(list, lnRailOrder, LN_RAIL_LABELS, 'ln-rail-order', moveLnRailOrder);
+            renderOrderWidget(list, lnRailOrder, LN_RAIL_LABELS, 'ln-rail-order', moveLnRailOrder, lnRailHints());
         }
 
         function moveLnRailOrder(index, delta) {
@@ -14221,14 +15570,17 @@ header('Cache-Control: no-cache, must-revalidate');
             const rows = entries.map(e => {
                 const cat = LOG_CATEGORY_LABELS[e.category] || e.category;
                 const store = e.storeId ? (logStoreNames[e.storeId] || e.storeId) : '';
-                // Deep-link the invoice id into the invoices view is overkill
-                // here; show a short prefix so the operator can find it.
+                // The invoice id opens the invoice detail modal (full id in
+                // the tooltip, short prefix in the cell).
                 const inv = e.invoiceId ? e.invoiceId.substring(0, 12) : '';
+                const invLink = inv
+                    ? `<br><a href="#" class="log-invoice-link" title="${escapeAttr(e.invoiceId)}" style="color: var(--accent, #60a5fa);" onclick="openInvoiceDetail('${escapeAttr(e.invoiceId)}'); return false;">inv ${escapeHtml(inv)}&hellip;</a>`
+                    : '';
                 return `<tr>
                     <td style="white-space: nowrap; vertical-align: top;">${escapeHtml(fmtTimestamp(e.timestamp))}</td>
                     <td style="vertical-align: top;"><code style="font-size: 0.75rem;">${escapeHtml(cat)}</code></td>
                     <td style="vertical-align: top;">${escapeHtml(store)}</td>
-                    <td style="vertical-align: top; word-break: break-all; font-size: 0.75rem;">${escapeHtml(e.ref || '')}${inv ? '<br><span style="color: var(--text-secondary);">inv ' + escapeHtml(inv) + '&hellip;</span>' : ''}</td>
+                    <td style="vertical-align: top; word-break: break-all; font-size: 0.75rem;">${escapeHtml(e.ref || '')}${invLink}</td>
                     <td style="vertical-align: top; word-break: break-word; font-size: 0.75rem;">${escapeHtml(e.message)}</td>
                 </tr>`;
             }).join('');
@@ -14417,6 +15769,7 @@ header('Cache-Control: no-cache, must-revalidate');
                     // Re-fetch dashboard data to refresh "effective" indicator.
                     await loadDashboard();
                     refreshStoreSwapsCard();
+                    renderLnRailOrder();
                 } else {
                     awError('store-swaps-error', result.error || 'Failed to save');
                 }
@@ -14548,13 +15901,14 @@ header('Cache-Control: no-cache, must-revalidate');
         async function saveHostingFee() {
             const pct = document.getElementById('hosting-fee-percent').value;
             const dest = document.getElementById('hosting-fee-destination').value.trim();
+            const ecxXpub = (document.getElementById('hosting-fee-ecx-xpub')?.value || '').trim();
             if (!currentStoreId) {
                 showToast('No store selected', 'error');
                 return;
             }
             try {
                 const response = await postWithCsrf(adminUrl,
-                    `action=update_store&store_id=${encodeURIComponent(currentStoreId)}&hosting_fee_percent=${encodeURIComponent(pct)}&hosting_fee_destination=${encodeURIComponent(dest)}`
+                    `action=update_store&store_id=${encodeURIComponent(currentStoreId)}&hosting_fee_percent=${encodeURIComponent(pct)}&hosting_fee_destination=${encodeURIComponent(dest)}&hosting_fee_ecx_xpub=${encodeURIComponent(ecxXpub)}`
                 );
                 const result = await response.json();
                 if (response.ok) {
@@ -14740,6 +16094,7 @@ header('Cache-Control: no-cache, must-revalidate');
         function openEnableMintModal() {
             if (!currentStoreId) return;
             document.getElementById('enable-mint-url').value = '';
+            document.getElementById('enable-mint-backup-url').value = '';
             document.getElementById('enable-mint-unit').value = 'sat';
             const err = document.getElementById('enable-mint-error');
             err.classList.add('hidden');
@@ -14757,12 +16112,26 @@ header('Cache-Control: no-cache, must-revalidate');
             openMintDiscoveryModal();
         }
 
+        function openEnableMintBackupDiscovery() {
+            discoveryContext = 'enable-mint-backup';
+            discoveryCallback = (url) => {
+                document.getElementById('enable-mint-backup-url').value = url;
+            };
+            openMintDiscoveryModal();
+        }
+
         async function submitEnableMint() {
             const errEl = document.getElementById('enable-mint-error');
             errEl.classList.add('hidden');
             const mintUrl = document.getElementById('enable-mint-url').value.trim();
             if (!mintUrl) {
                 errEl.textContent = 'Please enter a mint URL.';
+                errEl.classList.remove('hidden');
+                return;
+            }
+            const backupUrl = document.getElementById('enable-mint-backup-url').value.trim();
+            if (backupUrl && normalizeMintUrl(backupUrl).toLowerCase() === normalizeMintUrl(mintUrl).toLowerCase()) {
+                errEl.textContent = 'Your backup mint needs to be different from your main one.';
                 errEl.classList.remove('hidden');
                 return;
             }
@@ -14776,9 +16145,16 @@ header('Cache-Control: no-cache, must-revalidate');
                     mint_url: mintUrl,
                     mint_unit: document.getElementById('enable-mint-unit').value,
                 });
+                if (backupUrl) params.set('backup_mint_url', backupUrl);
                 const response = await postWithCsrf(adminUrl, params.toString());
                 const result = await response.json();
                 if (!response.ok) throw new Error(result.error || 'Failed to enable mint');
+                // A backup whose recovery step didn't finish (or failed) is
+                // reported, never silent — the mint stays listed either way.
+                if (result.backupMint && result.backupMint.message) {
+                    showToast(result.backupMint.message,
+                        result.backupMint.walletRecovery === 'error' ? 'error' : 'success');
+                }
                 if (result.seedPhrase) {
                     // Fresh wallet seed — show it once for backup before closing.
                     document.getElementById('enable-mint-form').style.display = 'none';
@@ -14805,9 +16181,16 @@ header('Cache-Control: no-cache, must-revalidate');
         // without a manual reload.
         async function refreshAfterMintEnable() {
             await loadDashboard();
-            if (document.getElementById('view-store-settings').classList.contains('active')) {
+            // The store settings live in the "stores" view (there is no
+            // view-store-settings element — the old id lookup threw here and
+            // silently skipped the reload, so the Mints block never caught
+            // up with the mint just enabled).
+            const storesView = document.getElementById('view-stores');
+            if (storesView && storesView.classList.contains('active')) {
                 loadStoreSettings();
             }
+            // The widget's "no mint enabled" hint keys off the dashboard.
+            renderLnRailOrder();
         }
 
         let mintDisclaimerAcknowledged = false;
@@ -15323,7 +16706,29 @@ header('Cache-Control: no-cache, must-revalidate');
             el.style.display = 'block';
         }
 
-        async function retryBackupMintRecovery(mintId, storeId, storeName) {
+        // The backup-mint actions are shared by the store details modal
+        // (default: input #backup-mint-url, refresh = re-render the modal)
+        // and the Cashu section's Mints block in store settings (opts from
+        // cashuMintsBlockOpts()).
+        function detailsModalOpts(storeId, storeName) {
+            return { inputId: 'backup-mint-url', refresh: () => showStoreDetails(storeId, storeName) };
+        }
+
+        function cashuMintsBlockOpts() {
+            return {
+                inputId: 'cashu-backup-mint-url',
+                refresh: () => {
+                    const form = document.getElementById('cashu-add-backup-mint-form');
+                    if (form) form.style.display = 'none';
+                    const input = document.getElementById('cashu-backup-mint-url');
+                    if (input) input.value = '';
+                    renderCashuMintsBlock(currentStoreId);
+                },
+            };
+        }
+
+        async function retryBackupMintRecovery(mintId, storeId, storeName, opts) {
+            opts = opts || detailsModalOpts(storeId, storeName);
             try {
                 const response = await postWithCsrf(adminUrl, `action=update_backup_mint&id=${mintId}&enabled=1`);
                 const result = await response.json().catch(() => ({}));
@@ -15332,14 +16737,15 @@ header('Cache-Control: no-cache, must-revalidate');
                     return;
                 }
                 showToast(result.message || (result.walletRecovery === 'ready' ? 'Backup mint ready' : 'Recovery resumed'), 'success');
-                showStoreDetails(storeId, storeName);
+                opts.refresh();
             } catch (e) {
                 showToast('Recovery failed again', 'error');
             }
         }
 
-        async function addBackupMint(storeId, storeName) {
-            const mintUrl = document.getElementById('backup-mint-url').value.trim();
+        async function addBackupMint(storeId, storeName, opts) {
+            opts = opts || detailsModalOpts(storeId, storeName);
+            const mintUrl = document.getElementById(opts.inputId).value.trim();
             if (!mintUrl) {
                 showToast('Please enter a mint URL', 'error');
                 return;
@@ -15364,7 +16770,7 @@ header('Cache-Control: no-cache, must-revalidate');
                     } else {
                         showToast('Backup mint added!', 'success');
                     }
-                    showStoreDetails(storeId, storeName);
+                    opts.refresh();
                 } else {
                     showToast(result.error || 'Failed to add backup mint', 'error');
                 }
@@ -15373,7 +16779,8 @@ header('Cache-Control: no-cache, must-revalidate');
             }
         }
 
-        async function removeBackupMint(mintId, storeId, storeName) {
+        async function removeBackupMint(mintId, storeId, storeName, opts) {
+            opts = opts || detailsModalOpts(storeId, storeName);
             if (!confirm('Remove this backup mint?')) return;
 
             try {
@@ -15386,10 +16793,79 @@ header('Cache-Control: no-cache, must-revalidate');
                     return;
                 }
                 showToast('Backup mint removed', 'success');
-                showStoreDetails(storeId, storeName);
+                opts.refresh();
             } catch (e) {
                 showToast('Failed to remove backup mint', 'error');
             }
+        }
+
+        // Cashu section → Mints block: the selected store's main mint and its
+        // backup mints (same rows and actions as the store details modal).
+        async function renderCashuMintsBlock(storeId) {
+            const list = document.getElementById('cashu-backup-mints-list');
+            const primaryEl = document.getElementById('cashu-primary-mint');
+            if (!list || !primaryEl || !storeId) return;
+            const store = dashboardData?.stores?.find(s => s.id === storeId);
+            primaryEl.textContent = store?.mint_url || 'Not configured';
+            let backups = [];
+            try {
+                const r = await fetch(`${adminUrl}?api=get_backup_mints&store_id=${encodeURIComponent(storeId)}`, { credentials: 'same-origin' });
+                const data = await r.json();
+                backups = Array.isArray(data) ? data : [];
+            } catch (e) {
+                list.innerHTML = '<p style="color: var(--error); font-size: 0.85rem;">Could not load backup mints.</p>';
+                return;
+            }
+            // A later store switch must not paint this store's rows.
+            if (storeId !== currentStoreId) return;
+            list.innerHTML = '';
+            if (backups.length === 0) {
+                list.innerHTML = '<p class="cashu-backup-mint-empty" style="color: var(--text-secondary); font-size: 0.85rem; margin:0;">No backup mints configured</p>';
+                return;
+            }
+            backups.forEach(m => {
+                const row = document.createElement('div');
+                row.className = 'cashu-backup-mint-row';
+                row.dataset.mintUrl = m.mint_url;
+                row.dataset.mintId = String(m.id);
+                row.style.cssText = 'display:flex; justify-content:space-between; align-items:center; padding:0.5rem; background:rgba(0,0,0,0.2); border-radius:4px; margin-bottom:0.5rem;';
+                const info = document.createElement('div');
+                info.style.cssText = 'flex:1; overflow:hidden;';
+                const unitTxt = String(m.unit || 'sat').toUpperCase();
+                let infoHtml = `<code style="font-size: 0.75rem; word-break: break-all;">${escapeHtml(m.mint_url)}</code>`
+                    + `${mintDiagnosticIcon(m.mint_url)}`
+                    + `<span style="opacity: 0.6; font-size: 0.75rem; margin-left: 0.5rem;">(${escapeHtml(unitTxt)})</span>`;
+                if (!Number(m.enabled)) {
+                    infoHtml += '<span style="opacity: 0.6; font-size: 0.75rem; margin-left: 0.5rem;">disabled</span>';
+                }
+                if (m.balance > 0 || m.exported > 0) {
+                    infoHtml += `<span style="display:block; font-size: 0.72rem; color: var(--warning, #f59e0b); margin-top: 0.2rem;">holds ${escapeHtml(formatAmount(m.balance || 0, m.unit))} ${escapeHtml(unitTxt)}${m.exported > 0 ? ` + ${escapeHtml(formatAmount(m.exported, m.unit))} exported` : ''}</span>`;
+                }
+                if (m.recovery === 'pending') {
+                    infoHtml += '<span class="backup-mint-recovery" style="display:block; font-size: 0.72rem; color: var(--text-secondary); margin-top: 0.2rem;">Preparing payments with this mint (checking the recovery phrase for existing ecash)</span>';
+                } else if (m.recovery === 'error') {
+                    infoHtml += `<span class="backup-mint-recovery" style="display:block; font-size: 0.72rem; color: var(--danger, #ef4444); margin-top: 0.2rem;">Recovery failed${m.recovery_error ? ': ' + escapeHtml(m.recovery_error) : ''}${Number(m.enabled) ? '' : ' (disabled until it succeeds)'}</span>`;
+                }
+                info.innerHTML = infoHtml;
+                row.appendChild(info);
+                if (m.recovery === 'error') {
+                    const retry = document.createElement('button');
+                    retry.type = 'button';
+                    retry.className = 'btn btn-secondary cashu-backup-mint-retry';
+                    retry.textContent = 'Retry recovery';
+                    retry.style.cssText = 'padding: 0.2rem 0.4rem; font-size: 0.7rem; margin-left: 0.5rem; white-space: nowrap;';
+                    retry.addEventListener('click', () => retryBackupMintRecovery(Number(m.id), storeId, '', cashuMintsBlockOpts()));
+                    row.appendChild(retry);
+                }
+                const remove = document.createElement('button');
+                remove.type = 'button';
+                remove.className = 'btn btn-danger cashu-backup-mint-remove';
+                remove.textContent = 'Remove';
+                remove.style.cssText = 'padding: 0.2rem 0.4rem; font-size: 0.7rem; margin-left: 0.5rem;';
+                remove.addEventListener('click', () => removeBackupMint(Number(m.id), storeId, '', cashuMintsBlockOpts()));
+                row.appendChild(remove);
+                list.appendChild(row);
+            });
         }
 
         // -------- Offline Cashu acceptance UI --------
@@ -15932,7 +17408,9 @@ header('Cache-Control: no-cache, must-revalidate');
         // the best we can do.
         async function loadCronUrl() {
             const code = document.getElementById('cron-url-display');
+            const plainUrl = document.getElementById('cron-plain-url-display');
             const codeSwaps = document.getElementById('cron-swaps-url-display');
+            const plainSwapsUrl = document.getElementById('cron-swaps-plain-url-display');
             const status = document.getElementById('cron-url-status');
             const statusSwaps = document.getElementById('cron-swaps-url-status');
             if (!code) return;
@@ -15944,13 +17422,20 @@ header('Cache-Control: no-cache, must-revalidate');
                 } else {
                     code.textContent = 'Unable to load cron URL';
                 }
+                if (plainUrl) {
+                    plainUrl.textContent = (data && data.url) || 'Unable to load cron URL';
+                }
                 if (codeSwaps) {
                     codeSwaps.textContent = data.crontab_swaps || 'Unable to load swaps cron URL';
+                }
+                if (plainSwapsUrl) {
+                    plainSwapsUrl.textContent = data.swaps_url || 'Unable to load swaps cron URL';
                 }
                 if (status) status.innerHTML = formatCronSeenAgo(data.last_full_seen_ago_sec, 90);
                 if (statusSwaps) statusSwaps.innerHTML = formatCronSeenAgo(data.last_swaps_seen_ago_sec, 30);
             } catch (e) {
                 code.textContent = 'Unable to load cron URL';
+                if (plainUrl) plainUrl.textContent = 'Unable to load cron URL';
             }
         }
 
@@ -15978,6 +17463,19 @@ header('Cache-Control: no-cache, must-revalidate');
             try {
                 await navigator.clipboard.writeText(code.textContent);
                 showToast('Cron entry copied to clipboard', 'success');
+            } catch (e) {
+                showToast('Copy failed — select the text manually', 'error');
+            }
+        }
+
+        // Copies one of the bare keyed URLs (main / swap fast-lane) — the
+        // form a hosting panel or scheduler service takes.
+        async function copyCronPlainUrl(elementId, label) {
+            const code = document.getElementById(elementId);
+            if (!code) return;
+            try {
+                await navigator.clipboard.writeText(code.textContent);
+                showToast(label + ' copied to clipboard', 'success');
             } catch (e) {
                 showToast('Copy failed — select the text manually', 'error');
             }
@@ -16275,6 +17773,10 @@ header('Cache-Control: no-cache, must-revalidate');
                 if (cronLine) {
                     cronLine.textContent = data.recommended_cron || 'Unavailable (set up the main cron first).';
                 }
+                const cronUrl = document.getElementById('auto-update-cron-url');
+                if (cronUrl) {
+                    cronUrl.textContent = data.recommended_cron_url || 'Unavailable (set up the main cron first).';
+                }
                 const hasBackup = Array.isArray(data.backups) && data.backups.length > 0;
                 if (rollbackBtn) rollbackBtn.disabled = !hasBackup;
                 if (rollbackHelp) {
@@ -16510,14 +18012,18 @@ header('Cache-Control: no-cache, must-revalidate');
             }
         }
 
-        function updateOnchainManualBanner(onchain) {
+        function updateOnchainManualBanner(onchain, ecx) {
             const banner = document.getElementById('onchain-manual-banner');
             const text = document.getElementById('onchain-manual-banner-text');
             if (!banner || !text) return;
-            const n = (onchain && onchain.needsManualConfirmation) || 0;
+            // Bitcoin static-address ambiguities plus eCash (ECX) ones.
+            const nBtc = (onchain && onchain.needsManualConfirmation) || 0;
+            const nEcx = (ecx && ecx.needsManualConfirmation) || 0;
+            const n = nBtc + nEcx;
             if (n > 0) {
+                const what = nBtc && nEcx ? 'on-chain / eCash payment' : (nEcx ? 'eCash payment' : 'on-chain payment');
                 text.textContent =
-                    n + ' on-chain payment' + (n === 1 ? '' : 's') + ' need' + (n === 1 ? 's' : '') + ' manual confirmation.';
+                    n + ' ' + what + (n === 1 ? '' : 's') + ' need' + (n === 1 ? 's' : '') + ' manual confirmation.';
                 banner.classList.remove('hidden');
             } else {
                 banner.classList.add('hidden');
@@ -16553,7 +18059,8 @@ header('Cache-Control: no-cache, must-revalidate');
                             const resp = await postWithCsrf(adminUrl,
                                 'action=resolve_onchain_manual&invoice_id=' + encodeURIComponent(invoiceId) +
                                 '&txid=' + encodeURIComponent(txid) +
-                                '&vout=' + encodeURIComponent(vout));
+                                '&vout=' + encodeURIComponent(vout) +
+                                '&chain=' + encodeURIComponent(btn.dataset.chain || 'btc'));
                             const result = await resp.json();
                             if (resp.ok) {
                                 showToast('Attributed and settled', 'success');
@@ -16574,17 +18081,21 @@ header('Cache-Control: no-cache, must-revalidate');
         }
 
         function renderManualInvoiceBlock(inv) {
+            // Bitcoin candidates are in sats, eCash (ECX) ones in szats.
+            const unit = inv.unit || (inv.chain === 'ecx' ? 'szats' : 'sats');
+            const chainTag = inv.chain === 'ecx' ? ' <span class="inv-chip">eCash (ECX)</span>' : '';
             const candidates = (inv.candidates || []).map(c => {
                 const conf = (c.confirmations || 0);
                 return `
                     <li style="margin-bottom: 0.5rem; padding: 0.5rem; background: rgba(0,0,0,0.08); border-radius: 6px;">
                         <div style="font-family: monospace; font-size: 0.78rem; word-break: break-all;">${escapeHtml(c.txid)}:${c.vout}</div>
                         <div style="font-size: 0.8rem; color: var(--text-secondary); margin: 0.25rem 0;">
-                            ${c.amount_sat} sats &middot; ${conf} confirmation${conf === 1 ? '' : 's'}
+                            ${c.amount_sat} ${unit} &middot; ${conf} confirmation${conf === 1 ? '' : 's'}${chainTag}
                         </div>
                         <button class="btn btn-secondary" style="padding: 0.25rem 0.75rem; font-size: 0.8rem;"
                                 data-manual-action="attribute"
                                 data-invoice-id="${escapeAttr(inv.id)}"
+                                data-chain="${escapeAttr(inv.chain || 'btc')}"
                                 data-txid="${escapeAttr(c.txid)}"
                                 data-vout="${c.vout}">
                             Attribute to this invoice
@@ -16595,7 +18106,7 @@ header('Cache-Control: no-cache, must-revalidate');
                 <div style="margin-bottom: 1rem; padding: 0.75rem; border: 1px solid var(--border); border-radius: 8px;">
                     <div style="display: flex; justify-content: space-between; align-items: baseline; flex-wrap: wrap; gap: 0.5rem;">
                         <div><strong>${escapeHtml(inv.id)}</strong>
-                            <span style="color: var(--text-secondary); font-size: 0.85rem;"> &middot; ${escapeHtml(inv.amount)} ${escapeHtml(inv.currency)} &middot; expected ${inv.onchain_amount_sat} sats</span>
+                            <span style="color: var(--text-secondary); font-size: 0.85rem;"> &middot; ${escapeHtml(inv.amount)} ${escapeHtml(inv.currency)} &middot; expected ${inv.onchain_amount_sat} ${unit}</span>
                         </div>
                         <span style="font-size: 0.8rem; color: var(--text-secondary);">${escapeHtml(inv.status)}</span>
                     </div>
@@ -17332,35 +18843,268 @@ header('Cache-Control: no-cache, must-revalidate');
             offerEnableSelfServe();
         }
 
-        // ---- Admin invoice line-item detail ----
+        // ---- Invoice detail modal ----
+        // Opened from any invoice row (All Invoices table, dashboard Recent
+        // invoices, Log tab). Loads ?api=invoice_detail and renders the
+        // invoice summary, the payment methods it carried, the cart line
+        // items, and the payment-path attempt log: which rails were tried,
+        // in order, and how each attempt ended.
 
-        async function openInvoiceItems(invoiceId) {
+        const ATTEMPT_RAIL_LABELS = {
+            strike: 'Strike', lnurl: 'Lightning address', nwc: 'NWC wallet', noffer: 'CLINK noffer',
+            swap: 'Submarine swap', mint: 'Cashu mint', onchain: 'On-chain address', ecx: 'eCash (ECX) address', fee: 'Fee redirect',
+        };
+        const ATTEMPT_CONTEXT_LABELS = {
+            checkout: 'Invoice creation', refresh: 'Lightning refresh', poll: 'Settlement checks',
+        };
+        const ATTEMPT_OUTCOME_LABELS = { ok: 'OK', failed: 'Failed', skipped: 'Skipped' };
+
+        function invdCopy(value, hint) {
+            return `<a href="#" class="invd-copy inv-copy" title="${escapeAttr((hint ? hint + '\n' : '') + '(click to copy)')}" data-copy="${escapeAttr(value)}" onclick="copyMono(event, this); return false;">copy</a>`;
+        }
+        function invdMono(value, hint) {
+            if (!value) return '';
+            return `<span class="invd-mono">${escapeHtml(value)}</span>${invdCopy(value, hint)}`;
+        }
+        function invdRow(label, valueHtml) {
+            if (valueHtml === null || valueHtml === undefined || valueHtml === '') return '';
+            return `<dt>${escapeHtml(label)}</dt><dd>${valueHtml}</dd>`;
+        }
+        function invdTime(ts) {
+            return ts ? escapeHtml(new Date(ts * 1000).toLocaleString()) : '';
+        }
+        function invdSection(title, bodyHtml) {
+            if (!bodyHtml) return '';
+            return `<div class="invd-section"><div class="invd-section-title">${escapeHtml(title)}</div>${bodyHtml}</div>`;
+        }
+
+        async function openInvoiceDetail(invoiceId) {
             const content = document.getElementById('invoice-detail-content');
+            const title = document.getElementById('invoice-detail-title');
+            title.textContent = 'Invoice';
             content.innerHTML = '<div class="loading"><div class="spinner"></div></div>';
             document.getElementById('modal-invoice-detail').classList.add('visible');
             try {
-                const r = await fetch(`${adminUrl}?api=invoice_items&id=${encodeURIComponent(invoiceId)}`, { credentials: 'same-origin' });
+                const r = await fetch(`${adminUrl}?api=invoice_detail&id=${encodeURIComponent(invoiceId)}`, { credentials: 'same-origin' });
                 const d = await r.json();
-                const items = d.items || [];
-                if (!items.length) {
-                    content.innerHTML = '<p style="color:var(--text-secondary);">This invoice has no cart line items.</p>';
+                if (!r.ok || !d.invoice) {
+                    content.innerHTML = `<p style="color:#ef4444;">${escapeHtml(d.error || 'Failed to load invoice.')}</p>`;
                     return;
                 }
+                content.innerHTML = renderInvoiceDetail(d);
+            } catch (e) {
+                content.innerHTML = '<p style="color:#ef4444;">Failed to load invoice.</p>';
+            }
+        }
+
+        function renderInvoiceDetail(d) {
+            const inv = d.invoice;
+            const det = d.detail || {};
+            const meta = det.metadata || {};
+            const network = inv.network || 'mainnet';
+            const statusLabel = inv.status === 'Settled' ? 'Paid' : inv.status;
+
+            // ---- header ----
+            const head = `
+                <div class="invd-head">
+                    <span class="inv-chip status-${escapeHtml(inv.status)}">${escapeHtml(statusLabel)}</span>
+                    ${renderPaymentMethod(inv.paymentRail, inv.mintUrl)}
+                    ${d.storeName ? `<span class="inv-chip">${escapeHtml(d.storeName)}</span>` : ''}
+                </div>
+                <div class="invd-id" id="invoice-detail-id">${escapeHtml(inv.id)}${invdCopy(inv.id, 'Invoice ID')}</div>`;
+
+            // ---- summary ----
+            let amount = `${escapeHtml(String(inv.amount))} ${escapeHtml(String(inv.currency))}`;
+            if (inv.amountInMintUnit !== undefined && inv.amountInMintUnit !== null
+                && String(inv.mintUnit || 'sat').toLowerCase() !== String(inv.currency).toLowerCase()) {
+                amount += ` <span style="color:var(--text-secondary);">(${escapeHtml(String(inv.amountInMintUnit))} ${escapeHtml(String(inv.mintUnit || 'sat'))})</span>`;
+            }
+            if (inv.exchangeRate && inv.exchangeRate.rate) {
+                amount += ` <span style="color:var(--text-secondary); font-size:0.78rem;">@ ${escapeHtml(String(inv.exchangeRate.rate))} ${escapeHtml(String(inv.exchangeRate.currency))}</span>`;
+            }
+            let statusCell = `<span class="inv-chip status-${escapeHtml(inv.status)}">${escapeHtml(statusLabel)}</span>`;
+            if (inv.additionalStatus && inv.additionalStatus !== 'None') {
+                statusCell += ` <span style="color:var(--text-secondary); font-size:0.8rem;">${escapeHtml(inv.additionalStatus)}</span>`;
+            }
+            let method = renderPaymentMethod(inv.paymentRail, inv.mintUrl);
+            if (det.paymentRailChosen && det.settledRail && det.paymentRailChosen !== det.settledRail) {
+                method += ` <span style="color:var(--text-secondary); font-size:0.78rem;">(created on ${escapeHtml(det.paymentRailChosen)}, paid via ${escapeHtml(det.settledRail)})</span>`;
+            }
+            const destination = inv.destination
+                ? (inv.destinationIsLightning ? invdMono(inv.destination, 'Lightning destination')
+                    : `${renderMonoLink('address', inv.destination, inv.destinationChain === 'ecx' ? 'ecx' : network)}${invdCopy(inv.destination, 'Address')}`)
+                : '';
+            const feeRedirect = inv.feeRedirect
+                ? `${escapeHtml(inv.feeRedirect.label || 'fees')}${inv.feeRedirect.destination ? ' → <span class="invd-mono">' + escapeHtml(inv.feeRedirect.destination) + '</span>' : ''}`
+                  + `${inv.feeRedirect.rails && inv.feeRedirect.rails.length ? ' <span style="color:var(--text-secondary); font-size:0.78rem;">(' + escapeHtml(inv.feeRedirect.rails.join(', ')) + ')</span>' : ''}`
+                  + `${inv.feeRedirect.settled ? (inv.feeRedirect.settledToFee ? ' — paid to the fee payee' : ' — paid to the merchant') : ''}`
+                : '';
+            const email = inv.customerEmail
+                ? `${escapeHtml(inv.customerEmail)}${inv.newsletterOptIn ? ' <span title="Subscribed to newsletter" style="color: var(--success, #48bb78);">✓ newsletter</span>' : ''}`
+                : '';
+            const expires = inv.expirationTime
+                ? `${invdTime(inv.expirationTime)}${inv.longLived ? ' <span class="inv-chip" title="Shareable long-lived payment request">long-lived</span>' : ''}`
+                : '';
+            const summary = `<dl class="invd-grid">
+                ${invdRow('Amount', amount)}
+                ${invdRow('Status', statusCell)}
+                ${invdRow('Created', invdTime(inv.createdTime))}
+                ${invdRow('Expires', expires)}
+                ${invdRow('Paid', invdTime(inv.paidTime))}
+                ${invdRow('Method', method)}
+                ${invdRow('Destination', destination)}
+                ${invdRow('Note', meta.itemDesc ? escapeHtml(String(meta.itemDesc)) : '')}
+                ${invdRow('Order reference', meta.orderId ? escapeHtml(String(meta.orderId)) : '')}
+                ${invdRow('Customer', email)}
+                ${invdRow('Receipt requested', det.payerReceiptRequested ? 'yes (sent when the payment settles)' : '')}
+                ${invdRow('Fee redirect', feeRedirect)}
+                ${invdRow('Payment link', inv.checkoutLink ? `<a href="${escapeAttr(inv.checkoutLink)}" target="_blank" rel="noopener noreferrer" class="invd-mono">${escapeHtml(inv.checkoutLink)}</a>${invdCopy(inv.checkoutLink, 'Payment link')}` : '')}
+            </dl>`;
+
+            // ---- payment methods offered ----
+            let methods = '';
+            if (det.bolt11) {
+                let ln = `<dl class="invd-grid">
+                    ${invdRow('Invoice (bolt11)', invdMono(det.bolt11, 'Lightning invoice (bolt11)'))}
+                    ${invdRow('Destination', det.lnDestination ? invdMono(det.lnDestination, 'Lightning destination') : (inv.paymentRail === 'mint' && inv.mintUrl ? escapeHtml(mintHost(inv.mintUrl)) + ' (mint quote)' : ''))}
+                    ${invdRow('Relay', det.nofferRelay ? escapeHtml(det.nofferRelay) : '')}
+                    ${invdRow('Strike invoice', det.strikeInvoiceId ? invdMono(det.strikeInvoiceId, 'Strike invoice ID') : '')}
+                    ${invdRow('Lightning expires', invdTime(det.lnExpiresAt))}
+                    ${invdRow('Last refreshed', invdTime(det.lnRefreshedAt))}
+                    ${invdRow('Last re-quoted', invdTime(det.requotedAt))}
+                    ${invdRow('Last checked', det.lastPolledAt ? `${invdTime(det.lastPolledAt)}${det.lastPollState ? ' — ' + escapeHtml(det.lastPollState) : ''}` : '')}
+                    ${invdRow('Last check error', det.lastPollError ? `<span style="color:#ef4444;">${escapeHtml(det.lastPollError)}</span>` : '')}
+                    ${invdRow('LNURL note', det.lnurlOverrideReason ? escapeHtml(det.lnurlOverrideReason) : '')}
+                </dl>`;
+                methods += `<div class="invd-group-title">⚡ Lightning</div>${ln}`;
+            }
+            if (det.onchain) {
+                const oc = det.onchain;
+                const pays = (oc.payments || []).map(p => `<div class="invd-attempt">
+                        <div class="invd-attempt-time">${invdTime(p.firstSeenAt)}</div>
+                        <div class="invd-attempt-body">
+                            <span class="invd-mono">${renderMonoLink('tx', p.txid, network)}</span>:${escapeHtml(String(p.vout))}${invdCopy(p.txid, 'Transaction ID')}
+                            <div class="invd-attempt-label">${escapeHtml(String(p.amountSat))} sat · ${escapeHtml(String(p.confirmations))} confirmation${p.confirmations === 1 ? '' : 's'}${p.blockHeight ? ' · block ' + escapeHtml(String(p.blockHeight)) : ''}</div>
+                        </div>
+                    </div>`).join('');
+                const ocGrid = `<dl class="invd-grid">
+                    ${invdRow('Address', `${renderMonoLink('address', oc.address, network)} <span class="invd-mono">${escapeHtml(oc.address)}</span>${invdCopy(oc.address, 'Address')}`)}
+                    ${invdRow('Expected', oc.amountSat !== null && oc.amountSat !== undefined ? `${escapeHtml(String(oc.amountSat))} sat${oc.tweakSats ? ' <span style="color:var(--text-secondary); font-size:0.78rem;">(static address, includes ' + escapeHtml(String(oc.tweakSats)) + ' sat uniqueness tweak)</span>' : ''}` : '')}
+                    ${invdRow('Strike receive request', det.strikeReceiveRequestId ? invdMono(det.strikeReceiveRequestId, 'Strike receive request ID') : '')}
+                    ${invdRow('First seen', invdTime(oc.firstSeenAt))}
+                    ${invdRow('Manual confirmation', oc.needsManualConfirmation ? '<span style="color:#f59e0b;">awaiting operator attribution</span>' : '')}
+                </dl>`;
+                methods += `<div class="invd-group-title">🔗 On-chain</div>${ocGrid}${pays ? `<div class="invd-note" style="margin-top:0.4rem;">Transactions seen</div>${pays}` : ''}`;
+            }
+            if (det.ecx) {
+                // eCash (ECX): same layout as on-chain, szat units, ECX explorer.
+                const ex = det.ecx;
+                const ecxCoin = (szats) => (Number(szats || 0) / 100_000_000).toFixed(8).replace(/\.?0+$/, '') || '0';
+                const epays = (ex.payments || []).map(p => `<div class="invd-attempt">
+                        <div class="invd-attempt-time">${invdTime(p.firstSeenAt)}</div>
+                        <div class="invd-attempt-body">
+                            <span class="invd-mono">${renderMonoLink('tx', p.txid, 'ecx')}</span>:${escapeHtml(String(p.vout))}${invdCopy(p.txid, 'Transaction ID')}
+                            <div class="invd-attempt-label">${escapeHtml(String(p.amountSzat))} szats · ${escapeHtml(String(p.confirmations))} confirmation${p.confirmations === 1 ? '' : 's'}${p.blockHeight ? ' · block ' + escapeHtml(String(p.blockHeight)) : ''}</div>
+                        </div>
+                    </div>`).join('');
+                const feeLabel = ex.feeNote ? ({DEV_FEE: 'dev fee', HOSTING_FEE: 'hosting fee'}[ex.feeNote] || 'fees') : '';
+                const exGrid = `<dl class="invd-grid">
+                    ${invdRow('Address', `${renderMonoLink('address', ex.address, 'ecx')} <span class="invd-mono">${escapeHtml(ex.address)}</span>${invdCopy(ex.address, 'Address')}`)}
+                    ${invdRow('Expected', ex.amountSzat !== null && ex.amountSzat !== undefined ? `${escapeHtml(String(ex.amountSzat))} szats (${ecxCoin(ex.amountSzat)} ECX)${ex.tweakSzats ? ' <span style="color:var(--text-secondary); font-size:0.78rem;">(static address, includes ' + escapeHtml(String(ex.tweakSzats)) + ' szat uniqueness tweak)</span>' : ''}` : '')}
+                    ${invdRow('ECX rate', ex.rate ? escapeHtml(String(ex.rate)) + ' ' + escapeHtml(String(inv.currency || '')) + ' per ECX' : '')}
+                    ${invdRow('Routed to', ex.feeNote ? `<span style="color:#f59e0b;">${escapeHtml(feeLabel)} (ECX ledger)</span>` : '')}
+                    ${invdRow('First seen', invdTime(ex.firstSeenAt))}
+                    ${invdRow('Manual confirmation', ex.needsManualConfirmation ? '<span style="color:#f59e0b;">awaiting operator attribution</span>' : '')}
+                </dl>`;
+                methods += `<div class="invd-group-title">🪙 eCash (ECX)</div>${exGrid}${epays ? `<div class="invd-note" style="margin-top:0.4rem;">Transactions seen</div>${epays}` : ''}`;
+            }
+            if (det.swap) {
+                const sw = det.swap;
+                const swGrid = `<dl class="invd-grid">
+                    ${invdRow('Provider', escapeHtml(sw.provider || ''))}
+                    ${invdRow('Swap status', `${escapeHtml(sw.status || '')}${renderSwapBadge(sw.status)}`)}
+                    ${invdRow('Target', `${escapeHtml(String(sw.targetSats))} sat on-chain for a ${escapeHtml(String(sw.invoiceSats))} sat Lightning invoice`)}
+                    ${invdRow('Fees', `lockup ${escapeHtml(String(sw.lockupFeeSats))} sat · percent ${escapeHtml(String(sw.percentFeeSats))} sat`)}
+                    ${invdRow('Merchant address', sw.merchantAddress ? `${renderMonoLink('address', sw.merchantAddress, network)}${invdCopy(sw.merchantAddress, 'Address')}` : '')}
+                    ${invdRow('Lockup tx', sw.lockupTxid ? `${renderMonoLink('tx', sw.lockupTxid, network)}${invdCopy(sw.lockupTxid, 'Lockup txid')}` : '')}
+                    ${invdRow('Claim tx', sw.claimTxid ? `${renderMonoLink('tx', sw.claimTxid, network)}${invdCopy(sw.claimTxid, 'Claim txid')}` : '')}
+                    ${invdRow('Error', sw.errorMessage ? `<span style="color:#ef4444;">${escapeHtml(sw.errorMessage)}</span>` : '')}
+                </dl>`;
+                methods += `<div class="invd-group-title">🔄 Submarine swap</div>${swGrid}`;
+            }
+            if (det.cashuOfflineFailReason) {
+                methods += `<div class="invd-group-title">🥜 Cashu token</div><dl class="invd-grid">${invdRow('Last token error', `<span style="color:#ef4444;">${escapeHtml(det.cashuOfflineFailReason)}</span>`)}</dl>`;
+            }
+            if (!methods) {
+                methods = '<p class="invd-note">No payment method is attached to this invoice.</p>';
+            }
+
+            // ---- items ----
+            const items = d.items || [];
+            let itemsHtml;
+            if (items.length) {
                 let totalSats = 0;
-                content.innerHTML = items.map(it => {
+                itemsHtml = items.map(it => {
                     totalSats += it.amountSats;
                     const paren = (it.displayAmount && it.displayCurrency && String(it.displayCurrency).toUpperCase() !== 'SAT')
                         ? ` <span style="color:var(--text-secondary);">(${escapeHtml(formatMoney(it.displayAmount, it.displayCurrency))})</span>` : '';
-                    return `<div style="display:flex; align-items:center; gap:0.6rem; padding:0.45rem 0; border-bottom:1px solid var(--border, rgba(255,255,255,0.06));">
+                    return `<div class="invd-item" style="display:flex; align-items:center; gap:0.6rem; padding:0.45rem 0; border-bottom:1px solid var(--border, rgba(255,255,255,0.06));">
                         ${productImageHtml(it.imageType, it.imageValue, it.imageUrl, 34)}
                         <div style="flex:1;"><div style="font-weight:500;">${escapeHtml(it.title)}</div>
-                        <div style="font-size:0.8rem; color:var(--text-secondary);">×${it.quantity}</div></div>
+                        <div style="font-size:0.8rem; color:var(--text-secondary);">×${escapeHtml(String(it.quantity))}${it.unitPrice ? ' · ' + escapeHtml(String(it.unitPrice)) + ' ' + escapeHtml(String(it.unitCurrency || '')) + ' each' : ''}</div></div>
                         <div style="text-align:right;">${it.amountSats.toLocaleString()} sats${paren}</div>
                     </div>`;
                 }).join('') + `<div style="text-align:right; font-weight:600; margin-top:0.5rem;">Total: ${totalSats.toLocaleString()} sats</div>`;
-            } catch (e) {
-                content.innerHTML = '<p style="color:#ef4444;">Failed to load items.</p>';
+            } else if (meta.orderId) {
+                itemsHtml = `<p class="invd-note">No line items were snapshotted for this invoice. It references order <strong>${escapeHtml(String(meta.orderId))}</strong>; the products are in that order on the shop side.</p>`;
+            } else {
+                itemsHtml = '<p class="invd-note">No products were attached when this invoice was created.</p>';
             }
+
+            // ---- attempts ----
+            const attempts = d.attempts || [];
+            let attemptsHtml;
+            if (!attempts.length) {
+                attemptsHtml = '<p class="invd-note">No payment-path attempts were recorded for this invoice.</p>';
+            } else {
+                const groups = {};
+                attempts.forEach(a => { (groups[a.context] = groups[a.context] || []).push(a); });
+                attemptsHtml = Object.keys(ATTEMPT_CONTEXT_LABELS).filter(k => groups[k]).map(k => {
+                    const rows = groups[k].map(a => {
+                        const rail = ATTEMPT_RAIL_LABELS[a.rail] || a.rail;
+                        const outcome = ATTEMPT_OUTCOME_LABELS[a.outcome] || a.outcome;
+                        return `<div class="invd-attempt" data-rail="${escapeAttr(a.rail)}" data-outcome="${escapeAttr(a.outcome)}">
+                            <div class="invd-attempt-time">${invdTime(a.timestamp)}</div>
+                            <div class="invd-attempt-body">
+                                <div><strong>${escapeHtml(rail)}</strong>${a.label ? ` <span class="invd-attempt-label">${escapeHtml(a.label)}</span>` : ''}</div>
+                                ${a.reason ? `<div class="invd-attempt-reason">${escapeHtml(a.reason)}</div>` : ''}
+                                ${a.detail && a.detail !== a.reason ? `<div class="invd-attempt-detail">${escapeHtml(a.detail)}</div>` : ''}
+                            </div>
+                            <span class="invd-outcome ${escapeAttr(a.outcome)}">${escapeHtml(outcome)}</span>
+                        </div>`;
+                    }).join('');
+                    return `<div class="invd-group-title">${escapeHtml(ATTEMPT_CONTEXT_LABELS[k])}</div>${rows}`;
+                }).join('');
+                if (d.attemptsLegacy) {
+                    attemptsHtml += '<p class="invd-note">Reconstructed from the invoice record — this invoice predates the attempt log, so timing is the creation time and destinations are not available.</p>';
+                }
+            }
+
+            // ---- raw ----
+            let raw = '';
+            if (det.metadata) {
+                raw += `<details class="invd-raw"><summary>Metadata (raw)</summary><pre>${escapeHtml(JSON.stringify(det.metadata, null, 2))}</pre></details>`;
+            }
+            if (det.checkoutConfig) {
+                raw += `<details class="invd-raw" style="margin-top:0.4rem;"><summary>Checkout options (raw)</summary><pre>${escapeHtml(JSON.stringify(det.checkoutConfig, null, 2))}</pre></details>`;
+            }
+
+            return head
+                + invdSection('Summary', summary)
+                + invdSection('Payment methods', methods)
+                + invdSection('Products', itemsHtml)
+                + invdSection('Payment attempts', attemptsHtml)
+                + (raw ? `<div class="invd-section">${raw}</div>` : '');
         }
 
         function openModal(id) {

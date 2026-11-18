@@ -11,11 +11,19 @@
  *   4. The order still only picks among WORKING destinations: lnaddress-first
  *      with the LNURL host down falls through to Strike, recording the lnurl
  *      failure in receive_errors.
+ *   5. The Cashu mint is an orderable path: cashu-first serves the invoice
+ *      from the mint (payment_rail 'mint'), and neither Strike nor the LNURL
+ *      host is contacted.
+ *   6. ...and only when it works: cashu-first with the mint down for new
+ *      quotes falls through to Strike, recording the mint failure.
+ *   7. Enabling cashu-first never makes the mint an auto-cashout target: the
+ *      destination chain holds only payout destinations.
  */
 declare(strict_types=1);
 require __DIR__ . '/harness.php';
 fresh_db();
 require __DIR__ . '/mock_strike_api.php';
+require __DIR__ . '/mock_mint_stub.php';
 require_once dirname(__DIR__, 2) . '/app/includes/invoice.php';
 require_once dirname(__DIR__, 2) . '/app/includes/rail_order.php';
 
@@ -39,7 +47,8 @@ if (strpos($path, '/.well-known/lnurlp/') === 0) {
     return;
 }
 if (strpos($path, '/callback') === 0) {
-    echo json_encode(['pr' => 'lnbc1mockorderlnurl', 'verify' => $base . '/verify/x']);
+    // BOLT11-shaped stub carrying the requested amount (1n = 100 msat).
+    echo json_encode(['pr' => 'lnbc' . intdiv((int)($_GET['amount'] ?? 0), 100) . 'n1m0ck0rderlnurl', 'verify' => $base . '/verify/x']);
     return;
 }
 if (strpos($path, '/verify') === 0) {
@@ -79,14 +88,14 @@ try {
     // ---------- 1. default order: strike leads ----------
     $inv = Invoice::create($store, ['amount' => 100, 'currency' => 'sat']);
     assert_eq('strike', $inv['payment_rail'], 'default order picks the Strike rail');
-    assert_true(str_starts_with((string)$inv['bolt11'], 'lnbcmock'), 'bolt11 from the Strike quote');
+    assert_true(str_contains((string)$inv['bolt11'], 'm0ckstr'), 'bolt11 from the Strike quote');
 
     // ---------- 2. lnaddress-first order flips the rail ----------
     RailOrder::setLnOrder($store, 'lnaddress,nwc,noffer,strike');
     $createsBefore = count(strike_mock_invoices($dir));
     $inv2 = Invoice::create($store, ['amount' => 100, 'currency' => 'sat']);
     assert_eq('lnaddress', $inv2['payment_rail'], 'lnaddress-first order picks the LNURL rail');
-    assert_eq('lnbc1mockorderlnurl', $inv2['bolt11'], 'bolt11 from the LNURL host');
+    assert_eq('lnbc1000n1m0ck0rderlnurl', $inv2['bolt11'], 'bolt11 from the LNURL host');
     assert_eq($createsBefore, count(strike_mock_invoices($dir)),
         'Strike was never contacted when a higher-priority rail worked');
     $row2 = Database::fetchOne("SELECT receive_errors, ln_destination FROM invoices WHERE id = ?", [$inv2['id']]);
@@ -108,6 +117,39 @@ try {
     $errors = json_decode((string)$row4['receive_errors'], true) ?: [];
     assert_eq(1, count($errors), 'one failure recorded');
     assert_eq('lnurl', $errors[0]['type'], 'the failed higher-priority rail is named');
+
+    // ---------- 5. cashu-first: the mint serves the invoice ----------
+    putenv("CASHU_LNURL_URL_TEMPLATE=http://127.0.0.1:{$lnurlPort}/.well-known/lnurlp/{user}");
+    $mint = start_mock_mint(['quotes' => [], 'quote_ttl' => 600]);
+    Database::query("UPDATE stores SET mint_url = ? WHERE id = ?", [$mint['url'], $store]);
+    RailOrder::setLnOrder($store, 'cashu,strike,lnaddress,nwc,noffer,swap');
+    $createsBefore = count(strike_mock_invoices($dir));
+    $inv5 = Invoice::create($store, ['amount' => 100, 'currency' => 'sat']);
+    assert_eq('mint', $inv5['payment_rail'], 'cashu-first order serves the invoice from the mint');
+    assert_eq($mint['url'], $inv5['mint_url'], 'the store mint issued the quote');
+    assert_not_null($inv5['quote_id'], 'mint quote recorded');
+    assert_eq($createsBefore, count(strike_mock_invoices($dir)),
+        'Strike was never contacted when the mint led and worked');
+    $row5 = Database::fetchOne("SELECT receive_errors FROM invoices WHERE id = ?", [$inv5['id']]);
+    assert_null($row5['receive_errors'], 'first-try mint success leaves receive_errors NULL');
+
+    // ---------- 6. cashu-first only picks the mint when it WORKS ----------
+    mock_mint_update_state($mint['dir'], ['quote_create_fail' => true]);
+    $inv6 = Invoice::create($store, ['amount' => 100, 'currency' => 'sat']);
+    assert_eq('strike', $inv6['payment_rail'], 'mint failure falls through to the next path (Strike)');
+    $row6 = Database::fetchOne("SELECT receive_errors FROM invoices WHERE id = ?", [$inv6['id']]);
+    $errors6 = json_decode((string)$row6['receive_errors'], true) ?: [];
+    assert_eq(['mint'], array_column($errors6, 'type'), 'the failed mint path is named for the payer');
+    mock_mint_update_state($mint['dir'], ['quote_create_fail' => false]);
+
+    // ---------- 7. the mint is never a cashout destination ----------
+    foreach (StoreLnAddresses::destinationsForStore($store) as $dest) {
+        assert_true(in_array($dest['type'], RailOrder::LN_DESTINATION_TYPES, true),
+            'cashu-first order leaves only payout destinations in the melt chain');
+    }
+    assert_eq(['strike', 'lnaddress'],
+        array_column(StoreLnAddresses::destinationsForStore($store), 'type'),
+        'destination chain keeps its own configured order under cashu-first');
 } finally {
     stop_strike_mock($pid);
     putenv('CASHUPAY_STRIKE_API_BASE');

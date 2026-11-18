@@ -554,6 +554,26 @@ class SafeHttp {
     }
 
     /**
+     * Make a response body safe to put in a log line or exception message.
+     *
+     * Remote bodies are attacker-influenced: a hostile upstream can embed
+     * terminal escape sequences (the Windows desktop package shows the PHP
+     * log in a live console), CR/LF to forge log lines, NULs or invalid
+     * UTF-8. Everything outside printable ASCII collapses to a single '?'
+     * and the result is capped at $max bytes (plus a '...' marker).
+     */
+    public static function logExcerpt(string $body, int $max = 120): string {
+        $s = preg_replace('/[^\x20-\x7E]+/', '?', $body);
+        if ($s === null) {
+            $s = '';
+        }
+        if (strlen($s) > $max) {
+            $s = substr($s, 0, max(0, $max)) . '...';
+        }
+        return $s;
+    }
+
+    /**
      * Returns true if the operator has opted in to allowing private/
      * loopback destinations (for self-hosted mints or local Bitcoin nodes).
      *

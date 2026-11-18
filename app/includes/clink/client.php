@@ -37,6 +37,7 @@ declare(strict_types=1);
 require_once __DIR__ . '/noffer.php';
 require_once __DIR__ . '/../crypto/nostr_crypto.php';
 require_once __DIR__ . '/../../vendor/autoload.php';
+require_once __DIR__ . '/../response_shape.php';
 
 use swentel\nostr\Event\Event;
 use swentel\nostr\Encryption\Nip44;
@@ -227,9 +228,14 @@ class ClinkClient
         if (!isset($reply['bolt11']) || !is_string($reply['bolt11']) || $reply['bolt11'] === '') {
             throw new ClinkException('CLINK service returned no bolt11', 2);
         }
+        // Shown to the payer as a QR / lightning: link: must be BOLT11-shaped.
+        $bolt11 = ResponseShape::bolt11($reply['bolt11']);
+        if ($bolt11 === null) {
+            throw new ClinkException('CLINK service returned a malformed bolt11', 2);
+        }
 
         return [
-            'bolt11' => (string)$reply['bolt11'],
+            'bolt11' => $bolt11,
             // The relay that actually answered — the receipt subscription
             // (payment page + cron) should listen where the service is known
             // to be reachable, not blindly on the offer's first relay.

@@ -247,8 +247,8 @@ function analytics_country(PDO $pdo, string $ip): ?string {
 // Report validation — the privacy contract, enforced server-side
 // --------------------------------------------------------------------------
 
-const ANALYTICS_FEATURE_RAILS = ['mint', 'lnaddress', 'nwc', 'noffer', 'strike', 'onchain', 'swaps'];
-const ANALYTICS_VOLUME_RAILS  = ['mint', 'lnaddress', 'nwc', 'noffer', 'strike', 'swap', 'onchain'];
+const ANALYTICS_FEATURE_RAILS = ['mint', 'lnaddress', 'nwc', 'noffer', 'strike', 'onchain', 'swaps', 'ecx'];
+const ANALYTICS_VOLUME_RAILS  = ['mint', 'lnaddress', 'nwc', 'noffer', 'strike', 'swap', 'onchain', 'ecx'];
 const ANALYTICS_MAX_COUNT     = 1000000000;      // counts: 1e9
 const ANALYTICS_MAX_SATS      = 2100000000000000; // 21M BTC in sats
 
@@ -285,6 +285,7 @@ function analytics_rules(): array {
             'stores_with_strike'    => ['int', [0, ANALYTICS_MAX_COUNT]],
             'stores_with_onchain'   => ['int', [0, ANALYTICS_MAX_COUNT]],
             'stores_with_swaps'     => ['int', [0, ANALYTICS_MAX_COUNT]],
+            'stores_with_ecx'       => ['int', [0, ANALYTICS_MAX_COUNT]],
             'auto_update_enabled'   => ['bool', null],
             'products_count'        => ['int', [0, ANALYTICS_MAX_COUNT]],
             'api_keys_count'        => ['int', [0, ANALYTICS_MAX_COUNT]],

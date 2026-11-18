@@ -31,7 +31,7 @@ Config::set('deployment_id', 'SECRET-DEPLOYMENT-42');
 make_store('s_mint', $MINT);                    // mint + lnaddress + nwc + xpub + swaps
 Database::update('stores', ['name' => 'Secret Store Name'], 'id = ?', ['s_mint']);
 make_store('s_nomint', null);                   // noffer + static on-chain + strike on-chain
-make_store('s_bare', null);                     // nothing at all
+make_store('s_bare', null);                     // nothing at all (an eCash xpub arrives below)
 Database::insert('store_ln_addresses', ['store_id' => 's_mint', 'position' => 0, 'address' => $LNADDR, 'type' => 'lnaddress']);
 Database::insert('store_ln_addresses', ['store_id' => 's_mint', 'position' => 1, 'address' => $NWC, 'type' => 'nwc']);
 Database::insert('store_ln_addresses', ['store_id' => 's_nomint', 'position' => 0, 'address' => 'noffer1secretoffer', 'type' => 'noffer']);
@@ -39,6 +39,14 @@ Database::update('stores', ['onchain_address_mode' => 'xpub', 'onchain_xpub' => 
 Database::update('stores', ['onchain_address_mode' => 'static', 'onchain_static_address' => $STATIC, 'onchain_strike_enabled' => 1], 'id = ?', ['s_nomint']);
 // a store that switched from static back to xpub keeps the stale static column: not configured
 Database::update('stores', ['onchain_address_mode' => 'xpub', 'onchain_static_address' => $STATIC], 'id = ?', ['s_bare']);
+// eCash (ECX): s_mint re-uses its Bitcoin xpub; s_bare has an ECX static
+// address but sits in xpub mode (stale column, not configured); s_nomint has
+// the eCash offer switched off but IS configured (the toggle hides the tab,
+// it does not unset the rail).
+$ECX_STATIC = 'bc1qsecretecxstaticaddressxxxxxxxxxxxxxx';
+Database::update('stores', ['ecx_address_mode' => 'xpub', 'ecx_xpub' => $XPUB], 'id = ?', ['s_mint']);
+Database::update('stores', ['ecx_address_mode' => 'xpub', 'ecx_static_address' => $ECX_STATIC], 'id = ?', ['s_bare']);
+Database::update('stores', ['ecx_address_mode' => 'static', 'ecx_static_address' => $ECX_STATIC, 'ecx_offer_enabled' => 0], 'id = ?', ['s_nomint']);
 
 Database::insert('products', ['id' => 'p1', 'store_id' => 's_mint', 'title' => 'Secret Product', 'price' => '1000', 'currency' => 'sat', 'created_at' => $NOW, 'updated_at' => $NOW]);
 Database::insert('products', ['id' => 'p2', 'store_id' => 's_mint', 'title' => 'Other', 'price' => '5', 'currency' => 'USD', 'enabled' => 0, 'created_at' => $NOW, 'updated_at' => $NOW]);
@@ -65,6 +73,10 @@ $addInvoice('s_mint', 'Settled', 9_999_999, 40 * 86400, 40 * 86400 - 60, 'lnaddr
 $addInvoice('s_mint', 'Expired', 50, 31 * 86400, null, null);                            // outside the window
 // Settled with a NULL paid_at (legacy row) is not counted as settled-in-window.
 $addInvoice('s_mint', 'Settled', 123, 86400, null, 'mint');
+// Paid in eCash (ECX): counted on its own rail at the sats the invoice was
+// quoted at; the szat figure and the ECX address never leave the install.
+$addInvoice('s_mint', 'Settled', 4000, 4 * 86400, 4 * 86400 - 60, 'ecx');
+Database::update('invoices', ['ecx_address' => $ECX_STATIC, 'ecx_amount_szat' => 123456789], 'id = ?', ["inv_{$inv}"]);
 
 // --- allowlist shape -----------------------------------------------------------------
 $l1 = UsageStats::buildPayload(1, $NOW);
@@ -80,8 +92,8 @@ foreach ([1 => $l1, 2 => $l2, 3 => $l3] as $level => $p) {
     assert_eq(UsageStats::allowedPropertiesForLevel($level), array_keys($p['properties']), "L{$level} carries exactly its allowlisted keys, in order");
 }
 assert_eq(7, count($l1['properties']));
-assert_eq(7 + 13, count($l2['properties']));
-assert_eq(7 + 13 + 4 + 14, count($l3['properties']));
+assert_eq(7 + 14, count($l2['properties']));
+assert_eq(7 + 14 + 4 + 16, count($l3['properties']));
 assert_eq(UsageStats::INSTALL_ID_PLACEHOLDER, $l1['install_id'], 'no id before opt-in: the preview says so');
 
 // The endpoint's rule table must list exactly the same keys per level.
@@ -107,7 +119,7 @@ assert_eq('unknown', $p['web_server'], 'CLI has no SERVER_SOFTWARE');
 // --- level 2 values --------------------------------------------------------------------
 $p = $l2['properties'];
 assert_eq(3, $p['store_count']);
-assert_eq(['mint', 'lnaddress', 'nwc', 'noffer', 'strike', 'onchain', 'swaps'], $p['rails_enabled'], 'every rail with at least one store, in canonical order');
+assert_eq(['mint', 'lnaddress', 'nwc', 'noffer', 'strike', 'onchain', 'swaps', 'ecx'], $p['rails_enabled'], 'every rail with at least one store, in canonical order');
 assert_eq(1, $p['stores_with_mint']);
 assert_eq(1, $p['stores_with_lnaddress']);
 assert_eq(1, $p['stores_with_nwc']);
@@ -115,6 +127,7 @@ assert_eq(1, $p['stores_with_noffer']);
 assert_eq(1, $p['stores_with_strike'], 'Strike on-chain minting counts as the Strike rail');
 assert_eq(2, $p['stores_with_onchain'], 'xpub store + static store; the stale-static xpub store does not count');
 assert_eq(1, $p['stores_with_swaps']);
+assert_eq(2, $p['stores_with_ecx'], 'ECX xpub store + ECX static store (offer off still configured); the stale-static xpub-mode store does not count');
 assert_false($p['auto_update_enabled']);
 assert_eq(2, $p['products_count'], 'disabled products still count as products');
 assert_eq(2, $p['api_keys_count']);
@@ -128,10 +141,12 @@ assert_eq(3, $p['api_keys_count']);
 
 // --- level 3 values --------------------------------------------------------------------
 $p = $l3['properties'];
-assert_eq(7, $p['invoices_30d_created'], 'created in the last 30 days (incl. New and Expired, excl. the two older rows)');
-assert_eq(4, $p['invoices_30d_settled'], 'Settled with paid_at in window: 2 mint + onchain + noffer');
+assert_eq(8, $p['invoices_30d_created'], 'created in the last 30 days (incl. New and Expired, excl. the two older rows)');
+assert_eq(5, $p['invoices_30d_settled'], 'Settled with paid_at in window: 2 mint + onchain + noffer + ecx');
 assert_eq(1, $p['invoices_30d_expired']);
-assert_eq(3800, $p['invoices_30d_settled_sats']);
+assert_eq(7800, $p['invoices_30d_settled_sats'], 'the eCash settlement counts at its quoted sats');
+assert_eq(1, $p['settled_30d_ecx_count']);
+assert_eq(4000, $p['settled_30d_ecx_sats'], 'quoted sats, never szats');
 assert_eq(2, $p['settled_30d_mint_count']);
 assert_eq(3000, $p['settled_30d_mint_sats']);
 assert_eq(0, $p['settled_30d_lnaddress_count'], 'the 40-day-old lnaddress settlement is outside the window');
@@ -147,6 +162,7 @@ foreach ([
     'SECRET-DEPLOYMENT-42', 'Secret Store Name', 'Secret Product', 'secret-example.com', $MINT, $LNADDR,
     'secret-lnaddr', 'walletconnect', 'cafebabe', 'noffer1secret', 'zpub6', $STATIC, $EMAIL, 'lnbc10u1', 'inv_1',
     'mint_url', 'deployment', 'email', 'bc1q', 'notification', 'auto_melt', 'cashout', 'seed', 'xpub',
+    $ECX_STATIC, '123456789', 'szat',
 ] as $needle) {
     assert_false(stripos($json, $needle) !== false, "level-3 report must not contain {$needle}");
 }

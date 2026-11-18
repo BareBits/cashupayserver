@@ -62,8 +62,13 @@ def test_releases_link_follows_update_channel(
     href = page.get_attribute(_FOOTER_LINK, "href")
     assert href is not None and href.endswith("/releases"), href
 
-    # And back to main -> /releases/latest again.
-    page.click('[data-view="settings"]')
+    # And back to main -> /releases/latest again. The reload kept the view
+    # in the URL, so after loadDashboard() the app restores it with
+    # switchView('settings'), which re-collapses every card. Clicking the
+    # nav entry ourselves would race that restore (expand, then the late
+    # restore collapses again -> the select is hidden); wait for the restore
+    # to activate the view, then expand.
+    page.wait_for_selector("#view-settings.active", state="attached")
     expand_settings_cards(page)
     page.wait_for_selector("#card-auto-update", state="visible")
     _wait_card_loaded(page)

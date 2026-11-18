@@ -11,6 +11,7 @@ require_once __DIR__ . '/../config.php';
 require_once __DIR__ . '/../webhook_sender.php';
 require_once __DIR__ . '/wallet.php';
 require_once __DIR__ . '/provider.php';
+require_once __DIR__ . '/chain.php';
 
 class OnchainPayments {
     /**
@@ -71,7 +72,8 @@ class OnchainPayments {
      * @throws RuntimeException with message ERR_TWEAK_SLOTS_EXHAUSTED when
      *         static mode has no free tweak slot.
      */
-    public static function allocateAddress(string $storeId, ?int $baseAmountSat = null): ?array {
+    public static function allocateAddress(string $storeId, ?int $baseAmountSat = null, ?Chain $chain = null): ?array {
+        $ch = $chain ?? Chain::btc();
         $pdo = Database::getInstance();
         Database::beginImmediate(); // write lock up front: read-before-write allocator (see Database::beginImmediate)
         // The allocation itself (slot/index reservation) happens under the write
@@ -94,11 +96,11 @@ class OnchainPayments {
             }
             $storeRow = $row;
 
-            $mode = $row['onchain_address_mode'] ?? 'xpub';
+            $mode = $row[$ch->store['mode']] ?? 'xpub';
             $now = time();
 
             if ($mode === 'static') {
-                $address = $row['onchain_static_address'] ?? null;
+                $address = $row[$ch->store['static']] ?? null;
                 if (!$address) {
                     $pdo->commit();
                     return null;
@@ -107,14 +109,14 @@ class OnchainPayments {
                     $pdo->rollBack();
                     throw new RuntimeException('allocateAddress(): baseAmountSat is required for static mode');
                 }
-                $tweak = self::pickTweakSlot($pdo, $row, $address, (int)$baseAmountSat, $now);
+                $tweak = self::pickTweakSlot($pdo, $row, $address, (int)$baseAmountSat, $now, $ch);
                 if ($tweak === null) {
                     $pdo->rollBack();
                     throw new RuntimeException(self::ERR_TWEAK_SLOTS_EXHAUSTED);
                 }
                 $result = ['address' => $address, 'index' => null, 'tweak' => $tweak];
                 $pdo->commit();
-            } elseif (empty($row['onchain_xpub'])) {
+            } elseif (empty($row[$ch->store['xpub']])) {
                 // xpub mode (default) but no xpub configured.
                 $pdo->commit();
                 return null;
@@ -122,7 +124,7 @@ class OnchainPayments {
                 // Counter is keyed by xpub, not by store, so two stores sharing
                 // the same xpub never derive the same address, and re-pasting a
                 // previously used xpub resumes from where it left off.
-                $xpubHash = hash('sha256', $row['onchain_xpub']);
+                $xpubHash = hash('sha256', $row[$ch->store['xpub']]);
                 $pdo->prepare(
                     "INSERT INTO onchain_xpub_state (xpub_hash, next_index, updated_at)
                      VALUES (?, 0, ?) ON CONFLICT(xpub_hash) DO NOTHING"
@@ -139,14 +141,15 @@ class OnchainPayments {
 
                 // Mirror the index back to the stores row too, for backwards-
                 // compat reporting (admin dashboard surfaces it as nextIndex).
+                // Per chain: the ECX card shows ecx_next_index.
                 $pdo->prepare(
-                    "UPDATE stores SET onchain_next_index = ? WHERE id = ?"
+                    "UPDATE stores SET {$ch->store['next_index']} = ? WHERE id = ?"
                 )->execute([$index + 1, $storeId]);
 
                 $address = OnchainWallet::deriveAddress(
-                    $row['onchain_xpub'],
-                    $row['onchain_address_type'] ?: 'P2WPKH',
-                    $row['onchain_network'] ?: 'mainnet',
+                    $row[$ch->store['xpub']],
+                    $row[$ch->store['type']] ?: 'P2WPKH',
+                    $ch->network($row),
                     $index
                 );
 
@@ -162,7 +165,7 @@ class OnchainPayments {
 
         // Tip read outside the txn (best-effort network call); failure leaves
         // tip NULL which simply disables historical-UTXO filtering.
-        $result['tip_height'] = self::currentTipBestEffort($storeRow);
+        $result['tip_height'] = self::currentTipBestEffort($storeRow, $ch);
         return $result;
     }
 
@@ -180,18 +183,19 @@ class OnchainPayments {
      * Runs inside the caller's transaction. Returns null when no tweak in
      * the range yields a unique total (pool exhausted).
      */
-    private static function pickTweakSlot(PDO $pdo, array $store, string $address, int $baseAmountSat, int $now): ?int {
-        $range = max(1, (int)($store['onchain_static_tweak_range'] ?? 1000));
-        $confirmTimeout = (int)($store['onchain_confirm_timeout_sec'] ?? 86400);
+    private static function pickTweakSlot(PDO $pdo, array $store, string $address, int $baseAmountSat, int $now, ?Chain $ch = null): ?int {
+        $ch = $ch ?? Chain::btc();
+        $range = max(1, (int)($store[$ch->store['tweak_range']] ?? 1000));
+        $confirmTimeout = (int)($store[$ch->store['timeout']] ?? 86400);
         // SQLite quirk: bound parameters arrive with TEXT affinity, and
         // `INTEGER > TEXT` compares by storage class (integers always
         // sort *below* text), so the naive `(expiration_time + ?) > ?`
         // silently returns false. CAST the bound timestamp to INTEGER
         // to force a numeric comparison.
         $stmt = $pdo->prepare(
-            "SELECT onchain_amount_sat FROM invoices
-              WHERE onchain_address = ?
-                AND onchain_amount_sat IS NOT NULL
+            "SELECT {$ch->inv['amount']} FROM invoices
+              WHERE {$ch->inv['address']} = ?
+                AND {$ch->inv['amount']} IS NOT NULL
                 AND status IN ('New','Processing')
                 AND (expiration_time + CAST(? AS INTEGER)) > CAST(? AS INTEGER)"
         );
@@ -208,16 +212,36 @@ class OnchainPayments {
         return null;
     }
 
+    /**
+     * The index the shared per-xpub counter will hand out next for $xpub, or
+     * $fallback when the key has never allocated. The counter lives in
+     * onchain_xpub_state and is shared by every chain (and every store) using
+     * the key, so this — not the per-store mirror column — is what the admin
+     * "next address" previews and the cards' m/0/<n> labels must read: after
+     * an eCash allocation the Bitcoin mirror column is behind by one.
+     */
+    public static function nextIndexForXpub(?string $xpub, int $fallback = 0): int {
+        if ($xpub === null || trim($xpub) === '') {
+            return $fallback;
+        }
+        $row = Database::fetchOne(
+            "SELECT next_index FROM onchain_xpub_state WHERE xpub_hash = ?",
+            [hash('sha256', $xpub)]
+        );
+        return $row ? (int)$row['next_index'] : $fallback;
+    }
+
     /** Public: Invoice::create also stamps a Strike-minted address with the
      *  allocation-time tip, using the same best-effort semantics. */
-    public static function currentTipBestEffort(array $store): ?int {
+    public static function currentTipBestEffort(array $store, ?Chain $chain = null): ?int {
+        $ch = $chain ?? Chain::btc();
         // Capture the chain tip at allocation time. The poller compares
         // each observation's block_height against this to discard payments
         // that existed on a re-used address BEFORE the invoice was created.
         // Provider call is best-effort: if it fails, we just leave the
         // tip NULL and skip filtering (old behavior).
         try {
-            $provider = OnchainProviderFactory::forStore($store);
+            $provider = OnchainProviderFactory::forStore($store, $ch);
             return $provider->currentTipHeight();
         } catch (Throwable $_) {
             return null;
@@ -237,6 +261,8 @@ class OnchainPayments {
      * @return array{address:string, index:int}|null  null if store has no xpub
      */
     public static function allocateClaimAddress(string $storeId): ?array {
+        // Swap claims are a Bitcoin-only concern; read the Bitcoin columns.
+        $ch = Chain::btc();
         $pdo = Database::getInstance();
         Database::beginImmediate(); // write lock up front: read-before-write allocator (see Database::beginImmediate)
         try {
@@ -248,11 +274,11 @@ class OnchainPayments {
             // an arbitrary amount and could collide with an open invoice's
             // tweaked total, leading to wrong attribution. Stores in static
             // mode fall back to non-swap rails for their invoices.
-            if (!$row || ($row['onchain_address_mode'] ?? 'xpub') === 'static' || empty($row['onchain_xpub'])) {
+            if (!$row || ($row[$ch->store['mode']] ?? 'xpub') === 'static' || empty($row[$ch->store['xpub']])) {
                 $pdo->commit();
                 return null;
             }
-            $xpubHash = hash('sha256', $row['onchain_xpub']);
+            $xpubHash = hash('sha256', $row[$ch->store['xpub']]);
             $now = time();
             $pdo->prepare(
                 "INSERT INTO onchain_xpub_state (xpub_hash, next_index, updated_at)
@@ -272,9 +298,9 @@ class OnchainPayments {
             )->execute([$index + 1, $storeId]);
 
             $address = OnchainWallet::deriveAddress(
-                $row['onchain_xpub'],
-                $row['onchain_address_type'] ?: 'P2WPKH',
-                $row['onchain_network'] ?: 'mainnet',
+                $row[$ch->store['xpub']],
+                $row[$ch->store['type']] ?: 'P2WPKH',
+                $ch->network($row),
                 $index
             );
             $pdo->commit();
@@ -311,8 +337,13 @@ class OnchainPayments {
         string $network,
         string $type,
         ?array $tipProviderStore = null,
-        ?int $branch = null
+        ?int $branch = null,
+        ?Chain $chain = null
     ): array {
+        // $chain only picks whose explorer answers the best-effort tip read;
+        // derivation is chain-agnostic (ECX addresses are Bitcoin addresses)
+        // and the per-xpub counter is shared across chains on purpose.
+        $ch = $chain ?? Chain::btc();
         $pdo = Database::getInstance();
         Database::beginImmediate(); // write lock up front: read-before-write allocator (see Database::beginImmediate)
         try {
@@ -347,7 +378,7 @@ class OnchainPayments {
 
         // Tip read is outside the txn (best-effort network call); failure
         // leaves tip NULL which simply disables historical-UTXO filtering.
-        $tip = $tipProviderStore !== null ? self::currentTipBestEffort($tipProviderStore) : null;
+        $tip = $tipProviderStore !== null ? self::currentTipBestEffort($tipProviderStore, $ch) : null;
         return ['address' => $address, 'index' => $index, 'tip_height' => $tip, 'branch' => $branch];
     }
 
@@ -360,12 +391,13 @@ class OnchainPayments {
      *   status:string, transition:?string
      * }
      */
-    public static function pollInvoice(string $invoiceId): array {
+    public static function pollInvoice(string $invoiceId, ?Chain $chain = null): array {
+        $ch = $chain ?? Chain::btc();
         $invoice = Database::fetchOne("SELECT * FROM invoices WHERE id = ?", [$invoiceId]);
         if (!$invoice) {
             throw new Exception("Invoice not found: {$invoiceId}");
         }
-        $address = $invoice['onchain_address'] ?? null;
+        $address = $invoice[$ch->inv['address']] ?? null;
         if (!$address) {
             return ['total_confirmed' => 0, 'total_pending' => 0, 'observation_count' => 0,
                     'status' => $invoice['status'], 'transition' => null];
@@ -375,24 +407,24 @@ class OnchainPayments {
             throw new Exception("Store not found: {$invoice['store_id']}");
         }
 
-        $provider = OnchainProviderFactory::forStore($store);
+        $provider = OnchainProviderFactory::forStore($store, $ch);
         // Pass the invoice's allocation tip as a paging hint: any tx confirmed
         // before the invoice existed is filtered out below, so the provider can
         // stop walking chain history once it pages below that height.
-        $createdTipHint = isset($invoice['onchain_created_tip_height'])
-            ? (int)$invoice['onchain_created_tip_height']
+        $createdTipHint = isset($invoice[$ch->inv['created_tip']])
+            ? (int)$invoice[$ch->inv['created_tip']]
             : null;
         $observations = $provider->addressTransactions($address, $createdTipHint);
 
-        $minConfs = (int)($store['onchain_min_confs'] ?? 1);
+        $minConfs = (int)($store[$ch->store['min_confs']] ?? 1);
         $now = time();
         // A Strike-minted address (strike_receive_request_id set) is fresh
         // per invoice, so it always uses the unambiguous unique-address
         // attribution below — even when the STORE is in static mode (the
         // static config is then only the fallback source for invoices where
         // the Strike call failed).
-        $isStaticMode = ($store['onchain_address_mode'] ?? 'xpub') === 'static'
-            && empty($invoice['strike_receive_request_id']);
+        $isStaticMode = ($store[$ch->store['mode']] ?? 'xpub') === 'static'
+            && (!$ch->isBtc() || empty($invoice['strike_receive_request_id']));
 
         // Filter out historical UTXOs on a re-used address — any tx confirmed
         // strictly before the invoice was created. onchain_created_tip_height
@@ -400,7 +432,7 @@ class OnchainPayments {
         // block_height < that height was mined before the invoice existed.
         // Mempool observations (block_height === null) are always kept.
         // Legacy invoices without a recorded tip skip the filter.
-        $createdTip = $invoice['onchain_created_tip_height'] ?? null;
+        $createdTip = $invoice[$ch->inv['created_tip']] ?? null;
         if ($createdTip !== null) {
             $observations = array_values(array_filter($observations, function ($obs) use ($createdTip) {
                 return $obs->blockHeight === null || $obs->blockHeight >= (int)$createdTip;
@@ -412,8 +444,8 @@ class OnchainPayments {
             // attribute every UTXO blindly. Only attribute a tx whose amount
             // matches the invoice total exactly AND no other open invoice on
             // the same address expects that same amount.
-            $expected = (int)($invoice['onchain_amount_sat'] ?? 0);
-            $confirmTimeout = (int)($store['onchain_confirm_timeout_sec'] ?? 86400);
+            $expected = (int)($invoice[$ch->inv['amount']] ?? 0);
+            $confirmTimeout = (int)($store[$ch->store['timeout']] ?? 86400);
             // Each poll re-evaluates ambiguity from scratch so the flag
             // can clear naturally once competing invoices expire.
             $candidates = [];
@@ -422,26 +454,26 @@ class OnchainPayments {
                     continue;
                 }
                 $existing = Database::fetchOne(
-                    "SELECT invoice_id FROM onchain_payments WHERE txid = ? AND vout = ?",
+                    "SELECT invoice_id FROM {$ch->paymentsTable} WHERE txid = ? AND vout = ?",
                     [$obs->txid, $obs->vout]
                 );
                 if ($existing) {
                     if ($existing['invoice_id'] === $invoiceId) {
-                        self::upsertObservation($invoiceId, $obs, $now);
+                        self::upsertObservation($invoiceId, $obs, $now, $ch);
                     }
                     continue;
                 }
                 $competitors = Database::fetchAll(
                     "SELECT id FROM invoices
-                      WHERE onchain_address = ?
-                        AND onchain_amount_sat = ?
+                      WHERE {$ch->inv['address']} = ?
+                        AND {$ch->inv['amount']} = ?
                         AND status IN ('New','Processing')
                         AND id != ?
                         AND (expiration_time + CAST(? AS INTEGER)) > CAST(? AS INTEGER)",
                     [$address, $expected, $invoiceId, $confirmTimeout, $now]
                 );
                 if (empty($competitors)) {
-                    self::upsertObservation($invoiceId, $obs, $now);
+                    self::upsertObservation($invoiceId, $obs, $now, $ch);
                 } else {
                     $candidates[] = [
                         'txid' => $obs->txid,
@@ -459,16 +491,16 @@ class OnchainPayments {
                             'confirmations' => $obs->confirmations,
                             'block_height' => $obs->blockHeight,
                             'first_seen_at' => $now,
-                        ]);
+                        ], $ch);
                     }
                 }
             }
-            self::setManualCandidates($invoiceId, $candidates);
+            self::setManualCandidates($invoiceId, $candidates, $ch);
         } else {
             // xpub mode: each address belongs to exactly one invoice, so any
             // UTXO at it is unambiguously this invoice's. Sum them all.
             foreach ($observations as $obs) {
-                self::upsertObservation($invoiceId, $obs, $now);
+                self::upsertObservation($invoiceId, $obs, $now, $ch);
             }
         }
 
@@ -488,7 +520,7 @@ class OnchainPayments {
             $observedKeys[$obs->txid . ':' . $obs->vout] = true;
         }
         $persistedRows = Database::fetchAll(
-            "SELECT id, txid, vout, confirmations FROM onchain_payments WHERE invoice_id = ?",
+            "SELECT id, txid, vout, confirmations FROM {$ch->paymentsTable} WHERE invoice_id = ?",
             [$invoiceId]
         );
         foreach ($persistedRows as $p) {
@@ -499,7 +531,7 @@ class OnchainPayments {
                 continue; // deeply buried -> treat as final, ignore provider omission
             }
             // Vanished while still shallow: reorged out or dropped. Stop counting it.
-            Database::query("DELETE FROM onchain_payments WHERE id = ?", [$p['id']]);
+            Database::query("DELETE FROM {$ch->paymentsTable} WHERE id = ?", [$p['id']]);
         }
 
         // Recompute totals from the persisted state (canonical source).
@@ -516,7 +548,7 @@ class OnchainPayments {
             }
         }
         $rows = Database::fetchAll(
-            "SELECT txid, vout, amount_sat, confirmations FROM onchain_payments WHERE invoice_id = ?",
+            "SELECT txid, vout, amount_sat, confirmations FROM {$ch->paymentsTable} WHERE invoice_id = ?",
             [$invoiceId]
         );
         $totalConfirmed = 0;
@@ -537,7 +569,8 @@ class OnchainPayments {
             totalConfirmed: $totalConfirmed,
             totalPending: $totalPending,
             anyObservation: count($rows) > 0,
-            now: $now
+            now: $now,
+            chain: $ch
         );
 
         return [
@@ -552,22 +585,21 @@ class OnchainPayments {
     /**
      * Build the BTC-OnChain payment-method block for the Greenfield API.
      */
-    public static function formatPaymentMethod(array $invoice): ?array {
-        $address = $invoice['onchain_address'] ?? null;
+    public static function formatPaymentMethod(array $invoice, ?Chain $chain = null): ?array {
+        $ch = $chain ?? Chain::btc();
+        $address = $invoice[$ch->inv['address']] ?? null;
         if (!$address) {
             return null;
         }
-        $amountSat = (int)($invoice['onchain_amount_sat'] ?? 0);
-        $btc = bcdiv((string)$amountSat, '100000000', 8);
-        // Strip trailing zeros from the BTC amount for the BIP21 URI.
-        $btcDisplay = rtrim(rtrim($btc, '0'), '.');
-        $btcDisplay = $btcDisplay === '' ? '0' : $btcDisplay;
+        $amountSat = (int)($invoice[$ch->inv['amount']] ?? 0);
         return [
             'destination' => $address,
-            'paymentLink' => "bitcoin:{$address}?amount={$btcDisplay}",
+            // bitcoin:<addr>?amount=<BTC> / ecash:<addr>?amount=<ECX>,
+            // trailing zeros trimmed from the coin amount.
+            'paymentLink' => $ch->paymentUri($address, $amountSat),
             'amount' => (string)$amountSat,
             'due' => (string)$amountSat,
-            'rate' => $invoice['exchange_rate'] ?? null,
+            'rate' => $invoice[$ch->inv['rate']] ?? null,
         ];
     }
 
@@ -587,7 +619,8 @@ class OnchainPayments {
      * @param int $minIntervalSec Minimum seconds between consecutive polls of the same invoice
      * @param int $batchLimit Maximum invoices to poll per call
      */
-    public static function pollPending(int $minIntervalSec = 60, int $batchLimit = 20): array {
+    public static function pollPending(int $minIntervalSec = 60, int $batchLimit = 20, ?Chain $chain = null): array {
+        $ch = $chain ?? Chain::btc();
         $now = time();
         // Throttle as `column <= cutoff`, NOT `(? - column) >= ?`: PDO binds
         // execute() params as TEXT, and while the column's INTEGER affinity
@@ -613,21 +646,21 @@ class OnchainPayments {
         // kept in the set by its additional_status so the second look happens.
         $rows = Database::fetchAll(
             "SELECT id FROM invoices
-              WHERE onchain_address IS NOT NULL
+              WHERE {$ch->inv['address']} IS NOT NULL
                 AND (
                   (status IN ('New', 'Processing')
-                    AND (onchain_last_polled_at IS NULL
-                         OR ((long_lived = 0 OR status = 'Processing' OR created_at > ?) AND onchain_last_polled_at <= ?)
-                         OR (long_lived = 1 AND status = 'New' AND created_at <= ? AND created_at > ? AND onchain_last_polled_at <= ?)
-                         OR (long_lived = 1 AND status = 'New' AND created_at <= ? AND onchain_last_polled_at <= ?)))
-                  OR (status = 'Settled' AND settled_rail = 'onchain'
+                    AND ({$ch->inv['last_polled']} IS NULL
+                         OR ((long_lived = 0 OR status = 'Processing' OR created_at > ?) AND {$ch->inv['last_polled']} <= ?)
+                         OR (long_lived = 1 AND status = 'New' AND created_at <= ? AND created_at > ? AND {$ch->inv['last_polled']} <= ?)
+                         OR (long_lived = 1 AND status = 'New' AND created_at <= ? AND {$ch->inv['last_polled']} <= ?)))
+                  OR (status = 'Settled' AND settled_rail = '{$ch->rail}'
                       AND paid_at IS NOT NULL AND paid_at >= ?
-                      AND (onchain_last_polled_at IS NULL OR onchain_last_polled_at <= ?)
+                      AND ({$ch->inv['last_polled']} IS NULL OR {$ch->inv['last_polled']} <= ?)
                       AND (additional_status = ?
-                           OR EXISTS (SELECT 1 FROM onchain_payments op
+                           OR EXISTS (SELECT 1 FROM {$ch->paymentsTable} op
                                        WHERE op.invoice_id = invoices.id AND op.confirmations < 1)))
                 )
-              ORDER BY onchain_last_polled_at ASC NULLS FIRST
+              ORDER BY {$ch->inv['last_polled']} ASC NULLS FIRST
               LIMIT ?",
             [
                 $dayAgo, $cutoff,
@@ -641,10 +674,10 @@ class OnchainPayments {
         foreach ($rows as $r) {
             try {
                 Database::query(
-                    "UPDATE invoices SET onchain_last_polled_at = ? WHERE id = ?",
+                    "UPDATE invoices SET {$ch->inv['last_polled']} = ? WHERE id = ?",
                     [$now, $r['id']]
                 );
-                $results[$r['id']] = self::pollInvoice($r['id']);
+                $results[$r['id']] = self::pollInvoice($r['id'], $ch);
             } catch (Throwable $e) {
                 error_log("on-chain poll failed for {$r['id']}: " . $e->getMessage());
                 $results[$r['id']] = ['error' => $e->getMessage()];
@@ -665,19 +698,20 @@ class OnchainPayments {
      *         or if the (txid, vout) is already attributed to a different
      *         invoice.
      */
-    public static function manuallyAttribute(string $invoiceId, string $txid, int $vout): void {
+    public static function manuallyAttribute(string $invoiceId, string $txid, int $vout, ?Chain $chain = null): void {
+        $ch = $chain ?? Chain::btc();
         $invoice = Database::fetchOne("SELECT * FROM invoices WHERE id = ?", [$invoiceId]);
         if (!$invoice) {
             throw new RuntimeException("Invoice not found: {$invoiceId}");
         }
         $existing = Database::fetchOne(
-            "SELECT invoice_id FROM onchain_payments WHERE txid = ? AND vout = ?",
+            "SELECT invoice_id FROM {$ch->paymentsTable} WHERE txid = ? AND vout = ?",
             [$txid, $vout]
         );
         if ($existing && $existing['invoice_id'] !== $invoiceId) {
             throw new RuntimeException("Transaction already attributed to another invoice");
         }
-        $candidates = self::decodeCandidates($invoice['onchain_manual_candidates'] ?? null);
+        $candidates = self::decodeCandidates($invoice[$ch->inv['manual']] ?? null);
         $match = null;
         foreach ($candidates as $c) {
             if (($c['txid'] ?? '') === $txid && (int)($c['vout'] ?? -1) === $vout) {
@@ -698,12 +732,12 @@ class OnchainPayments {
             // already-attributed guard above keep attribution correct, so a
             // racing duplicate is simply a no-op.
             Database::query(
-                "INSERT INTO onchain_payments
+                "INSERT INTO {$ch->paymentsTable}
                     (id, invoice_id, txid, vout, amount_sat, confirmations, block_height, first_seen_at, last_seen_at)
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                  ON CONFLICT(txid, vout) DO NOTHING",
                 [
-                    Database::generateId('och'),
+                    Database::generateId($ch->paymentIdPrefix),
                     $invoiceId,
                     $txid,
                     $vout,
@@ -718,7 +752,7 @@ class OnchainPayments {
 
         // Clear the candidate from every invoice that listed it (this one
         // resolves; the others lose this candidate but stay open).
-        self::scrubCandidateGlobally($txid, $vout);
+        self::scrubCandidateGlobally($txid, $vout, $ch);
 
         // Run the state machine from persisted onchain_payments rows so the
         // newly-attributed payment immediately drives the invoice to its
@@ -728,7 +762,7 @@ class OnchainPayments {
         // attribution must still succeed if the provider is currently
         // unavailable. The next scheduled poll will refresh confirmation
         // counts via the provider in the normal flow.
-        self::driveStateFromPersisted($invoiceId);
+        self::driveStateFromPersisted($invoiceId, $ch);
     }
 
     /**
@@ -736,14 +770,15 @@ class OnchainPayments {
      * without contacting the provider. Used by manuallyAttribute() and
      * any other path that has already mutated onchain_payments.
      */
-    private static function driveStateFromPersisted(string $invoiceId): void {
+    private static function driveStateFromPersisted(string $invoiceId, ?Chain $ch = null): void {
+        $ch = $ch ?? Chain::btc();
         $invoice = Database::fetchOne("SELECT * FROM invoices WHERE id = ?", [$invoiceId]);
         if (!$invoice) return;
         $store = Database::fetchOne("SELECT * FROM stores WHERE id = ?", [$invoice['store_id']]);
         if (!$store) return;
-        $minConfs = (int)($store['onchain_min_confs'] ?? 1);
+        $minConfs = (int)($store[$ch->store['min_confs']] ?? 1);
         $rows = Database::fetchAll(
-            "SELECT amount_sat, confirmations FROM onchain_payments WHERE invoice_id = ?",
+            "SELECT amount_sat, confirmations FROM {$ch->paymentsTable} WHERE invoice_id = ?",
             [$invoiceId]
         );
         $totalConfirmed = 0;
@@ -761,7 +796,8 @@ class OnchainPayments {
             totalConfirmed: $totalConfirmed,
             totalPending: $totalPending,
             anyObservation: count($rows) > 0,
-            now: time()
+            now: time(),
+            chain: $ch
         );
     }
 
@@ -769,15 +805,16 @@ class OnchainPayments {
      * Count invoices currently flagged as needing manual confirmation.
      * Scoped to one store when storeId is provided; otherwise global.
      */
-    public static function countNeedingManualConfirmation(?string $storeId = null): int {
+    public static function countNeedingManualConfirmation(?string $storeId = null, ?Chain $chain = null): int {
+        $ch = $chain ?? Chain::btc();
         if ($storeId === null) {
             $row = Database::fetchOne(
-                "SELECT COUNT(*) AS n FROM invoices WHERE onchain_needs_manual_confirmation = 1"
+                "SELECT COUNT(*) AS n FROM invoices WHERE {$ch->inv['needs_manual']} = 1"
             );
         } else {
             $row = Database::fetchOne(
                 "SELECT COUNT(*) AS n FROM invoices
-                  WHERE onchain_needs_manual_confirmation = 1 AND store_id = ?",
+                  WHERE {$ch->inv['needs_manual']} = 1 AND store_id = ?",
                 [$storeId]
             );
         }
@@ -791,24 +828,27 @@ class OnchainPayments {
      * @param string[]|null $storeIds Filter to these stores (null = all)
      * @return array<int, array>
      */
-    public static function listNeedingManualConfirmation(?array $storeIds = null): array {
+    public static function listNeedingManualConfirmation(?array $storeIds = null, ?Chain $chain = null): array {
+        $ch = $chain ?? Chain::btc();
         if ($storeIds === null) {
             $rows = Database::fetchAll(
-                "SELECT * FROM invoices WHERE onchain_needs_manual_confirmation = 1
+                "SELECT * FROM invoices WHERE {$ch->inv['needs_manual']} = 1
                   ORDER BY created_at DESC"
             );
         } else {
             if (empty($storeIds)) return [];
             $placeholders = implode(',', array_fill(0, count($storeIds), '?'));
             $rows = Database::fetchAll(
-                "SELECT * FROM invoices WHERE onchain_needs_manual_confirmation = 1
+                "SELECT * FROM invoices WHERE {$ch->inv['needs_manual']} = 1
                    AND store_id IN ({$placeholders})
                   ORDER BY created_at DESC",
                 $storeIds
             );
         }
         foreach ($rows as &$r) {
-            $r['onchain_manual_candidates_decoded'] = self::decodeCandidates($r['onchain_manual_candidates'] ?? null);
+            // Same key for both chains so the admin list renders either.
+            $r['onchain_manual_candidates_decoded'] = self::decodeCandidates($r[$ch->inv['manual']] ?? null);
+            $r['chain'] = $ch->id;
         }
         return $rows;
     }
@@ -825,19 +865,20 @@ class OnchainPayments {
      * Replace the candidate list on an invoice. Empty list clears the
      * manual-confirmation flag too.
      */
-    private static function setManualCandidates(string $invoiceId, array $candidates): void {
+    private static function setManualCandidates(string $invoiceId, array $candidates, ?Chain $ch = null): void {
+        $ch = $ch ?? Chain::btc();
         if (empty($candidates)) {
             Database::query(
-                "UPDATE invoices SET onchain_needs_manual_confirmation = 0,
-                                      onchain_manual_candidates = NULL
+                "UPDATE invoices SET {$ch->inv['needs_manual']} = 0,
+                                      {$ch->inv['manual']} = NULL
                   WHERE id = ?",
                 [$invoiceId]
             );
             return;
         }
         Database::query(
-            "UPDATE invoices SET onchain_needs_manual_confirmation = 1,
-                                  onchain_manual_candidates = ?
+            "UPDATE invoices SET {$ch->inv['needs_manual']} = 1,
+                                  {$ch->inv['manual']} = ?
               WHERE id = ?",
             [json_encode(array_values($candidates), JSON_UNESCAPED_SLASHES), $invoiceId]
         );
@@ -856,18 +897,19 @@ class OnchainPayments {
      * them: a lone setManualCandidates UPDATE can only land fully before or
      * fully after this block, never between its read and its write.
      */
-    private static function appendManualCandidate(string $invoiceId, array $candidate): void {
+    private static function appendManualCandidate(string $invoiceId, array $candidate, ?Chain $ch = null): void {
+        $ch = $ch ?? Chain::btc();
         Database::beginImmediate();
         try {
             $row = Database::fetchOne(
-                "SELECT onchain_manual_candidates FROM invoices WHERE id = ?",
+                "SELECT {$ch->inv['manual']} FROM invoices WHERE id = ?",
                 [$invoiceId]
             );
             if (!$row) {
                 Database::rollback();
                 return;
             }
-            $list = self::decodeCandidates($row['onchain_manual_candidates'] ?? null);
+            $list = self::decodeCandidates($row[$ch->inv['manual']] ?? null);
             foreach ($list as $existing) {
                 if (($existing['txid'] ?? '') === $candidate['txid']
                     && (int)($existing['vout'] ?? -1) === (int)$candidate['vout']) {
@@ -876,7 +918,7 @@ class OnchainPayments {
                 }
             }
             $list[] = $candidate;
-            self::setManualCandidates($invoiceId, $list); // inner UPDATE joins this tx
+            self::setManualCandidates($invoiceId, $list, $ch); // inner UPDATE joins this tx
             Database::commit();
         } catch (\Throwable $e) {
             Database::rollback();
@@ -889,7 +931,8 @@ class OnchainPayments {
      * holds it. Called after manual attribution so the same tx isn't
      * offered as a candidate elsewhere.
      */
-    private static function scrubCandidateGlobally(string $txid, int $vout): void {
+    private static function scrubCandidateGlobally(string $txid, int $vout, ?Chain $ch = null): void {
+        $ch = $ch ?? Chain::btc();
         // Atomic read-modify-write across every candidate list (see
         // appendManualCandidate). The whole scan + rewrite runs under the write
         // lock so a concurrent poll's append can't be lost between this read and
@@ -897,16 +940,16 @@ class OnchainPayments {
         Database::beginImmediate();
         try {
             $rows = Database::fetchAll(
-                "SELECT id, onchain_manual_candidates FROM invoices
-                  WHERE onchain_needs_manual_confirmation = 1"
+                "SELECT id, {$ch->inv['manual']} FROM invoices
+                  WHERE {$ch->inv['needs_manual']} = 1"
             );
             foreach ($rows as $r) {
-                $list = self::decodeCandidates($r['onchain_manual_candidates'] ?? null);
+                $list = self::decodeCandidates($r[$ch->inv['manual']] ?? null);
                 $filtered = array_values(array_filter($list, function ($c) use ($txid, $vout) {
                     return !(($c['txid'] ?? '') === $txid && (int)($c['vout'] ?? -1) === $vout);
                 }));
                 if (count($filtered) !== count($list)) {
-                    self::setManualCandidates($r['id'], $filtered);
+                    self::setManualCandidates($r['id'], $filtered, $ch);
                 }
             }
             Database::commit();
@@ -916,7 +959,8 @@ class OnchainPayments {
         }
     }
 
-    private static function upsertObservation(string $invoiceId, OnchainTxObservation $obs, int $now): void {
+    private static function upsertObservation(string $invoiceId, OnchainTxObservation $obs, int $now, ?Chain $ch = null): void {
+        $ch = $ch ?? Chain::btc();
         // Single atomic upsert keyed on UNIQUE(txid, vout). The old
         // SELECT-then-INSERT/UPDATE was racy: two concurrent pollers (the
         // customer's ~2s browser poll and the cron pass) both observe the same
@@ -927,7 +971,7 @@ class OnchainPayments {
         // invoice_id are left untouched on conflict (the first observer's
         // attribution wins), matching the previous UPDATE branch.
         Database::query(
-            "INSERT INTO onchain_payments
+            "INSERT INTO {$ch->paymentsTable}
                 (id, invoice_id, txid, vout, amount_sat, confirmations, block_height, first_seen_at, last_seen_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(txid, vout) DO UPDATE SET
@@ -935,7 +979,7 @@ class OnchainPayments {
                 block_height  = excluded.block_height,
                 last_seen_at  = excluded.last_seen_at",
             [
-                Database::generateId('och'),
+                Database::generateId($ch->paymentIdPrefix),
                 $invoiceId,
                 $obs->txid,
                 $obs->vout,
@@ -959,13 +1003,15 @@ class OnchainPayments {
         int $totalConfirmed,
         int $totalPending,
         bool $anyObservation,
-        int $now
+        int $now,
+        ?Chain $chain = null
     ): array {
-        $amount = (int)($invoice['onchain_amount_sat'] ?? 0);
+        $ch = $chain ?? Chain::btc();
+        $amount = (int)($invoice[$ch->inv['amount']] ?? 0);
         // A long-lived fiat invoice is re-quoted on page load; a payer who
         // already saw an earlier (smaller) amount and pays it still settles.
         // The floor is the smallest amount ever shown (Invoice::requoteForView).
-        $floor = (int)($invoice['onchain_amount_floor_sat'] ?? 0);
+        $floor = (int)($invoice[$ch->inv['floor']] ?? 0);
         if ($floor > 0 && $floor < $amount) {
             $amount = $floor;
         }
@@ -1006,8 +1052,12 @@ class OnchainPayments {
                         $totalConfirmed, $amount
                     );
                     error_log("on-chain {$invoice['id']}: {$msg}");
-                    AdminLog::log('onchain', 'zero_conf_reversed', $invoice['store_id'], $invoice['id'],
-                        $invoice['onchain_address'] ?? null, $msg);
+                    AdminLog::log($ch->logCategory, 'zero_conf_reversed', $invoice['store_id'], $invoice['id'],
+                        $invoice[$ch->inv['address']] ?? null, $msg);
+                    require_once __DIR__ . '/../invoice_attempts.php';
+                    InvoiceAttempts::record($invoice['id'], $invoice['store_id'], InvoiceAttempts::CONTEXT_POLL, $ch->attemptRail,
+                        $invoice[$ch->inv['address']] ?? null, InvoiceAttempts::FAILED,
+                        'the on-chain payment was reversed after settlement', $msg);
                     return ['status' => 'Invalid', 'fired' => 'InvoiceInvalid'];
                 }
             }
@@ -1026,7 +1076,7 @@ class OnchainPayments {
             require_once __DIR__ . '/../invoice.php';
             Invoice::updateStatus($invoice['id'], 'Processing');
             Database::query(
-                "UPDATE invoices SET onchain_first_seen_at = COALESCE(onchain_first_seen_at, ?) WHERE id = ?",
+                "UPDATE invoices SET {$ch->inv['first_seen']} = COALESCE({$ch->inv['first_seen']}, ?) WHERE id = ?",
                 [$now, $invoice['id']]
             );
             $status = 'Processing';
@@ -1037,13 +1087,13 @@ class OnchainPayments {
         // Settled when total confirmed reaches the invoice amount.
         if ($status !== 'Settled' && $totalConfirmed >= $amount && $amount > 0) {
             require_once __DIR__ . '/../invoice.php';
-            Invoice::updateStatus($invoice['id'], 'Settled', null, 'onchain');
+            Invoice::updateStatus($invoice['id'], 'Settled', null, $ch->rail);
             return ['status' => 'Settled', 'fired' => $fired ?: 'InvoiceSettled'];
         }
 
         // Confirmation window expired without crossing the threshold.
-        $firstSeen = (int)($invoice['onchain_first_seen_at'] ?? 0);
-        $timeout = (int)($store['onchain_confirm_timeout_sec'] ?? 86400);
+        $firstSeen = (int)($invoice[$ch->inv['first_seen']] ?? 0);
+        $timeout = (int)($store[$ch->store['timeout']] ?? 86400);
         if ($status === 'Processing' && $firstSeen > 0 && ($now - $firstSeen) >= $timeout && $totalConfirmed < $amount) {
             require_once __DIR__ . '/../invoice.php';
             Invoice::updateStatus($invoice['id'], 'Invalid');

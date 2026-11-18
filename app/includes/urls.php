@@ -268,6 +268,23 @@ class Urls {
     }
 
     /**
+     * A keyed scheduler URL: $endpoint with the cron key (and any extra
+     * query parameters, e.g. only=swaps) appended. This is the form the
+     * operator-facing surfaces hand out — a single URL a hosting panel,
+     * cron-job.org or an uptime monitor can GET on a schedule, no custom
+     * header needed. cron.php, update.php and health.php all accept the key
+     * via ?key= as well as the X-CRON-KEY header, so existing header-based
+     * schedulers keep working. The key is always the last parameter so the
+     * URL reads "...?only=swaps&key=…".
+     *
+     * @param array<string,string> $params
+     */
+    public static function withCronKey(string $endpoint, string $key, array $params = []): string {
+        $params['key'] = $key;
+        return $endpoint . (str_contains($endpoint, '?') ? '&' : '?') . http_build_query($params);
+    }
+
+    /**
      * Get the receive endpoint URL (NUT-18 payment requests)
      */
     public static function receive(): string {

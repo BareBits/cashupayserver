@@ -56,7 +56,7 @@ if (strpos(\$rawPath, \$prefix) === 0) {
 if (strpos(\$rawPath, '/cb/') === 0) {
     header('Content-Type: application/json');
     echo json_encode([
-        'pr' => 'lnbc1pretend' . substr(\$rawPath, 4),
+        'pr' => 'lnbc' . intdiv((int)(\$_GET['amount'] ?? 0), 100) . 'n1pretend' . strtr(substr(\$rawPath, 4), 'bio1', 'p3wl'),
         'verify' => "http://127.0.0.1:$port/verify/" . bin2hex(random_bytes(6)),
     ]);
     return;

@@ -109,18 +109,21 @@ $url = 'https://shop.example.com/cron.php';
 
 $unix = SetupFlow::cronScheduleLine('Linux', $key, $url);
 assert_true(str_contains($unix['intro'], 'crontab'), 'unix hosts are pointed at crontab');
+assert_eq("$url?key=$key", $unix['url'], 'the bare keyed URL is handed out for hosting panels / scheduler services');
 assert_eq(
-    "* * * * * curl -fsS -H 'X-CRON-KEY: $key' $url > /dev/null",
+    "* * * * * curl -fsS '$url?key=$key' > /dev/null",
     $unix['line'],
     'the crontab line matches the shape the admin Settings page renders'
 );
+assert_false(str_contains($unix['line'], 'X-CRON-KEY'), 'the key rides in the URL, not a header the operator must know how to send');
 
 $win = SetupFlow::cronScheduleLine('Windows', $key, $url);
 assert_true(str_contains($win['intro'], 'Task Scheduler'), 'Windows hosts are pointed at Task Scheduler');
+assert_eq("$url?key=$key", $win['url'], 'Windows gets the same bare keyed URL');
 assert_true(str_starts_with($win['line'], 'schtasks /Create'), 'the Windows line is a schtasks command');
 assert_true(str_contains($win['line'], '/SC MINUTE'), 'scheduled every minute, like the crontab line');
-assert_true(str_contains($win['line'], '\"X-CRON-KEY: ' . $key . '\"'), 'the key header survives schtasks /TR quoting');
-assert_true(str_contains($win['line'], $url), 'the cron URL is included');
+assert_true(str_contains($win['line'], '\"' . $url . '?key=' . $key . '\"'), 'the keyed URL survives schtasks /TR quoting');
+assert_false(str_contains($win['line'], 'X-CRON-KEY'), 'no header on Windows either');
 assert_false(str_contains($win['line'], '/dev/null'), 'no unix redirection on Windows');
 assert_false(str_contains($win['line'], "'"), 'no single quotes — cmd.exe does not strip them');
 

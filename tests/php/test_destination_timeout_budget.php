@@ -141,7 +141,7 @@ try {
     $uri = "nostr+walletconnect://{$walletPk}?relay=ws://127.0.0.1:1"
         . "&relay=ws://127.0.0.1:{$port}&secret={$clientSk}";
     $res = NwcClient::makeInvoice($uri, 21, null, null, 8);
-    assert_eq('lnbc210n1mockinvoice0000000', $res['bolt11'], 'failover relay still yields the bolt11');
+    assert_eq('lnbc210n1m0ckvnv0ce0000000', $res['bolt11'], 'failover relay still yields the bolt11');
     assert_eq("ws://127.0.0.1:{$port}", $res['relay'], 'the answering relay is reported');
 } finally {
     stop_mock($proc);
@@ -183,7 +183,7 @@ try {
 }
 
 // ---------- 4b. noffer: refused first relay fails over to the second ----------
-$bolt11 = 'lnbc100n1mockinvoice0000000';
+$bolt11 = 'lnbc100n1m0ckvnv0ce0000000';
 [$proc, $port] = start_mock('mock_clink_relay.php', 'MOCK_CLINK_PORT', [
     'MOCK_CLINK_MERCHANT_SK' => $mSk,
     'MOCK_CLINK_BOLT11' => $bolt11,

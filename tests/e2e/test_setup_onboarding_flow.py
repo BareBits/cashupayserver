@@ -92,7 +92,10 @@ def test_full_flow_persists_every_answer(
     body = w.post(step="updates", auto_update="0")
     assert _heading(body) == "Enable cron"
     assert 'id="wizard-back-link"' in body, "the cron screen has a Back link"
-    assert "X-CRON-KEY" in body, "the cron screen should render a ready-made crontab line"
+    assert "cron.php?key=" in body, "the cron screen should render the keyed cron URL"
+    assert 'id="wizard-cron-url"' in body and 'id="wizard-cron-line"' in body, \
+        "the cron screen shows both the bare URL and the crontab line"
+    assert "X-CRON-KEY" not in body, "operators are no longer asked to send a custom header"
 
     body = w.post(step="cron")
     assert _heading(body) == "You&#039;re all set!" or "all set" in _heading(body)

@@ -65,6 +65,7 @@ def test_anonymous_tail_post_on_configured_install_is_refused(configured: Config
         assert "admin" in r.headers.get("Location", ""), r.headers
         assert cron_key not in r.text, f"step={step} leaked the cron key"
         assert "X-CRON-KEY" not in r.text
+        assert "cron.php?key=" not in r.text
 
     assert _config(handle, "auto_update_enabled") == before, "the auto-update opt-in must be untouched"
 
@@ -198,7 +199,7 @@ def test_migration_failure_shows_upgrade_failed_page_not_the_wizard(configured: 
     # file and its directory read-only so the ALTER TABLE cannot run.
     conn = sqlite3.connect(db_path, isolation_level=None)
     try:
-        conn.execute("ALTER TABLE stores DROP COLUMN onchain_provider_fallback")
+        conn.execute("ALTER TABLE stores DROP COLUMN ecx_xpub")
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         conn.execute("PRAGMA journal_mode = DELETE")
     finally:
@@ -238,6 +239,6 @@ def test_migration_failure_shows_upgrade_failed_page_not_the_wizard(configured: 
     assert r.status_code == 302 and "admin" in r.headers.get("Location", ""), (r.status_code, r.headers)
     with handle.db() as db:
         cols = [row[1] for row in db.execute("PRAGMA table_info(stores)")]
-        assert "onchain_provider_fallback" in cols, "marker column restored by the migration"
+        assert "ecx_xpub" in cols, "marker column restored by the migration"
         names = [row[0] for row in db.execute("SELECT name FROM stores")]
     assert "Wedged Store" not in names, "no store was created while wedged"

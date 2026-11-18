@@ -130,9 +130,10 @@
 // the update check itself self-throttles to once a day, but a freshly-applied
 // build's health re-check (and any pending rollback) happens on the next tick.
 //
-//   */15 * * * * curl -fsS -H "X-CRON-KEY: YOUR_CRON_KEY" https://your-domain.com/update.php > /dev/null
+//   */15 * * * * curl -fsS 'https://your-domain.com/update.php?key=YOUR_CRON_KEY' > /dev/null
 //
 // Find YOUR_CRON_KEY the same place as the main cron line (Settings → Cron).
+// The key may also be sent as an X-CRON-KEY header instead of ?key=.
 // update.php is a no-op unless auto-update is enabled (UI toggle, constant,
 // or env var), so it's harmless to add even before you opt in.
 //

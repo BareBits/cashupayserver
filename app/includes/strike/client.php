@@ -40,6 +40,7 @@
 declare(strict_types=1);
 
 require_once __DIR__ . '/../safe_http.php';
+require_once __DIR__ . '/../response_shape.php';
 
 // Wall-clock budget for one Strike API operation. createInvoiceWithQuote is
 // two sequential HTTPS round trips and shares this budget across both, so a
@@ -176,15 +177,22 @@ class StrikeClient
         }
 
         $invoice = self::request($key, 'POST', '/invoices', $body, $deadline);
-        $invoiceId = (string)($invoice['invoiceId'] ?? '');
-        if ($invoiceId === '') {
+        // The id is persisted, shown in the admin UI / CSV and spliced into
+        // the quote URL: accept only a printable-ASCII token.
+        $invoiceId = ResponseShape::token($invoice['invoiceId'] ?? null, 128);
+        if ($invoiceId === null) {
             throw new StrikeException('Strike returned no invoiceId');
         }
 
         $quote = self::request($key, 'POST', '/invoices/' . rawurlencode($invoiceId) . '/quote', new stdClass(), $deadline);
-        $bolt11 = (string)($quote['lnInvoice'] ?? '');
-        if ($bolt11 === '') {
+        if (!isset($quote['lnInvoice']) || $quote['lnInvoice'] === '') {
             throw new StrikeException('Strike quote returned no Lightning invoice');
+        }
+        // The bolt11 goes straight into a QR code and a lightning: link, so it
+        // must at least be BOLT11-shaped (prefix, bech32 charset, bounded).
+        $bolt11 = ResponseShape::bolt11($quote['lnInvoice']);
+        if ($bolt11 === null) {
+            throw new StrikeException('Strike quote returned a malformed Lightning invoice');
         }
         // The payer pays sourceAmount; for a BTC invoice it must be sat-exact
         // for the requested amount. A mismatch means the API did something
@@ -202,10 +210,7 @@ class StrikeClient
             }
         }
 
-        $expSec = null;
-        if (isset($quote['expirationInSec']) && is_numeric($quote['expirationInSec'])) {
-            $expSec = (int)$quote['expirationInSec'];
-        }
+        $expSec = ResponseShape::integer($quote['expirationInSec'] ?? null);
 
         return [
             'bolt11' => $bolt11,
@@ -247,11 +252,17 @@ class StrikeClient
             ],
         ];
         $made = self::request($key, 'POST', '/receive-requests', $body, $deadline);
-        $requestId = (string)($made['receiveRequestId'] ?? '');
+        $requestId = ResponseShape::token($made['receiveRequestId'] ?? null, 128);
         $onchain = $made['onchain'] ?? null;
-        $address = is_array($onchain) ? trim((string)($onchain['address'] ?? '')) : '';
-        if ($requestId === '' || $address === '') {
+        $address = is_array($onchain) && is_string($onchain['address'] ?? null)
+            ? trim($onchain['address']) : '';
+        if ($requestId === null || $address === '') {
             throw new StrikeException('Strike returned no on-chain address');
+        }
+        // Shape only (base58/bech32 alphabet, bounded); the caller validates
+        // the address against the expected network before it is ever shown.
+        if (ResponseShape::addressToken($address) === null) {
+            throw new StrikeException('Strike returned a malformed on-chain address');
         }
         // btcAmount is the amount Strike suggests to the payer (and encodes
         // into the BIP21 URI). For a BTC-denominated request it must be
@@ -432,7 +443,10 @@ class StrikeClient
             // free-text messages never leave this method.
             $code = '';
             if (is_array($decoded)) {
-                $code = (string)($decoded['data']['code'] ?? $decoded['code'] ?? '');
+                $raw = $decoded['data']['code'] ?? $decoded['code'] ?? null;
+                // Error codes are short identifiers (UNAUTHORIZED, INVALID_DATA);
+                // anything else is dropped so no remote text reaches the logs.
+                $code = ResponseShape::token($raw, 64, '/^[A-Za-z0-9_.\-]+\z/') ?? '';
             }
             throw new StrikeException(
                 'Strike API HTTP ' . $status . ($code !== '' ? " ({$code})" : ''),

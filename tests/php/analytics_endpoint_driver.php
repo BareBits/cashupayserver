@@ -146,7 +146,7 @@ final class AnalyticsEndpointDriver {
                 'store_count' => 2, 'rails_enabled' => ['mint', 'lnaddress'],
                 'stores_with_mint' => 2, 'stores_with_lnaddress' => 1, 'stores_with_nwc' => 0,
                 'stores_with_noffer' => 0, 'stores_with_strike' => 0, 'stores_with_onchain' => 0,
-                'stores_with_swaps' => 0, 'auto_update_enabled' => true, 'products_count' => 3,
+                'stores_with_swaps' => 0, 'stores_with_ecx' => 0, 'auto_update_enabled' => true, 'products_count' => 3,
                 'api_keys_count' => 1, 'wordpress_connected' => false,
             ];
         }
@@ -155,7 +155,7 @@ final class AnalyticsEndpointDriver {
                 'invoices_30d_created' => 10, 'invoices_30d_settled' => 7, 'invoices_30d_expired' => 2,
                 'invoices_30d_settled_sats' => 70000,
             ];
-            foreach (['mint', 'lnaddress', 'nwc', 'noffer', 'strike', 'swap', 'onchain'] as $rail) {
+            foreach (['mint', 'lnaddress', 'nwc', 'noffer', 'strike', 'swap', 'onchain', 'ecx'] as $rail) {
                 $props["settled_30d_{$rail}_count"] = $rail === 'mint' ? 7 : 0;
                 $props["settled_30d_{$rail}_sats"] = $rail === 'mint' ? 70000 : 0;
             }
