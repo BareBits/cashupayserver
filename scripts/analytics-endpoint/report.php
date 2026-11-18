@@ -69,7 +69,20 @@ function analytics_store(PDO $pdo, array $report, ?string $country, string $ip, 
                 $country, (string)$props['version'], (string)$props['channel'], (string)$props['install_kind'],
                 json_encode($report, JSON_UNESCAPED_SLASHES),
             ]);
+        // Bound the table inside the same transaction as the insert, so
+        // concurrent requests cannot race each other past the ceiling.
+        $purged = analytics_purge_reports($pdo, $now);
         $pdo->exec('COMMIT');
+        if ($purged['ceiling'] > 0) {
+            // Retention deletions are routine; a CEILING hit is not. It means
+            // rows are arriving faster than they age out, which for an
+            // unauthenticated endpoint most likely means manufactured install
+            // ids -- so it must be visible rather than silently absorbed.
+            error_log(sprintf(
+                '[analytics/report.php] report row ceiling (%d) reached: '
+                . 'dropped %d oldest row(s)',
+                ANALYTICS_MAX_REPORT_ROWS, $purged['ceiling']));
+        }
         return ['stored' => true];
     } catch (Throwable $e) {
         if ($pdo->inTransaction()) {
