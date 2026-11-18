@@ -32,14 +32,14 @@ foreach ([[], ['invoice_first_method' => null], ['invoice_first_method' => ''],
           ['invoice_first_method' => 0]] as $store) {
     assert_eq('onchain', Invoice::preferredFirstMethod($store),
         'preferredFirstMethod -> onchain for ' . json_encode($store));
-    assert_eq(['onchain', 'lightning', 'cashu'], Invoice::paymentMethodTabOrder($store),
+    assert_eq(['onchain', 'lightning', 'ecx', 'cashu'], Invoice::paymentMethodTabOrder($store),
         'tab order on-chain first for ' . json_encode($store));
 }
 foreach (['lightning', 'Lightning', ' lightning '] as $v) {
     assert_eq('lightning', Invoice::preferredFirstMethod(['invoice_first_method' => $v]),
         'preferredFirstMethod -> lightning for ' . var_export($v, true));
 }
-assert_eq(['lightning', 'onchain', 'cashu'],
+assert_eq(['lightning', 'onchain', 'ecx', 'cashu'],
     Invoice::paymentMethodTabOrder(['invoice_first_method' => 'lightning']),
     'tab order lightning first');
 
@@ -64,6 +64,14 @@ $cases = [
 ];
 foreach ($cases as [$store, $hasOc, $hasLn, $hasCashu, $expected, $msg]) {
     assert_eq($expected, Invoice::firstPaymentMethod($store, $hasOc, $hasLn, $hasCashu), $msg);
+    // An eCash (ECX) option never changes the default while a Bitcoin method
+    // is offered; it only opens first on an eCash-only invoice.
+    $withEcx = Invoice::firstPaymentMethod($store, $hasOc, $hasLn, $hasCashu, true);
+    if ($hasOc || $hasLn) {
+        assert_eq($expected, $withEcx, $msg . ' (ecx offered too)');
+    } else {
+        assert_eq($hasCashu ? 'cashu' : 'ecx', $withEcx, $msg . ' (ecx offered, no bitcoin method)');
+    }
 }
 
 // ---------------------------------------------------------------------------

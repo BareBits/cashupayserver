@@ -117,8 +117,10 @@ class Stats {
 
         // Revenue + invoice count + on-chain count, all from paid invoices
         // in range. On-chain classification: onchain_first_seen_at IS NOT NULL.
+        // Invoices paid in eCash (settled_rail = 'ecx') are counted on their
+        // own ledger below, in szats; the sats figures exclude them.
         $whereInv = self::compose(
-            ['clauses' => ["status = 'Settled'", 'amount_sats IS NOT NULL'], 'params' => []],
+            ['clauses' => ["status = 'Settled'", 'amount_sats IS NOT NULL', "(settled_rail IS NULL OR settled_rail != 'ecx')"], 'params' => []],
             self::storeWhere($storeId),
             self::rangeWhere($startTs)
         );
@@ -186,33 +188,126 @@ class Stats {
         $currency = self::displayCurrency($storeId);
         $btcPrice = self::btcPrice($currency, $storeId);
 
+        // eCash (ECX) ledger: revenue, fees paid and owed in szats. Folded
+        // into the headline totals as a sats equivalent at the current
+        // ECX:BTC ratio (null ratio = no price -> folded as 0 and flagged so
+        // the UI can say so); the raw szat figures are reported alongside.
+        $ecx = self::ecxSummary($storeId, $startTs, $currency);
+        $foldedRevenue = $revenue + $ecx['revenue_sats_equiv'];
+        $foldedFeesPaid = $totalFeesPaid + $ecx['fees_paid_sats_equiv'];
+        $foldedOwed = $owed;
+        $foldedOwed['ecx_sats_equiv'] = $ecx['fees_owed_sats_equiv'];
+        $foldedOwed['total'] = $owed['total'] + $ecx['fees_owed_sats_equiv'];
+        $foldedProfit = $foldedRevenue - $foldedFeesPaid;
+        $foldedEffectivePct = $foldedRevenue > 0 ? ($foldedFeesPaid / $foldedRevenue * 100.0) : 0.0;
+
         return [
             'range' => $range,
             'range_start' => $startTs,
             'store_id' => $storeId,
             'currency' => $currency,
             'btc_price' => $btcPrice,
+            // Sats-ledger figures (Bitcoin / Lightning payments only) ...
             'revenue_sats' => $revenue,
-            'invoice_count' => $invoiceCount,
+            'invoice_count' => $invoiceCount + $ecx['count'],
             'lightning_revenue_sats' => $lightningRevenue,
             'lightning_count' => $lightningCount,
             'onchain_revenue_sats' => $onchainRevenue,
             'onchain_count' => $onchainCount,
+            // ... and the headline totals with the eCash ledger folded in as
+            // a sats equivalent (what the dashboard's top rows show).
+            'revenue_total_sats' => $foldedRevenue,
             'fees_paid' => [
                 'dev' => $feesPaidByNote['dev'],
                 'hosting' => $feesPaidByNote['hosting'],
                 'network' => $networkFees,
                 'swap' => $swapFees,
-                'total' => $totalFeesPaid,
+                'ecx_sats_equiv' => $ecx['fees_paid_sats_equiv'],
+                'total' => $foldedFeesPaid,
+                'total_sats_ledger' => $totalFeesPaid,
             ],
-            'fees_owed' => $owed,
-            'profit_sats' => $profit,
-            'effective_fee_pct' => $effectiveFeePct,
+            'fees_owed' => $foldedOwed,
+            'profit_sats' => $foldedProfit,
+            'effective_fee_pct' => $foldedEffectivePct,
+            'ecx' => $ecx,
             'free_trial' => FreeTrial::status(),
             // Install-wide (not per store): the BIP32 branch dev-fee on-chain
             // addresses derive under, for the Fees card + support.
             'dev_fee_branch' => FeeBranch::status(),
         ];
+    }
+
+    /**
+     * The eCash (ECX) side of the summary. Revenue / counts from invoices
+     * settled over their ECX address in the window; fees paid from
+     * ecx_fee_credits in the window; fees owed lifetime (EcxFees::computeOwed
+     * per store). Everything in szats, plus the sats equivalents the headline
+     * totals fold in and the ECX price in the display currency.
+     */
+    private static function ecxSummary(string $storeId, ?int $startTs, string $currency): array {
+        require_once __DIR__ . '/ecx/ecx.php';
+        $where = self::compose(
+            ['clauses' => ["status = 'Settled'", "settled_rail = 'ecx'", 'ecx_amount_szat IS NOT NULL'], 'params' => []],
+            self::storeWhere($storeId),
+            self::rangeWhere($startTs)
+        );
+        $row = Database::fetchOne(
+            "SELECT COALESCE(SUM(ecx_amount_szat), 0) AS revenue, COUNT(*) AS n FROM invoices" . $where['sql'],
+            $where['params']
+        );
+        $revenue = (int)($row['revenue'] ?? 0);
+        $count = (int)($row['n'] ?? 0);
+        $paid = EcxFees::paidByNote($storeId, $startTs);
+        $owed = ['dev' => 0, 'hosting' => 0];
+        $storeIds = ($storeId === self::ALL_STORES || $storeId === '')
+            ? array_column(Database::fetchAll("SELECT id FROM stores"), 'id')
+            : [$storeId];
+        foreach ($storeIds as $sid) {
+            $o = EcxFees::computeOwed($sid);
+            $owed['dev'] += (int)$o['dev_owed'];
+            $owed['hosting'] += (int)$o['hosting_owed'];
+        }
+        $owed['total'] = $owed['dev'] + $owed['hosting'];
+        $paidTotal = $paid['dev'] + $paid['hosting'];
+
+        // Prices: ECX in the display currency (for the fiat parentheses) and
+        // the szat->sat ratio (for folding into the sats totals). Both come
+        // from the cached CoinMarketCap quote; null when there is none.
+        $ratio = null;
+        $ecxPrice = null;
+        if ($revenue > 0 || $paidTotal > 0 || $owed['total'] > 0 || self::anyEcxConfigured($storeIds)) {
+            $ratio = EcxRates::szatToSatRatio();
+            $ecxPrice = EcxRates::getEcxPrice($currency);
+        }
+        $toSats = static fn(int $szats): int => $ratio === null ? 0 : (int)round($szats * $ratio);
+        return [
+            'revenue_szats' => $revenue,
+            'count' => $count,
+            'fees_paid' => ['dev' => $paid['dev'], 'hosting' => $paid['hosting'], 'total' => $paidTotal],
+            'fees_owed' => $owed,
+            'profit_szats' => $revenue - $paidTotal,
+            'ecx_price' => $ecxPrice,
+            'szat_to_sat' => $ratio,
+            'price_available' => $ratio !== null,
+            'revenue_sats_equiv' => $toSats($revenue),
+            'fees_paid_sats_equiv' => $toSats($paidTotal),
+            'fees_owed_sats_equiv' => $toSats($owed['total']),
+        ];
+    }
+
+    /** Does any of these stores have the eCash rail configured? (Skips the price lookup otherwise.) */
+    private static function anyEcxConfigured(array $storeIds): bool {
+        if ($storeIds === []) {
+            return false;
+        }
+        $ph = implode(',', array_fill(0, count($storeIds), '?'));
+        $row = Database::fetchOne(
+            "SELECT 1 AS x FROM stores WHERE id IN ({$ph})
+               AND ((ecx_xpub IS NOT NULL AND ecx_xpub != '') OR (ecx_static_address IS NOT NULL AND ecx_static_address != ''))
+             LIMIT 1",
+            $storeIds
+        );
+        return (bool)$row;
     }
 
     /**
@@ -352,18 +447,43 @@ class Stats {
                 "SELECT COALESCE(SUM(network_fee_sats), 0) AS s FROM melts" . $whereMelt['sql'],
                 $whereMelt['params']
             )['s'];
+            // eCash fees (szats) enter the chart as their sats equivalent.
+            require_once __DIR__ . '/ecx/ecx.php';
+            $ecxPaid = EcxFees::paidByNote($storeId, $startTs);
+            $ecxPaidTotal = $ecxPaid['dev'] + $ecxPaid['hosting'];
+            $ratio = $ecxPaidTotal > 0 ? EcxRates::szatToSatRatio() : null;
+            $ecxEquiv = $ratio === null ? 0 : (int)round($ecxPaidTotal * $ratio);
             return [
-                'labels' => ['Dev fee', 'Hosting fee', 'Network fees'],
-                'data'   => [$feesPaid['dev'], $feesPaid['hosting'], $network],
+                'labels' => ['Dev fee', 'Hosting fee', 'Network fees', 'eCash fees'],
+                'data'   => [$feesPaid['dev'], $feesPaid['hosting'], $network, $ecxEquiv],
             ];
         }
 
-        // revenue / count breakdowns: Lightning vs On-chain.
+        // revenue / count breakdowns: Lightning vs On-chain vs eCash. The
+        // first two are sats-ledger invoices; eCash is its own series
+        // (count, or szats folded to a sats equivalent for the revenue view).
         $whereInv = self::compose(
-            ['clauses' => ["status = 'Settled'", 'amount_sats IS NOT NULL'], 'params' => []],
+            ['clauses' => ["status = 'Settled'", 'amount_sats IS NOT NULL', "(settled_rail IS NULL OR settled_rail != 'ecx')"], 'params' => []],
             self::storeWhere($storeId),
             self::rangeWhere($startTs)
         );
+        $whereEcx = self::compose(
+            ['clauses' => ["status = 'Settled'", "settled_rail = 'ecx'", 'ecx_amount_szat IS NOT NULL'], 'params' => []],
+            self::storeWhere($storeId),
+            self::rangeWhere($startTs)
+        );
+        $ecxRow = Database::fetchOne(
+            "SELECT COALESCE(SUM(ecx_amount_szat), 0) AS szats, COUNT(*) AS n FROM invoices" . $whereEcx['sql'],
+            $whereEcx['params']
+        );
+        require_once __DIR__ . '/ecx/ecx.php';
+        if ($type === 'count') {
+            $ecxSeries = (int)($ecxRow['n'] ?? 0);
+        } else {
+            $szats = (int)($ecxRow['szats'] ?? 0);
+            $ratio = $szats > 0 ? EcxRates::szatToSatRatio() : null;
+            $ecxSeries = $ratio === null ? 0 : (int)round($szats * $ratio);
+        }
         if ($type === 'count') {
             $row = Database::fetchOne(
                 "SELECT
@@ -382,8 +502,8 @@ class Stats {
             );
         }
         return [
-            'labels' => ['Lightning', 'On-chain'],
-            'data'   => [(int)($row['lightning'] ?? 0), (int)($row['onchain'] ?? 0)],
+            'labels' => ['Lightning', 'On-chain', 'eCash'],
+            'data'   => [(int)($row['lightning'] ?? 0), (int)($row['onchain'] ?? 0), $ecxSeries],
         ];
     }
 
@@ -452,6 +572,8 @@ class Stats {
             'metadata', 'checkout_config', 'expiration_time', 'last_polled_at', 'last_poll_state', 'last_poll_error',
             'onchain_address', 'onchain_address_index', 'onchain_amount_sat',
             'onchain_first_seen_at', 'onchain_created_tip_height',
+            'ecx_address', 'ecx_address_index', 'ecx_amount_szat',
+            'ecx_first_seen_at', 'ecx_created_tip_height', 'ecx_exchange_rate',
             // melt-only
             'network_fee_sats', 'destination', 'preimage', 'note',
         ];
@@ -512,6 +634,13 @@ class Stats {
             'cashu_offline_allow_any_mint', 'cashu_offline_fail_reason',
             'cart_purchase_counted', 'strike_invoice_id',
             'strike_receive_request_id',
+            // eCash (ECX) leg: address, szat amounts, chain state, the rate it
+            // was quoted at, and whether the address pointed at a fee payee.
+            'ecx_address', 'ecx_address_index', 'ecx_amount_szat',
+            'ecx_amount_tweak_szats', 'ecx_amount_floor_szat', 'ecx_first_seen_at',
+            'ecx_created_tip_height', 'ecx_needs_manual_confirmation',
+            'ecx_manual_candidates', 'ecx_last_polled_at', 'ecx_exchange_rate',
+            'ecx_fee_note', 'ecx_fee_destination',
         ];
     }
 

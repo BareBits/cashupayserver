@@ -29,6 +29,7 @@ require_once __DIR__ . '/clink/client.php';
 require_once __DIR__ . '/nwc/client.php';
 require_once __DIR__ . '/strike/client.php';
 require_once __DIR__ . '/fee_redirect.php';
+require_once __DIR__ . '/ecx/ecx.php';
 require_once __DIR__ . '/admin_log.php';
 require_once __DIR__ . '/invoice_attempts.php';
 require_once __DIR__ . '/store_safety.php';
@@ -160,7 +161,7 @@ class Invoice {
      * the pre-setting rule did the same, and the page keys its brand row off
      * this value.
      */
-    public static function firstPaymentMethod(array $store, bool $hasOnchain, bool $hasLightning, bool $hasCashu): string {
+    public static function firstPaymentMethod(array $store, bool $hasOnchain, bool $hasLightning, bool $hasCashu, bool $hasEcx = false): string {
         $order = self::preferredFirstMethod($store) === self::FIRST_METHOD_LIGHTNING
             ? ['lightning', 'onchain']
             : ['onchain', 'lightning'];
@@ -169,6 +170,11 @@ class Invoice {
             if ($offered[$method]) {
                 return $method;
             }
+        }
+        // eCash is never the default while a Bitcoin method is offered; an
+        // eCash-only invoice (no Lightning, no Bitcoin address) opens on it.
+        if ($hasEcx && !$hasCashu) {
+            return 'ecx';
         }
         return 'cashu';
     }
@@ -180,9 +186,10 @@ class Invoice {
      * @return string[]
      */
     public static function paymentMethodTabOrder(array $store): array {
+        // eCash (ECX) follows the two Bitcoin methods and precedes Cashu.
         return self::preferredFirstMethod($store) === self::FIRST_METHOD_LIGHTNING
-            ? ['lightning', 'onchain', 'cashu']
-            : ['onchain', 'lightning', 'cashu'];
+            ? ['lightning', 'onchain', 'ecx', 'cashu']
+            : ['onchain', 'lightning', 'ecx', 'cashu'];
     }
 
     /**
@@ -376,10 +383,13 @@ class Invoice {
         // BOLT11 straight from the merchant's wallet, needing neither a mint
         // nor an xpub.
         $destinations = StoreLnAddresses::destinationsForStore($storeId);
-        if (!$cashuConfigured && !$onchainConfigured && $destinations === []) {
+        // An eCash (ECX) address source is a payment method of its own: an
+        // eCash-only store creates invoices on the 'ecx' rail (see below).
+        $ecxOffered = EcxConfig::isOffered($store);
+        if (!$cashuConfigured && !$onchainConfigured && $destinations === [] && !$ecxOffered) {
             throw new Exception(
                 'Store has no payment methods configured. Add a Cashu mint, an '
-                . 'on-chain xpub, or a Lightning destination (address, NWC, or noffer).'
+                . 'on-chain xpub, an eCash (ECX) xpub, or a Lightning destination (address, NWC, or noffer).'
             );
         }
         // Strike on-chain: the operator opted to mint the invoice's on-chain
@@ -854,6 +864,21 @@ class Invoice {
             $onchainCreatedTipHeight = $feeOnchain['tip_height'] ?? null;
         }
 
+        // ---- eCash (ECX) rail: priced in szats, allocated through the same
+        // on-chain engine under Chain::ecx(). Rides alongside whatever the
+        // Bitcoin / Lightning rails produced; never aborts invoice creation
+        // (no price, no address -> the invoice simply has no eCash option,
+        // see EcxRail::allocateForInvoice). The ECX address may belong to a
+        // fee payee (EcxFees::decide) independently of the Bitcoin rails'
+        // fee route — the ECX fee ledger is its own.
+        $ecxLeg = null;
+        try {
+            $ecxLeg = EcxRail::allocateForInvoice($storeId, $store, (string)$amount, $currency, $invoiceId);
+        } catch (Throwable $e) {
+            error_log('[ecx] rail skipped for ' . $invoiceId . ': ' . $e->getMessage());
+            $ecxLeg = null;
+        }
+
         // Calculate expiration. A mint quote carries its own (short, ~minutes)
         // expiry; everything else uses the default invoice window.
         $defaultExpiration = time() + $lifetimeSec;
@@ -873,7 +898,7 @@ class Invoice {
         // the on-chain window short — keep the invoice alive for the longer of
         // the two. The Lightning bolt11 may lapse first (its wallet shows it as
         // expired); the on-chain address stays payable for the full window.
-        if ($onchainAddress !== null && $expiration < $defaultExpiration) {
+        if (($onchainAddress !== null || $ecxLeg !== null) && $expiration < $defaultExpiration) {
             $expiration = $defaultExpiration;
         }
 
@@ -967,7 +992,7 @@ class Invoice {
             $quoteIdFinal = null;
             $amountSatsFinal = $swapAttempt['swap']->invoiceAmountSats;
         } else {
-            if ($quote === null && $onchainAddress === null) {
+            if ($quote === null && $onchainAddress === null && $ecxLeg === null) {
                 // No rail produced anything payable. Refuse rather than insert
                 // an invoice with a null bolt11 and no on-chain address — the
                 // customer would land on a payment page with no way to pay.
@@ -991,7 +1016,9 @@ class Invoice {
                     . ($hints !== [] ? ' ' . ucfirst(implode('; ', $hints)) . '.' : '')
                 );
             }
-            $paymentRail = $quote ? 'mint' : 'onchain';
+            // An invoice whose only payable rail is eCash is created on the
+            // 'ecx' rail; otherwise the Bitcoin address / mint quote decide.
+            $paymentRail = $quote ? 'mint' : ($onchainAddress !== null ? 'onchain' : 'ecx');
             $bolt11Final = $quote ? $quote->request : null;
             $mintUrlFinal = $usedMintUrl;
             $quoteIdFinal = $quote ? $quote->quote : null;
@@ -1046,6 +1073,15 @@ class Invoice {
             'fee_redirect_note' => $feeNote,
             'fee_redirect_destination' => $feeDestination,
             'fee_redirect_rails' => $feeRails ? implode(',', $feeRails) : null,
+            // eCash leg (ecx_* columns), when offered on this invoice.
+            'ecx_address' => $ecxLeg['ecx_address'] ?? null,
+            'ecx_address_index' => $ecxLeg['ecx_address_index'] ?? null,
+            'ecx_amount_szat' => $ecxLeg['ecx_amount_szat'] ?? null,
+            'ecx_amount_tweak_szats' => $ecxLeg['ecx_amount_tweak_szats'] ?? null,
+            'ecx_created_tip_height' => $ecxLeg['ecx_created_tip_height'] ?? null,
+            'ecx_exchange_rate' => $ecxLeg['ecx_exchange_rate'] ?? null,
+            'ecx_fee_note' => $ecxLeg['ecx_fee_note'] ?? null,
+            'ecx_fee_destination' => $ecxLeg['ecx_fee_destination'] ?? null,
             'receive_errors' => $receiveErrors !== [] ? json_encode(self::dedupeReceiveErrors($receiveErrors)) : null,
             'metadata' => $metadata ? json_encode($metadata) : null,
             'checkout_config' => $checkout ? json_encode($checkout) : null,
@@ -1853,6 +1889,12 @@ class Invoice {
         if ($settledToFee) {
             self::recordFeeRedirectCredit($invoice, $invoice['lnurl_preimage'] ?? null);
         }
+        // The eCash address of an invoice can point at a fee payee on its own
+        // ledger (EcxFees); a settlement over it is a fee payment in ECX.
+        if ($status === 'Settled' && $invoice && EcxFees::settledToFee($invoice)) {
+            EcxFees::recordCredit($invoice);
+            $settledToFee = true;
+        }
 
         // Fire appropriate webhook
         $eventType = match ($status) {
@@ -2002,12 +2044,14 @@ class Invoice {
             "expiration_time < ?
              AND (onchain_address IS NULL OR onchain_address = ''
                   OR (expiration_time + COALESCE((SELECT s.onchain_confirm_timeout_sec FROM stores s WHERE s.id = invoices.store_id), 86400)) < CAST(? AS INTEGER))
+             AND (ecx_address IS NULL OR ecx_address = ''
+                  OR (expiration_time + COALESCE((SELECT s.ecx_confirm_timeout_sec FROM stores s WHERE s.id = invoices.store_id), 86400)) < CAST(? AS INTEGER))
              AND (quote_id IS NULL OR quote_id = ''
                   OR expiration_time < ?
                   OR (last_polled_at IS NOT NULL AND last_polled_at >= expiration_time
                       AND last_poll_error IS NULL
                       AND UPPER(COALESCE(last_poll_state, '')) = 'UNPAID'))",
-            [$now, $now, $now - self::EXPIRY_CONFIRM_WINDOW]
+            [$now, $now, $now, $now - self::EXPIRY_CONFIRM_WINDOW]
         );
     }
 
@@ -3201,6 +3245,37 @@ class Invoice {
         if ($changed && $rate !== null) {
             Database::update('invoices', ['exchange_rate' => $rate], 'id = ? AND status = ?', [$invoice['id'], 'New']);
         }
+
+        // ---- eCash (ECX) amount: same rules as the on-chain amount, on its
+        // own price. Unique-address mode only (static attributes by exact
+        // amount), never once an ECX payment was seen, never when the ECX
+        // address belongs to a fee payee (the fee is owed in szats as
+        // decided). An unavailable ECX price leaves the amount as it is.
+        if (!empty($invoice['ecx_address']) && empty($invoice['ecx_fee_note'])
+                && empty($invoice['ecx_first_seen_at'])
+                && (($store['ecx_address_mode'] ?? 'xpub') !== 'static')) {
+            $ecxSeen = Database::fetchOne(
+                "SELECT 1 AS x FROM ecx_payments WHERE invoice_id = ? LIMIT 1", [$invoice['id']]
+            );
+            $ecxQuote = $ecxSeen ? null : EcxRates::convertToSzats(
+                (string)$invoice['amount'], (string)$invoice['currency'],
+                $store['price_provider_primary'] ?? null,
+                $store['price_provider_secondary'] ?? null
+            );
+            $currentEcx = (int)($invoice['ecx_amount_szat'] ?? 0);
+            if ($ecxQuote !== null && $ecxQuote['szats'] > 0 && $currentEcx > 0 && $ecxQuote['szats'] !== $currentEcx) {
+                $newSzats = (int)$ecxQuote['szats'];
+                $ecxFloor = (int)($invoice['ecx_amount_floor_szat'] ?? 0);
+                $ecxFloor = $ecxFloor > 0 ? min($ecxFloor, $currentEcx, $newSzats) : min($currentEcx, $newSzats);
+                Database::update(
+                    'invoices',
+                    ['ecx_amount_szat' => $newSzats, 'ecx_amount_floor_szat' => $ecxFloor, 'ecx_exchange_rate' => $ecxQuote['rate']],
+                    'id = ? AND status = ? AND ecx_first_seen_at IS NULL',
+                    [$invoice['id'], 'New']
+                );
+                $changed = true;
+            }
+        }
         return ['requoted' => $changed, 'lightning_done' => $lightningDone];
     }
 
@@ -3867,6 +3942,22 @@ class Invoice {
             if ($oc) {
                 $result['txid'] = $oc['txid'];
             }
+        } elseif ($rail === 'ecx' && !empty($invoice['ecx_address'])) {
+            // Paid in eCash (ECX): the txid lives on the ECX chain, so the
+            // admin UI links it to the ECX explorer (txidChain).
+            $result['destination'] = $invoice['ecx_address'];
+            $result['destinationChain'] = 'ecx';
+            $ep = Database::fetchOne(
+                "SELECT txid FROM ecx_payments
+                  WHERE invoice_id = ?
+                  ORDER BY first_seen_at ASC, id ASC
+                  LIMIT 1",
+                [$invoice['id']]
+            );
+            if ($ep) {
+                $result['txid'] = $ep['txid'];
+                $result['txidChain'] = 'ecx';
+            }
         } elseif ($rail === 'swap') {
             $sa = Database::fetchOne(
                 "SELECT merchant_address, status, lockup_txid, claim_txid
@@ -3933,6 +4024,11 @@ class Invoice {
         if ($onchain !== null) {
             $methods['BTC-OnChain'] = $onchain;
         }
+        // eCash (ECX): amount / due in szats, paymentLink ecash:<addr>?amount=<ECX>.
+        $ecxMethod = OnchainPayments::formatPaymentMethod($invoice, Chain::ecx());
+        if ($ecxMethod !== null) {
+            $methods[Chain::ecx()->apiMethod] = $ecxMethod;
+        }
         if (!empty($methods)) {
             $result['checkout'] = ['paymentMethods' => $methods];
         }
@@ -3965,6 +4061,25 @@ class Invoice {
                 // Decided only at settlement: did the paying rail go to the fee?
                 'settled' => $isSettled,
                 'settledToFee' => $isSettled && self::settledRailIsFeeRouted($invoice),
+            ];
+        }
+
+        // eCash (ECX) leg: the szat amount quoted, the rate it was quoted at
+        // and whether the ECX address points at a fee payee (its own ledger —
+        // independent of feeRedirect above, which covers the Bitcoin rails).
+        if (!empty($invoice['ecx_address'])) {
+            $ecxSettled = ($invoice['status'] ?? '') === 'Settled' && ($invoice['settled_rail'] ?? '') === 'ecx';
+            $result['ecx'] = [
+                'address' => $invoice['ecx_address'],
+                'amountSzat' => (int)($invoice['ecx_amount_szat'] ?? 0),
+                'rate' => $invoice['ecx_exchange_rate'] ?? null,
+                'settled' => $ecxSettled,
+                'feeNote' => $invoice['ecx_fee_note'] ?? null,
+                'feeLabel' => isset($invoice['ecx_fee_note'])
+                    ? (['DEV_FEE' => 'dev fee', 'HOSTING_FEE' => 'hosting fee'][$invoice['ecx_fee_note']] ?? 'fees')
+                    : null,
+                'feeDestination' => $invoice['ecx_fee_destination'] ?? null,
+                'settledToFee' => $ecxSettled && !empty($invoice['ecx_fee_note']),
             ];
         }
 
@@ -4549,7 +4664,7 @@ class Invoice {
             } elseif ($rail === 'noffer') {
                 self::pollSingleNoffer($invoiceId);
             }
-            if (empty($invoice['onchain_address'])) {
+            if (empty($invoice['onchain_address']) && empty($invoice['ecx_address'])) {
                 return;
             }
             $invoice = self::getById($invoiceId);
@@ -4569,6 +4684,18 @@ class Invoice {
                 }
             } catch (Throwable $e) {
                 error_log("on-chain poll failed for {$invoiceId}: " . $e->getMessage());
+            }
+        }
+        // Same for the eCash (ECX) address — its own chain, its own poll.
+        if (!empty($invoice['ecx_address'])) {
+            try {
+                OnchainPayments::pollInvoice($invoiceId, Chain::ecx());
+                $invoice = self::getById($invoiceId);
+                if (!$invoice || !in_array($invoice['status'], ['New', 'Processing'])) {
+                    return;
+                }
+            } catch (Throwable $e) {
+                error_log("ecx poll failed for {$invoiceId}: " . $e->getMessage());
             }
         }
 

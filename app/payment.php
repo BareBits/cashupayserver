@@ -99,6 +99,32 @@ function cashupay_onchain_tx_url(array $invoice): ?string {
 }
 
 /**
+ * Explorer link for whichever chain-watched payment this invoice has seen:
+ * the Bitcoin tx (mempool.space) or, failing that, the eCash (ECX) tx on
+ * explorer.ecash.com. One link is enough — an invoice settles over one rail.
+ */
+function cashupay_chain_tx_url(array $invoice): ?string {
+    return cashupay_onchain_tx_url($invoice) ?? EcxRail::txUrl($invoice);
+}
+
+/** Is a detected Bitcoin OR eCash payment still waiting for confirmations? */
+function cashupay_chain_pending(array $invoice): bool {
+    return $invoice['status'] === 'Processing'
+        && (!empty($invoice['onchain_first_seen_at']) || !empty($invoice['ecx_first_seen_at']));
+}
+
+/** Which chain the pending / settled payment is on: 'ecx' or 'btc' (default). */
+function cashupay_chain_kind(array $invoice): string {
+    if (($invoice['settled_rail'] ?? '') === 'ecx') {
+        return 'ecx';
+    }
+    if ($invoice['status'] === 'Processing' && empty($invoice['onchain_first_seen_at']) && !empty($invoice['ecx_first_seen_at'])) {
+        return 'ecx';
+    }
+    return 'btc';
+}
+
+/**
  * Relay-subscription parameters the page needs to watch for the merchant's
  * kind-21001 payment receipt; null unless this invoice currently rides the
  * noffer rail. Shared by the HTML bootstrap, the JSON poll and the Lightning
@@ -214,12 +240,14 @@ if (isset($_GET['json'])) {
         'additionalStatus' => $invoice['additional_status'],
         // True while an on-chain payment is detected in the mempool but not
         // yet confirmed — drives the "waiting for on-chain confirmation" copy.
-        'onchainPending' => $invoice['status'] === 'Processing'
-            && !empty($invoice['onchain_first_seen_at']),
-        // Explorer link for the detected on-chain tx; null for non-on-chain
-        // payments. Sent while confirming AND after settlement so the link
-        // survives the pending -> settled transition.
-        'onchainTxUrl' => cashupay_onchain_tx_url($invoice),
+        'onchainPending' => cashupay_chain_pending($invoice),
+        // Which chain the detected payment is on ('btc' | 'ecx') — drives the
+        // confirmation copy and the explorer-link label.
+        'chainKind' => cashupay_chain_kind($invoice),
+        // Explorer link for the detected on-chain / eCash tx; null for
+        // Lightning payments. Sent while confirming AND after settlement so
+        // the link survives the pending -> settled transition.
+        'onchainTxUrl' => cashupay_chain_tx_url($invoice),
         // Sanitized create-time direct-receive failures ([{type, reason}]);
         // static for the invoice's lifetime — the page renders them
         // server-side, this mirrors them for JSON consumers. Empty when the
@@ -287,8 +315,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'send_
     // Accepted for a settled invoice (receipt queued immediately) or while a
     // detected on-chain payment is still confirming (email saved now, receipt
     // queued at settlement — see NotificationSender::flushRequestedPayerReceipts).
-    $onchainConfirming = $invoice['status'] === 'Processing'
-        && !empty($invoice['onchain_first_seen_at']);
+    $onchainConfirming = cashupay_chain_pending($invoice);
     if ($invoice['status'] !== 'Settled' && !$onchainConfirming) {
         cashupay_status(400);
         echo json_encode(['error' => 'Invoice is not paid yet.']);
@@ -433,14 +460,15 @@ $newsletterDefaultChecked = $emailCaptureEnabled && Config::getNewsletterDefault
 // Settled webhook). The generic #payment-processing block remains for the
 // transient non-on-chain Processing state (Cashu minting after a Lightning
 // payment).
-$onchainPendingInitial = $invoice['status'] === 'Processing'
-    && !empty($invoice['onchain_first_seen_at']);
+$onchainPendingInitial = cashupay_chain_pending($invoice);
+// 'btc' | 'ecx': the eCash rail has its own explorer and confirmation copy.
+$chainKindInitial = cashupay_chain_kind($invoice);
 
-// Explorer link for the detected on-chain tx (null for non-on-chain
+// Explorer link for the detected on-chain / eCash tx (null for Lightning
 // payments). Rendered on the unified screen in both pending and settled
 // modes; the poll also carries it so JS can inject the link when the tx is
 // detected while the page is open.
-$onchainTxUrl = cashupay_onchain_tx_url($invoice);
+$onchainTxUrl = cashupay_chain_tx_url($invoice);
 
 // Format amount for display - use store's mint unit
 $mintUnit = Config::getStoreMintUnit($invoice['store_id']);
@@ -462,6 +490,10 @@ if ($invoice['amount_sats'] && $requestCurrency !== 'SAT' && $requestCurrency !=
     }
     // If request currency matches mint unit, no secondary display needed
 }
+// Paid in eCash: show what was actually received, in ECX.
+if (($invoice['settled_rail'] ?? '') === 'ecx' && (int)($invoice['ecx_amount_szat'] ?? 0) > 0) {
+    $displayAmount .= ' · ' . Chain::ecx()->formatCoin((int)$invoice['ecx_amount_szat']) . ' ECX';
+}
 
 $baseUrl = Config::getBaseUrl();
 
@@ -473,6 +505,7 @@ $baseUrl = Config::getBaseUrl();
 // stays a pure string builder. $pathDebug stays false for everyone else.
 $pathDebug = false;
 $pathDebugOnchainMode = null;
+$pathDebugEcxMode = null;
 $pathDebugSwapProvider = null;
 $pathDebugCashuMintUrl = null;
 $pathDebugMayBeAdmin = isset($_COOKIE['cashupay_session']);
@@ -485,6 +518,13 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                 [$invoice['store_id']]
             );
             $pathDebugOnchainMode = $modeRow['onchain_address_mode'] ?? null;
+        }
+        if (!empty($invoice['ecx_address'])) {
+            $ecxModeRow = Database::fetchOne(
+                "SELECT ecx_address_mode FROM stores WHERE id = ?",
+                [$invoice['store_id']]
+            );
+            $pathDebugEcxMode = $ecxModeRow['ecx_address_mode'] ?? null;
         }
         if (($invoice['payment_rail'] ?? '') === 'swap') {
             $swapRow = Database::fetchOne(
@@ -1147,6 +1187,18 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
             margin: 0 0 0.5rem;
             text-decoration: underline;
         }
+        /* The "Pay with" brand row lists Bitcoin / Lightning wallets; none of
+           them pays ECX, so the row hides while the eCash tab is active. */
+        .payment-methods[data-method="ecx"] {
+            display: none;
+        }
+        .ecx-note {
+            margin: 0.5rem 0 0.75rem;
+            font-size: 0.8rem;
+            line-height: 1.4;
+            color: var(--text-secondary);
+            text-align: center;
+        }
         .onchain-tx-link.hidden {
             display: none;
         }
@@ -1315,6 +1367,16 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                 ? htmlspecialchars($invoice['onchain_address'])
                 : '';
 
+            // eCash (ECX): the same kind of address on the ECX chain, priced
+            // in szats, shown only while the invoice is payable (an
+            // ECX-settled invoice shows the complete screen). QR + open-in-
+            // wallet use the `ecash:` scheme the eCash.com wallet registers.
+            $ecxChain = Chain::ecx();
+            $hasEcx = !empty($invoice['ecx_address']) && (int)($invoice['ecx_amount_szat'] ?? 0) > 0;
+            $ecxSzat = (int)($invoice['ecx_amount_szat'] ?? 0);
+            $ecxUri = $hasEcx ? $ecxChain->paymentUri($invoice['ecx_address'], $ecxSzat) : '';
+            $ecxCoin = $hasEcx ? $ecxChain->formatCoin($ecxSzat) : '0';
+
             // Cashu ecash: offered only when the store has opted into offline
             // Cashu acceptance. The request is built without contacting the
             // mint, so it works even while the server is mint-offline (the
@@ -1351,7 +1413,7 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                     $hasCashu = false;
                 }
             }
-            $methodCount = ($hasLightning ? 1 : 0) + ($hasOnchain ? 1 : 0) + ($hasCashu ? 1 : 0);
+            $methodCount = ($hasLightning ? 1 : 0) + ($hasOnchain ? 1 : 0) + ($hasCashu ? 1 : 0) + ($hasEcx ? 1 : 0);
             // "Popular wallet" tabs (WalletTabs): Cash App / Venmo / PayPal
             // tabs the store opted into, each repeating a native QR (the
             // source method) under a note on where that app hides its
@@ -1461,11 +1523,13 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                     is_array($store) ? $store : [],
                     $hasOnchain,
                     $hasLightning,
-                    $hasCashu
+                    $hasCashu,
+                    $hasEcx
                 );
                 $methodTabs = [
                     'onchain'   => ['offered' => $hasOnchain,   'label' => 'On-chain'],
                     'lightning' => ['offered' => $hasLightning, 'label' => 'Lightning'],
+                    'ecx'       => ['offered' => $hasEcx,       'label' => 'eCash'],
                     'cashu'     => ['offered' => $hasCashu,     'label' => 'Cashu'],
                 ];
                 // Wallet tabs follow the native methods. Up to three tabs share
@@ -1585,6 +1649,56 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                     <div class="debug-path" title="Admin debug: on-chain address derivation mode">
                         <span class="debug-path-tag">path</span>
                         <span class="debug-path-value"><?= htmlspecialchars(PaymentPathDebug::onchainLabel($invoice, $pathDebugOnchainMode)) ?></span>
+                    </div>
+                    <?php endif; ?>
+                </div>
+                <?php endif; ?>
+
+                <?php if ($hasEcx): ?>
+                <div class="method-block <?= $firstMethod === 'ecx' ? '' : 'hidden' ?>" data-method-block="ecx">
+                    <div class="qr-container" id="qr-ecx"></div>
+                    <div class="invoice-input" data-copy="<?= htmlspecialchars($invoice['ecx_address']) ?>">
+                        <?= htmlspecialchars($invoice['ecx_address']) ?>
+                        <div style="margin-top:.35rem;font-size:.85rem;color:var(--text-secondary)" data-ecx-amount>
+                            <?= htmlspecialchars($ecxChain->formatUnits($ecxSzat)) ?> (<?= htmlspecialchars($ecxCoin) ?> ECX)
+                        </div>
+                    </div>
+                    <p class="ecx-note">
+                        eCash (ECX) is a separate chain: pay this address with an <strong>ECX</strong> wallet only.
+                        The address looks like a Bitcoin address, but sending BTC to it will not complete this invoice.
+                    </p>
+                    <div class="btn-row">
+                        <a href="<?= htmlspecialchars($ecxUri) ?>" class="btn" data-ecx-link>
+                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <circle cx="12" cy="12" r="10"></circle>
+                                <path d="M8 9.5h8M8 14.5h8M10 7v10"></path>
+                            </svg>
+                            Pay with ECX wallet
+                        </a>
+                        <button type="button" class="btn btn-secondary" data-copy="<?= htmlspecialchars($invoice['ecx_address']) ?>">
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+                                <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+                            </svg>
+                            Copy Address
+                        </button>
+                        <?php if ($showShare): ?>
+                        <button type="button" class="btn btn-secondary btn-share" data-share-url="<?= htmlspecialchars($shareUrl) ?>" aria-label="Copy share link">
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <circle cx="18" cy="5" r="3"></circle>
+                                <circle cx="6" cy="12" r="3"></circle>
+                                <circle cx="18" cy="19" r="3"></circle>
+                                <line x1="8.59" y1="13.51" x2="15.42" y2="17.49"></line>
+                                <line x1="15.41" y1="6.51" x2="8.59" y2="10.49"></line>
+                            </svg>
+                            <span class="btn-share-label">Share</span>
+                        </button>
+                        <?php endif; ?>
+                    </div>
+                    <?php if ($pathDebug): ?>
+                    <div class="debug-path" title="Admin debug: eCash (ECX) address derivation mode">
+                        <span class="debug-path-tag">path</span>
+                        <span class="debug-path-value"><?= htmlspecialchars(PaymentPathDebug::ecxLabel($invoice, $pathDebugEcxMode)) ?></span>
                     </div>
                     <?php endif; ?>
                 </div>
@@ -1814,20 +1928,29 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                 </div>
                 <div class="status-badge processing <?= $onchainPendingInitial ? '' : 'hidden' ?>" id="success-badge-pending">
                     <div class="spinner"></div>
-                    Waiting for on-chain confirmation
+                    <span id="success-badge-pending-text"><?= $chainKindInitial === 'ecx' ? 'Waiting for eCash confirmation' : 'Waiting for on-chain confirmation' ?></span>
                 </div>
-                <p class="onchain-pending-copy <?= $onchainPendingInitial ? '' : 'hidden' ?>" id="onchain-pending-copy">
+                <p class="onchain-pending-copy <?= $onchainPendingInitial ? '' : 'hidden' ?>" id="onchain-pending-copy"
+                   data-copy-btc="Payment detected, waiting for on-chain confirmation. Please do not close this window. Confirmation usually takes up to 10 minutes, but may take longer if you elected to pay a low network fee."
+                   data-copy-ecx="eCash payment detected, waiting for a confirmation on the ECX chain. Please do not close this window. Confirmation times vary with ECX block times and may take longer if you elected to pay a low network fee.">
+                    <?php if ($chainKindInitial === 'ecx'): ?>
+                    eCash payment detected, waiting for a confirmation on the ECX chain. Please do not
+                    close this window. Confirmation times vary with ECX block times and may take
+                    longer if you elected to pay a low network fee.
+                    <?php else: ?>
                     Payment detected, waiting for on-chain confirmation. Please do not
                     close this window. Confirmation usually takes up to 10 minutes, but
                     may take longer if you elected to pay a low network fee.
+                    <?php endif; ?>
                 </p>
                 <!-- Explorer link for the detected tx. Always in the DOM so the
                      poll can populate it when the tx is detected mid-session;
                      shown in both pending and settled modes once a txid is
                      known (setSuccessMode deliberately doesn't toggle it). -->
                 <a class="onchain-tx-link <?= $onchainTxUrl ? '' : 'hidden' ?>" id="onchain-tx-link"
-                   href="<?= htmlspecialchars($onchainTxUrl ?? '') ?>" target="_blank" rel="noopener">
-                    View transaction on mempool.space
+                   href="<?= htmlspecialchars($onchainTxUrl ?? '') ?>" target="_blank" rel="noopener"
+                   data-label-btc="View transaction on mempool.space" data-label-ecx="View transaction on explorer.ecash.com">
+                    <?= $chainKindInitial === 'ecx' ? 'View transaction on explorer.ecash.com' : 'View transaction on mempool.space' ?>
                 </a>
                 <div class="invoice-details">
                     <div><span class="label">Invoice:</span><span class="invoice-id-value"><?= htmlspecialchars($invoice['id']) ?></span></div>
@@ -1915,6 +2038,7 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
         let invoice = <?= json_encode($invoice['bolt11']) ?>;
         const onchainAddress = <?= json_encode($invoice['onchain_address'] ?? null) ?>;
         const onchainBip21 = <?= json_encode($bip21 ?? '') ?>;
+        const ecxUri = <?= json_encode($ecxUri ?? '') ?>;
         const invoiceId = <?= json_encode($invoiceId) ?>;
         const expirationTime = <?= (int)$invoice['expiration_time'] ?>;
         // Long-lived (shareable) invoice: the invoice itself lives for months;
@@ -1985,7 +2109,7 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
         function renderWalletQRs(source) {
             document.querySelectorAll('.method-block[data-source][data-method-block]').forEach(block => {
                 const method = block.dataset.methodBlock;
-                if (method === 'lightning' || method === 'onchain' || method === 'cashu') return;
+                if (method === 'lightning' || method === 'onchain' || method === 'cashu' || method === 'ecx') return;
                 if (source && block.dataset.source !== source) return;
                 if (block.dataset.source === 'lightning' && invoice) {
                     renderQR('qr-' + method, lightningUri(invoice));
@@ -1998,6 +2122,7 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
         if (currentStatus === 'New') {
             if (invoice) renderQR('qr-lightning', lightningUri(invoice));
             if (onchainBip21) renderQR('qr-onchain', onchainBip21);
+            if (ecxUri) renderQR('qr-ecx', ecxUri);
             if (cashuRequest) renderQR('qr-cashu', cashuRequest);
             renderWalletQRs(null);
         }
@@ -2440,6 +2565,7 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                 // Populate the explorer link as soon as the poll knows the
                 // txid; independent of the status transition below so a page
                 // that already shows the pending screen still picks it up.
+                if (data.chainKind) applyChainKind(data.chainKind);
                 if (data.onchainTxUrl) {
                     const txLink = document.getElementById('onchain-tx-link');
                     if (txLink) {
@@ -2465,6 +2591,22 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
             }
 
             setTimeout(pollStatus, 2000);
+        }
+
+        // The detected payment's chain ('btc' | 'ecx') picks the confirmation
+        // copy and the explorer-link label on the unified screen.
+        function applyChainKind(kind) {
+            const k = kind === 'ecx' ? 'ecx' : 'btc';
+            const copy = document.getElementById('onchain-pending-copy');
+            if (copy && copy.dataset['copy' + (k === 'ecx' ? 'Ecx' : 'Btc')]) {
+                copy.textContent = copy.dataset['copy' + (k === 'ecx' ? 'Ecx' : 'Btc')];
+            }
+            const badge = document.getElementById('success-badge-pending-text');
+            if (badge) badge.textContent = k === 'ecx' ? 'Waiting for eCash confirmation' : 'Waiting for on-chain confirmation';
+            const link = document.getElementById('onchain-tx-link');
+            if (link && link.dataset['label' + (k === 'ecx' ? 'Ecx' : 'Btc')]) {
+                link.textContent = link.dataset['label' + (k === 'ecx' ? 'Ecx' : 'Btc')];
+            }
         }
 
         // Toggle the unified detected/complete screen between its two modes.
