@@ -3427,8 +3427,27 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                     Lightning is the fast, low-fee way to get paid &mdash; quick
                     for your customers, cheap for you. 🚀
                 </p>
-                <p style="margin-bottom: 1.25rem;">
+                <p style="margin-bottom: 0.75rem;">
                     We'd really suggest turning it on! BareBits supports several types of lightning wallet backends. When invoices are generated for your customers, BareBits will try each option in sequence until it can successfully generate an invoice. <strong>Only one method is needed for lightning payments to work</strong>, you can use multiple methods if you want.
+                </p>
+                <!-- Self-custody pointer: sits between the intro and the
+                     method list (above Method 1) so it's read before any
+                     backend is chosen. The CLINK receipt-loss warning is NOT
+                     repeated here — it lives in the Method 4 noffer section,
+                     which is where a CLINK destination is actually entered
+                     (tests/php/test_clink_receipt_warning.php). -->
+                <p id="ln-self-custody-note" style="margin-bottom: 1.25rem;">
+                    Want full self-custody? You can use the
+                    <a href="https://github.com/BareBits/electrum_clink" target="_blank" rel="noopener noreferrer" style="color: #63b3ed;">clink plugin</a>
+                    or the built-in NWC (nostr wallet connect) plugin for the
+                    <a href="https://electrum.org" target="_blank" rel="noopener noreferrer" style="color: #63b3ed;">Electrum wallet</a>
+                    to have lightning payments delivered directly to your wallet
+                    (when online). We also suggest the
+                    <a href="https://github.com/BareBits/electrum_liquidity" target="_blank" rel="noopener noreferrer" style="color: #63b3ed;">Electrum Liquidity Management plugin</a>,
+                    just set to automatic mode and you'll always have inbound
+                    liquidity once you reach a balance of around $100 worth of
+                    BTC. BareBits provides graceful fallback options for if your
+                    wallet is offline or doesn't have inbound liquidity.
                 </p>
 
                 <form method="POST" action="<?= htmlspecialchars(setupSelfUrl()) ?>">
@@ -3458,7 +3477,7 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                             instead.
                         </div>
                         <div id="ln-help-box" style="background: rgba(0,0,0,0.2); padding: 1rem; border-radius: 8px; font-size: 0.9rem; color: #a0aec0;">
-                            <p style="margin-bottom: 0.75rem;">
+                            <p style="margin: 0;">
                                 Have a Strike account (or want a free one with instant
                                 fiat/USD conversion, available in 100+ countries at
                                 <a href="https://strike.me" target="_blank" rel="noopener noreferrer" style="color: #63b3ed;">strike.me</a>)?
@@ -3466,42 +3485,6 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                                 Strike addresses don't support LUD-21 payment
                                 verification. Use the <strong>Strike API</strong> method
                                 below instead.
-                            </p>
-                            <p style="margin-bottom: 0.75rem;">
-                                Don't want to use strike? Want full self-custody? You can
-                                use the
-                                <a href="https://github.com/BareBits/electrum_clink" target="_blank" rel="noopener noreferrer" style="color: #63b3ed;">clink plugin</a>
-                                or the built-in NWC (nostr wallet connect) plugin for the
-                                <a href="https://electrum.org" target="_blank" rel="noopener noreferrer" style="color: #63b3ed;">Electrum wallet</a>
-                                to have lightning payments delivered directly to your
-                                wallet (when online). We also suggest the
-                                <a href="https://github.com/BareBits/electrum_liquidity" target="_blank" rel="noopener noreferrer" style="color: #63b3ed;">Electrum Liquidity Management plugin</a>,
-                                just set to automatic mode and you'll always have
-                                inbound liquidity once you reach a balance of around
-                                $100 worth of BTC. BareBits provides graceful fallback
-                                options for if your wallet is offline or doesn't have
-                                inbound liquidity.
-                            </p>
-                            <p style="margin-bottom: 0.75rem;">
-                                ⚠️ Using
-                                <a href="https://electrum.org" target="_blank" rel="noopener noreferrer" style="color: #63b3ed;">Electrum</a>
-                                with the
-                                <a href="https://github.com/BareBits/electrum_clink" target="_blank" rel="noopener noreferrer" style="color: #63b3ed;">CLINK plugin</a>
-                                is STRONGLY recommended as opposed to other wallets
-                                with CLINK support. CLINK payment receipts are
-                                temporary when issued, which means they can be lost
-                                during small network outages and report invoices as
-                                "unpaid". There is no risk to funds from this, but it
-                                does mean an order may show unpaid when it was, in
-                                fact, paid.
-                            </p>
-                            <p style="margin: 0;">
-                                Alternate option: use a cashu mint. A cashu mint holds
-                                onto your funds (no need to worry about managing
-                                liquidity or keeping wallet online) and funds are
-                                automatically withdrawn to your on-chain wallet when a
-                                sufficient amount has accumulated. Just skip this
-                                section if you prefer to use a cashu mint.
                             </p>
                         </div>
                     </details>
@@ -4144,19 +4127,17 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                 <p style="margin-bottom: 1rem;">
                     Help us understand how many people run BareBits and which
                     features matter. This is <strong>off by default</strong> and
-                    entirely optional. If you enable it, your server sends one
-                    small report now and then one a week to
-                    <code>getbarebits.com</code>. You choose how much it
-                    contains, and you can preview the exact report for each
-                    option below.
+                    entirely optional. You can choose how much is reported and
+                    preview the exact report for each option below.
                 </p>
                 <p style="margin-bottom: 1.25rem; font-size: 0.9rem; color: #a0aec0;">
-                    No report ever includes your deployment ID, store names,
-                    mint or Lightning addresses, email addresses, customer or
-                    invoice details. Our side records the country your server
-                    connected from and then discards the IP address. Change
-                    your mind any time under Settings &rarr; Anonymous usage
-                    statistics; turning it off stops the reports. Details in the
+                    No report ever includes your store names, mint or Lightning
+                    addresses, email addresses, customer or invoice details or
+                    other personally-identifiable information. Our side records
+                    the country your server connected from and then discards the
+                    IP address. Change your mind any time under Settings &rarr;
+                    Anonymous usage statistics; turning it off stops the
+                    reports. Details in the
                     <a href="https://github.com/BareBits/cashupayserver/blob/main/PRIVACY.md" target="_blank" rel="noopener" style="color: #f7931a;">Privacy Policy</a>.
                 </p>
                 <form method="POST" action="<?= htmlspecialchars(setupSelfUrl()) ?>">

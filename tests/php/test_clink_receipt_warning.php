@@ -13,7 +13,7 @@ $root = dirname(__DIR__, 2) . '/app';
 
 // file => expected number of warning instances
 $surfaces = [
-    'setup.php' => 2, // Method 1 help box + Method 3 noffer (CLINK) section
+    'setup.php' => 1, // Method 4 noffer (CLINK) section (the Method 1 help box no longer mentions CLINK)
     'admin.php' => 2, // CLINK noffers group + legacy per-row noffer hint (JS)
 ];
 

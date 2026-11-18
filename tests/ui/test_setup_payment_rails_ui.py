@@ -427,11 +427,30 @@ def test_lightning_screen_collapses_nwc_and_noffer_sections(
                 before('#strike-section', '#nwc-section'),
                 before('#nwc-section', '#noffer-section'),
                 !!document.querySelector('#lnurl-section #ln-help-box'),
+                // The self-custody pointer sits between the intro and Method 1,
+                // outside every method section.
+                before('#ln-self-custody-note', '#lnurl-section'),
+                !document.querySelector('details #ln-self-custody-note'),
             ];
         }"""
     )
-    assert order == [True, True, True, True, True], f"screen order wrong: {order}"
-    assert "Strike API" in page.locator("#ln-help-box").inner_text()
+    assert order == [True] * 7, f"screen order wrong: {order}"
+    help_text = page.locator("#ln-help-box").inner_text()
+    assert "Strike API" in help_text
+    # Everything after the Strike paragraph moved out of the help box
+    # (self-custody pointer) or was dropped (CLINK receipt warning, cashu
+    # alternative) on 2026-11-18.
+    for gone in ("self-custody", "STRONGLY recommended", "cashu mint"):
+        assert gone not in help_text, f"help box still contains {gone!r}: {help_text}"
+    note = page.locator("#ln-self-custody-note")
+    assert note.is_visible(), "self-custody note must render above the method list"
+    assert note.inner_text().startswith("Want full self-custody?"), note.inner_text()
+    for href in (
+        "https://github.com/BareBits/electrum_clink",
+        "https://electrum.org",
+        "https://github.com/BareBits/electrum_liquidity",
+    ):
+        assert note.locator(f'a[href="{href}"]').count() == 1, f"self-custody note must link {href}"
 
     # Collapsing the LNURL section via its summary hides the input; expanding
     # the others via their summaries reveals theirs.
