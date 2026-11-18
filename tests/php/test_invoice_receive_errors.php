@@ -116,7 +116,7 @@ function stop_mock($proc): void {
 ]);
 [$clinkProc, $clinkPort] = start_mock('mock_clink_relay.php', 'MOCK_CLINK_PORT', [
     'MOCK_CLINK_MERCHANT_SK' => $merchantSk,
-    'MOCK_CLINK_BOLT11' => 'lnbc10000n1mockinvoice0000000', // 1000 sats
+    'MOCK_CLINK_BOLT11' => 'lnbc10000n1m0ckvnv0ce0000000', // 1000 sats
 ]);
 try {
     $store = 'store_recv_err_nwc';
@@ -175,7 +175,7 @@ try {
 // ---------- 3. dead LNURL host first -> noffer second ----------
 [$clinkProc, $clinkPort] = start_mock('mock_clink_relay.php', 'MOCK_CLINK_PORT', [
     'MOCK_CLINK_MERCHANT_SK' => $merchantSk,
-    'MOCK_CLINK_BOLT11' => 'lnbc10000n1mockinvoice0000000',
+    'MOCK_CLINK_BOLT11' => 'lnbc10000n1m0ckvnv0ce0000000',
 ]);
 putenv('CASHU_LNURL_URL_TEMPLATE=http://127.0.0.1:1/.well-known/lnurlp/{user}');
 try {
@@ -218,7 +218,7 @@ try {
 // ---------- 4. first-try success leaves the column NULL ----------
 [$clinkProc, $clinkPort] = start_mock('mock_clink_relay.php', 'MOCK_CLINK_PORT', [
     'MOCK_CLINK_MERCHANT_SK' => $merchantSk,
-    'MOCK_CLINK_BOLT11' => 'lnbc10000n1mockinvoice0000000',
+    'MOCK_CLINK_BOLT11' => 'lnbc10000n1m0ckvnv0ce0000000',
 ]);
 try {
     $store = 'store_recv_err_none';

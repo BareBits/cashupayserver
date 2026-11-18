@@ -42,7 +42,8 @@ if (strpos($path, '/.well-known/lnurlp/') === 0) {
     return;
 }
 if (strpos($path, '/callback') === 0) {
-    echo json_encode(['pr' => 'lnbc1mocklnurlfallback', 'verify' => $base . '/verify/x']);
+    // BOLT11-shaped stub carrying the requested amount (1n = 100 msat).
+    echo json_encode(['pr' => 'lnbc' . intdiv((int)($_GET['amount'] ?? 0), 100) . 'n1m0cklnurlfallpack', 'verify' => $base . '/verify/x']);
     return;
 }
 if (strpos($path, '/verify') === 0) {
@@ -85,7 +86,7 @@ try {
         'metadata' => ['orderId' => '42', 'itemDesc' => 'Test order'],
     ]);
     assert_eq('strike', $inv['payment_rail'], 'strike rail selected');
-    assert_true(str_starts_with((string)$inv['bolt11'], 'lnbcmock'), 'bolt11 from the Strike quote');
+    assert_true(str_contains((string)$inv['bolt11'], 'm0ckstr'), 'bolt11 from the Strike quote');
 
     $row = Database::fetchOne("SELECT * FROM invoices WHERE id = ?", [$inv['id']]);
     assert_not_null($row['strike_invoice_id'], 'strike_invoice_id persisted');
@@ -140,7 +141,7 @@ try {
     file_put_contents($dir . '/fail_create', '500');
     $inv2 = Invoice::create($store, ['amount' => 100, 'currency' => 'sat']);
     assert_eq('lnaddress', $inv2['payment_rail'], 'strike failure falls through to LNURL');
-    assert_eq('lnbc1mocklnurlfallback', $inv2['bolt11'], 'fallback bolt11 from the LNURL host');
+    assert_eq('lnbc1000n1m0cklnurlfallpack', $inv2['bolt11'], 'fallback bolt11 from the LNURL host');
     $row2 = Database::fetchOne("SELECT receive_errors, strike_api_key FROM invoices WHERE id = ?", [$inv2['id']]);
     assert_null($row2['strike_api_key'], 'no strike context on a non-strike rail');
     $errors = json_decode((string)$row2['receive_errors'], true);

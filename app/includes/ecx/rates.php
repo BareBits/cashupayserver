@@ -25,6 +25,7 @@ require_once __DIR__ . '/../config.php';
 require_once __DIR__ . '/../rates.php';
 require_once __DIR__ . '/../safe_http.php';
 require_once __DIR__ . '/../endpoint_health.php';
+require_once __DIR__ . '/../response_shape.php';
 
 final class EcxRates {
     /** CoinMarketCap UCID of eCash (ECX, ecash.com). */
@@ -102,8 +103,8 @@ final class EcxRates {
      * Shape: {"data":[{"id":42032,"symbol":"ECX","quotes":[{"name":"2781","price":41.78}]}]}
      */
     public static function parseCmcUsd(string $body): ?float {
-        $data = json_decode($body, true);
-        if (!is_array($data)) {
+        $data = ResponseShape::decodeJsonArray($body);
+        if ($data === null) {
             throw new RuntimeException('malformed JSON response');
         }
         $rows = $data['data'] ?? null;
@@ -111,18 +112,31 @@ final class EcxRates {
             return null;
         }
         foreach ($rows as $row) {
-            if (!is_array($row) || (int)($row['id'] ?? 0) !== self::CMC_ID) {
+            if (!is_array($row) || ResponseShape::integer($row['id'] ?? null) !== self::CMC_ID) {
                 continue;
             }
-            foreach (($row['quotes'] ?? []) as $q) {
+            $quotes = $row['quotes'] ?? null;
+            if (!is_array($quotes)) {
+                continue;
+            }
+            foreach ($quotes as $q) {
                 if (!is_array($q)) {
                     continue;
                 }
-                if ((string)($q['name'] ?? '') !== (string)self::CMC_USD_ID) {
+                // `name` is the convert id as a string ("2781"); tolerate an int.
+                if (ResponseShape::integer($q['name'] ?? null) !== self::CMC_USD_ID) {
                     continue;
                 }
-                $price = $q['price'] ?? null;
-                return is_numeric($price) ? (float)$price : null;
+                if (!array_key_exists('price', $q) || $q['price'] === null) {
+                    return null; // listed, but no price yet
+                }
+                $price = ResponseShape::decimal($q['price']);
+                if ($price === null) {
+                    // Present but not a plain decimal (array, bool, "1e400",
+                    // control characters...): a malformed body, not "no price".
+                    throw new RuntimeException('malformed response: price is not a decimal number');
+                }
+                return $price;
             }
         }
         return null;
@@ -139,7 +153,7 @@ final class EcxRates {
             'allowPrivate' => \SafeHttp::privateEndpointsAllowed(),
         ]);
         if ($result['error'] !== '' || $result['status'] !== 200 || $result['body'] === '') {
-            throw new RuntimeException("HTTP {$result['status']}: " . ($result['error'] ?: substr($result['body'], 0, 120)));
+            throw new RuntimeException("HTTP {$result['status']}: " . ($result['error'] ?: \SafeHttp::logExcerpt($result['body'])));
         }
         return self::parseCmcUsd($result['body']);
     }
@@ -256,11 +270,12 @@ final class EcxRates {
             return null;
         }
         $maxAge = $allowStale ? self::STALE_TTL : self::CACHE_TTL;
-        if (time() - (int)($data['timestamp'] ?? 0) > $maxAge) {
+        $timestamp = ResponseShape::integer($data['timestamp'] ?? null);
+        if ($timestamp === null || time() - $timestamp > $maxAge) {
             return null;
         }
-        $rate = $data['rate'] ?? null;
-        return is_numeric($rate) && (float)$rate > 0 ? (float)$rate : null;
+        $rate = ResponseShape::decimal($data['rate'] ?? null);
+        return ($rate !== null && self::isSane($rate)) ? $rate : null;
     }
 
     private static function saveToCache(float $rate): void {
@@ -272,7 +287,7 @@ final class EcxRates {
     /** Last price ever obtained (any age) — display only, never for quoting. */
     public static function lastGoodUsd(): ?float {
         $data = Config::get(self::LASTGOOD_KEY);
-        $rate = is_array($data) ? ($data['rate'] ?? null) : null;
-        return is_numeric($rate) && (float)$rate > 0 ? (float)$rate : null;
+        $rate = ResponseShape::decimal(is_array($data) ? ($data['rate'] ?? null) : null);
+        return ($rate !== null && self::isSane($rate)) ? $rate : null;
     }
 }

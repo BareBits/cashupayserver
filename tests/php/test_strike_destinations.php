@@ -172,7 +172,7 @@ if (strpos($path, '/.well-known/lnurlp/') === 0) {
     return;
 }
 if (strpos($path, '/callback') === 0) {
-    echo json_encode(['pr' => 'lnbc1mocknoverify']); // no `verify` field
+    echo json_encode(['pr' => 'lnbc' . intdiv((int)($_GET['amount'] ?? 0), 100) . 'n1m0ckn0ver']); // no `verify` field
     return;
 }
 if ($path === '/__lnurl_hint_mock') {

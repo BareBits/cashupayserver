@@ -85,7 +85,7 @@ def _create_strike_invoice(configured: ConfiguredPayserver) -> tuple[str, str, d
         invoice.get("checkout", {}).get("paymentMethods", {})
         .get("BTC-LightningNetwork", {}).get("destination")
     )
-    assert bolt11 and bolt11.startswith("lnbcmockstrike"), f"expected mock strike bolt11, got {bolt11}"
+    assert bolt11 and bolt11.startswith("lnbc") and "m0ckstr" in bolt11, f"expected mock strike bolt11, got {bolt11}"
     row = _invoice_row(configured.handle, invoice_id)
     assert row["payment_rail"] == "strike", row
     assert row["strike_invoice_id"], row
@@ -182,6 +182,38 @@ def test_strike_settles_via_cron_after_tab_closed(
     final = _invoice_row(payserver, invoice_id)
     assert final["status"] == "Settled", final
     assert final["settled_rail"] == "strike", final
+
+
+def test_strike_malformed_invoice_falls_back_to_mint(
+    shared_configured_with_strike: ConfiguredPayserver, strike_api_shared: StrikeApiServer
+) -> None:
+    """The quote's lnInvoice goes straight into the customer's QR code, so a
+    value that is not BOLT11-shaped (wrong alphabet, escape bytes) is refused
+    at the client: the rail fails over to the mint, the payer still gets a
+    real regtest bolt11, and the hostile bytes appear nowhere in the row."""
+    configured = shared_configured_with_strike
+    strike_api = strike_api_shared
+    save_strike_destination(configured.admin, configured.store_id, TEST_STRIKE_KEY)
+
+    strike_api.quote_invoice_override = "lnbc1mockinvoice\x1b[31mPWNED\x1b[0m"
+    try:
+        invoice = configured.greenfield.create_invoice(
+            configured.store_id, amount=str(INVOICE_AMOUNT_SAT), currency="sat"
+        )
+    finally:
+        strike_api.quote_invoice_override = None
+    row = _invoice_row(configured.handle, invoice["id"])
+    assert row["payment_rail"] == "mint", row
+    assert row["bolt11"] and row["bolt11"].lower().startswith("lnbcrt"), row
+    assert row["strike_api_key"] is None, "no strike context on a non-strike rail"
+    errors = row["receive_errors"]
+    assert errors and '"strike"' in errors, errors
+    assert "\x1b" not in errors and "PWNED" not in errors, "hostile invoice bytes must not reach receive_errors"
+    shown = (
+        invoice.get("checkout", {}).get("paymentMethods", {})
+        .get("BTC-LightningNetwork", {}).get("destination")
+    )
+    assert shown == row["bolt11"], "the customer sees the mint's invoice, not Strike's"
 
 
 def test_strike_failure_falls_back_to_mint(

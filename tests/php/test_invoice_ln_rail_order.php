@@ -47,7 +47,8 @@ if (strpos($path, '/.well-known/lnurlp/') === 0) {
     return;
 }
 if (strpos($path, '/callback') === 0) {
-    echo json_encode(['pr' => 'lnbc1mockorderlnurl', 'verify' => $base . '/verify/x']);
+    // BOLT11-shaped stub carrying the requested amount (1n = 100 msat).
+    echo json_encode(['pr' => 'lnbc' . intdiv((int)($_GET['amount'] ?? 0), 100) . 'n1m0ck0rderlnurl', 'verify' => $base . '/verify/x']);
     return;
 }
 if (strpos($path, '/verify') === 0) {
@@ -87,14 +88,14 @@ try {
     // ---------- 1. default order: strike leads ----------
     $inv = Invoice::create($store, ['amount' => 100, 'currency' => 'sat']);
     assert_eq('strike', $inv['payment_rail'], 'default order picks the Strike rail');
-    assert_true(str_starts_with((string)$inv['bolt11'], 'lnbcmock'), 'bolt11 from the Strike quote');
+    assert_true(str_contains((string)$inv['bolt11'], 'm0ckstr'), 'bolt11 from the Strike quote');
 
     // ---------- 2. lnaddress-first order flips the rail ----------
     RailOrder::setLnOrder($store, 'lnaddress,nwc,noffer,strike');
     $createsBefore = count(strike_mock_invoices($dir));
     $inv2 = Invoice::create($store, ['amount' => 100, 'currency' => 'sat']);
     assert_eq('lnaddress', $inv2['payment_rail'], 'lnaddress-first order picks the LNURL rail');
-    assert_eq('lnbc1mockorderlnurl', $inv2['bolt11'], 'bolt11 from the LNURL host');
+    assert_eq('lnbc1000n1m0ck0rderlnurl', $inv2['bolt11'], 'bolt11 from the LNURL host');
     assert_eq($createsBefore, count(strike_mock_invoices($dir)),
         'Strike was never contacted when a higher-priority rail worked');
     $row2 = Database::fetchOne("SELECT receive_errors, ln_destination FROM invoices WHERE id = ?", [$inv2['id']]);

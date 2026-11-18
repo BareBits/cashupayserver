@@ -5,9 +5,12 @@ Serves exactly what EcxRates reads:
     GET /data-api/v3/cryptocurrency/quote/latest?id=42032&convertId=2781
         -> {"data":[{"id":42032,"symbol":"ECX","quotes":[{"name":"2781","price":<usd>}]}]}
 
-`price` is settable; `mode` switches the whole mock to "down" (HTTP 500) or
-"empty" (a well-formed payload without a price) so tests can prove that the
-eCash option is withheld when no price can be obtained. Every request is
+`price` is settable; `mode` switches the whole mock to "down" (HTTP 500),
+"empty" (a well-formed payload without a price), "garbage" (HTTP 200 whose
+price field is not a decimal: an exponent string that PHP would cast to INF)
+or "hostile" (HTTP 200 with a body full of terminal escape sequences and
+forged log lines that is not JSON at all) so tests can prove that the eCash
+option is withheld when no usable price can be obtained. Every request is
 appended to ``hits``. Point a payserver at it with CASHUPAY_CMC_API_BASE
 (honoured only while private endpoints are allowed, which the rigs are).
 """
@@ -46,6 +49,9 @@ class MockCmc:
                 if outer.mode == "down":
                     self._send(500, b"cmc-down", "text/plain")
                     return
+                if outer.mode == "hostile":
+                    self._send(200, b"\x1b[31mPWNED\x1b[0m\r\n[cron] forged log line\n<script>alert(1)</script>")
+                    return
                 u = urlparse(self.path)
                 if u.path != "/data-api/v3/cryptocurrency/quote/latest":
                     self._send(404, b"{}")
@@ -55,7 +61,8 @@ class MockCmc:
                 conv = (q.get("convertId") or [""])[0]
                 quotes = []
                 if outer.mode != "empty" and cid == ECX_CMC_ID and conv == str(USD_CONVERT_ID):
-                    quotes = [{"name": str(USD_CONVERT_ID), "price": outer.price, "volume24h": 1.0}]
+                    price = "1e400" if outer.mode == "garbage" else outer.price
+                    quotes = [{"name": str(USD_CONVERT_ID), "price": price, "volume24h": 1.0}]
                 body = {"data": [{"id": cid, "name": "eCash", "symbol": "ECX", "slug": "ecashdotcom", "quotes": quotes}],
                         "status": {"error_code": "0"}}
                 self._send(200, json.dumps(body).encode())

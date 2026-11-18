@@ -18,6 +18,9 @@
  *   fail_quote     — HTTP status to fail POST /v1/invoices/{id}/quote with.
  *   fail_read      — HTTP status to fail GET /v1/invoices/{id} with.
  *   fail_receive_request — HTTP status to fail POST /v1/receive-requests with.
+ *   quote_invoice_override — lnInvoice string the quote returns instead of
+ *                    the BOLT11-shaped stub (for the malformed-invoice
+ *                    refusal test).
  *   quote_btc_override — BTC decimal string the quote reports as
  *                    sourceAmount instead of the created amount (for the
  *                    amount-mismatch refusal test).
@@ -51,6 +54,14 @@ function fail_with(int $status, string $code): void {
     http_response_code($status);
     echo json_encode(['data' => ['code' => $code, 'message' => 'mock failure']]);
     exit;
+}
+function mock_btc_to_sats(string $btc): int {
+    [$whole, $frac] = array_pad(explode('.', $btc, 2), 2, '');
+    return (int)$whole * 100000000 + (int)str_pad(substr($frac, 0, 8), 8, '0');
+}
+function mock_bolt11(int $sats, string $data): string {
+    // N sats = N*10 nano-BTC; data part must be >= 6 bech32 chars.
+    return 'lnbc' . ($sats * 10) . 'n1' . str_pad($data, 6, 'q');
 }
 function marker(string $name): ?string {
     $v = @file_get_contents(__DIR__ . '/' . $name);
@@ -151,7 +162,10 @@ if ($method === 'POST' && preg_match('#^/v1/invoices/([^/]+)/quote$#', $path, $m
     http_response_code(201);
     echo json_encode([
         'quoteId' => 'q-' . $m[1],
-        'lnInvoice' => 'lnbcmock' . $m[1],
+        // A BOLT11-shaped stub (prefix, amount, '1', bech32 charset) carrying
+        // the invoice's sat amount, with the id mapped nibble-wise onto the
+        // bech32 alphabet so tests can still recognise it ("m0ckstr" marker).
+        'lnInvoice' => marker('quote_invoice_override') ?? mock_bolt11(mock_btc_to_sats($btc), 'm0ckstr' . strtr(preg_replace('/[^0-9a-f]/', '', strtolower($m[1])), '0123456789abcdef', 'qpzry9x8gf2tvdw0')),
         'expiration' => gmdate('c', time() + 300),
         'expirationInSec' => 300,
         'sourceAmount' => ['amount' => $btc, 'currency' => 'BTC'],

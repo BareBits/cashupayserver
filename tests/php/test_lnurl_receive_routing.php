@@ -71,7 +71,8 @@ if (strpos(\$rawPath, '/.well-known/lnurlp/') === 0) {
 if (\$rawPath === '/cb') {
     file_put_contents('$serverDir/calls.log', date('c') . "\n", FILE_APPEND);
     header('Content-Type: application/json');
-    \$resp = ['pr' => 'lnbc1pretendinvoice'];
+    parse_str(\$_SERVER['QUERY_STRING'] ?? '', \$q);
+    \$resp = ['pr' => 'lnbc' . intdiv((int)(\$q['amount'] ?? 0), 100) . 'n1pretend'];
     if ('$mode' === 'lud21') {
         \$resp['verify'] = "http://127.0.0.1:$port/verify/" . bin2hex(random_bytes(6));
     }

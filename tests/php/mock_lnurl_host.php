@@ -9,7 +9,7 @@
  *   mock_lnurl_requests($dir)          → every request URI the host served
  *                                        (path + raw query), in order
  *
- * Every callback hands out a NEW stub bolt11 ("lnbc1pretend<hex>") with its
+ * Every callback hands out a NEW stub bolt11 ("lnbc<amt>n1pretend<id>") with its
  * own verify URL, so tests can tell one sourced invoice from the next.
  * Callers export CASHU_LNURL_URL_TEMPLATE themselves (returned here) so
  * LnUrlReceive resolves addresses against this host.
@@ -45,11 +45,16 @@ if ($path === '/cb') {
         echo json_encode(['status' => 'ERROR', 'reason' => 'down']);
         exit;
     }
-    $id = bin2hex(random_bytes(4));
-    echo json_encode(['pr' => 'lnbc1pretend' . $id, 'verify' => "http://127.0.0.1:{$port}/verify/{$id}"]);
+    // bech32-alphabet id so the stub bolt11 stays BOLT11-shaped; the amount
+    // (msat, from the callback query) is encoded as nano-BTC (1n = 100 msat).
+    $cs = 'qpzry9x8gf2tvdw0s3jn54khce6mua7l';
+    $id = '';
+    for ($i = 0; $i < 8; $i++) { $id .= $cs[random_int(0, 31)]; }
+    $amt = (int)($_GET['amount'] ?? 0);
+    echo json_encode(['pr' => 'lnbc' . intdiv($amt, 100) . 'n1pretend' . $id, 'verify' => "http://127.0.0.1:{$port}/verify/{$id}"]);
     exit;
 }
-if (preg_match('#^/verify/([a-f0-9]+)$#', $path, $m)) {
+if (preg_match('#^/verify/([a-z0-9]+)$#', $path, $m)) {
     $settled = is_file($dir . '/settled_' . $m[1]);
     echo json_encode([
         'status' => 'OK', 'settled' => $settled,

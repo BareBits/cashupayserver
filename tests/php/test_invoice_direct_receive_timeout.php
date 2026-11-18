@@ -78,7 +78,7 @@ function stop_mock($proc): void {
 ]);
 [$clinkProc, $clinkPort] = start_mock('mock_clink_relay.php', 'MOCK_CLINK_PORT', [
     'MOCK_CLINK_MERCHANT_SK' => $merchantSk,
-    'MOCK_CLINK_BOLT11' => 'lnbc10000n1mockinvoice0000000', // 1000 sats
+    'MOCK_CLINK_BOLT11' => 'lnbc10000n1m0ckvnv0ce0000000', // 1000 sats
 ]);
 try {
     $store = 'store_budget_nwc_first';
@@ -136,7 +136,7 @@ try {
     $inv = Invoice::create($store, ['amount' => 1000, 'currency' => 'sat']);
     $elapsed = microtime(true) - $t0;
     assert_eq('nwc', $inv['payment_rail'], 'silent noffer falls through to the NWC wallet');
-    assert_eq('lnbc10000n1mockinvoice0000000', $inv['bolt11'], 'NWC bolt11 for 1000 sats');
+    assert_eq('lnbc10000n1m0ckvnv0ce0000000', $inv['bolt11'], 'NWC bolt11 for 1000 sats');
     assert_true($elapsed >= 1.5, "the noffer budget was actually waited out (elapsed {$elapsed}s)");
     assert_true($elapsed < 5.5,
         "checkout reached the fallback within the 2s budget (elapsed {$elapsed}s)");

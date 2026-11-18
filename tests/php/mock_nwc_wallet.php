@@ -198,7 +198,7 @@ function buildResponseBody(string $method, array $params): array
         if ($bolt11 === '') {
             // Synthesize an invoice whose encoded amount matches the request:
             // N sats = N*10 nano-BTC.
-            $bolt11 = 'lnbc' . (intdiv($msats, 1000) * 10) . 'n1mockinvoice0000000';
+            $bolt11 = 'lnbc' . (intdiv($msats, 1000) * 10) . 'n1m0ckvnv0ce0000000';
         }
         return [
             'result_type' => 'make_invoice',

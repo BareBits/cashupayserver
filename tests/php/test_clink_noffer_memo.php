@@ -140,7 +140,7 @@ $mPk = $key->getPublicKey($mSk);
 $dumpFile = sys_get_temp_dir() . '/clink_req_dump_' . bin2hex(random_bytes(4)) . '.json';
 [$proc, $pipes, $port] = start_relay([
     'MOCK_CLINK_MERCHANT_SK' => $mSk,
-    'MOCK_CLINK_BOLT11' => 'lnbc100n1mockinvoice0000000',
+    'MOCK_CLINK_BOLT11' => 'lnbc100n1m0ckvnv0ce0000000',
     'MOCK_CLINK_DUMP' => $dumpFile,
 ]);
 try {
@@ -164,7 +164,7 @@ try {
         'metadata' => ['itemDesc' => '2x Latte'],
     ]);
     assert_eq('noffer', $inv['payment_rail'], 'invoice rides the noffer rail');
-    assert_eq('lnbc100n1mockinvoice0000000', $inv['bolt11'], 'mock bolt11 stored on the invoice');
+    assert_eq('lnbc100n1m0ckvnv0ce0000000', $inv['bolt11'], 'mock bolt11 stored on the invoice');
 
     $payload = wait_for_dump($dumpFile);
     assert_not_null($payload, 'relay dumped the decrypted request payload');
@@ -189,7 +189,7 @@ function noffer_description(string $mSk, string $mPk, string $storeId, callable 
     $dump = sys_get_temp_dir() . '/clink_req_dump_' . bin2hex(random_bytes(4)) . '.json';
     [$proc, $pipes, $port] = start_relay([
         'MOCK_CLINK_MERCHANT_SK' => $mSk,
-        'MOCK_CLINK_BOLT11' => 'lnbc100n1mockinvoice0000000',
+        'MOCK_CLINK_BOLT11' => 'lnbc100n1m0ckvnv0ce0000000',
         'MOCK_CLINK_DUMP' => $dump,
     ]);
     try {
