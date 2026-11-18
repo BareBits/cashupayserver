@@ -88,8 +88,10 @@ def test_store_settings_collapsible_and_order(admin_page):
     assert "Auto-Cashout" not in titles
     assert "Cashu automatic cashout" not in titles
     assert "Offline Cashu Acceptance" not in titles
-    # Submarine Swaps directly beneath On-chain Bitcoin payments.
-    assert titles.index("Submarine Swaps (LN→on-chain)") == titles.index("On-chain Bitcoin payments") + 1
+    # eCash (ECX) payments sits between On-chain and Submarine Swaps (the
+    # ECX rail, PR #218); Submarine Swaps directly beneath it.
+    assert titles.index("eCash (ECX) payments") == titles.index("On-chain Bitcoin payments") + 1
+    assert titles.index("Submarine Swaps (LN→on-chain)") == titles.index("eCash (ECX) payments") + 1
 
     # Every section is collapsible. _goto() expanded them all (the view
     # starts with every card collapsed; see test_settings_cards_collapsed_on_view_entry
