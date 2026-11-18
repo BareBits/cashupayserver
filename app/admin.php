@@ -383,8 +383,9 @@ if (isset($_GET['api'])) {
             $autoMelt = [
                 // Ordered list of {address, lud21Support}; priority = array order.
                 'addresses' => $autoMeltAddresses,
-                // Configurable order the four destination types are tried in
-                // (permutation of strike,lnaddress,nwc,noffer; see RailOrder).
+                // Configurable order the Lightning paths are tried in
+                // (permutation of strike,lnaddress,nwc,noffer,swap,cashu; see
+                // RailOrder).
                 'railOrder' => RailOrder::lnOrderFromRow($store),
                 'enabled' => (bool)($store['auto_melt_enabled'] ?? 0),
                 'threshold' => (int)($store['auto_melt_threshold'] ?? 2000),
@@ -2208,6 +2209,30 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         'This mint doesn\'t offer ' . $mintUnit . '. Pick a different mint or unit.'
                     );
                 }
+                // Optional backup mint (same contract as setup's mints screen,
+                // minus the requirement): must differ from the primary and
+                // offer the same unit. Checked BEFORE anything is persisted so
+                // a bad backup leaves the store exactly as it was.
+                $backupUrl = rtrim(trim((string)($_POST['backup_mint_url'] ?? '')), '/');
+                if ($backupUrl !== '') {
+                    $backupUrl = Config::validateMintUrl($backupUrl);
+                    if (strcasecmp($backupUrl, $mintUrl) === 0) {
+                        throw new Exception(
+                            'Your backup mint needs to be different from your main one — that\'s the whole point of a backup.'
+                        );
+                    }
+                    try {
+                        $backupUnits = \Cashu\Wallet::getSupportedUnits($backupUrl);
+                    } catch (Exception $e) {
+                        throw new Exception('Cannot connect to the backup mint: ' . $e->getMessage());
+                    }
+                    if (empty($backupUnits) || !isset($backupUnits[$mintUnit])) {
+                        throw new Exception(
+                            'Your backup mint needs to support ' . $mintUnit
+                            . ', same as your main mint. This one doesn\'t.'
+                        );
+                    }
+                }
                 $seedPhrase = $store['seed_phrase'] ?? null;
                 $generatedSeed = null;
                 if (empty($seedPhrase)) {
@@ -2252,13 +2277,41 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
                 // Mintless setup pinned strict-no-mint-fallback FORCE_ON so a
                 // mint couldn't be acquired later without an explicit decision
-                // — this dialog IS that decision, so clear the pin. The mint
-                // stays the lowest-priority path regardless: invoices only
-                // fall back to it after every Lightning destination (Strike,
-                // LNURL, NWC, noffer) and any swap attempt have failed. The
+                // — this dialog IS that decision, so clear the pin. By default
+                // the mint stays the lowest-priority path: invoices only fall
+                // back to it after every Lightning destination (Strike, LNURL,
+                // NWC, noffer) and any swap attempt have failed — unless the
+                // operator moves it up in the payment path priority. The
                 // operator can re-pin strict mode in the Submarine Swaps card.
                 require_once __DIR__ . '/includes/swap/config.php';
                 SwapsConfig::setStoreStrictOverride($storeId, SwapsConfig::FORCE_OFF);
+
+                // Backup mint: added after the primary (validated above). A
+                // row the trusted-list applier already seeded is reused
+                // rather than tripping the (store_id, mint_url) unique
+                // constraint. Same seed-binding + bounded recovery step as
+                // add_backup_mint.
+                $backupResult = null;
+                if ($backupUrl !== '') {
+                    $backupId = null;
+                    foreach (Config::getStoreBackupMints($storeId) as $existing) {
+                        if (strcasecmp(rtrim((string)$existing['mint_url'], '/'), $backupUrl) === 0) {
+                            $backupId = (int)$existing['id'];
+                            break;
+                        }
+                    }
+                    if ($backupId === null) {
+                        $backupId = Config::addStoreBackupMint($storeId, $backupUrl, $mintUnit, 100);
+                    }
+                    $recovery = cashupay_recover_backup_mint($storeId, $backupUrl, $mintUnit, $backupId);
+                    $backupResult = [
+                        'id' => $backupId,
+                        'mint_url' => $backupUrl,
+                        'walletRecovery' => $recovery['status'],
+                        'enabled' => $recovery['enabled'],
+                        'message' => $recovery['message'],
+                    ];
+                }
 
                 echo json_encode([
                     'success' => true,
@@ -2267,6 +2320,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     // the one-time backup panel.
                     'seedPhrase' => $generatedSeed,
                     'walletRecovery' => $walletRecovery,
+                    // null when no backup mint was given.
+                    'backupMint' => $backupResult,
                 ]);
             } catch (Exception $e) {
                 cashupay_status(400);
@@ -3013,10 +3068,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     throw new Exception('Store ID required');
                 }
 
-                // Configurable order the four destination TYPES are tried in
-                // (see RailOrder). Validated up front (strict permutation of
-                // strike,lnaddress,nwc,noffer) so a bad order fails before any
-                // probe runs; persisted only after the chain saves below.
+                // Configurable order the Lightning paths are tried in (see
+                // RailOrder). Validated up front (strict permutation of
+                // strike,lnaddress,nwc,noffer,swap,cashu — or the legacy
+                // four-type shape) so a bad order fails before any probe
+                // runs; persisted only after the chain saves below.
                 // Absent = legacy caller → stored order left untouched.
                 $railOrder = isset($_POST['rail_order'])
                     ? RailOrder::parseLnOrder((string)$_POST['rail_order'])
@@ -3191,8 +3247,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if ($strikeOnchainParam !== null) {
                     OnchainConfig::setStrikeEnabled($storeId, (int)$strikeOnchainParam);
                 }
+                $strictCleared = false;
                 if ($railOrder !== null) {
                     RailOrder::setLnOrder($storeId, implode(',', $railOrder));
+                    // Strict no-mint-fallback means "when the swap fails,
+                    // never fall back to the mint" — meaningless once the
+                    // operator puts the Cashu mint AHEAD of the swap. Moving
+                    // the mint up is that decision, so the flag is cleared
+                    // here (and reported, so the UI can say so and refresh
+                    // the swaps card). The swaps card refuses to re-pin
+                    // strict while the order stays this way round.
+                    require_once __DIR__ . '/includes/swap/config.php';
+                    if (RailOrder::cashuPrecedesSwap($railOrder)
+                            && SwapsConfig::strictNoMintFallbackForStore($storeId)) {
+                        SwapsConfig::setStoreStrictOverride($storeId, SwapsConfig::FORCE_OFF);
+                        $strictCleared = true;
+                    }
                 }
 
                 echo json_encode([
@@ -3200,9 +3270,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     // Per-address LUD-21 results, in priority order.
                     'addresses' => $addressResults,
                     'strikeOnchainEnabled' => OnchainConfig::strikeEnabledForStore($storeId),
-                    // Effective type order after this save (permutation of
-                    // strike,lnaddress,nwc,noffer).
+                    // Effective path order after this save (permutation of
+                    // strike,lnaddress,nwc,noffer,swap,cashu).
                     'railOrder' => RailOrder::lnOrderForStore($storeId),
+                    // True when this save turned strict no-mint-fallback off
+                    // because the Cashu mint now precedes the swap.
+                    'strictCleared' => $strictCleared,
                 ]);
             } catch (Exception $e) {
                 cashupay_status(400);
@@ -3575,6 +3648,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     if (!in_array($rawStrict, ['0', '1'], true)) {
                         throw new Exception('Invalid mint-fallback mode');
                     }
+                    // Strict ("when the swap fails, never fall back to the
+                    // mint") has no meaning while the Cashu mint is tried
+                    // BEFORE the swap in the Lightning payment path order —
+                    // refuse rather than store a flag that can't apply.
+                    require_once __DIR__ . '/includes/rail_order.php';
+                    if ((int)$rawStrict === SwapsConfig::FORCE_ON
+                            && RailOrder::cashuPrecedesSwap(RailOrder::lnOrderForStore($storeId))) {
+                        throw new Exception(
+                            'Strict mode can\'t be turned on while the Cashu mint is ahead of the '
+                            . 'submarine swap in the payment path priority (Lightning payments card). '
+                            . 'Move the Cashu mint below the swap first.'
+                        );
+                    }
                     SwapsConfig::setStoreStrictOverride($storeId, (int)$rawStrict);
                 }
 
@@ -3892,6 +3978,25 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 }
                 if (empty($mintUrl)) {
                     throw new Exception('Mint URL required');
+                }
+                if (!Config::getStore($storeId)) {
+                    throw new Exception('Store not found');
+                }
+                // A backup that IS the primary, or one already listed, would
+                // either be a no-op (getStoreAllMintUrls drops a backup equal
+                // to the primary) or trip the (store_id, mint_url) unique
+                // constraint with an opaque SQL error — refuse up front.
+                $normalized = rtrim(trim((string)$mintUrl), '/');
+                $primaryNow = rtrim((string)(Config::getStoreMintUrl($storeId) ?? ''), '/');
+                if ($primaryNow !== '' && strcasecmp($normalized, $primaryNow) === 0) {
+                    throw new Exception(
+                        'That is already this store\'s main mint — a backup mint needs to be a different one.'
+                    );
+                }
+                foreach (Config::getStoreBackupMints($storeId) as $existing) {
+                    if (strcasecmp(rtrim((string)$existing['mint_url'], '/'), $normalized) === 0) {
+                        throw new Exception('That mint is already one of this store\'s backup mints.');
+                    }
                 }
 
                 // Test connection first
@@ -6785,10 +6890,16 @@ header('Cache-Control: no-cache, must-revalidate');
                                 <label class="form-label">Payment path priority</label>
                                 <p class="form-help" style="margin-top:0;">
                                     Lightning payment paths are tried in this order when an
-                                    invoice is generated (and when withdrawing) &mdash; you can
-                                    use multiple paths. Use the arrows to reorder. Entries
-                                    inside each path keep their own order from the sections
-                                    below. Saved with the button at the bottom of this card.
+                                    invoice is generated &mdash; you can use multiple paths,
+                                    including the submarine swap and the store&rsquo;s Cashu
+                                    mint. Use the arrows to reorder. Entries inside each path
+                                    keep their own order from the sections below. Withdrawals
+                                    (auto-cashout of the mint balance) follow the same order
+                                    across the Strike / address / NWC / noffer paths only
+                                    &mdash; the mint is never paid out to itself. A greyed
+                                    path isn&rsquo;t active for this store yet; its position
+                                    still saves. Saved with the button at the bottom of this
+                                    card.
                                 </p>
                                 <div id="ln-rail-order-list"></div>
                             </div>
@@ -6973,6 +7084,40 @@ header('Cache-Control: no-cache, must-revalidate');
                             <div id="cashu-cashout-body"<?= $cashuEnvError !== null
                                 ? ' data-env-error="1" style="opacity: 0.5; pointer-events: none;"'
                                 : '' ?>>
+                            <!-- Mints: the store's main mint plus its backup mints
+                                 (the same store_mints rows the store details modal
+                                 manages), so a backup can be added right where the
+                                 mint was enabled. Rendered by renderCashuMintsBlock. -->
+                            <div id="cashu-mints-block" style="margin-bottom:1.25rem; padding-bottom:1rem; border-bottom:1px solid var(--border);">
+                                <label class="form-label">Mints</label>
+                                <p class="form-help" style="margin-top:0;">
+                                    The main mint issues this store&rsquo;s Lightning invoices on the
+                                    Cashu path; backup mints take over when it is unavailable. A
+                                    backup must support the same unit as the main mint.
+                                </p>
+                                <div style="margin-bottom:0.6rem;">
+                                    <span style="color: var(--text-secondary); font-size:0.85rem;">Main mint:</span>
+                                    <code id="cashu-primary-mint" style="font-size:0.8rem; word-break:break-all;"></code>
+                                </div>
+                                <div style="color: var(--text-secondary); font-size:0.85rem; margin-bottom:0.35rem;">Backup mints</div>
+                                <div id="cashu-backup-mints-list"><div class="loading"><div class="spinner"></div></div></div>
+                                <div id="cashu-add-backup-mint-form" style="display:none; margin-top:0.75rem;">
+                                    <div style="display:flex; gap:0.5rem; margin-bottom:0.5rem;">
+                                        <input type="url" id="cashu-backup-mint-url" class="form-input"
+                                               placeholder="https://mint.example.com" style="flex:1; font-size:0.85rem;">
+                                        <button type="button" class="btn btn-secondary" id="btn-cashu-discover-backup-mint"
+                                                style="width:auto; white-space:nowrap; font-size:0.8rem;">Discover</button>
+                                    </div>
+                                    <div style="display:flex; gap:0.5rem;">
+                                        <button type="button" class="btn" id="btn-cashu-add-backup-mint" style="flex:1; font-size:0.8rem;">Add</button>
+                                        <button type="button" class="btn btn-secondary" id="btn-cashu-cancel-backup-mint" style="flex:1; font-size:0.8rem;">Cancel</button>
+                                    </div>
+                                </div>
+                                <button type="button" class="btn btn-secondary btn-full" id="btn-cashu-show-add-backup-mint"
+                                        style="margin-top:0.5rem; font-size:0.85rem;">
+                                    + Add Backup Mint
+                                </button>
+                            </div>
                             <label class="form-label">Cashu automatic cashout</label>
                             <div id="aw-store" data-aw data-aw-scope="store">
                             <p class="aw-title">auto-cashout settings</p>
@@ -8913,13 +9058,27 @@ header('Cache-Control: no-cache, must-revalidate');
                     </div>
                 </div>
                 <div class="form-group">
+                    <label class="form-label">Backup mint URL <span style="opacity:0.7; font-weight:normal;">(optional)</span></label>
+                    <div style="display:flex; gap:0.5rem;">
+                        <input type="url" class="form-input" id="enable-mint-backup-url"
+                               placeholder="https://backup-mint.example.com" style="flex:1;">
+                        <button type="button" class="btn btn-secondary" id="btn-enable-mint-backup-discover"
+                                style="width:auto; white-space:nowrap;">Discover</button>
+                    </div>
+                    <p class="form-help">
+                        Used when the main mint is unavailable. Must be a different mint that
+                        supports the same unit. You can add or change backup mints later in the
+                        Cashu section.
+                    </p>
+                </div>
+                <div class="form-group">
                     <label class="form-label">Currency unit</label>
                     <select class="form-input" id="enable-mint-unit">
                         <option value="sat">Bitcoin (sats)</option>
                         <option value="usd">USD</option>
                         <option value="eur">EUR</option>
                     </select>
-                    <p class="form-help">The mint must support the unit you pick.</p>
+                    <p class="form-help">The mint (and the backup, if given) must support the unit you pick.</p>
                 </div>
                 <div id="enable-mint-error" class="hidden" style="margin-bottom:0.75rem; color: var(--error); font-size: 0.85rem;"></div>
                 <button class="btn btn-full" id="btn-enable-mint-save">Enable mint</button>
@@ -9742,7 +9901,28 @@ header('Cache-Control: no-cache, must-revalidate');
 
             // Enable-a-Cashu-mint flow (greyed-out Cashu section → modal).
             document.getElementById('btn-enable-cashu-mint').addEventListener('click', openEnableMintModal);
+            // Cashu section → Mints block (backup mints for the selected store).
+            document.getElementById('btn-cashu-show-add-backup-mint').addEventListener('click', () => {
+                document.getElementById('cashu-add-backup-mint-form').style.display = 'block';
+                document.getElementById('cashu-backup-mint-url').focus();
+            });
+            document.getElementById('btn-cashu-cancel-backup-mint').addEventListener('click', () => {
+                document.getElementById('cashu-add-backup-mint-form').style.display = 'none';
+                document.getElementById('cashu-backup-mint-url').value = '';
+            });
+            document.getElementById('btn-cashu-discover-backup-mint').addEventListener('click', () => {
+                discoveryContext = 'cashu-backup';
+                discoveryCallback = (url) => {
+                    document.getElementById('cashu-backup-mint-url').value = url;
+                };
+                openMintDiscoveryModal();
+            });
+            document.getElementById('btn-cashu-add-backup-mint').addEventListener('click', () => {
+                if (!currentStoreId) return;
+                addBackupMint(currentStoreId, '', cashuMintsBlockOpts());
+            });
             document.getElementById('btn-enable-mint-discover').addEventListener('click', openEnableMintDiscovery);
+            document.getElementById('btn-enable-mint-backup-discover').addEventListener('click', openEnableMintBackupDiscovery);
             document.getElementById('btn-enable-mint-save').addEventListener('click', submitEnableMint);
             document.getElementById('btn-enable-mint-done').addEventListener('click', () => {
                 closeModal('modal-enable-mint');
@@ -11280,6 +11460,9 @@ header('Cache-Control: no-cache, must-revalidate');
 
                 // Load offline Cashu acceptance settings
                 loadOfflineCashu(currentStoreId);
+
+                // Mints block in the Cashu section (main + backup mints)
+                renderCashuMintsBlock(currentStoreId);
 
             } catch (e) {
                 console.error(e);
@@ -12914,10 +13097,19 @@ header('Cache-Control: no-cache, must-revalidate');
                     showToast('Settings saved!', 'success');
                     // Re-render the priority widget from the server's effective
                     // order so the UI reflects exactly what was persisted.
-                    if (Array.isArray(result.railOrder) && result.railOrder.length === 4) {
+                    if (Array.isArray(result.railOrder) && result.railOrder.length === LN_RAIL_TYPES.length) {
                         lnRailOrder = result.railOrder.slice();
-                        renderLnRailOrder();
                     }
+                    // Moving the Cashu mint ahead of the swap turned strict
+                    // no-mint-fallback off: say so and mirror it onto the
+                    // swaps card so the two never disagree.
+                    if (result.strictCleared === true) {
+                        if (dashboardData && dashboardData.swaps) dashboardData.swaps.strict = false;
+                        const strictSel = document.getElementById('store-swaps-strict');
+                        if (strictSel) strictSel.value = '0';
+                        showToast('Strict no-mint-fallback turned off: the Cashu mint now comes before the swap.', 'success');
+                    }
+                    renderLnRailOrder();
                     // Mirror the saved Strike on-chain flag onto the on-chain
                     // card's toggle (both controls back the same store flag).
                     if (typeof result.strikeOnchainEnabled === 'boolean') {
@@ -13224,7 +13416,7 @@ header('Cache-Control: no-cache, must-revalidate');
                 .map(a => ({ label: a.address, uri: '', ref: a.ref }));
             awStrike = mapped.filter(a => a.type === 'strike')
                 .map(a => ({ label: a.address, key: '', ref: a.ref }));
-            if (am && Array.isArray(am.railOrder) && am.railOrder.length === 4) {
+            if (am && Array.isArray(am.railOrder) && am.railOrder.length === LN_RAIL_TYPES.length) {
                 lnRailOrder = am.railOrder.slice();
             }
             renderLnRailOrder();
@@ -13305,28 +13497,58 @@ header('Cache-Control: no-cache, must-revalidate');
             renderLnAddressRows();
         }
 
-        // ---- Configurable payment path (destination type) priority ----
-        // Permutation of the four types; index 0 is tried first at invoice
-        // time (and when withdrawing). Rides the Lightning payments save;
-        // the server enforces a full permutation.
+        // ---- Configurable payment path priority ----
+        // Permutation of the six Lightning paths: the four destination types
+        // plus the two order-only paths (submarine swap, Cashu mint); index 0
+        // is tried first at invoice time. Withdrawals (auto-cashout) walk
+        // only the destination types in this order — the swap and mint rows
+        // are never payout targets. Rides the Lightning payments save; the
+        // server enforces a full permutation.
         const LN_RAIL_LABELS = {
             strike: 'Strike API',
             lnaddress: 'Lightning address (LNURL)',
             nwc: 'NWC connection',
             noffer: 'CLINK noffer',
+            swap: 'Submarine swap (to on-chain)',
+            cashu: 'Cashu mint',
         };
-        let lnRailOrder = ['strike', 'lnaddress', 'nwc', 'noffer'];
+        const LN_RAIL_TYPES = ['strike', 'lnaddress', 'nwc', 'noffer', 'swap', 'cashu'];
+        let lnRailOrder = LN_RAIL_TYPES.slice();
+
+        // Per-row state notes for the Lightning widget: a path that can't run
+        // for this store is shown greyed (still reorderable — the position is
+        // saved and applies once the path is enabled); a note is shown when a
+        // save will turn strict no-mint-fallback off.
+        function lnRailHints() {
+            const hints = {};
+            const hasMint = !!(dashboardData && dashboardData.storeConfigured);
+            const sw = dashboardData && dashboardData.swaps;
+            const swapsOn = !!(sw && sw.effective);
+            if (!hasMint) hints.cashu = { inactive: true, text: 'no mint enabled' };
+            if (!swapsOn) hints.swap = { inactive: true, text: 'swaps not enabled' };
+            const cashuAt = lnRailOrder.indexOf('cashu');
+            const swapAt = lnRailOrder.indexOf('swap');
+            if (sw && sw.strict && cashuAt !== -1 && swapAt !== -1 && cashuAt < swapAt) {
+                hints.cashu = Object.assign({}, hints.cashu || {}, {
+                    note: 'saving turns off strict no-mint-fallback (Submarine swaps card)',
+                });
+            }
+            return hints;
+        }
 
         // Shared row builder for the small fixed-item priority widgets (the
         // Lightning type order and the on-chain source order). Rows carry
         // data-rail for tests; buttons get stable ids "<idPrefix>-up-<key>" /
         // "<idPrefix>-down-<key>".
-        function renderOrderWidget(listEl, order, labels, idPrefix, onMove) {
+        function renderOrderWidget(listEl, order, labels, idPrefix, onMove, hints) {
             listEl.innerHTML = '';
+            hints = hints || {};
             order.forEach((key, i) => {
+                const hint = hints[key] || null;
                 const row = document.createElement('div');
                 row.className = idPrefix + '-row';
                 row.dataset.rail = key;
+                if (hint && hint.inactive) row.dataset.inactive = '1';
                 row.style.cssText = 'display:flex; align-items:center; gap:0.4rem; margin-bottom:0.4rem;';
                 const prio = document.createElement('span');
                 prio.textContent = (i + 1) + '.';
@@ -13334,7 +13556,14 @@ header('Cache-Control: no-cache, must-revalidate');
                 row.appendChild(prio);
                 const label = document.createElement('span');
                 label.textContent = labels[key] || key;
-                label.style.cssText = 'flex:1; font-size:0.9rem;';
+                label.style.cssText = 'flex:1; font-size:0.9rem;' + (hint && hint.inactive ? ' opacity:0.5;' : '');
+                if (hint && (hint.text || hint.note)) {
+                    const note = document.createElement('span');
+                    note.className = idPrefix + '-hint';
+                    note.textContent = ' (' + [hint.text, hint.note].filter(Boolean).join('; ') + ')';
+                    note.style.cssText = 'font-size:0.8rem; opacity:0.7;';
+                    label.appendChild(note);
+                }
                 row.appendChild(label);
                 const mkBtn = (text, title, id, handler, disabled) => {
                     const b = document.createElement('button');
@@ -13359,7 +13588,7 @@ header('Cache-Control: no-cache, must-revalidate');
         function renderLnRailOrder() {
             const list = document.getElementById('ln-rail-order-list');
             if (!list) return;
-            renderOrderWidget(list, lnRailOrder, LN_RAIL_LABELS, 'ln-rail-order', moveLnRailOrder);
+            renderOrderWidget(list, lnRailOrder, LN_RAIL_LABELS, 'ln-rail-order', moveLnRailOrder, lnRailHints());
         }
 
         function moveLnRailOrder(index, delta) {
@@ -14454,6 +14683,7 @@ header('Cache-Control: no-cache, must-revalidate');
                     // Re-fetch dashboard data to refresh "effective" indicator.
                     await loadDashboard();
                     refreshStoreSwapsCard();
+                    renderLnRailOrder();
                 } else {
                     awError('store-swaps-error', result.error || 'Failed to save');
                 }
@@ -14777,6 +15007,7 @@ header('Cache-Control: no-cache, must-revalidate');
         function openEnableMintModal() {
             if (!currentStoreId) return;
             document.getElementById('enable-mint-url').value = '';
+            document.getElementById('enable-mint-backup-url').value = '';
             document.getElementById('enable-mint-unit').value = 'sat';
             const err = document.getElementById('enable-mint-error');
             err.classList.add('hidden');
@@ -14794,12 +15025,26 @@ header('Cache-Control: no-cache, must-revalidate');
             openMintDiscoveryModal();
         }
 
+        function openEnableMintBackupDiscovery() {
+            discoveryContext = 'enable-mint-backup';
+            discoveryCallback = (url) => {
+                document.getElementById('enable-mint-backup-url').value = url;
+            };
+            openMintDiscoveryModal();
+        }
+
         async function submitEnableMint() {
             const errEl = document.getElementById('enable-mint-error');
             errEl.classList.add('hidden');
             const mintUrl = document.getElementById('enable-mint-url').value.trim();
             if (!mintUrl) {
                 errEl.textContent = 'Please enter a mint URL.';
+                errEl.classList.remove('hidden');
+                return;
+            }
+            const backupUrl = document.getElementById('enable-mint-backup-url').value.trim();
+            if (backupUrl && normalizeMintUrl(backupUrl).toLowerCase() === normalizeMintUrl(mintUrl).toLowerCase()) {
+                errEl.textContent = 'Your backup mint needs to be different from your main one.';
                 errEl.classList.remove('hidden');
                 return;
             }
@@ -14813,9 +15058,16 @@ header('Cache-Control: no-cache, must-revalidate');
                     mint_url: mintUrl,
                     mint_unit: document.getElementById('enable-mint-unit').value,
                 });
+                if (backupUrl) params.set('backup_mint_url', backupUrl);
                 const response = await postWithCsrf(adminUrl, params.toString());
                 const result = await response.json();
                 if (!response.ok) throw new Error(result.error || 'Failed to enable mint');
+                // A backup whose recovery step didn't finish (or failed) is
+                // reported, never silent — the mint stays listed either way.
+                if (result.backupMint && result.backupMint.message) {
+                    showToast(result.backupMint.message,
+                        result.backupMint.walletRecovery === 'error' ? 'error' : 'success');
+                }
                 if (result.seedPhrase) {
                     // Fresh wallet seed — show it once for backup before closing.
                     document.getElementById('enable-mint-form').style.display = 'none';
@@ -14842,9 +15094,16 @@ header('Cache-Control: no-cache, must-revalidate');
         // without a manual reload.
         async function refreshAfterMintEnable() {
             await loadDashboard();
-            if (document.getElementById('view-store-settings').classList.contains('active')) {
+            // The store settings live in the "stores" view (there is no
+            // view-store-settings element — the old id lookup threw here and
+            // silently skipped the reload, so the Mints block never caught
+            // up with the mint just enabled).
+            const storesView = document.getElementById('view-stores');
+            if (storesView && storesView.classList.contains('active')) {
                 loadStoreSettings();
             }
+            // The widget's "no mint enabled" hint keys off the dashboard.
+            renderLnRailOrder();
         }
 
         let mintDisclaimerAcknowledged = false;
@@ -15360,7 +15619,29 @@ header('Cache-Control: no-cache, must-revalidate');
             el.style.display = 'block';
         }
 
-        async function retryBackupMintRecovery(mintId, storeId, storeName) {
+        // The backup-mint actions are shared by the store details modal
+        // (default: input #backup-mint-url, refresh = re-render the modal)
+        // and the Cashu section's Mints block in store settings (opts from
+        // cashuMintsBlockOpts()).
+        function detailsModalOpts(storeId, storeName) {
+            return { inputId: 'backup-mint-url', refresh: () => showStoreDetails(storeId, storeName) };
+        }
+
+        function cashuMintsBlockOpts() {
+            return {
+                inputId: 'cashu-backup-mint-url',
+                refresh: () => {
+                    const form = document.getElementById('cashu-add-backup-mint-form');
+                    if (form) form.style.display = 'none';
+                    const input = document.getElementById('cashu-backup-mint-url');
+                    if (input) input.value = '';
+                    renderCashuMintsBlock(currentStoreId);
+                },
+            };
+        }
+
+        async function retryBackupMintRecovery(mintId, storeId, storeName, opts) {
+            opts = opts || detailsModalOpts(storeId, storeName);
             try {
                 const response = await postWithCsrf(adminUrl, `action=update_backup_mint&id=${mintId}&enabled=1`);
                 const result = await response.json().catch(() => ({}));
@@ -15369,14 +15650,15 @@ header('Cache-Control: no-cache, must-revalidate');
                     return;
                 }
                 showToast(result.message || (result.walletRecovery === 'ready' ? 'Backup mint ready' : 'Recovery resumed'), 'success');
-                showStoreDetails(storeId, storeName);
+                opts.refresh();
             } catch (e) {
                 showToast('Recovery failed again', 'error');
             }
         }
 
-        async function addBackupMint(storeId, storeName) {
-            const mintUrl = document.getElementById('backup-mint-url').value.trim();
+        async function addBackupMint(storeId, storeName, opts) {
+            opts = opts || detailsModalOpts(storeId, storeName);
+            const mintUrl = document.getElementById(opts.inputId).value.trim();
             if (!mintUrl) {
                 showToast('Please enter a mint URL', 'error');
                 return;
@@ -15401,7 +15683,7 @@ header('Cache-Control: no-cache, must-revalidate');
                     } else {
                         showToast('Backup mint added!', 'success');
                     }
-                    showStoreDetails(storeId, storeName);
+                    opts.refresh();
                 } else {
                     showToast(result.error || 'Failed to add backup mint', 'error');
                 }
@@ -15410,7 +15692,8 @@ header('Cache-Control: no-cache, must-revalidate');
             }
         }
 
-        async function removeBackupMint(mintId, storeId, storeName) {
+        async function removeBackupMint(mintId, storeId, storeName, opts) {
+            opts = opts || detailsModalOpts(storeId, storeName);
             if (!confirm('Remove this backup mint?')) return;
 
             try {
@@ -15423,10 +15706,79 @@ header('Cache-Control: no-cache, must-revalidate');
                     return;
                 }
                 showToast('Backup mint removed', 'success');
-                showStoreDetails(storeId, storeName);
+                opts.refresh();
             } catch (e) {
                 showToast('Failed to remove backup mint', 'error');
             }
+        }
+
+        // Cashu section → Mints block: the selected store's main mint and its
+        // backup mints (same rows and actions as the store details modal).
+        async function renderCashuMintsBlock(storeId) {
+            const list = document.getElementById('cashu-backup-mints-list');
+            const primaryEl = document.getElementById('cashu-primary-mint');
+            if (!list || !primaryEl || !storeId) return;
+            const store = dashboardData?.stores?.find(s => s.id === storeId);
+            primaryEl.textContent = store?.mint_url || 'Not configured';
+            let backups = [];
+            try {
+                const r = await fetch(`${adminUrl}?api=get_backup_mints&store_id=${encodeURIComponent(storeId)}`, { credentials: 'same-origin' });
+                const data = await r.json();
+                backups = Array.isArray(data) ? data : [];
+            } catch (e) {
+                list.innerHTML = '<p style="color: var(--error); font-size: 0.85rem;">Could not load backup mints.</p>';
+                return;
+            }
+            // A later store switch must not paint this store's rows.
+            if (storeId !== currentStoreId) return;
+            list.innerHTML = '';
+            if (backups.length === 0) {
+                list.innerHTML = '<p class="cashu-backup-mint-empty" style="color: var(--text-secondary); font-size: 0.85rem; margin:0;">No backup mints configured</p>';
+                return;
+            }
+            backups.forEach(m => {
+                const row = document.createElement('div');
+                row.className = 'cashu-backup-mint-row';
+                row.dataset.mintUrl = m.mint_url;
+                row.dataset.mintId = String(m.id);
+                row.style.cssText = 'display:flex; justify-content:space-between; align-items:center; padding:0.5rem; background:rgba(0,0,0,0.2); border-radius:4px; margin-bottom:0.5rem;';
+                const info = document.createElement('div');
+                info.style.cssText = 'flex:1; overflow:hidden;';
+                const unitTxt = String(m.unit || 'sat').toUpperCase();
+                let infoHtml = `<code style="font-size: 0.75rem; word-break: break-all;">${escapeHtml(m.mint_url)}</code>`
+                    + `${mintDiagnosticIcon(m.mint_url)}`
+                    + `<span style="opacity: 0.6; font-size: 0.75rem; margin-left: 0.5rem;">(${escapeHtml(unitTxt)})</span>`;
+                if (!Number(m.enabled)) {
+                    infoHtml += '<span style="opacity: 0.6; font-size: 0.75rem; margin-left: 0.5rem;">disabled</span>';
+                }
+                if (m.balance > 0 || m.exported > 0) {
+                    infoHtml += `<span style="display:block; font-size: 0.72rem; color: var(--warning, #f59e0b); margin-top: 0.2rem;">holds ${escapeHtml(formatAmount(m.balance || 0, m.unit))} ${escapeHtml(unitTxt)}${m.exported > 0 ? ` + ${escapeHtml(formatAmount(m.exported, m.unit))} exported` : ''}</span>`;
+                }
+                if (m.recovery === 'pending') {
+                    infoHtml += '<span class="backup-mint-recovery" style="display:block; font-size: 0.72rem; color: var(--text-secondary); margin-top: 0.2rem;">Preparing payments with this mint (checking the recovery phrase for existing ecash)</span>';
+                } else if (m.recovery === 'error') {
+                    infoHtml += `<span class="backup-mint-recovery" style="display:block; font-size: 0.72rem; color: var(--danger, #ef4444); margin-top: 0.2rem;">Recovery failed${m.recovery_error ? ': ' + escapeHtml(m.recovery_error) : ''}${Number(m.enabled) ? '' : ' (disabled until it succeeds)'}</span>`;
+                }
+                info.innerHTML = infoHtml;
+                row.appendChild(info);
+                if (m.recovery === 'error') {
+                    const retry = document.createElement('button');
+                    retry.type = 'button';
+                    retry.className = 'btn btn-secondary cashu-backup-mint-retry';
+                    retry.textContent = 'Retry recovery';
+                    retry.style.cssText = 'padding: 0.2rem 0.4rem; font-size: 0.7rem; margin-left: 0.5rem; white-space: nowrap;';
+                    retry.addEventListener('click', () => retryBackupMintRecovery(Number(m.id), storeId, '', cashuMintsBlockOpts()));
+                    row.appendChild(retry);
+                }
+                const remove = document.createElement('button');
+                remove.type = 'button';
+                remove.className = 'btn btn-danger cashu-backup-mint-remove';
+                remove.textContent = 'Remove';
+                remove.style.cssText = 'padding: 0.2rem 0.4rem; font-size: 0.7rem; margin-left: 0.5rem;';
+                remove.addEventListener('click', () => removeBackupMint(Number(m.id), storeId, '', cashuMintsBlockOpts()));
+                row.appendChild(remove);
+                list.appendChild(row);
+            });
         }
 
         // -------- Offline Cashu acceptance UI --------

@@ -9,9 +9,13 @@
     the statement "A Cashu Mint is not enabled, enable a cashu mint to
     access these settings." with an "Enable a Cashu mint" button.
   - That button opens the enable-mint dialog (modal-enable-mint): mint URL +
-    unit, backed by admin action=enable_store_mint, which tests the mint,
-    generates + shows the wallet seed once, clears the mintless-setup
-    strict-no-mint-fallback pin, and un-greys the section.
+    optional backup mint URL + unit, backed by admin action=enable_store_mint,
+    which tests the mint(s), generates + shows the wallet seed once, clears
+    the mintless-setup strict-no-mint-fallback pin, stores the backup as a
+    store_mints row, and un-greys the section.
+  - The Cashu section opens with a "Mints" block: the main mint plus the
+    backup mints (list / add with Discover / remove), the same rows the store
+    details modal manages.
   - The Cashu section's default expansion rule: open only when the store has
     a mint AND cashout is configured (enabled, or explicitly set on-chain).
 """
@@ -82,13 +86,27 @@ class _StubMintHandler(BaseHTTPRequestHandler):
         pass
 
 
-@pytest.fixture()
-def stub_mint() -> Iterator[str]:
+def _start_stub_mint() -> tuple[ThreadingHTTPServer, threading.Thread, str]:
     port = ports.allocate(1)[0]
     server = ThreadingHTTPServer(("127.0.0.1", port), _StubMintHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    yield f"http://127.0.0.1:{port}"
+    return server, thread, f"http://127.0.0.1:{port}"
+
+
+@pytest.fixture()
+def stub_mint() -> Iterator[str]:
+    server, thread, url = _start_stub_mint()
+    yield url
+    server.shutdown()
+    thread.join(timeout=5)
+
+
+@pytest.fixture()
+def stub_backup_mint() -> Iterator[str]:
+    """A second, distinct stub — the backup must differ from the main mint."""
+    server, thread, url = _start_stub_mint()
+    yield url
     server.shutdown()
     thread.join(timeout=5)
 
@@ -126,6 +144,16 @@ def _store_row(handle: PayserverHandle) -> sqlite3.Row:
             "SELECT id, mint_url, mint_unit, seed_phrase, strict_no_mint_fallback"
             " FROM stores LIMIT 1"
         ).fetchone()
+
+
+def _backup_mint_rows(handle: PayserverHandle) -> list[dict]:
+    with sqlite3.connect(str(handle.data_dir / "cashupay.sqlite")) as conn:
+        conn.row_factory = sqlite3.Row
+        return [
+            dict(r) for r in conn.execute(
+                "SELECT mint_url, unit, enabled FROM store_mints ORDER BY priority, id"
+            ).fetchall()
+        ]
 
 
 # ----------------------------------------------------------- raw-HTML contract
@@ -179,6 +207,16 @@ def test_sections_markup_order_and_default_collapsed(mintless_payserver) -> None
     assert 'id="btn-enable-cashu-mint"' in page
     assert 'id="modal-enable-mint"' in page
     assert 'id="enable-mint-url"' in page
+    # The dialog offers an (optional) backup mint with its own Discover.
+    assert 'id="enable-mint-backup-url"' in page
+    assert 'id="btn-enable-mint-backup-discover"' in page
+    assert page.index('id="enable-mint-url"') < page.index('id="enable-mint-backup-url"')
+    # The Cashu section opens with the Mints block (main + backup mints),
+    # inside the greyed body and before the cashout settings.
+    mints_block = page.index('id="cashu-mints-block"')
+    assert body < mints_block < page.index('id="aw-store"')
+    assert 'id="cashu-backup-mints-list"' in page
+    assert 'id="btn-cashu-show-add-backup-mint"' in page
 
 
 # ------------------------------------------------------------- browser (JS)
@@ -320,6 +358,79 @@ def test_cashu_greyed_without_mint_and_enable_flow(admin_page, mintless_payserve
     assert saved["ok"], saved
     _goto_stores(page, base)
     assert _collapsed_map(page)["ln-section-cashu"] is False
+
+
+def test_enable_mint_with_backup_and_cashu_mints_block(
+    admin_page, mintless_payserver, stub_mint, stub_backup_mint
+) -> None:
+    """Enabling a mint with a backup picked in the same dialog stores the
+    backup; the Cashu section's Mints block lists it, removes it, and adds
+    one back — without leaving store settings."""
+    page, base = admin_page
+    _goto_stores(page, base)
+    page.click("#ln-section-cashu .subsection-toggle")
+    page.click("#btn-enable-cashu-mint")
+    page.wait_for_selector("#modal-enable-mint.visible")
+
+    # Same URL for both → refused client-side, nothing posted.
+    page.fill("#enable-mint-url", stub_mint)
+    page.fill("#enable-mint-backup-url", stub_mint + "/")
+    page.click("#btn-enable-mint-save")
+    page.wait_for_selector("#enable-mint-error:not(.hidden)", timeout=5000)
+    assert "different" in page.inner_text("#enable-mint-error")
+    assert _store_row(mintless_payserver)["mint_url"] is None
+
+    # A distinct backup: accepted; the seed panel shows as before.
+    page.fill("#enable-mint-backup-url", stub_backup_mint)
+    page.click("#btn-enable-mint-save")
+    page.wait_for_selector("#enable-mint-seed", state="visible", timeout=20000)
+    page.click("#btn-enable-mint-done")
+    page.wait_for_selector("#modal-enable-mint.visible", state="detached", timeout=5000)
+
+    row = _store_row(mintless_payserver)
+    assert row["mint_url"] == stub_mint
+    backups = _backup_mint_rows(mintless_payserver)
+    assert [b["mint_url"] for b in backups] == [stub_backup_mint], backups
+    assert backups[0]["unit"] == "sat"
+
+    # The Mints block (inside the now un-greyed body) shows both.
+    page.wait_for_function(
+        "getComputedStyle(document.getElementById('cashu-cashout-body')).pointerEvents !== 'none'",
+        timeout=15000,
+    )
+    page.wait_for_selector("#cashu-backup-mints-list .cashu-backup-mint-row", timeout=15000)
+    assert page.inner_text("#cashu-primary-mint") == stub_mint
+    rows = page.eval_on_selector_all(
+        "#cashu-backup-mints-list .cashu-backup-mint-row", "els => els.map(e => e.dataset.mintUrl)"
+    )
+    assert rows == [stub_backup_mint], rows
+
+    # Remove it from the block (the confirm() dialog is accepted).
+    page.once("dialog", lambda d: d.accept())
+    page.click("#cashu-backup-mints-list .cashu-backup-mint-remove")
+    page.wait_for_selector("#cashu-backup-mints-list .cashu-backup-mint-empty", timeout=15000)
+    assert _backup_mint_rows(mintless_payserver) == []
+
+    # Add one back through the block's own form.
+    page.click("#btn-cashu-show-add-backup-mint")
+    page.wait_for_selector("#cashu-add-backup-mint-form", state="visible")
+    page.fill("#cashu-backup-mint-url", stub_backup_mint)
+    page.click("#btn-cashu-add-backup-mint")
+    page.wait_for_selector("#cashu-backup-mints-list .cashu-backup-mint-row", timeout=20000)
+    assert [b["mint_url"] for b in _backup_mint_rows(mintless_payserver)] == [stub_backup_mint]
+    # The form folds away again after a successful add.
+    assert page.evaluate(
+        "document.getElementById('cashu-add-backup-mint-form').style.display"
+    ) == "none"
+
+    # The main mint can't be added as its own backup; duplicates are refused.
+    page.click("#btn-cashu-show-add-backup-mint")
+    page.fill("#cashu-backup-mint-url", stub_mint)
+    page.click("#btn-cashu-add-backup-mint")
+    page.wait_for_function(
+        "document.getElementById('toast').textContent.includes('main mint')", timeout=15000
+    )
+    assert len(_backup_mint_rows(mintless_payserver)) == 1
 
 
 def test_enable_mint_dialog_rejects_unreachable_mint(admin_page) -> None:

@@ -8,6 +8,10 @@ decides which one serves the invoice:
 
     save_lightning_payments with rail_order=lnaddress,... -> the next
       invoice's payment_rail flips from 'strike' to 'lnaddress'
+    save_lightning_payments with rail_order=cashu,... -> the next invoice is
+      served by the store's Cashu mint ('mint'); Strike is not contacted
+    moving the Cashu mint ahead of the swap clears strict no-mint-fallback
+      (strictCleared), and the swaps card refuses to re-pin it
     save_onchain_source_order with source_order=local,strike -> the next
       invoice's on-chain address flips from a Strike receive request to the
       store's own static address
@@ -43,7 +47,7 @@ from fixtures.browser import expand_settings_cards
 
 LNURL_ADDRESS = "merchant@example.test"
 STATIC_ADDR = "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2"
-DEFAULT_LN_ORDER = ["strike", "lnaddress", "nwc", "noffer"]
+DEFAULT_LN_ORDER = ["strike", "lnaddress", "nwc", "noffer", "swap", "cashu"]
 
 
 @pytest.fixture(scope="module")
@@ -96,6 +100,19 @@ def _save_lightning(
         data.append(("rail_order", rail_order))
     return admin.s.post(
         admin._admin_url, data=data,
+        headers={"X-CSRF-Token": admin.csrf_token}, timeout=60,
+    )
+
+
+def _save_swaps_strict(admin: AdminClient, store_id: str, strict: str) -> requests.Response:
+    return admin.s.post(
+        admin._admin_url,
+        data=[
+            ("action", "save_store_swaps"),
+            ("store_id", store_id),
+            ("enabled", "0"),
+            ("strict_no_mint_fallback", strict),
+        ],
         headers={"X-CSRF-Token": admin.csrf_token}, timeout=60,
     )
 
@@ -166,16 +183,17 @@ def test_checkout_honors_lightning_rail_order(
     # the UI contract (kept entries skip the save-time probe).
     r = _save_lightning(
         admin, store_id, strike_key=TEST_STRIKE_KEY, ln_address=LNURL_ADDRESS,
-        rail_order="lnaddress,nwc,noffer,strike",
+        rail_order="lnaddress,nwc,noffer,strike,swap,cashu",
     )
     assert r.status_code == 200, r.text
     body = r.json()
-    assert body.get("railOrder") == ["lnaddress", "nwc", "noffer", "strike"], body
-    assert _store_col(cfg, "ln_rail_order") == "lnaddress,nwc,noffer,strike"
+    assert body.get("railOrder") == ["lnaddress", "nwc", "noffer", "strike", "swap", "cashu"], body
+    assert body.get("strictCleared") is False, body
+    assert _store_col(cfg, "ln_rail_order") == "lnaddress,nwc,noffer,strike,swap,cashu"
 
     # The dashboard payload feeds the widget the effective order.
     dash = _dashboard(admin, store_id)
-    assert dash["autoMelt"]["railOrder"] == ["lnaddress", "nwc", "noffer", "strike"], (
+    assert dash["autoMelt"]["railOrder"] == ["lnaddress", "nwc", "noffer", "strike", "swap", "cashu"], (
         dash["autoMelt"]
     )
 
@@ -194,20 +212,103 @@ def test_checkout_honors_lightning_rail_order(
     # Back to strike-first: the rail flips back.
     r = _save_lightning(
         admin, store_id, strike_key=TEST_STRIKE_KEY, ln_address=LNURL_ADDRESS,
-        rail_order="strike,lnaddress,nwc,noffer",
+        rail_order="strike,lnaddress,nwc,noffer,swap,cashu",
     )
     assert r.status_code == 200, r.text
     inv3 = cfg.greenfield.create_invoice(store_id, amount="1000", currency="sat")
     assert _invoice_row(cfg, inv3["id"])["payment_rail"] == "strike"
 
+    # Cashu mint first: the store's mint (the wizard-configured one) issues
+    # the invoice; neither Strike nor the LNURL host is asked.
+    creates_before = set(strike_api_shared.invoices)
+    r = _save_lightning(
+        admin, store_id, strike_key=TEST_STRIKE_KEY, ln_address=LNURL_ADDRESS,
+        rail_order="cashu,strike,lnaddress,nwc,noffer,swap",
+    )
+    assert r.status_code == 200, r.text
+    inv4 = cfg.greenfield.create_invoice(store_id, amount="1000", currency="sat")
+    row4 = _invoice_row(cfg, inv4["id"])
+    assert row4["payment_rail"] == "mint", row4["payment_rail"]
+    assert row4["mint_url"], row4
+    assert row4["quote_id"], row4
+    assert row4["strike_invoice_id"] is None, row4
+    assert row4["receive_errors"] is None, row4["receive_errors"]
+    assert set(strike_api_shared.invoices) == creates_before, (
+        "Strike must not be asked when the mint leads and works"
+    )
+    # The destination chain the auto-cashout walks never contains the mint.
+    with cfg.handle.db() as db:
+        types = [
+            r[0] for r in db.execute(
+                "SELECT type FROM store_ln_addresses WHERE store_id = ?", (store_id,)
+            ).fetchall()
+        ]
+    assert set(types) <= {"strike", "lnaddress", "nwc", "noffer"}, types
+
+    # An older client posting just the four destination types is still
+    # accepted: swap and mint are appended last (the historical walk).
+    r = _save_lightning(
+        admin, store_id, strike_key=TEST_STRIKE_KEY, ln_address=LNURL_ADDRESS,
+        rail_order="strike,lnaddress,nwc,noffer",
+    )
+    assert r.status_code == 200, r.text
+    assert r.json().get("railOrder") == DEFAULT_LN_ORDER, r.text
+    assert _store_col(cfg, "ln_rail_order") == "strike,lnaddress,nwc,noffer,swap,cashu"
+
     # Invalid orders are refused wholesale and leave the stored order alone.
-    for bad in ("strike,lnaddress,nwc", "strike,strike,nwc,noffer", "bogus"):
+    for bad in (
+        "strike,lnaddress,nwc",
+        "strike,strike,nwc,noffer,swap,cashu",
+        "strike,lnaddress,nwc,noffer,swap",
+        "bogus",
+    ):
         r = _save_lightning(
             admin, store_id, strike_key=TEST_STRIKE_KEY, ln_address=LNURL_ADDRESS,
             rail_order=bad,
         )
         assert r.status_code == 400, (bad, r.text)
-    assert _store_col(cfg, "ln_rail_order") == "strike,lnaddress,nwc,noffer"
+    assert _store_col(cfg, "ln_rail_order") == "strike,lnaddress,nwc,noffer,swap,cashu"
+
+
+def test_cashu_ahead_of_swap_clears_strict_mode(cfg: ConfiguredPayserver) -> None:
+    """Strict no-mint-fallback ("when the swap fails, never fall back to the
+    mint") is meaningless once the mint is tried BEFORE the swap: saving such
+    an order turns it off and says so; the swaps card refuses to turn it back
+    on until the swap precedes the mint again."""
+    admin = cfg.admin
+    store_id = cfg.store_id
+    with cfg.handle.db() as db:
+        db.execute("UPDATE stores SET strict_no_mint_fallback = 1 WHERE id = ?", (store_id,))
+    assert _store_col(cfg, "strict_no_mint_fallback") == 1
+
+    # Mint behind the swap: strict stays.
+    r = _save_lightning(admin, store_id, rail_order="noffer,nwc,lnaddress,strike,swap,cashu")
+    assert r.status_code == 200, r.text
+    assert r.json().get("strictCleared") is False, r.text
+    assert _store_col(cfg, "strict_no_mint_fallback") == 1
+
+    # Mint ahead of the swap: strict cleared and reported.
+    r = _save_lightning(admin, store_id, rail_order="strike,cashu,lnaddress,nwc,noffer,swap")
+    assert r.status_code == 200, r.text
+    assert r.json().get("strictCleared") is True, r.text
+    assert _store_col(cfg, "strict_no_mint_fallback") == 0
+    assert _dashboard(admin, store_id)["swaps"]["strict"] is False
+
+    # The swaps card can't re-pin strict while the order stays this way.
+    r = _save_swaps_strict(admin, store_id, "1")
+    assert r.status_code == 400, r.text
+    assert "ahead of the submarine swap" in r.json()["error"], r.text
+    assert _store_col(cfg, "strict_no_mint_fallback") == 0
+    # Strict OFF is always fine.
+    assert _save_swaps_strict(admin, store_id, "0").status_code == 200
+
+    # Swap back ahead of the mint: strict can be pinned again.
+    r = _save_lightning(admin, store_id, rail_order=",".join(DEFAULT_LN_ORDER))
+    assert r.status_code == 200, r.text
+    r = _save_swaps_strict(admin, store_id, "1")
+    assert r.status_code == 200, r.text
+    assert _store_col(cfg, "strict_no_mint_fallback") == 1
+    _save_swaps_strict(admin, store_id, "0")
 
 
 def test_checkout_honors_onchain_source_order(
@@ -330,12 +431,23 @@ def test_lightning_priority_widget_reorders_and_persists(
 
     # Top row's up-arrow is disabled; bottom row's down-arrow is disabled.
     assert page.get_attribute("#ln-rail-order-up-strike", "disabled") is not None
-    assert page.get_attribute("#ln-rail-order-down-noffer", "disabled") is not None
+    assert page.get_attribute("#ln-rail-order-down-cashu", "disabled") is not None
+
+    # The Cashu mint row is active (this store has a mint); the swap row is
+    # greyed because swaps are off for the store — still reorderable.
+    inactive = page.eval_on_selector_all(
+        "#ln-rail-order-list [data-rail]",
+        "els => Object.fromEntries(els.map(e => [e.dataset.rail, e.dataset.inactive === '1']))",
+    )
+    assert inactive["cashu"] is False, inactive
+    assert inactive["swap"] is True, inactive
+    assert "swaps not enabled" in page.inner_text("#ln-rail-order-list [data-rail='swap']")
+    assert page.get_attribute("#ln-rail-order-up-swap", "disabled") is None
 
     # Move strike below lnaddress, then save the card.
     page.click("#ln-rail-order-down-strike")
     assert _widget_order(page, "ln-rail-order-list") == [
-        "lnaddress", "strike", "nwc", "noffer",
+        "lnaddress", "strike", "nwc", "noffer", "swap", "cashu",
     ]
     page.click("#btn-save-lightning-payments")
     page.wait_for_timeout(1500)
@@ -343,13 +455,21 @@ def test_lightning_priority_widget_reorders_and_persists(
     toast_class = page.get_attribute("#toast", "class") or ""
     assert toast_text == "Settings saved!", toast_text
     assert "error" not in toast_class.split(), toast_class
-    assert _store_col(cfg, "ln_rail_order") == "lnaddress,strike,nwc,noffer"
+    assert _store_col(cfg, "ln_rail_order") == "lnaddress,strike,nwc,noffer,swap,cashu"
 
     # A reload renders the persisted order back into the widget.
     _goto_stores(page, base)
     assert _widget_order(page, "ln-rail-order-list") == [
-        "lnaddress", "strike", "nwc", "noffer",
+        "lnaddress", "strike", "nwc", "noffer", "swap", "cashu",
     ]
+
+    # The mint row moves like any other: all the way to the top and saved.
+    for _ in range(5):
+        page.click("#ln-rail-order-up-cashu")
+    assert _widget_order(page, "ln-rail-order-list")[0] == "cashu"
+    page.click("#btn-save-lightning-payments")
+    page.wait_for_timeout(1500)
+    assert _store_col(cfg, "ln_rail_order") == "cashu,lnaddress,strike,nwc,noffer,swap"
 
 
 @pytest.mark.ui

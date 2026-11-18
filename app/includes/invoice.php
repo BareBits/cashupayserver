@@ -453,45 +453,90 @@ class Invoice {
         $feeLightning   = $feeRoute['lightning'] ?? null; // ['bolt11','verify_url','destination']
         $feeOnchain     = $feeRoute['onchain'] ?? null;   // ['address','index','tip_height','destination']
 
-        // ---- LNURL direct-receive path: route LN payment straight to the
-        // merchant's auto-cashout LN address when the host supports LUD-21
-        // (verify URL) so we can detect settlement without running the LN
-        // node ourselves. Wins over swap and mint when eligible. ----
-        $lnurlAttempt = null;          // ['bolt11','verify_url','amount_sats'] on success
-        $nofferAttempt = null;         // CLINK noffer receive context on success
-        $nwcAttempt = null;            // NWC (NIP-47) receive context on success
-        $strikeAttempt = null;         // Strike API receive context on success
-        // Sanitized [{type, reason}] records of destinations that failed while
-        // walking the chain, persisted as invoices.receive_errors and shown to
-        // the payer on the payment page. Reasons are fixed server-side phrases
-        // — never wallet/host-provided text, URIs, or addresses (the page is
-        // public and NWC URIs embed the wallet secret).
-        $receiveErrors = [];
-        // Ordered fallback chain ($destinations, loaded with the rails gate
-        // above): try each destination (Lightning address via LNURL, NWC, or
-        // CLINK noffer via Nostr) in priority order until one yields a usable
-        // invoice. Walked regardless of the auto-cashout (threshold-melt)
-        // toggle — configuring a destination is enough to direct-receive to it;
-        // the toggle only governs the cron threshold-melt of mint balance. The
-        // single auto_melt_address column was replaced by store_ln_addresses.
-        // Skip the merchant lightning rail entirely when a fee owns it — the
-        // single lightning option on this invoice is the fee LNURL's bolt11.
+        // ---- Lightning paths, walked in the store's configured order ----
+        // RailOrder::lnOrderFromRow; default: the Strike / LNURL / NWC /
+        // noffer destinations, then a submarine swap, then the Cashu mint as
+        // the final fallback — the historical behavior. Each step is tried
+        // only while no earlier one produced a bolt11. Direct-receive
+        // destinations are grouped by type at their type's slot
+        // (listForStore already type-sorts the chain when an explicit order
+        // is stored; with the historical NULL order the stored per-row chain
+        // is walked verbatim as one group — see lightningWalkSteps). The
+        // 'swap' and 'cashu' slots are order-only: they are never
+        // store_ln_addresses rows, so the auto-cashout melt chain (which
+        // walks those rows) can't pay the mint balance "to the mint".
         //
-        // Fee collection never reroutes this chain: owed fees are either taken
+        // Direct receive routes the LN payment straight to the merchant's
+        // wallet (LNURL host with LUD-21 verify, NWC, CLINK noffer, Strike)
+        // so settlement is detected without running an LN node. Walked
+        // regardless of the auto-cashout (threshold-melt) toggle —
+        // configuring a destination is enough to direct-receive to it; the
+        // toggle only governs the cron threshold-melt of mint balance. The
+        // single auto_melt_address column was replaced by store_ln_addresses.
+        // Skipped entirely when a fee owns the lightning rail — the single
+        // lightning option on this invoice is the fee LNURL's bolt11.
+        //
+        // Fee collection never reroutes this walk: owed fees are either taken
         // by the fee-redirect path above (a fee large enough to cover the whole
         // invoice claims the rail outright) or melted from mint balance by the
         // cron's DevFee::settleStore pass. The old fees-due override — which
         // parked payments on the mint rail for immediate collection — was
         // removed in favor of those two paths.
+        $lnurlAttempt = null;          // ['bolt11','verify_url','amount_sats'] on success
+        $nofferAttempt = null;         // CLINK noffer receive context on success
+        $nwcAttempt = null;            // NWC (NIP-47) receive context on success
+        $strikeAttempt = null;         // Strike API receive context on success
+        $swapAttempt = null;           // populated by self::trySwapCreate on success
+        // Sanitized [{type, reason}] records of paths that failed while
+        // walking the order, persisted as invoices.receive_errors and shown to
+        // the payer on the payment page. Reasons are fixed server-side phrases
+        // — never wallet/host-provided text, URIs, or addresses (the page is
+        // public and NWC URIs embed the wallet secret).
+        $receiveErrors = [];
         // Generated up front (rather than at insert time below) so the Strike
         // rail can stamp it into the Strike invoice's correlationId, letting
         // the merchant match the two in Strike's dashboard.
         $invoiceId = Database::generateId('inv');
-        if ($feeLightning === null && !empty($destinations)) {
-            $lnurlTargetSats = (int) ExchangeRates::convertToSats((string)$amount, $currency, 'sat');
-            if ($lnurlTargetSats > 0) {
+        $lnurlTargetSats = (int) ExchangeRates::convertToSats((string)$amount, $currency, 'sat');
+
+        // Strict no-mint-fallback bookkeeping: set when a swap failed under
+        // strict mode, which takes the mint off the table for the rest of
+        // the walk (and decides the error precedence below when nothing
+        // Lightning came out).
+        $strictMintFallbackBlocked = false;
+        $strictSwapFailure = null;     // ['target' => int, 'detail' => string]
+        // Mint step state (consumed by the insert below as before).
+        $quote = null;
+        $usedMintUrl = null;
+        $amountInMintUnit = null;
+        $recoveringMints = [];
+        $mintAttempted = false;
+        $mintLastError = null;
+
+        $lnOrderCsv = RailOrder::storedLnOrderCsv($storeId);
+        $lnOrder = RailOrder::lnOrderFromRow(['ln_rail_order' => $lnOrderCsv]);
+        $lnSteps = self::lightningWalkSteps($lnOrder, $destinations, $lnOrderCsv !== null);
+        $mintStepIndex = null;
+        foreach ($lnSteps as $i => $step) {
+            if ($step['kind'] === 'mint') {
+                $mintStepIndex = $i;
+                break;
+            }
+        }
+        foreach ($lnSteps as $stepIndex => $step) {
+            if ($feeLightning !== null) {
+                break;
+            }
+            if ($lnurlAttempt !== null || $nofferAttempt !== null || $nwcAttempt !== null
+                || $strikeAttempt !== null || $swapAttempt !== null || $quote !== null) {
+                break;
+            }
+            if ($step['kind'] === 'direct') {
+                if ($step['destinations'] === [] || $lnurlTargetSats <= 0) {
+                    continue;
+                }
                 $direct = self::sourceDirectReceive(
-                    $storeId, $store, $destinations, $lnurlTargetSats, $metadata, $invoiceId, $receiveErrors
+                    $storeId, $store, $step['destinations'], $lnurlTargetSats, $metadata, $invoiceId, $receiveErrors
                 );
                 if ($direct !== null) {
                     switch ($direct['type']) {
@@ -501,103 +546,123 @@ class Invoice {
                         case 'lnurl':  $lnurlAttempt = $direct['attempt']; break;
                     }
                 }
+                continue;
+            }
+            if ($step['kind'] === 'swap') {
+                // ---- Submarine-swap path: a non-custodial LN→on-chain swap
+                // that settles directly to the merchant's xpub. ----
+                // Suppressed when a fee owns the on-chain rail (a swap invoice
+                // must stay lightning-only, so we don't pair it with a
+                // fee-owned on-chain address), and inert unless swaps are
+                // enabled for the store and it has an on-chain address.
+                if ($feeOnchain !== null || !SwapsConfig::isEnabledForStore($storeId) || !$onchainConfigured) {
+                    continue;
+                }
+                // Target = what the merchant wants to receive on-chain in sats.
+                $targetSats = ExchangeRates::convertToSats((string)$amount, $currency, 'sat');
+                $swapFailures = []; // per-provider reasons, populated by trySwapCreate
+                $strict = SwapsConfig::strictNoMintFallbackForStore($storeId);
+
+                // Fee-too-high → mint fallback thresholds. Only meaningful when
+                // this store has a cashu mint still AHEAD in this walk to fall
+                // back to (a mint that already failed earlier in the order is
+                // no fallback), and only when strict mode is OFF —
+                // strict_no_mint_fallback means "never fall back to mint", so
+                // the fee thresholds are intentionally inert under it. When
+                // inactive we pass 0/0, which disables the gate in
+                // trySwapCreate (swap proceeds regardless of fee).
+                $feeMaxPct = 0.0;
+                $feeMaxSats = 0;
+                if ($cashuConfigured && !$strict && $mintStepIndex !== null && $mintStepIndex > $stepIndex) {
+                    $thresholds = SwapsConfig::effectiveFeeFallbackForStore($storeId);
+                    $feeMaxPct = $thresholds['pct'];
+                    $feeMaxSats = $thresholds['sats'];
+                }
+
+                $swapAttempt = self::trySwapCreate(
+                    $storeId, $store, $targetSats, $swapFailures, $feeMaxPct, $feeMaxSats
+                );
+                if ($swapAttempt === null && $strict) {
+                    // Strict mode forbids the MINT fallback, not the other
+                    // paths: later destinations in the order are still walked
+                    // and the on-chain rail still serves. Surface each
+                    // provider's reason so the operator can act (typically:
+                    // "Boltz: amount 10000 sat outside range [50000, 5000000]").
+                    $detail = $swapFailures
+                        ? ' Provider attempts: ' . implode('; ', $swapFailures) . '.'
+                        : '';
+                    $strictMintFallbackBlocked = true;
+                    $strictSwapFailure = ['target' => (int)$targetSats, 'detail' => $detail];
+                    error_log(sprintf(
+                        '[swap] strict mode: swap failed for store=%s target=%d sat; mint fallback blocked.%s',
+                        $storeId, $targetSats, $detail
+                    ));
+                    // The payer sees a fixed phrase; provider detail stays in
+                    // the logs.
+                    $receiveErrors[] = [
+                        'type' => 'swap',
+                        'reason' => 'a Lightning invoice could not be created for this amount',
+                    ];
+                }
+                continue;
+            }
+            if ($step['kind'] === 'mint') {
+                // ---- Cashu / Lightning path: mint quote(s) from the store's
+                // mints (primary, then backups). Skipped under a strict swap
+                // failure (see above).
+                if (!$cashuConfigured || $strictMintFallbackBlocked) {
+                    continue;
+                }
+                $mintAttempted = true;
+                $mq = self::sourceMintQuote($storeId, $store, (string)$amount, $currency, $onchainConfigured);
+                $quote = $mq['quote'];
+                $usedMintUrl = $mq['mint_url'];
+                $amountInMintUnit = $mq['amount'];
+                $recoveringMints = $mq['recovering'];
+                $mintLastError = $mq['last_error'];
+                if ($quote === null) {
+                    // Same fixed phrase the long-lived refresh records; later
+                    // paths in the order (or the on-chain rail) may still
+                    // serve the invoice.
+                    $receiveErrors[] = [
+                        'type' => 'mint',
+                        'reason' => 'no configured mint could issue a Lightning invoice',
+                    ];
+                }
+                continue;
             }
         }
 
-        // ---- Submarine-swap path: replaces the cashu mint with a non-custodial
-        // LN→on-chain swap that settles directly to the merchant's xpub. ----
-        // Suppressed when a fee owns the lightning rail (the fee supplies the
-        // bolt11) or the on-chain rail (a swap invoice must stay lightning-only,
-        // so we don't pair it with a fee-owned on-chain address).
-        $swapAttempt = null; // populated by self::trySwapCreate on success
-        // Set when strict-no-mint-fallback suppressed the mint path after a
-        // failed swap (invoice proceeds on-chain only); keeps the mint block
-        // below from quoting in violation of strict mode.
-        $strictMintFallbackBlocked = false;
-        if ($lnurlAttempt === null && $nofferAttempt === null && $nwcAttempt === null
-            && $strikeAttempt === null
-            && $feeLightning === null && $feeOnchain === null
-            && SwapsConfig::isEnabledForStore($storeId) && $onchainConfigured) {
-            // Target = what the merchant wants to receive on-chain in sats.
-            $targetSats = ExchangeRates::convertToSats((string)$amount, $currency, 'sat');
-            $swapFailures = []; // per-provider reasons, populated by trySwapCreate
-
-            // Fee-too-high → mint fallback thresholds. Only meaningful when this
-            // store has a cashu mint to fall back to, and only when strict mode
-            // is OFF — strict_no_mint_fallback means "never fall back to mint",
-            // so the fee thresholds are intentionally inert under it. When
-            // inactive we pass 0/0, which disables the gate in trySwapCreate
-            // (swap proceeds regardless of fee, preserving prior behaviour).
-            $feeMaxPct = 0.0;
-            $feeMaxSats = 0;
-            if ($cashuConfigured && !SwapsConfig::strictNoMintFallbackForStore($storeId)) {
-                $thresholds = SwapsConfig::effectiveFeeFallbackForStore($storeId);
-                $feeMaxPct = $thresholds['pct'];
-                $feeMaxSats = $thresholds['sats'];
-            }
-
-            $swapAttempt = self::trySwapCreate(
-                $storeId, $store, $targetSats, $swapFailures, $feeMaxPct, $feeMaxSats
-            );
-            if ($swapAttempt === null && SwapsConfig::strictNoMintFallbackForStore($storeId)) {
-                // Surface each provider's reason so the operator can act
-                // (typically: "Boltz: amount 10000 sat outside range [50000, 5000000]").
-                $detail = $swapFailures
-                    ? ' Provider attempts: ' . implode('; ', $swapFailures) . '.'
-                    : '';
-                if (!$onchainOffered) {
-                    throw new Exception(
-                        'Submarine swap could not be created for ' . $targetSats . ' sat target.'
-                        . ' Strict mode is on (no mint fallback).' . $detail
-                    );
-                }
-                // Strict mode forbids the MINT fallback, not the on-chain rail.
-                // With an on-chain address on offer the invoice must still come
-                // out payable (on-chain only): a Lightning-path failure never
-                // aborts creation while another rail can serve. The payer sees
-                // a fixed phrase; provider detail stays in the logs.
-                error_log(sprintf(
-                    '[swap] strict mode: swap failed for store=%s target=%d sat; serving on-chain only.%s',
-                    $storeId, $targetSats, $detail
-                ));
-                $receiveErrors[] = [
-                    'type' => 'swap',
-                    'reason' => 'a Lightning invoice could not be created for this amount',
-                ];
-                AdminLog::log('swap', 'checkout', $storeId, null, null,
-                    'strict mode: no swap provider accepted the ' . $targetSats
-                    . ' sat target; invoice created on-chain only.' . $detail);
-                $strictMintFallbackBlocked = true;
-            }
-        }
-
-        // ---- Cashu / Lightning path: try mint quote(s) if a mint is configured ----
-        // Skipped when the swap path won — the swap supplies its own BOLT11 and
-        // the customer must pay that exact invoice (mint would create a different one).
-        $quote = null;
-        $usedMintUrl = null;
-        $amountInMintUnit = null;
-        $recoveringMints = [];
-        if ($cashuConfigured && !$strictMintFallbackBlocked && $swapAttempt === null
-            && $lnurlAttempt === null && $strikeAttempt === null
-            && $nofferAttempt === null && $nwcAttempt === null && $feeLightning === null) {
-            $mq = self::sourceMintQuote($storeId, $store, (string)$amount, $currency, $onchainConfigured);
-            $quote = $mq['quote'];
-            $usedMintUrl = $mq['mint_url'];
-            $amountInMintUnit = $mq['amount'];
-            $recoveringMints = $mq['recovering'];
-            $lastError = $mq['last_error'];
-            if ($quote === null && !$onchainConfigured) {
-                if ($lastError === null && !empty($recoveringMints)) {
-                    // Every candidate mint is still being prepared — nothing
-                    // was created, so the caller can simply retry later.
-                    throw new Exception(self::RECOVERY_MESSAGE);
-                }
+        // Nothing Lightning came out of the walk: keep the historical error
+        // precedence for the cases that abort creation, and record the
+        // strict swap outcome when the invoice goes on with on-chain only.
+        $anyLightning = $lnurlAttempt !== null || $nofferAttempt !== null || $nwcAttempt !== null
+            || $strikeAttempt !== null || $swapAttempt !== null || $quote !== null;
+        if (!$anyLightning && $strictSwapFailure !== null) {
+            if (!$onchainOffered) {
                 throw new Exception(
-                    'Failed to get mint quote from all configured mints. '
-                    . 'Last error: ' . ($lastError ? $lastError->getMessage() : 'Unknown')
+                    'Submarine swap could not be created for ' . $strictSwapFailure['target'] . ' sat target.'
+                    . ' Strict mode is on (no mint fallback).' . $strictSwapFailure['detail']
                 );
             }
+            // Strict mode forbids the MINT fallback, not the on-chain rail.
+            // With an on-chain address on offer the invoice must still come
+            // out payable (on-chain only): a Lightning-path failure never
+            // aborts creation while another rail can serve.
+            AdminLog::log('swap', 'checkout', $storeId, null, null,
+                'strict mode: no swap provider accepted the ' . $strictSwapFailure['target']
+                . ' sat target; invoice created on-chain only.' . $strictSwapFailure['detail']);
+        }
+        if (!$anyLightning && $mintAttempted && !$onchainConfigured) {
+            if ($mintLastError === null && !empty($recoveringMints)) {
+                // Every candidate mint is still being prepared — nothing
+                // was created, so the caller can simply retry later.
+                throw new Exception(self::RECOVERY_MESSAGE);
+            }
+            throw new Exception(
+                'Failed to get mint quote from all configured mints. '
+                . 'Last error: ' . ($mintLastError ? $mintLastError->getMessage() : 'Unknown')
+            );
         }
 
         // ---- On-chain path: allocate a receive address ----
@@ -964,6 +1029,68 @@ class Invoice {
         WebhookSender::fireEvent($storeId, 'InvoiceCreated', $invoice);
 
         return $invoice;
+    }
+
+    /**
+     * Turn a store's Lightning path order into the steps Invoice::create (and
+     * refreshLightning) walk: ['kind' => 'direct', 'destinations' => [...]]
+     * for each destination type that has entries, ['kind' => 'swap'] and
+     * ['kind' => 'mint'] for the two order-only slots — in the configured
+     * order.
+     *
+     * With an EXPLICIT stored order the chain is grouped by type at each
+     * type's slot (listForStore already type-sorted it, so the groups are
+     * contiguous and within-type priority is kept). With the historical NULL
+     * order (every pre-existing store) the stored per-row chain — which a
+     * legacy API write may interleave deliberately — is walked verbatim as
+     * ONE group at the first destination slot, exactly as before the swap
+     * and mint became orderable. Destinations of a type missing from the
+     * order (can't happen with a normalized order; defensive) walk last.
+     *
+     * @param string[] $order        permutation of RailOrder::LN_DEFAULT
+     * @param array[]  $destinations StoreLnAddresses::destinationsForStore()
+     * @param bool     $explicitOrder whether the store has a stored order
+     * @return array<int, array{kind:string, destinations?:array}>
+     */
+    public static function lightningWalkSteps(array $order, array $destinations, bool $explicitOrder): array {
+        $steps = [];
+        $emitted = false;
+        $seenTypes = [];
+        foreach ($order as $type) {
+            if ($type === RailOrder::LN_SWAP) {
+                $steps[] = ['kind' => 'swap'];
+                continue;
+            }
+            if ($type === RailOrder::LN_CASHU) {
+                $steps[] = ['kind' => 'mint'];
+                continue;
+            }
+            $seenTypes[$type] = true;
+            if (!$explicitOrder) {
+                if (!$emitted && $destinations !== []) {
+                    $steps[] = ['kind' => 'direct', 'destinations' => array_values($destinations)];
+                    $emitted = true;
+                }
+                continue;
+            }
+            $slice = array_values(array_filter(
+                $destinations,
+                static fn(array $d): bool => ($d['type'] ?? '') === $type
+            ));
+            if ($slice !== []) {
+                $steps[] = ['kind' => 'direct', 'destinations' => $slice];
+            }
+        }
+        if ($explicitOrder) {
+            $rest = array_values(array_filter(
+                $destinations,
+                static fn(array $d): bool => !isset($seenTypes[$d['type'] ?? ''])
+            ));
+            if ($rest !== []) {
+                $steps[] = ['kind' => 'direct', 'destinations' => $rest];
+            }
+        }
+        return $steps;
     }
 
     /**
@@ -3071,32 +3198,56 @@ class Invoice {
         } catch (Throwable $e) {
             $directSats = $currentIsDirect ? (int)$invoice['amount_sats'] : 0;
         }
+        // The same ordered walk as Invoice::create (destination types and the
+        // mint at their configured slots), minus the swap: a refresh never
+        // creates a swap (decision 6b), so that slot is skipped.
         $destinations = StoreLnAddresses::destinationsForStore($storeId);
-        if ($sourced === null && $destinations !== [] && $directSats > 0) {
-            $direct = self::sourceDirectReceive(
-                $storeId, $store, $destinations, $directSats, self::metadataOf($invoice), $invoiceId, $receiveErrors
-            );
-            if ($direct !== null) {
-                $sourced = self::lightningFieldsFromAttempt($direct['type'], $direct['attempt']);
-                $sourced['_quote'] = null;
-            }
-        }
+        $lnOrderCsv = RailOrder::storedLnOrderCsv($storeId);
+        $lnOrder = RailOrder::lnOrderFromRow(['ln_rail_order' => $lnOrderCsv]);
         // Strict no-mint-fallback: with swaps enabled the mint is only ever a
         // fallback for the swap rail, and strict mode forbids exactly that
-        // (see Invoice::create). A refresh never creates a swap (decision 6b),
-        // so under strict mode the mint is off the table here too — otherwise
-        // a long-lived invoice created on-chain only would quietly move onto
-        // the mint on its first page view.
-        $strictMintBlocked = $sourced === null
-            && SwapsConfig::isEnabledForStore($storeId)
-            && SwapsConfig::strictNoMintFallbackForStore($storeId);
-        if ($strictMintBlocked) {
-            error_log(sprintf(
-                '[long-lived] strict mode: mint fallback skipped on refresh invoice=%s store=%s',
-                $invoiceId, $storeId
-            ));
-        }
-        if ($sourced === null && !$strictMintBlocked && Config::isStoreConfigured($storeId)) {
+        // (see Invoice::create). Since no swap is created here, under strict
+        // mode the mint is off the table — otherwise a long-lived invoice
+        // created on-chain only would quietly move onto the mint on its
+        // first page view. Only meaningful while the swap precedes the mint
+        // in the order (saving the mint ahead of the swap clears strict).
+        $strictMintBlocked = SwapsConfig::isEnabledForStore($storeId)
+            && SwapsConfig::strictNoMintFallbackForStore($storeId)
+            && !RailOrder::cashuPrecedesSwap($lnOrder);
+        $strictMintLogged = false;
+        foreach (self::lightningWalkSteps($lnOrder, $destinations, $lnOrderCsv !== null) as $step) {
+            if ($sourced !== null) {
+                break;
+            }
+            if ($step['kind'] === 'direct') {
+                if ($step['destinations'] === [] || $directSats <= 0) {
+                    continue;
+                }
+                $direct = self::sourceDirectReceive(
+                    $storeId, $store, $step['destinations'], $directSats, self::metadataOf($invoice), $invoiceId, $receiveErrors
+                );
+                if ($direct !== null) {
+                    $sourced = self::lightningFieldsFromAttempt($direct['type'], $direct['attempt']);
+                    $sourced['_quote'] = null;
+                }
+                continue;
+            }
+            if ($step['kind'] !== 'mint') {
+                continue;
+            }
+            if ($strictMintBlocked) {
+                if (!$strictMintLogged) {
+                    $strictMintLogged = true;
+                    error_log(sprintf(
+                        '[long-lived] strict mode: mint fallback skipped on refresh invoice=%s store=%s',
+                        $invoiceId, $storeId
+                    ));
+                }
+                continue;
+            }
+            if (!Config::isStoreConfigured($storeId)) {
+                continue;
+            }
             $fixed = (!$requote && $currentRail === 'mint' && !empty($invoice['bolt11']))
                 ? (int)$invoice['amount_sats'] : null;
             try {
@@ -3117,6 +3268,8 @@ class Invoice {
                 $receiveErrors[] = ['type' => 'mint', 'reason' => 'no configured mint could issue a Lightning invoice'];
             }
         }
+        // For the "nothing could re-source" log below.
+        $strictMintBlocked = $strictMintBlocked && $sourced === null;
         if ($sourced === null) {
             error_log(sprintf('[long-lived] no Lightning rail could re-source invoice=%s store=%s', $invoiceId, $storeId));
             AdminLog::log('lightning', 'refresh', $storeId, $invoiceId, null,
