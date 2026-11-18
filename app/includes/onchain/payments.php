@@ -1008,6 +1008,10 @@ class OnchainPayments {
                     error_log("on-chain {$invoice['id']}: {$msg}");
                     AdminLog::log('onchain', 'zero_conf_reversed', $invoice['store_id'], $invoice['id'],
                         $invoice['onchain_address'] ?? null, $msg);
+                    require_once __DIR__ . '/../invoice_attempts.php';
+                    InvoiceAttempts::record($invoice['id'], $invoice['store_id'], InvoiceAttempts::CONTEXT_POLL, 'onchain',
+                        $invoice['onchain_address'] ?? null, InvoiceAttempts::FAILED,
+                        'the on-chain payment was reversed after settlement', $msg);
                     return ['status' => 'Invalid', 'fired' => 'InvoiceInvalid'];
                 }
             }
