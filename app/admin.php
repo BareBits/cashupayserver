@@ -9093,13 +9093,14 @@ header('Cache-Control: no-cache, must-revalidate');
                     </div>
                     <div class="card-body">
                         <p style="font-size: 0.85rem; color: var(--text-secondary); margin: 0 0 0.75rem 0;">
-                            Optionally send BareBits a small weekly report so we know how many
-                            installs exist and which features matter. Off by default. You choose
-                            how much is included and can preview the exact report below. No report
-                            ever includes your deployment ID, store names, mint or Lightning
-                            addresses, email addresses, customer or invoice details. Our side
-                            records the country your server connected from and discards the IP
-                            address. Turning this off stops future reports.
+                            Optionally send BareBits anonymous usage statistics so we know how
+                            many installs exist and which features matter. Off by default. You
+                            can choose how much is reported and preview the exact report below.
+                            No report ever includes your store names, mint or Lightning
+                            addresses, email addresses, customer or invoice details or other
+                            personally-identifiable information. Our side records the country
+                            your server connected from and discards the IP address. Turning this
+                            off stops future reports.
                             <a href="https://github.com/BareBits/cashupayserver/blob/main/PRIVACY.md" target="_blank" rel="noopener" style="color: var(--accent);">Privacy Policy</a>
                         </p>
                         <div class="toggle-container">

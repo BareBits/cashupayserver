@@ -175,6 +175,14 @@ def test_wizard_screen_previews_every_level_and_declining_sends_nothing(request,
         assert f"name=\"usage_stats\" value=\"{level}\"" in body, f"level {level} button missing"
     assert 'name="usage_stats" value="0"' in body, "decline button missing"
     assert "PRIVACY.md" in body, "the screen links the privacy policy"
+    # Intro wording (2026-11-18): no cadence/endpoint sentence, no
+    # "deployment ID" in the exclusion list — PII catch-all instead.
+    flat = " ".join(body.split())
+    assert "You can choose how much is reported and preview the exact report for each option below." in flat
+    assert "customer or invoice details or other personally-identifiable information." in flat
+    assert "No report ever includes your store names, mint or Lightning addresses" in flat
+    for stale in ("one small report", "then one a week", "No report ever includes your deployment ID"):
+        assert stale not in flat, f"stale wizard wording still present: {stale!r}"
 
     previews = _previews_from_wizard(body)
     assert sorted(previews) == [1, 2, 3], "every level shows its exact report"
@@ -329,6 +337,12 @@ def test_settings_card_toggle_level_and_preview(request, endpoint, browser) -> N
         toggle = page.locator("#usage-stats-enabled")
         slider = page.locator("#usage-stats-enabled + .toggle-slider")
         assert not toggle.is_checked(), "declined on the wizard -> off"
+        # The card's blurb mirrors the wizard screen (2026-11-18 wording).
+        blurb = " ".join(page.locator("#card-usage-stats .card-body > p").first.inner_text().split())
+        assert "other personally-identifiable information" in blurb, blurb
+        assert "You can choose how much is reported" in blurb, blurb
+        for stale in ("deployment ID", "weekly report"):
+            assert stale not in blurb, f"stale admin wording still present: {stale!r}"
         status = page.locator("#usage-stats-status").inner_text()
         assert "Off" in status and "nothing is sent" in status, status
 
