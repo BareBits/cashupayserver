@@ -450,8 +450,11 @@ if (isset($_GET['api'])) {
                 'strict' => SwapsConfig::strictNoMintFallbackForStore($storeId),
             ];
 
-            // Self-serve invoice per-store settings.
+            // Tip jar per-store settings: the master switch + per-payment cap
+            // (the jars themselves come from ?api=tip_jars).
             require_once __DIR__ . '/includes/selfserve.php';
+            require_once __DIR__ . '/includes/tip_jars.php';
+            $defaultJar = TipJar::legacyDefault($storeId);
             $storeSelfServe = [
                 'enabled'          => SelfServe::storeOverride($storeId) === SelfServe::FORCE_ON,
                 'effective'        => SelfServe::isEnabledForStore($storeId),
@@ -459,7 +462,13 @@ if (isset($_GET['api'])) {
                 'maxSatsOverride'  => SelfServe::storeMaxSats($storeId),   // null = built-in default
                 'effectiveMaxSats' => SelfServe::effectiveMaxSats($storeId),
                 'maxSatsDefault'   => SelfServe::DEFAULT_MAX_SATS,
-                'payUrl'           => Urls::selfServe($storeId),
+                // Link of the store's default jar (what the bare /pay/{store}
+                // link redirects to); null until the store has an enabled jar.
+                'payUrl'           => $defaultJar !== null ? Urls::tipJar($storeId, (string)$defaultJar['id']) : null,
+                'defaultJarName'   => $defaultJar !== null ? $defaultJar['name'] : null,
+                'jarCount'         => TipJar::countForStore($storeId),
+                // Bare store URL — the base for ?products= product links.
+                'storeUrl'         => Urls::selfServe($storeId),
             ];
 
             // On-chain Bitcoin payment settings.
@@ -776,6 +785,49 @@ if (isset($_GET['api'])) {
             ]);
             break;
 
+        // Tip jars of the selected store with their settled totals — any
+        // logged-in user (the Tip Jars view is read-only below the admin role;
+        // the write actions below are admin-gated).
+        case 'tip_jars':
+            $storeId = $_GET['store_id'] ?? null;
+            if (!$storeId) {
+                cashupay_status(400);
+                echo json_encode(['error' => 'store_id required']);
+                break;
+            }
+            $store = Config::getStore($storeId);
+            if (!$store) {
+                cashupay_status(404);
+                echo json_encode(['error' => 'Store not found']);
+                break;
+            }
+            require_once __DIR__ . '/includes/selfserve.php';
+            require_once __DIR__ . '/includes/tip_jars.php';
+            $received = TipJar::receivedByStore($storeId);
+            $jarCur = strtoupper((string)($store['default_currency'] ?? 'sat'));
+            $jarCurIsFiat = !in_array($jarCur, ['SAT', 'SATS', 'BTC'], true);
+            $jars = [];
+            foreach (TipJar::listByStore($storeId) as $row) {
+                $j = TipJar::formatForApi($row, $received[$row['id']] ?? null);
+                // Approximate store-currency value of the sats received, for
+                // fiat-priced stores (null when no rate is available).
+                $j['receivedFiat'] = ($jarCurIsFiat && $j['receivedSats'] > 0)
+                    ? ExchangeRates::satsToFiat($j['receivedSats'], $jarCur) : null;
+                $jars[] = $j;
+            }
+            echo json_encode([
+                'jars' => $jars,
+                'storeCurrency' => $jarCurIsFiat ? $jarCur : 'sat',
+                'enabled' => SelfServe::storeOverride($storeId) === SelfServe::FORCE_ON,
+                'effective' => SelfServe::isEnabledForStore($storeId),
+                'paymentCapable' => SelfServe::storeIsPaymentCapable($store),
+                'maxNameLen' => TipJar::MAX_NAME_LEN,
+                'maxMessageLen' => TipJar::MAX_MESSAGE_LEN,
+                'defaultEmoji' => TipJar::DEFAULT_EMOJI,
+                'isAdmin' => Auth::isAdmin(),
+            ]);
+            break;
+
         // Full product list incl. disabled — admin management view only.
         case 'products_manage':
             Auth::requireAdmin();
@@ -919,10 +971,14 @@ if (isset($_GET['api'])) {
                 ];
             }
 
+            require_once __DIR__ . '/includes/tip_jars.php';
             echo json_encode([
                 'invoice' => $formatted,
                 'storeName' => $detailStore['name'] ?? null,
                 'isAdmin' => $isAdminViewer,
+                // Tip jar the invoice came through: live row, else the
+                // metadata snapshot of a since-deleted jar, else null.
+                'tipJar' => TipJar::forInvoice($row),
                 'detail' => [
                     // The rail chosen at creation vs. the one that moved funds
                     // (formatForApi's paymentRail already prefers the latter).
@@ -983,6 +1039,14 @@ if (isset($_GET['api'])) {
                 $params[] = $storeId;
             }
 
+            // Tip jar filter (the Tip Jars view's "View invoices" shortcut).
+            // Shape-checked like the status filter; anything else is ignored.
+            $tipJarFilter = (string)($_GET['tip_jar_id'] ?? '');
+            if ($tipJarFilter !== '' && preg_match('/^jar_[a-f0-9]{12,}$/', $tipJarFilter)) {
+                $conditions[] = "tip_jar_id = ?";
+                $params[] = $tipJarFilter;
+            }
+
             $whereClause = count($conditions) > 0 ? (" WHERE " . implode(" AND ", $conditions)) : "";
             $sql .= $whereClause;
 
@@ -1014,8 +1078,34 @@ if (isset($_GET['api'])) {
                     $withItems[$r['invoice_id']] = true;
                 }
             }
+            // Name/emoji of the tip jar each invoice came through (one query
+            // for the page); the UI falls back to the metadata snapshot for
+            // jars that were deleted since.
+            $jarIds = array_values(array_unique(array_filter(array_map(
+                static fn($r) => $r['tip_jar_id'] ?? null, $invoices
+            ))));
+            $jarsById = [];
+            if ($jarIds !== []) {
+                require_once __DIR__ . '/includes/tip_jars.php';
+                $placeholders = implode(',', array_fill(0, count($jarIds), '?'));
+                foreach (Database::fetchAll(
+                    "SELECT id, name, emoji FROM tip_jars WHERE id IN ($placeholders)", $jarIds
+                ) as $jr) {
+                    $jarsById[$jr['id']] = [
+                        'id' => $jr['id'],
+                        'name' => $jr['name'],
+                        'emoji' => ($jr['emoji'] ?? '') !== '' && $jr['emoji'] !== null ? $jr['emoji'] : TipJar::DEFAULT_EMOJI,
+                    ];
+                }
+            }
+            $rowById = [];
+            foreach ($invoices as $r) {
+                $rowById[$r['id']] = $r;
+            }
             foreach ($formatted as &$inv) {
                 $inv['hasItems'] = isset($withItems[$inv['id']]);
+                $jid = $rowById[$inv['id']]['tip_jar_id'] ?? null;
+                $inv['tipJar'] = ($jid !== null && isset($jarsById[$jid])) ? $jarsById[$jid] : null;
             }
             unset($inv);
             echo json_encode($formatted);
@@ -1812,6 +1902,69 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     switch ($action) {
         case 'logout':
             Auth::logout();
+            echo json_encode(['success' => true]);
+            break;
+
+        // ---- Tip jar management (admin only) ----
+        case 'create_tip_jar':
+            Auth::requireAdmin();
+            require_once __DIR__ . '/includes/tip_jars.php';
+            try {
+                $storeId = $_POST['store_id'] ?? '';
+                if ($storeId === '') {
+                    throw new InvalidArgumentException('store_id required');
+                }
+                $jar = TipJar::create($storeId, [
+                    'name' => $_POST['name'] ?? '',
+                    'emoji' => $_POST['emoji'] ?? '',
+                    'message' => $_POST['message'] ?? '',
+                ]);
+                echo json_encode(['success' => true, 'jar' => TipJar::formatForApi($jar)]);
+            } catch (InvalidArgumentException $e) {
+                cashupay_status(400);
+                echo json_encode(['error' => $e->getMessage()]);
+            }
+            break;
+
+        case 'update_tip_jar':
+            Auth::requireAdmin();
+            require_once __DIR__ . '/includes/tip_jars.php';
+            try {
+                $storeId = $_POST['store_id'] ?? '';
+                $jarId = $_POST['tip_jar_id'] ?? '';
+                if ($storeId === '' || $jarId === '') {
+                    throw new InvalidArgumentException('store_id and tip_jar_id required');
+                }
+                // Only forward fields that were actually sent so a partial
+                // edit (e.g. the enable toggle) doesn't clobber the rest.
+                $data = [];
+                foreach (['name', 'emoji', 'message'] as $k) {
+                    if (array_key_exists($k, $_POST)) {
+                        $data[$k] = $_POST[$k];
+                    }
+                }
+                if (array_key_exists('enabled', $_POST)) {
+                    $data['enabled'] = ($_POST['enabled'] === '1' || $_POST['enabled'] === 'true');
+                }
+                $jar = TipJar::update($jarId, $storeId, $data);
+                echo json_encode(['success' => true, 'jar' => TipJar::formatForApi($jar)]);
+            } catch (InvalidArgumentException $e) {
+                cashupay_status(400);
+                echo json_encode(['error' => $e->getMessage()]);
+            }
+            break;
+
+        case 'delete_tip_jar':
+            Auth::requireAdmin();
+            require_once __DIR__ . '/includes/tip_jars.php';
+            $storeId = $_POST['store_id'] ?? '';
+            $jarId = $_POST['tip_jar_id'] ?? '';
+            if ($storeId === '' || $jarId === '') {
+                cashupay_status(400);
+                echo json_encode(['error' => 'store_id and tip_jar_id required']);
+                break;
+            }
+            TipJar::delete($jarId, $storeId);
             echo json_encode(['success' => true]);
             break;
 
@@ -4106,7 +4259,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 }
                 $rawEnabled = (string)($_POST['enabled'] ?? '0');
                 if (!in_array($rawEnabled, ['0', '1'], true)) {
-                    throw new Exception('Invalid self-serve enabled value');
+                    throw new Exception('Invalid tip jars enabled value');
                 }
                 $enabled = (int)$rawEnabled;
                 // Turning self-serve on only makes sense if the store can take a
@@ -4115,6 +4268,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     throw new Exception('This store has no payment method configured (add a Cashu mint or on-chain address first).');
                 }
                 SelfServe::setStoreOverride($storeId, $enabled);
+                if ($enabled === SelfServe::FORCE_ON) {
+                    // Turning tip jars on always yields a working link: a
+                    // store with no jars yet gets the default one.
+                    require_once __DIR__ . '/includes/tip_jars.php';
+                    TipJar::ensureDefault($storeId);
+                }
 
                 // Per-store max. Blank clears it (use the built-in default);
                 // a positive whole number sets it.
@@ -5248,7 +5407,7 @@ $fileResetRequested = !$isLoggedIn && Auth::fileResetRequested();
 // resolve sensibly; with query URLs, serve the dashboard directly (a
 // path-style redirect is exactly what such hosts cannot serve).
 // -----------------------------------------------------------------------------
-const ADMIN_VIEWS = ['dashboard', 'invoices', 'customers', 'stores', 'products', 'settings', 'stats', 'log'];
+const ADMIN_VIEWS = ['dashboard', 'invoices', 'tipjars', 'customers', 'stores', 'products', 'settings', 'stats', 'log'];
 
 $adminUsesPathUrls = Urls::adminUsesPathUrls($_SERVER['PATH_INFO'] ?? null, Config::getUrlMode());
 
@@ -6503,6 +6662,76 @@ header('Cache-Control: no-cache, must-revalidate');
             max-width: 60%;
         }
 
+        /* Tip Jars view: file-browser style icon grid + detail modal bits. */
+        .jar-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+            gap: 0.75rem;
+        }
+        .jar-tile {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            text-align: center;
+            gap: 0.3rem;
+            padding: 1rem 0.6rem 0.9rem;
+            background: rgba(255, 255, 255, 0.03);
+            border: 1px solid var(--border, rgba(255, 255, 255, 0.08));
+            border-radius: 14px;
+            cursor: pointer;
+            color: inherit;
+            font: inherit;
+            min-width: 0;
+            transition: border-color 0.15s, background 0.15s;
+        }
+        .jar-tile:hover,
+        .jar-tile:focus-visible {
+            border-color: var(--accent);
+            background: rgba(247, 147, 26, 0.08);
+            outline: none;
+        }
+        .jar-tile.disabled { opacity: 0.5; }
+        .jar-tile-emoji { font-size: 2.6rem; line-height: 1.1; }
+        .jar-tile-name { font-weight: 600; font-size: 0.9rem; max-width: 100%; overflow-wrap: anywhere; }
+        .jar-tile-amount { font-size: 0.85rem; color: var(--accent); font-weight: 600; }
+        .jar-tile-sub { font-size: 0.72rem; color: var(--text-secondary); }
+        .jar-tile-badge {
+            font-size: 0.65rem;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+            color: var(--text-secondary);
+            border: 1px solid var(--border, rgba(255, 255, 255, 0.15));
+            border-radius: 999px;
+            padding: 0.05rem 0.45rem;
+        }
+        .tipjar-detail-head { text-align: center; margin-bottom: 0.75rem; }
+        .tipjar-detail-emoji { font-size: 3rem; line-height: 1.1; margin-bottom: 0.4rem; }
+        .tipjar-detail-message {
+            font-size: 0.9rem;
+            color: var(--text-secondary);
+            white-space: pre-line;
+            overflow-wrap: anywhere;
+            margin-bottom: 0.3rem;
+        }
+        .tipjar-detail-stats { display: flex; gap: 0.75rem; margin-bottom: 1rem; }
+        .tipjar-detail-stats > div {
+            flex: 1;
+            text-align: center;
+            background: rgba(0, 0, 0, 0.18);
+            border-radius: 12px;
+            padding: 0.6rem 0.4rem;
+        }
+        .tipjar-stat-value { font-weight: 700; font-size: 1.05rem; overflow-wrap: anywhere; }
+        .tipjar-stat-label { font-size: 0.72rem; color: var(--text-secondary); }
+        .tipjar-qr { display: flex; justify-content: center; margin: 0.25rem 0 1rem; }
+        .tipjar-qr svg {
+            width: 180px;
+            height: 180px;
+            background: #fff;
+            padding: 8px;
+            border-radius: 10px;
+        }
+
         /* Empty State */
         .empty-state {
             text-align: center;
@@ -7228,21 +7457,23 @@ header('Cache-Control: no-cache, must-revalidate');
                         </div>
                     </div>
                 </div>
-                <!-- Self-serve link banner. Surfaces the public /pay/<store> link
-                     for the selected store so the operator knows the feature
-                     exists and can share it. Shown only when self-serve is
-                     effectively enabled for the current store; the toggle itself
-                     lives in the store's Settings card. -->
+                <!-- Tip jar banner. Surfaces the selected store's default tip
+                     jar link so the operator knows the feature exists and can
+                     share it, plus a shortcut to the Tip Jars view where every
+                     jar's link lives. Shown only when tip jars are effectively
+                     on for the current store; the switch itself is in the
+                     store's Settings card. -->
                 <div class="card hidden" id="card-selfserve-link">
                     <div class="card-body" style="display:flex; align-items:center; gap:0.75rem; flex-wrap:wrap;">
                         <span style="flex:1 1 240px; min-width:200px;">
-                            &#9889; <strong>Self-serve payments are on.</strong>
-                            Share this link so customers can create and pay their own invoice:
+                            &#129753; <strong>Tip jars are on.</strong>
+                            <span id="invoices-selfserve-text">Share a tip jar link so customers can pay what they want:</span>
                         </span>
                         <input type="text" class="form-input" id="invoices-selfserve-link" readonly
                                style="flex:2 1 260px; min-width:200px; font-size:0.8rem;">
                         <button class="btn btn-secondary" id="btn-copy-invoices-selfserve-link" style="width:auto; flex:0 0 auto;">Copy</button>
                         <a class="btn" id="invoices-selfserve-open" target="_blank" rel="noopener" style="width:auto; flex:0 0 auto;">Open</a>
+                        <button class="btn btn-secondary js-goto-tipjars" id="invoices-selfserve-manage" style="width:auto; flex:0 0 auto;">All tip jars</button>
                     </div>
                 </div>
                 <div class="card view-fill">
@@ -7268,11 +7499,49 @@ header('Cache-Control: no-cache, must-revalidate');
                         <select id="invoice-store-filter">
                             <option value="__all__">All stores</option>
                         </select></span>
+                        <!-- Tip jar filter chip: set from a jar's "View invoices"
+                             (or ?tip_jar= in the URL); × clears it. -->
+                        <span class="inv-filter hidden" id="invoice-tipjar-filter">
+                            <label>Tip jar:</label>
+                            <span class="inv-chip" id="invoice-tipjar-filter-label"></span>
+                            <button type="button" class="btn btn-secondary" id="btn-clear-invoice-tipjar-filter"
+                                    title="Show invoices from every tip jar" aria-label="Clear tip jar filter"
+                                    style="width:auto; padding:0.1rem 0.5rem; font-size:0.8rem; line-height:1.2;">&times;</button>
+                        </span>
                     </div>
                     <div id="all-invoices">
                         <div class="loading"><div class="spinner"></div></div>
                     </div>
                     <div id="invoices-pagination" class="list-pagination"></div>
+                </div>
+            </div>
+
+            <!-- Tip Jars view: one tile per jar of the selected store (a
+                 file-browser style icon grid) with how much each has received.
+                 Any logged-in user can look; create/edit/delete are admin-only
+                 (ensureAdmin client-side, Auth::requireAdmin on the actions). -->
+            <div class="view" id="view-tipjars">
+                <div class="card hidden" id="card-tipjars-off">
+                    <div class="card-body" style="display:flex; align-items:center; gap:0.75rem; flex-wrap:wrap;">
+                        <span style="flex:1 1 240px;" id="tipjars-off-text">Tip jars are turned off for this store, so these links won't work yet.</span>
+                        <button class="btn" id="btn-tipjars-turn-on" style="width:auto; flex:0 0 auto;">Turn on tip jars</button>
+                    </div>
+                </div>
+                <div class="card view-fill">
+                    <div class="card-header" style="display:flex; align-items:center; justify-content:space-between; gap:0.5rem; flex-wrap:wrap;">
+                        <div class="card-title">Tip Jars</div>
+                        <button class="btn" id="btn-new-tipjar" style="width:auto; padding:0.4rem 0.9rem;">+ New tip jar</button>
+                    </div>
+                    <div class="card-body">
+                        <p style="font-size:0.85rem; color:var(--text-secondary); margin:0 0 0.75rem 0;">
+                            Each tip jar is a public link where customers pick an amount and pay —
+                            donations, tips, pay-what-you-want. Click a jar for its link, QR code
+                            and settings.
+                        </p>
+                        <div id="tipjars-grid">
+                            <div class="loading"><div class="spinner"></div></div>
+                        </div>
+                    </div>
                 </div>
             </div>
 
@@ -7362,7 +7631,7 @@ header('Cache-Control: no-cache, must-revalidate');
                                 <span class="store-info-value" id="store-settings-mint">-</span>
                             </div>
                             <div class="store-info-item" id="store-info-selfserve-row" style="display:none;">
-                                <span class="store-info-label">Self-serve link</span>
+                                <span class="store-info-label">Tip jar link</span>
                                 <span class="store-info-value" style="display:flex; gap:0.4rem; align-items:center; max-width:70%;">
                                     <input type="text" class="form-input" id="store-info-selfserve-link" readonly
                                            style="flex:1; min-width:0; font-size:0.8rem; padding:0.25rem 0.4rem;">
@@ -8317,13 +8586,15 @@ header('Cache-Control: no-cache, must-revalidate');
 
                     <div class="card collapsible collapsed" id="card-store-selfserve">
                         <div class="card-header">
-                            <div class="card-title">Self-Serve Invoices</div>
+                            <div class="card-title">Tip Jars</div>
                         </div>
                         <div class="card-body">
                             <p style="font-size: 0.85rem; color: var(--text-secondary); margin: 0 0 0.75rem 0;">
-                                Let customers create and pay their own invoice (no login) from a public
-                                link, choosing the amount and an optional note. Requires a payment method
-                                on this store. Off by default.
+                                Public links where customers pick an amount and pay (no login) —
+                                tips, donations, pay-what-you-want. Create and name your jars in the
+                                <a href="#" class="js-goto-tipjars">Tip Jars</a> view; this switch turns
+                                all of them (and shareable product links) on or off for this store.
+                                Requires a payment method on this store. Off by default.
                             </p>
 
                             <div class="form-group">
@@ -8338,25 +8609,28 @@ header('Cache-Control: no-cache, must-revalidate');
                             </div>
 
                             <div class="form-group">
-                                <label class="form-label" for="store-selfserve-max">Maximum invoice (sats)</label>
+                                <label class="form-label" for="store-selfserve-max">Maximum per payment (sats)</label>
                                 <input type="number" class="form-input" id="store-selfserve-max"
                                        min="1" step="1" placeholder="500000">
                                 <p class="form-help">
-                                    Caps how much a single self-serve invoice can lock up. Leave blank
+                                    Caps how much a single tip jar payment can lock up. Leave blank
                                     for the default (500,000 sats). Effective now:
                                     <strong id="store-selfserve-max-effective">&mdash;</strong> sats.
                                 </p>
                             </div>
 
                             <div class="form-group" id="store-selfserve-link-row" style="display:none;">
-                                <label class="form-label">Public payment link</label>
+                                <label class="form-label">Default tip jar link</label>
                                 <div style="display:flex; gap:0.5rem;">
                                     <input type="text" class="form-input" id="store-selfserve-link" readonly
                                            style="flex:1; font-size:0.8rem;">
                                     <button type="button" class="btn btn-secondary" id="btn-copy-selfserve-link"
                                             style="width:auto; flex:0 0 auto;">Copy</button>
                                 </div>
-                                <p class="form-help">Share this link with your customers.</p>
+                                <p class="form-help">
+                                    The link your store's bare <code>/pay</code> address redirects to.
+                                    Every jar's own link is in the <a href="#" class="js-goto-tipjars">Tip Jars</a> view.
+                                </p>
                             </div>
 
                             <div id="store-selfserve-error" class="hidden" style="margin-top:0.5rem; color: var(--error); font-size: 0.85rem;"></div>
@@ -9473,6 +9747,14 @@ header('Cache-Control: no-cache, must-revalidate');
                 </svg>
                 Invoices
             </button>
+            <button class="nav-item<?= $isManaged ? ' managed-hidden' : '' ?>" data-view="tipjars" id="nav-tipjars">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <rect x="8" y="2" width="8" height="3" rx="1"></rect>
+                    <path d="M7 5h10v2.5a3.5 3.5 0 0 1 1.5 3V19a3 3 0 0 1-3 3h-7a3 3 0 0 1-3-3v-8.5a3.5 3.5 0 0 1 1.5-3z"></path>
+                    <line x1="9" y1="15" x2="15" y2="15"></line>
+                </svg>
+                Tip Jars
+            </button>
             <button class="nav-item" data-view="stores">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                     <path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path>
@@ -9688,7 +9970,7 @@ header('Cache-Control: no-cache, must-revalidate');
             <!-- Link mode: live preview of the shareable self-serve product link. -->
             <div id="cart-link-footer" style="display:none; flex-direction:column; gap:0.5rem; margin-top:0.5rem;">
                 <div id="cart-link-warning" style="display:none; font-size:0.78rem; color:var(--text-secondary); background:rgba(247,147,26,0.12); border:1px solid rgba(247,147,26,0.3); border-radius:8px; padding:0.5rem 0.7rem;">
-                    ⚠️ Self-serve invoices are off for this store, so this link won't work yet. Copy link will offer to turn them on.
+                    ⚠️ Tip jars (public payment links) are off for this store, so this link won't work yet. Copy link will offer to turn them on.
                 </div>
                 <div style="display:flex; gap:0.5rem;">
                     <input type="text" class="form-input" id="cart-link-input" readonly
@@ -9701,18 +9983,19 @@ header('Cache-Control: no-cache, must-revalidate');
         </div>
     </div>
 
-    <!-- Offer to enable self-serve for a product link. An in-app modal (not a
-         native confirm(), which browsers can suppress). z-index sits above the
-         cart modal so it stacks correctly when opened from the link generator. -->
+    <!-- Offer to turn on tip jars (the public-link master switch) for a
+         product link. An in-app modal (not a native confirm(), which browsers
+         can suppress). z-index sits above the cart modal so it stacks
+         correctly when opened from the link generator. -->
     <div class="modal-overlay" id="modal-enable-selfserve" style="z-index: 300;">
         <div class="modal">
             <div class="modal-handle"></div>
-            <div class="modal-title">Enable self-serve invoices?</div>
+            <div class="modal-title">Turn on tip jars?</div>
             <p style="color:var(--text-secondary); font-size:0.9rem; margin:0 0 1rem 0;">
-                Self-serve invoices are off for this store, so the link you just
-                copied won't work until you turn them on.
+                Tip jars (public payment links) are off for this store, so the
+                link you just copied won't work until you turn them on.
             </p>
-            <button class="btn btn-full" id="btn-enable-selfserve-confirm">Enable self-serve invoices</button>
+            <button class="btn btn-full" id="btn-enable-selfserve-confirm">Turn on tip jars</button>
             <button class="btn btn-secondary btn-full" style="margin-top: 0.5rem;" onclick="closeModal('modal-enable-selfserve')">Not now</button>
         </div>
     </div>
@@ -9750,6 +10033,89 @@ header('Cache-Control: no-cache, must-revalidate');
             <div id="product-edit-error" style="color:#ef4444; font-size:0.85rem; margin-bottom:0.5rem; display:none;"></div>
             <button class="btn btn-full" id="btn-save-product">Save product</button>
             <button class="btn btn-secondary btn-full" style="margin-top:0.5rem;" onclick="closeModal('modal-product-edit')">Cancel</button>
+        </div>
+    </div>
+
+    <!-- Tip jar detail: public link + QR, totals, and (admins) edit /
+         enable-disable / delete with an inline confirmation step. -->
+    <div class="modal-overlay" id="modal-tipjar-detail">
+        <div class="modal">
+            <div class="modal-handle"></div>
+            <div class="tipjar-detail-head">
+                <div class="tipjar-detail-emoji" id="tipjar-detail-emoji">&#129753;</div>
+                <div class="modal-title" id="tipjar-detail-name" style="margin-bottom:0.2rem;">Tip jar</div>
+                <div id="tipjar-detail-message" class="tipjar-detail-message"></div>
+                <div id="tipjar-detail-status" style="font-size:0.8rem; color:#f59e0b;"></div>
+            </div>
+            <div class="tipjar-detail-stats">
+                <div><div class="tipjar-stat-value" id="tipjar-detail-received">0 sats</div><div class="tipjar-stat-label">received</div></div>
+                <div><div class="tipjar-stat-value" id="tipjar-detail-count">0</div><div class="tipjar-stat-label">payments</div></div>
+            </div>
+            <div class="form-group">
+                <label class="form-label">Public link</label>
+                <div style="display:flex; gap:0.5rem;">
+                    <input type="text" class="form-input" id="tipjar-detail-link" readonly style="flex:1; min-width:0; font-size:0.8rem;">
+                    <button type="button" class="btn btn-secondary" id="btn-tipjar-copy-link" style="width:auto; flex:0 0 auto;">Copy</button>
+                    <a class="btn btn-secondary" id="tipjar-detail-open" target="_blank" rel="noopener" style="width:auto; flex:0 0 auto;">Open</a>
+                </div>
+                <div id="tipjar-detail-link-warning" class="hidden" style="margin-top:0.4rem; font-size:0.78rem; color:var(--text-secondary); background:rgba(247,147,26,0.12); border:1px solid rgba(247,147,26,0.3); border-radius:8px; padding:0.5rem 0.7rem;"></div>
+            </div>
+            <div id="tipjar-detail-qr" class="tipjar-qr"></div>
+            <button class="btn btn-full" id="btn-tipjar-view-invoices">View invoices</button>
+            <div id="tipjar-detail-admin">
+                <div style="display:flex; gap:0.5rem; margin-top:0.5rem;">
+                    <button class="btn btn-secondary" id="btn-tipjar-edit" style="flex:1;">Edit</button>
+                    <button class="btn btn-secondary" id="btn-tipjar-toggle" style="flex:1;">Disable</button>
+                    <button class="btn btn-secondary" id="btn-tipjar-delete" style="flex:1; color:#ef4444;">Delete</button>
+                </div>
+                <div id="tipjar-delete-confirm" class="hidden" style="margin-top:0.6rem; padding:0.7rem 0.9rem; border:1px solid rgba(239,68,68,0.45); border-radius:10px; background:rgba(239,68,68,0.1);">
+                    <p style="font-size:0.85rem; margin:0 0 0.6rem 0;">
+                        Delete “<strong id="tipjar-delete-name"></strong>”? Its link stops working.
+                        Past invoices are kept and still show the jar's name.
+                    </p>
+                    <div style="display:flex; gap:0.5rem;">
+                        <button class="btn" id="btn-tipjar-delete-confirm" style="flex:1; background:#ef4444;">Delete tip jar</button>
+                        <button class="btn btn-secondary" id="btn-tipjar-delete-cancel" style="flex:1;">Cancel</button>
+                    </div>
+                </div>
+            </div>
+            <button class="btn btn-secondary btn-full" style="margin-top:0.5rem;" onclick="closeModal('modal-tipjar-detail')">Close</button>
+        </div>
+    </div>
+
+    <!-- Tip jar create/edit (admin) -->
+    <div class="modal-overlay" id="modal-tipjar-edit">
+        <div class="modal">
+            <div class="modal-handle"></div>
+            <div class="modal-title" id="tipjar-edit-title">New tip jar</div>
+            <input type="hidden" id="tipjar-edit-id">
+
+            <div class="form-group">
+                <label class="form-label" for="tipjar-edit-name">Name</label>
+                <input type="text" class="form-input" id="tipjar-edit-name" maxlength="60" placeholder="Coffee fund">
+                <p class="form-help">The title of the jar's page. Must be unique within the store.</p>
+            </div>
+            <div class="form-group">
+                <label class="form-label">Emoji</label>
+                <div style="display:flex; gap:0.5rem; align-items:center; flex-wrap:wrap;">
+                    <div id="tipjar-edit-emoji-preview" style="width:56px; height:56px; border-radius:10px; display:flex; align-items:center; justify-content:center; font-size:2rem; background:rgba(0,0,0,0.2); overflow:hidden; flex-shrink:0;">&#129753;</div>
+                    <input type="text" class="form-input" id="tipjar-edit-emoji" placeholder="Emoji" maxlength="8" style="width:120px;">
+                    <button type="button" class="btn btn-secondary" id="btn-tipjar-emoji-pick" title="Pick an emoji" style="width:auto; padding:0.4rem 0.7rem; font-size:1.1rem; line-height:1;">＋</button>
+                    <button type="button" class="btn btn-secondary" id="btn-tipjar-clear-emoji" style="width:auto; padding:0.4rem 0.8rem;">Clear</button>
+                </div>
+                <div id="tipjar-edit-emoji-picker" style="display:none; margin-top:0.5rem; padding:0.5rem; border:1px solid var(--border, rgba(255,255,255,0.1)); border-radius:10px; max-height:180px; overflow-y:auto;">
+                    <div style="display:grid; grid-template-columns:repeat(8, 1fr); gap:0.25rem;"></div>
+                </div>
+                <p class="form-help">Pick one with ＋ or type one. Defaults to &#129753;.</p>
+            </div>
+            <div class="form-group">
+                <label class="form-label" for="tipjar-edit-message">Message to the payer <span style="opacity:0.6;">(optional)</span></label>
+                <textarea class="form-input" id="tipjar-edit-message" maxlength="200" rows="2" placeholder="Thank you for your donation!"></textarea>
+                <p class="form-help">Shown on the jar's page and on the invoice. Up to 200 characters.</p>
+            </div>
+            <div id="tipjar-edit-error" style="color:#ef4444; font-size:0.85rem; margin-bottom:0.5rem; display:none;"></div>
+            <button class="btn btn-full" id="btn-save-tipjar">Save tip jar</button>
+            <button class="btn btn-secondary btn-full" style="margin-top:0.5rem;" onclick="closeModal('modal-tipjar-edit')">Cancel</button>
         </div>
     </div>
 
@@ -10382,6 +10748,7 @@ header('Cache-Control: no-cache, must-revalidate');
             if (prodSortSel) prodSortSel.addEventListener('change', saveProductDefaultSort);
             wireCartModal();
             wireProductEditModal();
+            wireTipJarsView();
 
             // Invoices status filter: persist choice in the URL + refetch.
             const invStatusSel = document.getElementById('invoice-status-filter');
@@ -10405,6 +10772,21 @@ header('Cache-Control: no-cache, must-revalidate');
                         const header = document.getElementById('store-select');
                         if (header) header.value = currentStoreId;
                     }
+                    // A tip jar belongs to one store: drop the jar filter when
+                    // the store changes.
+                    if (invoiceTipJarFilter.id) {
+                        setInvoiceTipJarFilter(null, null);
+                        writeInvoiceFilterToUrl(getInvoiceStatusFilter());
+                    }
+                    invoicesState.offset = 0;
+                    loadInvoices();
+                });
+            }
+            const clearJarBtn = document.getElementById('btn-clear-invoice-tipjar-filter');
+            if (clearJarBtn) {
+                clearJarBtn.addEventListener('click', () => {
+                    setInvoiceTipJarFilter(null, null);
+                    writeInvoiceFilterToUrl(getInvoiceStatusFilter());
                     invoicesState.offset = 0;
                     loadInvoices();
                 });
@@ -10729,6 +11111,14 @@ header('Cache-Control: no-cache, must-revalidate');
                 });
             });
 
+            // Links into the Tip Jars view (store card, invoices banner).
+            document.querySelectorAll('.js-goto-tipjars').forEach(el => {
+                el.addEventListener('click', (e) => {
+                    e.preventDefault();
+                    switchView('tipjars');
+                });
+            });
+
             // Modal close on overlay click
             document.querySelectorAll('.modal-overlay').forEach(overlay => {
                 overlay.addEventListener('click', (e) => {
@@ -10788,6 +11178,7 @@ header('Cache-Control: no-cache, must-revalidate');
             const titles = {
                 dashboard: 'Dashboard',
                 invoices: 'Invoices',
+                tipjars: 'Tip Jars',
                 customers: 'Customers',
                 stores: 'Store Settings',
                 products: 'Products',
@@ -10809,11 +11200,21 @@ header('Cache-Control: no-cache, must-revalidate');
             // Reflect the active view in the URL so refreshes restore it.
             // Invoices keeps its ?status filter (read from the existing URL
             // when we re-enter the view) so the operator's selection survives
-            // both refreshes and navigation across views.
+            // both refreshes and navigation across views. The tip jar filter
+            // (?tip_jar=) is dropped when leaving the view, like status.
+            if (view !== 'invoices') {
+                setInvoiceTipJarFilter(null, null);
+            } else if (opts && opts.replace) {
+                // URL restore / Back-Forward: the URL is the source of truth.
+                // A plain navigation keeps whatever the caller set (the Tip
+                // Jars detail modal's "View invoices").
+                setInvoiceTipJarFilter(readInvoiceTipJarFromUrl() || null, null);
+            }
             writeViewToUrl(view, opts && opts.replace);
 
             if (view === 'invoices') {
                 setInvoiceStatusFilter(readInvoiceFilterFromUrl());
+                renderInvoiceTipJarChip();
                 invoicesState.offset = 0;
                 // Populate (and default to the current store) before loading so
                 // the list matches the dropdown selection on first entry.
@@ -10825,6 +11226,7 @@ header('Cache-Control: no-cache, must-revalidate');
             }
             if (view === 'stores') loadStoreSettings();
             if (view === 'products') loadProductsView();
+            if (view === 'tipjars') loadTipJarsView();
             if (view === 'stats') loadStats();
             if (view === 'log') {
                 adminLogState.offset = 0;
@@ -10878,7 +11280,7 @@ header('Cache-Control: no-cache, must-revalidate');
             let query = '';
             if (view === 'invoices') {
                 const status = readInvoiceFilterFromUrl();
-                if (status) query = 'status=' + encodeURIComponent(status);
+                query = invoicesQueryString(status);
             }
             const url = urlForView(view, query);
             const fn = replace ? history.replaceState : history.pushState;
@@ -11166,6 +11568,10 @@ header('Cache-Control: no-cache, must-revalidate');
             if (document.getElementById('view-products').classList.contains('active')) {
                 loadProductsView();
             }
+            // If on the tip jars view, reload that store's jars
+            if (document.getElementById('view-tipjars').classList.contains('active')) {
+                loadTipJarsView();
+            }
         }
 
         // Populate store selector dropdown
@@ -11416,13 +11822,62 @@ header('Cache-Control: no-cache, must-revalidate');
             return INVOICE_STATUSES.includes(s) ? s : '';
         }
 
+        // Query string for the invoices view URL: ?status= plus the active
+        // tip jar filter chip.
+        function invoicesQueryString(status) {
+            const parts = [];
+            if (status) parts.push('status=' + encodeURIComponent(status));
+            if (invoiceTipJarFilter.id) parts.push('tip_jar=' + encodeURIComponent(invoiceTipJarFilter.id));
+            return parts.join('&');
+        }
+
         function writeInvoiceFilterToUrl(status) {
             // Only touch the URL while the invoices view is the active view,
             // so we don't stomp on other views' URL state.
             const view = document.querySelector('.view.active');
             if (!view || view.id !== 'view-invoices') return;
-            const url = urlForView('invoices', status ? 'status=' + encodeURIComponent(status) : '');
+            const url = urlForView('invoices', invoicesQueryString(status));
             history.replaceState({ view: 'invoices' }, '', url);
+        }
+
+        // Tip jar filter on the Invoices view, set from a jar's "View invoices"
+        // button (or ?tip_jar= in a restored URL). Shown as a chip with ×.
+        const invoiceTipJarFilter = { id: null, name: null };
+
+        function setInvoiceTipJarFilter(id, name) {
+            invoiceTipJarFilter.id = id || null;
+            invoiceTipJarFilter.name = name || null;
+            renderInvoiceTipJarChip();
+        }
+
+        function readInvoiceTipJarFromUrl() {
+            const v = new URLSearchParams(window.location.search).get('tip_jar') || '';
+            return /^jar_[a-f0-9]{12,}$/.test(v) ? v : '';
+        }
+
+        function renderInvoiceTipJarChip() {
+            const wrap = document.getElementById('invoice-tipjar-filter');
+            const label = document.getElementById('invoice-tipjar-filter-label');
+            if (!wrap || !label) return;
+            if (!invoiceTipJarFilter.id) { wrap.classList.add('hidden'); return; }
+            const j = tipJarsCache.find(x => x.id === invoiceTipJarFilter.id);
+            const name = invoiceTipJarFilter.name || (j ? j.name : null);
+            label.textContent = (j ? j.emoji + ' ' : '') + (name || invoiceTipJarFilter.id);
+            wrap.classList.remove('hidden');
+            // Restored from a URL with no cached jar: look the name up once.
+            if (!name && currentStoreId) {
+                const wanted = invoiceTipJarFilter.id;
+                fetch(`${adminUrl}?api=tip_jars&store_id=${encodeURIComponent(currentStoreId)}`, { credentials: 'same-origin' })
+                    .then(r => r.json())
+                    .then(d => {
+                        const hit = (d.jars || []).find(x => x.id === wanted);
+                        if (hit && invoiceTipJarFilter.id === wanted) {
+                            invoiceTipJarFilter.name = hit.name;
+                            label.textContent = hit.emoji + ' ' + hit.name;
+                        }
+                    })
+                    .catch(() => {});
+            }
         }
 
         // The invoices store filter mirrors the global header store selector
@@ -11484,6 +11939,9 @@ header('Cache-Control: no-cache, must-revalidate');
                 const status = getInvoiceStatusFilter();
                 if (status) {
                     url += `&status=${encodeURIComponent(status)}`;
+                }
+                if (invoiceTipJarFilter.id) {
+                    url += `&tip_jar_id=${encodeURIComponent(invoiceTipJarFilter.id)}`;
                 }
                 const response = await fetch(url);
                 const invoices = await response.json();
@@ -12525,8 +12983,16 @@ header('Cache-Control: no-cache, must-revalidate');
                 const itemsLink = inv.hasItems
                     ? ` <span class="inv-chip" title="Cart line items — open the invoice for the itemized list" style="white-space:nowrap;">🛒 items</span>`
                     : '';
-                const noteCell = (description || swapBadge || itemsLink || feeBadge)
-                    ? `<div>${description ? escapeHtml(description) : ''}${swapBadge}${itemsLink}${feeBadge}</div>`
+                // Tip jar the invoice came through: the live jar, else the
+                // metadata snapshot of a since-deleted one.
+                const jarInfo = inv.tipJar
+                    || (inv.metadata && inv.metadata.tipJarName
+                        ? { name: inv.metadata.tipJarName, emoji: inv.metadata.tipJarEmoji || '🫙' } : null);
+                const jarChip = jarInfo
+                    ? ` <span class="inv-chip inv-chip-tipjar" title="Created through this tip jar" style="white-space:nowrap;">${escapeHtml(jarInfo.emoji || '🫙')} ${escapeHtml(jarInfo.name)}</span>`
+                    : '';
+                const noteCell = (description || swapBadge || itemsLink || feeBadge || jarChip)
+                    ? `<div>${description ? escapeHtml(description) : ''}${swapBadge}${itemsLink}${jarChip}${feeBadge}</div>`
                     : '<span style="color: var(--text-secondary);">—</span>';
                 // Customer email captured on the payment screen, with a checkmark
                 // when they opted into the newsletter.
@@ -15820,14 +16286,23 @@ header('Cache-Control: no-cache, must-revalidate');
             }
 
             // Mirror the link onto the Invoices view banner so the feature is
-            // discoverable from where operators manage invoices.
+            // discoverable from where operators manage invoices. With tip
+            // jars on but no jar yet, the banner just points at the view.
             const banner = document.getElementById('card-selfserve-link');
             const bannerLink = document.getElementById('invoices-selfserve-link');
             const bannerOpen = document.getElementById('invoices-selfserve-open');
+            const bannerCopy = document.getElementById('btn-copy-invoices-selfserve-link');
+            const bannerText = document.getElementById('invoices-selfserve-text');
             if (banner && bannerLink) {
-                if (s.effective && s.payUrl) {
-                    bannerLink.value = s.payUrl;
-                    if (bannerOpen) bannerOpen.href = s.payUrl;
+                if (s.effective) {
+                    const hasLink = !!s.payUrl;
+                    bannerLink.value = s.payUrl || '';
+                    bannerLink.style.display = hasLink ? '' : 'none';
+                    if (bannerCopy) bannerCopy.style.display = hasLink ? '' : 'none';
+                    if (bannerOpen) { bannerOpen.href = s.payUrl || '#'; bannerOpen.style.display = hasLink ? '' : 'none'; }
+                    if (bannerText) bannerText.textContent = hasLink
+                        ? 'Share a tip jar link so customers can pay what they want:'
+                        : 'Create a tip jar to get a shareable link.';
                     banner.classList.remove('hidden');
                 } else {
                     banner.classList.add('hidden');
@@ -15866,14 +16341,14 @@ header('Cache-Control: no-cache, must-revalidate');
                 );
                 const result = await response.json();
                 if (response.ok) {
-                    showToast('Store self-serve setting saved', 'success');
+                    showToast('Tip jar settings saved', 'success');
                     await loadDashboard();
                     refreshStoreSelfServeCard();
                 } else {
                     awError('store-selfserve-error', result.error || 'Failed to save');
                 }
             } catch (e) {
-                showToast('Failed to save store self-serve setting', 'error');
+                showToast('Failed to save tip jar settings', 'error');
             }
         }
 
@@ -18719,14 +19194,16 @@ header('Cache-Control: no-cache, must-revalidate');
         // quantities are URL-safe by construction (prod_<hex> and digits), so
         // no encoding is needed and the link stays readable.
         function buildSelfServeProductsUrl(items) {
+            // Product links hang off the bare store URL (no tip jar).
             const ss = dashboardData?.selfserve;
-            if (!ss || !ss.payUrl) return null;
+            const base = ss && ss.storeUrl;
+            if (!base) return null;
             const spec = items
                 .filter(i => i.productId)
                 .map(i => i.quantity > 1 ? `${i.productId}:${i.quantity}` : i.productId)
                 .join(',');
             if (!spec) return null;
-            return ss.payUrl + (ss.payUrl.includes('?') ? '&' : '?') + 'products=' + spec;
+            return base + (base.includes('?') ? '&' : '?') + 'products=' + spec;
         }
 
         // Copy text to the clipboard synchronously from within a click gesture.
@@ -18789,15 +19266,15 @@ header('Cache-Control: no-cache, must-revalidate');
                 `action=save_store_selfserve&store_id=${encodeURIComponent(storeId)}&enabled=1&max_sats=${encodeURIComponent(maxSats)}`)
                 .then(r => r.json().then(d => ({ ok: r.ok, d })))
                 .then(({ ok, d }) => {
-                    if (!ok) { showToast(d.error || 'Failed to enable self-serve invoices', 'error'); return; }
-                    showToast('Self-serve invoices enabled', 'success');
+                    if (!ok) { showToast(d.error || 'Failed to turn on tip jars', 'error'); return; }
+                    showToast('Tip jars turned on', 'success');
                     return loadDashboard().then(() => {
                         refreshStoreSelfServeCard();
                         // Re-render the cart link footer warning if the modal is open.
                         if (document.getElementById('modal-cart').classList.contains('visible')) renderCart();
                     });
                 })
-                .catch(() => showToast('Failed to enable self-serve invoices', 'error'))
+                .catch(() => showToast('Failed to turn on tip jars', 'error'))
                 .finally(() => {
                     if (btn) btn.disabled = false;
                     closeModal('modal-enable-selfserve');
@@ -18842,6 +19319,320 @@ header('Cache-Control: no-cache, must-revalidate');
             if (linkInput) linkInput.value = url;
             copyLinkToClipboard(url, 'Product link copied!');
             offerEnableSelfServe();
+        }
+
+        // ============================ Tip jars ============================
+        // The Tip Jars view: one tile per jar (emoji, name, settled total), a
+        // detail modal (link, QR, totals, admin actions) and an edit modal.
+        // Data comes from ?api=tip_jars for the selected store; writes go
+        // through create_tip_jar / update_tip_jar / delete_tip_jar (admin).
+
+        let tipJarsCache = [];
+        let tipJarsMeta = null;
+        let tipJarDetailId = null;
+
+        // Curated emoji set for the jar picker (gratitude / causes / crafts).
+        const TIP_JAR_EMOJIS = [
+            '🫙','💝','🙏','❤️','🧡','💛','💚','💙','💜','🤍',
+            '☕','🍵','🧋','🍺','🍷','🥂','🍕','🍰','🧁','🍩',
+            '🎸','🎤','🎹','🎷','🥁','🎨','🎭','🎬','📸','📚',
+            '🎁','💐','🌹','🌻','🌱','🍀','⭐','✨','🔥','🌈',
+            '🙌','👏','💪','🤘','✌️','🤝','👋','🫶','💯','🎉',
+            '🐶','🐱','🐾','🏠','🚀','💡','⚡','🛠️','🧹','🚲',
+        ];
+
+        function formatSatsShort(sats) {
+            return Number(sats || 0).toLocaleString() + ' sats';
+        }
+
+        function tipJarFiatText(j) {
+            const m = tipJarsMeta || {};
+            if (j.receivedFiat === null || j.receivedFiat === undefined || !m.storeCurrency || m.storeCurrency === 'sat') return '';
+            return '≈ ' + Number(j.receivedFiat).toFixed(2) + ' ' + m.storeCurrency;
+        }
+
+        async function loadTipJarsView() {
+            const grid = document.getElementById('tipjars-grid');
+            const offCard = document.getElementById('card-tipjars-off');
+            const newBtn = document.getElementById('btn-new-tipjar');
+            if (newBtn) newBtn.style.display = phpUser.role === 'admin' ? '' : 'none';
+            if (!currentStoreId) {
+                if (grid) grid.innerHTML = '<p style="color:var(--text-secondary);">Select a store first.</p>';
+                if (offCard) offCard.classList.add('hidden');
+                return;
+            }
+            if (grid) grid.innerHTML = '<div class="loading"><div class="spinner"></div></div>';
+            try {
+                const r = await fetch(`${adminUrl}?api=tip_jars&store_id=${encodeURIComponent(currentStoreId)}`, { credentials: 'same-origin' });
+                const data = await r.json();
+                if (!r.ok) throw new Error(data.error || 'failed');
+                tipJarsCache = data.jars || [];
+                tipJarsMeta = data;
+                renderTipJars();
+            } catch (e) {
+                if (grid) grid.innerHTML = '<p style="color:#ef4444;">Failed to load tip jars.</p>';
+            }
+        }
+
+        function renderTipJars() {
+            const grid = document.getElementById('tipjars-grid');
+            const offCard = document.getElementById('card-tipjars-off');
+            const offText = document.getElementById('tipjars-off-text');
+            const turnOn = document.getElementById('btn-tipjars-turn-on');
+            if (!grid) return;
+            const m = tipJarsMeta || {};
+            // Master-switch banner: off → offer to turn on (admins, payment-
+            // capable stores); no payment method → explain instead.
+            if (offCard) {
+                if (m.effective) {
+                    offCard.classList.add('hidden');
+                } else {
+                    offCard.classList.remove('hidden');
+                    if (!m.paymentCapable) {
+                        if (offText) offText.textContent = 'This store has no payment method configured (add a Cashu mint or on-chain address first), so tip jar links cannot work yet.';
+                        if (turnOn) turnOn.style.display = 'none';
+                    } else {
+                        if (offText) offText.textContent = 'Tip jars are turned off for this store, so these links won\'t work yet.';
+                        if (turnOn) turnOn.style.display = phpUser.role === 'admin' ? '' : 'none';
+                    }
+                }
+            }
+            if (!tipJarsCache.length) {
+                grid.innerHTML = `<div class="empty-state"><div class="empty-state-icon">🫙</div><p>No tip jars yet.${phpUser.role === 'admin' ? ' Click “New tip jar” to create one.' : ''}</p></div>`;
+                return;
+            }
+            grid.innerHTML = '<div class="jar-grid">' + tipJarsCache.map(j => {
+                const fiat = tipJarFiatText(j);
+                const sub = (fiat ? fiat + ' · ' : '') + j.receivedCount + (j.receivedCount === 1 ? ' payment' : ' payments');
+                return `
+                <button type="button" class="jar-tile${j.enabled ? '' : ' disabled'}" data-jar-id="${escapeAttr(j.id)}" title="${escapeAttr(j.name)}">
+                    <div class="jar-tile-emoji">${escapeHtml(j.emoji)}</div>
+                    <div class="jar-tile-name">${escapeHtml(j.name)}</div>
+                    <div class="jar-tile-amount">${escapeHtml(formatSatsShort(j.receivedSats))}</div>
+                    <div class="jar-tile-sub">${escapeHtml(sub)}</div>
+                    ${j.enabled ? '' : '<span class="jar-tile-badge">off</span>'}
+                </button>`;
+            }).join('') + '</div>';
+            grid.querySelectorAll('.jar-tile').forEach(t => t.addEventListener('click', () => openTipJarDetail(t.dataset.jarId)));
+        }
+
+        function openTipJarDetail(id) {
+            const j = tipJarsCache.find(x => x.id === id);
+            if (!j) return;
+            tipJarDetailId = id;
+            const m = tipJarsMeta || {};
+            document.getElementById('tipjar-detail-emoji').textContent = j.emoji;
+            document.getElementById('tipjar-detail-name').textContent = j.name;
+            const msg = document.getElementById('tipjar-detail-message');
+            msg.textContent = j.message || '';
+            msg.style.display = j.message ? '' : 'none';
+            document.getElementById('tipjar-detail-status').textContent = j.enabled ? '' : 'Disabled — the link returns “not found” until it is enabled again.';
+            const fiat = tipJarFiatText(j);
+            document.getElementById('tipjar-detail-received').textContent = formatSatsShort(j.receivedSats) + (fiat ? ' (' + fiat + ')' : '');
+            document.getElementById('tipjar-detail-count').textContent = String(j.receivedCount);
+            document.getElementById('tipjar-detail-link').value = j.url;
+            document.getElementById('tipjar-detail-open').href = j.url;
+            const warn = document.getElementById('tipjar-detail-link-warning');
+            if (!m.effective) {
+                warn.textContent = m.paymentCapable
+                    ? 'Tip jars are turned off for this store, so this link won\'t work until you turn them on.'
+                    : 'This store has no payment method configured, so this link cannot work yet.';
+                warn.classList.remove('hidden');
+            } else if (!j.enabled) {
+                warn.textContent = 'This tip jar is disabled, so its link won\'t work until you enable it.';
+                warn.classList.remove('hidden');
+            } else {
+                warn.classList.add('hidden');
+            }
+            renderTipJarQr(j.url);
+            document.getElementById('tipjar-detail-admin').style.display = phpUser.role === 'admin' ? '' : 'none';
+            document.getElementById('btn-tipjar-toggle').textContent = j.enabled ? 'Disable' : 'Enable';
+            document.getElementById('tipjar-delete-confirm').classList.add('hidden');
+            document.getElementById('tipjar-delete-name').textContent = j.name;
+            openModal('modal-tipjar-detail');
+        }
+
+        function renderTipJarQr(url) {
+            const box = document.getElementById('tipjar-detail-qr');
+            if (!box) return;
+            try {
+                const qr = qrcode(0, 'M');
+                qr.addData(url);
+                qr.make();
+                box.innerHTML = qr.createSvgTag({ cellSize: 4, margin: 0, scalable: true });
+            } catch (e) {
+                box.innerHTML = '';
+            }
+        }
+
+        function wireTipJarsView() {
+            const on = (id, fn) => { const el = document.getElementById(id); if (el) el.addEventListener('click', fn); };
+            on('btn-new-tipjar', () => openTipJarEditModal(null));
+            on('btn-tipjars-turn-on', turnOnTipJars);
+            on('btn-tipjar-copy-link', () => {
+                const v = document.getElementById('tipjar-detail-link').value;
+                if (v) copyLinkToClipboard(v, 'Tip jar link copied!');
+            });
+            on('btn-tipjar-view-invoices', () => {
+                const j = tipJarsCache.find(x => x.id === tipJarDetailId);
+                closeModal('modal-tipjar-detail');
+                setInvoiceTipJarFilter(j ? j.id : null, j ? j.name : null);
+                switchView('invoices');
+            });
+            on('btn-tipjar-edit', () => { closeModal('modal-tipjar-detail'); openTipJarEditModal(tipJarDetailId); });
+            on('btn-tipjar-toggle', toggleTipJarEnabled);
+            on('btn-tipjar-delete', () => document.getElementById('tipjar-delete-confirm').classList.remove('hidden'));
+            on('btn-tipjar-delete-cancel', () => document.getElementById('tipjar-delete-confirm').classList.add('hidden'));
+            on('btn-tipjar-delete-confirm', deleteTipJar);
+
+            // Edit modal: emoji input + picker grid (same pattern as products).
+            const emoji = document.getElementById('tipjar-edit-emoji');
+            if (emoji) emoji.addEventListener('input', refreshTipJarEmojiPreview);
+            on('btn-tipjar-clear-emoji', () => { if (emoji) emoji.value = ''; refreshTipJarEmojiPreview(); });
+            const picker = document.getElementById('tipjar-edit-emoji-picker');
+            if (picker) {
+                const grid = picker.querySelector('div');
+                grid.innerHTML = TIP_JAR_EMOJIS.map(em =>
+                    `<button type="button" class="tipjar-emoji-opt" data-emoji="${em}" style="background:none; border:0; cursor:pointer; font-size:1.4rem; padding:0.2rem; border-radius:6px;">${em}</button>`
+                ).join('');
+                grid.addEventListener('click', (e) => {
+                    const btn = e.target.closest('.tipjar-emoji-opt');
+                    if (!btn) return;
+                    if (emoji) emoji.value = btn.dataset.emoji;
+                    refreshTipJarEmojiPreview();
+                    picker.style.display = 'none';
+                });
+                on('btn-tipjar-emoji-pick', () => {
+                    picker.style.display = picker.style.display === 'none' ? 'block' : 'none';
+                });
+            }
+            on('btn-save-tipjar', handleTipJarSave);
+        }
+
+        function refreshTipJarEmojiPreview() {
+            const input = document.getElementById('tipjar-edit-emoji');
+            const prev = document.getElementById('tipjar-edit-emoji-preview');
+            if (!input || !prev) return;
+            const v = input.value.trim();
+            prev.textContent = v || ((tipJarsMeta && tipJarsMeta.defaultEmoji) || '🫙');
+        }
+
+        function openTipJarEditModal(id) {
+            if (!ensureAdmin('Only admins can manage tip jars.')) return;
+            if (!currentStoreId) { showToast('Select a store first', 'error'); return; }
+            const j = id ? tipJarsCache.find(x => x.id === id) : null;
+            document.getElementById('tipjar-edit-id').value = j ? j.id : '';
+            document.getElementById('tipjar-edit-title').textContent = j ? 'Edit tip jar' : 'New tip jar';
+            document.getElementById('tipjar-edit-name').value = j ? j.name : '';
+            document.getElementById('tipjar-edit-emoji').value = (j && j.emojiRaw) ? j.emojiRaw : '';
+            document.getElementById('tipjar-edit-message').value = j ? (j.message || '') : '';
+            document.getElementById('tipjar-edit-error').style.display = 'none';
+            document.getElementById('tipjar-edit-emoji-picker').style.display = 'none';
+            refreshTipJarEmojiPreview();
+            openModal('modal-tipjar-edit');
+            document.getElementById('tipjar-edit-name').focus();
+        }
+
+        function tipJarEditError(msg) {
+            const el = document.getElementById('tipjar-edit-error');
+            el.textContent = msg;
+            el.style.display = 'block';
+        }
+
+        // The store card / invoices banner show the default jar's link, which
+        // changes when jars are created, deleted or toggled.
+        function refreshTipJarDependents() {
+            return loadDashboard().then(() => refreshStoreSelfServeCard()).catch(() => {});
+        }
+
+        async function handleTipJarSave() {
+            const id = document.getElementById('tipjar-edit-id').value;
+            const name = document.getElementById('tipjar-edit-name').value.trim();
+            const emoji = document.getElementById('tipjar-edit-emoji').value.trim();
+            const message = document.getElementById('tipjar-edit-message').value.trim();
+            document.getElementById('tipjar-edit-error').style.display = 'none';
+            if (!name) { tipJarEditError('Name is required'); return; }
+            let body = `store_id=${encodeURIComponent(currentStoreId)}&name=${encodeURIComponent(name)}`
+                + `&emoji=${encodeURIComponent(emoji)}&message=${encodeURIComponent(message)}`;
+            body = (id ? `action=update_tip_jar&tip_jar_id=${encodeURIComponent(id)}&` : 'action=create_tip_jar&') + body;
+            const btn = document.getElementById('btn-save-tipjar');
+            btn.disabled = true;
+            try {
+                const r = await postWithCsrf(adminUrl, body);
+                const d = await r.json();
+                if (!r.ok || !d.success) { tipJarEditError(d.error || 'Failed to save'); return; }
+                closeModal('modal-tipjar-edit');
+                showToast(id ? 'Tip jar saved' : 'Tip jar created', 'success');
+                await loadTipJarsView();
+                if (id) openTipJarDetail(id);
+                if (!id) refreshTipJarDependents();
+            } catch (e) {
+                tipJarEditError('Failed to save');
+            } finally {
+                btn.disabled = false;
+            }
+        }
+
+        async function toggleTipJarEnabled() {
+            const j = tipJarsCache.find(x => x.id === tipJarDetailId);
+            if (!j || !ensureAdmin('Only admins can manage tip jars.')) return;
+            try {
+                const r = await postWithCsrf(adminUrl,
+                    `action=update_tip_jar&store_id=${encodeURIComponent(currentStoreId)}&tip_jar_id=${encodeURIComponent(j.id)}&enabled=${j.enabled ? '0' : '1'}`);
+                const d = await r.json();
+                if (!r.ok || !d.success) { showToast(d.error || 'Failed', 'error'); return; }
+                showToast(j.enabled ? 'Tip jar disabled' : 'Tip jar enabled', 'success');
+                await loadTipJarsView();
+                openTipJarDetail(j.id);
+                refreshTipJarDependents();
+            } catch (e) {
+                showToast('Failed', 'error');
+            }
+        }
+
+        async function deleteTipJar() {
+            const j = tipJarsCache.find(x => x.id === tipJarDetailId);
+            if (!j || !ensureAdmin('Only admins can manage tip jars.')) return;
+            const btn = document.getElementById('btn-tipjar-delete-confirm');
+            btn.disabled = true;
+            try {
+                const r = await postWithCsrf(adminUrl,
+                    `action=delete_tip_jar&store_id=${encodeURIComponent(currentStoreId)}&tip_jar_id=${encodeURIComponent(j.id)}`);
+                const d = await r.json();
+                if (!r.ok || !d.success) { showToast(d.error || 'Failed to delete', 'error'); return; }
+                closeModal('modal-tipjar-detail');
+                showToast('Tip jar deleted', 'success');
+                await loadTipJarsView();
+                refreshTipJarDependents();
+            } catch (e) {
+                showToast('Failed to delete', 'error');
+            } finally {
+                btn.disabled = false;
+            }
+        }
+
+        // Master switch from the Tip Jars view: the same save as the store
+        // card (keeps the current cap), then refresh both.
+        async function turnOnTipJars() {
+            if (!ensureAdmin('Only admins can change store settings.')) return;
+            if (!currentStoreId) return;
+            const ss = dashboardData?.selfserve;
+            const maxSats = (ss && ss.maxSatsOverride != null) ? ss.maxSatsOverride : '';
+            const btn = document.getElementById('btn-tipjars-turn-on');
+            if (btn) btn.disabled = true;
+            try {
+                const r = await postWithCsrf(adminUrl,
+                    `action=save_store_selfserve&store_id=${encodeURIComponent(currentStoreId)}&enabled=1&max_sats=${encodeURIComponent(maxSats)}`);
+                const d = await r.json();
+                if (!r.ok) { showToast(d.error || 'Failed to turn on tip jars', 'error'); return; }
+                showToast('Tip jars turned on', 'success');
+                await loadTipJarsView();
+                refreshTipJarDependents();
+            } catch (e) {
+                showToast('Failed to turn on tip jars', 'error');
+            } finally {
+                if (btn) btn.disabled = false;
+            }
         }
 
         // ---- Invoice detail modal ----
@@ -18955,6 +19746,7 @@ header('Cache-Control: no-cache, must-revalidate');
                 ${invdRow('Method', method)}
                 ${invdRow('Destination', destination)}
                 ${invdRow('Note', meta.itemDesc ? escapeHtml(String(meta.itemDesc)) : '')}
+                ${invdRow('Tip jar', d.tipJar ? `<span id="invoice-detail-tipjar">${escapeHtml((d.tipJar.emoji || '🫙') + ' ' + d.tipJar.name)}</span>${d.tipJar.live ? '' : ' <span style="color:var(--text-secondary); font-size:0.78rem;">(deleted)</span>'}` : '')}
                 ${invdRow('Order reference', meta.orderId ? escapeHtml(String(meta.orderId)) : '')}
                 ${invdRow('Customer', email)}
                 ${invdRow('Receipt requested', det.payerReceiptRequested ? 'yes (sent when the payment settles)' : '')}

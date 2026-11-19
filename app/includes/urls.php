@@ -229,6 +229,20 @@ class Urls {
     }
 
     /**
+     * Public link for one tip jar (/pay/{storeId}/{jarId}). Same mode handling
+     * as selfServe(); the bare store link (selfServe) redirects to the store's
+     * oldest enabled jar for links shared before jars existed.
+     */
+    public static function tipJar(string $storeId, string $jarId): string {
+        $base = rtrim(Config::getBaseUrl(), '/');
+        $mode = Config::getUrlMode();
+        $path = rawurlencode($storeId) . '/' . rawurlencode($jarId);
+        if ($mode === 'clean')  return $base . '/pay/' . $path;
+        if ($mode === 'router') return $base . '/router.php/pay/' . $path;
+        return $base . '/pay.php?store=' . urlencode($storeId) . '&jar=' . urlencode($jarId); // direct
+    }
+
+    /**
      * Get the API key authorization (pairing) URL
      *
      * @param array $params Query parameters for the authorization request

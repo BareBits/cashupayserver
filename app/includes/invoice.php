@@ -356,6 +356,10 @@ class Invoice {
         // the admin Request modal / self-serve page / API opt-in — see
         // Config::getSharedInvoiceLifetime.
         $longLived = !empty($options['long_lived']);
+        // Tip jar the invoice was created through (pay.php), for the per-jar
+        // totals in the admin Tip Jars view. NULL for every other path.
+        $tipJarId = isset($options['tip_jar_id']) && (string)$options['tip_jar_id'] !== ''
+            ? (string)$options['tip_jar_id'] : null;
         $lifetimeSec = isset($options['lifetime_sec'])
             ? max(60, (int)$options['lifetime_sec'])
             : Config::getInvoiceExpiration();
@@ -1089,6 +1093,7 @@ class Invoice {
             'expiration_time' => $expiration,
             'long_lived' => $longLived ? 1 : 0,
             'ln_expires_at' => $lnExpiresAt,
+            'tip_jar_id' => $tipJarId,
         ]);
 
         // Persist the swap_attempts row, now that the invoice exists for the FK.

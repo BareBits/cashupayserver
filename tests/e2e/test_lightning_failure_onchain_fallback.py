@@ -36,6 +36,7 @@ import requests
 
 from conftest import ConfiguredPayserver
 from fixtures import binaries, ports
+from fixtures.tip_jars import ensure_tip_jar
 from fixtures.nostr_crypto import generate_privkey, pubkey_xonly
 from fixtures.onchain import TEST_TPUB, configure_store_for_onchain
 
@@ -116,6 +117,9 @@ def _enable_selfserve(configured: ConfiguredPayserver, max_sats: int) -> None:
             "UPDATE stores SET selfserve_enabled = 1, selfserve_max_sats = ? WHERE id = ?",
             (max_sats, configured.store_id),
         )
+    # The bare /pay/{store} POST is served against the store's default tip
+    # jar, so one has to exist.
+    ensure_tip_jar(configured.handle, configured.store_id)
 
 
 def _reset_store(configured: ConfiguredPayserver) -> None:

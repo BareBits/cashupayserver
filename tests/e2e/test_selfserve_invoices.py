@@ -1,18 +1,22 @@
-"""Browser + HTTP e2e for self-serve invoices (the public /pay/{storeId} page).
+"""Browser + HTTP e2e for the tip jar master switch and the public pay page,
+driven through the pre-tip-jar /pay/{storeId} link (which redirects a GET to
+the store's default jar and serves a POST against it in place).
 
 Covers the customer-facing surface:
-  - When self-serve is disabled (the default) the page 404s, so store IDs and
-    the feature itself aren't discoverable.
-  - When enabled for the store, the form renders and a customer can create +
-    be redirected to a real, payable invoice.
+  - When tip jars are off (the default) the page 404s, so store IDs and the
+    feature itself aren't discoverable.
+  - When on for the store, the form renders and a customer can create + be
+    redirected to a real, payable invoice.
   - Untrusted input is enforced: an amount above the per-store maximum is
     rejected with a clear error instead of creating an oversized invoice.
 
-Self-serve is store-only: the enable toggle + max are seeded directly on the
-stores row (the same columns SelfServe writes) to keep the test focused on the
-public page rather than the admin UI; the resolution + validation logic itself
-is unit-tested in tests/php/test_selfserve_resolution.php and
-test_selfserve_validation.php.
+The master switch + max are seeded directly on the stores row (the same
+selfserve_* columns SelfServe writes — the column names predate the rename)
+and a default jar is seeded alongside, to keep the test focused on the public
+page rather than the admin UI; the resolution + validation logic itself is
+unit-tested in tests/php/test_selfserve_resolution.php and
+test_selfserve_validation.php, the jar model in tests/php/test_tip_jars.php,
+and the per-jar surfaces in tests/e2e/test_tip_jars.py.
 """
 from __future__ import annotations
 
@@ -23,6 +27,7 @@ import requests
 
 from conftest import ConfiguredPayserver, DEFAULT_ADMIN_PASSWORD
 from fixtures.browser import expand_settings_cards
+from fixtures.tip_jars import ensure_tip_jar
 
 
 def _enable_store_selfserve(shared_configured: ConfiguredPayserver, enabled: bool = True) -> None:
@@ -31,6 +36,9 @@ def _enable_store_selfserve(shared_configured: ConfiguredPayserver, enabled: boo
             "UPDATE stores SET selfserve_enabled = ? WHERE id = ?",
             (1 if enabled else 0, shared_configured.store_id),
         )
+    if enabled:
+        # The bare /pay/{store} link resolves to the store's default jar.
+        ensure_tip_jar(shared_configured.handle, shared_configured.store_id)
 
 
 def _set_store_max(shared_configured: ConfiguredPayserver, max_sats) -> None:
@@ -69,6 +77,9 @@ def test_pay_page_renders_when_enabled(shared_configured: ConfiguredPayserver) -
     _enable_store_selfserve(shared_configured)
     r = requests.get(f"{shared_configured.handle.url}/pay/{shared_configured.store_id}", timeout=15)
     assert r.status_code == 200, r.text
+    # The bare store link redirected onto the default jar's own link.
+    assert r.history and r.history[0].status_code == 302, "bare /pay/{store} should redirect to the default jar"
+    assert f"/pay/{shared_configured.store_id}/jar_" in r.url, r.url
     assert "Continue to payment" in r.text
     # Sat-only store: the max hint is shown.
     assert "Maximum" in r.text
@@ -132,7 +143,7 @@ def test_create_and_redirect_to_payment(shared_configured: ConfiguredPayserver, 
     # Filter by store_id: on the shared server other tests' invoices coexist.
     with shared_configured.handle.db() as db:
         row = db.execute(
-            "SELECT store_id, status, amount, currency, metadata FROM invoices "
+            "SELECT store_id, status, amount, currency, metadata, tip_jar_id FROM invoices "
             "WHERE store_id = ? ORDER BY created_at DESC LIMIT 1",
             (shared_configured.store_id,),
         ).fetchone()
@@ -142,6 +153,9 @@ def test_create_and_redirect_to_payment(shared_configured: ConfiguredPayserver, 
     assert str(row["amount"]) == "1500"
     assert (row["currency"] or "").upper() == "SAT"
     assert "e2e self-serve test" in (row["metadata"] or "")
+    # Created through the default jar: tagged + snapshotted.
+    assert str(row["tip_jar_id"] or "").startswith("jar_"), row["tip_jar_id"]
+    assert "tipJarName" in (row["metadata"] or "")
 
 
 def _seed_usd_rate(shared_configured: ConfiguredPayserver, btc_usd: float) -> None:
@@ -352,7 +366,7 @@ def test_site_selfserve_card_gone_and_store_card_round_trips(
         page.wait_for_timeout(1000)
         toast_text = page.text_content("#toast")
         toast_class = page.get_attribute("#toast", "class") or ""
-        assert toast_text == "Store self-serve setting saved", toast_text
+        assert toast_text == "Tip jar settings saved", toast_text
         assert "error" not in toast_class.split(), toast_class
         assert _store_selfserve_flag(shared_configured) == 1, "enable must persist on the stores row"
 
@@ -384,7 +398,7 @@ def test_admin_save_store_selfserve_shows_success(
         page.wait_for_timeout(1000)
         toast_text = page.text_content("#toast")
         toast_class = page.get_attribute("#toast", "class") or ""
-        assert toast_text == "Store self-serve setting saved", toast_text
+        assert toast_text == "Tip jar settings saved", toast_text
         assert "error" not in toast_class.split(), toast_class
     finally:
         ctx.close()

@@ -44,9 +44,11 @@ function has_table(string $table): bool {
     return (int)($r['n'] ?? 0) > 0;
 }
 
-// A fresh install has the newest marker artifact (the stores.ecx_xpub
-// column, eCash ECX rail) AND the older migration artifacts.
-assert_true(has_col('stores', 'ecx_xpub'), 'fresh install has the current marker column');
+// A fresh install has the newest marker artifact (the invoices.tip_jar_id
+// column, tip jars) AND the older migration artifacts.
+assert_true(has_col('invoices', 'tip_jar_id'), 'fresh install has the current marker column');
+assert_true(has_table('tip_jars'), 'fresh install has the tip_jars table');
+assert_true(has_col('stores', 'ecx_xpub'), 'fresh install has the previous marker column');
 assert_true(has_table('ecx_payments'), 'fresh install has the ECX observations table');
 assert_true(has_table('ecx_fee_credits'), 'fresh install has the ECX fee ledger');
 assert_true(has_col('stores', 'onchain_provider_fallback'), 'fresh install has the previous marker column');
@@ -73,7 +75,7 @@ assert_true(has_col('melts', 'melt_quote_id'), 'fresh install has older migratio
 // Simulate a pre-merge install: the newest artifacts are missing, but older
 // ones are still present — exactly the state of a running instance when it
 // pulls code that adds a new migration.
-Database::getInstance()->exec("ALTER TABLE stores DROP COLUMN ecx_xpub");
+Database::getInstance()->exec("ALTER TABLE invoices DROP COLUMN tip_jar_id");
 Database::getInstance()->exec("DROP TABLE ecx_payments");
 Database::getInstance()->exec("DROP TABLE ecx_fee_credits");
 Database::getInstance()->exec("ALTER TABLE stores DROP COLUMN onchain_provider_fallback");
@@ -94,7 +96,8 @@ Database::getInstance()->exec("ALTER TABLE melts DROP COLUMN strike_invoice_id")
 Database::getInstance()->exec("ALTER TABLE invoices DROP COLUMN strike_invoice_id");
 Database::getInstance()->exec("ALTER TABLE invoices DROP COLUMN strike_api_key");
 Database::getInstance()->exec("ALTER TABLE stores DROP COLUMN onchain_offer_enabled");
-assert_false(has_col('stores', 'onchain_provider_fallback'), 'pre-merge: marker column dropped');
+assert_false(has_col('invoices', 'tip_jar_id'), 'pre-merge: marker column dropped');
+assert_false(has_col('stores', 'onchain_provider_fallback'), 'pre-merge: previous marker column dropped');
 assert_false(has_col('stores', 'wallet_tabs'), 'pre-merge: previous marker column dropped');
 assert_false(has_col('invoices', 'ln_expires_at'), 'pre-merge: previous marker column dropped');
 assert_false(has_table('invoice_ln_quotes'), 'pre-merge: superseded-quote table dropped');
@@ -110,7 +113,9 @@ assert_true(has_col('melts', 'melt_quote_id'), 'pre-merge: older artifacts still
 // First DB access after the "deploy" must re-run migrations and re-add them.
 reset_db_singleton();
 Database::getInstance();
-assert_true(has_col('stores', 'onchain_provider_fallback'), 'getInstance() self-heals the marker column');
+assert_true(has_col('invoices', 'tip_jar_id'), 'getInstance() self-heals the marker column');
+assert_true(has_table('ecx_payments'), 'getInstance() self-heals the ECX observations table');
+assert_true(has_col('stores', 'onchain_provider_fallback'), 'getInstance() self-heals the previous marker column');
 assert_true(has_col('stores', 'wallet_tabs'), 'getInstance() self-heals the previous marker column');
 assert_true(has_col('invoices', 'ln_expires_at'), 'getInstance() self-heals the previous marker column');
 assert_true(has_col('invoices', 'long_lived'), 'getInstance() self-heals the long-lived flag');

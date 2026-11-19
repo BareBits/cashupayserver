@@ -119,11 +119,16 @@ if (preg_match('#^/i/([^/]+)$#', $uri, $matches)) {
 }
 
 // -----------------------------------------------------------------------------
-// Self-serve invoice page: /pay/{storeId} — public, unauthenticated page where
-// a customer creates and pays their own invoice (gated per store; see pay.php).
+// Tip jar page: /pay/{storeId}/{jarId} — public, unauthenticated page where a
+// customer creates and pays their own invoice (gated per store + per jar; see
+// pay.php). The bare /pay/{storeId} form is the pre-tip-jar link: it redirects
+// to the store's default jar, and still serves ?products= product links.
 // -----------------------------------------------------------------------------
-if (preg_match('#^/pay/([^/]+)$#', $uri, $matches)) {
+if (preg_match('#^/pay/([^/]+)(?:/([^/]+))?$#', $uri, $matches)) {
     $_GET['store'] = $matches[1];
+    if (isset($matches[2]) && $matches[2] !== '') {
+        $_GET['jar'] = $matches[2];
+    }
     require __DIR__ . '/pay.php';
     exit;
 }
