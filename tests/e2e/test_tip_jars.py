@@ -503,7 +503,15 @@ def test_tip_jars_view_off_banner_turns_switch_on(shared_configured: ConfiguredP
     delete_tip_jars(cfg.handle, cfg.store_id)
     ctx, page = _login_page(cfg, browser)
     try:
+        # The sidebar entry is always there — a store with the switch off and
+        # no jars at all still gets the icon (that is how you reach the view
+        # to create the first one); only managed installs hide it.
+        page.goto(_url(cfg, "/admin"), wait_until="networkidle")
+        nav = page.locator("#nav-tipjars")
+        assert nav.is_visible(), "Tip Jars nav must show for a store with no jars"
+        assert "hidden" not in (nav.get_attribute("class") or "").split()
         _goto_tipjars(cfg, page)
+        assert page.locator("#tipjars-grid .empty-state").is_visible()
         banner = page.locator("#card-tipjars-off")
         assert banner.is_visible()
         assert "turned off" in page.locator("#tipjars-off-text").inner_text()
