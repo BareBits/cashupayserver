@@ -5546,6 +5546,23 @@ header('Cache-Control: no-cache, must-revalidate');
             border-color: var(--accent);
         }
 
+        /* Inline sign-in error. The global toast sits at z-index 300, below
+           the lock screen's 1000, so a toast fired on a wrong password was
+           drawn behind the opaque lock screen and never seen. The message
+           lives inside the form instead; :empty keeps the slot collapsed
+           until there is something to say. */
+        .lock-error {
+            color: var(--error);
+            font-size: 0.85rem;
+            text-align: center;
+            margin-top: 0.75rem;
+            line-height: 1.3;
+        }
+
+        .lock-error:empty {
+            display: none;
+        }
+
         /* App Shell */
         .app {
             display: none;
@@ -5942,7 +5959,9 @@ header('Cache-Control: no-cache, must-revalidate');
             flex: 1 1 140px;
             min-width: 0;
             padding: 0.75rem;
-            background: rgba(255, 255, 255, 0.2);
+            /* Solid white on the orange card: the translucent tint read as
+               part of the gradient rather than as a button. */
+            background: #ffffff;
             border: none;
             border-radius: 12px;
             color: #000;
@@ -5957,7 +5976,7 @@ header('Cache-Control: no-cache, must-revalidate');
         }
 
         .balance-btn:hover {
-            background: rgba(255, 255, 255, 0.3);
+            background: #f0f0f0;
         }
 
         /* Cards */
@@ -7263,6 +7282,7 @@ header('Cache-Control: no-cache, must-revalidate');
             <input type="password" id="password-input" placeholder="Password"
                    autocomplete="current-password">
             <button class="btn btn-full" id="password-submit">Unlock</button>
+            <div class="lock-error" id="login-error" role="alert" data-testid="login-error"></div>
             <button class="btn-link" id="forgot-password-link" type="button"
                     style="background:none;border:0;color:var(--text-secondary);text-decoration:underline;cursor:pointer;margin-top:0.75rem;font-size:0.85rem;">
                 Forgot password?
@@ -10527,6 +10547,10 @@ header('Cache-Control: no-cache, must-revalidate');
         function showLockScreen() {
             document.getElementById('lock-screen').classList.remove('hidden');
             document.getElementById('app').classList.remove('visible');
+            // A session expiry relocks the screen: don't greet the operator
+            // with the error from an earlier, unrelated attempt.
+            const err = document.getElementById('login-error');
+            if (err) err.textContent = '';
         }
 
         async function showApp() {
@@ -10581,14 +10605,31 @@ header('Cache-Control: no-cache, must-revalidate');
 
         // Event Listeners
         function setupEventListeners() {
-            // Password login
-            document.getElementById('password-submit').addEventListener('click', async () => {
-                const username = document.getElementById('username-input').value.trim();
-                const password = document.getElementById('password-input').value;
+            // Password login. Feedback goes into #login-error inside the
+            // form: the toast is layered below the lock screen, so anything
+            // sent there while locked is invisible.
+            const loginErrorEl = document.getElementById('login-error');
+            const usernameInput = document.getElementById('username-input');
+            const passwordInput = document.getElementById('password-input');
+            const unlockBtn = document.getElementById('password-submit');
+            const setLoginError = (msg) => { loginErrorEl.textContent = msg || ''; };
+            unlockBtn.addEventListener('click', async () => {
+                if (unlockBtn.disabled) return; // Enter + click racing one request
+                const username = usernameInput.value.trim();
+                const password = passwordInput.value;
+                setLoginError('');
                 if (!username) {
-                    showToast('Username is required', 'error');
+                    setLoginError('Username is required');
+                    usernameInput.focus();
                     return;
                 }
+                if (!password) {
+                    // Don't spend a lockout attempt on an obviously empty form.
+                    setLoginError('Password is required');
+                    passwordInput.focus();
+                    return;
+                }
+                unlockBtn.disabled = true;
                 try {
                     const response = await fetch(adminUrl, {
                         method: 'POST',
@@ -10616,19 +10657,38 @@ header('Cache-Control: no-cache, must-revalidate');
 
                         showApp();
                     } else {
-                        showToast('Invalid username or password', 'error');
+                        // 401 carries "Invalid username or password"; 429 the
+                        // lockout countdown. Fall back per status when the
+                        // body isn't the JSON we expect (proxy error pages).
+                        let message = '';
+                        try {
+                            const err = await response.json();
+                            if (err && typeof err.error === 'string') message = err.error;
+                        } catch (_) { /* non-JSON body */ }
+                        if (!message) {
+                            message = response.status === 429
+                                ? 'Too many failed attempts. Please wait and try again.'
+                                : 'Invalid username or password';
+                        }
+                        setLoginError(message);
+                        passwordInput.value = '';
+                        passwordInput.focus();
                     }
                 } catch (e) {
-                    showToast('Login failed', 'error');
+                    setLoginError('Login failed. Check your connection and try again.');
+                } finally {
+                    unlockBtn.disabled = false;
                 }
             });
 
-            ['username-input', 'password-input'].forEach(id => {
-                document.getElementById(id).addEventListener('keypress', (e) => {
+            [usernameInput, passwordInput].forEach(el => {
+                el.addEventListener('keypress', (e) => {
                     if (e.key === 'Enter') {
-                        document.getElementById('password-submit').click();
+                        unlockBtn.click();
                     }
                 });
+                // A fresh keystroke means a fresh attempt: drop the stale message.
+                el.addEventListener('input', () => setLoginError(''));
             });
 
             // ----- Password recovery (lock screen) -----
