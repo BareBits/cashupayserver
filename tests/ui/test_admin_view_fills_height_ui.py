@@ -206,3 +206,63 @@ def test_invoices_list_card_fills_height(shared_configured: ConfiguredPayserver,
         f"invoices list card stops {gap:.1f}px above the bottom of .main; "
         f"expected it to grow and fill (within {_BOTTOM_SLACK_PX}px)"
     )
+
+
+@pytest.mark.parametrize("width", [390, 360, 320])
+def test_bottom_nav_items_fit_one_line_on_phones(
+    shared_configured: ConfiguredPayserver, page, width
+) -> None:
+    """The admin role sees nine bottom-nav items. On phone widths they must
+    all fit on one line with no label wrapped or clipped (the tip-jars entry
+    once pushed "Tip Jars" onto two lines, growing the bar past .main's
+    reserve and overlapping "Customers" onto "Stats"), and the reserve must
+    be at least as tall as the bar actually is."""
+    configured = shared_configured
+    page.set_viewport_size({"width": width, "height": 844})
+    page.set_default_timeout(15000)
+    page.goto(f"{configured.handle.url}/admin")
+    page.fill("#password-input", configured.admin_password)
+    page.click("#password-submit")
+    page.wait_for_selector("#app", state="visible")
+    page.wait_for_selector("#nav-log:not(.hidden)")  # admin-only items revealed
+
+    geom = page.evaluate(
+        """() => {
+            const nav = document.querySelector('.nav');
+            const items = [...nav.querySelectorAll('.nav-item')]
+                .filter(e => getComputedStyle(e).display !== 'none');
+            const navRect = nav.getBoundingClientRect();
+            return {
+                fixedBottomBar: getComputedStyle(nav).position === 'fixed'
+                    && navRect.top > window.innerHeight / 2,
+                navHeight: navRect.height,
+                reserve: parseFloat(getComputedStyle(document.querySelector('.main')).paddingBottom),
+                items: items.map(e => {
+                    const l = e.querySelector('.nav-label');
+                    const r = e.getBoundingClientRect();
+                    return {
+                        view: e.dataset.view,
+                        label: l.textContent.trim(),
+                        clipped: l.scrollWidth > l.clientWidth,
+                        // line-height is "normal" here, so count lines against
+                        // the font size (one line is ~1.15-1.3em tall).
+                        labelLines: Math.round(l.getBoundingClientRect().height
+                                              / (1.2 * parseFloat(getComputedStyle(l).fontSize))),
+                        left: r.left, right: r.right,
+                    };
+                }),
+            };
+        }"""
+    )
+    assert geom["fixedBottomBar"], geom
+    assert len(geom["items"]) == 9, [i["view"] for i in geom["items"]]
+    for item in geom["items"]:
+        assert not item["clipped"], item
+        assert item["labelLines"] == 1, item
+    # Items sit side by side inside the viewport, never overlapping.
+    xs = sorted(geom["items"], key=lambda i: i["left"])
+    for a, b in zip(xs, xs[1:]):
+        assert a["right"] <= b["left"] + 0.5, (a, b)
+    assert xs[0]["left"] >= 0 and xs[-1]["right"] <= width + 0.5, (xs[0], xs[-1])
+    # One row of items: the bar is no taller than the room kept for it.
+    assert geom["navHeight"] <= geom["reserve"], geom

@@ -5823,11 +5823,41 @@ header('Cache-Control: no-cache, must-revalidate');
             height: 24px;
         }
 
+        /* Phone-width bottom bar. An admin sees nine items; with 1rem side
+           padding and wrapping labels, "Tip Jars" broke onto two lines, the
+           bar grew past the reserve .main keeps for it, and "Customers"
+           spilled over "Stats". Items size to their label (equal slots can't
+           fit "Customers" at any legible size, while the nine natural widths
+           total well under 360px), labels stay on one line, and only on a
+           screen too narrow even for that do they shrink and clip. */
+        @media (max-width: 767.98px) {
+            .nav-item {
+                flex: 0 1 auto;
+                min-width: 0;
+                padding: 0.5rem 0.125rem;
+                /* 0.7rem at 390px wide, easing towards 0.55rem on the
+                   narrowest phones: the nine labels then fit unclipped from
+                   320px up. */
+                font-size: clamp(0.55rem, 2.9vw, 0.7rem);
+            }
+
+            .nav-label {
+                max-width: 100%;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+        }
+
         /* Main Content */
         .main {
             flex: 1;
             padding: 1rem;
-            padding-bottom: calc(5rem + env(safe-area-inset-bottom));
+            /* Room for the fixed bottom bar: its measured height (set on
+               :root by syncNavReserve) rather than a guess, so a taller bar
+               can never hide the view footer behind it again. The fallback
+               covers the first paint before the observer fires. */
+            padding-bottom: calc(var(--nav-height, calc(5rem + env(safe-area-inset-bottom))) + 0.5rem);
             /* Fill the full available width (right of the fixed sidebar on
                desktop) rather than a centered, boxed column. */
             max-width: none;
@@ -9756,7 +9786,7 @@ header('Cache-Control: no-cache, must-revalidate');
                     <path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path>
                     <polyline points="9 22 9 12 15 12 15 22"></polyline>
                 </svg>
-                Home
+                <span class="nav-label">Home</span>
             </button>
             <button class="nav-item" data-view="invoices">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -9765,7 +9795,7 @@ header('Cache-Control: no-cache, must-revalidate');
                     <line x1="16" y1="13" x2="8" y2="13"></line>
                     <line x1="16" y1="17" x2="8" y2="17"></line>
                 </svg>
-                Invoices
+                <span class="nav-label">Invoices</span>
             </button>
             <button class="nav-item<?= $isManaged ? ' managed-hidden' : '' ?>" data-view="tipjars" id="nav-tipjars">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -9773,20 +9803,20 @@ header('Cache-Control: no-cache, must-revalidate');
                     <path d="M7 5h10v2.5a3.5 3.5 0 0 1 1.5 3V19a3 3 0 0 1-3 3h-7a3 3 0 0 1-3-3v-8.5a3.5 3.5 0 0 1 1.5-3z"></path>
                     <line x1="9" y1="15" x2="15" y2="15"></line>
                 </svg>
-                Tip Jars
+                <span class="nav-label">Tip Jars</span>
             </button>
             <button class="nav-item" data-view="stores">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                     <path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path>
                     <path d="M9 22V12h6v10"></path>
                 </svg>
-                Store
+                <span class="nav-label">Store</span>
             </button>
             <button class="nav-item hidden<?= $isManaged ? ' managed-hidden' : '' ?>" data-view="products" data-admin-only="true" id="nav-products">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                     <path d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4"></path>
                 </svg>
-                Products
+                <span class="nav-label">Products</span>
             </button>
             <button class="nav-item hidden" data-view="stats" data-admin-only="true" id="nav-stats">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -9794,7 +9824,7 @@ header('Cache-Control: no-cache, must-revalidate');
                     <line x1="12" y1="20" x2="12" y2="4"></line>
                     <line x1="6" y1="20" x2="6" y2="14"></line>
                 </svg>
-                Stats
+                <span class="nav-label">Stats</span>
             </button>
             <button class="nav-item hidden<?= $isManaged ? ' managed-hidden' : '' ?>" data-view="customers" data-admin-only="true" id="nav-customers">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -9803,21 +9833,21 @@ header('Cache-Control: no-cache, must-revalidate');
                     <path d="M23 21v-2a4 4 0 0 0-3-3.87"></path>
                     <path d="M16 3.13a4 4 0 0 1 0 7.75"></path>
                 </svg>
-                Customers
+                <span class="nav-label">Customers</span>
             </button>
             <button class="nav-item hidden" data-view="log" data-admin-only="true" id="nav-log">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                     <polyline points="4 17 10 11 4 5"></polyline>
                     <line x1="12" y1="19" x2="20" y2="19"></line>
                 </svg>
-                Log
+                <span class="nav-label">Log</span>
             </button>
             <button class="nav-item" data-view="settings">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                     <circle cx="12" cy="12" r="3"></circle>
                     <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
                 </svg>
-                Settings
+                <span class="nav-label">Settings</span>
             </button>
         </nav>
     </div>
@@ -10605,6 +10635,18 @@ header('Cache-Control: no-cache, must-revalidate');
 
         // Event Listeners
         function setupEventListeners() {
+            // Publish the bottom bar's real height for .main's reserve (see
+            // the --nav-height CSS). The desktop sidebar overrides that
+            // reserve in its own media query, so a tall sidebar value is
+            // harmless there.
+            const navEl = document.querySelector('.nav');
+            if (navEl && window.ResizeObserver) {
+                const syncNavReserve = () => document.documentElement.style
+                    .setProperty('--nav-height', `${navEl.offsetHeight}px`);
+                new ResizeObserver(syncNavReserve).observe(navEl);
+                syncNavReserve();
+            }
+
             // Password login. Feedback goes into #login-error inside the
             // form: the toast is layered below the lock screen, so anything
             // sent there while locked is invisible.
