@@ -279,7 +279,7 @@ class Database {
                 // on existing installs that haven't yet picked it up. All migrations
                 // are idempotent, so a fire is safe.
                 $hasLatestMigration = $hasConfig
-                    && self::columnExists($pdo, 'stores', 'ecx_xpub');
+                    && self::columnExists($pdo, 'invoices', 'tip_jar_id');
                 // The auto-withdraw → auto-cashout rename is a data-only migration
                 // (config key + notification event labels) with no schema artifact
                 // to mark it done, so probe for the legacy config key directly. The
@@ -2350,6 +2350,64 @@ HTACCESS;
                 );
             ");
             $pdo->exec("CREATE INDEX idx_ecx_fee_credits_store_note ON ecx_fee_credits(store_id, note);");
+        }
+
+        // Tip jars — named public payment links (see includes/tip_jars.php).
+        // "Self-serve invoices" became "tip jars": a store owns any number of
+        // jars, each with its own /pay/{store}/{jar} link, emoji and payer-
+        // facing message. invoices.tip_jar_id records which jar an invoice
+        // was created through (NULL for every other creation path) and is
+        // the getInstance() migration marker for this set. The store-level
+        // master switch / per-payment cap keep their selfserve_* columns.
+        // Stores that already had the feature on get one default jar so the
+        // legacy /pay/{store} link (which now redirects to the oldest enabled
+        // jar) keeps working. All additive and idempotent.
+        if (!self::tableExists($pdo, 'tip_jars')) {
+            $pdo->exec("
+                CREATE TABLE tip_jars (
+                    id TEXT PRIMARY KEY,
+                    store_id TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    emoji TEXT,                               -- NULL = default emoji
+                    message TEXT NOT NULL DEFAULT '',
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    FOREIGN KEY (store_id) REFERENCES stores(id) ON DELETE CASCADE
+                );
+            ");
+            $pdo->exec("CREATE INDEX idx_tip_jars_store ON tip_jars(store_id);");
+            // Names are unique per store, case-insensitively.
+            $pdo->exec("CREATE UNIQUE INDEX idx_tip_jars_store_name ON tip_jars(store_id, name COLLATE NOCASE);");
+        }
+        $tipJarColumnFresh = false;
+        if (!self::columnExists($pdo, 'invoices', 'tip_jar_id')) {
+            // Plain column on purpose — no FK, no index: it is the migration
+            // marker, and the fail-closed migration tests re-create the
+            // pending-upgrade state with DROP COLUMN, which SQLite refuses for
+            // indexed or foreign-key columns. TipJar::delete nulls the
+            // references itself (the metadata snapshot still names the jar),
+            // and the per-jar totals query is bounded by the store's invoices.
+            $pdo->exec("ALTER TABLE invoices ADD COLUMN tip_jar_id TEXT DEFAULT NULL");
+            $tipJarColumnFresh = true;
+        }
+        if ($tipJarColumnFresh) {
+            // One-time backfill on the upgrade that introduces jars: every
+            // store with the master switch on gets a default jar. Guarded by
+            // the column being new so an operator who later deletes all jars
+            // on purpose doesn't get one back on the next migration run.
+            $now = time();
+            $ins = $pdo->prepare(
+                "INSERT INTO tip_jars (id, store_id, name, emoji, message, enabled, created_at, updated_at)
+                 VALUES (?, ?, ?, NULL, '', 1, ?, ?)"
+            );
+            foreach ($pdo->query(
+                "SELECT s.id FROM stores s
+                  WHERE s.selfserve_enabled = 1
+                    AND NOT EXISTS (SELECT 1 FROM tip_jars j WHERE j.store_id = s.id)"
+            )->fetchAll(\PDO::FETCH_COLUMN) as $sid) {
+                $ins->execute(['jar_' . bin2hex(random_bytes(12)), $sid, 'Tip Jar', $now, $now]);
+            }
         }
     }
 

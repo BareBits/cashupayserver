@@ -1,6 +1,6 @@
 """Long-lived (shareable) invoices end to end.
 
-A payment request made from the admin Request modal, the self-serve page, or
+A payment request made from the admin Request modal, the tip jar page, or
 the API with checkout.expirationMinutes stays payable for the shared lifetime
 (90 days by default) instead of the one-hour checkout window. Its Lightning
 bolt11 still lapses on its own schedule, so the payment page re-sources it:
@@ -38,6 +38,7 @@ import pytest
 import requests
 
 from conftest import ConfiguredPayserver
+from fixtures.tip_jars import ensure_tip_jar
 from fixtures.lnd import LndHandle
 from fixtures.onchain import OnchainContext, configure_store_for_onchain, configure_store_for_static_onchain
 
@@ -430,8 +431,9 @@ def test_selfserve_invoice_is_long_lived(shared_configured: ConfiguredPayserver)
     cfg = shared_configured
     with cfg.handle.db() as db:
         db.execute("UPDATE stores SET selfserve_enabled = 1 WHERE id = ?", (cfg.store_id,))
+    jar_id = ensure_tip_jar(cfg.handle, cfg.store_id)
     r = requests.post(
-        f"{cfg.handle.url}/pay/{cfg.store_id}",
+        f"{cfg.handle.url}/pay/{cfg.store_id}/{jar_id}",
         data={"amount": "777", "currency": "sat", "notes": "long-lived self-serve"},
         timeout=30, allow_redirects=False,
     )
@@ -440,6 +442,7 @@ def test_selfserve_invoice_is_long_lived(shared_configured: ConfiguredPayserver)
     invoice_id = loc.split("id=")[-1] if "id=" in loc else loc.rstrip("/").split("/")[-1]
     row = _row(cfg, invoice_id)
     assert row["long_lived"] == 1
+    assert row["tip_jar_id"] == jar_id
     assert abs(row["expiration_time"] - (int(time.time()) + NINETY_DAYS_MIN * 60)) < 300
 
 

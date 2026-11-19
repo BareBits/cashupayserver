@@ -18,6 +18,7 @@ require_once __DIR__ . '/includes/managed.php';
 require_once __DIR__ . '/includes/payment_path_debug.php';
 require_once __DIR__ . '/includes/offline_cashu.php';
 require_once __DIR__ . '/includes/wallet_tabs.php';
+require_once __DIR__ . '/includes/tip_jars.php';
 
 // Check setup
 if (!Database::isInitialized() || !Config::isSetupComplete()) {
@@ -290,6 +291,12 @@ $store = Database::fetchOne(
     [$invoice['store_id']]
 );
 $storeName = $store['name'] ?? 'Payment';
+
+// Tip jar the invoice was created through (pay.php): shown as a banner under
+// the merchant header — the jar's emoji + name and the merchant's message to
+// the payer ("Thank you for your donation"). Live row preferred so edits show
+// on open invoices; the metadata snapshot covers a deleted jar.
+$tipJar = TipJar::forInvoice($invoice);
 
 // Public POST endpoint: payer enters their email on the payment-complete
 // modal. We persist the email + newsletter opt-in on the invoice (always, for
@@ -1342,6 +1349,29 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
         .copy-toast.show {
             transform: translateX(-50%) translateY(0);
         }
+
+        /* Tip jar banner (invoices created through a jar on pay.php). */
+        .tipjar-banner {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            text-align: left;
+            background: rgba(247, 147, 26, 0.12);
+            border: 1px solid rgba(247, 147, 26, 0.3);
+            border-radius: 12px;
+            padding: 0.7rem 0.9rem;
+            margin-bottom: 1rem;
+        }
+        .tipjar-banner .tipjar-emoji { font-size: 2rem; line-height: 1; flex: none; }
+        .tipjar-banner .tipjar-text { min-width: 0; flex: 1; }
+        .tipjar-banner .tipjar-name { font-weight: 600; overflow-wrap: anywhere; }
+        .tipjar-banner .tipjar-message {
+            font-size: 0.9rem;
+            color: var(--text-secondary);
+            margin-top: 0.15rem;
+            white-space: pre-line;
+            overflow-wrap: anywhere;
+        }
     </style>
 </head>
 <body>
@@ -1351,6 +1381,17 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                 <span class="merchant-name"><?= htmlspecialchars($storeName) ?></span>
                 <span class="powered-by-group"><span class="powered-by">powered by</span><img class="logo" src="<?= htmlspecialchars(Urls::assets('img/barebits-logo.svg')) ?>" alt="BareBits"></span>
             </div>
+            <?php if ($tipJar !== null): ?>
+            <div class="tipjar-banner" id="tipjar-banner">
+                <span class="tipjar-emoji"><?= htmlspecialchars($tipJar['emoji']) ?></span>
+                <div class="tipjar-text">
+                    <div class="tipjar-name" id="tipjar-name"><?= htmlspecialchars($tipJar['name']) ?></div>
+                    <?php if ($tipJar['message'] !== ''): ?>
+                    <div class="tipjar-message" id="tipjar-message"><?= htmlspecialchars($tipJar['message']) ?></div>
+                    <?php endif; ?>
+                </div>
+            </div>
+            <?php endif; ?>
 
             <?php
             $hasLightning = !empty($invoice['bolt11']);

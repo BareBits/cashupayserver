@@ -20,7 +20,7 @@ BareBits can create invoices, receive payments, and be used as a point-of-sale s
 - **Fiat conversion** via Strike gives you access to instant fiat conversion in 100+ countries
 - **Secure by design** - No hot wallet sitting on your web server (unless using Cashu mint). Connects to your LN wallet via CLINK/NWC/LNURL with no ability to spend funds.
 - **Multiple stores** - Each store can have it's own invoice settings, cashout addresses, etc.
-- **Tip Jar** - Let customers make their own payments using a shared link. Links can be generic (any amount) or for specific products.
+- **Tip jars** - Let customers pay what they want from a shared link. Create any number of named tip jars per store, each with its own emoji, a message to the payer ("Thank you for your donation") and a running total of what it has received; product links let a shared link carry specific products instead.
 - **E-commerce integration** - Plugin for WooCommerce. On magneto, shopify, or another platform? Use the BTCPay plugin and point it to your BareBits URL.
 - **On-chain payments** to an off-server wallet using xpub addresses or even a single address
 - **eCash (ECX) payments** - optionally accept [eCash](https://ecash.com), the Drivechain fork of Bitcoin, alongside Bitcoin and Lightning: same xpub format, fresh address per invoice, amounts in szats at the CoinMarketCap price. See [docs/ecx.md](docs/ecx.md).
@@ -480,7 +480,7 @@ lifetime. An invoice created with that field and no `metadata.orderId` is a
 invoice whenever the previous one lapses (the old one stays under watch so a
 payer who already scanned it still settles the invoice), and a fiat amount is
 re-quoted in sats each time the page is opened. The admin "Create invoice"
-screen and the self-serve page create their invoices this way. Shop orders
+screen and the tip jar page create their invoices this way. Shop orders
 (any invoice carrying `metadata.orderId`) keep the standard expiry behavior.
 A long-lived request that was redirected to a fee destination (see Fee
 Payments) keeps the sats amount it was created with and refreshes its

@@ -634,6 +634,8 @@ class Stats {
             'cashu_offline_allow_any_mint', 'cashu_offline_fail_reason',
             'cart_purchase_counted', 'strike_invoice_id',
             'strike_receive_request_id',
+            // Tip jar the invoice was created through (pay.php), if any.
+            'tip_jar_id',
             // eCash (ECX) leg: address, szat amounts, chain state, the rate it
             // was quoted at, and whether the address pointed at a fee payee.
             'ecx_address', 'ecx_address_index', 'ecx_amount_szat',

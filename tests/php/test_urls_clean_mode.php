@@ -36,6 +36,7 @@ assert_eq($BASE,                 Urls::api(),               'clean: api = bare b
 assert_eq($BASE . '/admin',      Urls::admin(),             'clean: admin');
 assert_eq($BASE . '/setup',      Urls::setup(),             'clean: setup');
 assert_eq($BASE . '/pay/store1', Urls::selfServe('store1'), 'clean: self-serve');
+assert_eq($BASE . '/pay/store1/jar_ab12', Urls::tipJar('store1', 'jar_ab12'), 'clean: tip jar');
 assert_eq($BASE . '/payment',    Urls::payment(),           'clean: payment (no id)');
 assert_eq($BASE . '/payment/inv_9', Urls::payment('inv_9'), 'clean: payment (with id)');
 assert_eq('Clean URLs',          Urls::urlModeLabel(),      'clean: label');
@@ -47,7 +48,7 @@ assert_eq($BASE . '/images/payment-methods/strike.png',
 
 // The whole point of clean mode: no '.php' and no '/router.php/' in the
 // user-facing page URLs.
-foreach ([Urls::admin(), Urls::setup(), Urls::selfServe('s'), Urls::payment('i')] as $u) {
+foreach ([Urls::admin(), Urls::setup(), Urls::selfServe('s'), Urls::tipJar('s', 'j'), Urls::payment('i')] as $u) {
     assert_true(strpos($u, '.php') === false, "clean url must not contain .php: {$u}");
     assert_true(strpos($u, '/router.php') === false, "clean url must not contain router.php: {$u}");
 }
@@ -61,6 +62,7 @@ assert_eq($BASE,                        Urls::server(),            'direct: serv
 assert_eq('admin.php',                  Urls::admin(),             'direct: admin (relative file)');
 assert_eq($BASE . '/setup.php',         Urls::setup(),             'direct: setup');
 assert_eq($BASE . '/pay.php?store=store1', Urls::selfServe('store1'), 'direct: self-serve');
+assert_eq($BASE . '/pay.php?store=store1&jar=jar_ab12', Urls::tipJar('store1', 'jar_ab12'), 'direct: tip jar');
 assert_eq($BASE . '/payment.php?id=inv_9', Urls::payment('inv_9'), 'direct: payment');
 assert_eq('Direct URLs',                Urls::urlModeLabel(),      'direct: label');
 
@@ -73,6 +75,7 @@ assert_eq($BASE . '/router.php',            Urls::server(),            'router: 
 assert_eq('admin.php',                      Urls::admin(),             'router: admin (relative file)');
 assert_eq($BASE . '/router.php/setup.php',  Urls::setup(),             'router: setup');
 assert_eq($BASE . '/router.php/pay/store1', Urls::selfServe('store1'), 'router: self-serve');
+assert_eq($BASE . '/router.php/pay/store1/jar_ab12', Urls::tipJar('store1', 'jar_ab12'), 'router: tip jar');
 assert_eq('Router.php URLs',                Urls::urlModeLabel(),      'router: label');
 
 // -----------------------------------------------------------------------------

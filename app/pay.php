@@ -1,21 +1,26 @@
 <?php
 /**
- * CashuPayServer - Public Self-Serve Invoice Page
+ * CashuPayServer - Public Tip Jar Page
  *
- * Lets a customer create AND pay their own invoice without an account, when the
- * merchant has enabled self-serve invoices for the store (site-wide default +
- * per-store override; see includes/selfserve.php). Reached at:
+ * Lets a customer create AND pay their own invoice without an account, through
+ * one of the store's tip jars (includes/tip_jars.php) when the merchant has
+ * tip jars turned on for the store (includes/selfserve.php). Reached at:
  *
- *   /pay/{storeId}            (router / built-in-server / rewrite mode)
- *   /pay.php?store={storeId}  (direct file access)
+ *   /pay/{storeId}/{jarId}                 (router / built-in-server / rewrite mode)
+ *   /pay.php?store={storeId}&jar={jarId}   (direct file access)
  *
- * GET  renders a small form: amount + currency (sat or the store's default
- *      fiat) + optional note.
+ * The bare /pay/{storeId} link predates tip jars: a GET redirects to the
+ * store's default (oldest enabled) jar so already-shared links keep working,
+ * and a POST is served in place against that jar. ?products= product links
+ * also live on the bare store URL and need no jar.
+ *
+ * GET  renders a small form: the jar's emoji, name and message, then amount +
+ *      currency (sat or the store's default fiat) + optional note.
  * POST validates the (untrusted) input, creates the invoice via Invoice::create
- *      and redirects to the regular /payment page for display + payment.
+ *      (tagged with the jar) and redirects to the regular /payment page.
  *
- * Disabled / unknown stores return a generic 404 so we don't leak which store
- * IDs exist or which have self-serve turned on.
+ * Disabled / unknown stores and jars return a generic 404 so we don't leak
+ * which IDs exist or which have tip jars turned on.
  */
 
 require_once __DIR__ . '/includes/http_status.php';
@@ -23,6 +28,7 @@ require_once __DIR__ . '/includes/http_status.php';
 require_once __DIR__ . '/includes/database.php';
 require_once __DIR__ . '/includes/config.php';
 require_once __DIR__ . '/includes/selfserve.php';
+require_once __DIR__ . '/includes/tip_jars.php';
 require_once __DIR__ . '/includes/invoice.php';
 require_once __DIR__ . '/includes/rates.php';
 require_once __DIR__ . '/includes/security.php';
@@ -63,6 +69,37 @@ $maxSats = SelfServe::effectiveMaxSats($storeId);
 // a malformed parameter or a link with nothing left 404s like a bad store.
 // ---------------------------------------------------------------------------
 $productMode = isset($_GET['products']) && trim((string)$_GET['products']) !== '';
+
+// ---------------------------------------------------------------------------
+// Tip jar resolution (simple mode only). A jar id in the URL must name an
+// enabled jar of this store; the bare store URL resolves to the default jar —
+// redirecting a GET so the payer ends up on the jar's own link, serving a POST
+// in place so pre-tip-jar integrations that post straight to /pay/{store}
+// keep working. No jar at all → 404 like a disabled store.
+// ---------------------------------------------------------------------------
+$jar = null;
+if (!$productMode) {
+    $jarId = trim((string)($_GET['jar'] ?? ''));
+    if ($jarId !== '') {
+        $jar = TipJar::get($jarId, $storeId);
+        if ($jar === null || (int)$jar['enabled'] !== 1) {
+            selfserve_not_found();
+        }
+    } else {
+        $jar = TipJar::legacyDefault($storeId);
+        if ($jar === null) {
+            selfserve_not_found();
+        }
+        if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+            header('Location: ' . Urls::tipJar($storeId, (string)$jar['id']), true, 302);
+            exit;
+        }
+    }
+}
+$jarEmoji = ($jar !== null && ($jar['emoji'] ?? '') !== '' && $jar['emoji'] !== null) ? $jar['emoji'] : TipJar::DEFAULT_EMOJI;
+$jarName = $jar !== null ? (string)$jar['name'] : '';
+$jarMessage = $jar !== null ? (string)($jar['message'] ?? '') : '';
+
 $linkItems = [];        // [['product' => row, 'quantity' => int], ...]
 $droppedCount = 0;
 $pricedLines = [];      // Cart::priceItems lines, for display
@@ -201,15 +238,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && !$productMode) {
             // Uppercase to match the Greenfield API / admin Request modal, which
             // store the currency code uppercased (e.g. SAT, USD).
             'currency' => strtoupper($currency),
-            // A self-serve invoice is a payment request the customer may come
+            // A tip jar invoice is a payment request the customer may come
             // back to (or forward): long-lived, Lightning re-sourced on view.
             'lifetime_sec' => Config::getSharedInvoiceLifetime(),
             'long_lived' => true,
+            // Which jar this came through (per-jar totals in the admin).
+            'tip_jar_id' => $jar['id'],
+            // Snapshot of the jar for the invoice detail / payment page once
+            // the jar is renamed or deleted.
+            'metadata' => TipJar::metadataSnapshot($jar),
         ];
         if ($notes !== '') {
             // itemDesc is the payer-facing note convention used across the app
             // (admin Request modal, payment.php display).
-            $options['metadata'] = ['itemDesc' => $notes];
+            $options['metadata']['itemDesc'] = $notes;
         }
 
         $invoice = Invoice::create($storeId, $options);
@@ -233,8 +275,8 @@ $hasFiat = count($allowedCurrencies) > 1;
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Pay <?= htmlspecialchars($storeName) ?></title>
-    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
+    <title><?= $jar !== null ? htmlspecialchars($jarName) . ' - ' : 'Pay ' ?><?= htmlspecialchars($storeName) ?></title>
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'><?= $jar !== null ? rawurlencode($jarEmoji) : '⚡' ?></text></svg>">
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         :root {
@@ -271,6 +313,22 @@ $hasFiat = count($allowedCurrencies) > 1;
         .logo { font-size: 2.5rem; margin-bottom: 0.25rem; }
         .merchant-name { font-size: 1.1rem; font-weight: 600; margin-bottom: 0.25rem; }
         .subtitle { font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 1.5rem; }
+        /* Tip jar header: big emoji, the jar's name as the title, the store
+           name beneath it, then the merchant's message to the payer. */
+        .jar-emoji { font-size: 3.25rem; line-height: 1; margin-bottom: 0.5rem; }
+        .jar-name { font-size: 1.35rem; font-weight: 700; margin-bottom: 0.15rem; overflow-wrap: anywhere; }
+        .jar-store { font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 0.75rem; overflow-wrap: anywhere; }
+        .jar-message {
+            font-size: 0.95rem;
+            color: var(--text-primary);
+            background: rgba(247, 147, 26, 0.12);
+            border: 1px solid rgba(247, 147, 26, 0.3);
+            border-radius: 12px;
+            padding: 0.7rem 1rem;
+            margin-bottom: 1.25rem;
+            white-space: pre-line;
+            overflow-wrap: anywhere;
+        }
         .form-group { text-align: left; margin-bottom: 1.1rem; }
         .form-label { display: block; font-size: 0.8rem; color: var(--text-secondary); margin-bottom: 0.4rem; }
         .amount-row { display: flex; gap: 0.5rem; }
@@ -375,9 +433,19 @@ $hasFiat = count($allowedCurrencies) > 1;
 </head>
 <body>
     <div class="card">
+        <?php if ($jar !== null): ?>
+        <div class="jar-emoji" id="jar-emoji"><?= htmlspecialchars($jarEmoji) ?></div>
+        <div class="jar-name" id="jar-name"><?= htmlspecialchars($jarName) ?></div>
+        <div class="jar-store"><?= htmlspecialchars($storeName) ?></div>
+        <?php if ($jarMessage !== ''): ?>
+        <div class="jar-message" id="jar-message"><?= htmlspecialchars($jarMessage) ?></div>
+        <?php endif; ?>
+        <div class="subtitle">Enter an amount to generate a payment</div>
+        <?php else: ?>
         <div class="logo">⚡</div>
         <div class="merchant-name"><?= htmlspecialchars($storeName) ?></div>
-        <div class="subtitle"><?= $productMode ? 'Review your order and pay' : 'Enter an amount to generate a payment' ?></div>
+        <div class="subtitle">Review your order and pay</div>
+        <?php endif; ?>
 
         <?php if ($error !== null): ?>
             <div class="error"><?= htmlspecialchars($error) ?></div>

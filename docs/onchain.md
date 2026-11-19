@@ -140,7 +140,7 @@ The standard `invoice_expiration` (default 1 hour, global) still applies as
 the "time to broadcast" window: if no mempool sighting happens before it
 elapses, the invoice expires.
 
-Long-lived payment requests (admin "Create invoice", the self-serve page, or
+Long-lived payment requests (admin "Create invoice", the tip jar page, or
 API calls with `checkout.expirationMinutes`) use the shared lifetime instead
 (`shared_invoice_lifetime`, default 90 days). Their address stays watched for
 the whole lifetime, polled every minute for the first day, every 10 minutes
