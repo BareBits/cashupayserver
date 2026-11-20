@@ -11,6 +11,7 @@ require_once __DIR__ . '/config.php';
 require_once __DIR__ . '/rates.php';
 require_once __DIR__ . '/webhook_sender.php';
 require_once __DIR__ . '/notification_sender.php';
+require_once __DIR__ . '/cashu_limit.php';
 require_once __DIR__ . '/urls.php';
 require_once __DIR__ . '/../cashu-wallet-php/CashuWallet.php';
 require_once __DIR__ . '/onchain/payments.php';
@@ -545,6 +546,20 @@ class Invoice {
         $lnOrderCsv = RailOrder::storedLnOrderCsv($storeId);
         $lnOrder = RailOrder::lnOrderFromRow(['ln_rail_order' => $lnOrderCsv]);
         $lnSteps = self::lightningWalkSteps($lnOrder, $destinations, $lnOrderCsv !== null);
+        // Per-store Cashu maximum (see CashuLimit). Above it the mint is
+        // either not used at all (BLOCK: "respect size even if other
+        // Lightning options fail" on) or moved to the END of the walk so it
+        // only serves once every other Lightning path has failed (DEFER).
+        // The swap's fee-fallback thresholds below key off the mint's final
+        // slot, so a deferred mint stays a valid fallback behind the swap.
+        $cashuLimit = CashuLimit::fromRow($store);
+        $cashuDecision = $cashuConfigured
+            ? CashuLimit::decide($cashuLimit, $lnurlTargetSats)
+            : CashuLimit::ALLOW;
+        if ($cashuDecision === CashuLimit::DEFER) {
+            $lnSteps = CashuLimit::deferMintStep($lnSteps);
+        }
+        $cashuSizeBlocked = false;
         $mintStepIndex = null;
         foreach ($lnSteps as $i => $step) {
             if ($step['kind'] === 'mint') {
@@ -648,6 +663,19 @@ class Invoice {
                     }
                     continue;
                 }
+                if ($cashuDecision === CashuLimit::BLOCK) {
+                    // Above the store's Cashu maximum with "respect size even
+                    // if other Lightning options fail" on: recorded as a
+                    // FAILED mint attempt (like no liquidity / no response)
+                    // and never e-mailed. Later paths in the order and the
+                    // on-chain rail still serve the invoice; the error
+                    // precedence below handles "nothing else could".
+                    $cashuSizeBlocked = true;
+                    InvoiceAttempts::record($invoiceId, $storeId, InvoiceAttempts::CONTEXT_CHECKOUT, 'mint',
+                        null, InvoiceAttempts::FAILED, CashuLimit::REASON_BLOCKED,
+                        CashuLimit::detail(CashuLimit::BLOCK, $lnurlTargetSats, $cashuLimit));
+                    continue;
+                }
                 $mintAttempted = true;
                 $mq = self::sourceMintQuote(
                     $storeId, $store, (string)$amount, $currency, $onchainConfigured, null,
@@ -676,6 +704,13 @@ class Invoice {
         // strict swap outcome when the invoice goes on with on-chain only.
         $anyLightning = $lnurlAttempt !== null || $nofferAttempt !== null || $nwcAttempt !== null
             || $strikeAttempt !== null || $swapAttempt !== null || $quote !== null;
+        if ($cashuDecision === CashuLimit::DEFER && !$mintAttempted && $anyLightning) {
+            // Deferred for size and never reached: an earlier path served the
+            // invoice. Say so in the detail so the walk reads honestly.
+            InvoiceAttempts::record($invoiceId, $storeId, InvoiceAttempts::CONTEXT_CHECKOUT, 'mint',
+                null, InvoiceAttempts::SKIPPED, CashuLimit::REASON_DEFERRED,
+                CashuLimit::detail(CashuLimit::DEFER, $lnurlTargetSats, $cashuLimit));
+        }
         if (!$anyLightning && $strictSwapFailure !== null) {
             if (!$onchainOffered) {
                 throw new Exception(
@@ -690,6 +725,23 @@ class Invoice {
             AdminLog::log('swap', 'checkout', $storeId, $invoiceId, null,
                 'strict mode: no swap provider accepted the ' . $strictSwapFailure['target']
                 . ' sat target; invoice created on-chain only.' . $strictSwapFailure['detail']);
+        }
+        if (!$anyLightning && $cashuSizeBlocked) {
+            // The size block took the mint off the table and nothing else
+            // Lightning came out. Another rail (on-chain address, eCash) may
+            // still make the invoice payable; with none, refuse with a clear
+            // message rather than falling through to the generic one.
+            $sizeLine = sprintf(
+                'payment %s sat is above the store\'s Cashu maximum of %s sat and no other Lightning path produced an invoice',
+                number_format($lnurlTargetSats), number_format((int)$cashuLimit['max_sats'])
+            );
+            if (!$onchainOffered && !$ecxOffered) {
+                throw new Exception('Could not create an invoice: ' . $sizeLine
+                    . '. Raise the Cashu maximum, turn off "respect size even if other Lightning options fail", '
+                    . 'or add another payment method.');
+            }
+            AdminLog::log('mint', 'checkout', $storeId, $invoiceId, null,
+                'Cashu maximum: ' . $sizeLine . '; invoice created without Lightning.');
         }
         if (!$anyLightning && $mintAttempted && !$onchainConfigured) {
             if ($mintLastError === null && !empty($recoveringMints)) {
@@ -3405,7 +3457,20 @@ class Invoice {
             && SwapsConfig::strictNoMintFallbackForStore($storeId)
             && !RailOrder::cashuPrecedesSwap($lnOrder);
         $strictMintLogged = false;
-        foreach (self::lightningWalkSteps($lnOrder, $destinations, $lnOrderCsv !== null) as $step) {
+        // Same per-store Cashu maximum as at creation (see CashuLimit): a
+        // long-lived invoice must not land on the mint on refresh for a size
+        // the creation walk would have refused or deferred.
+        $cashuLimit = CashuLimit::fromRow($store);
+        $cashuDecision = Config::isStoreConfigured($storeId)
+            ? CashuLimit::decide($cashuLimit, $directSats)
+            : CashuLimit::ALLOW;
+        $refreshSteps = self::lightningWalkSteps($lnOrder, $destinations, $lnOrderCsv !== null);
+        if ($cashuDecision === CashuLimit::DEFER) {
+            $refreshSteps = CashuLimit::deferMintStep($refreshSteps);
+        }
+        $cashuSizeBlocked = false;
+        $mintTried = false;
+        foreach ($refreshSteps as $step) {
             if ($sourced !== null) {
                 break;
             }
@@ -3442,6 +3507,14 @@ class Invoice {
             if (!Config::isStoreConfigured($storeId)) {
                 continue;
             }
+            if ($cashuDecision === CashuLimit::BLOCK) {
+                $cashuSizeBlocked = true;
+                InvoiceAttempts::record($invoiceId, $storeId, InvoiceAttempts::CONTEXT_REFRESH, 'mint', null,
+                    InvoiceAttempts::FAILED, CashuLimit::REASON_BLOCKED,
+                    CashuLimit::detail(CashuLimit::BLOCK, $directSats, $cashuLimit));
+                continue;
+            }
+            $mintTried = true;
             $fixed = (!$requote && $currentRail === 'mint' && !empty($invoice['bolt11']))
                 ? (int)$invoice['amount_sats'] : null;
             try {
@@ -3466,14 +3539,23 @@ class Invoice {
                 $receiveErrors[] = ['type' => 'mint', 'reason' => 'no configured mint could issue a Lightning invoice'];
             }
         }
+        if ($cashuDecision === CashuLimit::DEFER && !$mintTried && $sourced !== null) {
+            InvoiceAttempts::record($invoiceId, $storeId, InvoiceAttempts::CONTEXT_REFRESH, 'mint', null,
+                InvoiceAttempts::SKIPPED, CashuLimit::REASON_DEFERRED,
+                CashuLimit::detail(CashuLimit::DEFER, $directSats, $cashuLimit));
+        }
         // For the "nothing could re-source" log below.
         $strictMintBlocked = $strictMintBlocked && $sourced === null;
         if ($sourced === null) {
             error_log(sprintf('[long-lived] no Lightning rail could re-source invoice=%s store=%s', $invoiceId, $storeId));
-            AdminLog::log('lightning', 'refresh', $storeId, $invoiceId, null,
-                $strictMintBlocked
-                    ? 'Lightning invoice could not be refreshed: no destination produced a bolt11 and strict mode (no mint fallback) is on'
-                    : 'Lightning invoice could not be refreshed: no destination or mint produced a bolt11');
+            if ($strictMintBlocked) {
+                $unavailableMsg = 'Lightning invoice could not be refreshed: no destination produced a bolt11 and strict mode (no mint fallback) is on';
+            } elseif ($cashuSizeBlocked) {
+                $unavailableMsg = 'Lightning invoice could not be refreshed: no destination produced a bolt11 and the amount is above the store\'s Cashu maximum';
+            } else {
+                $unavailableMsg = 'Lightning invoice could not be refreshed: no destination or mint produced a bolt11';
+            }
+            AdminLog::log('lightning', 'refresh', $storeId, $invoiceId, null, $unavailableMsg);
             return [
                 'ok' => false, 'reason' => 'unavailable', 'invoice' => $invoice,
                 'receive_errors' => self::dedupeReceiveErrors($receiveErrors),

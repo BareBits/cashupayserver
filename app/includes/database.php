@@ -279,7 +279,7 @@ class Database {
                 // on existing installs that haven't yet picked it up. All migrations
                 // are idempotent, so a fire is safe.
                 $hasLatestMigration = $hasConfig
-                    && self::columnExists($pdo, 'invoices', 'tip_jar_id');
+                    && self::columnExists($pdo, 'stores', 'cashu_max_invoice_sats');
                 // The auto-withdraw → auto-cashout rename is a data-only migration
                 // (config key + notification event labels) with no schema artifact
                 // to mark it done, so probe for the legacy config key directly. The
@@ -2356,8 +2356,9 @@ HTACCESS;
         // "Self-serve invoices" became "tip jars": a store owns any number of
         // jars, each with its own /pay/{store}/{jar} link, emoji and payer-
         // facing message. invoices.tip_jar_id records which jar an invoice
-        // was created through (NULL for every other creation path) and is
-        // the getInstance() migration marker for this set. The store-level
+        // was created through (NULL for every other creation path) and was
+        // the getInstance() migration marker for this set (the marker has
+        // since moved on to stores.cashu_max_invoice_sats). The store-level
         // master switch / per-payment cap keep their selfserve_* columns.
         // Stores that already had the feature on get one default jar so the
         // legacy /pay/{store} link (which now redirects to the oldest enabled
@@ -2382,7 +2383,7 @@ HTACCESS;
         }
         $tipJarColumnFresh = false;
         if (!self::columnExists($pdo, 'invoices', 'tip_jar_id')) {
-            // Plain column on purpose — no FK, no index: it is the migration
+            // Plain column on purpose — no FK, no index: it was the migration
             // marker, and the fail-closed migration tests re-create the
             // pending-upgrade state with DROP COLUMN, which SQLite refuses for
             // indexed or foreign-key columns. TipJar::delete nulls the
@@ -2408,6 +2409,22 @@ HTACCESS;
             )->fetchAll(\PDO::FETCH_COLUMN) as $sid) {
                 $ins->execute(['jar_' . bin2hex(random_bytes(12)), $sid, 'Tip Jar', $now, $now]);
             }
+        }
+
+        // Per-store maximum payment size for the Cashu path (see
+        // includes/cashu_limit.php). cashu_max_invoice_sats is the largest
+        // payment the store's mint may issue a Lightning invoice for (NULL =
+        // unlimited, the historical behavior) and is the getInstance()
+        // migration marker for this set — a plain column on purpose (no
+        // index / FK) so the fail-closed migration tests can DROP COLUMN it.
+        // cashu_max_respect_always is the "respect size even if other
+        // Lightning options fail" switch, default ON. Both additive and
+        // idempotent.
+        if (!self::columnExists($pdo, 'stores', 'cashu_max_respect_always')) {
+            $pdo->exec("ALTER TABLE stores ADD COLUMN cashu_max_respect_always INTEGER NOT NULL DEFAULT 1");
+        }
+        if (!self::columnExists($pdo, 'stores', 'cashu_max_invoice_sats')) {
+            $pdo->exec("ALTER TABLE stores ADD COLUMN cashu_max_invoice_sats INTEGER DEFAULT NULL");
         }
     }
 

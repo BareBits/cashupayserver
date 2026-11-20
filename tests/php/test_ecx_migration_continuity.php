@@ -90,8 +90,11 @@ $statsBefore = Stats::summary('legacy', 'all');
 
 // ---- roll the schema back to the release before ECX ----------------------------------------
 $pdo = Database::getInstance();
-// The release before ECX predates tip jars too: drop that newer marker set
-// first, or getInstance() sees the current marker and never re-runs.
+// The release before ECX predates the Cashu maximum and tip jars too: drop
+// those newer marker sets first, or getInstance() sees the current marker
+// and never re-runs.
+$pdo->exec("ALTER TABLE stores DROP COLUMN cashu_max_invoice_sats");
+$pdo->exec("ALTER TABLE stores DROP COLUMN cashu_max_respect_always");
 $pdo->exec("UPDATE invoices SET tip_jar_id = NULL");
 $pdo->exec("ALTER TABLE invoices DROP COLUMN tip_jar_id");
 $pdo->exec("DROP TABLE tip_jars");
@@ -104,7 +107,8 @@ foreach ($ECX_INVOICE_COLS as $c) {
 foreach ($ECX_STORE_COLS as $c) {
     $pdo->exec("ALTER TABLE stores DROP COLUMN {$c}");
 }
-assert_false(has_col('invoices', 'tip_jar_id'), 'pre-ECX: current marker column gone');
+assert_false(has_col('stores', 'cashu_max_invoice_sats'), 'pre-ECX: current marker column gone');
+assert_false(has_col('invoices', 'tip_jar_id'), 'pre-ECX: tip jar marker column gone');
 assert_false(has_col('stores', 'ecx_xpub'), 'pre-ECX: ECX marker column gone');
 assert_false(has_table('ecx_payments'));
 assert_false(has_col('invoices', 'ecx_amount_szat'));
@@ -114,6 +118,8 @@ assert_eq(2, (int)Database::fetchOne("SELECT COUNT(*) AS n FROM invoices")['n'])
 // ---- first connection after the deploy: self-heal -------------------------------------------
 reset_db_singleton();
 Database::getInstance();
+assert_true(has_col('stores', 'cashu_max_invoice_sats'), 'Cashu maximum marker re-added');
+assert_true(has_col('stores', 'cashu_max_respect_always'), 'Cashu respect-size column re-added');
 assert_true(has_col('invoices', 'tip_jar_id'), 'tip jar marker re-added');
 assert_true(has_table('tip_jars'), 'tip_jars table re-added');
 foreach ($ECX_STORE_COLS as $c) {
