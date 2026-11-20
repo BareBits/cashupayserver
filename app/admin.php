@@ -267,7 +267,11 @@ if (isset($_GET['api'])) {
     Auth::initSession();
     if (!Auth::isLoggedIn()) {
         cashupay_status(401);
-        echo json_encode(['error' => 'Not authenticated']);
+        // `code` lets the SPA tell a session that ended (relock the screen)
+        // from a sign-in attempt that failed (which carries no code).
+        echo json_encode(Auth::sessionTimedOut()
+            ? ['error' => 'Your session timed out after a period of inactivity. Please sign in again.', 'code' => 'session_timeout']
+            : ['error' => 'Not authenticated', 'code' => 'not_authenticated']);
         exit;
     }
 
@@ -763,6 +767,16 @@ if (isset($_GET['api'])) {
         case 'usage_stats_status':
             Auth::requireAdmin();
             echo json_encode(UsageStats::status());
+            break;
+
+        // Idle login timeout (Settings → My Account). Admin-only: the value
+        // is global and the Users card's audience is the admin.
+        case 'get_login_timeout':
+            Auth::requireAdmin();
+            echo json_encode([
+                'seconds' => Auth::loginTimeout(),
+                'choices' => Auth::LOGIN_TIMEOUT_CHOICES,
+            ]);
             break;
 
         // Product catalog for the request modal — any logged-in user. Only
@@ -1887,7 +1901,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     Auth::initSession();
     if (!Auth::isLoggedIn()) {
         cashupay_status(401);
-        echo json_encode(['error' => 'Not authenticated']);
+        // `code` lets the SPA tell a session that ended (relock the screen)
+        // from a sign-in attempt that failed (which carries no code).
+        echo json_encode(Auth::sessionTimedOut()
+            ? ['error' => 'Your session timed out after a period of inactivity. Please sign in again.', 'code' => 'session_timeout']
+            : ['error' => 'Not authenticated', 'code' => 'not_authenticated']);
         exit;
     }
 
@@ -5340,6 +5358,23 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
             break;
 
+        case 'save_login_timeout':
+            // Global idle login timeout. One of Auth::LOGIN_TIMEOUT_CHOICES
+            // only; applies to every existing session on its next request.
+            Auth::requireAdmin();
+            try {
+                $raw = trim((string)($_POST['seconds'] ?? ''));
+                if ($raw === '' || !ctype_digit($raw)) {
+                    throw new \InvalidArgumentException('Login timeout must be one of the offered durations');
+                }
+                Auth::setLoginTimeout((int)$raw);
+                echo json_encode(['success' => true, 'seconds' => Auth::loginTimeout()]);
+            } catch (\InvalidArgumentException $e) {
+                cashupay_status(400);
+                echo json_encode(['error' => $e->getMessage()]);
+            }
+            break;
+
         case 'set_recovery_email':
             // Set/clear the current user's recovery email. Powers the email
             // reset-link flow (only effective for admin accounts, which the
@@ -5560,6 +5595,26 @@ header('Cache-Control: no-cache, must-revalidate');
         }
 
         .lock-error:empty {
+            display: none;
+        }
+
+        /* Reason the screen relocked (session timeout): sits between the
+           subtitle and the form, same collapse-when-empty rule. */
+        .lock-notice {
+            color: var(--text-secondary);
+            background: rgba(247, 147, 26, 0.12);
+            border: 1px solid rgba(247, 147, 26, 0.4);
+            border-radius: 10px;
+            padding: 0.6rem 0.9rem;
+            font-size: 0.85rem;
+            text-align: center;
+            margin: -1rem 0 1.25rem;
+            max-width: 360px;
+            width: 100%;
+            line-height: 1.3;
+        }
+
+        .lock-notice:empty {
             display: none;
         }
 
@@ -7305,6 +7360,10 @@ header('Cache-Control: no-cache, must-revalidate');
     <div class="lock-screen<?= $isLoggedIn ? ' hidden' : '' ?>" id="lock-screen">
         <img class="lock-logo" src="<?= htmlspecialchars(Urls::assets('img/barebits-logo.svg')) ?>" alt="BareBits">
         <div class="lock-subtitle">Enter your password</div>
+        <!-- Why the lock screen is up (session timed out). Set by PHP when the
+             page itself was loaded on an expired session, by JS when an API
+             call came back 401 mid-session; :empty hides the slot. -->
+        <div class="lock-notice" id="lock-notice" role="status" data-testid="lock-notice"><?= Auth::sessionTimedOut() ? 'Your session timed out after a period of inactivity. Please sign in again.' : '' ?></div>
 
         <div class="password-fallback" id="password-fallback">
             <input type="text" id="username-input" placeholder="Username"
@@ -9492,6 +9551,24 @@ header('Cache-Control: no-cache, must-revalidate');
                             </p>
                             <button class="btn btn-secondary btn-full" id="btn-save-recovery-email">Save recovery email</button>
                         </div>
+                        <!-- Idle login timeout (admin only, global). Options are
+                             Auth::LOGIN_TIMEOUT_CHOICES; the current value is
+                             fetched by renderAccountCard so the lock screen
+                             page never discloses it. -->
+                        <div id="login-timeout-row" class="hidden" data-admin-only="true" style="margin-bottom: 0.5rem;">
+                            <label for="login-timeout-select" style="display:block;font-size:0.85rem;color:var(--text-secondary);margin-bottom:0.25rem;">
+                                Login timeout
+                            </label>
+                            <select id="login-timeout-select" class="form-input" style="margin-bottom:0.4rem;" data-testid="login-timeout-select">
+                                <?php foreach (Auth::LOGIN_TIMEOUT_CHOICES as $secs => $label): ?>
+                                <option value="<?= (int)$secs ?>"><?= htmlspecialchars($label) ?></option>
+                                <?php endforeach; ?>
+                            </select>
+                            <p style="font-size:0.75rem;color:var(--text-secondary);margin:0 0 0.5rem;">
+                                How long a signed-in session may sit idle before it is signed out. Applies to all users and takes effect immediately.
+                            </p>
+                            <button class="btn btn-secondary btn-full" id="btn-save-login-timeout">Save login timeout</button>
+                        </div>
                         <button class="btn btn-danger btn-full<?= $isManaged ? ' managed-hidden' : '' ?>" id="btn-logout">
                             Logout
                         </button>
@@ -10502,6 +10579,51 @@ header('Cache-Control: no-cache, must-revalidate');
         let serverUrl = <?= json_encode(Urls::server()) ?>;
 
         // Helper for POST requests with CSRF token
+        // Session-loss watch. Every admin call goes through fetch(); when one
+        // comes back 401 with a `code` from admin.php's auth gate (a timed-out
+        // or otherwise ended session — a failed sign-in carries no code) the
+        // app relocks instead of leaving buttons silently dead until a reload.
+        // Guarded so a burst of parallel 401s relocks once.
+        const nativeFetch = window.fetch.bind(window);
+        let sessionLossHandled = false;
+        // Bumped on every sign-in: a 401 from a request that was already in
+        // flight when the operator signed back in belongs to the dead session
+        // and must not relock the fresh one.
+        let authEpoch = 0;
+        window.fetch = async function (input, init) {
+            const epoch = authEpoch;
+            const response = await nativeFetch(input, init);
+            try {
+                if (response.status === 401 && isAuthenticated && !sessionLossHandled && epoch === authEpoch) {
+                    const rawUrl = typeof input === 'string' ? input : (input && input.url) || '';
+                    const target = new URL(rawUrl, window.location.href);
+                    if (target.origin === window.location.origin) {
+                        const data = await response.clone().json().catch(() => null);
+                        const code = data && data.code;
+                        if (code === 'session_timeout' || code === 'not_authenticated') {
+                            sessionLossHandled = true;
+                            handleSessionLost(code === 'session_timeout'
+                                ? (data.error || 'Your session timed out after a period of inactivity. Please sign in again.')
+                                : 'Your session has ended. Please sign in again.');
+                        }
+                    }
+                }
+            } catch (_) { /* never let the watch break the caller */ }
+            return response;
+        };
+
+        function handleSessionLost(notice) {
+            isAuthenticated = false;
+            localStorage.removeItem(STORAGE_AUTH);
+            // Dismiss whatever dialog was open: modals stack above the lock screen.
+            document.querySelectorAll('.modal-overlay.visible[id]').forEach(m => {
+                try { closeModal(m.id); } catch (_) { m.classList.remove('visible'); }
+            });
+            showLockScreen(notice);
+            const pw = document.getElementById('password-input');
+            if (pw) { pw.value = ''; pw.focus(); }
+        }
+
         async function postWithCsrf(url, body) {
             return fetch(url, {
                 method: 'POST',
@@ -10574,18 +10696,26 @@ header('Cache-Control: no-cache, must-revalidate');
             }
         }
 
-        function showLockScreen() {
+        function showLockScreen(notice) {
             document.getElementById('lock-screen').classList.remove('hidden');
             document.getElementById('app').classList.remove('visible');
             // A session expiry relocks the screen: don't greet the operator
             // with the error from an earlier, unrelated attempt.
             const err = document.getElementById('login-error');
             if (err) err.textContent = '';
+            // Explain the relock when there is a reason (session timed out);
+            // leave a PHP-rendered notice alone when called without one.
+            const noticeEl = document.getElementById('lock-notice');
+            if (noticeEl && notice !== undefined) noticeEl.textContent = notice || '';
         }
 
         async function showApp() {
             document.getElementById('lock-screen').classList.add('hidden');
             document.getElementById('app').classList.add('visible');
+            const noticeEl = document.getElementById('lock-notice');
+            if (noticeEl) noticeEl.textContent = '';
+            sessionLossHandled = false;
+            authEpoch++;
             isAuthenticated = true;
             localStorage.setItem(STORAGE_AUTH, 'true');
 
@@ -11089,6 +11219,10 @@ header('Cache-Control: no-cache, must-revalidate');
             if (btnSaveRecoveryEmail) {
                 btnSaveRecoveryEmail.addEventListener('click', saveRecoveryEmail);
             }
+            const btnSaveLoginTimeout = document.getElementById('btn-save-login-timeout');
+            if (btnSaveLoginTimeout) {
+                btnSaveLoginTimeout.addEventListener('click', saveLoginTimeout);
+            }
             const btnAddUser = document.getElementById('btn-add-user');
             if (btnAddUser) {
                 btnAddUser.addEventListener('click', () => openModal('modal-add-user'));
@@ -11466,6 +11600,54 @@ header('Cache-Control: no-cache, must-revalidate');
                 } else {
                     row.classList.add('hidden');
                 }
+            }
+
+            // Login timeout: global, admin-only. Fetched rather than rendered
+            // into the page so the (public) lock screen never carries it.
+            const timeoutRow = document.getElementById('login-timeout-row');
+            if (timeoutRow) {
+                if (u.role === 'admin') {
+                    timeoutRow.classList.remove('hidden');
+                    loadLoginTimeout();
+                } else {
+                    timeoutRow.classList.add('hidden');
+                }
+            }
+        }
+
+        async function loadLoginTimeout() {
+            const select = document.getElementById('login-timeout-select');
+            if (!select) return;
+            try {
+                const r = await fetch(adminUrl + '?api=get_login_timeout', { credentials: 'same-origin' });
+                const data = await r.json();
+                if (r.ok && data && Number.isInteger(data.seconds) && document.activeElement !== select) {
+                    select.value = String(data.seconds);
+                    select.dataset.loaded = '1';
+                }
+            } catch (e) { /* leave the select as rendered */ }
+        }
+
+        async function saveLoginTimeout() {
+            const select = document.getElementById('login-timeout-select');
+            const btn = document.getElementById('btn-save-login-timeout');
+            if (!select) return;
+            if (btn) btn.disabled = true;
+            try {
+                const response = await postWithCsrf(adminUrl,
+                    `action=save_login_timeout&seconds=${encodeURIComponent(select.value)}`);
+                const res = await response.json();
+                if (response.ok && res.success) {
+                    const label = select.options[select.selectedIndex] ? select.options[select.selectedIndex].text : select.value;
+                    showToast(`Login timeout set to ${label}`, 'success');
+                } else {
+                    showToast(res.error || 'Failed to save login timeout', 'error');
+                    loadLoginTimeout();
+                }
+            } catch (e) {
+                showToast(e.message || 'Failed to save login timeout', 'error');
+            } finally {
+                if (btn) btn.disabled = false;
             }
         }
 

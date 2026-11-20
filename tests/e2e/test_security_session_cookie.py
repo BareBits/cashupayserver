@@ -6,6 +6,8 @@ session_start() and rotate on logout.
 """
 from __future__ import annotations
 
+import re
+
 import requests
 
 from conftest import ConfiguredPayserver, DEFAULT_ADMIN_PASSWORD
@@ -21,7 +23,10 @@ def _session_set_cookie(resp) -> str:
     """
     for r in [*resp.history, resp]:
         raw = r.headers.get("Set-Cookie", "")
-        for c in (part.strip() for part in raw.split(",")):
+        # requests joins several Set-Cookie headers with ", "; the cookie's
+        # own `expires=Fri, 27 Nov ...` also contains one, so split only at
+        # commas that start a new `name=` pair.
+        for c in (part.strip() for part in re.split(r",\s*(?=[^\s;,=]+=)", raw)):
             if c.startswith("cashupay_session="):
                 return c
     raise AssertionError(

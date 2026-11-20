@@ -23,14 +23,21 @@ class Auth {
      * Lax + Secure on HTTPS) before session_start() — they only take effect
      * when set before the cookie is emitted. Idempotent: subsequent calls in
      * the same request are no-ops.
+     *
+     * The cookie lives as long as the configured login timeout (see
+     * loginTimeout()), so a signed-in operator survives a browser restart;
+     * validateSessionUser() slides that expiry forward on activity and ends
+     * the session server-side once it has sat idle for the whole timeout.
      */
     public static function initSession(): void {
         if (session_status() === PHP_SESSION_NONE) {
             $isHttps = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
                 || (($_SERVER['SERVER_PORT'] ?? null) == 443)
                 || (($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? null) === 'https');
+            $timeout = self::loginTimeout();
+            self::configureSessionStorage($timeout);
             session_set_cookie_params([
-                'lifetime' => 0,
+                'lifetime' => $timeout,
                 'path'     => '/',
                 'secure'   => $isHttps,
                 'httponly' => true,
@@ -39,6 +46,148 @@ class Auth {
             session_name(self::SESSION_NAME);
             session_start();
         }
+    }
+
+    // ---- Login timeout --------------------------------------------------------
+
+    /** Config key holding the idle login timeout, in seconds. */
+    public const LOGIN_TIMEOUT_KEY = 'login_timeout_seconds';
+    /** Default idle timeout: 7 days. */
+    public const LOGIN_TIMEOUT_DEFAULT = 7 * 86400;
+    /**
+     * The values the Settings page offers. The saved value must be one of
+     * these: a free-form number would let a typo lock everyone out after a
+     * second or keep sessions alive for years.
+     */
+    public const LOGIN_TIMEOUT_CHOICES = [
+        900        => '15 minutes',
+        1800       => '30 minutes',
+        3600       => '1 hour',
+        4 * 3600   => '4 hours',
+        8 * 3600   => '8 hours',
+        86400      => '24 hours',
+        7 * 86400  => '7 days',
+        30 * 86400 => '30 days',
+    ];
+
+    /** Set by validateSessionUser when this request's session died of inactivity. */
+    private static bool $timedOut = false;
+
+    /**
+     * The idle login timeout in seconds: how long a signed-in session may go
+     * without a request before it is ended. Global (one value for every
+     * user), admin-configured on the Settings page. Falls back to the default
+     * when the database is not reachable yet (pre-setup wizard) or the stored
+     * value is not one of the offered choices.
+     */
+    public static function loginTimeout(): int {
+        // A fresh install has no database yet; reading config would create
+        // an empty file ahead of the wizard's own first-run detection.
+        if (!file_exists(Database::getDbPath())) {
+            return self::LOGIN_TIMEOUT_DEFAULT;
+        }
+        try {
+            $v = (int)Config::get(self::LOGIN_TIMEOUT_KEY, self::LOGIN_TIMEOUT_DEFAULT);
+        } catch (\Throwable $e) {
+            $v = self::LOGIN_TIMEOUT_DEFAULT;
+        }
+        return isset(self::LOGIN_TIMEOUT_CHOICES[$v]) ? $v : self::LOGIN_TIMEOUT_DEFAULT;
+    }
+
+    /**
+     * Persist a new idle login timeout. Takes effect for every existing
+     * session on its next request (a shorter value can end sessions that
+     * are already idle for longer than it).
+     *
+     * @throws \InvalidArgumentException when $seconds is not an offered choice
+     */
+    public static function setLoginTimeout(int $seconds): void {
+        if (!isset(self::LOGIN_TIMEOUT_CHOICES[$seconds])) {
+            throw new \InvalidArgumentException('Login timeout must be one of the offered durations');
+        }
+        Config::set(self::LOGIN_TIMEOUT_KEY, $seconds);
+    }
+
+    /**
+     * True when this session was ended by inactivity and nobody has signed
+     * in since: either this very request found it expired, or an earlier one
+     * did (the fact is kept in the now-anonymous session so the lock screen
+     * can still explain itself after the SPA's 401-triggered reload or a
+     * redirect). Cleared by establishSession().
+     */
+    public static function sessionTimedOut(): bool {
+        return self::$timedOut
+            || (session_status() === PHP_SESSION_ACTIVE && !empty($_SESSION['login_timed_out_at']));
+    }
+
+    /**
+     * Point PHP's file-based session store at <data dir>/sessions and align
+     * its garbage collector with the login timeout.
+     *
+     * Left to the host, a long timeout is meaningless: the default
+     * session.gc_maxlifetime is 24 minutes, and Debian/Ubuntu packaged PHP
+     * disables in-process GC in favour of a cron job that deletes every file
+     * in the system session directory older than that — ini_set() cannot
+     * reach it. A directory of our own is outside that sweep, so we run
+     * PHP's own probabilistic GC there with a lifetime matching the timeout.
+     * The data directory already carries the deny-all protections the
+     * SQLite file relies on, so session files are no more exposed than it.
+     *
+     * Only applies to the 'files' handler (an operator who configured redis
+     * or memcached keeps their store) and only when the data directory
+     * already exists: before the wizard has created it the wizard's own
+     * session stays in PHP's default location.
+     */
+    private static function configureSessionStorage(int $timeout): void {
+        if (ini_get('session.save_handler') === 'files') {
+            $dataDir = Database::getDataDir();
+            if (is_dir($dataDir)) {
+                $dir = $dataDir . '/sessions';
+                if (!is_dir($dir)) {
+                    @mkdir($dir, 0700, true);
+                }
+                if (is_dir($dir) && is_writable($dir)) {
+                    @ini_set('session.save_path', $dir);
+                }
+            }
+        }
+        // Keep files at least as long as the idle timeout. Sessions are
+        // ended by validateSessionUser() exactly at the timeout regardless;
+        // GC here is disk hygiene for our own directory.
+        @ini_set('session.gc_maxlifetime', (string)$timeout);
+        @ini_set('session.gc_probability', '1');
+        @ini_set('session.gc_divisor', '100');
+    }
+
+    /** Minimum gap between two Set-Cookie refreshes of the same session, seconds. */
+    private const COOKIE_REFRESH_INTERVAL = 60;
+
+    /**
+     * Slide the session cookie's expiry forward so it tracks the idle
+     * timeout. PHP only emits the cookie when the id is new or regenerated,
+     * so without this a 7-day cookie minted at login would expire 7 days
+     * after login no matter how active the operator was. Throttled so a
+     * burst of dashboard requests does not stamp a Set-Cookie on each one.
+     */
+    private static function refreshSessionCookie(int $timeout): void {
+        $now = time();
+        $sentAt = (int)($_SESSION['cookie_sent_at'] ?? 0);
+        if ($now - $sentAt < self::COOKIE_REFRESH_INTERVAL) {
+            return;
+        }
+        if (headers_sent() || !ini_get('session.use_cookies')) {
+            return;
+        }
+        $params = session_get_cookie_params();
+        setcookie(session_name(), session_id(), [
+            'expires'  => $now + $timeout,
+            'path'     => $params['path'],
+            'domain'   => $params['domain'],
+            'secure'   => $params['secure'],
+            'httponly' => $params['httponly'],
+            'samesite' => $params['samesite'],
+        ]);
+        $_SESSION['cookie_sent_at'] = $now;
     }
 
     /** Per-request cache of the validated session user (see validateSessionUser). */
@@ -93,10 +242,15 @@ class Auth {
         $_SESSION['user_id']    = $user['id'];
         $_SESSION['user_role']  = $user['role'];
         $_SESSION['login_time'] = time();
+        $_SESSION['last_activity'] = time();
         $_SESSION['auth_fp']    = self::credentialFingerprint((string)($user['password_hash'] ?? ''));
         self::$sessionChecked = false;
         self::$sessionUser = null;
+        self::$timedOut = false;
+        unset($_SESSION['login_timed_out_at']);
+        // regenerate emits the cookie with initSession's lifetime (= the login timeout).
         session_regenerate_id(true);
+        $_SESSION['cookie_sent_at'] = time();
         if (($user['role'] ?? null) === self::ROLE_ADMIN) {
             Config::recordAdminBaseUrl();
         }
@@ -107,6 +261,11 @@ class Auth {
      * cleared identity) when the session no longer matches a live
      * credential. Sessions minted before the fingerprint existed carry no
      * auth_fp and are retired too: one re-login after the upgrade.
+     *
+     * Also enforces the idle login timeout: a session whose last request is
+     * older than loginTimeout() is ended here (sessionTimedOut() reports it
+     * for this request), otherwise the activity stamp and the cookie expiry
+     * move forward.
      */
     private static function validateSessionUser(): ?array {
         if (self::$sessionChecked) {
@@ -118,6 +277,18 @@ class Auth {
         if (!$userId) {
             return null;
         }
+        $timeout = self::loginTimeout();
+        // Sessions from before the timeout existed have login_time only;
+        // treat sign-in as their last activity rather than retiring them. A
+        // session with neither stamp can only have been seeded server-side
+        // (nothing a client sends reaches $_SESSION): it starts its clock now.
+        $lastActivity = (int)($_SESSION['last_activity'] ?? $_SESSION['login_time'] ?? 0);
+        if ($lastActivity > 0 && time() - $lastActivity > $timeout) {
+            self::clearSessionIdentity();
+            self::$timedOut = true;
+            $_SESSION['login_timed_out_at'] = time();
+            return null;
+        }
         $row = Database::fetchOne(
             "SELECT id, username, role, email, created_at, password_hash FROM users WHERE id = ?",
             [$userId]
@@ -127,13 +298,23 @@ class Auth {
             && is_string($fp)
             && hash_equals(self::credentialFingerprint((string)$row['password_hash']), $fp);
         if (!$ok) {
-            unset($_SESSION['user_id'], $_SESSION['user_role'], $_SESSION['login_time'], $_SESSION['auth_fp']);
+            self::clearSessionIdentity();
             return null;
         }
         $_SESSION['user_role'] = $row['role'];
+        $_SESSION['last_activity'] = time();
+        self::refreshSessionCookie($timeout);
         unset($row['password_hash']);
         self::$sessionUser = $row;
         return $row;
+    }
+
+    /** Drop the signed-in identity from the session (the CSRF token survives). */
+    private static function clearSessionIdentity(): void {
+        unset(
+            $_SESSION['user_id'], $_SESSION['user_role'], $_SESSION['login_time'],
+            $_SESSION['auth_fp'], $_SESSION['last_activity'], $_SESSION['cookie_sent_at']
+        );
     }
 
     /**
