@@ -253,7 +253,7 @@ BareBits is a fork of [CashuPayServer](https://github.com/jooray/cashupayserver)
 
 ### Database Protection
 
-The `data/` directory contains your SQLite database with ecash tokens (real Bitcoin value). It **must** be protected from HTTP access.
+The `data/` directory contains your SQLite database with ecash tokens (real Bitcoin value), and the admin sign-in sessions (`data/sessions/`). It **must** be protected from HTTP access.
 
 **Apache**: The `.htaccess` file handles this automatically, if enabled and honored. Verify.
 
@@ -303,6 +303,10 @@ your setup is safe, dismiss the dashboard notice or add
 Your seed phrase is your backup of funds stored in your Cashu mint (if enabled). Write it down and store it safely. If you lose access to your server, you can recover your funds with the seed phrase.
 
 **Warning**: Do not import the seed phrase into another wallet you use actively. Using the same seed in multiple wallets causes coin loss.
+
+### Login timeout
+
+Signed-in admin sessions stay valid across browser restarts and end after a period of inactivity: **7 days** by default, adjustable from 15 minutes to 30 days under **Settings → My Account → Login timeout**. The setting is global and applies to every existing session immediately.
 
 ### Resetting a lost admin password
 
