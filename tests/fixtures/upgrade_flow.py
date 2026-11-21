@@ -12,6 +12,7 @@ the suite runs on (bitcoind + LND + nutshell).
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -272,8 +273,32 @@ def cron_key(handle: PayserverHandle) -> str:
         return raw
 
 
+# The first release whose sessions carry the credential fingerprint (auth_fp).
+# The candidate retires fingerprint-less sessions (2026-11 security audit
+# decision: one re-login after that upgrade), so a dashboard session started
+# on an older release stops working the moment the candidate is applied.
+# Sessions from this release on are carried into <data dir>/sessions by the
+# candidate (Auth::adoptLegacySessionFile) and must survive the upgrade.
+FIRST_RELEASE_WITH_SESSION_FINGERPRINT = (1, 9)
+
+
+def release_version_tuple(tag: str) -> tuple[int, ...]:
+    """'v1.9.1' -> (1, 9, 1); 'v1.10-testing.119' -> (1, 10)."""
+    m = re.match(r"v?(\d+(?:\.\d+)*)", tag)
+    return tuple(int(x) for x in m.group(1).split(".")) if m else ()
+
+
+def session_survives_upgrade(tag: str) -> bool:
+    return release_version_tuple(tag) >= FIRST_RELEASE_WITH_SESSION_FINGERPRINT
+
+
 def update_status(seeded: SeededInstall) -> dict:
     r = seeded.admin.s.get(f"{seeded.url}/admin.php", params={"api": "update_status"}, timeout=30)
+    if r.status_code == 401 and not session_survives_upgrade(seeded.tag):
+        # Expected exactly once for a pre-fingerprint source release: the
+        # candidate has just retired the old session. Sign in again and go on.
+        seeded.admin.login(seeded.password)
+        r = seeded.admin.s.get(f"{seeded.url}/admin.php", params={"api": "update_status"}, timeout=30)
     r.raise_for_status()
     return r.json()
 

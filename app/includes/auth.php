@@ -147,6 +147,7 @@ class Auth {
                     @mkdir($dir, 0700, true);
                 }
                 if (is_dir($dir) && is_writable($dir)) {
+                    self::adoptLegacySessionFile($dir);
                     @ini_set('session.save_path', $dir);
                 }
             }
@@ -157,6 +158,98 @@ class Auth {
         @ini_set('session.gc_maxlifetime', (string)$timeout);
         @ini_set('session.gc_probability', '1');
         @ini_set('session.gc_divisor', '100');
+    }
+
+    /**
+     * Shape of a session id PHP mints (session.sid_length 22–256 chars drawn
+     * from [a-v0-9] or [A-Za-z0-9,-] depending on sid_bits_per_character).
+     * Anything else never names a file we would touch.
+     */
+    private const SESSION_ID_PATTERN = '/^[A-Za-z0-9,-]{22,256}$/';
+
+    /** Upper bound for a session file we are willing to carry over. */
+    private const LEGACY_SESSION_MAX_BYTES = 65536;
+
+    /**
+     * Carry this request's session over from PHP's default session directory.
+     *
+     * Releases before the login timeout kept sessions wherever the host's
+     * session.save_path pointed (the system temp dir under php -S, Debian's
+     * /var/lib/php/sessions, …). Redirecting save_path to <data dir>/sessions
+     * alone would leave every signed-in operator's cookie naming a file PHP
+     * can no longer see on the first request after the update: the very
+     * dashboard that just applied the update gets 401s and its progress
+     * never completes. So when the cookie names a session we do not have yet
+     * but the old directory does, move that file across once.
+     *
+     * Only a well-formed session id is ever turned into a path, only a file
+     * that looks like one of ours (it carries user_id) is taken, and a file
+     * already present in the new directory is never overwritten. The moved
+     * session still goes through validateSessionUser: one minted before the
+     * credential fingerprint existed is retired there as before.
+     */
+    private static function adoptLegacySessionFile(string $dir): void {
+        $id = $_COOKIE[self::SESSION_NAME] ?? null;
+        if (!is_string($id) || !preg_match(self::SESSION_ID_PATTERN, $id)) {
+            return;
+        }
+        $target = $dir . '/sess_' . $id;
+        if (file_exists($target)) {
+            return;
+        }
+        $legacyDir = self::legacySessionDir($dir);
+        if ($legacyDir === null) {
+            return;
+        }
+        $source = $legacyDir . '/sess_' . $id;
+        if (!is_file($source) || !is_readable($source)) {
+            return;
+        }
+        $size = @filesize($source);
+        if ($size === false || $size === 0 || $size > self::LEGACY_SESSION_MAX_BYTES) {
+            return;
+        }
+        $data = @file_get_contents($source);
+        if (!is_string($data) || strpos($data, 'user_id') === false) {
+            return; // not a sign-in of ours
+        }
+        if (@rename($source, $target)) {
+            @chmod($target, 0600);
+            return;
+        }
+        // rename() fails across filesystems: copy, then drop the original.
+        if (@file_put_contents($target, $data, LOCK_EX) !== false) {
+            @chmod($target, 0600);
+            @unlink($source);
+        } else {
+            @unlink($target);
+        }
+    }
+
+    /**
+     * The directory PHP's files handler used before configureSessionStorage
+     * redirected it: session.save_path as inherited from php.ini / .htaccess
+     * ("N;[mode;]/path" forms included) or, when unset, the system temp dir.
+     * Null when it does not exist or is already our own directory.
+     */
+    private static function legacySessionDir(string $own): ?string {
+        $raw = trim((string)ini_get('session.save_path'));
+        if ($raw !== '') {
+            $pos = strrpos($raw, ';');
+            if ($pos !== false) {
+                $raw = substr($raw, $pos + 1);
+            }
+        }
+        $path = $raw !== '' ? $raw : sys_get_temp_dir();
+        if (!is_dir($path)) {
+            return null;
+        }
+        $real = realpath($path);
+        $ownReal = realpath($own);
+        if ($real === false || ($ownReal !== false && $real === $ownReal)) {
+            return null;
+        }
+        return $real;
     }
 
     /** Minimum gap between two Set-Cookie refreshes of the same session, seconds. */
