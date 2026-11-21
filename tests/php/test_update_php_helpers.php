@@ -178,4 +178,38 @@ assert_eq('BROKEN', file_get_contents($inst . '/admin.php'), 'no rollback when i
 assert_not_null(upd_config_get('updater_pending_verify'), 'marker kept for re-check when inconclusive');
 assert_true(!in_array($badSha, upd_get_blocked_shas(), true), 'SHA not blocked when inconclusive');
 
+// ---- upd_self_request(): trusted URLs first, nothing request-derived on Apache ----
+// Mirror of Background::selfRequest (see test_background_trigger_origin.php):
+// Apache's SERVER_PORT follows the client's Host header, so the address pin
+// would still reach a listener on the attacker's port of our own address.
+foreach (['base_url', 'admin_base_url'] as $k) {
+    upd_config_set($k, null);
+}
+$_SERVER['HTTPS'] = '';
+$_SERVER['SCRIPT_NAME'] = '/update.php';
+$_SERVER['SERVER_ADDR'] = '127.0.0.1';
+$_SERVER['HTTP_HOST'] = '127.0.0.1:9999';
+$_SERVER['SERVER_PORT'] = '9999';
+$_SERVER['SERVER_SOFTWARE'] = 'nginx/1.25.3';
+$t = upd_self_request('/update.php');
+assert_not_null($t, 'nginx: request-derived target allowed');
+assert_eq('http://127.0.0.1:9999/update.php', $t['url'], 'nginx reports the real port');
+assert_eq(['127.0.0.1:9999:127.0.0.1'], $t['options'][CURLOPT_RESOLVE], 'pinned to the server address');
+
+$_SERVER['SERVER_SOFTWARE'] = 'Apache/2.4.58 (Debian)';
+assert_null(upd_self_request('/update.php'), 'Apache + nothing recorded -> no self-request');
+
+upd_config_set('admin_base_url', 'http://127.0.0.1:8080');
+$t = upd_self_request('/update.php?manual=1');
+assert_eq('http://127.0.0.1:8080/update.php?manual=1', $t['url'], 'admin sign-in URL used verbatim on Apache');
+assert_false(isset($t['options'][CURLOPT_RESOLVE]), 'no request-derived pin for a trusted URL');
+
+upd_config_set('base_url', 'https://pay.example');
+$t = upd_self_request('/update.php');
+assert_eq('https://pay.example/update.php', $t['url'], 'pinned base_url outranks admin_base_url');
+foreach (['base_url', 'admin_base_url'] as $k) {
+    upd_config_set($k, null);
+}
+unset($_SERVER['SERVER_SOFTWARE']);
+
 echo "ok\n";

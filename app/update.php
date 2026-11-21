@@ -223,8 +223,9 @@ function upd_base_url(): string {
 /**
  * Self-request target + curl policy for the health probe. Inlined mirror of
  * Background::selfRequest() (this file must not depend on includes/): a
- * pinned base_url (CASHUPAY_BASE_URL constant or DB base_url) is used
- * verbatim; otherwise the request-derived URL is only used when the Host
+ * pinned base_url (CASHUPAY_BASE_URL constant or DB base_url), else the
+ * admin's recorded sign-in URL (DB admin_base_url), is used verbatim;
+ * otherwise, never under Apache, the request-derived URL is only used when the Host
  * header has plain `host[:port]` / `[v6]:port` syntax AND the connection
  * can be pinned via CURLOPT_RESOLVE to the address this request arrived on
  * (SERVER_ADDR, or the built-in server's SERVER_NAME bind address), so the
@@ -243,7 +244,17 @@ function upd_self_request(string $pathAndQuery): ?array {
             $pinned = rtrim($configured, '/');
         }
     }
-    $url = ($pinned ?? upd_base_url()) . $pathAndQuery;
+    // Next best after operator configuration: the URL the admin last signed
+    // in from (Config::recordAdminBaseUrl), written only by a request that
+    // proved the admin credential.
+    $trusted = $pinned;
+    if ($trusted === null) {
+        $seen = upd_config_get('admin_base_url');
+        if (is_string($seen) && preg_match('#^https?://#i', $seen)) {
+            $trusted = rtrim($seen, '/');
+        }
+    }
+    $url = ($trusted ?? upd_base_url()) . $pathAndQuery;
     $parts = parse_url($url);
     if ($parts === false || empty($parts['host'])) {
         return null;
@@ -254,7 +265,15 @@ function upd_self_request(string $pathAndQuery): ?array {
     }
 
     $resolve = null;
-    if ($pinned === null) {
+    if ($trusted === null) {
+        // Apache (default UseCanonicalName Off) reports the Host header's
+        // port as SERVER_PORT, so the address pin below would still reach a
+        // listener on the attacker's port of our own address: no
+        // request-derived target there (mirrors
+        // Background::serverPortIsTrustworthy).
+        if (str_contains(strtolower((string)($_SERVER['SERVER_SOFTWARE'] ?? '')), 'apache')) {
+            return null;
+        }
         $hostHeader = (string)($_SERVER['HTTP_HOST'] ?? '');
         $plain = preg_match('/^[A-Za-z0-9.\-]+(:[0-9]{1,5})?$/D', $hostHeader) === 1
             || (preg_match('/^\[([0-9A-Fa-f:.]+)\](:[0-9]{1,5})?$/D', $hostHeader, $m) === 1
