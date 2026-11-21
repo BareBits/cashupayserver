@@ -16,9 +16,9 @@ use swentel\nostr\Sign\Sign;
 use swentel\nostr\Encryption\Nip44;
 
 $key = new Key();
-$mSk = $key->generatePrivateKey();           // merchant (receiver) identity
+$mSk = nostr_test_private_key();           // merchant (receiver) identity
 $mPk = $key->getPublicKey($mSk);
-$eSk = $key->generatePrivateKey();           // payer ephemeral identity (ours)
+$eSk = nostr_test_private_key();           // payer ephemeral identity (ours)
 $ePk = $key->getPublicKey($eSk);
 $reqId = str_repeat('aa', 32);
 
@@ -56,7 +56,7 @@ assert_false($v['paid'], 'res!=ok → not paid');
 assert_eq('res is not ok', $v['reason'] ?? null, 'res!=ok reason');
 
 // ---------- impostor author (different key signs a {res:ok}) ----------
-$xSk = $key->generatePrivateKey();
+$xSk = nostr_test_private_key();
 $impostor = mkEvent($xSk, $ePk, $reqId, ['res' => 'ok']);
 $v = ClinkClient::verifyReceiptEvent($impostor, $ctx);
 assert_false($v['paid'], 'wrong author → not paid');

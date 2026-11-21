@@ -16,9 +16,9 @@ require_once dirname(__DIR__, 2) . '/app/includes/nwc/client.php';
 use swentel\nostr\Key\Key;
 
 $key = new Key();
-$walletSk = $key->generatePrivateKey();
+$walletSk = nostr_test_private_key();
 $walletPk = $key->getPublicKey($walletSk);
-$clientSk = $key->generatePrivateKey();
+$clientSk = nostr_test_private_key();
 
 /** Start the mock wallet; returns [proc, port]. */
 function start_wallet(array $env): array {

@@ -42,8 +42,20 @@ def _login(page, configured: ConfiguredPayserver) -> None:
     wait_for_dashboard_settled(page)
 
 
-def _open_settings(page) -> None:
-    page.click('.nav-item[data-view="settings"]')
+def _open_settings(page, *, restored: bool = False) -> None:
+    """Show Settings and reveal the login-timeout row.
+
+    `restored=True` after a reload on /admin/settings: the app re-selects the
+    URL's view itself once loadDashboard() finishes, and that restore
+    re-collapses every card. Clicking the nav entry ourselves would race it
+    (expand, then the late restore folds the My Account card back up and the
+    row is hidden again), so wait for the restore to activate the view and
+    expand after it. expand_settings_cards() also waits for the dashboard
+    load to settle for the same reason."""
+    if restored:
+        page.wait_for_selector("#view-settings.active", state="attached")
+    else:
+        page.click('.nav-item[data-view="settings"]')
     expand_settings_cards(page)
     page.wait_for_selector("#view-settings.active")
     page.wait_for_selector("#login-timeout-row:not(.hidden)")
@@ -105,7 +117,7 @@ def test_setting_defaults_to_7_days_and_saves(configured: ConfiguredPayserver, p
     # Survives a reload.
     page.reload()
     page.wait_for_selector("#app", state="visible")
-    _open_settings(page)
+    _open_settings(page, restored=True)
     assert page.locator("#login-timeout-select").input_value() == "900"
 
 

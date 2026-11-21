@@ -14,7 +14,7 @@ require_once dirname(__DIR__, 2) . '/app/includes/clink/client.php';
 use swentel\nostr\Key\Key;
 
 $key = new Key();
-$mSk = $key->generatePrivateKey();
+$mSk = nostr_test_private_key();
 $mPk = $key->getPublicKey($mSk);
 
 /** Start the mock relay; returns [proc, pipes, port]. */

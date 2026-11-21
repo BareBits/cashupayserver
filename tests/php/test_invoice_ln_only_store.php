@@ -28,9 +28,9 @@ require_once dirname(__DIR__, 2) . '/app/includes/dev_fee.php';
 use swentel\nostr\Key\Key;
 
 $key = new Key();
-$walletSk = $key->generatePrivateKey();
+$walletSk = nostr_test_private_key();
 $walletPk = $key->getPublicKey($walletSk);
-$clientSk = $key->generatePrivateKey();
+$clientSk = nostr_test_private_key();
 
 /** Start a mock nwc wallet subprocess; returns [proc, port]. */
 function start_mock(string $script, string $portVar, array $env): array {

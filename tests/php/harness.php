@@ -15,6 +15,24 @@ declare(strict_types=1);
 // flip the same opt-in flag tests/fixtures/swap_stack.py uses.
 putenv('CASHUPAY_ALLOW_PRIVATE_ENDPOINTS=1');
 
+/**
+ * Fresh secp256k1 private key as exactly 64 lowercase hex characters.
+ *
+ * nostr-php's Key::generatePrivateKey() returns the scalar's hex WITHOUT
+ * left padding, so about one key in 256 (leading zero byte) comes back 62
+ * or 63 characters long. NwcUri and the other 64-hex validators reject such
+ * a key ("NWC secret must be 64 hex characters"), which made every test
+ * that builds NWC URIs or mock-wallet identities from these keys flaky.
+ * The scalar itself is fine; padding is the correct repair.
+ */
+function nostr_pad_hex(string $hex): string {
+    return str_pad(strtolower($hex), 64, '0', STR_PAD_LEFT);
+}
+
+function nostr_test_private_key(): string {
+    return nostr_pad_hex((new \swentel\nostr\Key\Key())->generatePrivateKey());
+}
+
 function fail(string $msg): void {
     fwrite(STDERR, $msg . "\n");
     debug_print_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS, 6);

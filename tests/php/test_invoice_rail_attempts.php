@@ -149,11 +149,11 @@ assert_eq(0, (int)$n['n'], 'discarded rows never reach the table');
 
 // ---------- shared mock plumbing (mirrors test_invoice_receive_errors) ----------
 $key = new Key();
-$walletSk = $key->generatePrivateKey();
+$walletSk = nostr_test_private_key();
 $walletPk = $key->getPublicKey($walletSk);
-$clientSk = $key->generatePrivateKey();
-$clientSk2 = $key->generatePrivateKey();
-$merchantSk = $key->generatePrivateKey();
+$clientSk = nostr_test_private_key();
+$clientSk2 = nostr_test_private_key();
+$merchantSk = nostr_test_private_key();
 $merchantPk = $key->getPublicKey($merchantSk);
 
 function start_mock(string $script, string $portVar, array $env): array {

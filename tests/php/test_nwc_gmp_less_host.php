@@ -62,9 +62,9 @@ assert_true(stripos($notice, 'php-gmp') !== false, "advisory tells the operator 
 
 // 2. Full NIP-47 round trip from a gmp-less child against a GMP mock wallet.
 $key = new Key();
-$walletSk = $key->generatePrivateKey();
+$walletSk = nostr_test_private_key();
 $walletPk = $key->getPublicKey($walletSk);
-$clientSk = $key->generatePrivateKey();
+$clientSk = nostr_test_private_key();
 
 /** Start the mock wallet; returns [proc, port]. */
 function start_wallet(array $env): array {

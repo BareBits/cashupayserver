@@ -100,14 +100,20 @@ def expand_settings_cards(page) -> None:
 
     Both views collapse all of their cards each time they are shown (see
     collapseSettingsCards() in admin.php), so a test that drives controls
-    inside a card must expand it first. Waits for the view to be active, which
-    switchView() sets in the same synchronous block as the collapse, so the
-    expansion can't be undone by a late initial-view restore. A later
-    switchView() back into the view re-collapses them. The per-section
-    defaults inside the Lightning payments card (the .subsection toggles) are
-    untouched; they have their own coverage.
+    inside a card must expand it first. Waits for the view to be active, then
+    for the dashboard load to settle: after a reload (or a sign-in on a deep
+    URL) the app restores the URL's view itself with switchView() right after
+    loadDashboard() finishes, and that restore re-collapses every card. A test
+    that clicked the nav entry and expanded before the restore landed would
+    see its cards fold back up (CI: "element is not visible" on a control
+    inside a card). Once the load has settled the restore has already run, so
+    the expansion sticks. A later switchView() back into the view still
+    re-collapses them. The per-section defaults inside the Lightning payments
+    card (the .subsection toggles) are untouched; they have their own
+    coverage.
     """
     page.wait_for_selector("#view-stores.active, #view-settings.active", state="attached")
+    wait_for_dashboard_settled(page)
     page.evaluate(
         "() => document.querySelectorAll('.view.active .card.collapsible')"
         ".forEach(c => c.classList.remove('collapsed'))"

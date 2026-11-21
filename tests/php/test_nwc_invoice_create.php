@@ -17,9 +17,9 @@ require_once dirname(__DIR__, 2) . '/app/includes/invoice.php';
 use swentel\nostr\Key\Key;
 
 $key = new Key();
-$walletSk = $key->generatePrivateKey();
+$walletSk = nostr_test_private_key();
 $walletPk = $key->getPublicKey($walletSk);
-$clientSk = $key->generatePrivateKey();
+$clientSk = nostr_test_private_key();
 
 /** Start a mock (nwc wallet | clink relay) subprocess; returns [proc, port]. */
 function start_mock(string $script, string $portVar, array $env): array {
@@ -86,7 +86,7 @@ try {
 
 // ---------- 3: dead NWC connection falls through to the noffer ----------
 require_once dirname(__DIR__, 2) . '/app/includes/clink/noffer.php';
-$mSk = $key->generatePrivateKey();
+$mSk = nostr_test_private_key();
 $mPk = $key->getPublicKey($mSk);
 [$proc, $port] = start_mock('mock_clink_relay.php', 'MOCK_CLINK_PORT', [
     'MOCK_CLINK_MERCHANT_SK' => $mSk,
