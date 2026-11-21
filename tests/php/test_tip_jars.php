@@ -198,6 +198,10 @@ SelfServe::setStoreOverride('s1', SelfServe::FORCE_OFF);
 SelfServe::setStoreOverride('s2', SelfServe::FORCE_OFF);
 SelfServe::setStoreOverride('s3', SelfServe::FORCE_OFF);
 $pdo = Database::getInstance();
+// The current getInstance() marker is the newer Cashu-maximum column set:
+// drop it too, or the marker is still present and migrations never re-run.
+$pdo->exec("ALTER TABLE stores DROP COLUMN cashu_max_invoice_sats");
+$pdo->exec("ALTER TABLE stores DROP COLUMN cashu_max_respect_always");
 $pdo->exec("UPDATE invoices SET tip_jar_id = NULL");
 $pdo->exec("ALTER TABLE invoices DROP COLUMN tip_jar_id");
 $pdo->exec("DROP TABLE tip_jars");

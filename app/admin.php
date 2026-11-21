@@ -641,6 +641,14 @@ if (isset($_GET['api'])) {
                 'onchain' => $onchain,
                 'ecx' => $ecxSettings,
                 'swaps' => $storeSwaps,
+                // Per-store Cashu maximum payment size (see CashuLimit):
+                // null maxSats = unlimited; respectAlways = "respect size
+                // even if other Lightning options fail".
+                'cashuLimit' => (function () use ($store) {
+                    require_once __DIR__ . '/includes/cashu_limit.php';
+                    $limit = CashuLimit::fromRow($store);
+                    return ['maxSats' => $limit['max_sats'], 'respectAlways' => $limit['respect_always']];
+                })(),
                 'selfserve' => $storeSelfServe,
                 'reliability' => (function() {
                     require_once __DIR__ . '/includes/mint_reliability.php';
@@ -4972,6 +4980,30 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
 
         // ===== Offline Cashu acceptance (NUT-12) =====
+        case 'save_cashu_limit':
+            // Per-store maximum payment size for the Cashu path + the
+            // "respect size even if other Lightning options fail" switch
+            // (includes/cashu_limit.php). Blank / 0 max = unlimited.
+            Auth::requireAdmin();
+            require_once __DIR__ . '/includes/cashu_limit.php';
+            try {
+                $storeId = $_POST['store_id'] ?? '';
+                if (empty($storeId) || !Config::getStore($storeId)) {
+                    throw new Exception('Store not found');
+                }
+                $maxSats = CashuLimit::parseMaxSats((string)($_POST['max_sats'] ?? ''));
+                $rawRespect = (string)($_POST['respect_always'] ?? '1');
+                if (!in_array($rawRespect, ['0', '1'], true)) {
+                    throw new Exception('Invalid "respect size" value');
+                }
+                CashuLimit::set($storeId, $maxSats, $rawRespect === '1');
+                echo json_encode(['success' => true, 'maxSats' => $maxSats, 'respectAlways' => $rawRespect === '1']);
+            } catch (Exception $e) {
+                cashupay_status(400);
+                echo json_encode(['error' => $e->getMessage()]);
+            }
+            break;
+
         case 'save_offline_cashu':
             Auth::requireAdmin();
             try {
@@ -8071,6 +8103,36 @@ header('Cache-Control: no-cache, must-revalidate');
                                     + Add Backup Mint
                                 </button>
                             </div>
+                            <!-- Per-store maximum payment size for the Cashu path
+                                 (includes/cashu_limit.php). Store-settings only; the
+                                 onboarding wizard never shows it. -->
+                            <div id="cashu-limit-block" style="margin-bottom:1.25rem; padding-bottom:1rem; border-bottom:1px solid var(--border);">
+                                <label class="form-label" for="cashu-max-invoice-sats">Maximum Cashu payment (sats)</label>
+                                <input type="number" class="form-input" id="cashu-max-invoice-sats"
+                                       min="0" step="1" placeholder="unlimited" inputmode="numeric">
+                                <p class="form-help" style="margin-top:0.5rem;">
+                                    Payments above this size are not issued through the Cashu mint.
+                                    Leave blank (or 0) for no limit.
+                                </p>
+                                <div class="toggle-container" style="margin-top:0.75rem;">
+                                    <span>Respect size even if other lightning options fail</span>
+                                    <label class="toggle">
+                                        <input type="checkbox" id="cashu-max-respect-always" checked>
+                                        <span class="toggle-slider"></span>
+                                    </label>
+                                </div>
+                                <p class="form-help" style="margin-top:-0.25rem;">
+                                    On: a payment above the maximum never gets a Cashu invoice, even when
+                                    every other Lightning path fails (it is recorded as a failed attempt).
+                                    Off: the Cashu mint is moved to the end of the Lightning payment path
+                                    order for that payment, so it only issues the invoice after every other
+                                    Lightning option has failed.
+                                </p>
+                                <div id="cashu-limit-error" class="hidden" style="margin-top:0.5rem; color: var(--error); font-size: 0.85rem;"></div>
+                                <button type="button" class="btn btn-full" id="btn-save-cashu-limit" style="margin-top:0.75rem;">
+                                    Save Cashu Maximum
+                                </button>
+                            </div>
                             <label class="form-label">Cashu automatic cashout</label>
                             <div id="aw-store" data-aw data-aw-scope="store">
                             <p class="aw-title">auto-cashout settings</p>
@@ -11145,6 +11207,8 @@ header('Cache-Control: no-cache, must-revalidate');
             if (testNotifsBtn) testNotifsBtn.addEventListener('click', sendTestNotification);
             const saveStoreSwapsBtn = document.getElementById('btn-save-store-swaps');
             if (saveStoreSwapsBtn) saveStoreSwapsBtn.addEventListener('click', saveStoreSwaps);
+            const saveCashuLimitBtn = document.getElementById('btn-save-cashu-limit');
+            if (saveCashuLimitBtn) saveCashuLimitBtn.addEventListener('click', saveCashuLimit);
             const revealSeedBtn = document.getElementById('btn-reveal-store-seed');
             if (revealSeedBtn) revealSeedBtn.addEventListener('click', revealStoreSeed);
             const saveStoreSelfServeBtn = document.getElementById('btn-save-store-selfserve');
@@ -12071,6 +12135,9 @@ header('Cache-Control: no-cache, must-revalidate');
 
                 // Per-store swap override + effective indicator.
                 refreshStoreSwapsCard();
+
+                // Per-store Cashu maximum payment size.
+                refreshCashuLimitBlock();
 
                 // Per-store self-serve override, max + public link.
                 refreshStoreSelfServeCard();
@@ -16353,6 +16420,46 @@ header('Cache-Control: no-cache, must-revalidate');
         }
 
         // -------- Submarine swap settings --------
+
+        // -------- Per-store Cashu maximum payment size (CashuLimit) --------
+
+        function refreshCashuLimitBlock() {
+            const limit = dashboardData && dashboardData.cashuLimit;
+            const maxEl = document.getElementById('cashu-max-invoice-sats');
+            const respectEl = document.getElementById('cashu-max-respect-always');
+            if (!limit || !maxEl || !respectEl) return;
+            maxEl.value = (limit.maxSats ?? null) === null ? '' : String(limit.maxSats);
+            respectEl.checked = limit.respectAlways !== false;
+            clearAwError('cashu-limit-error');
+        }
+
+        async function saveCashuLimit() {
+            if (!currentStoreId) return;
+            clearAwError('cashu-limit-error');
+            const maxEl = document.getElementById('cashu-max-invoice-sats');
+            const respectEl = document.getElementById('cashu-max-respect-always');
+            const maxSats = (maxEl?.value || '').trim();
+            if (maxSats !== '' && !/^\d+$/.test(maxSats)) {
+                return awError('cashu-limit-error', 'The Cashu maximum must be a whole number of sats (blank for no limit).');
+            }
+            const respect = respectEl && respectEl.checked ? '1' : '0';
+            try {
+                const response = await postWithCsrf(adminUrl,
+                    `action=save_cashu_limit&store_id=${encodeURIComponent(currentStoreId)}`
+                    + `&max_sats=${encodeURIComponent(maxSats)}&respect_always=${respect}`
+                );
+                const result = await response.json();
+                if (response.ok) {
+                    showToast('Cashu maximum saved', 'success');
+                    await loadDashboard();
+                    refreshCashuLimitBlock();
+                } else {
+                    awError('cashu-limit-error', result.error || 'Failed to save');
+                }
+            } catch (e) {
+                awError('cashu-limit-error', 'Failed to save the Cashu maximum');
+            }
+        }
 
         function refreshStoreSwapsCard() {
             // Driven by dashboardData.swaps once loaded.
