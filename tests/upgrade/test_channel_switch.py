@@ -31,6 +31,7 @@ from fixtures.upgrade_flow import (
     pay_ln_invoice,
     run_update_endpoint,
     seed_install,
+    session_survives_downgrade_to,
     set_channel,
     update_status,
     verify_install,
@@ -67,6 +68,12 @@ def _hop(
     # A published release's updater knows only GitHub; re-point the install
     # at the rig's release server so the NEXT hop stays inside the rig.
     point_updater_at(seeded.install, releases_base)
+    if channel == "main" and not session_survives_downgrade_to(expect_version):
+        # Older code, newer session store: the stable keeps sessions in PHP's
+        # default directory and cannot see the one the candidate carried into
+        # data/sessions, so this downgrade signs the operator out once. Sign
+        # in again; an upgrade hop must never need this.
+        seeded.admin.login(seeded.password)
     status = update_status(seeded)
     assert status.get("current_sha") == expect_sha, (
         f"after switching to {channel}: running {status.get('current_sha')}, expected {expect_sha}"

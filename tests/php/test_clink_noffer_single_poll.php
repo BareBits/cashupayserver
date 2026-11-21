@@ -20,7 +20,7 @@ require_once dirname(__DIR__, 2) . '/app/includes/invoice.php';
 use swentel\nostr\Key\Key;
 
 $key = new Key();
-$mSk = $key->generatePrivateKey();           // merchant (receiver) identity
+$mSk = nostr_test_private_key();           // merchant (receiver) identity
 $mPk = $key->getPublicKey($mSk);
 
 $store = 'store_noffer_poll';
@@ -51,7 +51,7 @@ function start_relay(array $env): array {
 
 function insert_noffer_invoice(string $id, string $store, string $relay, string $mPk, array $overrides = []): array {
     $key = new Key();
-    $eSk = $key->generatePrivateKey();       // payer ephemeral identity (ours)
+    $eSk = nostr_test_private_key();       // payer ephemeral identity (ours)
     $ePk = $key->getPublicKey($eSk);
     $reqId = bin2hex(random_bytes(32));
     Database::insert('invoices', array_merge([

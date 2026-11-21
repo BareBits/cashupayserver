@@ -15,9 +15,9 @@ require_once dirname(__DIR__, 2) . '/app/includes/invoice.php';
 use swentel\nostr\Key\Key;
 
 $key = new Key();
-$walletSk = $key->generatePrivateKey();
+$walletSk = nostr_test_private_key();
 $walletPk = $key->getPublicKey($walletSk);
-$clientSk = $key->generatePrivateKey();
+$clientSk = nostr_test_private_key();
 
 $store = 'store_nwc_rail';
 make_store($store);

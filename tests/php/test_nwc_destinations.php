@@ -20,9 +20,9 @@ $store = 'store_nwc';
 make_store($store);
 
 $key = new Key();
-$walletSk = $key->generatePrivateKey();
+$walletSk = nostr_test_private_key();
 $walletPk = $key->getPublicKey($walletSk);
-$clientSk = $key->generatePrivateKey();
+$clientSk = nostr_test_private_key();
 
 $noffer = ClinkNoffer::encode([
     'pubkey' => str_repeat('cd', 32),
@@ -63,7 +63,7 @@ try {
 assert_true($threw, 'same wallet+secret with different relay dedups');
 
 // Different secret to the same wallet is a distinct connection.
-$otherSk = $key->generatePrivateKey();
+$otherSk = nostr_test_private_key();
 $otherConn = "nostr+walletconnect://{$walletPk}?relay=wss://relay.test&secret={$otherSk}";
 assert_eq(2, count(StoreLnAddresses::chainFromLists([], [], [$nwcUri, $otherConn])), 'different secret not a dup');
 

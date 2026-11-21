@@ -75,11 +75,11 @@ assert_eq(2, count($deduped), 'identical {type,reason} pairs collapse; distinct 
 
 // ---------- shared mock plumbing (mirrors test_invoice_direct_receive_timeout) ----------
 $key = new Key();
-$walletSk = $key->generatePrivateKey();
+$walletSk = nostr_test_private_key();
 $walletPk = $key->getPublicKey($walletSk);
-$clientSk = $key->generatePrivateKey();
-$clientSk2 = $key->generatePrivateKey();
-$merchantSk = $key->generatePrivateKey();
+$clientSk = nostr_test_private_key();
+$clientSk2 = nostr_test_private_key();
+$merchantSk = nostr_test_private_key();
 $merchantPk = $key->getPublicKey($merchantSk);
 
 /** Start a mock (nwc wallet | clink relay) subprocess; returns [proc, port]. */

@@ -29,9 +29,9 @@ require_once dirname(__DIR__, 2) . '/app/includes/clink/client.php';
 use swentel\nostr\Key\Key;
 
 $key = new Key();
-$walletSk = $key->generatePrivateKey();
+$walletSk = nostr_test_private_key();
 $walletPk = $key->getPublicKey($walletSk);
-$clientSk = $key->generatePrivateKey();
+$clientSk = nostr_test_private_key();
 
 /** Start a mock (nwc wallet | clink relay) subprocess; returns [proc, port]. */
 function start_mock(string $script, string $portVar, array $env): array {
@@ -148,7 +148,7 @@ try {
 }
 
 // ---------- 4a. noffer: silent relays share one budget ----------
-$mSk = $key->generatePrivateKey();
+$mSk = nostr_test_private_key();
 $mPk = $key->getPublicKey($mSk);
 [$procA, $portA] = start_mock('mock_clink_relay.php', 'MOCK_CLINK_PORT', [
     'MOCK_CLINK_MERCHANT_SK' => $mSk,

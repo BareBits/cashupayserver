@@ -108,6 +108,35 @@ Database::delete('config', 'key = ?', ['base_url']);
 Config::clearCache();
 assert_null(Background::pinnedBaseUrl(), 'no pin without configuration');
 
+// ---- Apache: SERVER_PORT follows the Host header --------------------------------
+// With the default UseCanonicalName Off, Apache's SERVER_PORT is whatever port
+// the client put in Host, so the address pin alone would still hand the key to
+// a listener on that port of our own address. No request-derived target there.
+reset_server_vars();
+$_SERVER['SERVER_SOFTWARE'] = 'Apache/2.4.58 (Debian)';
+$_SERVER['SERVER_ADDR'] = '203.0.113.5';
+$_SERVER['HTTP_HOST'] = '127.0.0.1:9999';
+$_SERVER['SERVER_PORT'] = '9999';   // mirrored from Host, not the real socket
+assert_false(Background::serverPortIsTrustworthy(), 'Apache: SERVER_PORT not trusted');
+assert_null(Background::selfRequest('/cron.php?internal=1'), 'Apache + nothing recorded -> no self-request');
+// The admin's recorded sign-in URL is trusted and used verbatim (no pin needed).
+Config::set('admin_base_url', 'http://127.0.0.1:8080');
+$t = Background::selfRequest('/cron.php?internal=1');
+assert_not_null($t, 'Apache + admin_base_url -> self-request exists');
+assert_eq('http://127.0.0.1:8080/cron.php?internal=1', $t['url'], 'target is the admin sign-in URL, not the forged Host');
+assert_false(isset($t['options'][CURLOPT_RESOLVE]), 'trusted URL is used as-is');
+// admin_base_url also outranks the request on servers that do report the real port.
+$_SERVER['SERVER_SOFTWARE'] = 'nginx/1.25.3';
+$_SERVER['SERVER_PORT'] = '8443';
+$t = Background::selfRequest('/cron.php');
+assert_eq('http://127.0.0.1:8080/cron.php', $t['url'], 'admin_base_url preferred over the request-derived target');
+Database::delete('config', 'key = ?', ['admin_base_url']);
+Config::clearCache();
+assert_true(Background::serverPortIsTrustworthy(), 'nginx: SERVER_PORT trusted');
+$t = Background::selfRequest('/cron.php');
+assert_eq('http://127.0.0.1:8443/cron.php', $t['url'], 'nginx without a recorded URL: request-derived, real port');
+unset($_SERVER['SERVER_SOFTWARE']);
+
 // ---- trigger(): real sockets --------------------------------------------------
 $attacker = RequestSink::start($dir);
 // "Own" server answers with a redirect to the attacker, to prove no-follow.
@@ -150,6 +179,27 @@ $ownReqs = wait_for_requests($own, 3);
 assert_eq(3, count($ownReqs), 'pinned base_url target used');
 assert_eq([], $attacker->requests(), 'attacker listener untouched with a pinned base_url');
 
+// (e) Apache-style request: Host AND SERVER_PORT name the attacker listener.
+//     Without a recorded URL nothing is sent; with the admin's sign-in URL
+//     recorded the key goes to our own listener only.
+Database::delete('config', 'key = ?', ['base_url']);
+Config::clearCache();
+reset_server_vars();
+$_SERVER['SERVER_SOFTWARE'] = 'Apache/2.4.58 (Debian)';
+$_SERVER['SERVER_ADDR'] = '127.0.0.1';
+$_SERVER['HTTP_HOST'] = '127.0.0.1:' . $attacker->port;
+$_SERVER['SERVER_PORT'] = (string)$attacker->port;
+Background::trigger();
+usleep(300000);
+assert_eq(3, count($own->requests()), 'Apache + nothing recorded: no self-request at all');
+assert_eq([], $attacker->requests(), 'and the attacker port on our own address saw nothing');
+Config::set('admin_base_url', $own->base);
+Background::trigger();
+$ownReqs = wait_for_requests($own, 4);
+assert_eq(4, count($ownReqs), 'Apache + admin sign-in URL: self-request reached our own server');
+assert_eq($internalKey, $ownReqs[3]['headers']['HTTP_X_CRON_KEY'] ?? null, 'with the internal key');
+assert_eq([], $attacker->requests(), 'attacker listener still empty');
+unset($_SERVER['SERVER_SOFTWARE']);
 $own->stop();
 $attacker->stop();
 echo "ok\n";

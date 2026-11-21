@@ -547,7 +547,10 @@ def test_non_admin_sees_tiles_but_no_controls(shared_configured: ConfiguredPayse
         page.wait_for_selector("#modal-tipjar-detail.visible")
         assert page.locator("#tipjar-detail-link").input_value().endswith(f"/pay/{cfg.store_id}/{jar}")
         assert page.locator("#tipjar-detail-admin").is_hidden()
-        assert page.locator("#btn-tipjar-view-invoices").is_visible()
+        # Wait rather than an instant is_visible(): the sheet is still sliding
+        # in (0.3s transition) when the .visible class lands, and a one-shot
+        # read in that window has come back false in CI.
+        page.wait_for_selector("#btn-tipjar-view-invoices", state="visible", timeout=5000)
     finally:
         ctx.close()
         cfg.admin._post_action("delete_user", user_id=made["id"])

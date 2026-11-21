@@ -59,14 +59,18 @@ class Background {
     //
     //   1. A pinned base URL (CASHUPAY_BASE_URL or the DB `base_url`) is used
     //      verbatim: it is operator configuration, not request data.
-    //   2. Otherwise the URL is still built from the request (so paths and
+    //   2. Else the URL the admin last signed in from (admin_base_url,
+    //      written only by a credential-proving request) is used verbatim.
+    //   3. Otherwise the URL is still built from the request (so paths and
     //      scheme match the deployment), but the connection is pinned via
     //      CURLOPT_RESOLVE to the address this very request arrived on
     //      (SERVER_ADDR:SERVER_PORT), so whatever the Host header says, the
     //      bytes only ever reach our own server. Hosts that fail the plain
     //      `host[:port]` / `[v6]:port` syntax are refused outright, and when
-    //      no server address is known the self-request is skipped.
-    //   3. Never follow redirects, http/https only, verify TLS off-loopback.
+    //      no server address is known — or SERVER_PORT cannot be trusted,
+    //      which is Apache's default (see serverPortIsTrustworthy) — the
+    //      self-request is skipped.
+    //   4. Never follow redirects, http/https only, verify TLS off-loopback.
     //
     // Residual: on a shared IP where an attacker owns another vhost, a
     // Host-derived target still lands on that vhost of the same server.
@@ -81,7 +85,12 @@ class Background {
      */
     public static function selfRequest(string $pathAndQuery): ?array {
         $pinnedBase = self::pinnedBaseUrl();
-        $base = $pinnedBase ?? Config::getBaseUrl();
+        // Next best after operator configuration: the URL the admin last
+        // signed in from (Config::recordAdminBaseUrl). Only a request that
+        // proved the admin credential can write it, so it is not something
+        // an anonymous visitor's Host header can steer.
+        $trustedBase = $pinnedBase ?? Config::getTrustedBaseUrl();
+        $base = $trustedBase ?? Config::detectRequestBaseUrl();
         $url = rtrim($base, '/') . $pathAndQuery;
 
         $parts = parse_url($url);
@@ -93,17 +102,23 @@ class Background {
             return null;
         }
 
-        if ($pinnedBase === null) {
+        if ($trustedBase === null) {
             // Request-derived origin: refuse odd Host syntax and pin the
             // connection to the address:port the request came in on. The
             // port is rewritten too (SERVER_PORT is the socket this request
-            // arrived on; the Host header's port is what the client typed).
+            // arrived on where the server reports it honestly; see
+            // serverPortIsTrustworthy for Apache, which does not).
             $hostHeader = (string)($_SERVER['HTTP_HOST'] ?? '');
             if (!self::isPlainHostHeader($hostHeader)) {
                 return null;
             }
             $addr = self::serverAddress();
             if ($addr === null) {
+                return null;
+            }
+            if (!self::serverPortIsTrustworthy()) {
+                // The address pin alone is not enough: the port comes from
+                // SERVER_PORT, and Apache fills that from the Host header.
                 return null;
             }
             $defaultPort = $scheme === 'https' ? 443 : 80;
@@ -168,6 +183,24 @@ class Background {
             return filter_var($m[1], FILTER_VALIDATE_IP, FILTER_FLAG_IPV6) !== false;
         }
         return false;
+    }
+
+    /**
+     * Whether SERVER_PORT really is the port this request arrived on.
+     *
+     * php -S and nginx/FastCGI report the listening socket's port. Apache
+     * (mod_php or any FastCGI it fronts) with the default
+     * `UseCanonicalName Off` reports the port the CLIENT put in the Host
+     * header, and nothing else in the request reveals the real one. So a
+     * forged `Host: 127.0.0.1:<attacker port>` would, through the address
+     * pin, still deliver the internal key to a listener on that port of our
+     * own address. On Apache the request-derived target is therefore off;
+     * the operator pin or the admin's sign-in URL (both known for any
+     * configured install) carry the self-request instead.
+     */
+    public static function serverPortIsTrustworthy(): bool {
+        $software = strtolower((string)($_SERVER['SERVER_SOFTWARE'] ?? ''));
+        return !str_contains($software, 'apache');
     }
 
     /**

@@ -91,6 +91,7 @@ class EmailSender {
 
         $mailer = new PHPMailer(true);
         $mailer->CharSet = PHPMailer::CHARSET_UTF8;
+        $mailer->Hostname = self::messageIdHostname();
         $mailer->setFrom($fromAddress, $fromName);
         $mailer->addAddress($to);
         $mailer->Subject = $subject;
@@ -109,6 +110,26 @@ class EmailSender {
             // the SMTP server reply when available.
             throw new RuntimeException($e->getMessage(), 0, $e);
         }
+    }
+
+    /**
+     * Host part of the Message-ID (and PHPMailer's EHLO name).
+     *
+     * Left alone, PHPMailer takes $_SERVER['SERVER_NAME'], which Apache
+     * fills from the client's Host header: an anonymous password-reset
+     * request with `Host: evil.example` stamped `@evil.example` into the
+     * operator's genuine reset mail (php -S masks this: its SERVER_NAME is
+     * the bind address). Use the host of the operator-trusted base URL when
+     * one is known, otherwise the machine's own name. Never request data.
+     */
+    public static function messageIdHostname(): string {
+        $trusted = Config::getTrustedBaseUrl();
+        $host = $trusted !== null ? trim((string)parse_url($trusted, PHP_URL_HOST), '[]') : '';
+        if ($host === '') {
+            $own = function_exists('gethostname') ? gethostname() : false;
+            $host = is_string($own) && $own !== '' ? $own : 'localhost';
+        }
+        return $host;
     }
 
     private static function configureSmtp(PHPMailer $mailer, array $cfg): void {

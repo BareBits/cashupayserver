@@ -38,10 +38,10 @@ assert_eq(2, $m->invoke(null, 'CLINK_NOFFER_TIMEOUT_SEC'),
     'CLINK_NOFFER_TIMEOUT_SEC define overrides the default');
 
 $key = new Key();
-$walletSk = $key->generatePrivateKey();
+$walletSk = nostr_test_private_key();
 $walletPk = $key->getPublicKey($walletSk);
-$clientSk = $key->generatePrivateKey();
-$merchantSk = $key->generatePrivateKey();
+$clientSk = nostr_test_private_key();
+$merchantSk = nostr_test_private_key();
 $merchantPk = $key->getPublicKey($merchantSk);
 
 /** Start a mock (nwc wallet | clink relay) subprocess; returns [proc, port]. */

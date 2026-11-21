@@ -33,6 +33,8 @@ INVOICES = 8
 POLLERS = 6
 INVOICE_AMOUNT_SAT = "1000"
 WORKERS = 8
+# Far above what 6 pollers x 8 invoices + 8 browser tabs send in one minute.
+PAYMENT_RATE_LIMIT = 100000
 
 
 @pytest.fixture(scope="module")
@@ -43,7 +45,19 @@ def busy_server(request, mint: MintHandle, backup_mint: MintHandle) -> Iterator[
     every request and would hide the very contention this module exists to
     exercise."""
     workdir = SESSION_TMP / f"payserver-concurrency-{uuid.uuid4().hex[:8]}"
-    handle = start_payserver(workdir, extra_env={"PHP_CLI_SERVER_WORKERS": str(WORKERS)})
+    handle = start_payserver(
+        workdir,
+        extra_env={
+            "PHP_CLI_SERVER_WORKERS": str(WORKERS),
+            # payment.php budgets GET polls per client address (240/min by
+            # default). Every poller here shares 127.0.0.1 and together they
+            # send far more than that, so the limiter would answer 429 and
+            # the throttled polls would stop exercising the contention this
+            # test exists for. Lift it for this rig only; the limiter itself
+            # is covered by test_security_hardening.py.
+            "CASHUPAY_PAYMENT_RATE_LIMIT": str(PAYMENT_RATE_LIMIT),
+        },
+    )
     try:
         cfg = _configure(handle, mint, backup_mint)
     except Exception:
@@ -101,7 +115,8 @@ def test_eight_invoices_settle_exactly_once_under_contention(
             # i.e. the real settlement check, on every request — exactly what
             # eight open checkout tabs do every 2 s. (The Greenfield API
             # would do too, but it is rate-limited per IP at 100/min, and all
-            # the pollers here share one address.)
+            # the pollers here share one address; payment.php's own per-IP
+            # budget is lifted for this rig in busy_server.)
             return f"{cfg.handle.url}/payment.php?id={inv_id}&json=1"
 
         def poller() -> None:

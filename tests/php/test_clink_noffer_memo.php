@@ -134,7 +134,7 @@ function wait_for_dump(string $path, float $timeoutSec = 5.0): ?array {
 }
 
 $key = new Key();
-$mSk = $key->generatePrivateKey();
+$mSk = nostr_test_private_key();
 $mPk = $key->getPublicKey($mSk);
 
 $dumpFile = sys_get_temp_dir() . '/clink_req_dump_' . bin2hex(random_bytes(4)) . '.json';
