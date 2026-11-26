@@ -47,6 +47,7 @@ def _create_zero_rail_store(configured: ConfiguredPayserver, store_name: str) ->
     post(step="onchain", onchain_action="skip")
     post(step="lightning", lightning_action="skip")
     post(step="mints", mints_enabled="0")
+    post(step="rewards", rewards_action="skip")
     # wallet_tabs is the last add_store screen; answering it hands off (302).
     w.post(step="wallet_tabs", wallet_tabs_action="skip")
 

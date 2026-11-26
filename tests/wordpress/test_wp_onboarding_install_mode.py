@@ -69,9 +69,11 @@ def _walk_barebits_wizard(wp: WordPressHandle, mint_url: str, backup_mint_url: s
         backup_mint_url=backup_mint_url,
         mint_unit="sat",
     )
-    # The wallet-tabs question follows the last rail screen; skip it. The
-    # mints answer minted a wallet seed: the recovery-phrase screen follows,
-    # then the auto-update question…
+    # The rewards and wallet-tabs questions follow the last rail screen;
+    # skip both. The mints answer minted a wallet seed: the recovery-phrase
+    # screen follows, then the auto-update question…
+    assert wizard_heading(body) == "(Optional) Enable Rewards", wizard_heading(body)
+    body = wiz.post(step="rewards", rewards_action="skip")
     assert wizard_heading(body) == "Popular wallet tabs", wizard_heading(body)
     body = wiz.post(step="wallet_tabs", wallet_tabs_action="skip")
     assert wizard_heading(body) == "Save your recovery phrase", wizard_heading(body)

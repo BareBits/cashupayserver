@@ -643,6 +643,13 @@ class Stats {
             'ecx_created_tip_height', 'ecx_needs_manual_confirmation',
             'ecx_manual_candidates', 'ecx_last_polled_at', 'ecx_exchange_rate',
             'ecx_fee_note', 'ecx_fee_destination',
+            // Cash back rewards: the account applied / credited, the discount
+            // taken off `amount`, the reservation and its state, what the
+            // settlement earned and when it was claimed; plus the earlier
+            // static-address totals still attributable after a re-amount.
+            'rewards_account_id', 'rewards_discount_amount', 'rewards_applied_micro',
+            'rewards_spend_state', 'rewards_earned_micro', 'rewards_earn_currency',
+            'rewards_claimed_at', 'onchain_amount_alternates', 'ecx_amount_alternates',
         ];
     }
 

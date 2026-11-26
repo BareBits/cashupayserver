@@ -19,6 +19,7 @@ require_once __DIR__ . '/includes/payment_path_debug.php';
 require_once __DIR__ . '/includes/offline_cashu.php';
 require_once __DIR__ . '/includes/wallet_tabs.php';
 require_once __DIR__ . '/includes/tip_jars.php';
+require_once __DIR__ . '/includes/rewards_flow.php';
 
 // Check setup
 if (!Database::isInitialized() || !Config::isSetupComplete()) {
@@ -211,6 +212,111 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'noffe
     exit;
 }
 
+/**
+ * The `rewards` object of the JSON poll: what the success screen needs to
+ * offer the claim (or show the credit) once an invoice settles. The earn is
+ * computed at settlement, so a page that loaded while the invoice was New
+ * learns it from here. Skipped while the invoice is still New — the view
+ * walks the exchange-rate check there and the 2 s poll has no use for it.
+ */
+function cashupay_rewards_poll(array $invoice): array {
+    if ($invoice['status'] === 'New') {
+        return ['earned' => null, 'applied' => null];
+    }
+    $view = RewardsFlow::invoiceView($invoice);
+    return cashupay_rewards_subset($view);
+}
+
+/** The payer-facing subset of RewardsFlow::invoiceView (no account ids). */
+function cashupay_rewards_subset(array $view): array {
+    $earned = $view['earned'] ?? null;
+    $applied = $view['applied'] ?? null;
+    return [
+        'earned' => $earned === null ? null : [
+            'display' => (string)$earned['display'],
+            'fiatDisplay' => $earned['fiatDisplay'],
+            'claimable' => (bool)$earned['claimable'],
+            'claimedTo' => $earned['claimedTo'],
+        ],
+        'applied' => $applied === null ? null : [
+            'username' => (string)$applied['username'],
+            'discountAmount' => (string)$applied['discountAmount'],
+            'currency' => (string)$applied['currency'],
+            'display' => (string)$applied['display'],
+            'fullCoverage' => (bool)$applied['fullCoverage'],
+        ],
+    ];
+}
+
+// Cash back rewards (RewardsFlow): the payer applies a rewards balance to a
+// New invoice, undoes that before paying, or claims the earn on a paid one.
+// No CSRF token — the page is unauthenticated like send_receipt; the only
+// secret is the username itself (operator decision: usability over
+// security). Every outcome is a JSON {ok, ...}: 200 on success, 400 for a
+// payer-facing refusal (the exact RewardsFlow text, shown verbatim by the
+// page), 404 for an unknown invoice; the payment_post bucket above throttles
+// guessing. Usernames are validated by Rewards::normalizeUsername (letters
+// and digits only) before anything is looked up, and only the stored,
+// validated spelling is ever echoed back.
+if ($_SERVER['REQUEST_METHOD'] === 'POST'
+        && in_array($_POST['action'] ?? '', ['rewards_apply', 'rewards_remove', 'rewards_claim'], true)) {
+    header('Content-Type: application/json');
+    $rewardsAction = (string)$_POST['action'];
+    if (Invoice::getById($invoiceId) === null) {
+        cashupay_status(404);
+        echo json_encode(['ok' => false, 'error' => 'Invoice not found']);
+        exit;
+    }
+    $rewardsUsername = is_string($_POST['username'] ?? null) ? trim($_POST['username']) : '';
+    $jsonFlags = JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT;
+    if ($rewardsAction === 'rewards_apply') {
+        $res = RewardsFlow::applyToInvoice($invoiceId, $rewardsUsername);
+        if (empty($res['ok'])) {
+            cashupay_status(400);
+            echo json_encode(['ok' => false, 'error' => (string)$res['error']], $jsonFlags);
+            exit;
+        }
+        $applied = $res['applied'] ?? [];
+        echo json_encode([
+            'ok' => true,
+            'status' => (string)$res['status'],
+            'fullCoverage' => !empty($res['fullCoverage']),
+            'applied' => [
+                'username' => (string)($applied['username'] ?? ''),
+                'discountAmount' => (string)($applied['discountAmount'] ?? ''),
+                'currency' => (string)($applied['currency'] ?? ''),
+                'display' => (string)($applied['display'] ?? ''),
+            ],
+        ], $jsonFlags);
+        exit;
+    }
+    if ($rewardsAction === 'rewards_remove') {
+        $res = RewardsFlow::removeFromInvoice($invoiceId);
+        if (empty($res['ok'])) {
+            cashupay_status(400);
+            echo json_encode(['ok' => false, 'error' => (string)$res['error']], $jsonFlags);
+            exit;
+        }
+        echo json_encode(['ok' => true]);
+        exit;
+    }
+    // rewards_claim
+    $res = RewardsFlow::claimEarned($invoiceId, $rewardsUsername);
+    if (empty($res['ok'])) {
+        cashupay_status(400);
+        echo json_encode(['ok' => false, 'error' => (string)$res['error']], $jsonFlags);
+        exit;
+    }
+    echo json_encode([
+        'ok' => true,
+        'credited' => [
+            'display' => (string)($res['credited']['display'] ?? ''),
+            'username' => (string)($res['credited']['username'] ?? ''),
+        ],
+    ], $jsonFlags);
+    exit;
+}
+
 // JSON polling branch runs first so we can keep its work tight. The
 // customer's browser polls this every 2 s; firing the full Background
 // fan-out on every poll burns mint API budget and fights cron for the
@@ -259,6 +365,9 @@ if (isset($_GET['json'])) {
         // Long-lived invoice: lets a tab pick up a bolt11 another tab (or a
         // reload) refreshed, and drives its "refreshes in" timer.
         'longLived' => !empty($invoice['long_lived']),
+        // Cash back rewards: the earn (claimable / credited) once settled,
+        // and what was applied — see cashupay_rewards_poll.
+        'rewards' => cashupay_rewards_poll($invoice),
     ] + (!empty($invoice['long_lived']) ? cashupay_lightning_state($invoice) : []));
     exit;
 }
@@ -477,9 +586,37 @@ $chainKindInitial = cashupay_chain_kind($invoice);
 // detected while the page is open.
 $onchainTxUrl = cashupay_chain_tx_url($invoice);
 
-// Format amount for display - use store's mint unit
+// Cash back rewards: whether the payer may apply a balance, what is applied
+// (and therefore what is owed now), and the earn once settled. The store row
+// above is a projection; the rewards view needs the full row.
+$rewardsView = RewardsFlow::invoiceView($invoice, Config::getStore($invoice['store_id']) ?? []);
+$rewardsApplied = $rewardsView['applied'];
+// The struck-through original: only when rewards lower what is owed.
+$rewardsOriginalDisplay = $rewardsApplied !== null
+    ? $rewardsView['originalAmount'] . ' ' . strtoupper($invoice['currency'])
+    : null;
+// "Rewards applied: −X CUR (username)", with the rewards-currency value
+// when the balance is kept in another currency than the invoice's.
+$rewardsAppliedLine = null;
+if ($rewardsApplied !== null) {
+    $rewardsAppliedLine = 'Rewards applied: −' . $rewardsApplied['discountAmount'] . ' ' . strtoupper($rewardsApplied['currency']);
+    if (strtoupper((string)$rewardsView['rewardsCurrency']) !== strtoupper($invoice['currency'])) {
+        $rewardsAppliedLine .= ' (= ' . $rewardsApplied['display'] . ')';
+    }
+    $rewardsAppliedLine .= ' (' . $rewardsApplied['username'] . ')';
+}
+$rewardsEarned = $rewardsView['earned'];
+$rewardsClaimable = $rewardsEarned !== null && !empty($rewardsEarned['claimable']);
+$rewardsClaimedTo = $rewardsEarned !== null ? ($rewardsEarned['claimedTo'] ?? null) : null;
+// The claim / credited blocks are rendered (hidden) whenever the store runs
+// rewards, so the page can fill them when the status flips to Settled.
+$rewardsRenderClaim = !empty($rewardsView['enabled']) || $rewardsEarned !== null;
+
+// Format amount for display - use store's mint unit. With rewards applied
+// the headline is what is still owed (amount_sats already follows it).
 $mintUnit = Config::getStoreMintUnit($invoice['store_id']);
-$displayAmount = $invoice['amount'] . ' ' . strtoupper($invoice['currency']);
+$displayAmount = ($rewardsApplied !== null ? $rewardsView['effectiveAmount'] : $invoice['amount'])
+    . ' ' . strtoupper($invoice['currency']);
 
 // Show secondary amount info based on currency relationships
 $requestCurrency = strtoupper($invoice['currency']);
@@ -1320,6 +1457,106 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
             text-align: center;
         }
 
+        /* Cash back rewards: the struck-through original next to what is
+           owed, the "Rewards applied" line, the inline apply form on the
+           pending screen and the claim prompt on the success screen. */
+        .amount .amount-original {
+            color: var(--text-secondary);
+            font-weight: 500;
+            font-size: 0.7em;
+            margin-right: 0.4rem;
+        }
+        .rewards-block {
+            margin: 0 0 1rem;
+            text-align: center;
+        }
+        .rewards-applied {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            justify-content: center;
+            gap: 0.25rem 0.6rem;
+            font-size: 0.9rem;
+            color: var(--success);
+        }
+        .rewards-remove,
+        .rewards-link {
+            color: var(--text-secondary);
+            text-decoration: underline;
+            font-size: 0.8rem;
+            cursor: pointer;
+            background: none;
+            border: none;
+            padding: 0;
+        }
+        .rewards-apply-btn {
+            margin-top: 0;
+        }
+        .rewards-form,
+        .rewards-claim {
+            margin: 0.75rem 0 0;
+            text-align: left;
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+        }
+        .rewards-claim {
+            width: 100%;
+            margin: 0 0 1rem;
+            padding: 1rem;
+            background: rgba(0, 0, 0, 0.25);
+            border-radius: 12px;
+        }
+        .rewards-claim .rewards-claim-text {
+            margin: 0 0 0.75rem;
+            text-align: center;
+            color: var(--text-primary);
+            line-height: 1.5;
+        }
+        .rewards-form .form-input,
+        .rewards-claim .form-input {
+            width: 100%;
+            background: rgba(0, 0, 0, 0.3);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 12px;
+            padding: 0.75rem 1rem;
+            color: var(--text-primary);
+            font-size: 0.9rem;
+            margin-bottom: 0.5rem;
+        }
+        .rewards-form .form-input:focus,
+        .rewards-claim .form-input:focus {
+            outline: none;
+            border-color: var(--accent);
+        }
+        .rewards-hint {
+            font-size: 0.78rem;
+            color: var(--text-secondary);
+            margin: 0 0 0.25rem;
+            text-align: center;
+        }
+        .rewards-form .btn-row,
+        .rewards-claim .btn-row {
+            margin-top: 0.5rem;
+        }
+        .rewards-status {
+            margin-top: 0.5rem;
+            text-align: center;
+            font-size: 0.8rem;
+        }
+        .rewards-status.error {
+            color: var(--error);
+        }
+        .rewards-status.success {
+            color: var(--success);
+        }
+        .rewards-credited {
+            width: 100%;
+            margin: 0 0 1rem;
+            font-size: 0.9rem;
+            color: var(--success);
+            text-align: center;
+        }
+
         .footer {
             padding: 1rem;
             text-align: center;
@@ -1470,8 +1707,43 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
             $shareUrl = Urls::payment($invoice['id']);
             $showShare = Urls::paymentLinkShareable();
             ?>
+            <?php
+            // Amount line shared by the pending and success screens: with
+            // rewards applied, the original amount struck through before
+            // what is owed. Plain text otherwise (existing tests pin it).
+            $amountLineHtml = $rewardsOriginalDisplay !== null
+                ? '<s class="amount-original">' . htmlspecialchars($rewardsOriginalDisplay) . '</s><span class="amount-effective">' . htmlspecialchars($displayAmount) . '</span>'
+                : htmlspecialchars($displayAmount);
+            ?>
             <div id="payment-pending" class="<?= $invoice['status'] !== 'New' ? 'hidden' : '' ?>">
-                <div class="amount"><?= htmlspecialchars($displayAmount) ?></div>
+                <div class="amount"><?= $amountLineHtml ?></div>
+
+                <?php if ($rewardsApplied !== null && $invoice['status'] === 'New'): ?>
+                <!-- Rewards applied while still payable: the payer may undo. -->
+                <div class="rewards-block" id="rewards-applied-block">
+                    <div class="rewards-applied">
+                        <span class="rewards-applied-text" id="rewards-applied-text"><?= htmlspecialchars($rewardsAppliedLine) ?></span>
+                        <button type="button" class="rewards-remove" id="rewards-remove-btn">Remove</button>
+                    </div>
+                    <div class="rewards-status hidden" id="rewards-remove-status"></div>
+                </div>
+                <?php elseif (!empty($rewardsView['canApply'])): ?>
+                <!-- A balance may be applied: button opens the inline form. -->
+                <div class="rewards-block" id="rewards-apply-block">
+                    <button type="button" class="btn btn-secondary rewards-apply-btn" id="rewards-apply-btn">Apply rewards</button>
+                    <form class="rewards-form hidden" id="rewards-apply-form" novalidate>
+                        <input type="text" class="form-input" id="rewards-apply-username" name="username"
+                               placeholder="Your rewards username" autocomplete="off" inputmode="text"
+                               maxlength="64" pattern="[A-Za-z0-9]+" required>
+                        <div class="rewards-hint">Enter the username you chose when you earned rewards. Many people use their phone number.</div>
+                        <div class="btn-row">
+                            <button type="submit" class="btn" id="rewards-apply-submit">Apply</button>
+                            <button type="button" class="btn btn-secondary" id="rewards-apply-cancel">Cancel</button>
+                        </div>
+                        <div class="rewards-status hidden" id="rewards-apply-status"></div>
+                    </form>
+                </div>
+                <?php endif; ?>
 
                 <?php
                 // Itemized cart breakdown (when this invoice came from the cart
@@ -1963,7 +2235,12 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                     </svg>
                 </div>
                 <div class="confirming-icon <?= $onchainPendingInitial ? '' : 'hidden' ?>" id="confirming-icon"></div>
-                <div class="amount"><?= htmlspecialchars($displayAmount) ?></div>
+                <div class="amount"><?= $amountLineHtml ?></div>
+                <?php if ($rewardsApplied !== null): ?>
+                <div class="rewards-block" id="rewards-applied-success">
+                    <div class="rewards-applied"><span class="rewards-applied-text"><?= htmlspecialchars($rewardsAppliedLine) ?></span></div>
+                </div>
+                <?php endif; ?>
                 <div class="status-badge settled <?= $onchainPendingInitial ? 'hidden' : '' ?>" id="success-badge-settled">
                     Payment Complete
                 </div>
@@ -1993,6 +2270,29 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                    data-label-btc="View transaction on mempool.space" data-label-ecx="View transaction on explorer.ecash.com">
                     <?= $chainKindInitial === 'ecx' ? 'View transaction on explorer.ecash.com' : 'View transaction on mempool.space' ?>
                 </a>
+                <?php if ($rewardsRenderClaim): ?>
+                <!-- Cash back rewards earned on this payment. The claim prompt
+                     shows for an unclaimed earn inside the claim window; the
+                     credited line once a username holds it (auto-credited when
+                     rewards were applied, or after a claim here). Both live in
+                     the DOM so a page that loaded while the invoice was New can
+                     fill them from the poll when it settles. -->
+                <div class="rewards-claim <?= $rewardsClaimable ? '' : 'hidden' ?>" id="rewards-claim">
+                    <form id="rewards-claim-form" novalidate>
+                        <p class="rewards-claim-text">You are due <strong id="rewards-claim-amount"><?= htmlspecialchars($rewardsClaimable ? $rewardsEarned['display'] . (!empty($rewardsEarned['fiatDisplay']) ? ' (≈ ' . $rewardsEarned['fiatDisplay'] . ')' : '') : '') ?></strong> in rewards.
+                            Pick a username to claim them. Pick a difficult to predict username, there is no password, many people use their phone number. Unclaimed rewards disappear.</p>
+                        <input type="text" class="form-input" id="rewards-claim-username" name="username"
+                               placeholder="Pick a username" autocomplete="off" inputmode="text"
+                               maxlength="64" pattern="[A-Za-z0-9]+" required>
+                        <div class="btn-row">
+                            <button type="submit" class="btn" id="rewards-claim-submit">Claim rewards</button>
+                            <button type="button" class="btn btn-secondary" id="rewards-claim-skip">Skip</button>
+                        </div>
+                        <div class="rewards-status hidden" id="rewards-claim-status"></div>
+                    </form>
+                </div>
+                <div class="rewards-credited <?= $rewardsClaimedTo !== null ? '' : 'hidden' ?>" id="rewards-credited"><span id="rewards-credited-amount"><?= htmlspecialchars($rewardsClaimedTo !== null ? $rewardsEarned['display'] : '') ?></span> in rewards credited to <strong id="rewards-credited-user"><?= htmlspecialchars((string)($rewardsClaimedTo ?? '')) ?></strong>.</div>
+                <?php endif; ?>
                 <div class="invoice-details">
                     <div><span class="label">Invoice:</span><span class="invoice-id-value"><?= htmlspecialchars($invoice['id']) ?></span></div>
                     <?php if ($invoiceNote !== ''): ?>
@@ -2090,6 +2390,10 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
         let lnRefreshedAt = <?= (int)(($invoice['ln_refreshed_at'] ?? null) ?: ($invoice['created_at'] ?? 0)) ?>;
         const redirectUrl = <?= json_encode($redirectUrl) ?>;
         const payerReceiptOffered = <?= json_encode($payerReceiptOffered) ?>;
+        // Cash back rewards as rendered: {earned: {display, fiatDisplay,
+        // claimable, claimedTo} | null, applied: {...} | null}. The poll
+        // carries the same shape once the invoice settles.
+        let rewardsState = <?= json_encode(cashupay_rewards_subset($rewardsView), JSON_HEX_TAG | JSON_HEX_AMP) ?>;
         // CLINK noffer receive: subscription params so the page can watch the
         // offer's relay for the merchant's kind-21001 payment receipt. Null
         // unless this invoice rides the noffer rail.
@@ -2621,6 +2925,12 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
                     applyLightning(data, true);
                 }
 
+                // Rewards earned on this payment: the poll knows them once
+                // the invoice settled (the earn is computed at settlement).
+                if (data.rewards && typeof data.rewards === 'object') {
+                    rewardsState = data.rewards;
+                }
+
                 const onchainPending = !!data.onchainPending;
                 if (data.status !== currentStatus || onchainPending !== currentOnchainPending) {
                     currentStatus = data.status;
@@ -2731,7 +3041,202 @@ if (PaymentPathDebug::enabled() && $pathDebugMayBeAdmin) {
         // for ~2 seconds, which made the invoice ID + note unreadable.
         function onSettled() {
             wireReceiptForm();
+            renderRewardsEarned();
         }
+
+        // ---- Cash back rewards -------------------------------------------
+        // POST one of the rewards actions to this same URL. Resolves to
+        // {ok, status, data}; the error text comes verbatim from the server
+        // (RewardsFlow's payer-facing strings) and is only ever set as text.
+        async function rewardsPost(action, fields) {
+            const body = new URLSearchParams();
+            body.set('action', action);
+            Object.keys(fields || {}).forEach(k => body.set(k, fields[k]));
+            const url = new URL(window.location.href);
+            url.searchParams.set('id', invoiceId);
+            url.searchParams.delete('json');
+            const response = await fetch(url.toString(), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: body.toString(),
+            });
+            const data = await response.json().catch(() => ({}));
+            return { ok: response.ok && !!data.ok, status: response.status, data: data };
+        }
+        function rewardsSetStatus(el, msg, kind) {
+            if (!el) return;
+            el.textContent = msg || '';
+            el.classList.toggle('hidden', !msg);
+            el.classList.remove('error', 'success');
+            if (kind) el.classList.add(kind);
+        }
+        function rewardsErrorText(res, fallback) {
+            if (res.status === 429) return 'Too many attempts. Please wait a minute and try again.';
+            return (res.data && res.data.error) ? String(res.data.error) : fallback;
+        }
+
+        // Pending screen: "Apply rewards" opens the inline username form; a
+        // successful apply or remove reloads the page, which re-renders with
+        // the new amount and QR codes (a full-coverage apply lands on the
+        // success screen — the server already settled the invoice).
+        function wireRewardsPending() {
+            const applyBtn = document.getElementById('rewards-apply-btn');
+            const form = document.getElementById('rewards-apply-form');
+            if (applyBtn && form) {
+                const input = document.getElementById('rewards-apply-username');
+                const submit = document.getElementById('rewards-apply-submit');
+                const cancel = document.getElementById('rewards-apply-cancel');
+                const status = document.getElementById('rewards-apply-status');
+                applyBtn.addEventListener('click', () => {
+                    applyBtn.classList.add('hidden');
+                    form.classList.remove('hidden');
+                    rewardsSetStatus(status, '', null);
+                    try { input.focus(); } catch (e) {}
+                });
+                cancel.addEventListener('click', () => {
+                    form.classList.add('hidden');
+                    applyBtn.classList.remove('hidden');
+                    rewardsSetStatus(status, '', null);
+                });
+                form.addEventListener('submit', async (e) => {
+                    e.preventDefault();
+                    const username = input.value.trim();
+                    if (!username) { rewardsSetStatus(status, 'Please enter your username.', 'error'); return; }
+                    submit.disabled = true;
+                    cancel.disabled = true;
+                    rewardsSetStatus(status, 'Applying…', null);
+                    try {
+                        const res = await rewardsPost('rewards_apply', { username: username });
+                        if (res.ok) {
+                            rewardsSetStatus(status, res.data.fullCoverage ? 'Rewards covered this payment.' : 'Rewards applied.', 'success');
+                            window.location.reload();
+                            return;
+                        }
+                        rewardsSetStatus(status, rewardsErrorText(res, 'Rewards could not be applied right now, please try again'), 'error');
+                    } catch (err) {
+                        rewardsSetStatus(status, 'Network error — please try again.', 'error');
+                    }
+                    submit.disabled = false;
+                    cancel.disabled = false;
+                });
+            }
+            const removeBtn = document.getElementById('rewards-remove-btn');
+            if (removeBtn) {
+                const status = document.getElementById('rewards-remove-status');
+                removeBtn.addEventListener('click', async () => {
+                    removeBtn.disabled = true;
+                    rewardsSetStatus(status, 'Removing…', null);
+                    try {
+                        const res = await rewardsPost('rewards_remove', {});
+                        if (res.ok) {
+                            window.location.reload();
+                            return;
+                        }
+                        rewardsSetStatus(status, rewardsErrorText(res, 'Rewards could not be removed right now, please try again'), 'error');
+                    } catch (err) {
+                        rewardsSetStatus(status, 'Network error — please try again.', 'error');
+                    }
+                    removeBtn.disabled = false;
+                });
+            }
+        }
+
+        // Success screen: show the claim prompt for an unclaimed earn inside
+        // the window, the credited line once a username holds it, nothing
+        // otherwise. Renders from rewardsState; a page that loaded while the
+        // invoice was New asks the server once more when the poll that saw
+        // the settlement carried no earn yet.
+        let rewardsEarnedFetched = false;
+        function renderRewardsEarned() {
+            const claim = document.getElementById('rewards-claim');
+            const credited = document.getElementById('rewards-credited');
+            if (!claim || !credited) return;
+            wireRewardsClaim();
+            const earned = rewardsState && rewardsState.earned;
+            if (earned && earned.claimedTo) {
+                claim.classList.add('hidden');
+                document.getElementById('rewards-credited-amount').textContent = earned.display || '';
+                document.getElementById('rewards-credited-user').textContent = earned.claimedTo;
+                credited.classList.remove('hidden');
+                return;
+            }
+            if (earned && earned.claimable) {
+                document.getElementById('rewards-claim-amount').textContent =
+                    (earned.display || '') + (earned.fiatDisplay ? ' (≈ ' + earned.fiatDisplay + ')' : '');
+                credited.classList.add('hidden');
+                claim.classList.remove('hidden');
+                return;
+            }
+            claim.classList.add('hidden');
+            credited.classList.add('hidden');
+            if (!earned && !rewardsEarnedFetched && currentStatus === 'Settled') {
+                rewardsEarnedFetched = true;
+                setTimeout(fetchRewardsOnce, 1500);
+            }
+        }
+        async function fetchRewardsOnce() {
+            try {
+                const pollUrl = new URL(window.location.href);
+                pollUrl.searchParams.set('id', invoiceId);
+                pollUrl.searchParams.set('json', '1');
+                const response = await fetch(pollUrl.toString());
+                if (!response.ok) return;
+                const data = await response.json();
+                if (data.rewards && typeof data.rewards === 'object') {
+                    rewardsState = data.rewards;
+                    renderRewardsEarned();
+                }
+            } catch (e) {
+                console.error('Rewards poll error:', e);
+            }
+        }
+        let rewardsClaimWired = false;
+        function wireRewardsClaim() {
+            if (rewardsClaimWired) return;
+            const form = document.getElementById('rewards-claim-form');
+            if (!form) return;
+            rewardsClaimWired = true;
+            const claim = document.getElementById('rewards-claim');
+            const credited = document.getElementById('rewards-credited');
+            const input = document.getElementById('rewards-claim-username');
+            const submit = document.getElementById('rewards-claim-submit');
+            const skip = document.getElementById('rewards-claim-skip');
+            const status = document.getElementById('rewards-claim-status');
+            // Skip: on to the store when the merchant configured a redirect,
+            // otherwise just put the prompt away.
+            skip.addEventListener('click', () => {
+                if (redirectUrl) {
+                    window.location = redirectUrl;
+                } else {
+                    claim.classList.add('hidden');
+                }
+            });
+            form.addEventListener('submit', async (e) => {
+                e.preventDefault();
+                const username = input.value.trim();
+                if (!username) { rewardsSetStatus(status, 'Please pick a username.', 'error'); return; }
+                submit.disabled = true;
+                skip.disabled = true;
+                rewardsSetStatus(status, 'Claiming…', null);
+                try {
+                    const res = await rewardsPost('rewards_claim', { username: username });
+                    if (res.ok) {
+                        const c = res.data.credited || {};
+                        rewardsState = Object.assign({}, rewardsState, {
+                            earned: { display: c.display || '', fiatDisplay: null, claimable: false, claimedTo: c.username || username },
+                        });
+                        renderRewardsEarned();
+                        return;
+                    }
+                    rewardsSetStatus(status, rewardsErrorText(res, 'Rewards could not be claimed right now, please try again'), 'error');
+                } catch (err) {
+                    rewardsSetStatus(status, 'Network error — please try again.', 'error');
+                }
+                submit.disabled = false;
+                skip.disabled = false;
+            });
+        }
+        wireRewardsPending();
 
         // Wire up the receipt form: submit POSTs to this same URL with
         // action=send_receipt. "No thanks" just hides the form so the

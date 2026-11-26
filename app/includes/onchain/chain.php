@@ -98,6 +98,10 @@ final class Chain {
                 'manual'        => 'onchain_manual_candidates',
                 'last_polled'   => 'onchain_last_polled_at',
                 'floor'         => 'onchain_amount_floor_sat',
+                // Earlier expected totals of a static shared address that are
+                // still attributable (JSON int list; cash back rewards moved
+                // the amount). See OnchainPayments::reallocateStaticAmount.
+                'alternates'    => 'onchain_amount_alternates',
                 // Exchange rate the amount was quoted at (coin price in the
                 // invoice currency); the Bitcoin rail shares the invoice's.
                 'rate'          => 'exchange_rate',
@@ -163,6 +167,7 @@ final class Chain {
                 'manual'        => 'ecx_manual_candidates',
                 'last_polled'   => 'ecx_last_polled_at',
                 'floor'         => 'ecx_amount_floor_szat',
+                'alternates'    => 'ecx_amount_alternates',
                 'rate'          => 'ecx_exchange_rate',
             ],
             store: [

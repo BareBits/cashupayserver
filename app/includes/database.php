@@ -279,7 +279,7 @@ class Database {
                 // on existing installs that haven't yet picked it up. All migrations
                 // are idempotent, so a fire is safe.
                 $hasLatestMigration = $hasConfig
-                    && self::columnExists($pdo, 'stores', 'cashu_max_invoice_sats');
+                    && self::columnExists($pdo, 'stores', 'rewards_percent');
                 // The auto-withdraw → auto-cashout rename is a data-only migration
                 // (config key + notification event labels) with no schema artifact
                 // to mark it done, so probe for the legacy config key directly. The
@@ -2414,9 +2414,10 @@ HTACCESS;
         // Per-store maximum payment size for the Cashu path (see
         // includes/cashu_limit.php). cashu_max_invoice_sats is the largest
         // payment the store's mint may issue a Lightning invoice for (NULL =
-        // unlimited, the historical behavior) and is the getInstance()
-        // migration marker for this set — a plain column on purpose (no
-        // index / FK) so the fail-closed migration tests can DROP COLUMN it.
+        // unlimited, the historical behavior) and was the getInstance()
+        // migration marker for this set (the marker has since moved on to
+        // stores.rewards_percent) — a plain column on purpose (no index / FK)
+        // so the fail-closed migration tests can DROP COLUMN it.
         // cashu_max_respect_always is the "respect size even if other
         // Lightning options fail" switch, default ON. Both additive and
         // idempotent.
@@ -2425,6 +2426,93 @@ HTACCESS;
         }
         if (!self::columnExists($pdo, 'stores', 'cashu_max_invoice_sats')) {
             $pdo->exec("ALTER TABLE stores ADD COLUMN cashu_max_invoice_sats INTEGER DEFAULT NULL");
+        }
+
+        // Cash back rewards (see includes/rewards.php). Per store: an opt-in
+        // switch, the flat percentage of every settled invoice credited to the
+        // payer's rewards account, and the currency the balances are kept in
+        // (the store's default currency when the feature was first enabled;
+        // decoupled from default_currency so a later currency switch can
+        // either convert the balances or leave them as they are).
+        // stores.rewards_percent is the getInstance() migration marker for
+        // this set — a plain column on purpose (no index / FK) so the
+        // fail-closed migration tests can DROP COLUMN it.
+        //
+        // Balances are integers in micro-units of the rewards currency
+        // (1 unit = 1,000,000 micro; 1 sat = 1,000,000 micro on a sat store)
+        // so fractional rewards on small invoices carry over exactly.
+        if (!self::columnExists($pdo, 'stores', 'rewards_enabled')) {
+            $pdo->exec("ALTER TABLE stores ADD COLUMN rewards_enabled INTEGER NOT NULL DEFAULT 0");
+        }
+        if (!self::columnExists($pdo, 'stores', 'rewards_currency')) {
+            $pdo->exec("ALTER TABLE stores ADD COLUMN rewards_currency TEXT DEFAULT NULL");
+        }
+        if (!self::tableExists($pdo, 'rewards_accounts')) {
+            $pdo->exec("
+                CREATE TABLE rewards_accounts (
+                    id TEXT PRIMARY KEY,
+                    store_id TEXT NOT NULL,
+                    username TEXT NOT NULL,                     -- as the payer typed it (trimmed)
+                    username_key TEXT NOT NULL,                 -- lower-cased match key
+                    balance_micro INTEGER NOT NULL DEFAULT 0,   -- spendable now
+                    reserved_micro INTEGER NOT NULL DEFAULT 0,  -- held by open invoices
+                    earned_micro INTEGER NOT NULL DEFAULT 0,    -- lifetime credited
+                    spent_micro INTEGER NOT NULL DEFAULT 0,     -- lifetime spent on settled invoices
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    last_activity_at INTEGER NOT NULL,
+                    FOREIGN KEY (store_id) REFERENCES stores(id) ON DELETE CASCADE
+                );
+            ");
+            $pdo->exec("CREATE UNIQUE INDEX idx_rewards_accounts_store_user ON rewards_accounts(store_id, username_key);");
+        }
+        if (!self::tableExists($pdo, 'rewards_ledger')) {
+            // Every balance movement, keyed by (invoice, kind) so an earn, a
+            // reservation, its commit / release and a reversal can each
+            // happen at most once per invoice however many pollers race.
+            $pdo->exec("
+                CREATE TABLE rewards_ledger (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_id TEXT NOT NULL,
+                    store_id TEXT NOT NULL,
+                    invoice_id TEXT,
+                    kind TEXT NOT NULL,                         -- earn | reserve | commit | release | reverse | convert
+                    delta_micro INTEGER NOT NULL,               -- signed change to balance_micro
+                    currency TEXT NOT NULL,
+                    note TEXT,
+                    created_at INTEGER NOT NULL,
+                    FOREIGN KEY (account_id) REFERENCES rewards_accounts(id) ON DELETE CASCADE
+                );
+            ");
+            $pdo->exec("CREATE INDEX idx_rewards_ledger_account ON rewards_ledger(account_id, created_at);");
+            $pdo->exec("CREATE UNIQUE INDEX idx_rewards_ledger_invoice_kind ON rewards_ledger(invoice_id, kind) WHERE invoice_id IS NOT NULL;");
+        }
+        // Per-invoice rewards bookkeeping. All plain columns (no FK / index):
+        // the account the balance was applied from (and that the earn of this
+        // invoice is credited to), the discount taken off `amount` in the
+        // invoice's own currency, the micro-units reserved for it, the
+        // reservation's lifecycle, what the settlement earned, and when that
+        // earn was credited (claimed). onchain/ecx_amount_alternates keep the
+        // totals a static shared address was previously expecting for this
+        // invoice (JSON int list) so a payment at an earlier amount still
+        // attributes to it after rewards lowered what is owed.
+        foreach ([
+            'rewards_account_id' => 'TEXT DEFAULT NULL',
+            'rewards_discount_amount' => 'TEXT DEFAULT NULL',
+            'rewards_applied_micro' => 'INTEGER DEFAULT NULL',
+            'rewards_spend_state' => 'TEXT DEFAULT NULL',
+            'rewards_earned_micro' => 'INTEGER DEFAULT NULL',
+            'rewards_earn_currency' => 'TEXT DEFAULT NULL',
+            'rewards_claimed_at' => 'INTEGER DEFAULT NULL',
+            'onchain_amount_alternates' => 'TEXT DEFAULT NULL',
+            'ecx_amount_alternates' => 'TEXT DEFAULT NULL',
+        ] as $col => $def) {
+            if (!self::columnExists($pdo, 'invoices', $col)) {
+                $pdo->exec("ALTER TABLE invoices ADD COLUMN {$col} {$def}");
+            }
+        }
+        if (!self::columnExists($pdo, 'stores', 'rewards_percent')) {
+            $pdo->exec("ALTER TABLE stores ADD COLUMN rewards_percent REAL NOT NULL DEFAULT 0");
         }
     }
 

@@ -3,14 +3,17 @@
 The wizard at /setup uses PHP sessions (cookies) and a slug-valued 'step'
 POST field. The standalone first-run sequence is:
 
-    terms -> security -> password -> store -> onchain -> lightning
-          -> [zeroconf] -> swaps -> mints -> cron -> done
+    terms -> analytics -> install_type -> security -> password -> email
+          -> store -> onchain -> lightning -> [zeroconf] -> mints -> rewards
+          -> wallet_tabs -> [seed] -> updates -> cron -> done
 
 `zeroconf` only appears once the store has an on-chain receive source — an
 xpub/static destination saved on `onchain`, or Strike on-chain minting
 enabled on `lightning` (which is why it sits after that screen). A run that
 skips both skips it too. `setup_complete` flips at the end of the `mints`
-screen — `cron` and `done` are advisory and need not be walked.
+screen — `rewards`, `wallet_tabs`, `seed`, `updates`, `cron` and `done` are
+advisory and need not be walked (the walkers below skip the first two so
+fixture stores behave exactly as before those screens existed).
 
 `run_setup_wizard()` performs the standalone happy path: security ack, admin
 password, store create, skip on-chain, skip lightning, swaps off, and a
@@ -360,10 +363,14 @@ def run_setup_wizard(
         mint_unit=mint_unit,
     )
 
-    # wallet_tabs: the first post-completion screen. Skip, so fixture stores
-    # render the payment page exactly as before the screen existed (tests
-    # that want the Cash App / Venmo / PayPal tabs opt in via the admin card
-    # or the stores.wallet_tabs column).
+    # rewards: the first post-completion screen. Skip, so fixture stores
+    # keep rewards off (tests that want them opt in via Rewards::setStoreSettings
+    # or the admin card).
+    post("rewards (skip)", 15, step="rewards", rewards_action="skip")
+
+    # wallet_tabs: skip, so fixture stores render the payment page exactly
+    # as before the screen existed (tests that want the Cash App / Venmo /
+    # PayPal tabs opt in via the admin card or the stores.wallet_tabs column).
     post("wallet_tabs (skip)", 15, step="wallet_tabs", wallet_tabs_action="skip")
 
     return SetupResult(
@@ -387,7 +394,7 @@ def run_add_store_wizard(
     default_currency: str = "sat",
 ) -> None:
     """Walk the admin-gated add_store wizard (store → onchain skip →
-    lightning skip → mints → wallet_tabs skip), creating one more store on an
+    lightning skip → mints → rewards skip → wallet_tabs skip), creating one more store on an
     already-set-up instance. Each store minted this way gets its own fresh
     wallet seed, so stores on a shared instance never collide at the mint."""
     s = requests.Session()
@@ -426,6 +433,8 @@ def run_add_store_wizard(
         backup_mint_url=backup_mint_url,
         mint_unit=mint_unit,
     )
+    # rewards follows the rail screens in add_store too. Skip: rewards off.
+    post("rewards (skip)", step="rewards", rewards_action="skip")
     # wallet_tabs is the last add_store screen; answering it is what hands
     # off to admin (a 302, or the seed panel). Skip: no wallet tabs.
     post("wallet_tabs (skip)", step="wallet_tabs", wallet_tabs_action="skip")

@@ -205,6 +205,8 @@ function wizard_answer(string $step, array $cfg): ?array {
                 'backup_mint_url' => $cfg['backup_mint'],
                 'mint_unit' => $cfg['unit'],
             ];
+        case 'rewards':
+            return ['rewards_action' => 'skip'];
         case 'wallet_tabs':
             return ['wallet_tabs_action' => 'skip'];
         case 'seed':

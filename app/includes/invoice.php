@@ -33,6 +33,7 @@ require_once __DIR__ . '/fee_redirect.php';
 require_once __DIR__ . '/ecx/ecx.php';
 require_once __DIR__ . '/admin_log.php';
 require_once __DIR__ . '/invoice_attempts.php';
+require_once __DIR__ . '/rewards_flow.php';
 require_once __DIR__ . '/store_safety.php';
 require_once __DIR__ . '/transfer.php';
 
@@ -1932,6 +1933,21 @@ class Invoice {
             return false; // already settled / closed by another path
         }
 
+        // Cash back rewards bookkeeping runs BEFORE the row is re-read for the
+        // webhook: the InvoiceSettled payload is frozen at enqueue and carries
+        // the rewards block (what was applied, what was earned), so the
+        // reservation commit + earn have to be on the row by then. Expired /
+        // Invalid hand an open reservation back; Invalid after Settled (the
+        // zero-conf reversal, expectedStatuses = ['Settled']) takes the
+        // credited earn back. Both hooks are idempotent and never throw.
+        if ($status === 'Settled') {
+            RewardsFlow::onSettled($invoiceId);
+        } elseif ($status === 'Expired' || $status === 'Invalid') {
+            $previous = ($expectedStatuses !== null && count($expectedStatuses) === 1)
+                ? (string)array_values($expectedStatuses)[0] : null;
+            RewardsFlow::onClosed($invoiceId, $status, $previous);
+        }
+
         // Get updated invoice for webhook
         $invoice = self::getById($invoiceId);
 
@@ -1986,6 +2002,9 @@ class Invoice {
         return match ($settledRail) {
             'onchain' => 'onchain',
             'mint', 'lnaddress', 'noffer', 'swap' => 'lightning',
+            // A rewards balance covered the whole invoice: no rail moved any
+            // funds, so no fee attribution applies either.
+            Rewards::RAIL => null,
             default => null,
         };
     }
@@ -2373,6 +2392,9 @@ class Invoice {
                 self::clearWebhookQueue();
                 return;
             }
+            // Rewards bookkeeping before the webhook payload is read (same
+            // transaction; see Invoice::updateStatus).
+            RewardsFlow::onSettled((string)$invoice['id']);
             $updatedInvoice = self::getById($invoice['id']);
             self::queueWebhook($invoice['store_id'], 'InvoiceSettled', $updatedInvoice);
 
@@ -2524,6 +2546,8 @@ class Invoice {
             return; // already settled by another poller
         }
 
+        // Rewards bookkeeping before the webhook payload is read (see Invoice::updateStatus).
+        RewardsFlow::onSettled((string)$invoice['id']);
         $updated = self::getById((string)$invoice['id']);
         if ($updated !== null) {
             // The lightning rail just settled (settled_rail='lnaddress'). If
@@ -2692,6 +2716,8 @@ class Invoice {
             return; // already settled by another poller
         }
 
+        // Rewards bookkeeping before the webhook payload is read (see Invoice::updateStatus).
+        RewardsFlow::onSettled((string)$invoice['id']);
         $updated = self::getById((string)$invoice['id']);
         if ($updated !== null) {
             WebhookSender::fireEvent($invoice['store_id'], 'InvoiceSettled', $updated);
@@ -2845,6 +2871,8 @@ class Invoice {
             return; // already settled by another poller
         }
 
+        // Rewards bookkeeping before the webhook payload is read (see Invoice::updateStatus).
+        RewardsFlow::onSettled((string)$invoice['id']);
         $updated = self::getById((string)$invoice['id']);
         if ($updated !== null) {
             WebhookSender::fireEvent($invoice['store_id'], 'InvoiceSettled', $updated);
@@ -3050,6 +3078,8 @@ class Invoice {
             return; // already settled by another path
         }
 
+        // Rewards bookkeeping before the webhook payload is read (see Invoice::updateStatus).
+        RewardsFlow::onSettled((string)$invoice['id']);
         $updated = self::getById((string)$invoice['id']);
         if ($updated !== null) {
             WebhookSender::fireEvent($invoice['store_id'], 'InvoiceSettled', $updated);
@@ -3183,6 +3213,9 @@ class Invoice {
      *     sats and the amount decided at creation is what the payee is due.
      *     This covers every rail of such an invoice, including a merchant
      *     rail on a mixed one — the fee's share must stay as decided.
+     *   - The target is the EFFECTIVE amount (RewardsFlow::effectiveAmount):
+     *     cash back rewards applied to the invoice lower what every rail asks
+     *     for, and a re-quote must not price the discount back in.
      *
      * @return array{requoted:bool, lightning_done:bool} lightning_done is true
      *         when this call already (re)sourced the bolt11.
@@ -3214,8 +3247,10 @@ class Invoice {
         if (!$store) {
             return $none;
         }
+        // What the payer owes: the invoice amount net of cash back rewards.
+        $target = RewardsFlow::effectiveAmount($invoice);
         try {
-            $newSats = (int)ExchangeRates::convertToSats((string)$invoice['amount'], (string)$invoice['currency'], 'sat');
+            $newSats = (int)ExchangeRates::convertToSats($target, (string)$invoice['currency'], 'sat');
             $rate = ExchangeRates::getBtcPrice(
                 (string)$invoice['currency'],
                 $store['price_provider_primary'] ?? 'coingecko',
@@ -3246,7 +3281,7 @@ class Invoice {
             } elseif ($rail === 'mint') {
                 try {
                     $mintTarget = ExchangeRates::convertToMintUnit(
-                        (string)$invoice['amount'], (string)$invoice['currency'],
+                        $target, (string)$invoice['currency'],
                         (string)($store['mint_unit'] ?? 'sat'),
                         (float)($store['exchange_fee_percent'] ?? 0),
                         $store['price_provider_primary'] ?? null,
@@ -3281,20 +3316,10 @@ class Invoice {
             }
         }
 
-        // ---- On-chain amount (unique-address modes only) ----
+        // ---- On-chain amount (unique-address modes only: a static shared
+        // address attributes by exact amount, so a re-quote leaves it alone) ----
         if (!empty($invoice['onchain_address']) && empty($invoice['fee_redirect_rails'])) {
-            $staticShared = (($store['onchain_address_mode'] ?? 'xpub') === 'static')
-                && empty($invoice['strike_receive_request_id']);
-            $current = (int)($invoice['onchain_amount_sat'] ?? 0);
-            if (!$staticShared && $current > 0 && $current !== $newSats) {
-                $floor = (int)($invoice['onchain_amount_floor_sat'] ?? 0);
-                $floor = $floor > 0 ? min($floor, $current, $newSats) : min($current, $newSats);
-                Database::update(
-                    'invoices',
-                    ['onchain_amount_sat' => $newSats, 'onchain_amount_floor_sat' => $floor],
-                    'id = ? AND status = ? AND onchain_first_seen_at IS NULL',
-                    [$invoice['id'], 'New']
-                );
+            if (self::reamountChainLeg($invoice, $store, Chain::btc(), $newSats, null, false)) {
                 $changed = true;
             }
         }
@@ -3315,25 +3340,164 @@ class Invoice {
                 "SELECT 1 AS x FROM ecx_payments WHERE invoice_id = ? LIMIT 1", [$invoice['id']]
             );
             $ecxQuote = $ecxSeen ? null : EcxRates::convertToSzats(
-                (string)$invoice['amount'], (string)$invoice['currency'],
+                $target, (string)$invoice['currency'],
                 $store['price_provider_primary'] ?? null,
                 $store['price_provider_secondary'] ?? null
             );
-            $currentEcx = (int)($invoice['ecx_amount_szat'] ?? 0);
-            if ($ecxQuote !== null && $ecxQuote['szats'] > 0 && $currentEcx > 0 && $ecxQuote['szats'] !== $currentEcx) {
-                $newSzats = (int)$ecxQuote['szats'];
-                $ecxFloor = (int)($invoice['ecx_amount_floor_szat'] ?? 0);
-                $ecxFloor = $ecxFloor > 0 ? min($ecxFloor, $currentEcx, $newSzats) : min($currentEcx, $newSzats);
-                Database::update(
-                    'invoices',
-                    ['ecx_amount_szat' => $newSzats, 'ecx_amount_floor_szat' => $ecxFloor, 'ecx_exchange_rate' => $ecxQuote['rate']],
-                    'id = ? AND status = ? AND ecx_first_seen_at IS NULL',
-                    [$invoice['id'], 'New']
-                );
+            if ($ecxQuote !== null && $ecxQuote['szats'] > 0
+                    && self::reamountChainLeg($invoice, $store, Chain::ecx(), (int)$ecxQuote['szats'], (float)$ecxQuote['rate'], false)) {
                 $changed = true;
             }
         }
         return ['requoted' => $changed, 'lightning_done' => $lightningDone];
+    }
+
+    /**
+     * Move one pay-to-address leg (Bitcoin or eCash) of a New invoice to a
+     * new expected amount in base units.
+     *
+     *   - Unique address (xpub-derived, Strike-minted, fee payee): the amount
+     *     moves and the chain's floor column keeps the smallest amount ever
+     *     shown, so a payer who pays an earlier (smaller) figure still settles
+     *     (OnchainPayments::applyTransitions floors on it). $rate, when given,
+     *     is written to the leg's rate column alongside.
+     *   - Static shared address: attribution is by exact total, so the
+     *     amount can only move by taking a fresh tweak and keeping the old
+     *     total reserved as an alternate (OnchainPayments::reallocateStaticAmount).
+     *     Only when $staticAlternates — the fiat re-quote leaves static legs
+     *     locked (requoteForView), cash back rewards move them.
+     *
+     * Never once a payment was seen on the leg. Returns whether the row changed.
+     */
+    private static function reamountChainLeg(array $invoice, array $store, Chain $ch, int $newAmount, ?float $rate, bool $staticAlternates): bool {
+        if ($newAmount <= 0 || empty($invoice[$ch->inv['address']]) || !empty($invoice[$ch->inv['first_seen']])) {
+            return false;
+        }
+        $current = (int)($invoice[$ch->inv['amount']] ?? 0);
+        if ($current <= 0) {
+            return false;
+        }
+        // Same predicate as OnchainPayments::pollInvoice: what the poller
+        // attributes by exact amount is what needs the alternates mechanism.
+        $staticShared = (($store[$ch->store['mode']] ?? 'xpub') === 'static')
+            && (!$ch->isBtc() || empty($invoice['strike_receive_request_id']));
+        if ($staticShared) {
+            if (!$staticAlternates || $current === $newAmount) {
+                return false;
+            }
+            $res = OnchainPayments::reallocateStaticAmount((string)$invoice['id'], $newAmount, $ch);
+            if ($res === null) {
+                error_log(sprintf(
+                    '[rewards] invoice=%s: %s amount left at %d %s (no free tweak slot for %d)',
+                    $invoice['id'], $ch->label, $current, $ch->unitPlural, $newAmount
+                ));
+                return false;
+            }
+            if ($rate !== null) {
+                Database::update('invoices', [$ch->inv['rate'] => $rate], 'id = ? AND status = ?', [$invoice['id'], 'New']);
+            }
+            return $res['amount'] !== $current;
+        }
+        if ($current === $newAmount) {
+            return false;
+        }
+        $floor = (int)($invoice[$ch->inv['floor']] ?? 0);
+        $floor = $floor > 0 ? min($floor, $current, $newAmount) : min($current, $newAmount);
+        $updates = [$ch->inv['amount'] => $newAmount, $ch->inv['floor'] => $floor];
+        if ($rate !== null) {
+            $updates[$ch->inv['rate']] = $rate;
+        }
+        return Database::update(
+            'invoices', $updates,
+            "id = ? AND status = ? AND {$ch->inv['first_seen']} IS NULL",
+            [$invoice['id'], 'New']
+        ) === 1;
+    }
+
+    /**
+     * Cash back rewards were applied to / removed from a New invoice: move
+     * its pay-to-address legs to $amount (invoice currency, the effective
+     * amount owed). Unlike the fiat re-quote this also moves static shared
+     * addresses (new tweak, old total kept as an alternate) and fee-routed
+     * legs (the fee address is unique per invoice; the gate owed >= original
+     * > reduced still holds), at the invoice's own exchange rate when it has
+     * one so the fee payee's sats stay consistent with its Lightning leg.
+     * A fiat invoice's exchange_rate is refreshed when the rate moved, as a
+     * re-quote does. Never throws; a leg that cannot be re-priced (no rate,
+     * no tweak slot) is logged and left as it is.
+     */
+    public static function reamountChainsForRewards(string $invoiceId, string $amount): void {
+        $invoice = self::getById($invoiceId);
+        if (!$invoice || $invoice['status'] !== 'New') {
+            return;
+        }
+        $store = Config::getStore((string)$invoice['store_id']);
+        if (!$store) {
+            return;
+        }
+        $currency = (string)$invoice['currency'];
+        $feeRouted = !empty($invoice['fee_redirect_rails']);
+        try {
+            if (!empty($invoice['onchain_address'])) {
+                $sats = $feeRouted
+                    ? self::satsAtInvoiceRate($invoice, $amount)
+                    : (int)ExchangeRates::convertToSats($amount, $currency, 'sat');
+                if ($sats !== null && $sats > 0) {
+                    self::reamountChainLeg($invoice, $store, Chain::btc(), $sats, null, true);
+                }
+            }
+            if (self::isFiatCurrency($currency) && !$feeRouted) {
+                $rate = ExchangeRates::getBtcPrice(
+                    $currency,
+                    $store['price_provider_primary'] ?? 'coingecko',
+                    $store['price_provider_secondary'] ?? 'binance'
+                );
+                if ($rate !== null && $rate > 0 && (float)($invoice['exchange_rate'] ?? 0) !== (float)$rate) {
+                    Database::update('invoices', ['exchange_rate' => $rate], 'id = ? AND status = ?', [$invoiceId, 'New']);
+                }
+            }
+        } catch (Throwable $e) {
+            error_log("[rewards] invoice={$invoiceId}: on-chain re-amount skipped: " . $e->getMessage());
+        }
+        try {
+            if (!empty($invoice['ecx_address'])) {
+                $q = EcxRates::convertToSzats(
+                    $amount, $currency,
+                    $store['price_provider_primary'] ?? null,
+                    $store['price_provider_secondary'] ?? null
+                );
+                if ($q !== null && $q['szats'] > 0) {
+                    self::reamountChainLeg($invoice, $store, Chain::ecx(), (int)$q['szats'], (float)$q['rate'], true);
+                } else {
+                    error_log("[rewards] invoice={$invoiceId}: eCash amount left as it is (no ECX price)");
+                }
+            }
+        } catch (Throwable $e) {
+            error_log("[rewards] invoice={$invoiceId}: eCash re-amount skipped: " . $e->getMessage());
+        }
+    }
+
+    /**
+     * Whole sats for an invoice-currency amount at the rate the invoice was
+     * quoted at (exchange_rate) when it has one, else today's; sat / BTC
+     * amounts need no rate. Null when no rate is available. Fee-routed
+     * invoices are re-priced this way so their sats stay on the creation
+     * rate (a fee invoice is never re-quoted).
+     */
+    private static function satsAtInvoiceRate(array $invoice, string $amount): ?int {
+        $currency = (string)$invoice['currency'];
+        try {
+            if (!self::isFiatCurrency($currency)) {
+                return (int)ExchangeRates::convertToSats($amount, $currency, 'sat');
+            }
+            $rate = (float)($invoice['exchange_rate'] ?? 0);
+            if ($rate > 0) {
+                return (int)bcmul(bcdiv($amount, ExchangeRates::fmt($rate), 16), '100000000', 0);
+            }
+            return (int)ExchangeRates::convertToSats($amount, $currency, 'sat');
+        } catch (Throwable $e) {
+            return null;
+        }
     }
 
     /**
@@ -3348,11 +3512,23 @@ class Invoice {
      * silently hand the fee's payment to the merchant. Unreachable payee ->
      * 'unavailable', the current bolt11 stays.
      *
+     * The amount sourced is the invoice's EFFECTIVE amount — net of cash back
+     * rewards applied to it (RewardsFlow::effectiveAmount) — or an explicit
+     * override.
+     *
      * Options:
      *   force    skip the "is it due yet" gate (re-quote / explicit request)
      *   requote  price the new bolt11 at the CURRENT rate instead of reusing
      *            the invoice's present sats amount (ignored on a fee-routed
      *            rail: its sats are locked)
+     *   rewards  cash back rewards were applied to / removed from the invoice
+     *            (RewardsFlow): any New invoice qualifies, not just a
+     *            long-lived one; implies force + requote; attempts are logged
+     *            under the 'rewards' context; a fee-routed rail is re-fetched
+     *            from its payee at the override amount's sats (at the
+     *            invoice's own rate, see satsAtInvoiceRate)
+     *   amount_override  decimal string in the invoice currency to source
+     *            for, instead of the effective amount
      *
      * @return array{ok:bool, reason?:string, status?:string, invoice?:array,
      *               receive_errors?:array, ln_expires_at?:int}
@@ -3360,12 +3536,18 @@ class Invoice {
      */
     public static function refreshLightning(string $invoiceId, array $opts = []): array {
         $invoice = self::getById($invoiceId);
-        if (!$invoice || empty($invoice['long_lived'])) {
+        $forRewards = !empty($opts['rewards']);
+        if (!$invoice || (empty($invoice['long_lived']) && !$forRewards)) {
             return ['ok' => false, 'reason' => 'not_refreshable'];
         }
         if ($invoice['status'] !== 'New') {
             return ['ok' => false, 'reason' => 'settled', 'status' => $invoice['status']];
         }
+        if ($forRewards) {
+            $opts['force'] = true;
+            $opts['requote'] = true;
+        }
+        $context = $forRewards ? InvoiceAttempts::CONTEXT_REWARDS : InvoiceAttempts::CONTEXT_REFRESH;
         $feeRails = array_filter(explode(',', (string)($invoice['fee_redirect_rails'] ?? '')));
         $feeRouted = in_array('lightning', $feeRails, true);
         $now = time();
@@ -3407,7 +3589,9 @@ class Invoice {
             return ['ok' => false, 'reason' => 'not_refreshable'];
         }
         $storeId = (string)$invoice['store_id'];
-        $amount = (string)$invoice['amount'];
+        $amount = isset($opts['amount_override']) && (string)$opts['amount_override'] !== ''
+            ? (string)$opts['amount_override']
+            : RewardsFlow::effectiveAmount($invoice);
         $currency = (string)$invoice['currency'];
         $currentRail = (string)($invoice['payment_rail'] ?? '');
         $currentIsDirect = in_array($currentRail, self::DIRECT_RAILS, true);
@@ -3421,7 +3605,10 @@ class Invoice {
         $sourced = null;
         $receiveErrors = [];
         if ($feeRouted) {
-            $sourced = self::sourceFeeLightning($invoice, $receiveErrors);
+            // The fee payee re-issues at the locked sats — or, when rewards
+            // moved the amount, at the override's sats on the same rate.
+            $feeSats = $forRewards ? self::satsAtInvoiceRate($invoice, $amount) : null;
+            $sourced = self::sourceFeeLightning($invoice, $receiveErrors, $feeSats, $context);
             if ($sourced === null) {
                 error_log(sprintf('[long-lived] fee payee could not re-issue invoice=%s store=%s', $invoiceId, $storeId));
                 AdminLog::log('lightning', 'refresh', $storeId, $invoiceId, (string)($invoice['ln_destination'] ?? ''),
@@ -3480,7 +3667,7 @@ class Invoice {
                 }
                 $direct = self::sourceDirectReceive(
                     $storeId, $store, $step['destinations'], $directSats, self::metadataOf($invoice), $invoiceId, $receiveErrors,
-                    InvoiceAttempts::CONTEXT_REFRESH
+                    $context
                 );
                 if ($direct !== null) {
                     $sourced = self::lightningFieldsFromAttempt($direct['type'], $direct['attempt']);
@@ -3498,7 +3685,7 @@ class Invoice {
                         '[long-lived] strict mode: mint fallback skipped on refresh invoice=%s store=%s',
                         $invoiceId, $storeId
                     ));
-                    InvoiceAttempts::record($invoiceId, $storeId, InvoiceAttempts::CONTEXT_REFRESH, 'mint', null,
+                    InvoiceAttempts::record($invoiceId, $storeId, $context, 'mint', null,
                         InvoiceAttempts::SKIPPED, 'strict mode forbids the Cashu mint fallback',
                         'Cashu mint skipped on refresh: swaps enabled with strict mode (no mint fallback)');
                 }
@@ -3509,7 +3696,7 @@ class Invoice {
             }
             if ($cashuDecision === CashuLimit::BLOCK) {
                 $cashuSizeBlocked = true;
-                InvoiceAttempts::record($invoiceId, $storeId, InvoiceAttempts::CONTEXT_REFRESH, 'mint', null,
+                InvoiceAttempts::record($invoiceId, $storeId, $context, 'mint', null,
                     InvoiceAttempts::FAILED, CashuLimit::REASON_BLOCKED,
                     CashuLimit::detail(CashuLimit::BLOCK, $directSats, $cashuLimit));
                 continue;
@@ -3519,11 +3706,11 @@ class Invoice {
                 ? (int)$invoice['amount_sats'] : null;
             try {
                 $mq = self::sourceMintQuote(
-                    $storeId, $store, $amount, $currency, true, $fixed, $invoiceId, InvoiceAttempts::CONTEXT_REFRESH
+                    $storeId, $store, $amount, $currency, true, $fixed, $invoiceId, $context
                 );
             } catch (Throwable $e) {
                 $mq = ['quote' => null, 'last_error' => $e];
-                InvoiceAttempts::record($invoiceId, $storeId, InvoiceAttempts::CONTEXT_REFRESH, 'mint', null,
+                InvoiceAttempts::record($invoiceId, $storeId, $context, 'mint', null,
                     InvoiceAttempts::FAILED, 'no configured mint could issue a Lightning invoice', $e->getMessage());
             }
             if (!empty($mq['quote'])) {
@@ -3540,7 +3727,7 @@ class Invoice {
             }
         }
         if ($cashuDecision === CashuLimit::DEFER && !$mintTried && $sourced !== null) {
-            InvoiceAttempts::record($invoiceId, $storeId, InvoiceAttempts::CONTEXT_REFRESH, 'mint', null,
+            InvoiceAttempts::record($invoiceId, $storeId, $context, 'mint', null,
                 InvoiceAttempts::SKIPPED, CashuLimit::REASON_DEFERRED,
                 CashuLimit::detail(CashuLimit::DEFER, $directSats, $cashuLimit));
         }
@@ -3607,22 +3794,29 @@ class Invoice {
     /**
      * Re-fetch a fee-routed invoice's bolt11 from the fee payee it was issued
      * by (ln_destination, the dev / hosting LNURL chosen at creation) for the
-     * invoice's locked sats amount. The request carries the amount and
+     * invoice's locked sats amount (or $sats). The request carries the amount and
      * nothing else — the payee learns nothing about the sale (see the
      * PRIVACY note in includes/fee_redirect.php). Returns the LN column map
      * (same shape as lightningFieldsFromAttempt) or null when the payee is
      * unreachable / refuses; a sanitized reason is appended to $receiveErrors.
      */
-    private static function sourceFeeLightning(array $invoice, array &$receiveErrors): ?array {
+    private static function sourceFeeLightning(
+        array $invoice,
+        array &$receiveErrors,
+        ?int $sats = null,
+        string $context = InvoiceAttempts::CONTEXT_REFRESH
+    ): ?array {
         $address = (string)($invoice['ln_destination'] ?? '');
-        $sats = (int)($invoice['amount_sats'] ?? 0);
+        // Default: the invoice's locked sats. Cash back rewards pass the
+        // reduced figure explicitly (RewardsFlow via refreshLightning).
+        $sats = $sats ?? (int)($invoice['amount_sats'] ?? 0);
         if ($address === '' || $sats < 1) {
             error_log(sprintf(
                 '[long-lived] fee-routed invoice=%s has no fee LNURL / amount to re-source from (dest=%s sats=%d)',
                 (string)$invoice['id'], $address, $sats
             ));
             $receiveErrors[] = ['type' => 'lnurl', 'reason' => 'the Lightning address could not produce an invoice'];
-            InvoiceAttempts::record((string)$invoice['id'], (string)$invoice['store_id'], InvoiceAttempts::CONTEXT_REFRESH,
+            InvoiceAttempts::record((string)$invoice['id'], (string)$invoice['store_id'], $context,
                 'fee', $address !== '' ? $address : null, InvoiceAttempts::FAILED,
                 'the Lightning address could not produce an invoice', 'fee-routed invoice has no fee LNURL / amount to re-source from');
             return null;
@@ -3642,12 +3836,12 @@ class Invoice {
                 'type' => 'lnurl',
                 'reason' => $failReason ?? 'the Lightning address could not produce an invoice',
             ];
-            InvoiceAttempts::record((string)$invoice['id'], (string)$invoice['store_id'], InvoiceAttempts::CONTEXT_REFRESH,
+            InvoiceAttempts::record((string)$invoice['id'], (string)$invoice['store_id'], $context,
                 'fee', $address, InvoiceAttempts::FAILED,
                 $failReason ?? 'the Lightning address could not produce an invoice', $thrown ?? ($failReason ?? 'probe failed'));
             return null;
         }
-        InvoiceAttempts::record((string)$invoice['id'], (string)$invoice['store_id'], InvoiceAttempts::CONTEXT_REFRESH,
+        InvoiceAttempts::record((string)$invoice['id'], (string)$invoice['store_id'], $context,
             'fee', $address, InvoiceAttempts::OK, null, 'fee payee re-issued a bolt11 for ' . $sats . ' sat');
         return self::lightningFieldsFromAttempt('lnurl', [
             'bolt11' => $probed['bolt11'],
@@ -4168,6 +4362,15 @@ class Invoice {
                 'feeDestination' => $invoice['ecx_fee_destination'] ?? null,
                 'settledToFee' => $ecxSettled && !empty($invoice['ecx_fee_note']),
             ];
+        }
+
+        // Cash back rewards: what the payer applied to this invoice (the
+        // discount, the username, full coverage) and what the settlement
+        // earned (claimed or not). Absent when nothing rewards-related
+        // happened on the invoice.
+        $rewards = RewardsFlow::apiBlock($invoice);
+        if ($rewards !== null) {
+            $result['rewards'] = $rewards;
         }
 
         // Include converted amount in mint unit
@@ -4864,6 +5067,8 @@ class Invoice {
                         return; // already settled by another poller
                     }
 
+                    // Rewards bookkeeping before the webhook payload is read (see Invoice::updateStatus).
+                    RewardsFlow::onSettled((string)$invoice['id']);
                     $updatedInvoice = self::getById($invoice['id']);
                     WebhookSender::fireEvent($invoice['store_id'], 'InvoiceSettled', $updatedInvoice);
                     NotificationSender::queueInvoicePaid($updatedInvoice);
@@ -4934,6 +5139,8 @@ class Invoice {
                         }
                         $recovered[] = $invoice['id'];
 
+                        // Rewards bookkeeping before the webhook payload is read (see Invoice::updateStatus).
+                        RewardsFlow::onSettled((string)$invoice['id']);
                         $updatedInvoice = self::getById($invoice['id']);
                         WebhookSender::fireEvent($invoice['store_id'], 'InvoiceSettled', $updatedInvoice);
                         NotificationSender::queueInvoicePaid($updatedInvoice);

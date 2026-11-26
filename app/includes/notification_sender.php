@@ -312,6 +312,7 @@ class NotificationSender {
             case 'strike':    return 'Lightning (Strike API)';
             case 'mint':      return 'Lightning (cashu)' . $mintSuffix;
             case 'cashu':     return 'Cashu' . $mintSuffix;
+            case 'rewards':   return 'Rewards';
             default:          return $rail !== '' ? $rail : '(unknown)';
         }
     }

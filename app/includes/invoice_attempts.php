@@ -14,9 +14,13 @@
  *   checkout  invoice creation (Invoice::create)
  *   refresh   long-lived invoice Lightning re-sourcing (Invoice::refreshLightning)
  *   poll      settlement checks after creation (payment page + cron pollers)
+ *   rewards   cash back rewards applied to / removed from the invoice by the
+ *             payer (RewardsFlow), including the Lightning re-source that
+ *             re-prices the invoice at the discounted amount
  *
  * Rails use the admin-log category vocabulary: strike | lnurl | nwc |
- * noffer | swap | mint | onchain | fee.
+ * noffer | swap | mint | onchain | ecx | fee | rewards (the rewards balance
+ * itself, when it covers or discounts the invoice).
  *
  * Two message columns, deliberately separate:
  *   reason  the sanitized, fixed server-side phrase — the same text that
@@ -45,14 +49,15 @@ class InvoiceAttempts {
     public const CONTEXT_CHECKOUT = 'checkout';
     public const CONTEXT_REFRESH = 'refresh';
     public const CONTEXT_POLL = 'poll';
-    public const CONTEXTS = [self::CONTEXT_CHECKOUT, self::CONTEXT_REFRESH, self::CONTEXT_POLL];
+    public const CONTEXT_REWARDS = 'rewards';
+    public const CONTEXTS = [self::CONTEXT_CHECKOUT, self::CONTEXT_REFRESH, self::CONTEXT_POLL, self::CONTEXT_REWARDS];
 
     public const OK = 'ok';
     public const FAILED = 'failed';
     public const SKIPPED = 'skipped';
     public const OUTCOMES = [self::OK, self::FAILED, self::SKIPPED];
 
-    public const RAILS = ['strike', 'lnurl', 'nwc', 'noffer', 'swap', 'mint', 'onchain', 'ecx', 'fee'];
+    public const RAILS = ['strike', 'lnurl', 'nwc', 'noffer', 'swap', 'mint', 'onchain', 'ecx', 'fee', 'rewards'];
 
     /** Rows kept per invoice; the oldest beyond it are pruned on insert. */
     public const PER_INVOICE_CAP = 300;

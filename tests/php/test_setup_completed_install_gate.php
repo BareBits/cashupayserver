@@ -63,12 +63,17 @@ $post(['step' => 'store', 'store_name' => 'Gate Store', 'default_currency' => 's
 $post(['step' => 'onchain', 'onchain_action' => 'skip']);
 $post(['step' => 'lightning', 'lightning_action' => 'skip']);
 $r = $post(['step' => 'mints', 'mints_enabled' => '0']);
-assert_eq('wallet_tabs', HttpDriver::wizardStep($r['body']), 'declining mints lands on the wallet-tabs screen');
+assert_eq('rewards', HttpDriver::wizardStep($r['body']), 'declining mints lands on the rewards screen');
 assert_true(cfg('setup_complete') === true, 'setup is complete from here');
 function store_wallet_tabs(): ?string {
     $row = Database::fetchOne("SELECT wallet_tabs FROM stores WHERE name = 'Gate Store'");
     return $row ? $row['wallet_tabs'] : null;
 }
+function store_rewards_enabled(): int {
+    $row = Database::fetchOne("SELECT rewards_enabled FROM stores WHERE name = 'Gate Store'");
+    return (int)($row['rewards_enabled'] ?? 0);
+}
+assert_eq(0, store_rewards_enabled(), 'rewards not yet answered (off)');
 assert_null(store_wallet_tabs(), 'wallet tabs not yet answered');
 assert_null(cfg('auto_update_enabled'), 'auto-update not yet answered');
 $cronKey = (string)cfg('cron_key');
@@ -76,6 +81,9 @@ assert_true(strlen($cronKey) >= 32, 'cron key was seeded at initialize');
 
 // ---- a stranger's fresh session: tail POSTs are refused ---------------------
 $sessionA = $srv->newSession();
+$r = $srv->post('/setup.php', ['step' => 'rewards', 'rewards_enabled' => '1', 'rewards_percent' => '5', 'rewards_action' => 'save']);
+assert_eq(302, $r['status'], 'anonymous step=rewards on a completed install is redirected');
+assert_eq(0, store_rewards_enabled(), 'the rewards answer was NOT written');
 $r = $srv->post('/setup.php', ['step' => 'wallet_tabs', 'wallet_tabs' => ['cashapp'], 'wallet_tabs_action' => 'save']);
 assert_eq(302, $r['status'], 'anonymous step=wallet_tabs on a completed install is redirected');
 assert_null(store_wallet_tabs(), 'the wallet-tabs answer was NOT written');
@@ -114,6 +122,9 @@ $r = $srv->get('/setup.php?step=mints');
 assert_eq(200, $r['status'], 'the completing session may step Back onto the mints screen');
 assert_eq('mints', HttpDriver::wizardStep($r['body']), 'and sees the mints screen');
 assert_true(str_contains($r['body'], 'wizard-back-link'), 'the mints screen has a Back link');
+$r = $post(['step' => 'rewards', 'rewards_action' => 'skip']);
+assert_eq(200, $r['status'], 'the completing session answers the rewards screen');
+assert_eq('wallet_tabs', HttpDriver::wizardStep($r['body']), 'and is shown the wallet-tabs screen');
 $r = $post(['step' => 'wallet_tabs', 'wallet_tabs' => ['venmo', 'cashapp'], 'wallet_tabs_action' => 'save']);
 assert_eq(200, $r['status'], 'the completing session answers the wallet-tabs screen');
 assert_eq('updates', HttpDriver::wizardStep($r['body']), 'and is shown the updates screen');
@@ -161,6 +172,10 @@ assert_true(cfg('auto_update_enabled') === false, 'their answer is written');
 $r = $srv->post('/setup.php', ['step' => 'wallet_tabs', 'wallet_tabs_action' => 'skip', 'csrf_token' => $adminCsrf]);
 assert_true($r['status'] < 500, 'logged-in wallet_tabs POST without a wizard store does not crash');
 assert_eq('cashapp,venmo', store_wallet_tabs(), 'and does not touch the store');
+// Same for rewards: a tail screen whose store comes from the wizard marker.
+$r = $srv->post('/setup.php', ['step' => 'rewards', 'rewards_enabled' => '1', 'rewards_percent' => '5', 'rewards_action' => 'save', 'csrf_token' => $adminCsrf]);
+assert_true($r['status'] < 500, 'logged-in rewards POST without a wizard store does not crash');
+assert_eq(0, store_rewards_enabled(), 'and does not touch the store');
 $r = $srv->post('/setup.php', ['step' => 'analytics', 'usage_stats' => '1', 'csrf_token' => $adminCsrf]);
 assert_eq(302, $r['status'], 'the usage-statistics screen is not a tail screen: a logged-in POST is redirected to admin (the settings card owns it now)');
 assert_true(cfg('usage_stats_enabled') === false, 'the opt-in is unchanged');

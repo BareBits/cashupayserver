@@ -212,11 +212,13 @@ def test_invoices_list_card_fills_height(shared_configured: ConfiguredPayserver,
 def test_bottom_nav_items_fit_one_line_on_phones(
     shared_configured: ConfiguredPayserver, page, width
 ) -> None:
-    """The admin role sees nine bottom-nav items. On phone widths they must
-    all fit on one line with no label wrapped or clipped (the tip-jars entry
-    once pushed "Tip Jars" onto two lines, growing the bar past .main's
-    reserve and overlapping "Customers" onto "Stats"), and the reserve must
-    be at least as tall as the bar actually is."""
+    """The admin role sees ten bottom-nav items (Rewards is the tenth). On
+    phone widths they must all fit on one line with no label wrapped or
+    clipped (the tip-jars entry once pushed "Tip Jars" onto two lines, growing
+    the bar past .main's reserve and overlapping "Customers" onto "Stats"; the
+    Rewards entry then overflowed every label at 390px until the side padding
+    and font clamp were re-measured), and the reserve must be at least as tall
+    as the bar actually is."""
     configured = shared_configured
     page.set_viewport_size({"width": width, "height": 844})
     page.set_default_timeout(15000)
@@ -255,7 +257,8 @@ def test_bottom_nav_items_fit_one_line_on_phones(
         }"""
     )
     assert geom["fixedBottomBar"], geom
-    assert len(geom["items"]) == 9, [i["view"] for i in geom["items"]]
+    assert len(geom["items"]) == 10, [i["view"] for i in geom["items"]]
+    assert "rewards" in [i["view"] for i in geom["items"]], geom["items"]
     for item in geom["items"]:
         assert not item["clipped"], item
         assert item["labelLines"] == 1, item

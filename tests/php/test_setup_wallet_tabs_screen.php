@@ -2,8 +2,8 @@
 /**
  * The wizard's "Popular wallet tabs" screen (setup.php step=wallet_tabs).
  *
- * First run: it follows the last rail screen (the install is already
- * complete), pre-ticks all three wallets on a store that never answered,
+ * First run: it follows the rewards screen, which follows the last rail
+ * screen (the install is already complete); it pre-ticks all three wallets on a store that never answered,
  * writes the ticked set (or '' on Skip) to stores.wallet_tabs, then hands
  * over to the auto-update question; stepping Back onto it shows what was
  * saved. add_store: it is the last screen, and answering it is what returns
@@ -58,9 +58,11 @@ $post(['step' => 'store', 'store_name' => 'Tabs Store', 'default_currency' => 's
 $post(['step' => 'onchain', 'onchain_action' => 'skip']);
 $post(['step' => 'lightning', 'lightning_action' => 'skip']);
 $r = $post(['step' => 'mints', 'mints_enabled' => '0']);
+assert_eq('rewards', HttpDriver::wizardStep($r['body']), 'declining mints lands on the rewards screen first');
+$r = $post(['step' => 'rewards', 'rewards_action' => 'skip']);
 
 // The screen itself.
-assert_eq('wallet_tabs', HttpDriver::wizardStep($r['body']), 'declining mints lands on the wallet-tabs screen');
+assert_eq('wallet_tabs', HttpDriver::wizardStep($r['body']), 'skipping rewards lands on the wallet-tabs screen');
 assert_eq('Popular wallet tabs', heading($r['body']), 'screen heading');
 assert_true(str_contains($r['body'], 'Enable additional tabs on the payment page for these popular'), 'the operator-approved question');
 assert_true(str_contains($r['body'], 'help guide customers in the'), 'the operator-approved rationale');
@@ -72,12 +74,12 @@ foreach (['cashapp', 'venmo', 'paypal'] as $k) {
 assert_true(str_contains($r['body'], 'name="wallet_tabs_action" value="save"'), 'Continue button');
 assert_true(str_contains($r['body'], 'name="wallet_tabs_action" value="skip"'), 'Skip button');
 assert_true(str_contains($r['body'], 'wizard-back-link'), 'the screen has a Back link');
-assert_true(str_contains($r['body'], 'step=mints'), 'Back leads to the last rail screen');
+assert_true(str_contains($r['body'], 'step=rewards'), 'Back leads to the rewards screen');
 // Counter: this rig's data dir is outside the web root, so the security
-// screen is dropped — 13 screens without zeroconf/seed (terms analytics
-// install_type password email store onchain lightning mints wallet_tabs
-// updates cron done), wallet_tabs the 10th.
-assert_true(str_contains($r['body'], 'Step 10 of 13'), 'step counter counts the new screen: ' . (preg_match('/Step \d+ of \d+/', $r['body'], $m) ? $m[0] : '?'));
+// screen is dropped — 14 screens without zeroconf/seed (terms analytics
+// install_type password email store onchain lightning mints rewards
+// wallet_tabs updates cron done), wallet_tabs the 11th.
+assert_true(str_contains($r['body'], 'Step 11 of 14'), 'step counter counts the new screen: ' . (preg_match('/Step \d+ of \d+/', $r['body'], $m) ? $m[0] : '?'));
 assert_null(wallet_tabs_of('Tabs Store'), 'nothing written until answered');
 assert_true(Config::isSetupComplete(), 'the install is already complete on this screen');
 
@@ -122,7 +124,7 @@ $r = $srv->post('/admin.php', ['action' => 'login', 'username' => 'admin', 'pass
 assert_eq(200, $r['status'], 'admin login works: ' . $r['body']);
 $r = $srv->get('/setup.php?mode=add_store');
 assert_eq(200, $r['status'], 'add_store opens');
-assert_true(str_contains($r['body'], 'Step 1 of 5'), 'add_store counts the wallet-tabs screen: ' . (preg_match('/Step \d+ of \d+/', $r['body'], $m) ? $m[0] : '?'));
+assert_true(str_contains($r['body'], 'Step 1 of 6'), 'add_store counts the rewards and wallet-tabs screens: ' . (preg_match('/Step \d+ of \d+/', $r['body'], $m) ? $m[0] : '?'));
 $csrf = HttpDriver::wizardCsrf($r['body']);
 $apost = function (array $data) use ($srv, &$csrf): array {
     $data['csrf_token'] = $csrf;
@@ -136,9 +138,12 @@ $apost(['step' => 'onchain', 'onchain_action' => 'skip']);
 $apost(['step' => 'lightning', 'lightning_action' => 'skip']);
 $r = $apost(['step' => 'mints', 'mints_enabled' => '0']);
 assert_eq(200, $r['status'], 'declining mints in add_store no longer redirects');
-assert_eq('wallet_tabs', HttpDriver::wizardStep($r['body']), 'add_store asks about wallet tabs after mints');
+assert_eq('rewards', HttpDriver::wizardStep($r['body']), 'add_store asks about rewards after mints');
+$r = $apost(['step' => 'rewards', 'rewards_action' => 'skip']);
+assert_eq(200, $r['status'], 'skipping rewards in add_store does not redirect yet');
+assert_eq('wallet_tabs', HttpDriver::wizardStep($r['body']), 'add_store asks about wallet tabs after rewards');
 assert_eq('Popular wallet tabs', heading($r['body']), 'same screen in add_store');
-assert_true(str_contains($r['body'], 'Step 5 of 5'), 'last add_store screen');
+assert_true(str_contains($r['body'], 'Step 6 of 6'), 'last add_store screen');
 assert_not_null(Database::fetchOne("SELECT id FROM stores WHERE name = 'Second Store'"), 'the store exists before the screen');
 assert_null(wallet_tabs_of('Second Store'), 'not answered yet');
 

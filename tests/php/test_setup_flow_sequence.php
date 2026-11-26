@@ -21,7 +21,7 @@ require_once dirname(__DIR__, 2) . '/app/includes/setup_flow.php';
 // Default shape: no installation type chosen yet (renders like "something
 // else"), no seed minted yet.
 
-$full = ['terms', 'analytics', 'install_type', 'security', 'password', 'email', 'store', 'onchain', 'lightning', 'zeroconf', 'mints', 'wallet_tabs', 'updates', 'cron', 'done'];
+$full = ['terms', 'analytics', 'install_type', 'security', 'password', 'email', 'store', 'onchain', 'lightning', 'zeroconf', 'mints', 'rewards', 'wallet_tabs', 'updates', 'cron', 'done'];
 
 $noOnchain = SetupFlow::stepSequence('', false);
 assert_eq(
@@ -55,12 +55,12 @@ assert_false(SetupFlow::isInstallType('Strike'), 'types are matched case-sensiti
 // timed by onchain_min_confs too.
 $strike = SetupFlow::stepSequence('', true, true, false, false, false, 'strike');
 assert_eq(
-    ['terms', 'analytics', 'install_type', 'security', 'password', 'email', 'store', 'strike', 'zeroconf', 'wallet_tabs', 'updates', 'cron', 'done'],
+    ['terms', 'analytics', 'install_type', 'security', 'password', 'email', 'store', 'strike', 'zeroconf', 'rewards', 'wallet_tabs', 'updates', 'cron', 'done'],
     $strike,
     'the Strike type swaps onchain+lightning for the strike screen and drops mints'
 );
 assert_eq(
-    ['terms', 'analytics', 'install_type', 'security', 'password', 'email', 'store', 'strike', 'wallet_tabs', 'updates', 'cron', 'done'],
+    ['terms', 'analytics', 'install_type', 'security', 'password', 'email', 'store', 'strike', 'rewards', 'wallet_tabs', 'updates', 'cron', 'done'],
     SetupFlow::stepSequence('', false, true, false, false, false, 'strike'),
     'a Strike store without on-chain receiving has no zeroconf screen either'
 );
@@ -82,11 +82,12 @@ assert_false(in_array('strike', $full, true), 'the strike screen is absent from 
 
 $withSeed = SetupFlow::stepSequence('', true, true, false, false, false, 'cashu', true);
 assert_eq(
-    ['terms', 'analytics', 'install_type', 'security', 'password', 'email', 'store', 'onchain', 'lightning', 'zeroconf', 'mints', 'wallet_tabs', 'seed', 'updates', 'cron', 'done'],
+    ['terms', 'analytics', 'install_type', 'security', 'password', 'email', 'store', 'onchain', 'lightning', 'zeroconf', 'mints', 'rewards', 'wallet_tabs', 'seed', 'updates', 'cron', 'done'],
     $withSeed,
     'a minted seed adds the recovery-phrase screen right after mints'
 );
-assert_eq('wallet_tabs', SetupFlow::nextStep('mints', $withSeed), 'mints hands over to the wallet-tabs screen');
+assert_eq('rewards', SetupFlow::nextStep('mints', $withSeed), 'mints hands over to the rewards screen');
+assert_eq('wallet_tabs', SetupFlow::nextStep('rewards', $withSeed), 'the rewards screen hands over to the wallet-tabs screen');
 assert_eq('seed', SetupFlow::nextStep('wallet_tabs', $withSeed), 'the wallet-tabs screen hands over to the seed screen');
 assert_eq('updates', SetupFlow::nextStep('seed', $withSeed), 'the auto-update question follows the seed screen');
 
@@ -100,12 +101,15 @@ foreach (SetupFlow::INSTALL_TYPES as $type) {
     }
 }
 assert_eq('wallet_tabs', SetupFlow::backStep('seed', $withSeed), 'Back from the seed screen returns to the wallet-tabs screen');
-assert_eq('mints', SetupFlow::backStep('wallet_tabs', $withSeed), 'Back from the wallet-tabs screen returns to mints');
+assert_eq('rewards', SetupFlow::backStep('wallet_tabs', $withSeed), 'Back from the wallet-tabs screen returns to the rewards screen');
+assert_eq('mints', SetupFlow::backStep('rewards', $withSeed), 'Back from the rewards screen returns to mints');
 assert_false(in_array('seed', SetupFlow::stepSequence('add_store', true, true, false, false, false, null, true), true), 'add_store has its own hand-off panel, never the seed screen');
 
 // --- Leaving the rail group is the finalisation trigger -------------------
 
 assert_eq(['onchain', 'lightning', 'strike', 'zeroconf', 'mints'], SetupFlow::RAIL_STEPS, 'the rail screens');
+assert_true(SetupFlow::leavesRailGroup('mints', 'rewards'), 'mints -> rewards leaves the rail group');
+assert_true(SetupFlow::leavesRailGroup('zeroconf', 'rewards'), 'zeroconf -> rewards (Strike path) leaves the rail group');
 assert_true(SetupFlow::leavesRailGroup('mints', 'wallet_tabs'), 'mints -> wallet_tabs leaves the rail group');
 assert_true(SetupFlow::leavesRailGroup('zeroconf', 'wallet_tabs'), 'zeroconf -> wallet_tabs (Strike path) leaves the rail group');
 assert_true(SetupFlow::leavesRailGroup('mints', 'updates'), 'mints -> updates leaves the rail group');
@@ -119,6 +123,7 @@ assert_false(SetupFlow::leavesRailGroup('strike', 'zeroconf'), 'strike -> zeroco
 assert_false(SetupFlow::leavesRailGroup('store', 'onchain'), 'entering the group is not leaving it');
 assert_false(SetupFlow::leavesRailGroup('seed', 'updates'), 'a post-rail screen never triggers finalisation');
 assert_false(SetupFlow::leavesRailGroup('wallet_tabs', 'seed'), 'the wallet-tabs screen is past the rail group');
+assert_false(SetupFlow::leavesRailGroup('rewards', 'wallet_tabs'), 'the rewards screen is past the rail group');
 
 // --- Security screen skip (data dir outside the web root) ------------------
 //
@@ -162,7 +167,8 @@ assert_eq(
     $externalCron,
     'external cron drops the cron screen and nothing else'
 );
-assert_eq('wallet_tabs', SetupFlow::nextStep('mints', $externalCron), 'with external cron, the wallet-tabs screen still follows mints');
+assert_eq('rewards', SetupFlow::nextStep('mints', $externalCron), 'with external cron, the rewards screen still follows mints');
+assert_eq('wallet_tabs', SetupFlow::nextStep('rewards', $externalCron), 'with external cron, the wallet-tabs screen still follows rewards');
 assert_eq('updates', SetupFlow::nextStep('wallet_tabs', $externalCron), 'with external cron, updates still follows the wallet-tabs screen');
 assert_eq('done', SetupFlow::nextStep('updates', $externalCron), 'with external cron, done follows updates directly');
 
@@ -215,12 +221,12 @@ assert_eq(
 
 $addStore = SetupFlow::stepSequence('add_store', true);
 assert_eq(
-    ['store', 'onchain', 'lightning', 'zeroconf', 'mints', 'wallet_tabs'],
+    ['store', 'onchain', 'lightning', 'zeroconf', 'mints', 'rewards', 'wallet_tabs'],
     $addStore,
-    'add_store skips the pre-store screens up front and the tail screens at the end, keeping the per-store wallet-tabs question'
+    'add_store skips the pre-store screens up front and the tail screens at the end, keeping the per-store rewards and wallet-tabs questions'
 );
 assert_eq(
-    ['store', 'onchain', 'lightning', 'mints', 'wallet_tabs'],
+    ['store', 'onchain', 'lightning', 'mints', 'rewards', 'wallet_tabs'],
     SetupFlow::stepSequence('add_store', false),
     'add_store drops zeroconf with no on-chain rail too'
 );
@@ -244,13 +250,16 @@ assert_eq('lightning', SetupFlow::nextStep('onchain', $withOnchain), 'lightning 
 assert_eq('zeroconf', SetupFlow::nextStep('lightning', $withOnchain), 'zeroconf follows lightning');
 assert_eq('mints', SetupFlow::nextStep('lightning', $noOnchain), 'without zeroconf, mints follow lightning');
 assert_eq('zeroconf', SetupFlow::nextStep('strike', $strike), 'zeroconf follows the strike screen');
-assert_eq('wallet_tabs', SetupFlow::nextStep('zeroconf', $strike), 'on the Strike path the wallet-tabs screen follows zeroconf');
+assert_eq('rewards', SetupFlow::nextStep('zeroconf', $strike), 'on the Strike path the rewards screen follows zeroconf');
+assert_eq('wallet_tabs', SetupFlow::nextStep('rewards', $strike), 'on the Strike path the wallet-tabs screen follows rewards');
 assert_eq('updates', SetupFlow::nextStep('wallet_tabs', $strike), 'on the Strike path the auto-update question follows the wallet-tabs screen');
-assert_eq('wallet_tabs', SetupFlow::nextStep('mints', $withOnchain), 'the wallet-tabs screen follows mints');
+assert_eq('rewards', SetupFlow::nextStep('mints', $withOnchain), 'the rewards screen follows mints');
+assert_eq('wallet_tabs', SetupFlow::nextStep('rewards', $withOnchain), 'the wallet-tabs screen follows rewards');
 assert_eq('updates', SetupFlow::nextStep('wallet_tabs', $withOnchain), 'the auto-update question follows the wallet-tabs screen');
 assert_eq('cron', SetupFlow::nextStep('updates', $withOnchain), 'cron follows the auto-update question');
 assert_null(SetupFlow::nextStep('done', $withOnchain), 'done is terminal');
-assert_eq('wallet_tabs', SetupFlow::nextStep('mints', $addStore), 'add_store asks about wallet tabs after mints');
+assert_eq('rewards', SetupFlow::nextStep('mints', $addStore), 'add_store asks about rewards after mints');
+assert_eq('wallet_tabs', SetupFlow::nextStep('rewards', $addStore), 'add_store asks about wallet tabs after rewards');
 assert_null(SetupFlow::nextStep('wallet_tabs', $addStore), 'the wallet-tabs screen is terminal in add_store mode');
 assert_null(SetupFlow::nextStep('cron', $addStore), 'a screen outside the sequence has no next');
 
@@ -283,10 +292,12 @@ assert_eq('lightning', SetupFlow::backStep('mints', $noOnchain), 'Back skips the
 // The post-completion screens have Back too (the completing session is let
 // through setup.php's guard for them); only the completion screen itself
 // is a dead end.
-assert_eq(['wallet_tabs', 'seed', 'updates', 'cron', 'done'], SetupFlow::POST_COMPLETION, 'wallet_tabs, seed, updates, cron and done are the post-completion screens');
+assert_eq(['rewards', 'wallet_tabs', 'seed', 'updates', 'cron', 'done'], SetupFlow::POST_COMPLETION, 'rewards, wallet_tabs, seed, updates, cron and done are the post-completion screens');
 assert_eq('wallet_tabs', SetupFlow::backStep('updates', $withOnchain), 'Back from the auto-update screen returns to the wallet-tabs screen');
-assert_eq('mints', SetupFlow::backStep('wallet_tabs', $withOnchain), 'Back from the wallet-tabs screen returns to mints');
-assert_eq('zeroconf', SetupFlow::backStep('wallet_tabs', $strike), 'Back from the wallet-tabs screen on the Strike path returns to zeroconf');
+assert_eq('rewards', SetupFlow::backStep('wallet_tabs', $withOnchain), 'Back from the wallet-tabs screen returns to the rewards screen');
+assert_eq('mints', SetupFlow::backStep('rewards', $withOnchain), 'Back from the rewards screen returns to mints');
+assert_eq('rewards', SetupFlow::backStep('wallet_tabs', $strike), 'Back from the wallet-tabs screen on the Strike path returns to the rewards screen');
+assert_eq('zeroconf', SetupFlow::backStep('rewards', $strike), 'Back from the rewards screen on the Strike path returns to zeroconf');
 assert_eq('seed', SetupFlow::backStep('updates', $withSeed), 'Back from the auto-update screen returns to the seed screen when there is one');
 assert_eq('wallet_tabs', SetupFlow::backStep('updates', $strike), 'Back from the auto-update screen on the Strike path returns to the wallet-tabs screen');
 assert_eq('updates', SetupFlow::backStep('cron', $withOnchain), 'the cron screen has a Back');
@@ -300,6 +311,7 @@ assert_eq('store', SetupFlow::backStep('onchain', $addStore), 'add_store Back fr
 
 assert_true(SetupFlow::isKnownStep('terms'), 'terms is a real screen');
 assert_true(SetupFlow::isKnownStep('mints'), 'mints is a real screen');
+assert_true(SetupFlow::isKnownStep('rewards'), 'rewards is a real screen');
 assert_true(SetupFlow::isKnownStep('wallet_tabs'), 'wallet_tabs is a real screen');
 assert_false(SetupFlow::isKnownStep(''), 'an empty step is not a screen');
 assert_false(SetupFlow::isKnownStep('4'), 'the pre-slug numeric steps are gone');

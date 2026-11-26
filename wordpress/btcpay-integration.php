@@ -6,7 +6,9 @@
  * BareBits server: installs/activates the gateway plugin from wordpress.org,
  * writes its options, registers the webhook over the server's Greenfield API,
  * and applies BareBits branding — with safety checks so a real BTCPay Server
- * configuration is never overwritten without explicit consent. All server
+ * configuration is never overwritten without explicit consent. Also records
+ * the server's cash back rewards (applied / earned) as an order note when a
+ * gateway-paid order completes. All server
  * communication is HTTP; nothing here reads BareBits internals. License:
  * GPLv2 or later.
  */
@@ -379,6 +381,271 @@ function barebits_maybe_handle_retry(): void {
     exit;
 }
 add_action('template_redirect', 'barebits_maybe_handle_retry');
+
+// ---------------------------------------------------------------------------
+// Cash back rewards: the order note
+// ---------------------------------------------------------------------------
+//
+// A BareBits server with rewards enabled lets the payer apply an earlier
+// cash-back balance to an invoice (lowering what is owed, or covering it
+// outright) and credits a percentage of what was actually paid to a rewards
+// account. None of that changes the WooCommerce order total — the gateway
+// created the invoice for the full amount and the server settled it — so the
+// merchant would otherwise never see it. When an order paid through the
+// BareBits gateway completes, the plugin fetches the invoice once from the
+// server's Greenfield API and, if its `rewards` block is present, records
+// what happened as an order note. Pure composition below, live wiring at the
+// bottom.
+
+/** Order meta flagging that the rewards note was handled (written once). */
+const BAREBITS_REWARDS_NOTE_META = 'barebits_rewards_note_added';
+
+/**
+ * Plain-text amount in the rewards block's own spelling: "1.20 USD",
+ * "12 sats", "1 sat". The server sends amounts as decimal strings at the
+ * currency's natural precision; anything that is not a plain non-negative
+ * decimal yields '' so the caller drops the sentence rather than printing
+ * garbage. Pure (no WordPress calls).
+ */
+function barebits_rewards_format_amount($amount, $currency): string {
+    if (is_int($amount)) {
+        $amount = (string) $amount;
+    } elseif (is_float($amount)) {
+        // Never a bare (string) cast: small floats print as "1.5E-5".
+        $amount = rtrim(rtrim(number_format($amount, 8, '.', ''), '0'), '.');
+    }
+    if (!is_string($amount)) {
+        return '';
+    }
+    $amount = trim($amount);
+    if (!preg_match('/^[0-9]+(\.[0-9]+)?$/', $amount)) {
+        return '';
+    }
+    $currency = is_string($currency) ? strtoupper(trim($currency)) : '';
+    if ($currency === 'SAT' || $currency === 'SATS') {
+        return $amount . ' ' . ($amount === '1' ? 'sat' : 'sats');
+    }
+    if ($currency === '' || !preg_match('/^[A-Z0-9]{2,12}$/', $currency)) {
+        return $amount;
+    }
+    return $amount . ' ' . $currency;
+}
+
+/** True for "0", "0.00", … — an amount with nothing to report. */
+function barebits_rewards_amount_is_zero(string $amount): bool {
+    return $amount === '' || preg_match('/^0+(\.0+)?( .*)?$/', $amount) === 1;
+}
+
+/**
+ * A rewards username fit for an order note. The server only ever issues
+ * letters and digits (3–64), so anything else is not a username the server
+ * produced — it is dropped rather than escaped, and the note simply omits
+ * the account clause. Pure.
+ */
+function barebits_rewards_username($raw): string {
+    if (!is_string($raw)) {
+        return '';
+    }
+    $raw = trim($raw);
+    return preg_match('/^[A-Za-z0-9]{1,64}$/', $raw) ? $raw : '';
+}
+
+/**
+ * $a − $b for two plain non-negative decimal strings, exact, at the larger
+ * of their two precisions ("10.00" − "1.20" = "8.80"; "1500" − "500" =
+ * "1000"). Null when either operand is malformed, the result would be
+ * negative, or the numbers are too large for exact integer arithmetic. No
+ * bcmath dependency on purpose — WordPress hosts do not all ship it. Pure.
+ */
+function barebits_rewards_decimal_sub(string $a, string $b): ?string {
+    $parts = [];
+    foreach ([$a, $b] as $v) {
+        if (!preg_match('/^([0-9]+)(?:\.([0-9]+))?$/', $v, $m)) {
+            return null;
+        }
+        $parts[] = [$m[1], $m[2] ?? ''];
+    }
+    $scale = max(strlen($parts[0][1]), strlen($parts[1][1]));
+    $ints = [];
+    foreach ($parts as [$whole, $frac]) {
+        $digits = ltrim($whole . str_pad($frac, $scale, '0'), '0');
+        if (strlen($digits) > 17) {
+            return null; // beyond exact int64 territory
+        }
+        $ints[] = $digits === '' ? 0 : (int) $digits;
+    }
+    $diff = $ints[0] - $ints[1];
+    if ($diff < 0) {
+        return null;
+    }
+    if ($scale === 0) {
+        return (string) $diff;
+    }
+    $text = str_pad((string) $diff, $scale + 1, '0', STR_PAD_LEFT);
+    return substr($text, 0, -$scale) . '.' . substr($text, -$scale);
+}
+
+/**
+ * Compose the order note for an invoice's `rewards` block — the object the
+ * BareBits server adds to a Greenfield invoice when anything rewards-related
+ * happened on it:
+ *
+ *   appliedAmount / appliedCurrency / appliedUsername  rewards spent on it
+ *   fullCoverage                                        covered the whole invoice
+ *   earnedAmount / earnedCurrency                       cash back earned by paying
+ *   earnedClaimed / earnedUsername                      credited to an account, or
+ *                                                       still waiting to be claimed
+ *
+ * $invoice is the surrounding invoice (amount, currency, paymentRail): when
+ * the applied amount is in the invoice's currency the note also states the
+ * remainder the customer paid. Returns '' when there is nothing to say, so
+ * the caller never writes an empty note. Pure (no WordPress calls) so
+ * tests/php can pin every wording without a WordPress install.
+ */
+function barebits_rewards_order_note(array $rewards, array $invoice = []): string {
+    $sentences = [];
+
+    $applied = barebits_rewards_format_amount(
+        $rewards['appliedAmount'] ?? null,
+        $rewards['appliedCurrency'] ?? null
+    );
+    $appliedUser = barebits_rewards_username($rewards['appliedUsername'] ?? null);
+    $account = $appliedUser !== '' ? ' (account ' . $appliedUser . ')' : '';
+
+    if (!empty($rewards['fullCoverage'])) {
+        $sentences[] = 'Paid entirely with BareBits rewards' . $account . '.';
+    } elseif (!barebits_rewards_amount_is_zero($applied)) {
+        $rail = isset($invoice['paymentRail']) && is_string($invoice['paymentRail'])
+            ? $invoice['paymentRail'] : '';
+        $paidIn = $rail === 'ecx' ? 'eCash' : 'Bitcoin';
+        $remaining = null;
+        $invoiceCurrency = isset($invoice['currency']) && is_string($invoice['currency'])
+            ? strtoupper(trim($invoice['currency'])) : '';
+        $appliedCurrency = is_string($rewards['appliedCurrency'] ?? null)
+            ? strtoupper(trim($rewards['appliedCurrency'])) : '';
+        if ($invoiceCurrency !== '' && $invoiceCurrency === $appliedCurrency
+                && isset($invoice['amount']) && is_scalar($invoice['amount'])) {
+            $rest = barebits_rewards_decimal_sub(
+                trim((string) $invoice['amount']),
+                trim((string) $rewards['appliedAmount'])
+            );
+            if ($rest !== null) {
+                $remaining = barebits_rewards_format_amount($rest, $invoiceCurrency);
+            }
+        }
+        $sentences[] = 'Customer applied ' . $applied . ' of BareBits rewards' . $account
+            . '; the remaining ' . ($remaining !== null && $remaining !== '' ? $remaining . ' ' : 'amount ')
+            . 'was paid in ' . $paidIn . '.';
+    }
+
+    $earned = barebits_rewards_format_amount(
+        $rewards['earnedAmount'] ?? null,
+        $rewards['earnedCurrency'] ?? null
+    );
+    if (!barebits_rewards_amount_is_zero($earned)) {
+        if (!empty($rewards['earnedClaimed'])) {
+            $claimedBy = barebits_rewards_username($rewards['earnedUsername'] ?? null);
+            $tail = $claimedBy !== '' ? 'claimed by ' . $claimedBy : 'claimed';
+        } else {
+            $tail = 'unclaimed';
+        }
+        $sentences[] = 'Customer earned ' . $earned . ' in BareBits rewards (' . $tail . ').';
+    }
+
+    return implode(' ', $sentences);
+}
+
+/**
+ * The store the gateway creates its invoices in: the BTCPay gateway's own
+ * store option, falling back to the plugin's connection record.
+ */
+function barebits_rewards_store_id(): string {
+    $id = trim((string) get_option('btcpay_gf_store_id', ''));
+    return $id !== '' ? $id : trim((string) get_option('barebits_store_id', ''));
+}
+
+/**
+ * Fetch one invoice from the connected server's Greenfield API (the same
+ * authenticated GET the gateway itself performs), as the decoded JSON
+ * object. Null — never an exception — when the server is unreachable,
+ * refuses, or answers with anything but an invoice object.
+ */
+function barebits_fetch_invoice(string $invoiceId): ?array {
+    $storeId = barebits_rewards_store_id();
+    if ($storeId === '' || !preg_match('/^[A-Za-z0-9_-]{1,64}$/', $invoiceId)) {
+        return null;
+    }
+    try {
+        $res = barebits_api_request(
+            'GET',
+            '/api/v1/stores/' . rawurlencode($storeId) . '/invoices/' . rawurlencode($invoiceId)
+        );
+    } catch (\Throwable $e) {
+        return null;
+    }
+    if (($res['error'] ?? null) !== null || ($res['code'] ?? 0) !== 200 || !is_array($res['body'] ?? null)) {
+        return null;
+    }
+    return $res['body'];
+}
+
+/**
+ * On woocommerce_payment_complete for an order paid through the BareBits
+ * (BTCPay) gateway: fetch its invoice once and record the rewards story as
+ * an order note.
+ *
+ * Why this hook: the gateway plugin exposes no hook of its own around its
+ * webhook handling, and payment_complete() is the one call its
+ * InvoiceSettled branch makes — so this fires exactly when the server has
+ * said "settled" and the signed webhook has verified, for every checkout
+ * flavour (classic, blocks, order-pay retry) and for invoices covered
+ * entirely by rewards (which settle the moment the balance is applied). It
+ * fires once per order by WooCommerce's own rules (only while the order
+ * still needs payment); the meta flag makes that explicit and survives a
+ * manual re-run.
+ *
+ * Failure is silent on purpose: the order is already paid, and the server
+ * being briefly unreachable from a webhook callback must never surface as an
+ * error on the merchant's order. The flag is only written once the server
+ * answered, so an unreachable server leaves nothing behind.
+ */
+function barebits_note_rewards_on_payment_complete($orderId): void {
+    if (!function_exists('wc_get_order')) {
+        return;
+    }
+    $order = wc_get_order($orderId);
+    if (!$order instanceof WC_Order) {
+        return;
+    }
+    // The same gateway test the BTCPay plugin's webhook handler applies
+    // (its separate-gateways mode suffixes the id per payment method).
+    if (strpos((string) $order->get_payment_method(), 'btcpaygf_') !== 0) {
+        return;
+    }
+    if ((string) $order->get_meta(BAREBITS_REWARDS_NOTE_META) !== '') {
+        return;
+    }
+    $invoiceId = trim((string) $order->get_meta('BTCPay_id'));
+    if ($invoiceId === '') {
+        return;
+    }
+
+    $invoice = barebits_fetch_invoice($invoiceId);
+    if ($invoice === null) {
+        return;
+    }
+
+    $note = '';
+    if (isset($invoice['rewards']) && is_array($invoice['rewards'])) {
+        $note = barebits_rewards_order_note($invoice['rewards'], $invoice);
+    }
+    if ($note !== '') {
+        $order->add_order_note($note);
+    }
+    $order->update_meta_data(BAREBITS_REWARDS_NOTE_META, $note !== '' ? 'noted' : 'none');
+    $order->save();
+}
+add_action('woocommerce_payment_complete', 'barebits_note_rewards_on_payment_complete');
 
 /**
  * Whether this WordPress install can install plugins programmatically without

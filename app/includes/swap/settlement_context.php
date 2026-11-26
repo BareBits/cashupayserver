@@ -19,6 +19,7 @@
 
 require_once __DIR__ . '/../database.php';
 require_once __DIR__ . '/../webhook_sender.php';
+require_once __DIR__ . '/../rewards_flow.php';
 
 interface SwapSettlementContext {
     /** Table name that holds the swap rows this context drives. */
@@ -60,6 +61,9 @@ final class CustomerSwapSettlement implements SwapSettlementContext {
         if ($stmt->rowCount() !== 1) {
             return; // already settled
         }
+        // Rewards bookkeeping before the webhook payload is read (see
+        // Invoice::updateStatus): the payload is frozen at enqueue.
+        RewardsFlow::onSettled((string)$row['invoice_id']);
         $invoice = Database::fetchOne("SELECT * FROM invoices WHERE id = ?", [$row['invoice_id']]);
         if ($invoice) {
             WebhookSender::fireEvent($invoice['store_id'], 'InvoiceSettled', $invoice);

@@ -345,6 +345,14 @@ in your installation's local database and data directory. They stay on your infr
 under your control and your responsibility (see the
 [Terms of Use](https://github.com/BareBits/cashupayserver/blob/main/USE_POLICY.md)).
 
+If you enable the optional **cash back rewards** program ([docs/rewards.md](docs/rewards.md)),
+the usernames payers choose for their rewards accounts — frequently a phone number — and
+their balances, together with a ledger of every credit and spend, are stored in the same local
+database, per store. This data is shown only in your admin's Rewards view and its CSV export
+and on the payer's own invoice page; it is not sent anywhere. Rewards introduce no new
+external service: pricing a balance uses the exchange-rate providers of section 3 that the
+server already consults.
+
 ## 8. A note on DNS
 
 Any outbound connection above also resolves the target hostname through the DNS resolver

@@ -147,7 +147,10 @@ def _walk_wizard_in_iframe(page) -> None:
     frame.locator("h2:has-text('Cashu mints')").wait_for()
     frame.locator("button:has-text('No thanks, run without mints')").click()
 
-    # The wallet-tabs question follows the last rail screen; skip it.
+    # The rewards question follows the last rail screen, then wallet tabs;
+    # skip both.
+    frame.locator("h2:has-text('(Optional) Enable Rewards')").wait_for()
+    frame.locator("button[name='rewards_action'][value='skip']").click()
     frame.locator("h2:has-text('Popular wallet tabs')").wait_for()
     frame.locator("button[name='wallet_tabs_action'][value='skip']").click()
 
