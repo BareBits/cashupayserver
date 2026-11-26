@@ -21,6 +21,7 @@ BareBits can create invoices, receive payments, and be used as a point-of-sale s
 - **Secure by design** - No hot wallet sitting on your web server (unless using Cashu mint). Connects to your LN wallet via CLINK/NWC/LNURL with no ability to spend funds.
 - **Multiple stores** - Each store can have it's own invoice settings, cashout addresses, etc.
 - **Tip jars** - Let customers pay what they want from a shared link. Create any number of named tip jars per store, each with its own emoji, a message to the payer ("Thank you for your donation") and a running total of what it has received; product links let a shared link carry specific products instead.
+- **Cash back rewards** - Give customers a reason to pay with Bitcoin again. Opt in per store and a percentage of every payment is credited to a rewards account the payer names on the paid page (a username, no password); the balance can be applied to their next invoice at the same store, up to covering it entirely. Balances stay on your server as plain bookkeeping. See [docs/rewards.md](docs/rewards.md).
 - **E-commerce integration** - Plugin for WooCommerce. On magneto, shopify, or another platform? Use the BTCPay plugin and point it to your BareBits URL.
 - **On-chain payments** to an off-server wallet using xpub addresses or even a single address
 - **eCash (ECX) payments** - optionally accept [eCash](https://ecash.com), the Drivechain fork of Bitcoin, alongside Bitcoin and Lightning: same xpub format, fresh address per invoice, amounts in szats at the CoinMarketCap price. See [docs/ecx.md](docs/ecx.md).
@@ -503,6 +504,28 @@ curl "https://yoursite.com/api/v1/stores/{storeId}/invoices/{invoiceId}" \
   -H "Authorization: token YOUR_API_KEY"
 ```
 
+When the store's [cash back rewards](docs/rewards.md) touched the invoice,
+the response carries a `rewards` object; the key is absent otherwise:
+
+```json
+"rewards": {
+  "appliedAmount": "1.20", "appliedCurrency": "USD", "appliedUsername": "alice",
+  "fullCoverage": false,
+  "earnedAmount": "0.09", "earnedCurrency": "USD", "earnedClaimed": true, "earnedUsername": "alice"
+}
+```
+
+`applied*` describe rewards the payer spent on the invoice (the invoice's
+`amount` stays the amount you asked for; the payer owed `amount` minus
+`appliedAmount`), `fullCoverage` is true when rewards covered all of it
+(the invoice then settles immediately with `paymentRail` `rewards`), and
+`earned*` describe the cash back the payment produced in the store's
+rewards currency, with whether and to which account it has been credited.
+The payment page does the rest: on a pending invoice it offers "Apply
+rewards" (username only) and "Remove"; on the paid screen it credits the
+earn automatically when the account is known, or asks the payer for a
+username to claim it within 24 hours.
+
 ### Webhooks
 
 Register webhooks to receive payment notifications:
@@ -518,6 +541,10 @@ curl -X POST "https://yoursite.com/api/v1/stores/{storeId}/webhooks" \
 ```
 
 Webhook events: `InvoiceCreated`, `InvoiceReceivedPayment`, `InvoiceProcessing`, `InvoiceProvisional`, `InvoiceSettled`, `InvoiceExpired`, `InvoiceInvalid`
+
+The `InvoiceSettled` payload embeds the invoice as `invoice`; when rewards
+touched it, `invoice.rewards` is the same object the GET returns (see
+above), frozen at the moment of settlement.
 
 ## Troubleshooting
 

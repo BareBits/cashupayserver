@@ -18,6 +18,8 @@ This plugin connects your WooCommerce installation to your BareBits server, whic
 
 The plugin then installs and configures the "BTCPay for WooCommerce" gateway plugin, points it at your BareBits server, registers the payment webhook, and can apply an automatic checkout discount for Bitcoin payments — on both the classic and the block-based checkout, with the percentage advertised in the payment method's title.
 
+If your BareBits server has its optional cash back rewards program enabled, customers can spend earlier rewards on an order's payment page and earn new ones by paying; the plugin records what happened as a note on the WooCommerce order ("Customer applied 1.20 USD of BareBits rewards…") without changing the order total.
+
 The BareBits server itself is a separate, self-hosted application (https://github.com/BareBits/cashupayserver) with its own license. This plugin contains no BareBits server code and talks to it purely over its HTTP API.
 
 == Installation ==
@@ -42,6 +44,10 @@ Yes, using any crypto exchange. BareBits is compatible with Strike which can do 
 = Where does the money go? =
 
 To wallets you control: your own Lightning wallet, your own on-chain wallet (xpub), or a Cashu mint of your choosing. The BareBits admin walks you through it. Lightning funds can be directed to your wallet via: CLINK noffer, NWC, or LNURL (lightning address). We suggest Electrum wallet.
+
+= Can I reward customers for paying with Bitcoin? =
+
+Two ways. The plugin applies an automatic percentage discount at checkout for customers who choose BareBits. Separately, the BareBits server has an optional cash back rewards program: a percentage of every payment is credited to a rewards account the customer names on the paid page, and that balance can be spent on their next order at your store, up to covering it entirely. Rewards are configured on the BareBits server (setup wizard or store settings); the plugin adds an order note describing rewards applied or earned on each paid order. The order total itself never changes.
 
 = What happens if I uninstall this plugin? =
 
@@ -74,6 +80,10 @@ During onboarding the plugin installs and activates the "BTCPay for WooCommerce"
 The full plugin build distributed on the project's GitHub releases page can additionally install a BareBits server alongside WordPress. That flow fetches release metadata from api.github.com and downloads the release archive and its checksums from github.com. The build distributed on wordpress.org does not include this component and never contacts GitHub. GitHub terms of service: https://docs.github.com/en/site-policy/github-terms/github-terms-of-service — privacy statement: https://docs.github.com/en/site-policy/privacy-policies/github-general-privacy-statement
 
 == Changelog ==
+
+= 1.11 =
+* Orders paid through the BareBits gateway now carry an order note describing the server's cash back rewards on that payment — rewards applied by the customer (with the account and the remainder paid in Bitcoin), orders covered entirely by rewards, and rewards earned (claimed or unclaimed). Written once per order; the order total is never changed.
+* Server-side (for installs updating the companion BareBits server): an optional per-store cash back rewards program — a percentage of every payment (net of rewards applied) is credited to a rewards account the payer names on the paid page, spendable on a later invoice of the same store up to full coverage; setup wizard screen, store settings card, admin Rewards view with CSV export, `rewards` object on the Greenfield invoice and the InvoiceSettled webhook.
 
 = 1.10 =
 * Server-side (for installs updating the companion BareBits server): eCash (ECX) pay-to-address rail alongside Bitcoin on-chain and Lightning (xpub or static address, CoinMarketCap pricing with eCash withheld when no price is available, fees in szats on their own ledger, admin card, payment-page tab, API method ECX-OnChain); the six Lightning payment paths — Strike, Lightning address, NWC, CLINK, submarine swap, Cashu mint — are orderable per store and a backup mint can be added from store settings; an invoice detail modal with products and a per-invoice payment-attempt log; every value read from price feeds, Lightning rails, swap providers and explorers is shape-validated before use and remote response excerpts are sanitized before logging; cron surfaces show the keyed cron.php URL first; balance card text is black.
