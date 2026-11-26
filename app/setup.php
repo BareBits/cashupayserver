@@ -64,6 +64,7 @@ require_once __DIR__ . '/includes/desktop.php';
 require_once __DIR__ . '/includes/managed.php';
 require_once __DIR__ . '/includes/usage_stats.php';
 require_once __DIR__ . '/includes/wallet_tabs.php';
+require_once __DIR__ . '/includes/rewards.php';
 
 // Initialize session early - needed for storing temp data during setup
 Auth::initSession();
@@ -444,7 +445,7 @@ function setupAdvanceRail(string $current, string $storeId): string {
     if ($next === null) {
         // Only reachable when $current is the last screen of a truncated
         // sequence; the first post-rail screen is the safe landing.
-        return $mode === 'add_store' ? SetupFlow::ADD_STORE_COMPLETE : 'wallet_tabs';
+        return $mode === 'add_store' ? SetupFlow::ADD_STORE_COMPLETE : 'rewards';
     }
     return $next;
 }
@@ -504,9 +505,10 @@ function setupFinalizeRails(string $storeId): ?string {
     SetupFlow::resolveAutoCashout($storeId);
 
     if ($mode === 'add_store') {
-        // The store is complete; the wallet_tabs screen still follows, and
-        // it is the one that hands off to admin (setupAddStoreHandoff) —
-        // showing the seed panel first when this run minted a seed.
+        // The store is complete; the rewards and wallet_tabs screens still
+        // follow, and wallet_tabs is the one that hands off to admin
+        // (setupAddStoreHandoff) — showing the seed panel first when this
+        // run minted a seed.
         return null;
     }
 
@@ -1280,6 +1282,35 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 // setupAdvanceRail finalises the install (swaps default,
                 // auto-cashout rail, setup_complete / add_store hand-off).
                 $step = setupAdvanceRail('mints', $storeId);
+                break;
+
+            case 'rewards':
+                $storeId = $_SESSION['setup_store_id'] ?? null;
+                if (!$storeId) {
+                    throw new Exception('Store not found. Please restart setup.');
+                }
+                if (!isset($_POST['rewards_action'])) {
+                    // GET landing — fall through to render the form.
+                    break;
+                }
+                // "(Optional) Enable Rewards" (Rewards). Continue writes the
+                // answer: ticked = enabled at the typed percentage (the
+                // percent field is posted either way and ignored when the
+                // box is unticked); unticked = off, the stored percentage
+                // kept so re-enabling remembers it. Skip writes nothing.
+                // Rewards::parsePercent / setStoreSettings throw
+                // InvalidArgumentException (an Exception) with the
+                // operator-facing message, which the outer catch turns into
+                // the error banner with the typed values prefilled.
+                if ($_POST['rewards_action'] === 'save') {
+                    if (!empty($_POST['rewards_enabled'])) {
+                        $rwPercent = Rewards::parsePercent($_POST['rewards_percent'] ?? '');
+                        Rewards::setStoreSettings($storeId, true, $rwPercent);
+                    } else {
+                        Rewards::setStoreSettings($storeId, false, null);
+                    }
+                }
+                $step = SetupFlow::nextStep('rewards', $flowSteps) ?? 'wallet_tabs';
                 break;
 
             case 'wallet_tabs':
@@ -4003,6 +4034,93 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                 <a href="<?= htmlspecialchars($adminReturn) ?>" class="btn" style="width: 100%; text-align: center; display: block;">
                     Go to BareBits Admin
                 </a>
+
+            <?php elseif ($step === 'rewards'): ?>
+                <!-- Screen: "(Optional) Enable Rewards" (Rewards). Per store,
+                     so add_store asks it too. Unticked on a store that never
+                     answered; a failed save re-renders with the typed values,
+                     a revisit via Back shows what was saved. Abandoning the
+                     wizard here is safe: unanswered means rewards stay off,
+                     which is how every store behaved before the screen
+                     existed (the admin Rewards card can enable them later). -->
+                <?php
+                $rwStore = $renderStoreId ? Config::getStore($renderStoreId) : null;
+                $rwSaved = Rewards::settingsFromRow($rwStore);
+                $rwPosted = ($_POST['rewards_action'] ?? '') === 'save';
+                $rwChecked = $rwPosted ? !empty($_POST['rewards_enabled']) : $rwSaved['enabled'];
+                if ($rwPosted) {
+                    $rwPercentValue = (string)($_POST['rewards_percent'] ?? '');
+                } elseif ($rwSaved['percent'] > 0) {
+                    // Natural spelling: "1", "2.5", "0.25" — never "1.0000".
+                    $rwPercentValue = rtrim(rtrim(number_format($rwSaved['percent'], Rewards::PERCENT_DECIMALS, '.', ''), '0'), '.');
+                } else {
+                    $rwPercentValue = '';
+                }
+                // Balances are kept in the store's rewards currency: the one
+                // already pinned when rewards were enabled before, else the
+                // store's default currency (what enabling now would pin).
+                $rwCurrency = $rwSaved['currency']
+                    ?? ($renderStoreId ? Rewards::normalizeCurrency(Config::getStoreDefaultCurrency($renderStoreId)) : 'sat');
+                $rwCurrencyLabel = $rwCurrency === 'sat' ? 'sats' : $rwCurrency;
+                ?>
+                <h2 style="margin-bottom: 1rem;">🎁 (Optional) Enable Rewards</h2>
+                <p style="margin-bottom: 1.25rem;">
+                    BareBits comes with a built-in rewards mechanism to provide a
+                    powerful encouragement for your customers to come back and pay
+                    with BareBits. With the amount of money BareBits saves you vs
+                    credit cards, you can offer rewards and <em>still</em> be
+                    saving money! Users can spend their rewards by using them on a
+                    future purchase.
+                </p>
+                <form method="POST" action="<?= htmlspecialchars(setupSelfUrl()) ?>" id="rewards-form">
+                    <input type="hidden" name="step" value="rewards">
+                    <?php if ($mode === 'add_store'): ?>
+                        <input type="hidden" name="mode" value="add_store">
+                    <?php endif; ?>
+                    <?= setupCsrfField() ?>
+
+                    <div class="checkbox-group" style="margin-bottom: 1rem;">
+                        <input type="checkbox" id="rewards_enabled" name="rewards_enabled" value="1"<?= $rwChecked ? ' checked' : '' ?>>
+                        <label for="rewards_enabled" style="margin: 0;">
+                            Enable rewards
+                        </label>
+                    </div>
+                    <div class="form-group" id="rewards-percent-row"<?= $rwChecked ? '' : ' style="display:none;"' ?>>
+                        <label for="rewards_percent">Rewards percentage</label>
+                        <input type="text" id="rewards_percent" name="rewards_percent" inputmode="decimal" autocomplete="off" value="<?= htmlspecialchars($rwPercentValue) ?>" placeholder="1">
+                        <p class="help-text">
+                            The share of every payment credited back to the customer,
+                            between <?= htmlspecialchars((string)Rewards::MIN_PERCENT) ?> and <?= htmlspecialchars((string)Rewards::MAX_PERCENT) ?>%
+                            (up to <?= (int)Rewards::PERCENT_DECIMALS ?> decimals). For example, 1% on a 100 sat payment credits 1 sat.
+                        </p>
+                    </div>
+                    <p style="margin: 0 0 1.25rem; font-size: 0.9rem; color: #a0aec0;" id="rewards-currency-note">
+                        Rewards balances are kept in <strong><?= htmlspecialchars($rwCurrencyLabel) ?></strong><?= $rwSaved['currency'] === null ? ", your store's currency" : '' ?>.
+                        Change this any time under Settings &rarr; Rewards.
+                    </p>
+                    <div class="warning">
+                        ⚠️ <strong>Rewards are experimental.</strong> The feature is new; keep an eye
+                        on the Rewards view in admin while you try it out.
+                    </div>
+
+                    <button type="submit" name="rewards_action" value="save" class="btn" style="width: 100%; margin-bottom: 0.75rem;">Continue</button>
+                    <button type="submit" name="rewards_action" value="skip" class="btn btn-secondary" style="width: 100%;">Skip for now</button>
+                </form>
+
+                <script>
+                (function () {
+                    // Show the percentage only while rewards are ticked; the
+                    // field stays in the form (hidden, not disabled) so it is
+                    // posted either way and the server ignores it when off.
+                    var box = document.getElementById('rewards_enabled');
+                    var row = document.getElementById('rewards-percent-row');
+                    if (box && row) {
+                        box.addEventListener('change', function () {
+                            row.style.display = box.checked ? '' : 'none';
+                        });
+                    }
+                })();
+                </script>
 
             <?php elseif ($step === 'wallet_tabs'): ?>
                 <!-- Screen: "Popular wallet tabs" (WalletTabs). Per store,

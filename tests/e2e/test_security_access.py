@@ -55,6 +55,7 @@ def test_anonymous_tail_post_on_configured_install_is_refused(configured: Config
 
     stranger = requests.Session()
     for step, data in (
+        ("rewards", {"step": "rewards", "rewards_enabled": "1", "rewards_percent": "5", "rewards_action": "save"}),
         ("wallet_tabs", {"step": "wallet_tabs", "wallet_tabs_action": "skip"}),
         ("updates", {"step": "updates", "auto_update": "0"}),
         ("cron", {"step": "cron"}),

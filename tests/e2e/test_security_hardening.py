@@ -102,7 +102,7 @@ def test_unfinished_wizard_is_locked_to_the_session_that_set_the_password(
     assert _config(payserver, "smtp_host") is None
 
     # Nor can it reach the store/rail screens or add_store.
-    for step in ("store", "onchain", "mints", "updates"):
+    for step in ("store", "onchain", "mints", "rewards", "updates"):
         r = intruder.post(
             f"{payserver.url}/setup.php",
             data={"step": step, "csrf_token": csrf.group(1), "store_name": "Hijacked"},

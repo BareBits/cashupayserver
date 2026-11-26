@@ -541,10 +541,13 @@ def main() -> int:
             page.fill("#mint_url_manual", mint.url)
             page.fill("#backup_mint_url_manual", backup_mint.url)
             page.click("#mints-continue-btn")
-            # setup_complete flips here; wallet tabs, seed, updates, cron and
-            # done are advisory. Keep all three wallet tabs (pre-ticked) so
-            # the dev stack's payment page shows the Cash App / Venmo /
-            # PayPal tabs.
+            # setup_complete flips here; rewards, wallet tabs, seed, updates,
+            # cron and done are advisory. Skip rewards (off, like every store
+            # before the screen existed) and keep all three wallet tabs
+            # (pre-ticked) so the dev stack's payment page shows the
+            # Cash App / Venmo / PayPal tabs.
+            page.wait_for_selector("h2:has-text('(Optional) Enable Rewards')")
+            page.click("button[name='rewards_action'][value='skip']")
             page.wait_for_selector("h2:has-text('Popular wallet tabs')")
             page.click("button[name='wallet_tabs_action'][value='save']")
             page.wait_for_selector("h2:has-text('Save your recovery phrase')")

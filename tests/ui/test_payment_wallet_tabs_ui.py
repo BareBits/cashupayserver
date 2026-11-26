@@ -334,6 +334,9 @@ def test_wizard_screen_writes_the_ticked_wallets(payserver: PayserverHandle, pag
     page.wait_for_selector("button:has-text('No thanks, run without mints')")
     page.click("button:has-text('No thanks, run without mints')")
 
+    # Rewards sit between the rail screens and the wallet tabs; skip them.
+    page.wait_for_selector("h2:has-text('(Optional) Enable Rewards')")
+    page.click("button[name='rewards_action'][value='skip']")
     page.wait_for_selector("h2:has-text('Popular wallet tabs')")
     assert "Enable additional tabs on the payment page for these popular wallets?" in page.locator("body").inner_text()
     for key in ("cashapp", "venmo", "paypal"):

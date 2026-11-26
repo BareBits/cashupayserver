@@ -62,7 +62,7 @@ def test_full_flow_persists_every_answer(
     # sits after the lightning screen (where the last possible on-chain
     # receive source, Strike on-chain minting, is answered).
     assert _heading(body) == "Lightning payments"
-    assert "of 15" in body
+    assert "of 16" in body
 
     body = w.post(step="lightning", lightning_action="save", lightning_address="merchant@strike.me")
     assert _heading(body) == "Zero-conf payments"
@@ -81,8 +81,11 @@ def test_full_flow_persists_every_answer(
 
     # Decline mints — the last rail screen is where setup_complete flips.
     body = w.post(step="mints", mints_enabled="0")
-    assert _heading(body) == "Popular wallet tabs", "the wallet-tabs question follows the last rail screen"
+    assert _heading(body) == "(Optional) Enable Rewards", "the rewards question follows the last rail screen"
     assert 'id="wizard-back-link"' in body, "the post-completion screens have a Back link"
+    # Skip rewards (left off) — the wallet-tabs question is next.
+    body = w.post(step="rewards", rewards_action="skip")
+    assert _heading(body) == "Popular wallet tabs", "the wallet-tabs question follows the rewards screen"
     # Skip the wallet tabs (explicit none) — the auto-update question is next.
     body = w.post(step="wallet_tabs", wallet_tabs_action="skip")
     assert _heading(body) == "Enable automatic updates?"
@@ -114,12 +117,13 @@ def test_full_flow_persists_every_answer(
     assert row["auto_melt_use_swap"] == 0, "and it sweeps over Lightning, not via a swap"
     assert not row["mint_url"] and not row["seed_phrase"]
     assert row["wallet_tabs"] == "", "Skip on the wallet-tabs screen is an explicit none"
+    assert not row["rewards_enabled"], "Skip on the rewards screen leaves rewards off"
 
 
 def test_skipping_onchain_removes_the_zeroconf_screen(payserver: PayserverHandle) -> None:
     w = Wizard(payserver)
     body = w.through_store("Skip Onchain")
-    assert "of 14" in body, "without an on-chain rail the wizard is 14 screens, not 15"
+    assert "of 15" in body, "without an on-chain rail the wizard is 15 screens, not 16"
 
     body = w.post(step="onchain", onchain_action="skip")
     assert _heading(body) == "Lightning payments"
@@ -149,7 +153,7 @@ def test_strike_only_store_is_asked_the_zeroconf_question(
     payserver = payserver_with_strike
     w = Wizard(payserver)
     body = w.through_store("Strike Only")
-    assert "of 14" in body, "no on-chain receive source yet, so no zeroconf screen"
+    assert "of 15" in body, "no on-chain receive source yet, so no zeroconf screen"
 
     body = w.post(step="onchain", onchain_action="skip")
     assert _heading(body) == "Lightning payments"
@@ -170,7 +174,7 @@ def test_strike_only_store_is_asked_the_zeroconf_question(
         strike_onchain="1",
     )
     assert _heading(body) == "Zero-conf payments", "Strike on-chain must pull zeroconf in"
-    assert "of 15" in body, "the step counter must count the screen it just gained"
+    assert "of 16" in body, "the step counter must count the screen it just gained"
 
     body = w.post(step="zeroconf", zero_conf="1")
     assert _heading(body) == "Cashu mints"
@@ -207,7 +211,7 @@ def test_swaps_default_on_only_with_an_xpub(payserver: PayserverHandle) -> None:
     assert _stores(payserver)[0]["swaps_enabled"] == -1, "swaps are settled at the end of the rail screens"
 
     body = w.post(step="mints", mints_enabled="0")
-    assert _heading(body) == "Popular wallet tabs"
+    assert _heading(body) == "(Optional) Enable Rewards"
     assert _stores(payserver)[0]["swaps_enabled"] == 0, "a static address cannot back swaps, so they stay off"
 
 
@@ -486,8 +490,8 @@ def test_security_screen_skipped_when_data_dir_is_outside_the_webroot() -> None:
         try:
             w = SetupWizard(handle.url)
             body = w.get("terms")
-            assert "of 13" in body, (
-                "skipping the security screen makes the standalone wizard 13 screens"
+            assert "of 14" in body, (
+                "skipping the security screen makes the standalone wizard 14 screens"
             )
 
             w.accept_terms()
