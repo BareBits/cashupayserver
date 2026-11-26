@@ -4098,11 +4098,6 @@ define('CASHUPAY_DATA_DIR', '/home/youruser/cashupay-data');</pre>
                         Rewards balances are kept in <strong><?= htmlspecialchars($rwCurrencyLabel) ?></strong><?= $rwSaved['currency'] === null ? ", your store's currency" : '' ?>.
                         Change this any time under Settings &rarr; Rewards.
                     </p>
-                    <div class="warning">
-                        ⚠️ <strong>Rewards are experimental.</strong> The feature is new; keep an eye
-                        on the Rewards view in admin while you try it out.
-                    </div>
-
                     <button type="submit" name="rewards_action" value="save" class="btn" style="width: 100%; margin-bottom: 0.75rem;">Continue</button>
                     <button type="submit" name="rewards_action" value="skip" class="btn btn-secondary" style="width: 100%;">Skip for now</button>
                 </form>

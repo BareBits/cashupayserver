@@ -8016,9 +8016,6 @@ header('Cache-Control: no-cache, must-revalidate');
                          from here with a percentage (same validation + save
                          action as the Store settings card). -->
                     <div id="rewards-enable-inline" class="hidden" style="margin: 0 0 1rem 0; padding: 0.75rem 1rem; border: 1px solid var(--border); border-radius: 8px;">
-                        <div style="font-size: 0.82rem; margin-bottom: 0.6rem; padding: 0.5rem 0.7rem; border-radius: 8px; background: rgba(245,158,11,0.12); border: 1px solid rgba(245,158,11,0.4);">
-                            ⚠️ Rewards are experimental.
-                        </div>
                         <div style="display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem 0.75rem;">
                             <label for="rewards-inline-percent" style="font-size: 0.85rem;">Cash back percentage</label>
                             <input type="text" class="form-input" id="rewards-inline-percent" inputmode="decimal" placeholder="1" autocomplete="off"
@@ -8148,9 +8145,6 @@ header('Cache-Control: no-cache, must-revalidate');
                                 (letters and digits, no password), and they can spend it on a
                                 later purchase at this store. Tips never earn or spend rewards.
                             </p>
-                            <div id="rewards-experimental-warning" style="margin-bottom:0.75rem; padding:0.6rem 0.8rem; border-radius:8px; background:rgba(245,158,11,0.12); border:1px solid rgba(245,158,11,0.4); font-size:0.82rem;">
-                                ⚠️ Rewards are experimental.
-                            </div>
                             <div class="toggle-container" style="margin-bottom:0.75rem;">
                                 <span>Enable rewards</span>
                                 <label class="toggle">

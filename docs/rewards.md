@@ -12,11 +12,6 @@ BareBits charges 1%. Give a slice of the difference back as rewards and
 your customers have a reason to come back and pay with Bitcoin again — and
 you are *still* ahead.
 
-> Rewards are **experimental**. The money model below is deliberately
-> conservative (balances are exact integers, every movement is a ledger row
-> that can happen at most once per invoice), but the feature is new; keep
-> the percentage modest while you get a feel for it.
-
 ## Enabling it
 
 Rewards are off by default and switched on per store.

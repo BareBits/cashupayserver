@@ -294,7 +294,7 @@ def test_store_settings_rewards_card_save_validation_and_disable(shared_configur
     assert not page.is_checked("#rewards-enabled")
     assert page.input_value("#rewards-percent") == ""
     assert page.get_attribute("#rewards-percent", "inputmode") == "decimal"
-    assert "experimental" in page.text_content("#rewards-experimental-warning").lower()
+    assert page.locator("#rewards-experimental-warning").count() == 0, "the experimental warning is gone"
     assert "Balances will be kept in sats" in page.text_content("#rewards-currency-line")
     assert "No rewards accounts yet" in page.text_content("#rewards-totals-line")
     assert page.locator("#rewards-error").is_hidden()
