@@ -198,8 +198,19 @@ SelfServe::setStoreOverride('s1', SelfServe::FORCE_OFF);
 SelfServe::setStoreOverride('s2', SelfServe::FORCE_OFF);
 SelfServe::setStoreOverride('s3', SelfServe::FORCE_OFF);
 $pdo = Database::getInstance();
-// The current getInstance() marker is the newer Cashu-maximum column set:
-// drop it too, or the marker is still present and migrations never re-run.
+// The current getInstance() marker is the newer rewards column set (and the
+// Cashu-maximum set before it): drop them too, or the marker is still present
+// and migrations never re-run.
+$pdo->exec("ALTER TABLE stores DROP COLUMN rewards_percent");
+$pdo->exec("ALTER TABLE stores DROP COLUMN rewards_enabled");
+$pdo->exec("ALTER TABLE stores DROP COLUMN rewards_currency");
+$pdo->exec("DROP TABLE rewards_ledger");
+$pdo->exec("DROP TABLE rewards_accounts");
+foreach (['rewards_account_id', 'rewards_discount_amount', 'rewards_applied_micro', 'rewards_spend_state',
+          'rewards_earned_micro', 'rewards_earn_currency', 'rewards_claimed_at',
+          'onchain_amount_alternates', 'ecx_amount_alternates'] as $c) {
+    $pdo->exec("ALTER TABLE invoices DROP COLUMN {$c}");
+}
 $pdo->exec("ALTER TABLE stores DROP COLUMN cashu_max_invoice_sats");
 $pdo->exec("ALTER TABLE stores DROP COLUMN cashu_max_respect_always");
 $pdo->exec("UPDATE invoices SET tip_jar_id = NULL");

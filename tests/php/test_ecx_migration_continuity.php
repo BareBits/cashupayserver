@@ -93,6 +93,16 @@ $pdo = Database::getInstance();
 // The release before ECX predates the Cashu maximum and tip jars too: drop
 // those newer marker sets first, or getInstance() sees the current marker
 // and never re-runs.
+$pdo->exec("ALTER TABLE stores DROP COLUMN rewards_percent");
+$pdo->exec("ALTER TABLE stores DROP COLUMN rewards_enabled");
+$pdo->exec("ALTER TABLE stores DROP COLUMN rewards_currency");
+$pdo->exec("DROP TABLE rewards_ledger");
+$pdo->exec("DROP TABLE rewards_accounts");
+foreach (['rewards_account_id', 'rewards_discount_amount', 'rewards_applied_micro', 'rewards_spend_state',
+          'rewards_earned_micro', 'rewards_earn_currency', 'rewards_claimed_at',
+          'onchain_amount_alternates', 'ecx_amount_alternates'] as $c) {
+    $pdo->exec("ALTER TABLE invoices DROP COLUMN {$c}");
+}
 $pdo->exec("ALTER TABLE stores DROP COLUMN cashu_max_invoice_sats");
 $pdo->exec("ALTER TABLE stores DROP COLUMN cashu_max_respect_always");
 $pdo->exec("UPDATE invoices SET tip_jar_id = NULL");
@@ -107,7 +117,8 @@ foreach ($ECX_INVOICE_COLS as $c) {
 foreach ($ECX_STORE_COLS as $c) {
     $pdo->exec("ALTER TABLE stores DROP COLUMN {$c}");
 }
-assert_false(has_col('stores', 'cashu_max_invoice_sats'), 'pre-ECX: current marker column gone');
+assert_false(has_col('stores', 'rewards_percent'), 'pre-ECX: current marker column gone');
+assert_false(has_col('stores', 'cashu_max_invoice_sats'), 'pre-ECX: Cashu maximum marker column gone');
 assert_false(has_col('invoices', 'tip_jar_id'), 'pre-ECX: tip jar marker column gone');
 assert_false(has_col('stores', 'ecx_xpub'), 'pre-ECX: ECX marker column gone');
 assert_false(has_table('ecx_payments'));
@@ -118,6 +129,8 @@ assert_eq(2, (int)Database::fetchOne("SELECT COUNT(*) AS n FROM invoices")['n'])
 // ---- first connection after the deploy: self-heal -------------------------------------------
 reset_db_singleton();
 Database::getInstance();
+assert_true(has_col('stores', 'rewards_percent'), 'rewards marker re-added');
+assert_true(has_table('rewards_accounts'), 'rewards accounts table re-added');
 assert_true(has_col('stores', 'cashu_max_invoice_sats'), 'Cashu maximum marker re-added');
 assert_true(has_col('stores', 'cashu_max_respect_always'), 'Cashu respect-size column re-added');
 assert_true(has_col('invoices', 'tip_jar_id'), 'tip jar marker re-added');
