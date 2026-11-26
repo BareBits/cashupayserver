@@ -202,8 +202,14 @@ def test_paid_orders_carry_the_rewards_note_once(woocommerce, configured_multiwo
 
     # ------------------------------------------------------------------
     # Order 3: nothing rewards-related happened. No note; the flag records
-    # that the invoice was looked at so it is never fetched again.
+    # that the invoice was looked at so it is never fetched again. Rewards
+    # are switched off on the store first: the earn is computed at
+    # settlement, so a store that still had them on would legitimately earn
+    # 1% on this order too.
     # ------------------------------------------------------------------
+    with configured.handle.db() as db:
+        db.execute("UPDATE stores SET rewards_enabled = 0 WHERE id = ?", (store_id,))
+        db.commit()
     order_3, invoice_3 = _place_and_settle(wp, configured, info["product_id"])
     body_3 = configured.greenfield.get_invoice(store_id, invoice_3)
     assert "rewards" not in body_3 or body_3["rewards"] is None, body_3
@@ -233,4 +239,10 @@ def test_paid_orders_carry_the_rewards_note_once(woocommerce, configured_multiwo
     finally:
         wp.wp_cli("option", "update", "barebits_server_url", live_url, check=False)
     assert _rewards_notes(wp, order_3) == []
-    assert _order_field(wp, order_3, "get_meta('barebits_rewards_note_added')") == ""
+    # An absent flag echoes nothing, which the generic field helper cannot
+    # parse; read it JSON-encoded so "" is a real line.
+    flag_out = wp.wp_cli(
+        "eval",
+        f"echo json_encode((string) wc_get_order({order_3})->get_meta('barebits_rewards_note_added'));",
+    ).stdout.strip().splitlines()[-1]
+    assert json.loads(flag_out) == "", flag_out
