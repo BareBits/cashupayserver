@@ -649,6 +649,30 @@ if (isset($_GET['api'])) {
                     $limit = CashuLimit::fromRow($store);
                     return ['maxSats' => $limit['max_sats'], 'respectAlways' => $limit['respect_always']];
                 })(),
+                // Cash back rewards (includes/rewards.php): the per-store
+                // settings plus account totals, for the Store settings card.
+                // `live` is the effective switch (on + percent + currency);
+                // `currency` is the one balances are kept in, which stays
+                // put when the default currency changes ("keep" decision).
+                'rewards' => (function () use ($store) {
+                    require_once __DIR__ . '/includes/rewards.php';
+                    $rw = Rewards::settingsFromRow($store);
+                    $totals = Rewards::storeTotals((string)$store['id']);
+                    $outstanding = $totals['balanceMicro'] + $totals['reservedMicro'];
+                    $cur = $rw['currency'];
+                    return [
+                        'enabled' => $rw['enabled'],
+                        'percent' => $rw['percent'],
+                        'currency' => $cur,
+                        'live' => Rewards::isEnabled($store),
+                        'defaultCurrency' => Rewards::normalizeCurrency((string)($store['default_currency'] ?? 'sat')),
+                        'accounts' => $totals['accounts'],
+                        'outstandingMicro' => $outstanding,
+                        'outstandingDisplay' => $cur !== null ? Rewards::formatMicro($outstanding, $cur) : null,
+                        'earnedDisplay' => $cur !== null ? Rewards::formatMicro($totals['earnedMicro'], $cur) : null,
+                        'spentDisplay' => $cur !== null ? Rewards::formatMicro($totals['spentMicro'], $cur) : null,
+                    ];
+                })(),
                 'selfserve' => $storeSelfServe,
                 'reliability' => (function() {
                     require_once __DIR__ . '/includes/mint_reliability.php';
@@ -892,6 +916,7 @@ if (isset($_GET['api'])) {
                 break;
             }
             require_once __DIR__ . '/includes/invoice_attempts.php';
+            require_once __DIR__ . '/includes/rewards_flow.php';
             $isAdminViewer = Auth::isAdmin();
             $detailStore = Config::getStore($row['store_id']);
             $decodeJson = static function ($v) {
@@ -1001,6 +1026,10 @@ if (isset($_GET['api'])) {
                 // Tip jar the invoice came through: live row, else the
                 // metadata snapshot of a since-deleted jar, else null.
                 'tipJar' => TipJar::forInvoice($row),
+                // Cash back rewards on this invoice (applied discount, earn
+                // and its claim state) — RewardsFlow::invoiceView, the same
+                // shape the payment page renders from.
+                'rewards' => RewardsFlow::invoiceView($row, $detailStore ?: null),
                 'detail' => [
                     // The rail chosen at creation vs. the one that moved funds
                     // (formatForApi's paymentRail already prefers the latter).
@@ -1131,6 +1160,54 @@ if (isset($_GET['api'])) {
             }
             unset($inv);
             echo json_encode($formatted);
+            break;
+
+        // Cash back rewards accounts (includes/rewards.php): one store or
+        // every store ('__all__'), optional username substring search,
+        // paginated, newest activity first. Admin-only like Customers — a
+        // bulk list of payer identities and balances.
+        case 'rewards_accounts':
+            Auth::requireAdmin();
+            require_once __DIR__ . '/includes/rewards.php';
+            $rwStoreId = trim((string)($_GET['store_id'] ?? '__all__'));
+            if ($rwStoreId === '') {
+                $rwStoreId = '__all__';
+            }
+            $rwQuery = (string)($_GET['q'] ?? '');
+            $limit = min(max((int)($_GET['limit'] ?? 50), 1), 100);
+            $offset = max((int)($_GET['offset'] ?? 0), 0);
+
+            $rwStoreRows = [];
+            foreach (Database::fetchAll("SELECT * FROM stores ORDER BY created_at DESC") as $s) {
+                $rwStoreRows[$s['id']] = $s;
+            }
+            if ($rwStoreId !== '__all__' && !isset($rwStoreRows[$rwStoreId])) {
+                cashupay_status(404);
+                echo json_encode(['error' => 'Store not found']);
+                break;
+            }
+            $rwAccounts = array_map(
+                fn(array $r) => Rewards::formatAccountForApi($r, $rwStoreRows[$r['store_id']] ?? null),
+                Rewards::listAccounts($rwStoreId, $rwQuery, $limit, $offset)
+            );
+            $rwStores = [];
+            foreach ($rwStoreRows as $s) {
+                $rs = Rewards::settingsFromRow($s);
+                $rwStores[] = [
+                    'id' => $s['id'],
+                    'name' => $s['name'],
+                    'enabled' => Rewards::isEnabled($s),
+                    'percent' => $rs['percent'],
+                    'currency' => $rs['currency'],
+                ];
+            }
+            echo json_encode([
+                'accounts' => $rwAccounts,
+                'total' => Rewards::countAccounts($rwStoreId, $rwQuery),
+                'limit' => $limit,
+                'offset' => $offset,
+                'stores' => $rwStores,
+            ]);
             break;
 
         case 'customers':
@@ -1319,6 +1396,51 @@ if (isset($_GET['api'])) {
 
             $out = fopen('php://output', 'w');
             (new Diagnostics($anonymize, $rangeArg))->stream($out);
+            fclose($out);
+            exit;
+
+        // CSV of the rewards accounts list, honoring the same store filter
+        // and username search as the on-screen list (every matching row, not
+        // just the current page). Admin-only, like the other exports. The
+        // username is payer-typed text: csvCell neutralises formula
+        // injection even though the validator only admits letters + digits.
+        case 'export_rewards_csv':
+            Auth::requireAdmin();
+            require_once __DIR__ . '/includes/rewards.php';
+            $rwStoreId = trim((string)($_GET['store_id'] ?? '__all__'));
+            if ($rwStoreId === '') {
+                $rwStoreId = '__all__';
+            }
+            $rwQuery = (string)($_GET['q'] ?? '');
+
+            $stamp = date('Ymd-His');
+            header('Content-Type: text/csv; charset=utf-8');
+            header('Content-Disposition: attachment; filename="rewards-' . $stamp . '.csv"');
+            header('Cache-Control: no-store');
+
+            $out = fopen('php://output', 'w');
+            fputcsv($out, ['Store', 'Username', 'Currency', 'Balance', 'Reserved', 'Earned', 'Spent', 'Created at (UTC)', 'Last activity (UTC)']);
+            $rwPage = 1000;
+            for ($rwOffset = 0; ; $rwOffset += $rwPage) {
+                $rows = Rewards::listAccounts($rwStoreId, $rwQuery, $rwPage, $rwOffset);
+                foreach ($rows as $r) {
+                    $cur = Rewards::normalizeCurrency((string)($r['currency'] ?? 'sat'));
+                    fputcsv($out, array_map([Security::class, 'csvCell'], [
+                        (string)($r['store_name'] ?? ''),
+                        (string)$r['username'],
+                        $cur,
+                        Rewards::fromMicroExact((int)$r['balance_micro']),
+                        Rewards::fromMicroExact((int)$r['reserved_micro']),
+                        Rewards::fromMicroExact((int)$r['earned_micro']),
+                        Rewards::fromMicroExact((int)$r['spent_micro']),
+                        gmdate('Y-m-d H:i:s', (int)$r['created_at']),
+                        gmdate('Y-m-d H:i:s', (int)$r['last_activity_at']),
+                    ]));
+                }
+                if (count($rows) < $rwPage) {
+                    break;
+                }
+            }
             fclose($out);
             exit;
 
@@ -2420,6 +2542,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 }
 
                 $updates = [];
+                // Cash back rewards: what the operator decided about existing
+                // balances when the default currency changes (see below).
+                $rewardsCurrencyDecision = null;
 
                 if (isset($_POST['name'])) {
                     $updates['name'] = $_POST['name'];
@@ -2463,6 +2588,34 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         }
                     }
                     $updates['default_currency'] = $normalized;
+                    // Rewards balances are kept in the store's rewards
+                    // currency. Switching the default currency while
+                    // balances exist needs the operator's decision (locked
+                    // operator decision 12): convert them once at today's
+                    // rate, or keep them in the old currency. Without one
+                    // the request is refused with 409 and nothing is saved;
+                    // the admin UI turns that into the two-choice modal.
+                    require_once __DIR__ . '/includes/rewards.php';
+                    if (Rewards::currencySwitchNeedsDecision($store, $normalized)) {
+                        $rwAction = (string)($_POST['rewards_currency_action'] ?? '');
+                        if ($rwAction !== 'convert' && $rwAction !== 'keep') {
+                            $rwFrom = Rewards::settingsFromRow($store)['currency'];
+                            $rwTotals = Rewards::storeTotals($storeId);
+                            $rwLabel = static fn(?string $c) => ($c === null || $c === 'sat') ? 'sats' : $c;
+                            cashupay_status(409);
+                            echo json_encode([
+                                'error' => 'Rewards balances are kept in ' . $rwLabel($rwFrom)
+                                    . '. Choose whether to convert them to ' . $rwLabel($normalized)
+                                    . ' at today\'s rate or keep them in ' . $rwLabel($rwFrom) . '.',
+                                'needsRewardsCurrencyDecision' => true,
+                                'from' => $rwFrom,
+                                'to' => $normalized,
+                                'accounts' => $rwTotals['accounts'],
+                            ]);
+                            break;
+                        }
+                        $rewardsCurrencyDecision = $rwAction;
+                    }
                 }
                 if (isset($_POST['hosting_fee_percent'])) {
                     $pct = (float) $_POST['hosting_fee_percent'];
@@ -2564,6 +2717,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                             . 'change anyway (the funds stay recoverable under "Recover funds from a previous mint").',
                     ]);
                     break;
+                }
+
+                // Rewards balances first: convertStoreCurrency throws when no
+                // rate is available (RuntimeException → the 400 below) and
+                // then nothing — not even the default currency — is saved.
+                if ($rewardsCurrencyDecision === 'convert') {
+                    Rewards::convertStoreCurrency($storeId, (string)$updates['default_currency']);
+                } elseif ($rewardsCurrencyDecision === 'keep') {
+                    Rewards::keepCurrency($storeId);
                 }
 
                 Config::updateStore($storeId, $updates, $wouldStrand && $confirmStranding);
@@ -2852,6 +3014,52 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 ], 'id = ?', [$storeId]);
                 echo json_encode(['success' => true]);
             } catch (Exception $e) {
+                cashupay_status(400);
+                echo json_encode(['error' => $e->getMessage()]);
+            }
+            break;
+
+        // Cash back rewards: per-store on/off + percentage (Store settings →
+        // Rewards card and the onboarding screen). The percentage is parsed
+        // only when enabling; disabling keeps the stored one so re-enabling
+        // remembers it (a valid typed value is still saved along). The
+        // rewards currency is pinned by Rewards::setStoreSettings on first
+        // enable and never changed here (see update_store for the switch).
+        case 'save_rewards_settings':
+            Auth::requireAdmin();
+            require_once __DIR__ . '/includes/rewards.php';
+            try {
+                $storeId = (string)($_POST['store_id'] ?? '');
+                if ($storeId === '') {
+                    throw new InvalidArgumentException('Store ID required');
+                }
+                if (!Config::getStore($storeId)) {
+                    throw new InvalidArgumentException('Store not found');
+                }
+                $rwEnabled = (string)($_POST['enabled'] ?? '0') === '1';
+                $rwPercentRaw = trim((string)($_POST['percent'] ?? ''));
+                $rwPercent = null;
+                if ($rwEnabled) {
+                    $rwPercent = Rewards::parsePercent($rwPercentRaw);
+                } elseif ($rwPercentRaw !== '') {
+                    try {
+                        $rwPercent = Rewards::parsePercent($rwPercentRaw);
+                    } catch (InvalidArgumentException $e) {
+                        $rwPercent = null;
+                    }
+                }
+                Rewards::setStoreSettings($storeId, $rwEnabled, $rwPercent);
+                $rwSettings = Rewards::forStore($storeId);
+                echo json_encode([
+                    'success' => true,
+                    'settings' => [
+                        'enabled' => $rwSettings['enabled'],
+                        'percent' => $rwSettings['percent'],
+                        'currency' => $rwSettings['currency'],
+                        'live' => Rewards::isEnabledForStore($storeId),
+                    ],
+                ]);
+            } catch (InvalidArgumentException $e) {
                 cashupay_status(400);
                 echo json_encode(['error' => $e->getMessage()]);
             }
@@ -5474,7 +5682,7 @@ $fileResetRequested = !$isLoggedIn && Auth::fileResetRequested();
 // resolve sensibly; with query URLs, serve the dashboard directly (a
 // path-style redirect is exactly what such hosts cannot serve).
 // -----------------------------------------------------------------------------
-const ADMIN_VIEWS = ['dashboard', 'invoices', 'tipjars', 'customers', 'stores', 'products', 'settings', 'stats', 'log'];
+const ADMIN_VIEWS = ['dashboard', 'invoices', 'tipjars', 'customers', 'rewards', 'stores', 'products', 'settings', 'stats', 'log'];
 
 $adminUsesPathUrls = Urls::adminUsesPathUrls($_SERVER['PATH_INFO'] ?? null, Config::getUrlMode());
 
@@ -5910,22 +6118,24 @@ header('Cache-Control: no-cache, must-revalidate');
             height: 24px;
         }
 
-        /* Phone-width bottom bar. An admin sees nine items; with 1rem side
+        /* Phone-width bottom bar. An admin sees ten items; with 1rem side
            padding and wrapping labels, "Tip Jars" broke onto two lines, the
            bar grew past the reserve .main keeps for it, and "Customers"
            spilled over "Stats". Items size to their label (equal slots can't
-           fit "Customers" at any legible size, while the nine natural widths
-           total well under 360px), labels stay on one line, and only on a
-           screen too narrow even for that do they shrink and clip. */
+           fit "Customers" at any legible size, while the ten natural widths
+           total about 305px at 320px wide), labels stay on one line, and
+           only on a screen too narrow even for that do they shrink and clip.
+           Measured when "Rewards" became the tenth item: 1px side padding and
+           this clamp leave ~15px of slack at 320px, ~50px at 360px. */
         @media (max-width: 767.98px) {
             .nav-item {
                 flex: 0 1 auto;
                 min-width: 0;
-                padding: 0.5rem 0.125rem;
-                /* 0.7rem at 390px wide, easing towards 0.55rem on the
-                   narrowest phones: the nine labels then fit unclipped from
+                padding: 0.5rem 0.0625rem;
+                /* 0.7rem at 448px+ wide, easing towards 0.5rem on the
+                   narrowest phones: the ten labels then fit unclipped from
                    320px up. */
-                font-size: clamp(0.55rem, 2.9vw, 0.7rem);
+                font-size: clamp(0.5rem, 2.5vw, 0.7rem);
             }
 
             .nav-label {
@@ -7750,6 +7960,36 @@ header('Cache-Control: no-cache, must-revalidate');
                 </div>
             </div>
 
+            <!-- Rewards View: cash back rewards accounts (includes/rewards.php),
+                 read-only — username, balance (+ the sats/fiat equivalent),
+                 lifetime earned/spent, last activity — with a store filter,
+                 username search and CSV export. Admin-only (same gate as the
+                 API). The per-store switch lives in Store settings → Rewards. -->
+            <div class="view" id="view-rewards">
+                <div class="card view-fill">
+                    <div class="card-header">
+                        <div class="card-title">Rewards</div>
+                        <div style="display: flex; gap: 0.5rem;">
+                            <button class="btn btn-secondary" id="btn-export-rewards-csv">Export CSV</button>
+                        </div>
+                    </div>
+                    <div class="inv-filter-row">
+                        <span class="inv-filter"><label for="rewards-store-filter">Store:</label>
+                        <select id="rewards-store-filter">
+                            <option value="__all__">All stores</option>
+                        </select></span>
+                        <span class="inv-filter"><label for="rewards-search">Username:</label>
+                        <input type="search" id="rewards-search" class="form-input" placeholder="Search" autocomplete="off"
+                               style="width: 12rem; max-width: 100%; padding: 0.5rem 0.75rem; font-size: 0.875rem;"></span>
+                    </div>
+                    <p id="rewards-store-summary" class="hidden" style="font-size: 0.85rem; color: var(--text-secondary); margin: 0 0 0.75rem 0;"></p>
+                    <div id="all-rewards">
+                        <div class="loading"><div class="spinner"></div></div>
+                    </div>
+                    <div id="rewards-pagination" class="list-pagination"></div>
+                </div>
+            </div>
+
             <!-- Store Settings View -->
             <div class="view" id="view-stores">
                 <div id="store-settings-content">
@@ -7843,6 +8083,50 @@ header('Cache-Control: no-cache, must-revalidate');
                                 <?php endforeach; ?>
                             </div>
                             <div id="wallet-tabs-error" class="hidden" style="margin-top:0.5rem; color: var(--error); font-size: 0.85rem;"></div>
+                        </div>
+                    </div>
+
+                    <!-- Cash back rewards (includes/rewards.php): per-store
+                         opt-in, percentage, and the currency balances are
+                         kept in. Filled from the dashboard payload's
+                         `rewards` block (refreshRewardsCard); saves through
+                         action=save_rewards_settings. -->
+                    <div class="card collapsible collapsed" id="card-rewards">
+                        <div class="card-header">
+                            <div class="card-title">🎁 Rewards</div>
+                        </div>
+                        <div class="card-body">
+                            <p style="font-size: 0.85rem; color: var(--text-secondary); margin: 0 0 0.75rem 0;">
+                                Cash back for your customers: a percentage of every payment is
+                                credited to a rewards account the payer names on the paid screen
+                                (letters and digits, no password), and they can spend it on a
+                                later purchase at this store. Tips never earn or spend rewards.
+                            </p>
+                            <div id="rewards-experimental-warning" style="margin-bottom:0.75rem; padding:0.6rem 0.8rem; border-radius:8px; background:rgba(245,158,11,0.12); border:1px solid rgba(245,158,11,0.4); font-size:0.82rem;">
+                                ⚠️ Rewards are experimental.
+                            </div>
+                            <div class="toggle-container" style="margin-bottom:0.75rem;">
+                                <span>Enable rewards</span>
+                                <label class="toggle">
+                                    <input type="checkbox" id="rewards-enabled">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
+                            <label class="form-label" for="rewards-percent">Cash back percentage</label>
+                            <input type="text" class="form-input" id="rewards-percent" inputmode="decimal"
+                                   placeholder="1" autocomplete="off">
+                            <p class="form-help" style="margin-top:0.5rem;">
+                                0.0001–50, up to 4 decimals; e.g. 1 = 1% cash back.
+                            </p>
+                            <p class="form-help" id="rewards-currency-line" style="margin-top:0.5rem;"></p>
+                            <p class="form-help" id="rewards-totals-line" style="margin-top:0.25rem;"></p>
+                            <div id="rewards-error" class="hidden" style="margin-top:0.5rem; color: var(--error); font-size: 0.85rem;"></div>
+                            <button type="button" class="btn btn-full" id="btn-save-rewards" style="margin-top:0.75rem;">
+                                Save Rewards
+                            </button>
+                            <p class="form-help" style="margin-top:0.75rem;">
+                                <a href="#" id="link-rewards-view">View rewards accounts</a>
+                            </p>
                         </div>
                     </div>
 
@@ -9974,6 +10258,16 @@ header('Cache-Control: no-cache, must-revalidate');
                 </svg>
                 <span class="nav-label">Customers</span>
             </button>
+            <button class="nav-item hidden" data-view="rewards" data-admin-only="true" id="nav-rewards">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <polyline points="20 12 20 22 4 22 4 12"></polyline>
+                    <rect x="2" y="7" width="20" height="5"></rect>
+                    <line x1="12" y1="22" x2="12" y2="7"></line>
+                    <path d="M12 7H7.5a2.5 2.5 0 0 1 0-5C11 2 12 7 12 7z"></path>
+                    <path d="M12 7h4.5a2.5 2.5 0 0 0 0-5C13 2 12 7 12 7z"></path>
+                </svg>
+                <span class="nav-label">Rewards</span>
+            </button>
             <button class="nav-item hidden" data-view="log" data-admin-only="true" id="nav-log">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                     <polyline points="4 17 10 11 4 5"></polyline>
@@ -10186,6 +10480,21 @@ header('Cache-Control: no-cache, must-revalidate');
             </p>
             <button class="btn btn-full" id="btn-enable-selfserve-confirm">Turn on tip jars</button>
             <button class="btn btn-secondary btn-full" style="margin-top: 0.5rem;" onclick="closeModal('modal-enable-selfserve')">Not now</button>
+        </div>
+    </div>
+
+    <!-- Default-currency switch while rewards balances exist (operator
+         decision 12): convert them once at today's rate, or keep them in the
+         old rewards currency. Opened by saveExchangeSettings on a 409 with
+         needsRewardsCurrencyDecision; either choice resubmits the save. -->
+    <div class="modal-overlay" id="modal-rewards-currency" style="z-index: 300;">
+        <div class="modal">
+            <div class="modal-handle"></div>
+            <div class="modal-title">Switch rewards balances?</div>
+            <p id="rewards-currency-text" style="color:var(--text-secondary); font-size:0.9rem; margin:0 0 1rem 0;"></p>
+            <button class="btn btn-full" id="btn-rewards-currency-convert">Convert at today's rate</button>
+            <button class="btn btn-secondary btn-full" style="margin-top: 0.5rem;" id="btn-rewards-currency-keep">Keep balances</button>
+            <button class="btn btn-secondary btn-full" style="margin-top: 0.5rem;" onclick="closeModal('modal-rewards-currency')">Cancel</button>
         </div>
     </div>
 
@@ -10790,6 +11099,8 @@ header('Cache-Control: no-cache, must-revalidate');
                 if (navCustomers) navCustomers.classList.remove('hidden');
                 const navLog = document.getElementById('nav-log');
                 if (navLog) navLog.classList.remove('hidden');
+                const navRewards = document.getElementById('nav-rewards');
+                if (navRewards) navRewards.classList.remove('hidden');
             }
 
             // Check for store_created parameter from setup.php redirect
@@ -11112,6 +11423,49 @@ header('Cache-Control: no-cache, must-revalidate');
                     window.location = adminUrl + '?' + params.toString();
                 });
             }
+
+            // Rewards view: store filter, debounced username search, CSV export.
+            const rwStoreSel = document.getElementById('rewards-store-filter');
+            if (rwStoreSel) {
+                rwStoreSel.addEventListener('change', () => {
+                    rewardsState.offset = 0;
+                    loadRewardsAccounts();
+                });
+            }
+            const rwSearch = document.getElementById('rewards-search');
+            if (rwSearch) {
+                rwSearch.addEventListener('input', () => {
+                    clearTimeout(rewardsSearchTimer);
+                    rewardsSearchTimer = setTimeout(() => {
+                        rewardsState.offset = 0;
+                        loadRewardsAccounts();
+                    }, 250);
+                });
+            }
+            const rwExportBtn = document.getElementById('btn-export-rewards-csv');
+            if (rwExportBtn) {
+                rwExportBtn.addEventListener('click', () => {
+                    const params = new URLSearchParams({ api: 'export_rewards_csv', store_id: getRewardsStoreFilter() });
+                    const q = getRewardsSearch();
+                    if (q) params.set('q', q);
+                    window.location = adminUrl + '?' + params.toString();
+                });
+            }
+            // Store settings → Rewards card.
+            const saveRewardsBtn = document.getElementById('btn-save-rewards');
+            if (saveRewardsBtn) saveRewardsBtn.addEventListener('click', saveRewardsSettings);
+            const rewardsViewLink = document.getElementById('link-rewards-view');
+            if (rewardsViewLink) {
+                rewardsViewLink.addEventListener('click', (ev) => {
+                    ev.preventDefault();
+                    switchView('rewards');
+                });
+            }
+            // Default-currency switch modal (rewards balances exist).
+            const rwConvertBtn = document.getElementById('btn-rewards-currency-convert');
+            if (rwConvertBtn) rwConvertBtn.addEventListener('click', () => resolveRewardsCurrencyDecision('convert'));
+            const rwKeepBtn = document.getElementById('btn-rewards-currency-keep');
+            if (rwKeepBtn) rwKeepBtn.addEventListener('click', () => resolveRewardsCurrencyDecision('keep'));
 
             // Log view: filters, refresh, and the settings-card save button.
             const logCatSel = document.getElementById('log-category-filter');
@@ -11461,7 +11815,7 @@ header('Cache-Control: no-cache, must-revalidate');
         // grow a duplicate history entry.
         function switchView(view, opts) {
             if (!ADMIN_VIEWS.includes(view)) view = 'dashboard';
-            if ((view === 'stats' || view === 'products' || view === 'customers' || view === 'log') && phpUser.role !== 'admin') {
+            if ((view === 'stats' || view === 'products' || view === 'customers' || view === 'rewards' || view === 'log') && phpUser.role !== 'admin') {
                 showToast('Admin role required', 'error');
                 return;
             }
@@ -11480,6 +11834,7 @@ header('Cache-Control: no-cache, must-revalidate');
                 invoices: 'Invoices',
                 tipjars: 'Tip Jars',
                 customers: 'Customers',
+                rewards: 'Rewards',
                 stores: 'Store Settings',
                 products: 'Products',
                 settings: 'Settings',
@@ -11491,7 +11846,7 @@ header('Cache-Control: no-cache, must-revalidate');
             // Show/hide store selector based on view (hide on global settings
             // and on the stats page, which has its own per-page selector).
             const storeSelector = document.getElementById('header-store-selector');
-            if (view === 'settings' || view === 'stats' || view === 'customers' || view === 'log') {
+            if (view === 'settings' || view === 'stats' || view === 'customers' || view === 'rewards' || view === 'log') {
                 storeSelector.style.display = 'none';
             } else {
                 storeSelector.style.display = 'flex';
@@ -11523,6 +11878,10 @@ header('Cache-Control: no-cache, must-revalidate');
             if (view === 'customers') {
                 customersState.offset = 0;
                 populateCustomerStoreFilter().then(loadCustomers);
+            }
+            if (view === 'rewards') {
+                rewardsState.offset = 0;
+                populateRewardsStoreFilter().then(loadRewardsAccounts);
             }
             if (view === 'stores') loadStoreSettings();
             if (view === 'products') loadProductsView();
@@ -11920,6 +12279,15 @@ header('Cache-Control: no-cache, must-revalidate');
             if (document.getElementById('view-tipjars').classList.contains('active')) {
                 loadTipJarsView();
             }
+            // If on the rewards view, follow the header selection in its own filter
+            if (document.getElementById('view-rewards').classList.contains('active')) {
+                const rwSel = document.getElementById('rewards-store-filter');
+                if (rwSel && currentStoreId && [...rwSel.options].some(o => o.value === currentStoreId)) {
+                    rwSel.value = currentStoreId;
+                }
+                rewardsState.offset = 0;
+                loadRewardsAccounts();
+            }
         }
 
         // Populate store selector dropdown
@@ -12138,6 +12506,9 @@ header('Cache-Control: no-cache, must-revalidate');
 
                 // Per-store Cashu maximum payment size.
                 refreshCashuLimitBlock();
+
+                // Per-store cash back rewards settings + totals.
+                refreshRewardsCard();
 
                 // Per-store self-serve override, max + public link.
                 refreshStoreSelfServeCard();
@@ -12402,6 +12773,166 @@ header('Cache-Control: no-cache, must-revalidate');
                                 <th>Store</th>
                                 <th>Most recent invoice</th>
                                 <th>Paid</th>
+                            </tr>
+                        </thead>
+                        <tbody>${rows}</tbody>
+                    </table>
+                </div>
+            `;
+        }
+
+        // ===== Rewards view (cash back rewards accounts) =====
+        // Read-only list over ?api=rewards_accounts: store filter (defaults to
+        // the header's store on first entry, "All stores" otherwise), debounced
+        // username search, pagination shared with the other lists, CSV export.
+        // Balances are shown in the store's rewards currency with the sats or
+        // fiat equivalent underneath when a rate is available.
+        const rewardsState = { offset: 0, total: 0, stores: [], loadToken: 0, filterInitialised: false };
+        let rewardsSearchTimer = null;
+
+        function getRewardsStoreFilter() {
+            const sel = document.getElementById('rewards-store-filter');
+            return (sel && sel.value) ? sel.value : '__all__';
+        }
+        function getRewardsSearch() {
+            const el = document.getElementById('rewards-search');
+            return el ? el.value.trim() : '';
+        }
+        function rewardsCurrencyLabel(cur) {
+            return (!cur || cur === 'sat') ? 'sats' : String(cur);
+        }
+
+        async function populateRewardsStoreFilter() {
+            const sel = document.getElementById('rewards-store-filter');
+            if (!sel) return;
+            try {
+                const r = await fetch(adminUrl + '?api=stores', { credentials: 'same-origin' });
+                const stores = await r.json();
+                // First entry follows the header's store (accounts are per
+                // store, so that is the list the operator most likely wants);
+                // afterwards the operator's own choice is kept.
+                const prev = rewardsState.filterInitialised ? (sel.value || '__all__') : (currentStoreId || '__all__');
+                sel.innerHTML = '<option value="__all__">All stores</option>'
+                    + stores.map(s => `<option value="${escapeAttr(s.id)}">${escapeHtml(s.name || s.id)}</option>`).join('');
+                sel.value = [...sel.options].some(o => o.value === prev) ? prev : '__all__';
+                rewardsState.filterInitialised = true;
+            } catch (e) {
+                // Leave the existing "All stores" option in place on failure.
+            }
+        }
+
+        async function loadRewardsAccounts() {
+            const token = ++rewardsState.loadToken;
+            try {
+                const store = getRewardsStoreFilter();
+                const q = getRewardsSearch();
+                let url = adminUrl + `?api=rewards_accounts&store_id=${encodeURIComponent(store)}&limit=${LIST_PAGE_SIZE}&offset=${rewardsState.offset}`;
+                if (q) url += `&q=${encodeURIComponent(q)}`;
+                const response = await fetch(url, { credentials: 'same-origin' });
+                if (token !== rewardsState.loadToken) return; // superseded by a newer filter change
+                if (!response.ok) { showToast('Failed to load rewards accounts', 'error'); return; }
+                const data = await response.json();
+                if (token !== rewardsState.loadToken) return;
+                rewardsState.total = data.total || 0;
+                rewardsState.stores = data.stores || [];
+                renderRewardsSummary(store, rewardsState.stores);
+                renderRewardsTable('all-rewards', data.accounts || [], store === '__all__', q !== '');
+                renderListPagination('rewards-pagination', rewardsState, (off) => {
+                    rewardsState.offset = off;
+                    loadRewardsAccounts();
+                });
+            } catch (e) {
+                if (token === rewardsState.loadToken) showToast('Failed to load rewards accounts', 'error');
+            }
+        }
+
+        // One line above the table: the selected store's rewards status
+        // (on/off, percentage, currency) or, for "All stores", how many
+        // stores have rewards on.
+        function renderRewardsSummary(storeFilter, stores) {
+            const el = document.getElementById('rewards-store-summary');
+            if (!el) return;
+            let text = '';
+            if (storeFilter === '__all__') {
+                const on = stores.filter(s => s.enabled).length;
+                text = stores.length
+                    ? `${on} of ${stores.length} store${stores.length === 1 ? '' : 's'} ${on === 1 ? 'has' : 'have'} rewards on.`
+                    : '';
+            } else {
+                const s = stores.find(x => x.id === storeFilter);
+                if (s) {
+                    text = s.enabled
+                        ? `Rewards on · ${s.percent}% cash back · balances kept in ${rewardsCurrencyLabel(s.currency)}.`
+                        : `Rewards off for this store${s.currency ? ` (balances kept in ${rewardsCurrencyLabel(s.currency)})` : ''} — enable them in Store settings → Rewards.`;
+                }
+            }
+            el.textContent = text;
+            el.classList.toggle('hidden', text === '');
+        }
+
+        // Secondary balance line: sats for a fiat store, fiat (store default
+        // currency) for a sat store; empty when no rate was available.
+        function rewardsSecondaryBalance(a) {
+            if (a.currency === 'sat') {
+                if (a.balanceFiat !== null && a.balanceFiat !== undefined && a.balanceFiatCurrency) {
+                    return `≈ ${Number(a.balanceFiat).toFixed(2)} ${a.balanceFiatCurrency}`;
+                }
+                return '';
+            }
+            if (a.balanceSats !== null && a.balanceSats !== undefined && a.balanceMicro > 0) {
+                return `≈ ${formatSatsShort(a.balanceSats)}`;
+            }
+            return '';
+        }
+
+        function renderRewardsTable(containerId, accounts, showStore, searching) {
+            const container = document.getElementById(containerId);
+            if (!container) return;
+
+            if (!accounts || accounts.length === 0) {
+                container.innerHTML = `
+                    <div class="empty-state" id="rewards-empty">
+                        <div class="empty-state-icon">🎁</div>
+                        <p>${searching
+                            ? 'No rewards accounts match this search'
+                            : 'No rewards accounts yet. Enable rewards in Store settings → Rewards.'}</p>
+                    </div>
+                `;
+                return;
+            }
+
+            const rows = accounts.map(a => {
+                const cur = rewardsCurrencyLabel(a.currency);
+                // Lifetime figures in the rewards currency, sats with the
+                // same thousands separator formatMicro gives the balance.
+                const fmt = (v) => a.currency === 'sat' ? formatSatsShort(Number(v)) : `${v} ${cur}`;
+                const secondary = rewardsSecondaryBalance(a);
+                const reserved = a.reservedMicro > 0
+                    ? `<div style="font-size:0.78rem; color:var(--text-secondary);">${escapeHtml(fmt(a.reserved))} reserved</div>`
+                    : '';
+                return `
+                    <tr class="rewards-row" data-account-id="${escapeAttr(a.id)}" data-username="${escapeAttr(a.username)}">
+                        <td><span class="inv-mono">${escapeHtml(a.username)}</span></td>
+                        ${showStore ? `<td>${escapeHtml(a.storeName || a.storeId || '')}</td>` : ''}
+                        <td class="inv-amount">${escapeHtml(a.balanceDisplay)}${secondary ? `<div style="font-size:0.78rem; color:var(--text-secondary);">${escapeHtml(secondary)}</div>` : ''}${reserved}</td>
+                        <td class="inv-amount">${escapeHtml(fmt(a.earned))}</td>
+                        <td class="inv-amount">${escapeHtml(fmt(a.spent))}</td>
+                        <td>${formatPaidTime(a.lastActivityAt)}</td>
+                    </tr>
+                `;
+            }).join('');
+
+            container.innerHTML = `
+                <div style="overflow-x: auto;">
+                    <table class="inv-table" id="rewards-table">
+                        <thead>
+                            <tr>
+                                <th>Username</th>
+                                ${showStore ? '<th>Store</th>' : ''}
+                                <th class="inv-amount">Balance</th>
+                                <th class="inv-amount">Earned</th>
+                                <th class="inv-amount">Spent</th>
+                                <th>Last activity</th>
                             </tr>
                         </thead>
                         <tbody>${rows}</tbody>
@@ -13262,6 +13793,7 @@ header('Cache-Control: no-cache, must-revalidate');
                 ecx:     { icon: '🪙', label: 'eCash (ECX)' },
                 swap:    { icon: '🔄', label: 'Swap' },
                 cashu:   { icon: '🥜', label: 'Cashu' },
+                rewards: { icon: '🎁', label: 'Rewards' },
             };
             const m = map[rail] || { icon: '', label: rail || '—' };
             let label = m.label;
@@ -13329,6 +13861,12 @@ header('Cache-Control: no-cache, must-revalidate');
                 // swap-status badge appended when the swap isn't fully settled.
                 // Em-dash when there's neither a description nor a badge.
                 const feeBadge = inv.feeRedirect ? feeRedirectBadge(inv.feeRedirect) : '';
+                // Cash back rewards applied: the amount column keeps the
+                // invoice's face value; the discount rides as a chip so the
+                // effective amount paid (amount − discount) is visible.
+                const rewardsChip = inv.rewards && inv.rewards.appliedAmount
+                    ? ` <span class="inv-chip inv-chip-rewards" title="${escapeAttr(inv.rewards.fullCoverage ? 'Paid entirely with rewards' : 'Cash back rewards applied; the payer owed the amount minus this discount')}" style="white-space:nowrap;">🎁 −${escapeHtml(String(inv.rewards.appliedAmount))} ${escapeHtml(String(inv.rewards.appliedCurrency || inv.currency))}</span>`
+                    : '';
                 // Cart invoices flag their itemized breakdown; the row click
                 // opens the invoice detail, which lists the items.
                 const itemsLink = inv.hasItems
@@ -13342,8 +13880,8 @@ header('Cache-Control: no-cache, must-revalidate');
                 const jarChip = jarInfo
                     ? ` <span class="inv-chip inv-chip-tipjar" title="Created through this tip jar" style="white-space:nowrap;">${escapeHtml(jarInfo.emoji || '🫙')} ${escapeHtml(jarInfo.name)}</span>`
                     : '';
-                const noteCell = (description || swapBadge || itemsLink || feeBadge || jarChip)
-                    ? `<div>${description ? escapeHtml(description) : ''}${swapBadge}${itemsLink}${jarChip}${feeBadge}</div>`
+                const noteCell = (description || swapBadge || itemsLink || feeBadge || jarChip || rewardsChip)
+                    ? `<div>${description ? escapeHtml(description) : ''}${swapBadge}${itemsLink}${jarChip}${feeBadge}${rewardsChip}</div>`
                     : '<span style="color: var(--text-secondary);">—</span>';
                 // Customer email captured on the payment screen, with a checkmark
                 // when they opted into the newsletter.
@@ -16461,6 +16999,92 @@ header('Cache-Control: no-cache, must-revalidate');
             }
         }
 
+        // -------- Cash back rewards (includes/rewards.php) --------
+
+        function refreshRewardsCard() {
+            const rw = dashboardData && dashboardData.rewards;
+            const enabledEl = document.getElementById('rewards-enabled');
+            const pctEl = document.getElementById('rewards-percent');
+            if (!rw || !enabledEl || !pctEl) return;
+            enabledEl.checked = !!rw.enabled;
+            pctEl.value = rw.percent > 0 ? String(rw.percent) : '';
+            const curLine = document.getElementById('rewards-currency-line');
+            if (curLine) {
+                if (rw.currency) {
+                    let text = `Balances are kept in ${rewardsCurrencyLabel(rw.currency)}.`;
+                    if (rw.defaultCurrency && rw.defaultCurrency !== rw.currency) {
+                        text += ` The store's default currency is ${rewardsCurrencyLabel(rw.defaultCurrency)}; balances are shown converted at the current rate.`;
+                    }
+                    curLine.textContent = text;
+                } else {
+                    curLine.textContent = `Balances will be kept in ${rewardsCurrencyLabel(rw.defaultCurrency)} (the store's default currency when rewards are first enabled).`;
+                }
+            }
+            const totalsLine = document.getElementById('rewards-totals-line');
+            if (totalsLine) {
+                totalsLine.textContent = rw.accounts > 0
+                    ? `${rw.accounts} account${rw.accounts === 1 ? '' : 's'} · ${rw.outstandingDisplay || '0'} outstanding · ${rw.earnedDisplay || '0'} earned · ${rw.spentDisplay || '0'} spent in total.`
+                    : 'No rewards accounts yet.';
+            }
+            clearAwError('rewards-error');
+        }
+
+        async function saveRewardsSettings() {
+            if (!currentStoreId) return;
+            clearAwError('rewards-error');
+            const enabledEl = document.getElementById('rewards-enabled');
+            const pctEl = document.getElementById('rewards-percent');
+            const enabled = enabledEl && enabledEl.checked ? '1' : '0';
+            const percent = (pctEl?.value || '').trim();
+            if (enabled === '1' && percent === '') {
+                return awError('rewards-error', 'Set a cash back percentage to enable rewards.');
+            }
+            const btn = document.getElementById('btn-save-rewards');
+            if (btn) btn.disabled = true;
+            try {
+                const response = await postWithCsrf(adminUrl,
+                    `action=save_rewards_settings&store_id=${encodeURIComponent(currentStoreId)}`
+                    + `&enabled=${enabled}&percent=${encodeURIComponent(percent)}`
+                );
+                const { ok, data } = await readJsonResponse(response);
+                if (ok) {
+                    showToast('Rewards settings saved', 'success');
+                    await loadDashboard();
+                    refreshRewardsCard();
+                } else {
+                    awError('rewards-error', data.error || 'Failed to save');
+                }
+            } catch (e) {
+                awError('rewards-error', 'Failed to save the rewards settings');
+            } finally {
+                if (btn) btn.disabled = false;
+            }
+        }
+
+        // The default-currency save came back 409: rewards balances exist in
+        // another currency. Show the two choices; either one resubmits the
+        // same save with rewards_currency_action set.
+        function openRewardsCurrencyModal(info) {
+            const from = rewardsCurrencyLabel(info.from);
+            const to = rewardsCurrencyLabel(info.to);
+            const n = Number(info.accounts) || 0;
+            const text = document.getElementById('rewards-currency-text');
+            if (text) {
+                text.textContent = `Rewards balances are kept in ${from}. Switch them to ${to}? `
+                    + `${n} account${n === 1 ? '' : 's'} hold${n === 1 ? 's' : ''} a balance. `
+                    + `Converting changes every balance once, at today's rate; keeping leaves them in ${from} `
+                    + `(payers see them converted at the rate of the day they spend them).`;
+            }
+            const keepBtn = document.getElementById('btn-rewards-currency-keep');
+            if (keepBtn) keepBtn.textContent = `Keep balances in ${from}`;
+            document.getElementById('modal-rewards-currency').classList.add('visible');
+        }
+
+        function resolveRewardsCurrencyDecision(action) {
+            closeModal('modal-rewards-currency');
+            saveExchangeSettings(action);
+        }
+
         function refreshStoreSwapsCard() {
             // Driven by dashboardData.swaps once loaded.
             if (!dashboardData || !dashboardData.swaps) return;
@@ -16788,7 +17412,10 @@ header('Cache-Control: no-cache, must-revalidate');
             }
         }
 
-        async function saveExchangeSettings() {
+        // rewardsCurrencyAction: 'convert' | 'keep' when resubmitting after the
+        // rewards-currency modal (the click handler passes an Event instead,
+        // which is ignored).
+        async function saveExchangeSettings(rewardsCurrencyAction) {
             if (!currentStoreId) {
                 showToast('No store selected', 'error');
                 return;
@@ -16798,16 +17425,23 @@ header('Cache-Control: no-cache, must-revalidate');
             const secondaryProvider = document.getElementById('price-provider-secondary').value;
             const exchangeFee = document.getElementById('exchange-fee-percent').value;
             const defaultCurrency = document.getElementById('default-currency').value;
+            const decision = (rewardsCurrencyAction === 'convert' || rewardsCurrencyAction === 'keep') ? rewardsCurrencyAction : null;
 
             try {
-                const response = await postWithCsrf(adminUrl,
-                    `action=update_store&store_id=${encodeURIComponent(currentStoreId)}&price_provider_primary=${encodeURIComponent(primaryProvider)}&price_provider_secondary=${encodeURIComponent(secondaryProvider)}&exchange_fee_percent=${encodeURIComponent(exchangeFee)}&default_currency=${encodeURIComponent(defaultCurrency)}`
-                );
+                let body = `action=update_store&store_id=${encodeURIComponent(currentStoreId)}&price_provider_primary=${encodeURIComponent(primaryProvider)}&price_provider_secondary=${encodeURIComponent(secondaryProvider)}&exchange_fee_percent=${encodeURIComponent(exchangeFee)}&default_currency=${encodeURIComponent(defaultCurrency)}`;
+                if (decision) body += `&rewards_currency_action=${encodeURIComponent(decision)}`;
+                const response = await postWithCsrf(adminUrl, body);
 
-                const result = await response.json();
+                const { ok, status, data: result } = await readJsonResponse(response);
 
-                if (response.ok) {
+                if (ok) {
                     showToast('Exchange settings saved!', 'success');
+                    if (decision) {
+                        // The rewards card's currency line follows the decision.
+                        loadDashboard().then(refreshRewardsCard).catch(() => {});
+                    }
+                } else if (status === 409 && result.needsRewardsCurrencyDecision) {
+                    openRewardsCurrencyModal(result);
                 } else {
                     showToast(result.error || 'Failed to save', 'error');
                 }
@@ -20036,9 +20670,10 @@ header('Cache-Control: no-cache, must-revalidate');
         const ATTEMPT_RAIL_LABELS = {
             strike: 'Strike', lnurl: 'Lightning address', nwc: 'NWC wallet', noffer: 'CLINK noffer',
             swap: 'Submarine swap', mint: 'Cashu mint', onchain: 'On-chain address', ecx: 'eCash (ECX) address', fee: 'Fee redirect',
+            rewards: 'Rewards',
         };
         const ATTEMPT_CONTEXT_LABELS = {
-            checkout: 'Invoice creation', refresh: 'Lightning refresh', poll: 'Settlement checks',
+            checkout: 'Invoice creation', refresh: 'Lightning refresh', poll: 'Settlement checks', rewards: 'Rewards',
         };
         const ATTEMPT_OUTCOME_LABELS = { ok: 'OK', failed: 'Failed', skipped: 'Skipped' };
 
@@ -20128,6 +20763,32 @@ header('Cache-Control: no-cache, must-revalidate');
             const expires = inv.expirationTime
                 ? `${invdTime(inv.expirationTime)}${inv.longLived ? ' <span class="inv-chip" title="Shareable long-lived payment request">long-lived</span>' : ''}`
                 : '';
+            // ---- cash back rewards (RewardsFlow::invoiceView) ----
+            const rw = d.rewards || null;
+            let rewardsApplied = '';
+            let rewardsEarned = '';
+            if (rw && rw.applied) {
+                const ap = rw.applied;
+                rewardsApplied = `<span id="invoice-detail-rewards-applied">−${escapeHtml(String(ap.discountAmount))} ${escapeHtml(String(ap.currency))}`
+                    + (ap.username ? ` (${escapeHtml(ap.username)})` : '')
+                    + (ap.fullCoverage ? ', paid entirely with rewards' : '')
+                    + (ap.state === 'reserved' ? ' <span style="color:var(--text-secondary); font-size:0.78rem;">(reserved until the invoice is paid)</span>' : '')
+                    + '</span>';
+                if (rw.effectiveAmount !== undefined && rw.originalAmount !== undefined && String(rw.effectiveAmount) !== String(rw.originalAmount)) {
+                    amount += ` <span style="color:var(--text-secondary); font-size:0.78rem;">(${escapeHtml(String(rw.effectiveAmount))} ${escapeHtml(String(inv.currency))} after rewards)</span>`;
+                }
+            }
+            if (rw && rw.earned) {
+                const e = rw.earned;
+                let tail;
+                if (e.claimedTo) tail = `credited to ${escapeHtml(e.claimedTo)}`;
+                else if (e.claimable) tail = `unclaimed, claimable until ${invdTime(e.claimDeadline)}`;
+                else tail = 'unclaimed, expired';
+                rewardsEarned = `<span id="invoice-detail-rewards-earned">${escapeHtml(String(e.display))}`
+                    + (e.fiatDisplay ? ` <span style="color:var(--text-secondary);">(≈ ${escapeHtml(String(e.fiatDisplay))})</span>` : '')
+                    + ` — ${tail}</span>`;
+            }
+
             const summary = `<dl class="invd-grid">
                 ${invdRow('Amount', amount)}
                 ${invdRow('Status', statusCell)}
@@ -20142,6 +20803,8 @@ header('Cache-Control: no-cache, must-revalidate');
                 ${invdRow('Customer', email)}
                 ${invdRow('Receipt requested', det.payerReceiptRequested ? 'yes (sent when the payment settles)' : '')}
                 ${invdRow('Fee redirect', feeRedirect)}
+                ${invdRow('Rewards applied', rewardsApplied)}
+                ${invdRow('Rewards earned', rewardsEarned)}
                 ${invdRow('Payment link', inv.checkoutLink ? `<a href="${escapeAttr(inv.checkoutLink)}" target="_blank" rel="noopener noreferrer" class="invd-mono">${escapeHtml(inv.checkoutLink)}</a>${invdCopy(inv.checkoutLink, 'Payment link')}` : '')}
             </dl>`;
 
