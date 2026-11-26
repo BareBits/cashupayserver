@@ -180,12 +180,37 @@ class OnchainPayments {
      * (expiration_time + onchain_confirm_timeout_sec). Held slots release
      * naturally once that window passes so the pool can recycle.
      *
+     * An open invoice's EARLIER totals (the alternates list, see
+     * reallocateStaticAmount) are used totals too: a payer who scanned the
+     * QR before cash back rewards moved the amount may still pay the old
+     * total, and it has to stay attributable to that invoice alone.
+     *
      * Runs inside the caller's transaction. Returns null when no tweak in
      * the range yields a unique total (pool exhausted).
      */
     private static function pickTweakSlot(PDO $pdo, array $store, string $address, int $baseAmountSat, int $now, ?Chain $ch = null): ?int {
         $ch = $ch ?? Chain::btc();
         $range = max(1, (int)($store[$ch->store['tweak_range']] ?? 1000));
+        $usedTotals = self::openTotalsOnAddress($pdo, $store, $address, $now, null, $ch);
+        for ($i = 0; $i < $range; $i++) {
+            if (!isset($usedTotals[$baseAmountSat + $i])) {
+                return $i;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Every total currently expected on a static shared address by an open,
+     * still-attributable invoice (status New/Processing within
+     * expiration_time + confirm timeout): the current amount AND the
+     * alternates. Keys are totals, values are the invoice ids claiming them
+     * (a list; the picker only needs the keys, the poller the competitors).
+     *
+     * @return array<int, list<string>>
+     */
+    private static function openTotalsOnAddress(PDO $pdo, array $store, string $address, int $now, ?string $excludeInvoiceId, ?Chain $ch = null): array {
+        $ch = $ch ?? Chain::btc();
         $confirmTimeout = (int)($store[$ch->store['timeout']] ?? 86400);
         // SQLite quirk: bound parameters arrive with TEXT affinity, and
         // `INTEGER > TEXT` compares by storage class (integers always
@@ -193,23 +218,141 @@ class OnchainPayments {
         // silently returns false. CAST the bound timestamp to INTEGER
         // to force a numeric comparison.
         $stmt = $pdo->prepare(
-            "SELECT {$ch->inv['amount']} FROM invoices
+            "SELECT id, {$ch->inv['amount']} AS amount, {$ch->inv['alternates']} AS alternates FROM invoices
               WHERE {$ch->inv['address']} = ?
                 AND {$ch->inv['amount']} IS NOT NULL
                 AND status IN ('New','Processing')
                 AND (expiration_time + CAST(? AS INTEGER)) > CAST(? AS INTEGER)"
         );
         $stmt->execute([$address, $confirmTimeout, $now]);
-        $usedTotals = [];
-        foreach ($stmt->fetchAll(PDO::FETCH_COLUMN) as $t) {
-            $usedTotals[(int)$t] = true;
-        }
-        for ($i = 0; $i < $range; $i++) {
-            if (!isset($usedTotals[$baseAmountSat + $i])) {
-                return $i;
+        $used = [];
+        foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $row) {
+            if ($excludeInvoiceId !== null && (string)$row['id'] === $excludeInvoiceId) {
+                continue;
+            }
+            $used[(int)$row['amount']][] = (string)$row['id'];
+            foreach (self::decodeAlternates($row['alternates'] ?? null) as $alt) {
+                $used[$alt][] = (string)$row['id'];
             }
         }
-        return null;
+        return $used;
+    }
+
+    /** JSON int list column -> sorted unique positive ints. */
+    private static function decodeAlternates($json): array {
+        if ($json === null || $json === '') {
+            return [];
+        }
+        $list = json_decode((string)$json, true);
+        if (!is_array($list)) {
+            return [];
+        }
+        $out = [];
+        foreach ($list as $v) {
+            if (is_numeric($v) && (int)$v > 0) {
+                $out[(int)$v] = true;
+            }
+        }
+        $out = array_keys($out);
+        sort($out);
+        return $out;
+    }
+
+    /**
+     * The earlier expected totals of an invoice that still settle it (its
+     * alternates list for $chain), oldest first. Empty for xpub-mode
+     * invoices and for static ones whose amount never moved.
+     *
+     * @return int[]
+     */
+    public static function alternatesOf(array $invoice, ?Chain $chain = null): array {
+        $ch = $chain ?? Chain::btc();
+        return self::decodeAlternates($invoice[$ch->inv['alternates']] ?? null);
+    }
+
+    /**
+     * Move an existing static-shared-address invoice to a new base amount
+     * (cash back rewards applied or removed). The invoice gets a fresh tweak
+     * so that base + tweak is unique among the open totals on the address —
+     * including every other open invoice's alternates — and its previous
+     * total is appended to its own alternates list, because a payer who
+     * already scanned the earlier QR may still pay it: exact-amount
+     * attribution needs that total to stay reserved for this invoice, and
+     * pollInvoice accepts any alternate. (A unique-address invoice is simply
+     * re-amounted with a floor instead — see Invoice::requoteForView.)
+     *
+     * Nothing moves once a payment has been seen on the address for this
+     * invoice. Returns the new ['amount', 'tweak', 'alternates'], or null
+     * when the invoice is not re-amountable or no tweak slot is free; the
+     * row is then left exactly as it was.
+     *
+     * @return array{amount:int, tweak:int, alternates:int[]}|null
+     */
+    public static function reallocateStaticAmount(string $invoiceId, int $newBaseAmount, ?Chain $chain = null): ?array {
+        $ch = $chain ?? Chain::btc();
+        if ($newBaseAmount <= 0) {
+            return null;
+        }
+        $pdo = Database::getInstance();
+        Database::beginImmediate(); // read-before-write allocator (see Database::beginImmediate)
+        try {
+            $invoice = Database::fetchOne("SELECT * FROM invoices WHERE id = ?", [$invoiceId]);
+            if (!$invoice || $invoice['status'] !== 'New' || empty($invoice[$ch->inv['address']])
+                    || !empty($invoice[$ch->inv['first_seen']])) {
+                Database::rollback();
+                return null;
+            }
+            $store = Database::fetchOne("SELECT * FROM stores WHERE id = ?", [$invoice['store_id']]);
+            if (!$store) {
+                Database::rollback();
+                return null;
+            }
+            $address = (string)$invoice[$ch->inv['address']];
+            $now = time();
+            $current = (int)($invoice[$ch->inv['amount']] ?? 0);
+            $alternates = self::decodeAlternates($invoice[$ch->inv['alternates']] ?? null);
+            // The invoice's own totals stay reserved (old QR), so they count
+            // as used for the new pick as well.
+            $used = self::openTotalsOnAddress($pdo, $store, $address, $now, null, $ch);
+            $range = max(1, (int)($store[$ch->store['tweak_range']] ?? 1000));
+            $tweak = null;
+            for ($i = 0; $i < $range; $i++) {
+                $candidate = $newBaseAmount + $i;
+                if ($candidate === $current) {
+                    // The new base lands exactly on the current total:
+                    // nothing to move.
+                    Database::rollback();
+                    return ['amount' => $current, 'tweak' => (int)($invoice[$ch->inv['tweak']] ?? 0), 'alternates' => $alternates];
+                }
+                if (!isset($used[$candidate])) {
+                    $tweak = $i;
+                    break;
+                }
+            }
+            if ($tweak === null) {
+                Database::rollback();
+                return null;
+            }
+            if ($current > 0) {
+                $alternates[] = $current;
+            }
+            $alternates = array_values(array_unique(array_filter($alternates, fn($t) => $t !== $newBaseAmount + $tweak)));
+            sort($alternates);
+            $n = Database::update('invoices', [
+                $ch->inv['amount'] => $newBaseAmount + $tweak,
+                $ch->inv['tweak'] => $tweak,
+                $ch->inv['alternates'] => $alternates === [] ? null : json_encode($alternates),
+            ], "id = ? AND status = 'New' AND {$ch->inv['first_seen']} IS NULL", [$invoiceId]);
+            if ($n !== 1) {
+                Database::rollback();
+                return null;
+            }
+            Database::commit();
+            return ['amount' => $newBaseAmount + $tweak, 'tweak' => $tweak, 'alternates' => $alternates];
+        } catch (Throwable $e) {
+            Database::rollback();
+            throw $e;
+        }
     }
 
     /**
@@ -442,15 +585,24 @@ class OnchainPayments {
         if ($isStaticMode) {
             // Static mode: address is shared across invoices, so we can't
             // attribute every UTXO blindly. Only attribute a tx whose amount
-            // matches the invoice total exactly AND no other open invoice on
-            // the same address expects that same amount.
+            // matches one of the invoice's totals exactly — the current one
+            // or an earlier one still owed to it (alternates: the amount
+            // moved after cash back rewards were applied / removed and the
+            // payer may have scanned the earlier QR) — AND no other open
+            // invoice on the same address expects that same amount (by its
+            // current total or one of its alternates).
             $expected = (int)($invoice[$ch->inv['amount']] ?? 0);
-            $confirmTimeout = (int)($store[$ch->store['timeout']] ?? 86400);
+            $accepted = [$expected => true];
+            foreach (self::alternatesOf($invoice, $ch) as $alt) {
+                $accepted[$alt] = true;
+            }
+            // Every total the OTHER open invoices on this address claim.
+            $othersTotals = self::openTotalsOnAddress(Database::getInstance(), $store, $address, $now, $invoiceId, $ch);
             // Each poll re-evaluates ambiguity from scratch so the flag
             // can clear naturally once competing invoices expire.
             $candidates = [];
             foreach ($observations as $obs) {
-                if ($obs->amountSat !== $expected) {
+                if (!isset($accepted[$obs->amountSat])) {
                     continue;
                 }
                 $existing = Database::fetchOne(
@@ -463,15 +615,10 @@ class OnchainPayments {
                     }
                     continue;
                 }
-                $competitors = Database::fetchAll(
-                    "SELECT id FROM invoices
-                      WHERE {$ch->inv['address']} = ?
-                        AND {$ch->inv['amount']} = ?
-                        AND status IN ('New','Processing')
-                        AND id != ?
-                        AND (expiration_time + CAST(? AS INTEGER)) > CAST(? AS INTEGER)",
-                    [$address, $expected, $invoiceId, $confirmTimeout, $now]
-                );
+                $competitors = [];
+                foreach (array_unique($othersTotals[$obs->amountSat] ?? []) as $cid) {
+                    $competitors[] = ['id' => $cid];
+                }
                 if (empty($competitors)) {
                     self::upsertObservation($invoiceId, $obs, $now, $ch);
                 } else {
@@ -1014,6 +1161,15 @@ class OnchainPayments {
         $floor = (int)($invoice[$ch->inv['floor']] ?? 0);
         if ($floor > 0 && $floor < $amount) {
             $amount = $floor;
+        }
+        // Static shared address: an earlier total still owed to this invoice
+        // (alternates — cash back rewards moved the amount) was only ever
+        // attributed by exact match in pollInvoice, so a smaller alternate
+        // that arrived settles the invoice too.
+        foreach (self::alternatesOf($invoice, $ch) as $alt) {
+            if ($alt > 0 && $alt < $amount) {
+                $amount = $alt;
+            }
         }
         $status = $invoice['status'];
         $fired = null;

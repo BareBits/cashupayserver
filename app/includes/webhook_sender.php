@@ -123,6 +123,17 @@ class WebhookSender {
             $payload['partiallyPaid'] = false;
         }
 
+        // Cash back rewards applied to / earned on the invoice (the discount,
+        // the username, full coverage, the earn and whether it was claimed).
+        // Only present when something rewards-related happened. The payload
+        // is frozen here, which is why every settlement path runs
+        // RewardsFlow::onSettled before it re-reads the row for this call.
+        require_once __DIR__ . '/rewards_flow.php';
+        $rewards = RewardsFlow::apiBlock($invoiceData);
+        if ($rewards !== null) {
+            $payload['invoice']['rewards'] = $rewards;
+        }
+
         // Add invoice metadata for certain events
         if (in_array($eventType, ['InvoiceSettled', 'InvoiceReceivedPayment', 'InvoiceCreated', 'InvoiceProvisional'])) {
             if (isset($invoiceData['metadata'])) {

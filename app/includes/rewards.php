@@ -35,7 +35,7 @@
  *
  * Auth is enforced by the callers (admin.php / payment.php), not here. The
  * invoice-side orchestration (apply / settle / earn / release) lives in
- * Invoice and uses the primitives below.
+ * RewardsFlow (includes/rewards_flow.php) and uses the primitives below.
  */
 
 require_once __DIR__ . '/database.php';
@@ -598,6 +598,44 @@ class Rewards {
                 'params' => [$take, $earned, time(), time(), $acct['id']],
             ];
         });
+    }
+
+    /**
+     * Forget a RELEASED reservation so the invoice is a clean slate again.
+     *
+     * The payer may undo applied rewards before paying (operator decision
+     * 13) and then apply them again; the UNIQUE (invoice_id, kind) ledger
+     * index would otherwise refuse the second 'reserve' for the same
+     * invoice. The reserve + release pair nets to zero on the account, so
+     * dropping both rows changes no balance; the account's lifetime figures
+     * and last_activity_at keep the trace. Refuses (returns false, nothing
+     * deleted) unless the reservation was released and never committed —
+     * an expired invoice's release is kept as history by its caller not
+     * asking for this.
+     */
+    public static function forgetReservation(string $invoiceId): bool {
+        if (!self::hasKind($invoiceId, self::KIND_RELEASE) || self::hasKind($invoiceId, self::KIND_COMMIT)) {
+            return false;
+        }
+        $owns = !Database::inTransaction();
+        if ($owns) {
+            Database::beginImmediate();
+        }
+        try {
+            Database::query(
+                "DELETE FROM rewards_ledger WHERE invoice_id = ? AND kind IN (?, ?)",
+                [$invoiceId, self::KIND_RESERVE, self::KIND_RELEASE]
+            );
+            if ($owns) {
+                Database::commit();
+            }
+            return true;
+        } catch (Throwable $e) {
+            if ($owns) {
+                Database::rollback();
+            }
+            throw $e;
+        }
     }
 
     /** Micro currently reserved for $invoiceId on $accountId (0 when none / already settled). */
