@@ -27,10 +27,15 @@ Rewards are off by default and switched on per store.
 - **Store settings → Rewards card** — the same two controls afterwards,
   plus the currency the balances are kept in and a link to the Rewards
   view.
-- **Admin → Rewards view** — an admin-only, read-only list of every rewards
-  account (search by username; balance with its fiat/sats equivalent,
-  lifetime earned and spent, last activity) with a CSV export. It can show
-  one store or all stores.
+- **Admin → Rewards view** — an admin-only list of every rewards account
+  (search by username; balance with its fiat/sats equivalent, lifetime
+  earned and spent, last activity) with a CSV export. It can show one store
+  or all stores. A store with rewards off can be switched on from here
+  (percentage + "Enable rewards"); changes afterwards go through the Store
+  settings card. A balance line "+ X held for an open invoice" is money the
+  customer applied to an invoice that is not paid yet: it becomes spent when
+  that invoice is paid and returns to the balance if it expires or the
+  customer removes it.
 
 The percentage must be between **0.0001% and 50%**, with up to four
 decimal places.

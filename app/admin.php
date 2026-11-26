@@ -1199,6 +1199,9 @@ if (isset($_GET['api'])) {
                     'enabled' => Rewards::isEnabled($s),
                     'percent' => $rs['percent'],
                     'currency' => $rs['currency'],
+                    // What a first enable from the view would pin as the
+                    // rewards currency.
+                    'defaultCurrency' => Rewards::normalizeCurrency((string)($s['default_currency'] ?? 'sat')),
                 ];
             }
             echo json_encode([
@@ -7424,6 +7427,29 @@ header('Cache-Control: no-cache, must-revalidate');
             text-align: right;
             white-space: nowrap;
         }
+        /* Numeric column headers align with the figures under them. */
+        .inv-table th.inv-amount {
+            text-align: right;
+        }
+        /* Rewards table: the figure and date columns size to their content so
+           balance / earned / spent read as one block next to each other
+           instead of being spread across the whole card; the username column
+           takes the rest. */
+        #rewards-table th.inv-amount,
+        #rewards-table td.inv-amount,
+        #rewards-table th.rw-when,
+        #rewards-table td.rw-when {
+            width: 1%;
+            white-space: nowrap;
+        }
+        #rewards-table td.inv-amount + td.inv-amount,
+        #rewards-table th.inv-amount + th.inv-amount {
+            padding-left: 1.5rem;
+        }
+        #rewards-table td.rw-when,
+        #rewards-table th.rw-when {
+            padding-left: 1.5rem;
+        }
         .inv-chip {
             display: inline-block;
             padding: 0.1rem 0.5rem;
@@ -7964,7 +7990,9 @@ header('Cache-Control: no-cache, must-revalidate');
                  read-only — username, balance (+ the sats/fiat equivalent),
                  lifetime earned/spent, last activity — with a store filter,
                  username search and CSV export. Admin-only (same gate as the
-                 API). The per-store switch lives in Store settings → Rewards. -->
+                 API). A store with rewards off can be switched on right here
+                 (#rewards-enable-inline posts action=save_rewards_settings);
+                 the percentage is changed later in Store settings → Rewards. -->
             <div class="view" id="view-rewards">
                 <div class="card view-fill">
                     <div class="card-header">
@@ -7983,6 +8011,24 @@ header('Cache-Control: no-cache, must-revalidate');
                                style="width: 12rem; max-width: 100%; padding: 0.5rem 0.75rem; font-size: 0.875rem;"></span>
                     </div>
                     <p id="rewards-store-summary" class="hidden" style="font-size: 0.85rem; color: var(--text-secondary); margin: 0 0 0.75rem 0;"></p>
+                    <!-- Shown instead of a bare "go to Store settings" pointer
+                         when the selected store has rewards off: enable them
+                         from here with a percentage (same validation + save
+                         action as the Store settings card). -->
+                    <div id="rewards-enable-inline" class="hidden" style="margin: 0 0 1rem 0; padding: 0.75rem 1rem; border: 1px solid var(--border); border-radius: 8px;">
+                        <div style="font-size: 0.82rem; margin-bottom: 0.6rem; padding: 0.5rem 0.7rem; border-radius: 8px; background: rgba(245,158,11,0.12); border: 1px solid rgba(245,158,11,0.4);">
+                            ⚠️ Rewards are experimental.
+                        </div>
+                        <div style="display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem 0.75rem;">
+                            <label for="rewards-inline-percent" style="font-size: 0.85rem;">Cash back percentage</label>
+                            <input type="text" class="form-input" id="rewards-inline-percent" inputmode="decimal" placeholder="1" autocomplete="off"
+                                   style="width: 6rem; padding: 0.5rem 0.75rem; font-size: 0.875rem;">
+                            <span style="font-size: 0.85rem; color: var(--text-secondary);">%</span>
+                            <button type="button" class="btn" id="btn-rewards-inline-enable">Enable rewards</button>
+                        </div>
+                        <p class="form-help" id="rewards-inline-help" style="margin: 0.5rem 0 0 0;"></p>
+                        <div id="rewards-inline-error" class="hidden" style="margin-top: 0.5rem; color: var(--error); font-size: 0.85rem;"></div>
+                    </div>
                     <div id="all-rewards">
                         <div class="loading"><div class="spinner"></div></div>
                     </div>
@@ -11454,6 +11500,10 @@ header('Cache-Control: no-cache, must-revalidate');
             // Store settings → Rewards card.
             const saveRewardsBtn = document.getElementById('btn-save-rewards');
             if (saveRewardsBtn) saveRewardsBtn.addEventListener('click', saveRewardsSettings);
+            const rwInlineBtn = document.getElementById('btn-rewards-inline-enable');
+            if (rwInlineBtn) rwInlineBtn.addEventListener('click', enableRewardsFromView);
+            const rwInlinePct = document.getElementById('rewards-inline-percent');
+            if (rwInlinePct) rwInlinePct.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); enableRewardsFromView(); } });
             const rewardsViewLink = document.getElementById('link-rewards-view');
             if (rewardsViewLink) {
                 rewardsViewLink.addEventListener('click', (ev) => {
@@ -12836,7 +12886,9 @@ header('Cache-Control: no-cache, must-revalidate');
                 rewardsState.total = data.total || 0;
                 rewardsState.stores = data.stores || [];
                 renderRewardsSummary(store, rewardsState.stores);
-                renderRewardsTable('all-rewards', data.accounts || [], store === '__all__', q !== '');
+                const storeRow = store === '__all__' ? null : rewardsState.stores.find(x => x.id === store);
+                renderRewardsTable('all-rewards', data.accounts || [], store === '__all__', q !== '',
+                    storeRow ? (storeRow.enabled ? 'on' : 'off') : 'all');
                 renderListPagination('rewards-pagination', rewardsState, (off) => {
                     rewardsState.offset = off;
                     loadRewardsAccounts();
@@ -12853,6 +12905,8 @@ header('Cache-Control: no-cache, must-revalidate');
             const el = document.getElementById('rewards-store-summary');
             if (!el) return;
             let text = '';
+            let showInline = false;
+            let inlineStore = null;
             if (storeFilter === '__all__') {
                 const on = stores.filter(s => s.enabled).length;
                 text = stores.length
@@ -12863,11 +12917,75 @@ header('Cache-Control: no-cache, must-revalidate');
                 if (s) {
                     text = s.enabled
                         ? `Rewards on · ${s.percent}% cash back · balances kept in ${rewardsCurrencyLabel(s.currency)}.`
-                        : `Rewards off for this store${s.currency ? ` (balances kept in ${rewardsCurrencyLabel(s.currency)})` : ''} — enable them in Store settings → Rewards.`;
+                        : `Rewards are off for this store${s.currency ? ` (balances kept in ${rewardsCurrencyLabel(s.currency)})` : ''}.`;
+                    showInline = !s.enabled;
+                    inlineStore = s;
                 }
             }
             el.textContent = text;
             el.classList.toggle('hidden', text === '');
+            renderRewardsInlineEnable(showInline ? inlineStore : null);
+        }
+
+        // The enable form under the summary line (one store selected, rewards
+        // off). Prefilled with the store's last percentage, if any; says which
+        // currency the balances will be (or already are) kept in.
+        function renderRewardsInlineEnable(store) {
+            const box = document.getElementById('rewards-enable-inline');
+            if (!box) return;
+            if (!store) {
+                box.classList.add('hidden');
+                return;
+            }
+            const pct = document.getElementById('rewards-inline-percent');
+            // Keep what the operator is typing across the periodic reloads.
+            if (pct && box.classList.contains('hidden')) {
+                pct.value = store.percent > 0 ? String(store.percent) : '';
+            }
+            const help = document.getElementById('rewards-inline-help');
+            if (help) {
+                help.textContent = (store.currency
+                    ? `Balances are kept in ${rewardsCurrencyLabel(store.currency)}.`
+                    : `Balances will be kept in ${rewardsCurrencyLabel(store.defaultCurrency)} (the store's default currency).`)
+                    + ' 0.0001–50, up to 4 decimals; e.g. 1 = 1% cash back. Change it later in Store settings → Rewards.';
+            }
+            clearAwError('rewards-inline-error');
+            box.classList.remove('hidden');
+        }
+
+        async function enableRewardsFromView() {
+            const store = getRewardsStoreFilter();
+            if (store === '__all__') return;
+            clearAwError('rewards-inline-error');
+            const percent = (document.getElementById('rewards-inline-percent')?.value || '').trim();
+            if (percent === '') {
+                return awError('rewards-inline-error', 'Set a cash back percentage to enable rewards.');
+            }
+            const btn = document.getElementById('btn-rewards-inline-enable');
+            if (btn) btn.disabled = true;
+            try {
+                const response = await postWithCsrf(adminUrl,
+                    `action=save_rewards_settings&store_id=${encodeURIComponent(store)}`
+                    + `&enabled=1&percent=${encodeURIComponent(percent)}`
+                );
+                const { ok, data } = await readJsonResponse(response);
+                if (ok) {
+                    showToast('Rewards enabled', 'success');
+                    document.getElementById('rewards-enable-inline')?.classList.add('hidden');
+                    loadRewardsAccounts();
+                    // The Store settings card for this store shows the same switch.
+                    if (store === currentStoreId) {
+                        await loadDashboard();
+                        refreshRewardsCard();
+                    }
+                } else {
+                    awError('rewards-inline-error', data.error || 'Failed to enable rewards');
+                }
+            } catch (e) {
+                awError('rewards-inline-error', 'Failed to enable rewards');
+            } finally {
+                if (btn) btn.disabled = false;
+            }
         }
 
         // Secondary balance line: sats for a fiat store, fiat (store default
@@ -12885,17 +13003,25 @@ header('Cache-Control: no-cache, must-revalidate');
             return '';
         }
 
-        function renderRewardsTable(containerId, accounts, showStore, searching) {
+        // storeState: 'on' / 'off' for a single selected store, 'all' for the
+        // all-stores filter — picks the empty-state hint.
+        function renderRewardsTable(containerId, accounts, showStore, searching, storeState) {
             const container = document.getElementById(containerId);
             if (!container) return;
 
             if (!accounts || accounts.length === 0) {
+                let msg = 'No rewards accounts yet.';
+                if (searching) {
+                    msg = 'No rewards accounts match this search';
+                } else if (storeState === 'off') {
+                    msg += ' Enable rewards above to start crediting customers.';
+                } else if (storeState === 'on') {
+                    msg += ' Accounts appear once a customer claims their first reward.';
+                }
                 container.innerHTML = `
                     <div class="empty-state" id="rewards-empty">
                         <div class="empty-state-icon">🎁</div>
-                        <p>${searching
-                            ? 'No rewards accounts match this search'
-                            : 'No rewards accounts yet. Enable rewards in Store settings → Rewards.'}</p>
+                        <p>${msg}</p>
                     </div>
                 `;
                 return;
@@ -12907,8 +13033,12 @@ header('Cache-Control: no-cache, must-revalidate');
                 // same thousands separator formatMicro gives the balance.
                 const fmt = (v) => a.currency === 'sat' ? formatSatsShort(Number(v)) : `${v} ${cur}`;
                 const secondary = rewardsSecondaryBalance(a);
+                // Balance is what the account can spend now; money applied
+                // to an invoice that is still unpaid is held aside until that
+                // invoice is paid (spent) or expires / is undone (back to
+                // balance).
                 const reserved = a.reservedMicro > 0
-                    ? `<div style="font-size:0.78rem; color:var(--text-secondary);">${escapeHtml(fmt(a.reserved))} reserved</div>`
+                    ? `<div style="font-size:0.78rem; color:var(--text-secondary);">+ ${escapeHtml(fmt(a.reserved))} held for an open invoice</div>`
                     : '';
                 return `
                     <tr class="rewards-row" data-account-id="${escapeAttr(a.id)}" data-username="${escapeAttr(a.username)}">
@@ -12917,7 +13047,7 @@ header('Cache-Control: no-cache, must-revalidate');
                         <td class="inv-amount">${escapeHtml(a.balanceDisplay)}${secondary ? `<div style="font-size:0.78rem; color:var(--text-secondary);">${escapeHtml(secondary)}</div>` : ''}${reserved}</td>
                         <td class="inv-amount">${escapeHtml(fmt(a.earned))}</td>
                         <td class="inv-amount">${escapeHtml(fmt(a.spent))}</td>
-                        <td>${formatPaidTime(a.lastActivityAt)}</td>
+                        <td class="rw-when">${formatPaidTime(a.lastActivityAt)}</td>
                     </tr>
                 `;
             }).join('');
@@ -12932,7 +13062,7 @@ header('Cache-Control: no-cache, must-revalidate');
                                 <th class="inv-amount">Balance</th>
                                 <th class="inv-amount">Earned</th>
                                 <th class="inv-amount">Spent</th>
-                                <th>Last activity</th>
+                                <th class="rw-when">Last activity</th>
                             </tr>
                         </thead>
                         <tbody>${rows}</tbody>

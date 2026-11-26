@@ -2,8 +2,9 @@
 
 * Rewards view (admin-only nav item "Rewards"): the account table for the
   pinned store, the per-store status line, the debounced username search, the
-  store filter incl. "All stores" (adds a Store column), the empty state that
-  points at Store settings, and the header store selector staying hidden.
+  store filter incl. "All stores" (adds a Store column), the inline "Enable
+  rewards" form for a store with rewards off, and the header store selector
+  staying hidden.
 * Store settings -> "Rewards" card: enable + percentage save round-trip
   through action=save_rewards_settings into stores.rewards_*, a validation
   error surfaced inline, disabling keeps the percentage.
@@ -143,6 +144,18 @@ def test_rewards_view_lists_accounts_search_and_store_filter(shared_configured: 
     # textContent: the header cells are CSS-uppercased.
     headers = page.evaluate("() => [...document.querySelectorAll('#rewards-table thead th')].map(th => th.textContent.trim())")
     assert headers == ["Username", "Balance", "Earned", "Spent", "Last activity"], headers
+    # The figure headers sit over the figures (both right-aligned) and the
+    # three figure columns size to their content rather than spreading out.
+    aligns = page.evaluate(
+        "() => [...document.querySelectorAll('#rewards-table thead th')].map(th => getComputedStyle(th).textAlign)"
+    )
+    assert aligns == ["left", "right", "right", "right", "left"], aligns
+    widths = page.evaluate(
+        "() => [...document.querySelector('#rewards-table thead tr').children].map(th => th.getBoundingClientRect().width)"
+    )
+    assert widths[0] > max(widths[1:4]) * 2, widths
+    # No inline enable form while rewards are on.
+    assert page.evaluate("() => document.getElementById('rewards-enable-inline').classList.contains('hidden')")
 
     # Username search is a case-insensitive substring filter (debounced).
     page.fill("#rewards-search", "ALI")
@@ -191,15 +204,44 @@ def test_rewards_view_lists_accounts_search_and_store_filter(shared_configured: 
     assert csv.startswith("text/csv") and csv.endswith("|200"), csv
 
 
-def test_rewards_view_empty_state_points_at_store_settings(shared_configured: ConfiguredPayserver, page) -> None:
+def test_rewards_view_enables_rewards_inline(shared_configured: ConfiguredPayserver, page) -> None:
     cfg = shared_configured  # fresh per-test store: rewards off, no accounts
     _login(page, cfg)
     _open_rewards_view(page)
     assert page.input_value("#rewards-store-filter") == cfg.store_id
     empty = page.text_content("#rewards-empty")
-    assert "No rewards accounts yet" in empty and "Store settings" in empty and "Rewards" in empty, empty
+    assert "No rewards accounts yet" in empty and "Enable rewards above" in empty, empty
     summary = page.text_content("#rewards-store-summary")
-    assert "Rewards off for this store" in summary and "Store settings" in summary, summary
+    assert "Rewards are off for this store" in summary, summary
+    # The enable form is right there: it names the currency a first enable
+    # pins (the store's default currency) and validates like the settings card.
+    page.wait_for_selector("#rewards-enable-inline:not(.hidden)")
+    assert "Balances will be kept in sats" in page.text_content("#rewards-inline-help")
+    page.fill("#rewards-inline-percent", "")
+    page.click("#btn-rewards-inline-enable")
+    page.wait_for_selector("#rewards-inline-error:not(.hidden)")
+    assert "percentage" in page.text_content("#rewards-inline-error")
+    page.fill("#rewards-inline-percent", "75")
+    page.click("#btn-rewards-inline-enable")
+    page.wait_for_function("() => /50/.test(document.getElementById('rewards-inline-error').textContent)")
+    assert _store_row(cfg)[0] == 0, "an invalid percentage must not enable rewards"
+
+    page.fill("#rewards-inline-percent", "2.5")
+    page.press("#rewards-inline-percent", "Enter")
+    row = _wait_store_row(cfg, lambda r: r[0] == 1)
+    assert row == (1, 2.5, "sat", "sat"), row
+    # The view reflects the switch: summary on, form gone, empty state no
+    # longer asks for enabling.
+    page.wait_for_function("() => /Rewards on/.test(document.getElementById('rewards-store-summary').textContent)")
+    summary = page.text_content("#rewards-store-summary")
+    assert "2.5% cash back" in summary and "kept in sats" in summary, summary
+    assert page.evaluate("() => document.getElementById('rewards-enable-inline').classList.contains('hidden')")
+    page.wait_for_function("() => /claims their first reward/.test((document.getElementById('rewards-empty') || {}).textContent || '')")
+
+    # "All stores" never shows the form.
+    page.select_option("#rewards-store-filter", "__all__")
+    page.wait_for_function("() => /store/.test(document.getElementById('rewards-store-summary').textContent)")
+    assert page.evaluate("() => document.getElementById('rewards-enable-inline').classList.contains('hidden')")
 
 
 # --------------------------------------------------------------------------- store settings card

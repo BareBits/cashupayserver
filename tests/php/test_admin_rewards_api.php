@@ -161,9 +161,10 @@ assert_true(is_int($a['createdAt']) && $a['createdAt'] > 0, 'createdAt');
 $byId = [];
 foreach ($j['stores'] as $s) { $byId[$s['id']] = $s; }
 assert_eq(3, count($byId), 'every store is listed in stores');
-assert_eq(['id' => 'store_rw_a', 'name' => 'Alpha', 'enabled' => true, 'percent' => 2.5, 'currency' => 'USD'], $byId['store_rw_a'], 'store A summary');
+assert_eq(['id' => 'store_rw_a', 'name' => 'Alpha', 'enabled' => true, 'percent' => 2.5, 'currency' => 'USD', 'defaultCurrency' => 'USD'], $byId['store_rw_a'], 'store A summary');
 assert_eq(false, $byId['store_rw_b']['enabled'], 'store B rewards off');
 assert_null($byId['store_rw_b']['currency'], 'store B has no rewards currency yet');
+assert_eq('sat', $byId['store_rw_b']['defaultCurrency'], 'store B default currency (what an enable from the view would pin)');
 
 // Search: case-insensitive substring on the username.
 $j = get_json($srv, '/admin.php?api=rewards_accounts&store_id=store_rw_a&q=BO');
