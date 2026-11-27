@@ -134,7 +134,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             // Already counted by attemptLogin's reservation.
             $error = 'Invalid username or password';
         }
-    } elseif ($action === 'approve' && Auth::isAdmin()) {
+    } elseif ($action === 'approve' && Auth::isStoreManager()) {
         // Get selected store and permissions. The approved set is the
         // ticked subset of what was REQUESTED (never anything else the form
         // might post); in strict mode the form carries every requested
@@ -148,6 +148,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         if (empty($selectedStoreId)) {
             $error = 'Please select a store';
+        } elseif (!Auth::canManageStore((string)$selectedStoreId)) {
+            // A store admin pairs only the stores granted to them; the key
+            // carries store-level permissions only, never more than they hold.
+            $error = 'You do not have access to that store';
         } elseif (!empty($permissions) && empty($approvedPermissions)) {
             $error = 'Select at least one permission to grant, or deny the request.';
         } else {
@@ -182,7 +186,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             if ($redirect) {
                 $responseData = [
                     'apiKey' => $apiKey,
-                    'userId' => 'admin',  // Static - CashuPayServer is single-user
+                    'userId' => Auth::currentUser()['username'] ?? 'admin',
                     'storeId' => $selectedStoreId,
                     'permissions' => array_map(function($perm) use ($selectedStoreId) {
                         return $perm . ':' . $selectedStoreId;
@@ -216,16 +220,23 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 }
 
-// Get stores for selection. Every store is listed: a store can be
-// Lightning-only or on-chain-only (the wizard's "run without mints" answer
-// leaves mint_url/seed_phrase NULL) and still take payments, so filtering on
-// the mint columns here wrongly told merchants with such stores "No stores
-// found" and blocked pairing entirely. A store with no payment rail at all
-// is still selectable — pair first, add a rail after — but gets flagged in
-// the chooser so the admin knows checkouts will fail until one is added.
+// Get stores for selection. Every store the signed-in account manages is
+// listed (admins: all; store admins: their grants; a plain user manages
+// none and is told so below): a store can be Lightning-only or on-chain-only
+// (the wizard's "run without mints" answer leaves mint_url/seed_phrase NULL)
+// and still take payments, so filtering on the mint columns here wrongly
+// told merchants with such stores "No stores found" and blocked pairing
+// entirely. A store with no payment rail at all is still selectable — pair
+// first, add a rail after — but gets flagged in the chooser so the admin
+// knows checkouts will fail until one is added.
 $stores = [];
-if (Auth::isLoggedIn()) {
+$cannotPair = Auth::isLoggedIn() && !Auth::isStoreManager();
+if (Auth::isStoreManager()) {
     $stores = Database::fetchAll("SELECT id, name FROM stores ORDER BY name");
+    if (!Auth::isAdmin()) {
+        $mine = array_fill_keys(Auth::accessibleStoreIds(), true);
+        $stores = array_values(array_filter($stores, static fn(array $r) => isset($mine[$r['id']])));
+    }
     foreach ($stores as &$storeRow) {
         $storeRow['hasPaymentRail'] = Config::storeHasPaymentRail($storeRow['id']);
     }
@@ -722,7 +733,12 @@ $baseUrl = Config::getBaseUrl();
 
             <?php if (empty($stores)): ?>
                 <div class="warning">
-                    No stores found. Please create a store first in the admin dashboard.
+                    <?php if ($cannotPair): ?>
+                        Your account can view and create invoices but cannot authorize
+                        applications. Ask an admin or the store's store admin to pair it.
+                    <?php else: ?>
+                        No stores found. Please create a store first in the admin dashboard.
+                    <?php endif; ?>
                 </div>
                 <a href="<?= Urls::admin() ?>" class="btn btn-primary" style="text-decoration: none; text-align: center;">
                     Go to Dashboard

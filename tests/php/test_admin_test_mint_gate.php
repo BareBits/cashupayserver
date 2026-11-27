@@ -1,7 +1,7 @@
 <?php
 /**
- * admin.php ?api=test_mint / test_mint_expiry are admin-only, and even for an
- * admin the URL is validated before any connection.
+ * admin.php ?api=test_mint / test_mint_expiry need the admin or store admin
+ * role, and even then the URL is validated before any connection.
  *
  * Both endpoints fetch an operator-supplied URL and echo the mint's answer
  * (or the error text) back; for a ROLE_USER dashboard account that was a
@@ -15,8 +15,8 @@ $dir = fresh_db();
 require_once dirname(__DIR__, 2) . '/app/includes/auth.php';
 
 Auth::setAdminPassword('admin-pw-1234');
-Auth::createUser('staff', 'staffpw1234', Auth::ROLE_USER);
 make_store('store_a');
+Auth::createUser('staff', 'staffpw1234', Auth::ROLE_USER, ['store_a']);
 // Private endpoints OFF for the policy checks below (the driver env sets the
 // opt-in; the DB key wins).
 Config::set('allow_private_endpoints', false);
@@ -44,7 +44,7 @@ $tok = login($srv, 'staff', 'staffpw1234');
 $t0 = microtime(true);
 $r = $srv->post('/admin.php', ['action' => 'test_mint', 'mint_url' => 'http://127.0.0.1:1'], ['X-CSRF-Token' => $tok]);
 assert_eq(403, $r['status'], 'ROLE_USER test_mint is 403: ' . $r['body']);
-assert_true(str_contains($r['body'], 'Admin role required'), 'admin gate message');
+assert_true(str_contains($r['body'], 'role required'), 'role gate message');
 $r = $srv->post('/admin.php', ['action' => 'test_mint_expiry', 'mint_url' => 'http://127.0.0.1:1', 'unit' => 'sat'], ['X-CSRF-Token' => $tok]);
 assert_eq(403, $r['status'], 'ROLE_USER test_mint_expiry is 403: ' . $r['body']);
 assert_true(microtime(true) - $t0 < 10.0, 'refused without any connection attempt');

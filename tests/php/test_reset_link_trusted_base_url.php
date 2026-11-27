@@ -32,7 +32,8 @@ assert_eq('http://evil.example', Config::getBaseUrl(), 'getBaseUrl auto-detects 
 assert_null(Config::getTrustedBaseUrl(), 'an anonymous request records nothing');
 
 // A non-admin sign-in records nothing either.
-Auth::createUser('staff', 'staff-pass-1234', Auth::ROLE_USER);
+make_store('store_staff');
+Auth::createUser('staff', 'staff-pass-1234', Auth::ROLE_USER, ['store_staff']);
 $_SERVER['HTTP_HOST'] = 'staff-host.example';
 assert_true(Auth::login('staff', 'staff-pass-1234'), 'staff login');
 assert_null(Config::getTrustedBaseUrl(), 'a user-role sign-in does not record a base URL');

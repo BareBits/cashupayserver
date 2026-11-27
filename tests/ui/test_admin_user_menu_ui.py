@@ -80,8 +80,7 @@ def test_user_menu_shows_non_admin_username(
     configured: ConfiguredPayserver, page,
 ) -> None:
     configured.admin._post_action(
-        "create_user", username="erin", password="erinpw1234abc", role="user"
-    )
+        "create_user", username="erin", password="erinpw1234abc", role="user", store_ids=configured.store_id)
     _login(page, configured.handle.url, "erin", "erinpw1234abc")
     page.click("#user-btn")
     page.wait_for_function(

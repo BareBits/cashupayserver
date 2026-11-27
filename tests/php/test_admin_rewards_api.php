@@ -34,7 +34,6 @@ require_once dirname(__DIR__, 2) . '/app/includes/rewards.php';
 require_once dirname(__DIR__, 2) . '/app/includes/security.php';
 
 Auth::setAdminPassword('admin-pw-1234');
-Auth::createUser('staff', 'staffpw1234', Auth::ROLE_USER);
 Config::set('allow_private_endpoints', false);
 Config::set('last_external_cron_at', time());
 
@@ -49,6 +48,7 @@ make_store('store_rw_b', 'https://mint.example');
 Database::update('stores', ['name' => 'Beta', 'default_currency' => 'sat'], 'id = ?', ['store_rw_b']);
 make_store('store_rw_c', 'https://mint.example');
 Database::update('stores', ['name' => 'Gamma', 'default_currency' => 'sat'], 'id = ?', ['store_rw_c']);
+Auth::createUser('staff', 'staffpw1234', Auth::ROLE_USER, ['store_rw_a']);
 
 Rewards::setStoreSettings('store_rw_a', true, 2.5);   // rewards currency pinned to USD
 assert_eq('USD', Rewards::forStore('store_rw_a')['currency'], 'store A rewards currency pinned to USD');

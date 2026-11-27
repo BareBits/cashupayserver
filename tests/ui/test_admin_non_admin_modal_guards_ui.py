@@ -23,8 +23,7 @@ def _login(page, base_url: str, username: str, password: str) -> None:
 
 def _create_staff(configured: ConfiguredPayserver) -> tuple[str, str]:
     configured.admin._post_action(
-        "create_user", username="staffmod", password="staffmodpw1234", role="user"
-    )
+        "create_user", username="staffmod", password="staffmodpw1234", role="user", store_ids=configured.store_id)
     return "staffmod", "staffmodpw1234"
 
 

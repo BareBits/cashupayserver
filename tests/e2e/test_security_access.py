@@ -200,7 +200,7 @@ def test_migration_failure_shows_upgrade_failed_page_not_the_wizard(configured: 
     # file and its directory read-only so the ALTER TABLE cannot run.
     conn = sqlite3.connect(db_path, isolation_level=None)
     try:
-        conn.execute("ALTER TABLE stores DROP COLUMN rewards_percent")
+        conn.execute("ALTER TABLE stores DROP COLUMN trusted_mints_enabled")
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         conn.execute("PRAGMA journal_mode = DELETE")
     finally:
@@ -240,6 +240,6 @@ def test_migration_failure_shows_upgrade_failed_page_not_the_wizard(configured: 
     assert r.status_code == 302 and "admin" in r.headers.get("Location", ""), (r.status_code, r.headers)
     with handle.db() as db:
         cols = [row[1] for row in db.execute("PRAGMA table_info(stores)")]
-        assert "rewards_percent" in cols, "marker column restored by the migration"
+        assert "trusted_mints_enabled" in cols, "marker column restored by the migration"
         names = [row[0] for row in db.execute("SELECT name FROM stores")]
     assert "Wedged Store" not in names, "no store was created while wedged"

@@ -93,6 +93,8 @@ $pdo = Database::getInstance();
 // The release before ECX predates the Cashu maximum and tip jars too: drop
 // those newer marker sets first, or getInstance() sees the current marker
 // and never re-runs.
+$pdo->exec("ALTER TABLE stores DROP COLUMN trusted_mints_enabled");
+$pdo->exec("DROP TABLE user_store_access");
 $pdo->exec("ALTER TABLE stores DROP COLUMN rewards_percent");
 $pdo->exec("ALTER TABLE stores DROP COLUMN rewards_enabled");
 $pdo->exec("ALTER TABLE stores DROP COLUMN rewards_currency");
@@ -117,7 +119,9 @@ foreach ($ECX_INVOICE_COLS as $c) {
 foreach ($ECX_STORE_COLS as $c) {
     $pdo->exec("ALTER TABLE stores DROP COLUMN {$c}");
 }
-assert_false(has_col('stores', 'rewards_percent'), 'pre-ECX: current marker column gone');
+assert_false(has_col('stores', 'trusted_mints_enabled'), 'pre-ECX: current marker column gone');
+assert_false(has_table('user_store_access'), 'pre-ECX: store grants table gone');
+assert_false(has_col('stores', 'rewards_percent'), 'pre-ECX: rewards marker column gone');
 assert_false(has_col('stores', 'cashu_max_invoice_sats'), 'pre-ECX: Cashu maximum marker column gone');
 assert_false(has_col('invoices', 'tip_jar_id'), 'pre-ECX: tip jar marker column gone');
 assert_false(has_col('stores', 'ecx_xpub'), 'pre-ECX: ECX marker column gone');
@@ -129,6 +133,8 @@ assert_eq(2, (int)Database::fetchOne("SELECT COUNT(*) AS n FROM invoices")['n'])
 // ---- first connection after the deploy: self-heal -------------------------------------------
 reset_db_singleton();
 Database::getInstance();
+assert_true(has_col('stores', 'trusted_mints_enabled'), 'trusted-mints marker re-added');
+assert_true(has_table('user_store_access'), 'store grants table re-added');
 assert_true(has_col('stores', 'rewards_percent'), 'rewards marker re-added');
 assert_true(has_table('rewards_accounts'), 'rewards accounts table re-added');
 assert_true(has_col('stores', 'cashu_max_invoice_sats'), 'Cashu maximum marker re-added');

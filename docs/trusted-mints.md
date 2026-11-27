@@ -78,6 +78,24 @@ re-enabled.
 Removing a mint from the list entirely (no `disabled: true`, just gone) is a
 no-op — the trusted list is additive/blacklist-only, never a sync.
 
+## Per-store opt-out
+
+The list is a site-wide policy, but a store admin (see *User roles* in the
+README) may switch it off for one of their stores under **Stores → Lightning
+payments → Cashu → "Use the site's trusted mints list on this store"**
+(`stores.trusted_mints_enabled = 0`). For that store:
+
+- no trusted mints are added as backups on refresh (`applyToAllStores` skips
+  it, and so does `applyToNewStore`);
+- the list's `disabled: true` flags no longer gate the store's invoices — the
+  store runs on exactly the mints its operator chose. A mint the reliability
+  tracker has **permanently disabled** after repeated withdrawal failures is
+  still excluded; that gate is not a list policy.
+
+Backups the list already added before the switch was turned off stay in
+place until the store admin removes them. Switching the list back on applies
+the cached list to the store immediately.
+
 ## Hosting tips
 
 - Serve the file over HTTPS with a valid certificate. The fetcher enforces

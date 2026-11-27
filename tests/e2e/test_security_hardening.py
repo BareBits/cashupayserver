@@ -161,7 +161,7 @@ def test_wizard_stays_anonymous_until_the_admin_exists(payserver: PayserverHandl
 
 def test_tail_screens_require_admin_not_just_a_login(configured: ConfiguredPayserver) -> None:
     admin = configured.admin
-    r = admin._post_action("create_user", username="staff", password="staffpw1234", role="user")
+    r = admin._post_action("create_user", username="staff", password="staffpw1234", role="user", store_ids=configured.store_id)
     assert r.get("success"), r
     staff = AdminClient(configured.handle.url)
     staff.login("staffpw1234", username="staff")
@@ -223,7 +223,7 @@ def test_password_reset_ends_other_sessions(configured: ConfiguredPayserver) -> 
 
 def test_deleting_a_user_ends_its_session(configured: ConfiguredPayserver) -> None:
     admin = configured.admin
-    r = admin._post_action("create_user", username="temp", password="temppw1234", role="user")
+    r = admin._post_action("create_user", username="temp", password="temppw1234", role="user", store_ids=configured.store_id)
     staff = AdminClient(configured.handle.url)
     staff.login("temppw1234", username="temp")
     assert staff.s.get(f"{configured.handle.url}/admin?api=dashboard", timeout=15).status_code == 200

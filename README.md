@@ -192,7 +192,7 @@ BareBits integrates with [Strike](https://strike.me) so your funds can be instan
 
 #### Can I have multiple stores in a single installation, like if I want to help onboard another merchant?
 
-Absolutely! You can create multiple stores and can create non-admin accounts (so they can take payments but not modify settings). You can even charge a fee ("hosting fee" in store settings) for your help. Each store has its own settings so they can use separate wallets, payment preferences, etc.
+Absolutely! You can create multiple stores and give each merchant their own account: a **store admin** account manages the settings of the stores you grant it (payment methods, mints, tip jars, products, API keys, its own users) but never the site-wide settings, and a **user** account can view and create invoices on its granted stores. You can even charge a fee ("hosting fee" in store settings) for your help. Each store has its own settings so they can use separate wallets, payment preferences, etc. See [User roles](#user-roles).
 
 #### Which wallets do you suggest? What if my wallet is offline or doesn't have enough inbound liquidity?
 
@@ -305,20 +305,36 @@ Your seed phrase is your backup of funds stored in your Cashu mint (if enabled).
 
 **Warning**: Do not import the seed phrase into another wallet you use actively. Using the same seed in multiple wallets causes coin loss.
 
+### User roles
+
+Three kinds of sign-in account exist, managed under **Settings → Users**:
+
+| Role | Sees | Can change |
+| --- | --- | --- |
+| **Admin** | every store | everything, including the site-wide settings (server URL, updates, SMTP, trusted mints list, login timeout, …), creating and deleting stores, and every account |
+| **Store admin** | the stores granted to it | every setting of those stores (payment methods, mints and backups, tip jars, products, rewards, notifications and the store's SMTP override, API keys and pairing, withdrawals, the recovery phrase), plus the user and store-admin accounts whose stores all lie within its own |
+| **User** | the stores granted to it | nothing — it views invoices and creates new ones (Request Payment, tip jar links) |
+
+Store grants are chosen when an account is created and can be edited later. An admin edits anyone; a store admin creates users and store admins for its own stores only and can never grant a store it does not hold or create an admin. Deleting a store removes it from every account; an account left with no stores can still sign in but sees nothing. Accounts that existed before this release keep seeing every store they saw before.
+
+A store admin may switch off the site's **trusted mints list** for one of its stores (Stores → Lightning payments → Cashu): the list then adds no backup mints to that store and its disabled flags no longer gate the store's invoices, so the store runs on exactly the mints its operator chose.
+
+Every account can set a **recovery e-mail** under **Settings → My Account** and use **Forgot password?** on the sign-in screen to e-mail itself a reset link (needs SMTP, see below).
+
 ### Login timeout
 
-Signed-in admin sessions stay valid across browser restarts and end after a period of inactivity: **7 days** by default, adjustable from 15 minutes to 30 days under **Settings → My Account → Login timeout**. The setting is global and applies to every existing session immediately.
+Signed-in sessions stay valid across browser restarts and end after a period of inactivity: **7 days** by default, adjustable from 15 minutes to 30 days under **Settings → My Account → Login timeout**. The setting is global and applies to every existing session immediately.
 
 ### Resetting a lost admin password
 
 If you're locked out of the admin dashboard there are two ways to recover, both reachable from the **Forgot password?** link on the sign-in screen.
 
-**Option 1 — Email a reset link.** Requires two things to be set up in advance:
+**Option 1 — Email a reset link.** Works for every account (admin, store admin, user). Requires two things to be set up in advance:
 
-- A **recovery email** on the admin account. Set it during the setup wizard (the "E-mail notifications" step collects it alongside your SMTP settings; by default it is the same address notifications go to) or later under **Settings → My Account → Recovery email**.
+- A **recovery email** on the account. Set it during the setup wizard (the "E-mail notifications" step collects it alongside your SMTP settings; by default it is the same address notifications go to) or later under **Settings → My Account → Recovery email**.
 - **Outbound email (SMTP)** configured under **Settings → Email Notifications** in the admin UI (global, with an optional per-store override). As a fallback, SMTP can also be set via the `CASHUPAY_SMTP_*` settings in `user_config.php` (see `user_config.example.php`). Without working email this option cannot deliver the link.
 
-Click **Forgot password? → Email me a reset link**, enter the admin recovery email, and open the link that arrives. The link is valid for **one hour** and can be used **once**. (For privacy, the page always reports success regardless of whether the address matched an account.)
+Click **Forgot password? → Email me a reset link**, enter the account's recovery email, and open the link that arrives. The link is valid for **one hour** and can be used **once**. (For privacy, the page always reports success regardless of whether the address matched an account.)
 
 **Option 2 — Reset via a file on the server.** Use this when you have filesystem access (SSH / SFTP / your host's file manager) but no working email. Create an **empty** file named `reset-admin-password` inside the server's data directory:
 

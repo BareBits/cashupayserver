@@ -168,17 +168,37 @@ class TrustedMints {
         if ($list === null) {
             return;
         }
-        $stores = Database::fetchAll("SELECT id FROM stores");
+        $stores = Database::fetchAll("SELECT id FROM stores WHERE trusted_mints_enabled != 0");
         foreach ($stores as $row) {
             self::applyToStore($row['id'], $list);
         }
         self::applyGlobalDisableFlags($list);
     }
 
+    /**
+     * Whether the trusted list applies to a store. A store admin may switch
+     * it off for a store (stores.trusted_mints_enabled = 0): no backup mints
+     * are auto-added to it and the list's disabled flags do not gate its
+     * invoices — the store runs on exactly the mints its operator chose.
+     * Unknown stores report true (the site-wide behaviour).
+     */
+    public static function appliesToStore(string $storeId): bool {
+        $row = Database::fetchOne(
+            "SELECT trusted_mints_enabled FROM stores WHERE id = ?",
+            [$storeId]
+        );
+        return $row === null || (int)$row['trusted_mints_enabled'] !== 0;
+    }
+
+    /** Switch the trusted list on/off for one store. */
+    public static function setAppliesToStore(string $storeId, bool $enabled): void {
+        Database::update('stores', ['trusted_mints_enabled' => $enabled ? 1 : 0], 'id = ?', [$storeId]);
+    }
+
     /** Apply the list to a single (typically just-created) store. */
     public static function applyToNewStore(string $storeId): void {
         $list = self::getCachedList();
-        if ($list === null) {
+        if ($list === null || !self::appliesToStore($storeId)) {
             return;
         }
         self::applyToStore($storeId, $list);

@@ -39,7 +39,7 @@ def _set_config(handle, key: str, value) -> None:
 
 
 def test_user_role_cannot_probe_mints(configured: ConfiguredPayserver) -> None:
-    r = configured.admin._post_action("create_user", username="staff", password="staffpw1234", role="user")
+    r = configured.admin._post_action("create_user", username="staff", password="staffpw1234", role="user", store_ids=configured.store_id)
     assert r.get("success"), r
     staff = AdminClient(configured.handle.url)
     staff.login("staffpw1234", username="staff")
@@ -47,7 +47,7 @@ def test_user_role_cannot_probe_mints(configured: ConfiguredPayserver) -> None:
     t0 = time.monotonic()
     r = _raw_action(staff, configured.handle.url, "test_mint", mint_url="http://127.0.0.1:1")
     assert r.status_code == 403, r.text
-    assert "Admin role required" in r.text
+    assert "role required" in r.text
     r = _raw_action(staff, configured.handle.url, "test_mint_expiry", mint_url="http://127.0.0.1:1", unit="sat")
     assert r.status_code == 403, r.text
     assert time.monotonic() - t0 < 5, "refused without any connection attempt"

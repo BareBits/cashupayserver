@@ -38,11 +38,34 @@ class Stats {
      * Build a WHERE-fragment list (clauses + params) for the given store
      * filter. Returns ['clauses' => [...], 'params' => [...]].
      */
-    private static function storeWhere(string $storeId, string $column = 'store_id'): array {
+    private static function storeWhere(string|array $storeId, string $column = 'store_id'): array {
+        if (is_array($storeId)) {
+            // A store admin's "all stores": the stores granted to them. An
+            // empty grant list matches nothing rather than everything.
+            if ($storeId === []) {
+                return ['clauses' => ['1 = 0'], 'params' => []];
+            }
+            $marks = implode(',', array_fill(0, count($storeId), '?'));
+            return ['clauses' => ["{$column} IN ({$marks})"], 'params' => array_values($storeId)];
+        }
         if ($storeId === self::ALL_STORES || $storeId === '') {
             return ['clauses' => [], 'params' => []];
         }
         return ['clauses' => ["{$column} = ?"], 'params' => [$storeId]];
+    }
+
+    /**
+     * Normalize a store scope to the list of store ids it covers:
+     * ALL_STORES / '' → every store, an id → [id], a list → itself.
+     */
+    private static function storeIdList(string|array $storeId): array {
+        if (is_array($storeId)) {
+            return array_values($storeId);
+        }
+        if ($storeId === self::ALL_STORES || $storeId === '') {
+            return array_column(Database::fetchAll("SELECT id FROM stores"), 'id');
+        }
+        return [$storeId];
     }
 
     /**
@@ -73,9 +96,9 @@ class Stats {
      * Best-effort current BTC price in the chosen display currency. Falls
      * back to USD if the store doesn't have a default_currency set.
      */
-    public static function btcPrice(string $currency, ?string $storeId = null): ?float {
+    public static function btcPrice(string $currency, string|array|null $storeId = null): ?float {
         $providers = ['coingecko', 'binance'];
-        if ($storeId !== null && $storeId !== self::ALL_STORES && $storeId !== '') {
+        if (is_string($storeId) && $storeId !== self::ALL_STORES && $storeId !== '') {
             $p = Config::getStorePriceProviders($storeId);
             $providers = [$p['primary'], $p['secondary']];
         }
@@ -93,8 +116,11 @@ class Stats {
      * useful fiat parenthetical and would cause the BTC price lookup to
      * return 0).
      */
-    public static function displayCurrency(string $storeId): string {
-        if ($storeId === self::ALL_STORES || $storeId === '') {
+    public static function displayCurrency(string|array $storeId): string {
+        if (is_array($storeId) && count($storeId) === 1) {
+            $storeId = (string)$storeId[0];
+        }
+        if (is_array($storeId) || $storeId === self::ALL_STORES || $storeId === '') {
             return 'USD';
         }
         $store = Config::getStore($storeId);
@@ -112,7 +138,7 @@ class Stats {
     /**
      * Full summary block: financials + fees + effective fee %.
      */
-    public static function summary(string $storeId, string $range): array {
+    public static function summary(string|array $storeId, string $range): array {
         $startTs = self::rangeStart($range);
 
         // Revenue + invoice count + on-chain count, all from paid invoices
@@ -244,7 +270,7 @@ class Stats {
      * per store). Everything in szats, plus the sats equivalents the headline
      * totals fold in and the ECX price in the display currency.
      */
-    private static function ecxSummary(string $storeId, ?int $startTs, string $currency): array {
+    private static function ecxSummary(string|array $storeId, ?int $startTs, string $currency): array {
         require_once __DIR__ . '/ecx/ecx.php';
         $where = self::compose(
             ['clauses' => ["status = 'Settled'", "settled_rail = 'ecx'", 'ecx_amount_szat IS NOT NULL'], 'params' => []],
@@ -259,9 +285,7 @@ class Stats {
         $count = (int)($row['n'] ?? 0);
         $paid = EcxFees::paidByNote($storeId, $startTs);
         $owed = ['dev' => 0, 'hosting' => 0];
-        $storeIds = ($storeId === self::ALL_STORES || $storeId === '')
-            ? array_column(Database::fetchAll("SELECT id FROM stores"), 'id')
-            : [$storeId];
+        $storeIds = self::storeIdList($storeId);
         foreach ($storeIds as $sid) {
             $o = EcxFees::computeOwed($sid);
             $owed['dev'] += (int)$o['dev_owed'];
@@ -313,7 +337,7 @@ class Stats {
     /**
      * Sum of melts.amount_sats grouped by fee note, filtered by store + range.
      */
-    private static function feesPaidByNote(string $storeId, ?int $startTs): array {
+    private static function feesPaidByNote(string|array $storeId, ?int $startTs): array {
         $out = ['upstream' => 0, 'dev' => 0, 'hosting' => 0];
         $map = [
             'upstream' => FEE_NOTE_UPSTREAM,
@@ -339,11 +363,9 @@ class Stats {
      * per-store DevFee::computeOwed results so the numbers match what cron
      * would settle on the next tick.
      */
-    private static function lifetimeOwed(string $storeId): array {
+    private static function lifetimeOwed(string|array $storeId): array {
         $totals = ['dev' => 0, 'hosting' => 0, 'total' => 0];
-        $storeIds = ($storeId === self::ALL_STORES || $storeId === '')
-            ? array_column(Database::fetchAll("SELECT id FROM stores"), 'id')
-            : [$storeId];
+        $storeIds = self::storeIdList($storeId);
         foreach ($storeIds as $sid) {
             $o = DevFee::computeOwed($sid);
             $totals['dev']      += (int) $o['dev_owed'];
@@ -432,7 +454,7 @@ class Stats {
     /**
      * Chart data for the financials section. type ∈ {revenue, count, fees}.
      */
-    public static function chart(string $storeId, string $range, string $type): array {
+    public static function chart(string|array $storeId, string $range, string $type): array {
         $startTs = self::rangeStart($range);
 
         if ($type === 'fees') {
@@ -510,18 +532,18 @@ class Stats {
     /**
      * Paginated payouts (user-initiated / auto-melt; melts.note IS NULL).
      */
-    public static function payouts(string $storeId, string $range, int $page, int $perPage = 10): array {
+    public static function payouts(string|array $storeId, string $range, int $page, int $perPage = 10): array {
         return self::melts($storeId, $range, $page, $perPage, null);
     }
 
     /**
      * Paginated fee payments (melts.note IS NOT NULL).
      */
-    public static function feePayments(string $storeId, string $range, int $page, int $perPage = 10): array {
+    public static function feePayments(string|array $storeId, string $range, int $page, int $perPage = 10): array {
         return self::melts($storeId, $range, $page, $perPage, 'fee');
     }
 
-    private static function melts(string $storeId, string $range, int $page, int $perPage, ?string $filter): array {
+    private static function melts(string|array $storeId, string $range, int $page, int $perPage, ?string $filter): array {
         $startTs = self::rangeStart($range);
         $base = self::storeWhere($storeId);
         $rangeF = self::rangeWhere($startTs);
@@ -582,7 +604,7 @@ class Stats {
     /**
      * Yield all melts matching the filter, one row at a time, for CSV export.
      */
-    public static function streamMelts(string $storeId, ?string $range, ?string $filter): \Generator {
+    public static function streamMelts(string|array $storeId, ?string $range, ?string $filter): \Generator {
         $startTs = $range !== null ? self::rangeStart($range) : null;
         $w = self::compose(
             self::storeWhere($storeId),
@@ -658,7 +680,7 @@ class Stats {
      * Projects through invoiceExportColumns() so secret-bearing columns never
      * reach an export.
      */
-    public static function streamInvoices(string $storeId, ?string $range, bool $paidOnly): \Generator {
+    public static function streamInvoices(string|array $storeId, ?string $range, bool $paidOnly): \Generator {
         $startTs = $range !== null ? self::rangeStart($range) : null;
         $extra = $paidOnly
             ? ['clauses' => ["status = 'Settled'"], 'params' => []]

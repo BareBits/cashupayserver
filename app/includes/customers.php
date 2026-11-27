@@ -28,12 +28,20 @@ class Customers {
      * @param string|null $subFilter 'subscribed' | 'unsubscribed' | null (all).
      * @return array{0:string,1:array}
      */
-    public static function baseQuery(?string $storeId, ?string $subFilter): array {
+    public static function baseQuery(string|array|null $storeId, ?string $subFilter): array {
         $params = [];
         // Only settled invoices with a captured email are "customers". TRIM
         // guards against a stray empty string slipping past the NOT NULL check.
         $scope = "status = 'Settled' AND customer_email IS NOT NULL AND TRIM(customer_email) != ''";
-        if ($storeId !== null && $storeId !== '') {
+        if (is_array($storeId)) {
+            // A store admin's scope: the stores granted to them (none → nothing).
+            if ($storeId === []) {
+                $scope .= " AND 1 = 0";
+            } else {
+                $scope .= " AND store_id IN (" . implode(',', array_fill(0, count($storeId), '?')) . ")";
+                $params = array_merge($params, array_values($storeId));
+            }
+        } elseif ($storeId !== null && $storeId !== '') {
             $scope .= " AND store_id = ?";
             $params[] = $storeId;
         }
@@ -88,7 +96,7 @@ class Customers {
     /**
      * Total number of distinct customers matching the filters (page count).
      */
-    public static function count(?string $storeId, ?string $subFilter): int {
+    public static function count(string|array|null $storeId, ?string $subFilter): int {
         [$base, $params] = self::baseQuery($storeId, $subFilter);
         $row = Database::fetchOne("SELECT COUNT(*) AS c FROM ({$base}) sub", $params);
         return (int)($row['c'] ?? 0);
@@ -97,7 +105,7 @@ class Customers {
     /**
      * A page of customers, most-recently-paid first.
      */
-    public static function page(?string $storeId, ?string $subFilter, int $limit, int $offset): array {
+    public static function page(string|array|null $storeId, ?string $subFilter, int $limit, int $offset): array {
         [$base, $params] = self::baseQuery($storeId, $subFilter);
         return Database::fetchAll(
             $base . " ORDER BY paid_ts DESC, email ASC LIMIT ? OFFSET ?",

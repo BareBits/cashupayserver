@@ -83,7 +83,10 @@ def test_store_settings_collapsible_and_order(admin_page):
     # "Popular wallet tabs" (Cash App / Venmo / PayPal) sits right under
     # Payment order; tests/ui/test_payment_wallet_tabs_ui.py pins the same.
     assert titles.index("Popular wallet tabs") == titles.index("Payment order") + 1
-    assert titles.index("Lightning payments") == titles.index("Popular wallet tabs") + 1
+    # The Rewards card (cash back) sits between the wallet tabs and the
+    # payment rails, so Lightning payments follows it.
+    assert titles.index("🎁 Rewards") == titles.index("Popular wallet tabs") + 1
+    assert titles.index("Lightning payments") == titles.index("🎁 Rewards") + 1
     assert titles.index("On-chain Bitcoin payments") == titles.index("Lightning payments") + 1
     assert "Auto-Cashout" not in titles
     assert "Cashu automatic cashout" not in titles

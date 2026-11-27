@@ -432,7 +432,7 @@ class Rewards {
      * optional username search (prefix / substring, case-insensitive), newest
      * activity first. Each row carries the store's name and rewards currency.
      */
-    public static function listAccounts(?string $storeId, string $search = '', int $limit = 100, int $offset = 0): array {
+    public static function listAccounts(string|array|null $storeId, string $search = '', int $limit = 100, int $offset = 0): array {
         [$where, $params] = self::listWhere($storeId, $search);
         $limit = max(1, min(1000, $limit));
         $offset = max(0, $offset);
@@ -446,7 +446,7 @@ class Rewards {
         );
     }
 
-    public static function countAccounts(?string $storeId, string $search = ''): int {
+    public static function countAccounts(string|array|null $storeId, string $search = ''): int {
         [$where, $params] = self::listWhere($storeId, $search);
         return (int)Database::fetchOne(
             "SELECT COUNT(*) AS n FROM rewards_accounts a JOIN stores s ON s.id = a.store_id WHERE {$where}",
@@ -474,10 +474,18 @@ class Rewards {
         ];
     }
 
-    private static function listWhere(?string $storeId, string $search): array {
+    private static function listWhere(string|array|null $storeId, string $search): array {
         $where = ['1 = 1'];
         $params = [];
-        if ($storeId !== null && $storeId !== '' && $storeId !== '__all__') {
+        if (is_array($storeId)) {
+            // A store admin's scope: the stores granted to them (none → nothing).
+            if ($storeId === []) {
+                $where[] = '1 = 0';
+            } else {
+                $where[] = 'a.store_id IN (' . implode(',', array_fill(0, count($storeId), '?')) . ')';
+                $params = array_merge($params, array_values($storeId));
+            }
+        } elseif ($storeId !== null && $storeId !== '' && $storeId !== '__all__') {
             $where[] = 'a.store_id = ?';
             $params[] = $storeId;
         }
