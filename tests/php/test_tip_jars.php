@@ -198,9 +198,11 @@ SelfServe::setStoreOverride('s1', SelfServe::FORCE_OFF);
 SelfServe::setStoreOverride('s2', SelfServe::FORCE_OFF);
 SelfServe::setStoreOverride('s3', SelfServe::FORCE_OFF);
 $pdo = Database::getInstance();
-// The current getInstance() marker is the newer rewards column set (and the
-// Cashu-maximum set before it): drop them too, or the marker is still present
-// and migrations never re-run.
+// The current getInstance() marker is the store-admin set (and the rewards
+// and Cashu-maximum sets before it): drop them too, or the marker is still
+// present and migrations never re-run.
+$pdo->exec("ALTER TABLE stores DROP COLUMN trusted_mints_enabled");
+$pdo->exec("DROP TABLE user_store_access");
 $pdo->exec("ALTER TABLE stores DROP COLUMN rewards_percent");
 $pdo->exec("ALTER TABLE stores DROP COLUMN rewards_enabled");
 $pdo->exec("ALTER TABLE stores DROP COLUMN rewards_currency");

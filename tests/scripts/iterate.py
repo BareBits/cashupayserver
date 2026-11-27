@@ -88,6 +88,7 @@ from fixtures.setup_helpers import browser_walk_to_store, run_setup_wizard  # no
 # ------------------------------------------------------------------------------
 
 ADMIN_PASSWORD = "password"
+DEMO_ACCOUNT_PASSWORD = "iterate-pw"   # store admin / user demo accounts
 STORE_ONECONF = "oneconf"
 STORE_ZEROCONF = "zeroconf"
 STORE_SINGLECONF_SINGLE = "singleconf_single"  # static-address mode
@@ -951,6 +952,34 @@ def main() -> int:
             except Exception: pass
         handles.append(("wallet-browser", stop_wallet_browser, None))
 
+        # 8b. Store-admin role demo: accounts with store grants so the
+        #     three roles can be compared side by side in the admin UI.
+        #     - "mallory"  store admin of oneconf + zeroconf (not feeredirect)
+        #     - "oscar"    store admin of feeredirect only
+        #     - "clerk"    user on oneconf only (Request Payment, invoices, tip jars)
+        #     - "ringo"    user on zeroconf + feeredirect
+        #     All demo passwords: iterate-pw
+        print("[iterate] seeding store-admin / user demo accounts ...")
+        demo_accounts = [
+            ("mallory", "store_admin", [oneconf_store_id, zeroconf_store_id], "mallory@iterate.local"),
+            ("oscar", "store_admin", [feeredirect_store_id], "oscar@iterate.local"),
+            ("clerk", "user", [oneconf_store_id], "clerk@iterate.local"),
+            ("ringo", "user", [zeroconf_store_id, feeredirect_store_id], ""),
+        ]
+        for uname, role, sids, email in demo_accounts:
+            admin._post_action(
+                "create_user", username=uname, password=DEMO_ACCOUNT_PASSWORD, role=role,
+                store_ids=",".join(sids), email=email,
+            )
+        # A tip jar and a product on oneconf so the store admin has something
+        # to manage, and the trusted-mints switch turned OFF on zeroconf so the
+        # opt-out is visible in its Cashu section.
+        admin._post_action("save_store_selfserve", store_id=oneconf_store_id, enabled="1", max_sats="")
+        admin._post_action("create_tip_jar", store_id=oneconf_store_id, name="Coffee fund", emoji="☕", message="Thanks for the coffee!")
+        admin._post_action("create_product", store_id=oneconf_store_id, title="Espresso", price="500", enabled="1")
+        admin._post_action("create_product", store_id=oneconf_store_id, title="Croissant", price="900", enabled="1")
+        admin._post_action("save_store_trusted_mints", store_id=zeroconf_store_id, enabled="0")
+
         # 9. Summary + halt
         print("\n" + "=" * 72)
         print(f"{'Store':<10} {'Method':<12} {'Invoice ID':<32} {'Status'}")
@@ -959,6 +988,12 @@ def main() -> int:
             print(f"{store_label:<10} {method:<12} {iid:<32} {status}")
         print("=" * 72)
         print(f"\nAdmin URL:        {payserver.url}/admin     (password: {ADMIN_PASSWORD})")
+        print(f"Demo accounts:    (password for all: {DEMO_ACCOUNT_PASSWORD})")
+        print(f"                  mallory  store admin  -> {STORE_ONECONF} + {STORE_ZEROCONF}")
+        print(f"                  oscar    store admin  -> {STORE_FEEREDIRECT}")
+        print(f"                  clerk    user         -> {STORE_ONECONF}")
+        print(f"                  ringo    user         -> {STORE_ZEROCONF} + {STORE_FEEREDIRECT}")
+        print(f"                  ({STORE_ZEROCONF} has the trusted-mints list switched off)")
         print(f"Payserver:        {payserver.url}")
         print(f"Mint:             {mint.url}")
         print(f"oneconf store id: {oneconf_store_id}    (on-chain min_confs=1)")

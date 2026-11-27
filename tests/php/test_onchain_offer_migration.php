@@ -45,9 +45,11 @@ function has_table(string $table): bool {
 }
 
 // A fresh install has the newest marker artifact (the
-// stores.rewards_percent column, cash back rewards) AND the older migration
-// artifacts.
-assert_true(has_col('stores', 'rewards_percent'), 'fresh install has the current marker column');
+// stores.trusted_mints_enabled column, store admin role) AND the older
+// migration artifacts.
+assert_true(has_col('stores', 'trusted_mints_enabled'), 'fresh install has the current marker column');
+assert_true(has_table('user_store_access'), 'fresh install has the store grants table');
+assert_true(has_col('stores', 'rewards_percent'), 'fresh install has the rewards marker column');
 assert_true(has_col('stores', 'rewards_enabled'), 'fresh install has the rewards switch column');
 assert_true(has_table('rewards_accounts'), 'fresh install has the rewards accounts table');
 assert_true(has_table('rewards_ledger'), 'fresh install has the rewards ledger');
@@ -83,6 +85,8 @@ assert_true(has_col('melts', 'melt_quote_id'), 'fresh install has older migratio
 // Simulate a pre-merge install: the newest artifacts are missing, but older
 // ones are still present — exactly the state of a running instance when it
 // pulls code that adds a new migration.
+Database::getInstance()->exec("ALTER TABLE stores DROP COLUMN trusted_mints_enabled");
+Database::getInstance()->exec("DROP TABLE user_store_access");
 Database::getInstance()->exec("ALTER TABLE stores DROP COLUMN rewards_percent");
 Database::getInstance()->exec("ALTER TABLE stores DROP COLUMN rewards_enabled");
 Database::getInstance()->exec("ALTER TABLE stores DROP COLUMN rewards_currency");
@@ -116,7 +120,9 @@ Database::getInstance()->exec("ALTER TABLE melts DROP COLUMN strike_invoice_id")
 Database::getInstance()->exec("ALTER TABLE invoices DROP COLUMN strike_invoice_id");
 Database::getInstance()->exec("ALTER TABLE invoices DROP COLUMN strike_api_key");
 Database::getInstance()->exec("ALTER TABLE stores DROP COLUMN onchain_offer_enabled");
-assert_false(has_col('stores', 'rewards_percent'), 'pre-merge: marker column dropped');
+assert_false(has_col('stores', 'trusted_mints_enabled'), 'pre-merge: marker column dropped');
+assert_false(has_table('user_store_access'), 'pre-merge: store grants table dropped');
+assert_false(has_col('stores', 'rewards_percent'), 'pre-merge: previous marker column dropped');
 assert_false(has_table('rewards_accounts'), 'pre-merge: rewards tables dropped');
 assert_false(has_col('stores', 'cashu_max_invoice_sats'), 'pre-merge: previous marker column dropped');
 assert_false(has_col('invoices', 'tip_jar_id'), 'pre-merge: previous marker column dropped');
@@ -136,7 +142,9 @@ assert_true(has_col('melts', 'melt_quote_id'), 'pre-merge: older artifacts still
 // First DB access after the "deploy" must re-run migrations and re-add them.
 reset_db_singleton();
 Database::getInstance();
-assert_true(has_col('stores', 'rewards_percent'), 'getInstance() self-heals the marker column');
+assert_true(has_col('stores', 'trusted_mints_enabled'), 'getInstance() self-heals the marker column');
+assert_true(has_table('user_store_access'), 'getInstance() self-heals the store grants table');
+assert_true(has_col('stores', 'rewards_percent'), 'getInstance() self-heals the rewards marker column');
 assert_true(has_col('stores', 'rewards_enabled'), 'getInstance() self-heals the rewards switch column');
 assert_true(has_table('rewards_accounts'), 'getInstance() self-heals the rewards accounts table');
 assert_true(has_table('rewards_ledger'), 'getInstance() self-heals the rewards ledger');

@@ -32,7 +32,8 @@ function new_request(): void {
 }
 
 Auth::createUser('alice', 'alice-pass-1234', Auth::ROLE_ADMIN);
-Auth::createUser('bob', 'bob-pass-1234', Auth::ROLE_USER);
+make_store('store_bob');
+Auth::createUser('bob', 'bob-pass-1234', Auth::ROLE_USER, ['store_bob']);
 $alice = Auth::getUserByUsername('alice');
 $bob = Auth::getUserByUsername('bob');
 

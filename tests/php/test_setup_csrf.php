@@ -101,7 +101,8 @@ $post(['step' => 'lightning', 'lightning_action' => 'skip']);
 $post(['step' => 'mints', 'mints_enabled' => '0']);
 assert_true(cfg('setup_complete') === true, 'install complete');
 
-Auth::createUser('staff', 'staffpw1234', Auth::ROLE_USER);
+$csrfStoreId = (string)Database::fetchOne("SELECT id FROM stores LIMIT 1")['id'];
+Auth::createUser('staff', 'staffpw1234', Auth::ROLE_USER, [$csrfStoreId]);
 $srv->newSession();
 $r = $srv->post('/admin.php', ['action' => 'login', 'username' => 'staff', 'password' => 'staffpw1234']);
 assert_eq(200, $r['status'], 'staff login ok: ' . $r['body']);

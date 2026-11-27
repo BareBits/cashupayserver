@@ -1,8 +1,7 @@
 """Playwright tests for the Users section of the admin Settings panel.
 
-Covers the admin-only user management UI: list, add, reset password,
-reset PIN, delete. Also confirms a non-admin user does not see the
-Users card.
+Covers the user management UI: list, add (with store grants), reset
+password, delete. Also confirms a plain user does not see the Users card.
 """
 from __future__ import annotations
 
@@ -55,6 +54,8 @@ def test_admin_can_create_and_delete_user(
     page.fill("#au-username", "alice")
     page.fill("#au-password", "alicepw1234")
     page.select_option("#au-role", "user")
+    # A user needs at least one store: tick the fixture store.
+    page.check(f'#au-stores input.user-store-box[value="{configured.store_id}"]')
     page.click("#btn-confirm-add-user")
 
     # Wait for the new row.
@@ -110,8 +111,7 @@ def test_non_admin_does_not_see_users_card(
 ) -> None:
     # Create a non-admin via API first.
     configured.admin._post_action(
-        "create_user", username="bob", password="bobpw1234abc", role="user"
-    )
+        "create_user", username="bob", password="bobpw1234abc", role="user", store_ids=configured.store_id)
     _login(page, configured.handle.url, "bob", "bobpw1234abc")
     _open_settings(page)
     # My Account card should still appear.
@@ -130,8 +130,7 @@ def test_admin_reset_other_users_password_lets_them_login(
     """Admin uses the Reset password UI on another user; that user can then
     log in with the new password."""
     configured.admin._post_action(
-        "create_user", username="carol", password="carolpw1234", role="user"
-    )
+        "create_user", username="carol", password="carolpw1234", role="user", store_ids=configured.store_id)
 
     _login(page, configured.handle.url, "admin", configured.admin_password)
     _open_settings(page)

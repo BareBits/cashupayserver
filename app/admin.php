@@ -183,6 +183,129 @@ function smtpFieldsFromPost(array $post): array {
     return EmailSender::smtpFieldsFromPost($post);
 }
 
+/**
+ * Store rows the signed-in user may see (Auth::accessibleStoreIds), newest
+ * first. Admins get every store; store admins and users their grants. Both
+ * the dashboard payload and the Stores view selector are built from this,
+ * so a store nobody granted is simply absent for a non-admin.
+ */
+function cashupay_accessible_store_rows(): array {
+    $rows = Database::fetchAll("SELECT * FROM stores ORDER BY created_at DESC");
+    if (Auth::isAdmin()) {
+        return $rows;
+    }
+    $allowed = array_fill_keys(Auth::accessibleStoreIds(), true);
+    return array_values(array_filter($rows, static fn(array $r) => isset($allowed[$r['id']])));
+}
+
+/**
+ * Store-scope gate for actions keyed by a row of another table (an API key,
+ * a backup mint row, a token export, an invoice): resolve the row's store
+ * and require manage rights on it. An unknown id resolves to '' — admins
+ * pass (the handler then reports "not found"), everyone else is refused.
+ * $table / $idColumn are code literals, never request input.
+ */
+function cashupay_require_store_manage_via(string $table, string $idColumn, mixed $id): void {
+    $row = Database::fetchOne("SELECT store_id FROM {$table} WHERE {$idColumn} = ?", [(string)$id]);
+    Auth::requireStoreManage((string)($row['store_id'] ?? ''));
+}
+
+/**
+ * Turn a store filter from the UI into the argument the reporting modules
+ * take: $all (their "every store" token) for an admin asking for all, the
+ * single id as a string, or the list of store ids a store admin holds.
+ * A single store the caller does not hold ends the request (403).
+ */
+function cashupay_store_scope_arg(?string $requested, ?string $all = null): string|array|null {
+    $ids = Auth::scopeStoreFilter($requested);
+    if ($ids === null) {
+        return $all;
+    }
+    return count($ids) === 1 ? (string)$ids[0] : $ids;
+}
+
+/**
+ * Users the signed-in store manager may see and what they may do to each.
+ * Admins see and manage everyone. A store admin sees the admins (read-only,
+ * so they know whom to ask), themselves, and every non-admin whose grants
+ * touch their own stores (or who holds none): those whose grants lie
+ * entirely within the caller's stores are fully manageable (grants, role,
+ * password, deletion); the others only have their shared stores editable.
+ * Store ids outside the caller's grants are never disclosed.
+ */
+function cashupay_visible_users(): array {
+    $self = Auth::currentUser();
+    $users = Auth::listUsers();
+    if (Auth::isAdmin()) {
+        foreach ($users as &$u) {
+            $u['isSelf'] = $u['id'] === ($self['id'] ?? null);
+            // An admin edits every other account (role, grants, e-mail);
+            // a fellow admin's grants are moot until it is demoted.
+            $u['canManage'] = !$u['isSelf'];
+            $u['canEditStores'] = !$u['isSelf'];
+            $u['hiddenStoreCount'] = 0;
+        }
+        unset($u);
+        return $users;
+    }
+    $mine = array_fill_keys(Auth::accessibleStoreIds(), true);
+    $out = [];
+    foreach ($users as $u) {
+        $isSelf = $u['id'] === ($self['id'] ?? null);
+        $shared = array_values(array_filter($u['storeIds'], static fn($sid) => isset($mine[$sid])));
+        $hidden = count($u['storeIds']) - count($shared);
+        if ($u['role'] !== Auth::ROLE_ADMIN && !$isSelf && $shared === [] && $u['storeIds'] !== []) {
+            continue; // no overlap with the caller's stores: not theirs to see
+        }
+        $u['storeIds'] = $shared;
+        $u['hiddenStoreCount'] = $hidden;
+        $u['isSelf'] = $isSelf;
+        $u['canManage'] = !$isSelf && $u['role'] !== Auth::ROLE_ADMIN && $hidden === 0;
+        $u['canEditStores'] = !$isSelf && $u['role'] !== Auth::ROLE_ADMIN;
+        $out[] = $u;
+    }
+    return $out;
+}
+
+/**
+ * The visible-users entry for $userId, or null when the caller may not see
+ * that account at all.
+ */
+function cashupay_visible_user(string $userId): ?array {
+    foreach (cashupay_visible_users() as $u) {
+        if ($u['id'] === $userId) {
+            return $u;
+        }
+    }
+    return null;
+}
+
+/**
+ * Parse the store_ids[] field of the user forms: unique, non-empty strings.
+ * A store admin may only hand out stores they hold themselves.
+ */
+function cashupay_posted_store_ids(): array {
+    $raw = $_POST['store_ids'] ?? [];
+    if (is_string($raw)) {
+        $raw = $raw === '' ? [] : explode(',', $raw);
+    }
+    if (!is_array($raw)) {
+        throw new \InvalidArgumentException('store_ids must be a list');
+    }
+    $ids = array_values(array_unique(array_filter(array_map(
+        static fn($v) => is_scalar($v) ? trim((string)$v) : '', $raw
+    ), static fn($v) => $v !== '')));
+    if (!Auth::isAdmin()) {
+        $mine = array_fill_keys(Auth::accessibleStoreIds(), true);
+        foreach ($ids as $sid) {
+            if (!isset($mine[$sid])) {
+                throw new \InvalidArgumentException('You can only grant stores you have access to');
+            }
+        }
+    }
+    return $ids;
+}
+
 // Password-reset landing page (Mechanism 1). The emailed link opens here as
 // ?action=reset&token=... No session required — the operator is locked out by
 // definition. Rendered as a standalone page (not the SPA) so it works even if
@@ -281,8 +404,15 @@ if (isset($_GET['api'])) {
         case 'dashboard':
             $storeId = $_GET['store_id'] ?? null;
 
-            // Get all stores for selector
-            $stores = Database::fetchAll("SELECT * FROM stores ORDER BY created_at DESC");
+            // Stores for the selector: only the ones this user may see. A
+            // requested store outside that set reads as "not found" (the UI
+            // treats a 404 here as a stale selection and picks another).
+            $stores = cashupay_accessible_store_rows();
+            if ($storeId && !Auth::canViewStore((string)$storeId)) {
+                cashupay_status(404);
+                echo json_encode(['error' => 'Store not found']);
+                break;
+            }
 
             // Ensure each store has an internal API key. Redact the raw secret
             // columns (seed phrase, SMTP password, xpubs, raw internal_api_key)
@@ -649,6 +779,15 @@ if (isset($_GET['api'])) {
                     $limit = CashuLimit::fromRow($store);
                     return ['maxSats' => $limit['max_sats'], 'respectAlways' => $limit['respect_always']];
                 })(),
+                // Per-store trusted mints list opt-out (TrustedMints::appliesToStore)
+                // plus whether the site has a list at all (the switch is moot without).
+                'trustedMints' => (function () use ($store) {
+                    require_once __DIR__ . '/includes/trusted_mints.php';
+                    return [
+                        'enabled' => (int)($store['trusted_mints_enabled'] ?? 1) !== 0,
+                        'listConfigured' => TrustedMints::getUrl() !== null,
+                    ];
+                })(),
                 // Cash back rewards (includes/rewards.php): the per-store
                 // settings plus account totals, for the Store settings card.
                 // `live` is the effective switch (on + percent + currency);
@@ -820,6 +959,7 @@ if (isset($_GET['api'])) {
                 echo json_encode(['error' => 'store_id required']);
                 break;
             }
+            Auth::requireStoreView((string)$storeId);
             $store = Config::getStore($storeId);
             echo json_encode([
                 'products' => array_map(
@@ -832,8 +972,8 @@ if (isset($_GET['api'])) {
             break;
 
         // Tip jars of the selected store with their settled totals — any
-        // logged-in user (the Tip Jars view is read-only below the admin role;
-        // the write actions below are admin-gated).
+        // user holding the store (the Tip Jars view is read-only below the
+        // store admin role; the write actions below need manage rights).
         case 'tip_jars':
             $storeId = $_GET['store_id'] ?? null;
             if (!$storeId) {
@@ -841,6 +981,7 @@ if (isset($_GET['api'])) {
                 echo json_encode(['error' => 'store_id required']);
                 break;
             }
+            Auth::requireStoreView((string)$storeId);
             $store = Config::getStore($storeId);
             if (!$store) {
                 cashupay_status(404);
@@ -870,19 +1011,20 @@ if (isset($_GET['api'])) {
                 'maxNameLen' => TipJar::MAX_NAME_LEN,
                 'maxMessageLen' => TipJar::MAX_MESSAGE_LEN,
                 'defaultEmoji' => TipJar::DEFAULT_EMOJI,
-                'isAdmin' => Auth::isAdmin(),
+                // Whether the caller may change this store's jars.
+                'isAdmin' => Auth::canManageStore((string)$storeId),
             ]);
             break;
 
         // Full product list incl. disabled — admin management view only.
         case 'products_manage':
-            Auth::requireAdmin();
             $storeId = $_GET['store_id'] ?? null;
             if (!$storeId) {
                 cashupay_status(400);
                 echo json_encode(['error' => 'store_id required']);
                 break;
             }
+            Auth::requireStoreManage((string)$storeId);
             $store = Config::getStore($storeId);
             echo json_encode([
                 'products' => array_map(
@@ -910,14 +1052,18 @@ if (isset($_GET['api'])) {
                 break;
             }
             $row = Invoice::getById($invoiceId);
-            if (!$row) {
+            // An invoice of a store the caller does not hold is "not found":
+            // its existence is not theirs to learn either.
+            if (!$row || !Auth::canViewStore((string)$row['store_id'])) {
                 cashupay_status(404);
                 echo json_encode(['error' => 'Invoice not found']);
                 break;
             }
             require_once __DIR__ . '/includes/invoice_attempts.php';
             require_once __DIR__ . '/includes/rewards_flow.php';
-            $isAdminViewer = Auth::isAdmin();
+            // Error detail and the raw attempt log are for whoever runs the
+            // store (admin or its store admin), not the invoice-taking role.
+            $isAdminViewer = Auth::canManageStore((string)$row['store_id']);
             $detailStore = Config::getStore($row['store_id']);
             $decodeJson = static function ($v) {
                 if ($v === null || $v === '') { return null; }
@@ -1086,8 +1232,14 @@ if (isset($_GET['api'])) {
             }
 
             if ($storeId) {
+                Auth::requireStoreView((string)$storeId);
                 $conditions[] = "store_id = ?";
                 $params[] = $storeId;
+            } elseif (!Auth::isAdmin()) {
+                // "All stores" below the admin role: the stores this user holds.
+                $scope = Auth::storeScopeSql(Auth::accessibleStoreIds());
+                $conditions[] = $scope['sql'];
+                $params = array_merge($params, $scope['params']);
             }
 
             // Tip jar filter (the Tip Jars view's "View invoices" shortcut).
@@ -1167,7 +1319,7 @@ if (isset($_GET['api'])) {
         // paginated, newest activity first. Admin-only like Customers — a
         // bulk list of payer identities and balances.
         case 'rewards_accounts':
-            Auth::requireAdmin();
+            Auth::requireStoreManager();
             require_once __DIR__ . '/includes/rewards.php';
             $rwStoreId = trim((string)($_GET['store_id'] ?? '__all__'));
             if ($rwStoreId === '') {
@@ -1178,7 +1330,7 @@ if (isset($_GET['api'])) {
             $offset = max((int)($_GET['offset'] ?? 0), 0);
 
             $rwStoreRows = [];
-            foreach (Database::fetchAll("SELECT * FROM stores ORDER BY created_at DESC") as $s) {
+            foreach (cashupay_accessible_store_rows() as $s) {
                 $rwStoreRows[$s['id']] = $s;
             }
             if ($rwStoreId !== '__all__' && !isset($rwStoreRows[$rwStoreId])) {
@@ -1186,6 +1338,8 @@ if (isset($_GET['api'])) {
                 echo json_encode(['error' => 'Store not found']);
                 break;
             }
+            // A store admin's "all" is the stores they hold.
+            $rwStoreId = cashupay_store_scope_arg($rwStoreId, '__all__');
             $rwAccounts = array_map(
                 fn(array $r) => Rewards::formatAccountForApi($r, $rwStoreRows[$r['store_id']] ?? null),
                 Rewards::listAccounts($rwStoreId, $rwQuery, $limit, $offset)
@@ -1215,11 +1369,13 @@ if (isset($_GET['api'])) {
 
         case 'customers':
             // Aggregated customer list: one row per distinct email, scoped by
-            // store + subscription filter, paginated. Admin-only — it's a bulk
-            // PII/marketing surface (same gate as the CSV exports).
-            Auth::requireAdmin();
+            // store + subscription filter, paginated. Store managers only —
+            // it's a bulk PII/marketing surface (same gate as the CSV
+            // exports); a store admin sees their stores' customers.
+            Auth::requireStoreManager();
             require_once __DIR__ . '/includes/customers.php';
             [$custStore, $custSub] = Customers::filterArgs($_GET);
+            $custStore = cashupay_store_scope_arg($custStore);
             $limit = min(max((int)($_GET['limit'] ?? 50), 1), 100);
             $offset = max((int)($_GET['offset'] ?? 0), 0);
 
@@ -1255,24 +1411,24 @@ if (isset($_GET['api'])) {
             break;
 
         case 'stores':
-            // Store selector list. Consumers only read id/name/mint_url, so
-            // strip every secret column — this endpoint is reachable by the
-            // non-admin ROLE_USER (no requireAdmin gate on ?api=).
-            $stores = Database::fetchAll("SELECT * FROM stores ORDER BY created_at DESC");
+            // Store selector list: the stores this user holds. Consumers only
+            // read id/name/mint_url, so strip every secret column — this
+            // endpoint is reachable by the non-admin roles.
+            $stores = cashupay_accessible_store_rows();
             $stores = array_map([Config::class, 'redactStoreSecrets'], $stores);
             echo json_encode($stores);
             break;
 
         case 'stats_summary':
-            Auth::requireAdmin();
-            $storeId = (string)($_GET['store_id'] ?? Stats::ALL_STORES);
+            Auth::requireStoreManager();
+            $storeId = cashupay_store_scope_arg((string)($_GET['store_id'] ?? ''), Stats::ALL_STORES);
             $range   = (string)($_GET['range']    ?? 'all');
             echo json_encode(Stats::summary($storeId, $range));
             break;
 
         case 'stats_chart':
-            Auth::requireAdmin();
-            $storeId = (string)($_GET['store_id'] ?? Stats::ALL_STORES);
+            Auth::requireStoreManager();
+            $storeId = cashupay_store_scope_arg((string)($_GET['store_id'] ?? ''), Stats::ALL_STORES);
             $range   = (string)($_GET['range']    ?? 'all');
             $type    = (string)($_GET['type']     ?? 'revenue');
             if (!in_array($type, ['revenue', 'count', 'fees'], true)) {
@@ -1284,16 +1440,16 @@ if (isset($_GET['api'])) {
             break;
 
         case 'stats_payouts':
-            Auth::requireAdmin();
-            $storeId = (string)($_GET['store_id'] ?? Stats::ALL_STORES);
+            Auth::requireStoreManager();
+            $storeId = cashupay_store_scope_arg((string)($_GET['store_id'] ?? ''), Stats::ALL_STORES);
             $range   = (string)($_GET['range']    ?? 'all');
             $page    = max(1, (int)($_GET['page'] ?? 1));
             echo json_encode(Stats::payouts($storeId, $range, $page));
             break;
 
         case 'stats_fee_payments':
-            Auth::requireAdmin();
-            $storeId = (string)($_GET['store_id'] ?? Stats::ALL_STORES);
+            Auth::requireStoreManager();
+            $storeId = cashupay_store_scope_arg((string)($_GET['store_id'] ?? ''), Stats::ALL_STORES);
             $range   = (string)($_GET['range']    ?? 'all');
             $page    = max(1, (int)($_GET['page'] ?? 1));
             echo json_encode(Stats::feePayments($storeId, $range, $page));
@@ -1304,8 +1460,8 @@ if (isset($_GET['api'])) {
         case 'export_fee_payments_csv':
         case 'export_combined_csv':
         case 'export_all_invoices_csv':
-            Auth::requireAdmin();
-            $storeId = (string)($_GET['store_id'] ?? Stats::ALL_STORES);
+            Auth::requireStoreManager();
+            $storeId = cashupay_store_scope_arg((string)($_GET['store_id'] ?? ''), Stats::ALL_STORES);
             $range   = (string)($_GET['range']    ?? 'all');
 
             // Filename hint reflects the action + a timestamp; not stored on disk.
@@ -1408,12 +1564,13 @@ if (isset($_GET['api'])) {
         // username is payer-typed text: csvCell neutralises formula
         // injection even though the validator only admits letters + digits.
         case 'export_rewards_csv':
-            Auth::requireAdmin();
+            Auth::requireStoreManager();
             require_once __DIR__ . '/includes/rewards.php';
             $rwStoreId = trim((string)($_GET['store_id'] ?? '__all__'));
             if ($rwStoreId === '') {
                 $rwStoreId = '__all__';
             }
+            $rwStoreId = cashupay_store_scope_arg($rwStoreId, '__all__');
             $rwQuery = (string)($_GET['q'] ?? '');
 
             $stamp = date('Ymd-His');
@@ -1450,10 +1607,11 @@ if (isset($_GET['api'])) {
         case 'export_customers_csv':
             // CSV of the customers list, honoring the same store + subscription
             // filters as the on-screen list (but every matching row, not just the
-            // current page). Admin-only, like the other exports.
-            Auth::requireAdmin();
+            // current page). Store managers only, like the other exports.
+            Auth::requireStoreManager();
             require_once __DIR__ . '/includes/customers.php';
             [$custStore, $custSub] = Customers::filterArgs($_GET);
+            $custStore = cashupay_store_scope_arg($custStore);
             [$base, $baseParams] = Customers::baseQuery($custStore, $custSub);
 
             $storeNames = [];
@@ -1481,18 +1639,18 @@ if (isset($_GET['api'])) {
             exit;
 
         case 'api_keys':
-            Auth::requireAdmin();
             $storeId = $_GET['store_id'] ?? null;
             if (!$storeId) {
                 echo json_encode([]);
                 break;
             }
+            Auth::requireStoreManage((string)$storeId);
             $keys = Auth::getApiKeys($storeId);
             echo json_encode($keys);
             break;
 
         case 'export_info':
-            Auth::requireAdmin();
+            Auth::requireStoreManage((string)($_GET['store_id'] ?? ''));
             $storeId = $_GET['store_id'] ?? null;
             if (!$storeId || !Config::isStoreConfigured($storeId)) {
                 echo json_encode(['available' => 0, 'error' => 'Store not configured']);
@@ -1590,11 +1748,12 @@ if (isset($_GET['api'])) {
                 echo json_encode(['error' => 'Store ID required']);
                 break;
             }
+            Auth::requireStoreView((string)$storeId);
             echo json_encode(cashupay_backup_mint_rows((string)$storeId));
             break;
 
         case 'list_transfers':
-            Auth::requireAdmin();
+            Auth::requireStoreManage((string)($_GET['store_id'] ?? ''));
             $storeId = $_GET['store_id'] ?? '';
             if ($storeId === '') {
                 cashupay_status(400);
@@ -1609,7 +1768,7 @@ if (isset($_GET['api'])) {
         case 'proofs':
             // Admin-only: these rows carry secret + C — i.e. spendable bearer
             // ecash. Match the sibling fund endpoint (export_info).
-            Auth::requireAdmin();
+            Auth::requireStoreManage((string)($_GET['store_id'] ?? ''));
             $storeId = $_GET['store_id'] ?? null;
             if (!$storeId || !Config::isStoreConfigured($storeId)) {
                 echo json_encode([]);
@@ -1647,13 +1806,15 @@ if (isset($_GET['api'])) {
         case 'stuck_funds_summary':
             // Per-store breakdown of sats stranded in mints with an active
             // withdrawal-failure flag, plus how much has been absorbed against
-            // each owed fee bucket. Drives the Stuck Funds admin card.
-            Auth::requireAdmin();
+            // each owed fee bucket. Drives the Stuck Funds admin card; a
+            // store admin sees the breakdown of their stores.
+            Auth::requireStoreManager();
             require_once __DIR__ . '/includes/stuck_funds.php';
             require_once __DIR__ . '/includes/dev_fee.php';
-            $rows = Database::fetchAll(
-                "SELECT id, name FROM stores WHERE mint_url IS NOT NULL AND seed_phrase IS NOT NULL"
-            );
+            $rows = array_values(array_filter(
+                cashupay_accessible_store_rows(),
+                static fn(array $r) => $r['mint_url'] !== null && $r['seed_phrase'] !== null
+            ));
             $storesOut = [];
             $totalStuckSats = 0;
             $totalAbsorbedSats = 0;
@@ -1799,6 +1960,7 @@ if (isset($_GET['api'])) {
                 echo json_encode(['error' => 'Store ID required']);
                 break;
             }
+            Auth::requireStoreView((string)$storeId);
             echo json_encode([
                 'enabled' => OfflineCashu::isEnabled($storeId),
                 'policy' => OfflineCashu::policy($storeId),
@@ -1813,7 +1975,7 @@ if (isset($_GET['api'])) {
             break;
 
         case 'list_onchain_manual':
-            Auth::requireAdmin();
+            Auth::requireStoreManager();
             // List invoices awaiting manual confirmation. Scoped to a single
             // store if store_id is provided; otherwise lists across every
             // store the (admin) user can see. A GET ?api= endpoint (the
@@ -1821,9 +1983,12 @@ if (isset($_GET['api'])) {
             // action switch, where no request ever reached it.
             try {
                 require_once __DIR__ . '/includes/onchain/payments.php';
-                $storeIds = null;
+                // null = every store (admin); a store admin's "all" is the
+                // stores they hold.
+                $storeIds = Auth::isAdmin() ? null : Auth::accessibleStoreIds();
                 $storeId = $_GET['store_id'] ?? null;
                 if ($storeId) {
+                    Auth::requireStoreManage((string)$storeId);
                     $storeIds = [$storeId];
                 }
                 // Both chain-watched rails: Bitcoin static addresses and
@@ -1934,7 +2099,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
         $email = trim($_POST['email'] ?? '');
         if ($email !== '' && Auth::validateEmail($email) === null) {
-            $admin = Auth::findAdminByEmail($email);
+            $admin = Auth::findUserByEmail($email);
             if ($admin) {
                 try {
                     require_once __DIR__ . '/includes/email_sender.php';
@@ -1953,20 +2118,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                             ? $base . '/admin.php'
                             : $base . '/router.php/admin.php';
                         $link = $adminAbs . $resetQuery;
-                        $body = "A password reset was requested for your CashuPayServer admin account.\n\n"
+                        $body = "A password reset was requested for your CashuPayServer account"
+                              . " (" . $admin['username'] . ").\n\n"
                               . "Open this link to choose a new password (valid for 1 hour, single use):\n\n"
                               . $link . "\n\n"
                               . "If you did not request this, you can ignore this email. The link does "
                               . "nothing until used and expires on its own.\n";
                     } else {
-                        $body = "A password reset was requested for your CashuPayServer admin account.\n\n"
+                        $body = "A password reset was requested for your CashuPayServer account"
+                              . " (" . $admin['username'] . ").\n\n"
                               . "Open your BareBits admin sign-in page in the browser and append the "
                               . "following to its address (valid for 1 hour, single use):\n\n"
                               . $resetQuery . "\n\n"
                               . "If you did not request this, you can ignore this email. The code does "
                               . "nothing until used and expires on its own.\n";
                     }
-                    EmailSender::send($admin['email'], 'Reset your CashuPayServer admin password', $body);
+                    EmailSender::send($admin['email'], 'Reset your CashuPayServer password', $body);
                 } catch (\Throwable $e) {
                     // Never surface SMTP/config detail to an unauthenticated
                     // caller; log it for the operator instead.
@@ -1976,7 +2143,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
         echo json_encode([
             'success' => true,
-            'message' => 'If an admin account has that email, a reset link has been sent.',
+            'message' => 'If an account has that email, a reset link has been sent.',
         ]);
         exit;
     }
@@ -2058,7 +2225,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         // ---- Tip jar management (admin only) ----
         case 'create_tip_jar':
-            Auth::requireAdmin();
+            Auth::requireStoreManage((string)($_POST['store_id'] ?? ''));
             require_once __DIR__ . '/includes/tip_jars.php';
             try {
                 $storeId = $_POST['store_id'] ?? '';
@@ -2078,7 +2245,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
 
         case 'update_tip_jar':
-            Auth::requireAdmin();
+            Auth::requireStoreManage((string)($_POST['store_id'] ?? ''));
             require_once __DIR__ . '/includes/tip_jars.php';
             try {
                 $storeId = $_POST['store_id'] ?? '';
@@ -2106,7 +2273,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
 
         case 'delete_tip_jar':
-            Auth::requireAdmin();
+            Auth::requireStoreManage((string)($_POST['store_id'] ?? ''));
             require_once __DIR__ . '/includes/tip_jars.php';
             $storeId = $_POST['store_id'] ?? '';
             $jarId = $_POST['tip_jar_id'] ?? '';
@@ -2121,7 +2288,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         // ---- Product catalog management (admin only) ----
         case 'create_product':
-            Auth::requireAdmin();
+            Auth::requireStoreManage((string)($_POST['store_id'] ?? ''));
             try {
                 $storeId = $_POST['store_id'] ?? '';
                 if ($storeId === '') {
@@ -2141,7 +2308,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
 
         case 'update_product':
-            Auth::requireAdmin();
+            Auth::requireStoreManage((string)($_POST['store_id'] ?? ''));
             try {
                 $storeId = $_POST['store_id'] ?? '';
                 $productId = $_POST['product_id'] ?? '';
@@ -2168,7 +2335,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
 
         case 'delete_product':
-            Auth::requireAdmin();
+            Auth::requireStoreManage((string)($_POST['store_id'] ?? ''));
             $storeId = $_POST['store_id'] ?? '';
             $productId = $_POST['product_id'] ?? '';
             if ($storeId === '' || $productId === '') {
@@ -2181,7 +2348,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
 
         case 'save_product_sort':
-            Auth::requireAdmin();
+            Auth::requireStoreManage((string)($_POST['store_id'] ?? ''));
             $storeId = $_POST['store_id'] ?? '';
             if ($storeId === '') {
                 cashupay_status(400);
@@ -2193,7 +2360,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
 
         case 'upload_product_image':
-            Auth::requireAdmin();
+            Auth::requireStoreManager();
             try {
                 $f = $_FILES['image'] ?? null;
                 if (!is_array($f)) {
@@ -2242,6 +2409,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         // ---- Cart checkout (any logged-in user, like the request modal) ----
         case 'cart_checkout':
+            Auth::requireStoreView((string)($_POST['store_id'] ?? ''));
             try {
                 $storeId = $_POST['store_id'] ?? '';
                 if ($storeId === '') {
@@ -2532,7 +2700,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
 
         case 'update_store':
-            Auth::requireAdmin();
+            Auth::requireStoreManage((string)($_POST['store_id'] ?? ''));
             try {
                 $storeId = $_POST['store_id'] ?? '';
                 if (!$storeId) {
@@ -2777,7 +2945,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         // store is already mint-configured: replacing a live mint is a
         // different (balance-moving) operation this endpoint must not do.
         case 'enable_store_mint':
-            Auth::requireAdmin();
+            Auth::requireStoreManage((string)($_POST['store_id'] ?? ''));
             try {
                 $storeId = $_POST['store_id'] ?? '';
                 if (empty($storeId)) {
@@ -2939,7 +3107,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
 
         case 'save_payment_order':
-            Auth::requireAdmin();
+            Auth::requireStoreManage((string)($_POST['store_id'] ?? ''));
             // "Payment order" card: which method the customer invoice page
             // shows first when an invoice offers both on-chain and Lightning.
             // Instant-save from the radio group. Written via Database::update
@@ -2965,7 +3133,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
 
         case 'save_wallet_tabs':
-            Auth::requireAdmin();
+            Auth::requireStoreManage((string)($_POST['store_id'] ?? ''));
             // "Popular wallet tabs" card: which of the Cash App / Venmo /
             // PayPal tabs the customer invoice page shows (WalletTabs).
             // Instant-save from the toggles; the whole set is sent each time
@@ -2997,7 +3165,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
 
         case 'save_store_privacy':
-            Auth::requireAdmin();
+            Auth::requireStoreManage((string)($_POST['store_id'] ?? ''));
             try {
                 $storeId = $_POST['store_id'] ?? '';
                 if (empty($storeId)) {
@@ -3029,7 +3197,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         // rewards currency is pinned by Rewards::setStoreSettings on first
         // enable and never changed here (see update_store for the switch).
         case 'save_rewards_settings':
-            Auth::requireAdmin();
+            Auth::requireStoreManage((string)($_POST['store_id'] ?? ''));
             require_once __DIR__ . '/includes/rewards.php';
             try {
                 $storeId = (string)($_POST['store_id'] ?? '');
@@ -3069,13 +3237,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
 
         case 'generate_seed':
-            Auth::requireAdmin();
+            Auth::requireStoreManager();
             require_once __DIR__ . '/cashu-wallet-php/CashuWallet.php';
             echo json_encode(['seedPhrase' => \Cashu\Mnemonic::generate()]);
             break;
 
         case 'validate_seed':
-            Auth::requireAdmin();
+            Auth::requireStoreManager();
             try {
                 $seedPhrase = $_POST['seed_phrase'] ?? '';
                 if (empty($seedPhrase)) {
@@ -3111,7 +3279,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
 
         case 'create_api_key':
-            Auth::requireAdmin();
+            Auth::requireStoreManage((string)($_POST['store_id'] ?? ''));
             $storeId = $_POST['store_id'] ?? '';
             $label = $_POST['label'] ?? 'API Key';
             $apiKey = Auth::createApiKey($storeId, $label);
@@ -3119,7 +3287,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
 
         case 'delete_api_key':
-            Auth::requireAdmin();
+            cashupay_require_store_manage_via('api_keys', 'id', $_POST['key_id'] ?? '');
             $keyId = $_POST['key_id'] ?? '';
             Auth::deleteApiKey($keyId);
             echo json_encode(['success' => true]);
@@ -3127,6 +3295,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         case 'check_proofs_spent':
             // Check if specific proofs have been spent (for detecting token claims)
+            Auth::requireStoreView((string)($_POST['store_id'] ?? ''));
             try {
                 $storeId = $_POST['store_id'] ?? '';
                 $secretsRaw = $_POST['secrets'] ?? '[]';
@@ -3197,6 +3366,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         case 'get_withdrawal_estimate':
             // Get mint's actual cost for a Lightning withdrawal (to handle exchange rate differences)
+            Auth::requireStoreView((string)($_POST['store_id'] ?? ''));
             try {
                 $storeId = $_POST['store_id'] ?? '';
                 $destination = $_POST['destination'] ?? '';
@@ -3282,7 +3452,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
 
         case 'save_onchain_offer':
-            Auth::requireAdmin();
+            Auth::requireStoreManage((string)($_POST['store_id'] ?? ''));
             // Toggle whether the on-chain rail is OFFERED to customers for this
             // store, independent of whether an xpub/static address is
             // configured. Lets a merchant keep the xpub (submarine swaps still
@@ -3309,7 +3479,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
 
         case 'save_onchain_strike':
-            Auth::requireAdmin();
+            Auth::requireStoreManage((string)($_POST['store_id'] ?? ''));
             // Toggle "also accept on-chain payments via Strike" from the
             // on-chain settings card (the Lightning payments card saves the
             // same flag alongside the Strike key). Enabling probes a real
@@ -3355,7 +3525,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
 
         case 'save_onchain_source_order':
-            Auth::requireAdmin();
+            Auth::requireStoreManage((string)($_POST['store_id'] ?? ''));
             // Which source mints an invoice's on-chain address first: 'strike'
             // (receive request in the merchant's Strike account) or 'local'
             // (the store's xpub-derived / static address). Whichever is listed
@@ -3379,7 +3549,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
 
         case 'save_onchain':
-            Auth::requireAdmin();
+            Auth::requireStoreManage((string)($_POST['store_id'] ?? ''));
             // Persist a store's on-chain Bitcoin payment configuration.
             // Two modes are supported: 'xpub' (server derives a fresh address
             // per invoice) and 'static' (server reuses a single address and
@@ -3586,7 +3756,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
 
         case 'save_ecx_offer':
-            Auth::requireAdmin();
+            Auth::requireStoreManage((string)($_POST['store_id'] ?? ''));
             // Toggle whether the eCash (ECX) tab is OFFERED to customers,
             // independent of whether an ECX xpub / static address is saved.
             try {
@@ -3613,7 +3783,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
 
         case 'save_ecx':
-            Auth::requireAdmin();
+            Auth::requireStoreManage((string)($_POST['store_id'] ?? ''));
             // Persist a store's eCash (ECX) payment configuration. The twin of
             // save_onchain for the ECX rail: 'xpub' (fresh address per invoice)
             // or 'static' (one address, per-invoice szat tweak); ECX has a
@@ -3747,7 +3917,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
 
         case 'test_ecx_xpub':
-            Auth::requireAdmin();
+            Auth::requireStoreManage((string)($_POST['store_id'] ?? ''));
             // Next ECX address at the shared per-xpub counter, not consumed.
             try {
                 require_once __DIR__ . '/includes/onchain/wallet.php';
@@ -3771,7 +3941,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
 
         case 'validate_onchain_xpub':
-            Auth::requireAdmin();
+            Auth::requireStoreManager();
             // Used by the admin store-settings form to validate + preview
             // addresses before saving. Mirrors setup.php's validate_xpub action
             // so the same JS can drive either context.
@@ -3806,7 +3976,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
 
         case 'test_onchain_xpub':
-            Auth::requireAdmin();
+            Auth::requireStoreManage((string)($_POST['store_id'] ?? ''));
             // "Test xpub" button: derive the address at the shared per-xpub
             // counter's next index without consuming it, so the user can
             // confirm derivation matches their signing wallet. The counter
@@ -3840,7 +4010,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
 
         case 'resolve_onchain_manual':
-            Auth::requireAdmin();
+            cashupay_require_store_manage_via('invoices', 'id', $_POST['invoice_id'] ?? '');
             // Attribute a specific (txid, vout) to the chosen invoice and
             // clear the candidate from every other invoice that listed it.
             try {
@@ -3869,7 +4039,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             // addresses, NWC connections, CLINK noffers). Used both for
             // invoice receive routing and for the Lightning auto-cashout rail;
             // lives in the store-settings "Lightning payments" card.
-            Auth::requireAdmin();
+            Auth::requireStoreManage((string)($_POST['store_id'] ?? ''));
             require_once __DIR__ . '/includes/lnurl_receive.php';
             require_once __DIR__ . '/includes/store_ln_addresses.php';
             require_once __DIR__ . '/includes/rail_order.php';
@@ -4098,7 +4268,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             // Cashu automatic cashout: mode (lightning vs on-chain swap),
             // enable toggle and threshold. The Lightning destination chain
             // itself is saved by save_lightning_payments above.
-            Auth::requireAdmin();
+            Auth::requireStoreManage((string)($_POST['store_id'] ?? ''));
             require_once __DIR__ . '/includes/swap/auto_melt.php';
             require_once __DIR__ . '/includes/swap/config.php';
             try {
@@ -4151,7 +4321,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
 
         case 'save_store_notifications':
-            Auth::requireAdmin();
+            Auth::requireStoreManage((string)($_POST['store_id'] ?? ''));
             try {
                 $storeId = $_POST['store_id'] ?? '';
                 $enabled = ($_POST['enabled'] ?? '0') === '1' ? 1 : 0;
@@ -4314,7 +4484,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         // swap/sweep errors. POST (not ?api=) — see the path-routing note in
         // loadDeveloperSettings.
         case 'get_admin_log':
-            Auth::requireAdmin();
+            // Store admins read the log of their stores only (site-wide
+            // entries carry no store and are not shown to them).
+            Auth::requireStoreManager();
             require_once __DIR__ . '/includes/admin_log.php';
             $limit = min(200, max(1, (int)($_POST['limit'] ?? 50)));
             $offset = max(0, (int)($_POST['offset'] ?? 0));
@@ -4324,7 +4496,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $limit,
                 $offset,
                 $category !== '' ? $category : null,
-                ($storeId !== '' && $storeId !== '__all__') ? $storeId : null
+                cashupay_store_scope_arg($storeId)
             ));
             break;
 
@@ -4363,7 +4535,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
 
         case 'save_store_swaps':
-            Auth::requireAdmin();
+            Auth::requireStoreManage((string)($_POST['store_id'] ?? ''));
             require_once __DIR__ . '/includes/swap/config.php';
             require_once __DIR__ . '/includes/swap/factory.php';
             try {
@@ -4483,7 +4655,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
 
         case 'save_store_selfserve':
-            Auth::requireAdmin();
+            Auth::requireStoreManage((string)($_POST['store_id'] ?? ''));
             require_once __DIR__ . '/includes/selfserve.php';
             try {
                 $storeId = $_POST['store_id'] ?? '';
@@ -4532,7 +4704,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
 
         case 'send_test_notification':
-            Auth::requireAdmin();
+            // With a store_id the store's resolved SMTP config is tested —
+            // its store admin may do that; the global config stays admin-only.
+            if (trim((string)($_POST['store_id'] ?? '')) !== '') {
+                Auth::requireStoreManage(trim((string)$_POST['store_id']));
+            } else {
+                Auth::requireAdmin();
+            }
             require_once __DIR__ . '/includes/email_sender.php';
             try {
                 $to = trim((string)($_POST['to'] ?? Config::get('notifications_to_email', '')));
@@ -4562,7 +4740,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
 
         case 'manual_melt':
-            Auth::requireAdmin();
+            Auth::requireStoreManage((string)($_POST['store_id'] ?? ''));
             // A melt can outlive a tight max_execution_time while the mint
             // pays the invoice; being cut off mid-melt is how a payment's
             // outcome gets lost.
@@ -4732,6 +4910,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         case 'get_balance_in_sats':
             // Get store balance converted to satoshis (for fiat mints)
+            Auth::requireStoreView((string)($_POST['store_id'] ?? ''));
             try {
                 $storeId = $_POST['store_id'] ?? '';
                 if (empty($storeId)) {
@@ -4779,11 +4958,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 echo json_encode(['error' => 'Store ID required']);
                 break;
             }
+            Auth::requireStoreView((string)$storeId);
             echo json_encode(cashupay_backup_mint_rows((string)$storeId));
             break;
 
         case 'add_backup_mint':
-            Auth::requireAdmin();
+            Auth::requireStoreManage((string)($_POST['store_id'] ?? ''));
             try {
                 $storeId = $_POST['store_id'] ?? '';
                 $mintUrl = $_POST['mint_url'] ?? '';
@@ -4849,7 +5029,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
 
         case 'update_backup_mint':
-            Auth::requireAdmin();
+            cashupay_require_store_manage_via('store_mints', 'id', $_POST['id'] ?? '');
             try {
                 $id = (int)($_POST['id'] ?? 0);
                 $enabled = isset($_POST['enabled']) ? (int)$_POST['enabled'] : null;
@@ -4902,7 +5082,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
 
         case 'remove_backup_mint':
-            Auth::requireAdmin();
+            cashupay_require_store_manage_via('store_mints', 'id', $_POST['id'] ?? '');
             try {
                 $id = (int)($_POST['id'] ?? 0);
 
@@ -4935,7 +5115,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             // Re-display a token that was handed out. It is bearer money, so
             // it stays valid for as long as nobody has cashed it in — a lost
             // QR code must not mean lost funds.
-            Auth::requireAdmin();
+            cashupay_require_store_manage_via('transfers', 'id', $_POST['id'] ?? '');
             try {
                 $row = Transfer::getById((string)($_POST['id'] ?? ''));
                 if (!$row || empty($row['token'])) {
@@ -4960,7 +5140,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         case 'check_transfer':
             // Ask the issuing mint whether this token has been cashed in yet.
-            Auth::requireAdmin();
+            cashupay_require_store_manage_via('transfers', 'id', $_POST['id'] ?? '');
             try {
                 $row = Transfer::getById((string)($_POST['id'] ?? ''));
                 if (!$row) {
@@ -5027,7 +5207,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             // Take back an unclaimed token by swapping its ecash for fresh
             // ecash, which kills the old token at the mint. Anything less
             // would leave two valid claims on the same money.
-            Auth::requireAdmin();
+            cashupay_require_store_manage_via('transfers', 'id', $_POST['id'] ?? '');
             @set_time_limit(0);
             $reclaimLock = null;
             try {
@@ -5091,7 +5271,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             // recorded in the transfers ledger, so calling this again shows
             // the SAME token (same export id) and "mark recovered" writes off
             // exactly these proofs.
-            Auth::requireAdmin();
+            Auth::requireStoreManage((string)($_POST['store_id'] ?? ''));
             @set_time_limit(0);
             $strandedLock = null;
             try {
@@ -5125,7 +5305,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             // After the recovery token was claimed elsewhere, write off exactly
             // the proofs of that export. When the old mint can still be
             // reached, it is asked first and an unclaimed token is refused.
-            Auth::requireAdmin();
+            cashupay_require_store_manage_via('transfers', 'id', $_POST['export_id'] ?? '');
             try {
                 $exportId = (string)($_POST['export_id'] ?? '');
                 $row = Transfer::getById($exportId);
@@ -5176,7 +5356,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             // Admin-only: this probe fetches an operator-supplied URL and
             // echoes the response (or the error text) back, so for any
             // lesser role it was a server-side request primitive.
-            Auth::requireAdmin();
+            Auth::requireStoreManager();
             try {
                 $mintUrl = $_POST['mint_url'] ?? '';
                 if (empty($mintUrl)) {
@@ -5195,7 +5375,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             // Per-store maximum payment size for the Cashu path + the
             // "respect size even if other Lightning options fail" switch
             // (includes/cashu_limit.php). Blank / 0 max = unlimited.
-            Auth::requireAdmin();
+            Auth::requireStoreManage((string)($_POST['store_id'] ?? ''));
             require_once __DIR__ . '/includes/cashu_limit.php';
             try {
                 $storeId = $_POST['store_id'] ?? '';
@@ -5216,7 +5396,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
 
         case 'save_offline_cashu':
-            Auth::requireAdmin();
+            Auth::requireStoreManage((string)($_POST['store_id'] ?? ''));
             try {
                 $storeId = $_POST['store_id'] ?? '';
                 if (empty($storeId)) {
@@ -5246,7 +5426,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
 
         case 'set_invoice_allow_any_mint':
-            Auth::requireAdmin();
+            cashupay_require_store_manage_via('invoices', 'id', $_POST['invoice_id'] ?? '');
             try {
                 $invoiceId = $_POST['invoice_id'] ?? '';
                 $allow = !empty($_POST['allow']) ? 1 : 0;
@@ -5262,7 +5442,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
 
         case 'add_offline_mint':
-            Auth::requireAdmin();
+            Auth::requireStoreManage((string)($_POST['store_id'] ?? ''));
             try {
                 $storeId = $_POST['store_id'] ?? '';
                 $mintUrl = trim($_POST['mint_url'] ?? '');
@@ -5279,7 +5459,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
 
         case 'toggle_offline_mint':
-            Auth::requireAdmin();
+            Auth::requireStoreManage((string)($_POST['store_id'] ?? ''));
             try {
                 $storeId = $_POST['store_id'] ?? '';
                 $mintUrl = trim($_POST['mint_url'] ?? '');
@@ -5296,7 +5476,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
 
         case 'remove_offline_mint':
-            Auth::requireAdmin();
+            Auth::requireStoreManage((string)($_POST['store_id'] ?? ''));
             try {
                 $storeId = $_POST['store_id'] ?? '';
                 $mintUrl = trim($_POST['mint_url'] ?? '');
@@ -5420,7 +5600,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         case 'test_mint_expiry':
             // Same outbound-request primitive as test_mint: admin only.
-            Auth::requireAdmin();
+            Auth::requireStoreManager();
             try {
                 require_once __DIR__ . '/includes/mint_helpers.php';
                 $mintUrl = $_POST['mint_url'] ?? '';
@@ -5437,19 +5617,44 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
             break;
 
-        // ===== User management (admin-only) =====
+        // ===== User management (admins and store admins) =====
+        //
+        // Admins manage every account. A store admin manages the non-admin
+        // accounts whose store grants lie within their own stores, may hand
+        // out only stores they hold, and may create users and store admins
+        // but never admins. See cashupay_visible_users() for the exact scope
+        // each listed account comes back with (canManage / canEditStores).
         case 'list_users':
-            Auth::requireAdmin();
-            echo json_encode(['users' => Auth::listUsers()]);
+            Auth::requireStoreManager();
+            $visibleStores = array_map(
+                static fn(array $r) => ['id' => $r['id'], 'name' => $r['name']],
+                cashupay_accessible_store_rows()
+            );
+            echo json_encode([
+                'users' => cashupay_visible_users(),
+                // The stores the caller may grant (name lookup for the list).
+                'stores' => $visibleStores,
+                'roles' => Auth::isAdmin()
+                    ? Auth::ROLES
+                    : [Auth::ROLE_STORE_ADMIN, Auth::ROLE_USER],
+            ]);
             break;
 
         case 'create_user':
-            Auth::requireAdmin();
+            Auth::requireStoreManager();
             try {
                 $username = trim($_POST['username'] ?? '');
                 $password = $_POST['password'] ?? '';
                 $role = $_POST['role'] ?? Auth::ROLE_USER;
-                $userId = Auth::createUser($username, $password, $role);
+                $email = trim((string)($_POST['email'] ?? ''));
+                if (!Auth::isValidRole($role)) {
+                    throw new \InvalidArgumentException('Invalid role');
+                }
+                if ($role === Auth::ROLE_ADMIN && !Auth::isAdmin()) {
+                    throw new \InvalidArgumentException('Only an admin can create admin accounts');
+                }
+                $storeIds = $role === Auth::ROLE_ADMIN ? [] : cashupay_posted_store_ids();
+                $userId = Auth::createUser($username, $password, $role, $storeIds, $email !== '' ? $email : null);
                 echo json_encode(['success' => true, 'id' => $userId]);
             } catch (\InvalidArgumentException $e) {
                 cashupay_status(400);
@@ -5460,13 +5665,98 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
             break;
 
-        case 'delete_user':
-            Auth::requireAdmin();
+        case 'update_user':
+            // Change an account's role, store grants and/or recovery e-mail.
+            // Fields absent from the POST are left alone. A store admin may
+            // change the role (user <-> store admin) only of a fully managed
+            // account, and for an account that also holds stores outside
+            // their own may only toggle the shared ones.
+            Auth::requireStoreManager();
             try {
-                $userId = $_POST['user_id'] ?? '';
+                $userId = (string)($_POST['user_id'] ?? '');
+                $target = cashupay_visible_user($userId);
+                if ($target === null) {
+                    cashupay_status(404);
+                    echo json_encode(['error' => 'User not found']);
+                    break;
+                }
+                if ($target['isSelf']) {
+                    throw new \InvalidArgumentException('Change your own account from My Account');
+                }
+                if (!$target['canEditStores']) {
+                    throw new \InvalidArgumentException('You cannot change this account');
+                }
+                $full = Auth::getUserById($userId);
+                $role = $full['role'];
+                if (isset($_POST['role']) && (string)$_POST['role'] !== $role) {
+                    $newRole = (string)$_POST['role'];
+                    if (!Auth::isValidRole($newRole)) {
+                        throw new \InvalidArgumentException('Invalid role');
+                    }
+                    if (!Auth::isAdmin()) {
+                        if (!$target['canManage']) {
+                            throw new \InvalidArgumentException('You cannot change the role of this account');
+                        }
+                        if ($newRole === Auth::ROLE_ADMIN) {
+                            throw new \InvalidArgumentException('Only an admin can grant the admin role');
+                        }
+                    }
+                    if ($newRole !== Auth::ROLE_ADMIN && $role === Auth::ROLE_ADMIN && !isset($_POST['store_ids'])) {
+                        // Demoted from admin without an explicit store list: the
+                        // account must be told which stores it now holds. Checked
+                        // before anything is written.
+                        throw new \InvalidArgumentException('Select the stores this account should hold');
+                    }
+                    Auth::setUserRole($userId, $newRole);
+                    $role = $newRole;
+                }
+                if (isset($_POST['store_ids']) && $role !== Auth::ROLE_ADMIN) {
+                    $posted = cashupay_posted_store_ids();
+                    if (Auth::isAdmin()) {
+                        $next = $posted;
+                    } else {
+                        // Keep the grants outside the caller's reach, replace
+                        // the shared part with what was posted.
+                        $mine = array_fill_keys(Auth::accessibleStoreIds(), true);
+                        $outside = array_values(array_filter(
+                            Auth::getUserStoreIds($userId),
+                            static fn($sid) => !isset($mine[$sid])
+                        ));
+                        $next = array_values(array_unique(array_merge($outside, $posted)));
+                    }
+                    if ($next === []) {
+                        throw new \InvalidArgumentException('Select at least one store for this account');
+                    }
+                    Auth::setUserStoreIds($userId, $next);
+                }
+                if (isset($_POST['email'])) {
+                    if (!$target['canManage']) {
+                        throw new \InvalidArgumentException('You cannot change the e-mail of this account');
+                    }
+                    $email = trim((string)$_POST['email']);
+                    Auth::setUserEmail($userId, $email === '' ? null : $email);
+                }
+                echo json_encode(['success' => true, 'user' => cashupay_visible_user($userId)]);
+            } catch (\InvalidArgumentException $e) {
+                cashupay_status(400);
+                echo json_encode(['error' => $e->getMessage()]);
+            } catch (\RuntimeException $e) {
+                cashupay_status(409);
+                echo json_encode(['error' => $e->getMessage()]);
+            }
+            break;
+
+        case 'delete_user':
+            Auth::requireStoreManager();
+            try {
+                $userId = (string)($_POST['user_id'] ?? '');
                 $self = Auth::currentUser();
                 if ($self && $self['id'] === $userId) {
                     throw new \RuntimeException('You cannot delete your own account');
+                }
+                $target = cashupay_visible_user($userId);
+                if ($target === null || !$target['canManage']) {
+                    throw new \RuntimeException($target === null ? 'User not found' : 'You cannot delete this account');
                 }
                 Auth::deleteUser($userId);
                 echo json_encode(['success' => true]);
@@ -5477,11 +5767,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
 
         case 'reset_password':
-            // Admin resets another user's password.
-            Auth::requireAdmin();
+            // An admin (or the store admin managing the account) sets a new
+            // password for another user.
+            Auth::requireStoreManager();
             try {
-                $userId = $_POST['user_id'] ?? '';
+                $userId = (string)($_POST['user_id'] ?? '');
                 $newPassword = $_POST['new_password'] ?? '';
+                $target = cashupay_visible_user($userId);
+                if ($target === null || !$target['canManage']) {
+                    cashupay_status($target === null ? 404 : 403);
+                    echo json_encode(['error' => $target === null ? 'User not found' : 'You cannot reset the password of this account']);
+                    break;
+                }
                 Auth::changePassword($userId, $newPassword);
                 echo json_encode(['success' => true]);
             } catch (\InvalidArgumentException $e) {
@@ -5489,6 +5786,29 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 echo json_encode(['error' => $e->getMessage()]);
             } catch (\RuntimeException $e) {
                 cashupay_status(404);
+                echo json_encode(['error' => $e->getMessage()]);
+            }
+            break;
+
+        case 'save_store_trusted_mints':
+            // Per-store opt-out of the site's trusted mints list (see
+            // TrustedMints::appliesToStore). Store admins keep the mints they
+            // chose; turning it back on applies the cached list right away.
+            Auth::requireStoreManage((string)($_POST['store_id'] ?? ''));
+            try {
+                require_once __DIR__ . '/includes/trusted_mints.php';
+                $storeId = (string)($_POST['store_id'] ?? '');
+                if (!Config::getStore($storeId)) {
+                    throw new Exception('Store not found');
+                }
+                $enabled = ($_POST['enabled'] ?? '1') === '1';
+                TrustedMints::setAppliesToStore($storeId, $enabled);
+                if ($enabled) {
+                    TrustedMints::applyToNewStore($storeId);
+                }
+                echo json_encode(['success' => true, 'enabled' => $enabled]);
+            } catch (Exception $e) {
+                cashupay_status(400);
                 echo json_encode(['error' => $e->getMessage()]);
             }
             break;
@@ -5546,7 +5866,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             // the acting admin's own password, so a hijacked session alone is
             // not enough. The seed itself is never logged and never appears in
             // any bulk payload — only ever returned from here.
-            Auth::requireAdmin();
+            Auth::requireStoreManage((string)($_POST['store_id'] ?? ''));
             try {
                 $storeId = $_POST['store_id'] ?? '';
                 if (!$storeId) {
@@ -5620,10 +5940,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         case 'set_recovery_email':
             // Set/clear the current user's recovery email. Powers the email
-            // reset-link flow (only effective for admin accounts, which the
-            // reset request looks up by email). Admin-gated: only admins have
-            // a meaningful recovery path here.
-            Auth::requireAdmin();
+            // reset-link flow, which every role may use for its own account.
             try {
                 $self = Auth::currentUser();
                 if (!$self) {
@@ -7705,7 +8022,7 @@ header('Cache-Control: no-cache, must-revalidate');
                  Shown across all admin views (dashboard, invoices, settings) so the
                  issue isn't missed. Hidden by default; populated by JS from
                  dashboardData.onchain.needsManualConfirmation. -->
-            <div id="onchain-manual-banner" class="hidden" style="background: rgba(245, 158, 11, 0.15); border: 1px solid rgba(245, 158, 11, 0.45); border-radius: 8px; padding: 0.75rem 1rem; margin-bottom: 1rem; font-size: 0.9rem; display: flex; align-items: center; gap: 0.75rem;" data-admin-only="true">
+            <div id="onchain-manual-banner" class="hidden" style="background: rgba(245, 158, 11, 0.15); border: 1px solid rgba(245, 158, 11, 0.45); border-radius: 8px; padding: 0.75rem 1rem; margin-bottom: 1rem; font-size: 0.9rem; display: flex; align-items: center; gap: 0.75rem;">
                 <span style="flex-shrink: 0; font-size: 1.1rem; line-height: 1.2;">&#9888;</span>
                 <span style="flex: 1;">
                     <strong id="onchain-manual-banner-text">On-chain payment(s) need manual confirmation.</strong>
@@ -7796,7 +8113,7 @@ header('Cache-Control: no-cache, must-revalidate');
                 <!-- Tokens this store handed out. Each one can be shown again
                      (bearer money: valid until cashed in), checked against the
                      mint, or taken back while nobody has claimed it. -->
-                <div class="card hidden" id="card-recent-exports" data-admin-only="true">
+                <div class="card hidden" id="card-recent-exports">
                     <div class="card-header">
                         <div class="card-title">Recent exports</div>
                     </div>
@@ -7818,7 +8135,7 @@ header('Cache-Control: no-cache, must-revalidate');
                 <!-- Static-address manual-confirmation queue. Hidden when empty.
                      Each row shows the invoice plus the candidate (txid, vout)
                      pairs that matched its amount. Admin picks one to attribute. -->
-                <div class="card hidden" id="card-onchain-manual" data-admin-only="true">
+                <div class="card hidden" id="card-onchain-manual">
                     <div class="card-header">
                         <div class="card-title" style="color: #f59e0b;">&#9888; Payments awaiting manual confirmation</div>
                     </div>
@@ -8456,6 +8773,25 @@ header('Cache-Control: no-cache, must-revalidate');
                                 <button type="button" class="btn btn-full" id="btn-save-cashu-limit" style="margin-top:0.75rem;">
                                     Save Cashu Maximum
                                 </button>
+                            </div>
+                            <!-- Per-store opt-out of the site's trusted mints list
+                                 (TrustedMints::appliesToStore). Filled from the
+                                 dashboard payload's `trustedMints` block; saves
+                                 through action=save_store_trusted_mints. -->
+                            <div id="trusted-mints-store-block" style="margin-bottom:1.25rem; padding-bottom:1rem; border-bottom:1px solid var(--border);">
+                                <div class="toggle-container">
+                                    <span>Use the site's trusted mints list on this store</span>
+                                    <label class="toggle">
+                                        <input type="checkbox" id="store-trusted-mints-enabled" data-testid="store-trusted-mints-enabled" checked>
+                                        <span class="toggle-slider"></span>
+                                    </label>
+                                </div>
+                                <p class="form-help" id="trusted-mints-store-help" style="margin-top:0.25rem;">
+                                    On: mints from the list this server's admin maintains are added
+                                    as backups here and mints the list disables are never used by this
+                                    store. Off: this store runs on exactly the mints you chose; backups
+                                    the list already added stay until you remove them.
+                                </p>
                             </div>
                             <label class="form-label">Cashu automatic cashout</label>
                             <div id="aw-store" data-aw data-aw-scope="store">
@@ -9926,7 +10262,7 @@ header('Cache-Control: no-cache, must-revalidate');
                         </button>
                         <!-- Recovery email (admin only): powers the emailed
                              password-reset link. Revealed by renderAccountCard. -->
-                        <div id="recovery-email-row" class="hidden" data-admin-only="true" style="margin-bottom: 0.5rem;">
+                        <div id="recovery-email-row" class="hidden" style="margin-bottom: 0.5rem;">
                             <label for="recovery-email-input" style="display:block;font-size:0.85rem;color:var(--text-secondary);margin-bottom:0.25rem;">
                                 Recovery email
                             </label>
@@ -9961,8 +10297,9 @@ header('Cache-Control: no-cache, must-revalidate');
                     </div>
                 </div>
 
-                <!-- Users card: admin-only. Managed installs hide it (SSO owns accounts). -->
-                <div class="card collapsible collapsed hidden<?= $isManaged ? ' managed-hidden' : '' ?>" id="card-users" data-admin-only="true">
+                <!-- Users card: admins and store admins (store admins manage the
+                     accounts of their own stores). Managed installs hide it (SSO owns accounts). -->
+                <div class="card collapsible collapsed hidden<?= $isManaged ? ' managed-hidden' : '' ?>" id="card-users">
                     <div class="card-header">
                         <div class="card-title">Users</div>
                         <button class="btn" id="btn-add-user" style="padding: 0.25rem 0.75rem; font-size: 0.85rem;">Add user</button>
@@ -9975,7 +10312,7 @@ header('Cache-Control: no-cache, must-revalidate');
                 <!-- Stuck Funds card: admin-only.
                      Hidden when no store has any sats stranded in a mint with
                      an active withdrawal-failure flag. -->
-                <div class="card collapsible collapsed hidden" id="card-stuck-funds" data-admin-only="true">
+                <div class="card collapsible collapsed hidden" id="card-stuck-funds">
                     <div class="card-header">
                         <div class="card-title">Stuck Funds</div>
                     </div>
@@ -10275,13 +10612,13 @@ header('Cache-Control: no-cache, must-revalidate');
                 </svg>
                 <span class="nav-label">Store</span>
             </button>
-            <button class="nav-item hidden<?= $isManaged ? ' managed-hidden' : '' ?>" data-view="products" data-admin-only="true" id="nav-products">
+            <button class="nav-item hidden<?= $isManaged ? ' managed-hidden' : '' ?>" data-view="products" data-manager-only="true" id="nav-products">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                     <path d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4"></path>
                 </svg>
                 <span class="nav-label">Products</span>
             </button>
-            <button class="nav-item hidden" data-view="stats" data-admin-only="true" id="nav-stats">
+            <button class="nav-item hidden" data-view="stats" data-manager-only="true" id="nav-stats">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                     <line x1="18" y1="20" x2="18" y2="10"></line>
                     <line x1="12" y1="20" x2="12" y2="4"></line>
@@ -10289,7 +10626,7 @@ header('Cache-Control: no-cache, must-revalidate');
                 </svg>
                 <span class="nav-label">Stats</span>
             </button>
-            <button class="nav-item hidden<?= $isManaged ? ' managed-hidden' : '' ?>" data-view="customers" data-admin-only="true" id="nav-customers">
+            <button class="nav-item hidden<?= $isManaged ? ' managed-hidden' : '' ?>" data-view="customers" data-manager-only="true" id="nav-customers">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                     <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path>
                     <circle cx="9" cy="7" r="4"></circle>
@@ -10298,7 +10635,7 @@ header('Cache-Control: no-cache, must-revalidate');
                 </svg>
                 <span class="nav-label">Customers</span>
             </button>
-            <button class="nav-item hidden" data-view="rewards" data-admin-only="true" id="nav-rewards">
+            <button class="nav-item hidden" data-view="rewards" data-manager-only="true" id="nav-rewards">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                     <polyline points="20 12 20 22 4 22 4 12"></polyline>
                     <rect x="2" y="7" width="20" height="5"></rect>
@@ -10308,7 +10645,7 @@ header('Cache-Control: no-cache, must-revalidate');
                 </svg>
                 <span class="nav-label">Rewards</span>
             </button>
-            <button class="nav-item hidden" data-view="log" data-admin-only="true" id="nav-log">
+            <button class="nav-item hidden" data-view="log" data-manager-only="true" id="nav-log">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                     <polyline points="4 17 10 11 4 5"></polyline>
                     <line x1="12" y1="19" x2="20" y2="19"></line>
@@ -10814,7 +11151,8 @@ header('Cache-Control: no-cache, must-revalidate');
         </div>
     </div>
 
-    <!-- Add User modal (admin) -->
+    <!-- Add User modal (admins and store admins; the role list and the
+         store checklist are filled from list_users by prepareAddUserModal) -->
     <div class="modal-overlay" id="modal-add-user">
         <div class="modal">
             <div class="modal-handle"></div>
@@ -10828,15 +11166,47 @@ header('Cache-Control: no-cache, must-revalidate');
                        placeholder="Initial password (min 8)" autocomplete="new-password">
             </div>
             <div class="form-group">
+                <input type="email" class="form-input" id="au-email"
+                       placeholder="Recovery e-mail (optional, for password resets)" autocomplete="off">
+            </div>
+            <div class="form-group">
                 <label class="form-label">Role</label>
                 <select id="au-role" class="form-input">
-                    <option value="user">User (read + create invoices)</option>
-                    <option value="admin">Admin (full access)</option>
+                    <option value="user">User (view + create invoices on selected stores)</option>
                 </select>
+            </div>
+            <div class="form-group" id="au-stores-block">
+                <label class="form-label">Stores this account can access</label>
+                <div id="au-stores" data-testid="au-stores"></div>
             </div>
             <button class="btn btn-full" id="btn-confirm-add-user">Create user</button>
             <button class="btn btn-secondary btn-full" style="margin-top: 0.5rem;"
                     onclick="closeModal('modal-add-user')">Cancel</button>
+        </div>
+    </div>
+
+    <!-- Edit User modal: role, store grants, recovery e-mail -->
+    <div class="modal-overlay" id="modal-edit-user">
+        <div class="modal">
+            <div class="modal-handle"></div>
+            <div class="modal-title">Edit <span id="eu-username"></span></div>
+            <input type="hidden" id="eu-user-id">
+            <div class="form-group">
+                <label class="form-label">Role</label>
+                <select id="eu-role" class="form-input"></select>
+            </div>
+            <div class="form-group" id="eu-stores-block">
+                <label class="form-label">Stores this account can access</label>
+                <div id="eu-stores" data-testid="eu-stores"></div>
+                <p class="form-help hidden" id="eu-hidden-note" style="margin-top:0.4rem;"></p>
+            </div>
+            <div class="form-group">
+                <label class="form-label" for="eu-email">Recovery e-mail</label>
+                <input type="email" class="form-input" id="eu-email" placeholder="optional" autocomplete="off">
+            </div>
+            <button class="btn btn-full" id="btn-confirm-edit-user">Save</button>
+            <button class="btn btn-secondary btn-full" style="margin-top: 0.5rem;"
+                    onclick="closeModal('modal-edit-user')">Cancel</button>
         </div>
     </div>
 
@@ -10942,6 +11312,14 @@ header('Cache-Control: no-cache, must-revalidate');
             role:     <?= json_encode($currentRole) ?>,
             email:    <?= json_encode($currentUser['email'] ?? null) ?>,
         };
+        // Role helpers. 'admin' holds every store and the site-wide settings;
+        // 'store_admin' manages the settings of the stores granted to it;
+        // 'user' views and creates invoices on its stores. The server enforces
+        // every gate — these only shape the UI (Auth::requireStoreManage etc.).
+        const ROLE_LABELS = { admin: 'admin', store_admin: 'store admin', user: 'user' };
+        function isAdminUser() { return phpUser.role === 'admin'; }
+        function isStoreManager() { return phpUser.role === 'admin' || phpUser.role === 'store_admin'; }
+        function roleLabel(role) { return ROLE_LABELS[role] || String(role || ''); }
         // SPA routing: adminBasePath is the URL prefix the user reached the
         // admin under (no trailing slash, no view tail). All view URLs and
         // ?api=... fetches build off this so the same code works under
@@ -11130,7 +11508,17 @@ header('Cache-Control: no-cache, must-revalidate');
             isAuthenticated = true;
             localStorage.setItem(STORAGE_AUTH, 'true');
 
-            if (phpUser.role === 'admin') {
+            // Site-wide surfaces (settings cards, banners) are marked
+            // data-admin-only in the markup; everything so marked is hidden
+            // below the admin role. Store-level surfaces carry no marker and
+            // follow isStoreManager() / the server's per-store gates.
+            if (!isAdminUser()) {
+                document.querySelectorAll('[data-admin-only]').forEach(el => el.classList.add('hidden'));
+                // Creating and deleting stores is site-level too.
+                document.getElementById('btn-create-store')?.classList.add('hidden');
+                document.getElementById('btn-delete-store')?.closest('.card')?.classList.add('hidden');
+            }
+            if (isStoreManager()) {
                 const navStats = document.getElementById('nav-stats');
                 if (navStats) navStats.classList.remove('hidden');
                 const navProducts = document.getElementById('nav-products');
@@ -11307,7 +11695,7 @@ header('Cache-Control: no-cache, must-revalidate');
                         const data = await r.json().catch(() => ({}));
                         if (r.ok) {
                             // Generic response — never reveals whether the address matched.
-                            msg.textContent = data.message || 'If an admin account has that email, a reset link has been sent.';
+                            msg.textContent = data.message || 'If an account has that email, a reset link has been sent.';
                             msg.style.color = '#22c55e';
                         } else {
                             msg.textContent = data.error || 'Could not send reset link.';
@@ -11365,7 +11753,7 @@ header('Cache-Control: no-cache, must-revalidate');
 
             // Balance actions
             document.getElementById('btn-withdraw').addEventListener('click', () => {
-                if (!ensureAdmin('Only admins can withdraw funds.')) return;
+                if (!ensureAdmin('Only admins and store admins can withdraw funds.')) return;
                 openModal('modal-withdraw');
             });
             document.getElementById('btn-request').addEventListener('click', () => openCartModal());
@@ -11607,6 +11995,8 @@ header('Cache-Control: no-cache, must-revalidate');
             if (saveStoreSwapsBtn) saveStoreSwapsBtn.addEventListener('click', saveStoreSwaps);
             const saveCashuLimitBtn = document.getElementById('btn-save-cashu-limit');
             if (saveCashuLimitBtn) saveCashuLimitBtn.addEventListener('click', saveCashuLimit);
+            const trustedMintsStoreBox = document.getElementById('store-trusted-mints-enabled');
+            if (trustedMintsStoreBox) trustedMintsStoreBox.addEventListener('change', saveStoreTrustedMints);
             const revealSeedBtn = document.getElementById('btn-reveal-store-seed');
             if (revealSeedBtn) revealSeedBtn.addEventListener('click', revealStoreSeed);
             const saveStoreSelfServeBtn = document.getElementById('btn-save-store-selfserve');
@@ -11687,9 +12077,12 @@ header('Cache-Control: no-cache, must-revalidate');
             }
             const btnAddUser = document.getElementById('btn-add-user');
             if (btnAddUser) {
-                btnAddUser.addEventListener('click', () => openModal('modal-add-user'));
+                btnAddUser.addEventListener('click', () => { prepareAddUserModal(); openModal('modal-add-user'); });
                 document.getElementById('btn-confirm-add-user').addEventListener('click', addUser);
                 document.getElementById('btn-confirm-reset-user-password').addEventListener('click', confirmResetUserPassword);
+                document.getElementById('au-role').addEventListener('change', () => toggleStoreBlock('au-role', 'au-stores-block'));
+                document.getElementById('eu-role').addEventListener('change', () => toggleStoreBlock('eu-role', 'eu-stores-block'));
+                document.getElementById('btn-confirm-edit-user').addEventListener('click', saveEditUser);
             }
 
             // URL Mode re-detect button (standalone only). Detection is normally
@@ -11701,7 +12094,8 @@ header('Cache-Control: no-cache, must-revalidate');
                 btnDetectUrlMode.addEventListener('click', detectAndSaveUrlMode);
             }
 
-            // Stores
+            // Stores. Creating and deleting stores is site-level: the
+            // buttons disappear below the admin role.
             document.getElementById('btn-create-store').addEventListener('click', () => {
                 window.location.href = setupUrl + '?mode=add_store';
             });
@@ -11859,8 +12253,8 @@ header('Cache-Control: no-cache, must-revalidate');
         // grow a duplicate history entry.
         function switchView(view, opts) {
             if (!ADMIN_VIEWS.includes(view)) view = 'dashboard';
-            if ((view === 'stats' || view === 'products' || view === 'customers' || view === 'rewards' || view === 'log') && phpUser.role !== 'admin') {
-                showToast('Admin role required', 'error');
+            if ((view === 'stats' || view === 'products' || view === 'customers' || view === 'rewards' || view === 'log') && !isStoreManager()) {
+                showToast('Store admin role required', 'error');
                 return;
             }
             document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
@@ -11937,9 +12331,11 @@ header('Cache-Control: no-cache, must-revalidate');
             }
             if (view === 'settings') {
                 renderAccountCard();
-                if (phpUser.role === 'admin') {
+                if (isStoreManager()) {
                     renderUsersCard();
                     loadStuckFundsCard();
+                }
+                if (isAdminUser()) {
                     loadReliabilityCard();
                     loadTrustedMintsCard();
                     loadCronUrl();
@@ -12008,8 +12404,10 @@ header('Cache-Control: no-cache, must-revalidate');
         // action — this just stops the modal from flashing up and prompting
         // for input the request will be rejected for.
         function ensureAdmin(message) {
-            if (phpUser.role === 'admin') return true;
-            showToast(message || 'Admin role required', 'error');
+            // Store-level actions: admins and store admins (the server checks
+            // the store itself). Site-wide actions use isAdminUser() directly.
+            if (isStoreManager()) return true;
+            showToast(message || 'Store admin role required', 'error');
             return false;
         }
 
@@ -12054,19 +12452,14 @@ header('Cache-Control: no-cache, must-revalidate');
             const usernameEl = document.getElementById('my-username');
             const badgeEl = document.getElementById('my-role-badge');
             if (usernameEl) usernameEl.textContent = u.username || '';
-            if (badgeEl) badgeEl.textContent = u.role === 'admin' ? 'admin' : 'user';
+            if (badgeEl) badgeEl.textContent = roleLabel(u.role);
 
-            // Recovery email is only meaningful for admins (the reset-link flow
-            // looks up admin accounts by email).
+            // Recovery email: every role can reset its own password by e-mail.
             const row = document.getElementById('recovery-email-row');
             if (row) {
-                if (u.role === 'admin') {
-                    row.classList.remove('hidden');
-                    const input = document.getElementById('recovery-email-input');
-                    if (input && document.activeElement !== input) input.value = u.email || '';
-                } else {
-                    row.classList.add('hidden');
-                }
+                row.classList.remove('hidden');
+                const input = document.getElementById('recovery-email-input');
+                if (input && document.activeElement !== input) input.value = u.email || '';
             }
 
             // Login timeout: global, admin-only. Fetched rather than rendered
@@ -12136,6 +12529,19 @@ header('Cache-Control: no-cache, must-revalidate');
             }
         }
 
+        // Users card state: the last list_users payload (users, the stores
+        // the caller may grant, the roles they may assign).
+        let usersCardData = { users: [], stores: [], roles: [] };
+
+        function userStoreSummary(u, storeNames) {
+            if (u.role === 'admin') return 'all stores';
+            const names = (u.storeIds || []).map(id => storeNames[id] || id);
+            if (u.hiddenStoreCount > 0) {
+                names.push(`${u.hiddenStoreCount} other store${u.hiddenStoreCount === 1 ? '' : 's'}`);
+            }
+            return names.length ? names.join(', ') : 'no stores';
+        }
+
         async function renderUsersCard() {
             const card = document.getElementById('card-users');
             if (!card) return;
@@ -12150,17 +12556,25 @@ header('Cache-Control: no-cache, must-revalidate');
                     container.innerHTML = '<div class="empty-state"><p>No users yet</p></div>';
                     return;
                 }
+                usersCardData = { users: data.users, stores: data.stores || [], roles: data.roles || [] };
+                const storeNames = {};
+                usersCardData.stores.forEach(s => { storeNames[s.id] = s.name || s.id; });
                 container.innerHTML = data.users.map(u => `
-                    <div class="list-item">
+                    <div class="list-item" data-testid="user-row" data-user-id="${escapeAttr(u.id)}" data-username="${escapeAttr(u.username)}">
                         <div class="list-content">
                             <div class="list-title">
                                 ${escapeHtml(u.username)}
-                                <span style="margin-left: 0.5rem; padding: 0.125rem 0.5rem; border-radius: 999px; font-size: 0.7rem; background: rgba(247,147,26,0.2);">${escapeHtml(u.role)}</span>
+                                <span class="user-role-badge" style="margin-left: 0.5rem; padding: 0.125rem 0.5rem; border-radius: 999px; font-size: 0.7rem; background: rgba(247,147,26,0.2);">${escapeHtml(roleLabel(u.role))}</span>
+                                ${u.isSelf ? '<span style="margin-left:0.35rem; font-size:0.7rem; color: var(--text-secondary);">(you)</span>' : ''}
+                            </div>
+                            <div class="list-subtitle user-stores" style="font-size:0.75rem; color: var(--text-secondary);">
+                                ${escapeHtml(userStoreSummary(u, storeNames))}${u.email ? ' · ' + escapeHtml(u.email) : ''}
                             </div>
                         </div>
-                        <div style="display: flex; gap: 0.25rem;">
-                            <button class="btn btn-secondary user-action" data-user-action="reset-password" data-user-id="${escapeAttr(u.id)}" data-username="${escapeAttr(u.username)}" style="padding: 0.25rem 0.5rem; font-size: 0.75rem;">Reset password</button>
-                            ${u.username === phpUser.username ? '' : `<button class="btn btn-danger user-action" data-user-action="delete" data-user-id="${escapeAttr(u.id)}" data-username="${escapeAttr(u.username)}" style="padding: 0.25rem 0.5rem; font-size: 0.75rem;">Delete</button>`}
+                        <div style="display: flex; gap: 0.25rem; flex-wrap: wrap; justify-content: flex-end;">
+                            ${u.canEditStores ? `<button class="btn btn-secondary user-action" data-user-action="edit" data-user-id="${escapeAttr(u.id)}" style="padding: 0.25rem 0.5rem; font-size: 0.75rem;">Edit</button>` : ''}
+                            ${u.canManage ? `<button class="btn btn-secondary user-action" data-user-action="reset-password" data-user-id="${escapeAttr(u.id)}" data-username="${escapeAttr(u.username)}" style="padding: 0.25rem 0.5rem; font-size: 0.75rem;">Reset password</button>` : ''}
+                            ${u.canManage ? `<button class="btn btn-danger user-action" data-user-action="delete" data-user-id="${escapeAttr(u.id)}" data-username="${escapeAttr(u.username)}" style="padding: 0.25rem 0.5rem; font-size: 0.75rem;">Delete</button>` : ''}
                         </div>
                     </div>
                 `).join('');
@@ -12169,13 +12583,116 @@ header('Cache-Control: no-cache, must-revalidate');
                         const id = btn.dataset.userId;
                         const name = btn.dataset.username;
                         switch (btn.dataset.userAction) {
+                            case 'edit':           openEditUser(id); break;
                             case 'reset-password': openResetUserPassword(id, name); break;
                             case 'delete':         deleteUserById(id, name); break;
                         }
                     });
                 });
+                prepareAddUserModal();
             } catch (e) {
                 container.innerHTML = '<div class="empty-state"><p>Failed to load users</p></div>';
+            }
+        }
+
+        // Store checkbox list shared by the Add / Edit user modals.
+        function renderStoreChecklist(containerId, checkedIds) {
+            const el = document.getElementById(containerId);
+            if (!el) return;
+            const checked = new Set(checkedIds || []);
+            if (!usersCardData.stores.length) {
+                el.innerHTML = '<p class="form-help" style="margin:0;">No stores available.</p>';
+                return;
+            }
+            el.innerHTML = usersCardData.stores.map(s => `
+                <label style="display:flex; align-items:center; gap:0.5rem; padding:0.25rem 0; font-size:0.9rem; cursor:pointer;">
+                    <input type="checkbox" class="user-store-box" value="${escapeAttr(s.id)}" ${checked.has(s.id) ? 'checked' : ''}>
+                    <span>${escapeHtml(s.name || s.id)}</span>
+                </label>
+            `).join('');
+        }
+
+        function checkedStoreIds(containerId) {
+            return [...document.querySelectorAll(`#${containerId} input.user-store-box:checked`)].map(i => i.value);
+        }
+
+        function fillRoleSelect(select, roles, current) {
+            select.innerHTML = roles.map(r => {
+                const desc = r === 'admin' ? 'Admin (every store + site settings)'
+                    : r === 'store_admin' ? 'Store admin (settings of selected stores)'
+                    : 'User (view + create invoices on selected stores)';
+                return `<option value="${escapeAttr(r)}">${escapeHtml(desc)}</option>`;
+            }).join('');
+            if (current && roles.includes(current)) select.value = current;
+        }
+
+        function toggleStoreBlock(roleSelectId, blockId) {
+            const role = document.getElementById(roleSelectId).value;
+            const block = document.getElementById(blockId);
+            if (block) block.classList.toggle('hidden', role === 'admin');
+        }
+
+        function prepareAddUserModal() {
+            const roleSel = document.getElementById('au-role');
+            if (!roleSel) return;
+            const roles = usersCardData.roles.length ? usersCardData.roles : ['user'];
+            fillRoleSelect(roleSel, roles, roles.includes('user') ? 'user' : roles[0]);
+            renderStoreChecklist('au-stores', []);
+            toggleStoreBlock('au-role', 'au-stores-block');
+        }
+
+        function openEditUser(userId) {
+            const u = usersCardData.users.find(x => x.id === userId);
+            if (!u) return;
+            document.getElementById('eu-user-id').value = u.id;
+            document.getElementById('eu-username').textContent = u.username;
+            const roleSel = document.getElementById('eu-role');
+            // Roles the caller may set on this account: an admin may set any;
+            // a store admin only user <-> store admin on a fully managed account.
+            const roles = usersCardData.roles.slice();
+            fillRoleSelect(roleSel, roles.includes(u.role) ? roles : roles.concat([u.role]), u.role);
+            roleSel.disabled = !u.canManage;
+            renderStoreChecklist('eu-stores', u.storeIds || []);
+            const hiddenNote = document.getElementById('eu-hidden-note');
+            if (hiddenNote) {
+                hiddenNote.textContent = u.hiddenStoreCount > 0
+                    ? `This account also holds ${u.hiddenStoreCount} store${u.hiddenStoreCount === 1 ? '' : 's'} you do not manage; those grants stay as they are.`
+                    : '';
+                hiddenNote.classList.toggle('hidden', !(u.hiddenStoreCount > 0));
+            }
+            const emailInput = document.getElementById('eu-email');
+            emailInput.value = u.email || '';
+            emailInput.disabled = !u.canManage;
+            toggleStoreBlock('eu-role', 'eu-stores-block');
+            openModal('modal-edit-user');
+        }
+
+        async function saveEditUser() {
+            const userId = document.getElementById('eu-user-id').value;
+            const u = usersCardData.users.find(x => x.id === userId);
+            if (!u) return;
+            const role = document.getElementById('eu-role').value;
+            const params = new URLSearchParams({ action: 'update_user', user_id: userId });
+            if (u.canManage && role !== u.role) params.set('role', role);
+            if (role !== 'admin') {
+                checkedStoreIds('eu-stores').forEach(id => params.append('store_ids[]', id));
+                // An empty selection still has to reach the server (so it can
+                // refuse it) rather than read as "leave the grants alone".
+                if (!checkedStoreIds('eu-stores').length) params.append('store_ids[]', '');
+            }
+            if (u.canManage) params.set('email', document.getElementById('eu-email').value.trim());
+            try {
+                const response = await postWithCsrf(adminUrl, params.toString());
+                const res = await response.json();
+                if (response.ok && res.success) {
+                    showToast('User updated', 'success');
+                    closeModal('modal-edit-user');
+                    renderUsersCard();
+                } else {
+                    showToast(res.error || 'Failed to update user', 'error');
+                }
+            } catch (e) {
+                showToast(e.message || 'Failed to update user', 'error');
             }
         }
 
@@ -12217,14 +12734,23 @@ header('Cache-Control: no-cache, must-revalidate');
             const username = document.getElementById('au-username').value.trim();
             const password = document.getElementById('au-password').value;
             const role = document.getElementById('au-role').value;
+            const email = document.getElementById('au-email').value.trim();
+            const params = new URLSearchParams({ action: 'create_user', username, password, role, email });
+            if (role !== 'admin') {
+                const ids = checkedStoreIds('au-stores');
+                if (!ids.length) {
+                    showToast('Select at least one store for this account', 'error');
+                    return;
+                }
+                ids.forEach(id => params.append('store_ids[]', id));
+            }
             try {
-                const response = await postWithCsrf(adminUrl,
-                    `action=create_user&username=${encodeURIComponent(username)}&password=${encodeURIComponent(password)}&role=${encodeURIComponent(role)}`);
+                const response = await postWithCsrf(adminUrl, params.toString());
                 const res = await response.json();
                 if (response.ok && res.success) {
                     showToast('User created', 'success');
                     closeModal('modal-add-user');
-                    ['au-username','au-password'].forEach(id => document.getElementById(id).value = '');
+                    ['au-username','au-password','au-email'].forEach(id => document.getElementById(id).value = '');
                     renderUsersCard();
                 } else {
                     showToast(res.error || 'Failed to create user', 'error');
@@ -12357,11 +12883,14 @@ header('Cache-Control: no-cache, must-revalidate');
                 });
             }
 
-            // Add "Create Store" option
-            const createOpt = document.createElement('option');
-            createOpt.value = '__create__';
-            createOpt.textContent = '+ Create Store';
-            select.appendChild(createOpt);
+            // Add "Create Store" option (admins only: stores are created
+            // and deleted at site level)
+            if (isAdminUser()) {
+                const createOpt = document.createElement('option');
+                createOpt.value = '__create__';
+                createOpt.textContent = '+ Create Store';
+                select.appendChild(createOpt);
+            }
 
             select.disabled = false;
 
@@ -14431,7 +14960,7 @@ header('Cache-Control: no-cache, must-revalidate');
             const card = document.getElementById('card-recent-exports');
             const container = document.getElementById('recent-exports');
             if (!card || !container) return;
-            if (!rows || rows.length === 0 || (phpUser && phpUser.role !== 'admin')) {
+            if (!rows || rows.length === 0 || !isStoreManager()) {
                 card.classList.add('hidden');
                 container.innerHTML = '';
                 return;
@@ -14559,7 +15088,7 @@ header('Cache-Control: no-cache, must-revalidate');
             const card = document.getElementById('card-stranded-funds');
             const list = document.getElementById('stranded-funds-list');
             if (!card || !list) return;
-            if (!phpUser || phpUser.role !== 'admin') {
+            if (!isAdminUser()) {
                 card.classList.add('hidden');
                 return;
             }
@@ -17093,6 +17622,42 @@ header('Cache-Control: no-cache, must-revalidate');
             maxEl.value = (limit.maxSats ?? null) === null ? '' : String(limit.maxSats);
             respectEl.checked = limit.respectAlways !== false;
             clearAwError('cashu-limit-error');
+            refreshTrustedMintsStoreBlock();
+        }
+
+        // -------- Per-store trusted mints list opt-out --------
+
+        function refreshTrustedMintsStoreBlock() {
+            const tm = dashboardData && dashboardData.trustedMints;
+            const box = document.getElementById('store-trusted-mints-enabled');
+            const help = document.getElementById('trusted-mints-store-help');
+            if (!tm || !box) return;
+            box.checked = tm.enabled !== false;
+            if (help) {
+                help.dataset.listConfigured = tm.listConfigured ? '1' : '0';
+            }
+        }
+
+        async function saveStoreTrustedMints() {
+            if (!currentStoreId) return;
+            const box = document.getElementById('store-trusted-mints-enabled');
+            const enabled = box && box.checked ? '1' : '0';
+            try {
+                const response = await postWithCsrf(adminUrl,
+                    `action=save_store_trusted_mints&store_id=${encodeURIComponent(currentStoreId)}&enabled=${enabled}`);
+                const result = await response.json();
+                if (response.ok && result.success) {
+                    showToast(enabled === '1' ? 'Trusted mints list enabled for this store' : 'Trusted mints list disabled for this store', 'success');
+                    await loadDashboard();
+                    renderCashuMintsBlock(currentStoreId);
+                } else {
+                    showToast(result.error || 'Failed to save', 'error');
+                    if (box) box.checked = enabled !== '1';
+                }
+            } catch (e) {
+                showToast('Failed to save the trusted mints setting', 'error');
+                if (box) box.checked = enabled !== '1';
+            }
         }
 
         async function saveCashuLimit() {
@@ -19893,7 +20458,7 @@ header('Cache-Control: no-cache, must-revalidate');
         let productsAdminCache = [];
 
         async function loadProductsView() {
-            if (phpUser.role !== 'admin') return;
+            if (!isStoreManager()) return;
             const list = document.getElementById('products-admin-list');
             const curLabel = document.getElementById('products-currency-label');
             if (curLabel) curLabel.textContent = String(currentStoreCurrency()).toUpperCase();
@@ -19986,7 +20551,7 @@ header('Cache-Control: no-cache, must-revalidate');
         }
 
         function openProductEditModal(id) {
-            if (!ensureAdmin('Only admins can manage products.')) return;
+            if (!ensureAdmin('Only admins and store admins can manage products.')) return;
             if (!currentStoreId) { showToast('Select a store first', 'error'); return; }
             const p = id ? productsAdminCache.find(x => x.id === id) : null;
             document.getElementById('product-edit-id').value = p ? p.id : '';
@@ -20444,7 +21009,7 @@ header('Cache-Control: no-cache, must-revalidate');
         }
 
         function copyProductLink(id) {
-            if (!ensureAdmin('Only admins can manage products.')) return;
+            if (!ensureAdmin('Only admins and store admins can manage products.')) return;
             const p = productsAdminCache.find(x => x.id === id);
             if (!p) return;
             if (!p.enabled) {
@@ -20504,7 +21069,7 @@ header('Cache-Control: no-cache, must-revalidate');
             const grid = document.getElementById('tipjars-grid');
             const offCard = document.getElementById('card-tipjars-off');
             const newBtn = document.getElementById('btn-new-tipjar');
-            if (newBtn) newBtn.style.display = phpUser.role === 'admin' ? '' : 'none';
+            if (newBtn) newBtn.style.display = isStoreManager() ? '' : 'none';
             if (!currentStoreId) {
                 if (grid) grid.innerHTML = '<p style="color:var(--text-secondary);">Select a store first.</p>';
                 if (offCard) offCard.classList.add('hidden');
@@ -20542,12 +21107,12 @@ header('Cache-Control: no-cache, must-revalidate');
                         if (turnOn) turnOn.style.display = 'none';
                     } else {
                         if (offText) offText.textContent = 'Tip jars are turned off for this store, so these links won\'t work yet.';
-                        if (turnOn) turnOn.style.display = phpUser.role === 'admin' ? '' : 'none';
+                        if (turnOn) turnOn.style.display = isStoreManager() ? '' : 'none';
                     }
                 }
             }
             if (!tipJarsCache.length) {
-                grid.innerHTML = `<div class="empty-state"><div class="empty-state-icon">🫙</div><p>No tip jars yet.${phpUser.role === 'admin' ? ' Click “New tip jar” to create one.' : ''}</p></div>`;
+                grid.innerHTML = `<div class="empty-state"><div class="empty-state-icon">🫙</div><p>No tip jars yet.${isStoreManager() ? ' Click “New tip jar” to create one.' : ''}</p></div>`;
                 return;
             }
             grid.innerHTML = '<div class="jar-grid">' + tipJarsCache.map(j => {
@@ -20594,7 +21159,7 @@ header('Cache-Control: no-cache, must-revalidate');
                 warn.classList.add('hidden');
             }
             renderTipJarQr(j.url);
-            document.getElementById('tipjar-detail-admin').style.display = phpUser.role === 'admin' ? '' : 'none';
+            document.getElementById('tipjar-detail-admin').style.display = isStoreManager() ? '' : 'none';
             document.getElementById('btn-tipjar-toggle').textContent = j.enabled ? 'Disable' : 'Enable';
             document.getElementById('tipjar-delete-confirm').classList.add('hidden');
             document.getElementById('tipjar-delete-name').textContent = j.name;
@@ -20667,7 +21232,7 @@ header('Cache-Control: no-cache, must-revalidate');
         }
 
         function openTipJarEditModal(id) {
-            if (!ensureAdmin('Only admins can manage tip jars.')) return;
+            if (!ensureAdmin('Only admins and store admins can manage tip jars.')) return;
             if (!currentStoreId) { showToast('Select a store first', 'error'); return; }
             const j = id ? tipJarsCache.find(x => x.id === id) : null;
             document.getElementById('tipjar-edit-id').value = j ? j.id : '';
@@ -20724,7 +21289,7 @@ header('Cache-Control: no-cache, must-revalidate');
 
         async function toggleTipJarEnabled() {
             const j = tipJarsCache.find(x => x.id === tipJarDetailId);
-            if (!j || !ensureAdmin('Only admins can manage tip jars.')) return;
+            if (!j || !ensureAdmin('Only admins and store admins can manage tip jars.')) return;
             try {
                 const r = await postWithCsrf(adminUrl,
                     `action=update_tip_jar&store_id=${encodeURIComponent(currentStoreId)}&tip_jar_id=${encodeURIComponent(j.id)}&enabled=${j.enabled ? '0' : '1'}`);
@@ -20741,7 +21306,7 @@ header('Cache-Control: no-cache, must-revalidate');
 
         async function deleteTipJar() {
             const j = tipJarsCache.find(x => x.id === tipJarDetailId);
-            if (!j || !ensureAdmin('Only admins can manage tip jars.')) return;
+            if (!j || !ensureAdmin('Only admins and store admins can manage tip jars.')) return;
             const btn = document.getElementById('btn-tipjar-delete-confirm');
             btn.disabled = true;
             try {
@@ -20763,7 +21328,7 @@ header('Cache-Control: no-cache, must-revalidate');
         // Master switch from the Tip Jars view: the same save as the store
         // card (keeps the current cap), then refresh both.
         async function turnOnTipJars() {
-            if (!ensureAdmin('Only admins can change store settings.')) return;
+            if (!ensureAdmin('Only admins and store admins can change store settings.')) return;
             if (!currentStoreId) return;
             const ss = dashboardData?.selfserve;
             const maxSats = (ss && ss.maxSatsOverride != null) ? ss.maxSatsOverride : '';

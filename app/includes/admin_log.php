@@ -129,7 +129,7 @@ class AdminLog {
         int $limit = 50,
         int $offset = 0,
         ?string $category = null,
-        ?string $storeId = null
+        string|array|null $storeId = null
     ): array {
         $limit = max(1, min(200, $limit));
         $offset = max(0, $offset);
@@ -195,7 +195,16 @@ class AdminLog {
             $where[] = 'category = ?';
             $params[] = $category;
         }
-        if ($storeId !== null && $storeId !== '') {
+        if (is_array($storeId)) {
+            // A store admin's scope: only entries of their stores; site-wide
+            // entries (store_id NULL) are not theirs to see.
+            if ($storeId === []) {
+                $where[] = '1 = 0';
+            } else {
+                $where[] = 'store_id IN (' . implode(',', array_fill(0, count($storeId), '?')) . ')';
+                $params = array_merge($params, array_values($storeId));
+            }
+        } elseif ($storeId !== null && $storeId !== '') {
             $where[] = 'store_id = ?';
             $params[] = $storeId;
         }

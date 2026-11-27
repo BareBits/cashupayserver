@@ -157,7 +157,7 @@ class MintReliability {
      *     NOT auto-cleared on interval — see the rationale on the
      *     MINT_UNREACHABLE_RETRY_INTERVAL_SEC constant.
      */
-    public static function isAvailableForNewInvoices(string $mintUrl): bool {
+    public static function isAvailableForNewInvoices(string $mintUrl, bool $honourTrustedList = true): bool {
         $row = Database::fetchOne(
             "SELECT disabled_pending_success, permanently_disabled,
                     trusted_list_disabled, last_failure_at, last_failure_kind
@@ -167,7 +167,12 @@ class MintReliability {
         if ($row === null) {
             return true; // unknown mint → assume healthy
         }
-        if ((int)$row['permanently_disabled'] || (int)$row['trusted_list_disabled']) {
+        if ((int)$row['permanently_disabled']) {
+            return false;
+        }
+        // The trusted list's blacklist is a site policy; a store that opted
+        // out of the list (TrustedMints::appliesToStore) is not bound by it.
+        if ($honourTrustedList && (int)$row['trusted_list_disabled']) {
             return false;
         }
         if (!(int)$row['disabled_pending_success']) {

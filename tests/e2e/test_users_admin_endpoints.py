@@ -22,7 +22,7 @@ def non_admin(configured: ConfiguredPayserver) -> dict[str, Any]:
     """Create a non-admin 'staff' user via the admin endpoint and return a
     logged-in AdminClient pointed at it plus its credentials."""
     admin = configured.admin
-    r = admin._post_action("create_user", username="staff", password="staffpw1234", role="user")
+    r = admin._post_action("create_user", username="staff", password="staffpw1234", role="user", store_ids=configured.store_id)
     assert r.get("success"), r
     user_id = r["id"]
 
@@ -191,8 +191,7 @@ def test_admin_can_list_and_create_and_delete_users(
     assert any(u["username"] == "admin" for u in before)
 
     created = admin._post_action(
-        "create_user", username="staff2", password="staff2pw1234", role="user"
-    )
+        "create_user", username="staff2", password="staff2pw1234", role="user", store_ids=configured.store_id)
     assert created["success"] is True
     new_id = created["id"]
 
@@ -282,7 +281,7 @@ def test_create_user_rejects_duplicate_username(
     r = admin.s.post(
         f"{configured.handle.url}/admin",
         data={"action": "create_user", "username": "staff", "password": "abcdefgh",
-              "role": "user"},
+              "role": "user", "store_ids": configured.store_id},
         headers={"X-CSRF-Token": admin.csrf_token},
         timeout=15,
     )

@@ -284,7 +284,7 @@ def test_api_write_actions_round_trip_and_are_admin_only(shared_configured: Conf
 
     # Non-admin: can read, cannot write.
     uname = "tj_staff_" + secrets.token_hex(3)
-    made = admin._post_action("create_user", username=uname, password="staffpw1234", role="user")
+    made = admin._post_action("create_user", username=uname, password="staffpw1234", role="user", store_ids=cfg.store_id)
     assert made.get("success"), made
     staff = AdminClient(cfg.handle.url)
     staff.login("staffpw1234", username=uname)
@@ -534,7 +534,7 @@ def test_non_admin_sees_tiles_but_no_controls(shared_configured: ConfiguredPayse
     jar = ensure_tip_jar(cfg.handle, cfg.store_id, "Read only", emoji="👀")
     _seed_settled_invoice(cfg, jar, 300)
     uname = "tj_viewer_" + secrets.token_hex(3)
-    made = cfg.admin._post_action("create_user", username=uname, password="viewerpw1234", role="user")
+    made = cfg.admin._post_action("create_user", username=uname, password="viewerpw1234", role="user", store_ids=cfg.store_id)
     assert made.get("success"), made
     ctx, page = _login_page(cfg, browser, username=uname, password="viewerpw1234")
     try:

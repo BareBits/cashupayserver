@@ -648,7 +648,9 @@ class Config {
      */
     public static function getStoreAllMintUrls(string $storeId): array {
         require_once __DIR__ . '/mint_reliability.php';
+        require_once __DIR__ . '/trusted_mints.php';
 
+        $honourTrustedList = TrustedMints::appliesToStore($storeId);
         $primary = self::getStoreMintUrl($storeId);
         $unit = self::getStoreMintUnit($storeId);
         $backups = self::getStoreEnabledMints($storeId, $unit);
@@ -665,7 +667,7 @@ class Config {
 
         $result = [];
         foreach ($candidates as $mintUrl) {
-            if (MintReliability::isAvailableForNewInvoices($mintUrl)) {
+            if (MintReliability::isAvailableForNewInvoices($mintUrl, $honourTrustedList)) {
                 $result[] = $mintUrl;
             }
         }

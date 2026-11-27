@@ -279,7 +279,7 @@ class Database {
                 // on existing installs that haven't yet picked it up. All migrations
                 // are idempotent, so a fire is safe.
                 $hasLatestMigration = $hasConfig
-                    && self::columnExists($pdo, 'stores', 'rewards_percent');
+                    && self::columnExists($pdo, 'stores', 'trusted_mints_enabled');
                 // The auto-withdraw → auto-cashout rename is a data-only migration
                 // (config key + notification event labels) with no schema artifact
                 // to mark it done, so probe for the legacy config key directly. The
@@ -544,6 +544,11 @@ HTACCESS;
             -- order. NULL = never answered (wizard pre-checks all three);
             -- '' = explicitly none. See WalletTabs::enabled.
             wallet_tabs TEXT DEFAULT NULL,
+            -- Whether the site-wide trusted mints list (docs/trusted-mints.md)
+            -- is applied to this store: auto-added backup mints and the
+            -- list's disabled flags. 0 = the store keeps exactly the mints
+            -- its operator chose. See TrustedMints::appliesToStore.
+            trusted_mints_enabled INTEGER NOT NULL DEFAULT 1,
             -- Timestamps
             created_at INTEGER NOT NULL
         );
@@ -634,16 +639,30 @@ HTACCESS;
             FOREIGN KEY (webhook_id) REFERENCES webhooks(id) ON DELETE CASCADE
         );
 
-        -- Users: web-admin identities. Single 'admin' role gates fund moves
-        -- and store/config changes; 'user' role can view + create invoices.
+        -- Users: web-admin identities. 'admin' holds every store and the
+        -- site-wide settings; 'store_admin' changes the settings of the
+        -- stores granted to it (user_store_access) and nothing global;
+        -- 'user' views + creates invoices on its granted stores.
         -- Migrated from the legacy single config.admin_password_hash slot —
         -- see runMigrations().
         CREATE TABLE IF NOT EXISTS users (
             id              TEXT PRIMARY KEY,
             username        TEXT NOT NULL UNIQUE COLLATE NOCASE,
             password_hash   TEXT NOT NULL,
-            role            TEXT NOT NULL CHECK (role IN ('admin','user')),
+            role            TEXT NOT NULL CHECK (role IN ('admin','store_admin','user')),
             created_at      INTEGER NOT NULL
+        );
+
+        -- Store grants for the non-admin roles. Admins have no rows: they
+        -- implicitly hold every store. A grant disappears with its user or
+        -- its store. See Auth::accessibleStoreIds().
+        CREATE TABLE IF NOT EXISTS user_store_access (
+            user_id    TEXT NOT NULL,
+            store_id   TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY (user_id, store_id),
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+            FOREIGN KEY (store_id) REFERENCES stores(id) ON DELETE CASCADE
         );
 
         -- Per-store backup mints for failover
@@ -2513,6 +2532,88 @@ HTACCESS;
         }
         if (!self::columnExists($pdo, 'stores', 'rewards_percent')) {
             $pdo->exec("ALTER TABLE stores ADD COLUMN rewards_percent REAL NOT NULL DEFAULT 0");
+        }
+
+        // ---- Store admin role + per-user store grants ----
+        // users.role gains 'store_admin'. The CHECK constraint lives in the
+        // table SQL, so widening it is the SQLite rebuild dance. Foreign keys
+        // are switched off around it: with them on, DROP TABLE users would
+        // cascade-delete password_reset_tokens (and the grants below).
+        self::widenUsersRoleCheck($pdo);
+
+        // Grants table. When it first appears on an existing install every
+        // 'user' account is granted every existing store: until now that role
+        // saw all stores, and an upgrade must not take anything away.
+        if (!self::tableExists($pdo, 'user_store_access')) {
+            $pdo->exec("
+                CREATE TABLE user_store_access (
+                    user_id    TEXT NOT NULL,
+                    store_id   TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    PRIMARY KEY (user_id, store_id),
+                    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+                    FOREIGN KEY (store_id) REFERENCES stores(id) ON DELETE CASCADE
+                );
+            ");
+            $pdo->exec("
+                INSERT OR IGNORE INTO user_store_access (user_id, store_id, created_at)
+                SELECT u.id, s.id, " . time() . "
+                  FROM users u CROSS JOIN stores s
+                 WHERE u.role = 'user'
+            ");
+        }
+
+        // Per-store opt-out of the trusted mints list (store admins keep the
+        // mints they chose). Plain column on purpose (no index / FK): it is
+        // the getInstance() migration marker and the marker tests drop it.
+        if (!self::columnExists($pdo, 'stores', 'trusted_mints_enabled')) {
+            $pdo->exec("ALTER TABLE stores ADD COLUMN trusted_mints_enabled INTEGER NOT NULL DEFAULT 1");
+        }
+    }
+
+    /**
+     * Rebuild the users table with the three-role CHECK constraint when it
+     * still carries the two-role one. Idempotent: the sqlite_master SQL of a
+     * rebuilt table names 'store_admin'.
+     */
+    private static function widenUsersRoleCheck(\PDO $pdo): void {
+        if (!self::tableExists($pdo, 'users')) {
+            return;
+        }
+        $sql = (string)($pdo->query("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'users'")
+            ->fetchColumn() ?: '');
+        if (str_contains($sql, 'store_admin')) {
+            return;
+        }
+        if ($pdo->inTransaction()) {
+            throw new \RuntimeException('users role widening must run outside a transaction');
+        }
+        $hasEmail = self::columnExists($pdo, 'users', 'email');
+        $cols = 'id, username, password_hash, role, created_at' . ($hasEmail ? ', email' : '');
+        $pdo->exec('PRAGMA foreign_keys = OFF');
+        try {
+            $pdo->exec("
+                BEGIN;
+                CREATE TABLE users_new (
+                    id              TEXT PRIMARY KEY,
+                    username        TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                    password_hash   TEXT NOT NULL,
+                    role            TEXT NOT NULL CHECK (role IN ('admin','store_admin','user')),
+                    created_at      INTEGER NOT NULL,
+                    email           TEXT DEFAULT NULL
+                );
+                INSERT INTO users_new ({$cols}) SELECT {$cols} FROM users;
+                DROP TABLE users;
+                ALTER TABLE users_new RENAME TO users;
+                COMMIT;
+            ");
+        } catch (\Throwable $e) {
+            if ($pdo->inTransaction()) {
+                $pdo->exec('ROLLBACK');
+            }
+            throw $e;
+        } finally {
+            $pdo->exec('PRAGMA foreign_keys = ON');
         }
     }
 

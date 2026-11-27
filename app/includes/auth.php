@@ -15,8 +15,10 @@ require_once __DIR__ . '/urls.php';
 class Auth {
     private const SESSION_NAME = 'cashupay_session';
     private const CSRF_TOKEN_NAME = 'csrf_token';
-    public const ROLE_ADMIN = 'admin';
-    public const ROLE_USER  = 'user';
+    public const ROLE_ADMIN       = 'admin';
+    public const ROLE_STORE_ADMIN = 'store_admin';
+    public const ROLE_USER        = 'user';
+    public const ROLES = [self::ROLE_ADMIN, self::ROLE_STORE_ADMIN, self::ROLE_USER];
 
     /**
      * Initialize session. Applies hardened cookie params (HttpOnly + SameSite
@@ -317,6 +319,177 @@ class Auth {
         return (self::validateSessionUser()['role'] ?? null) === self::ROLE_ADMIN;
     }
 
+    /** Role of the signed-in user, or null when nobody is signed in. */
+    public static function currentRole(): ?string {
+        if (!self::isLoggedIn()) {
+            return null;
+        }
+        return self::validateSessionUser()['role'] ?? null;
+    }
+
+    /** Store admin: changes the settings of its granted stores, nothing global. */
+    public static function isStoreAdmin(): bool {
+        return self::currentRole() === self::ROLE_STORE_ADMIN;
+    }
+
+    /** Admin or store admin — the roles that may change store settings at all. */
+    public static function isStoreManager(): bool {
+        $role = self::currentRole();
+        return $role === self::ROLE_ADMIN || $role === self::ROLE_STORE_ADMIN;
+    }
+
+    // =========================================================================
+    // Store grants
+    //
+    // Admins implicitly hold every store. Store admins and users hold the
+    // stores listed for them in user_store_access. "View" is what every
+    // granted role may do on a store (dashboard, invoices, create invoices);
+    // "manage" additionally requires the store_admin role (or admin).
+    // =========================================================================
+
+    /** Store ids granted to a user row (any role). Admins: every store. */
+    public static function storeIdsForUser(array $user): array {
+        if (($user['role'] ?? null) === self::ROLE_ADMIN) {
+            return array_column(Database::fetchAll("SELECT id FROM stores ORDER BY created_at DESC"), 'id');
+        }
+        return self::getUserStoreIds((string)($user['id'] ?? ''));
+    }
+
+    /** Store ids the signed-in user may see; [] when nobody is signed in. */
+    public static function accessibleStoreIds(): array {
+        $user = self::currentUser();
+        return $user ? self::storeIdsForUser($user) : [];
+    }
+
+    /** Admin, or any granted role holding the store. */
+    public static function canViewStore(string $storeId): bool {
+        if ($storeId === '') {
+            return false;
+        }
+        if (self::isAdmin()) {
+            return true;
+        }
+        $user = self::currentUser();
+        if (!$user) {
+            return false;
+        }
+        return Database::fetchOne(
+            "SELECT 1 FROM user_store_access WHERE user_id = ? AND store_id = ?",
+            [$user['id'], $storeId]
+        ) !== null;
+    }
+
+    /** Admin, or a store admin holding the store. */
+    public static function canManageStore(string $storeId): bool {
+        if (self::isAdmin()) {
+            return true;
+        }
+        return self::isStoreAdmin() && self::canViewStore($storeId);
+    }
+
+    private static function denyStore(string $message): void {
+        cashupay_status(403);
+        header('Content-Type: application/json');
+        echo json_encode(['error' => $message]);
+        exit;
+    }
+
+    /** 403 + exit unless the session may view $storeId. */
+    public static function requireStoreView(string $storeId): void {
+        if (!self::canViewStore($storeId)) {
+            self::denyStore('You do not have access to this store');
+        }
+    }
+
+    /** 403 + exit unless the session may change $storeId's settings. */
+    public static function requireStoreManage(string $storeId): void {
+        if (!self::canManageStore($storeId)) {
+            self::denyStore(self::isStoreManager()
+                ? 'You do not have access to this store'
+                : 'Store admin role required');
+        }
+    }
+
+    /** 403 + exit unless the session is an admin or a store admin. */
+    public static function requireStoreManager(): void {
+        if (!self::isStoreManager()) {
+            self::denyStore('Store admin role required');
+        }
+    }
+
+    /**
+     * Resolve a store filter from the UI ('' or '__all__' = every store the
+     * caller may see, otherwise one store id) to the list of store ids a
+     * query may cover. null means "no restriction" (an admin asking for all).
+     * A single store the caller does not hold ends the request with 403.
+     */
+    public static function scopeStoreFilter(?string $requested): ?array {
+        $requested = trim((string)$requested);
+        if ($requested === '' || $requested === '__all__') {
+            return self::isAdmin() ? null : self::accessibleStoreIds();
+        }
+        self::requireStoreView($requested);
+        return [$requested];
+    }
+
+    /** SQL fragment restricting `$column` to $storeIds (null = no restriction). */
+    public static function storeScopeSql(?array $storeIds, string $column = 'store_id'): array {
+        if ($storeIds === null) {
+            return ['sql' => '', 'params' => []];
+        }
+        if ($storeIds === []) {
+            return ['sql' => '1 = 0', 'params' => []];
+        }
+        return [
+            'sql' => $column . ' IN (' . implode(',', array_fill(0, count($storeIds), '?')) . ')',
+            'params' => array_values($storeIds),
+        ];
+    }
+
+    /** Store ids granted to a user (user_store_access rows only). */
+    public static function getUserStoreIds(string $userId): array {
+        if ($userId === '') {
+            return [];
+        }
+        return array_column(Database::fetchAll(
+            "SELECT a.store_id FROM user_store_access a
+               JOIN stores s ON s.id = a.store_id
+              WHERE a.user_id = ? ORDER BY s.created_at DESC",
+            [$userId]
+        ), 'store_id');
+    }
+
+    /**
+     * Replace a user's grants. Admin accounts never carry grants (their rows
+     * are cleared). Unknown store ids are refused. Caller authorizes.
+     */
+    public static function setUserStoreIds(string $userId, array $storeIds): void {
+        $user = self::getUserById($userId);
+        if (!$user) {
+            throw new \RuntimeException('User not found');
+        }
+        $storeIds = array_values(array_unique(array_map('strval', $storeIds)));
+        if ($user['role'] === self::ROLE_ADMIN) {
+            $storeIds = [];
+        }
+        $known = [];
+        foreach (Database::fetchAll("SELECT id FROM stores") as $row) {
+            $known[$row['id']] = true;
+        }
+        foreach ($storeIds as $sid) {
+            if (!isset($known[$sid])) {
+                throw new \InvalidArgumentException('Unknown store');
+            }
+        }
+        Database::delete('user_store_access', 'user_id = ?', [$userId]);
+        $now = Database::timestamp();
+        foreach ($storeIds as $sid) {
+            Database::insert('user_store_access', [
+                'user_id' => $userId, 'store_id' => $sid, 'created_at' => $now,
+            ]);
+        }
+    }
+
     /**
      * Fingerprint of the credential a session was established with. Stored
      * in the session (never the hash itself) and compared on every request.
@@ -599,14 +772,60 @@ class Auth {
     }
 
     /**
-     * List all users (no hashes). Ordered admin-first then alphabetical.
+     * List all users (no hashes) with their store grants. Ordered admin,
+     * store admin, user, then alphabetical.
      */
     public static function listUsers(): array {
-        return Database::fetchAll(
-            "SELECT id, username, role, created_at
+        $users = Database::fetchAll(
+            "SELECT id, username, role, email, created_at
              FROM users
-             ORDER BY (role = 'admin') DESC, LOWER(username) ASC"
+             ORDER BY CASE role WHEN 'admin' THEN 0 WHEN 'store_admin' THEN 1 ELSE 2 END,
+                      LOWER(username) ASC"
         );
+        $grants = [];
+        foreach (Database::fetchAll("SELECT user_id, store_id FROM user_store_access") as $row) {
+            $grants[$row['user_id']][] = $row['store_id'];
+        }
+        foreach ($users as &$u) {
+            $u['storeIds'] = $u['role'] === self::ROLE_ADMIN ? [] : ($grants[$u['id']] ?? []);
+        }
+        unset($u);
+        return $users;
+    }
+
+    public static function isValidRole(mixed $role): bool {
+        return is_string($role) && in_array($role, self::ROLES, true);
+    }
+
+    /**
+     * Change a user's role. Demoting the only admin is refused (the install
+     * would have nobody left who can reach the site-wide settings). Promotion
+     * to admin drops the grants (admins hold every store implicitly). Caller
+     * authorizes and, when demoting, follows up with setUserStoreIds().
+     */
+    public static function setUserRole(string $userId, string $role): void {
+        if (!self::isValidRole($role)) {
+            throw new \InvalidArgumentException('Invalid role');
+        }
+        $user = self::getUserById($userId);
+        if (!$user) {
+            throw new \RuntimeException('User not found');
+        }
+        if ($user['role'] === $role) {
+            return;
+        }
+        if ($user['role'] === self::ROLE_ADMIN) {
+            $adminCount = (int)Database::fetchOne(
+                "SELECT COUNT(*) AS c FROM users WHERE role = 'admin'"
+            )['c'];
+            if ($adminCount <= 1) {
+                throw new \RuntimeException('Cannot demote the only remaining admin');
+            }
+        }
+        Database::update('users', ['role' => $role], 'id = ?', [$userId]);
+        if ($role === self::ROLE_ADMIN) {
+            Database::delete('user_store_access', 'user_id = ?', [$userId]);
+        }
     }
 
     /**
@@ -632,13 +851,33 @@ class Auth {
     /**
      * Create a new user. Returns the new user id.
      * Throws on duplicate username, invalid input, or invalid role.
+     *
+     * $storeIds are the grants for a store admin / user (admins take none);
+     * a non-admin needs at least one — an account that can see nothing is a
+     * mistake at creation time, even though one may end up with none later
+     * when its last store is deleted. $email is the optional recovery
+     * address for the e-mailed password reset.
      */
-    public static function createUser(string $username, string $password, string $role): string {
-        if ($role !== self::ROLE_ADMIN && $role !== self::ROLE_USER) {
+    public static function createUser(
+        string $username,
+        string $password,
+        string $role,
+        array $storeIds = [],
+        ?string $email = null
+    ): string {
+        if (!self::isValidRole($role)) {
             throw new \InvalidArgumentException('Invalid role');
         }
         if ($err = self::validateUsername($username))  throw new \InvalidArgumentException($err);
         if ($err = self::validatePassword($password))  throw new \InvalidArgumentException($err);
+        $email = $email !== null ? trim($email) : null;
+        if ($email !== null && $email !== '' && ($err = self::validateEmail($email))) {
+            throw new \InvalidArgumentException($err);
+        }
+        $storeIds = array_values(array_unique(array_map('strval', $storeIds)));
+        if ($role !== self::ROLE_ADMIN && $storeIds === []) {
+            throw new \InvalidArgumentException('Select at least one store for this account');
+        }
 
         if (self::getUserByUsername($username) !== null) {
             throw new \RuntimeException('A user with that name already exists');
@@ -650,8 +889,17 @@ class Auth {
             'username'      => $username,
             'password_hash' => password_hash($password, PASSWORD_DEFAULT),
             'role'          => $role,
+            'email'         => ($email !== null && $email !== '') ? $email : null,
             'created_at'    => Database::timestamp(),
         ]);
+        if ($role !== self::ROLE_ADMIN) {
+            try {
+                self::setUserStoreIds($userId, $storeIds);
+            } catch (\Throwable $e) {
+                Database::delete('users', 'id = ?', [$userId]);
+                throw $e;
+            }
+        }
         return $userId;
     }
 
@@ -754,21 +1002,29 @@ class Auth {
     }
 
     /**
-     * Find the admin user whose recovery email matches (case-insensitive).
-     * Returns the full row or null. Used by the reset-link request flow.
+     * Find the user whose recovery email matches (case-insensitive), any
+     * role — every account may reset its own password by e-mail. Admins win
+     * when two accounts share an address. Returns the full row or null.
      */
-    public static function findAdminByEmail(string $email): ?array {
+    public static function findUserByEmail(string $email): ?array {
         $email = trim($email);
         if ($email === '') {
             return null;
         }
         return Database::fetchOne(
             "SELECT * FROM users
-              WHERE role = 'admin' AND email IS NOT NULL AND email != ''
+              WHERE email IS NOT NULL AND email != ''
                 AND email = ? COLLATE NOCASE
+              ORDER BY CASE role WHEN 'admin' THEN 0 WHEN 'store_admin' THEN 1 ELSE 2 END,
+                       created_at ASC
               LIMIT 1",
             [$email]
         ) ?: null;
+    }
+
+    /** @deprecated Kept for callers written when only admins could reset by e-mail. */
+    public static function findAdminByEmail(string $email): ?array {
+        return self::findUserByEmail($email);
     }
 
     /**
