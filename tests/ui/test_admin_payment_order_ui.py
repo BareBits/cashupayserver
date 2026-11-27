@@ -97,7 +97,9 @@ def test_payment_order_card_sits_below_store_info(
         "#store-settings-content > .card > .card-header > .card-title",
         "els => els.map(e => e.textContent.trim())",
     )
-    assert titles[:4] == ["Store Info", "Payment order", "Popular wallet tabs", "Lightning payments"], titles
+    assert titles[:5] == [
+        "Store Info", "Payment order", "Popular wallet tabs", "🎁 Rewards", "Lightning payments",
+    ], titles
 
     # Two radios, on-chain checked by default for a store that never saved.
     assert _store_first_method(shared_configured.handle, shared_configured.store_id) is None
