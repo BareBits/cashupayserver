@@ -2,7 +2,7 @@
 Contributors: barebits
 Tags: bitcoin, lightning, payments, woocommerce, btcpay
 Requires at least: 6.0
-Tested up to: 7.1
+Tested up to: 7.2
 Requires PHP: 8.0
 Stable tag: 1.10
 License: GPLv2 or later

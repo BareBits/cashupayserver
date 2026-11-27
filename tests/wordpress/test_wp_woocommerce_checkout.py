@@ -47,6 +47,7 @@ from fixtures.wc_checkout import (  # noqa: F401 — re-exported for the sibling
     order_field,
     place_order,
     store_api_url,
+    woocommerce_order_total,
 )
 from fixtures.wordpress import WordPressHandle
 
@@ -191,8 +192,11 @@ def test_checkout_totals_match_submitted_payment_method(woocommerce, configured)
     state the extension sync left the session in:
 
     - paying with BareBits WITHOUT any prior selection sync (a blocked or
-      racing script) still yields a discounted order, and the invoice the
-      gateway creates on the payserver carries the discounted amount;
+      racing script) still yields a discounted order — the fee item is on
+      the order and the total is WooCommerce's own figure for the discounted
+      cart (rounded to WC_ORDER_TOTAL_DECIMALS, see fixtures/wc_checkout.py)
+      — and the invoice the gateway creates on the payserver carries exactly
+      that order total;
     - paying with another method AFTER the cart was discounted strips the
       fee, so no card/COD order ever leaves with the Bitcoin discount."""
     wp, info = woocommerce
@@ -217,11 +221,14 @@ def test_checkout_totals_match_submitted_payment_method(woocommerce, configured)
         " 'total' => $f->get_total()], $o->get_fees()))]);"
     )
     order = json.loads(wp.wp_cli("eval", snippet).stdout.strip().splitlines()[-1])
-    assert float(order["total"]) == pytest.approx(0.00002925), order
+    # 2 x 1500 sats less 2.5% = 2925 sats exactly; WooCommerce stores the
+    # order total at its own precision (0.00002900).
+    assert float(order["total"]) == pytest.approx(float(woocommerce_order_total(2925))), order
     assert [f["name"] for f in order["fees"]] == ["Bitcoin discount (2.5%)"], order
     assert float(order["fees"][0]["total"]) == pytest.approx(-0.00000075), order
 
-    # The gateway invoiced the payserver for the DISCOUNTED total.
+    # The gateway invoiced the payserver for exactly the order total
+    # WooCommerce computed — BareBits never second-guesses that figure.
     invoice_id = _order_field(wp, order_id, "get_meta('BTCPay_id')")
     assert invoice_id and invoice_id != "NO_ORDER", checkout
     inv = requests.get(
@@ -230,7 +237,7 @@ def test_checkout_totals_match_submitted_payment_method(woocommerce, configured)
         timeout=15,
     )
     inv.raise_for_status()
-    assert float(inv.json()["amount"]) == pytest.approx(0.00002925), inv.json()
+    assert float(inv.json()["amount"]) == pytest.approx(float(order["total"])), inv.json()
 
     # --- COD order placed from a cart the sync had already discounted ---
     session = _StoreApiSession(wp)

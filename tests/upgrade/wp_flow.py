@@ -45,7 +45,7 @@ from fixtures.lnd import LndHandle
 from fixtures.payserver import PayserverHandle
 from fixtures.upgrade_flow import SeededInstall, pay_ln_invoice
 from fixtures.wc_checkout import GATEWAY_ID, order_field, place_order
-from fixtures.wordpress import WordPressHandle
+from fixtures.wordpress import WordPressHandle, php_error_in_page
 from wordpress.conftest import drive_pairing, onboarding_page, post_onboarding, wp_option
 
 PLUGIN_SLUG = "barebits"
@@ -284,7 +284,10 @@ def assert_plugin_serving(wp: WordPressHandle, s: requests.Session, *, label: st
     version skew) and, in install mode, the WP-cron pinger still reaches the
     install's cron.php."""
     body = onboarding_page(s, wp)
-    assert "Fatal error" not in body and "Warning:" not in body, f"[{label}] plugin page broken: {body[:2000]}"
+    at = body.find("Fatal error")
+    assert at < 0, f"[{label}] plugin page broken (fatal): ...{body[max(0, at - 600):at + 600]}..."
+    rendered = php_error_in_page(body)
+    assert rendered is None, f"[{label}] plugin page broken (PHP error rendered into it): {rendered}"
     if wp_option(wp, "barebits_mode") == "install":
         res = wp.wp_cli("cron", "event", "run", "barebits_cron_tick", check=False)
         assert res.returncode == 0, f"[{label}] WP-cron pinger failed:\n{res.stdout}\n{res.stderr}"

@@ -109,6 +109,47 @@ fixture variants share the same three goldens. Escape hatch:
 `CASHUPAY_WP_NO_TEMPLATE=1` restores the per-test real install; the template
 contract itself is pinned by `wordpress/test_wp_template_clone.py`.
 
+### WordPress core version and the compatibility check
+
+The tier runs on the core pinned as `WP_VERSION` in `fixtures/wordpress.py`
+(WooCommerce, the BTCPay gateway, the SQLite drop-in and Plugin Check are
+pinned next to it). `CASHUPAY_WP_CORE_VERSION=<version>` points one run at
+any core wordpress.org serves a tarball for, betas and release candidates
+included — the way to validate an upcoming WordPress release before the pin
+and the readme's `Tested up to` move:
+
+```bash
+CASHUPAY_WP_CORE_VERSION=7.2-RC3 .venv/bin/pytest wordpress/
+```
+
+`wordpress/test_wp_core_compat.py` is the test aimed at new cores: it runs
+the plugin's whole surface (activation, wp-admin pages, URL-mode onboarding
+with a real pairing, the WooCommerce wiring, both checkout renders, a Store
+API checkout through the gateway, the settled-invoice webhook, WP-Cron,
+uninstall) on an install with `WP_DEBUG` + `WP_DEBUG_LOG` on
+(`start_wordpress(debug_log=True)`) and asserts no PHP error or WordPress
+deprecation is attributable to the plugin. A test-only mu-plugin records
+every `_deprecated_*()` / `_doing_it_wrong()` report with its call stack
+(WordPress logs those from `wp-includes/functions.php`, so the log line alone
+cannot say whose call it was); `classify_debug_findings` pins a report on the
+plugin only when the plugin is the deprecated call's direct caller, names a
+deprecated hook in its source, or owns the text domain of an early
+translation load — WooCommerce's and wp-cli's own noise is dropped
+(`wordpress/test_wp_debug_probe_classifier.py` pins the rules). The readme
+gate in `test_wp_plugin_check.py` compares `Tested up to` with the running
+core's major.minor, so a `7.2-RC3` run needs the readme to say 7.2.
+
+Two things the WooCommerce 11 bump (2026-11-26) taught the tier: WooCommerce
+10.1+ rounds *order* totals to 6 decimals whatever the shop's price decimals
+(`NumberUtil::normalize()` pre-rounds to `WC_ROUNDING_PRECISION`), so on the
+8-decimal BTC fixture shop a 1462-sat cart becomes a 0.00001500 order and
+invoice; BareBits invoices whatever total WooCommerce hands the gateway, and
+the discount tests assert that figure through
+`fixtures/wc_checkout.py::woocommerce_order_total()`. And never assert a bare
+`"Warning:" not in body` on a wp-admin page — the BTCPay gateway prints the
+word in a localized script string; `fixtures.wordpress.php_error_in_page`
+matches PHP's own rendered errors instead.
+
 ### SQLite drop-in driver
 
 The fixture's `wp-config.php` turns on the sqlite-database-integration
@@ -237,6 +278,9 @@ See `fixtures/binaries.py` for the canonical manifest. At time of writing:
 | PHP (static) | 8.3.31 |
 | Nutshell | 0.16.5 |
 | Playwright Chromium | bundled with playwright 1.49.1 |
+| WordPress core (`fixtures/wordpress.py`) | 7.1 (`CASHUPAY_WP_CORE_VERSION` overrides per run) |
+| WooCommerce | 11.3.1 |
+| BTCPay Greenfield for WooCommerce | 2.8.0 |
 
 ## Selecting a subset
 
