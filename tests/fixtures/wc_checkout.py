@@ -10,12 +10,34 @@ during and after a plugin/server upgrade.
 from __future__ import annotations
 
 import time
+from decimal import ROUND_HALF_UP, Decimal
 
 import requests
 
 from .wordpress import WordPressHandle
 
 GATEWAY_ID = "btcpaygf_default"
+
+# WooCommerce rounds ORDER totals to this many decimals regardless of the
+# shop's price decimals: since WooCommerce 10.1 ("Restore support for float
+# based quantities", #58693) NumberUtil::round() first normalises every value
+# to the fixed WC_ROUNDING_PRECISION constant (6), so WC_Abstract_Order::
+# calculate_totals() — which the blocks checkout / Store API run on every
+# order it builds — rounds an 8-decimal BTC shop's total to 100-sat steps,
+# half up. Line items and fee items keep their exact amounts; the cart totals
+# the shopper sees at checkout are exact too (integer-precision cart math).
+# BareBits deliberately invoices whatever total WooCommerce hands the gateway
+# (operator decision 2026-11-26), so the tests assert against this rounding
+# rather than steering WooCommerce's math.
+WC_ORDER_TOTAL_DECIMALS = 6
+
+
+def woocommerce_order_total(sats: int) -> Decimal:
+    """The order total WooCommerce stores for an exact `sats` cart total on
+    an 8-decimal BTC shop — see WC_ORDER_TOTAL_DECIMALS. 1462 -> 0.000015,
+    2925 -> 0.000029, 1500 -> 0.000015."""
+    exact = Decimal(sats).scaleb(-8)
+    return exact.quantize(Decimal(1).scaleb(-WC_ORDER_TOTAL_DECIMALS), rounding=ROUND_HALF_UP)
 
 
 def store_api_url(wp: WordPressHandle, path: str) -> str:

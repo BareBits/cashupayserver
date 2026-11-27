@@ -106,7 +106,12 @@ def _assert_readme_sane(zip_path: Path, wp: WordPressHandle) -> None:
     assert headers.get("Stable tag") == headers["_plugin_version"], headers
     core = wp.wp_cli("core", "version").stdout.strip()
     tested = headers.get("Tested up to", "0")
-    assert [int(x) for x in tested.split(".")] >= [int(x) for x in core.split(".")[:2]], (
+    # Major.minor only: a point release ("7.1.5") and a pre-release the tier
+    # was pointed at via CASHUPAY_WP_CORE_VERSION ("7.2-RC3") both count as
+    # their minor, which is what the readme header names.
+    core_minor = re.match(r"(\d+)\.(\d+)", core)
+    assert core_minor, f"unparseable WP core version {core!r}"
+    assert [int(x) for x in tested.split(".")] >= [int(core_minor.group(1)), int(core_minor.group(2))], (
         f"readme 'Tested up to: {tested}' is older than the WP core this suite runs ({core})"
     )
     # wordpress.org review gate (2026-09 submission feedback): external

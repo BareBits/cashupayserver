@@ -15,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -34,7 +35,13 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 TESTS_DIR = REPO_ROOT / "tests"
 BIN_DIR = TESTS_DIR / "bin"
 
-WP_VERSION = "7.1"
+# The WordPress core the tier runs on. CASHUPAY_WP_CORE_VERSION overrides the
+# pin for one run — any version wordpress.org serves a tarball for, betas and
+# release candidates included ("7.2-RC3") — so an upcoming release can be
+# validated against the whole tier before the pin (and the readme's "Tested
+# up to") move. The cache dir is versioned, so overrides never clobber the
+# pinned core.
+WP_VERSION = os.environ.get("CASHUPAY_WP_CORE_VERSION", "").strip() or "7.1"
 WP_TARBALL_URL = f"https://wordpress.org/wordpress-{WP_VERSION}.tar.gz"
 WP_TARBALL_SHA256 = ""  # populated lazily via wp.org checksums; see _wp_core_path
 WP_TARBALL_CACHE = BIN_DIR / f"wordpress-{WP_VERSION}"
@@ -52,14 +59,18 @@ WP_ADMIN_EMAIL = "admin@example.test"
 WP_SITE_TITLE = "CashuPay Test"
 
 # WooCommerce + the real BTCPay Greenfield gateway plugin, pinned for a
-# deterministic end-to-end checkout. WooCommerce stays pinned at 9.6.2
-# (Requires at least: 6.6) even on the 7.1 core — bumping it is its own
-# shake-out (checkout flows, HPOS goldens) and is deliberately decoupled from
-# core bumps. The BTCPay plugin verifies the exact same `sha256=` HMAC
-# BareBits emits, so no protocol shim is needed.
-WOOCOMMERCE_VERSION = "9.6.2"
+# deterministic end-to-end checkout. WooCommerce 11.3.1 (Requires at least:
+# 7.0) — bumped from 9.6.2 alongside the WordPress 7.2 validation
+# (2026-11-26); a WooCommerce bump is its own shake-out (checkout flows,
+# HPOS goldens) and stays a deliberate, separate decision from core bumps.
+# What this one shook out: WooCommerce >= 10.1 rounds ORDER totals to 6
+# decimals on this 8-decimal BTC shop (fixtures/wc_checkout.py,
+# WC_ORDER_TOTAL_DECIMALS); the discount tests assert WooCommerce's figure.
+# The BTCPay plugin verifies the exact same `sha256=` HMAC BareBits emits, so
+# no protocol shim is needed.
+WOOCOMMERCE_VERSION = "11.3.1"
 WOOCOMMERCE_URL = f"https://downloads.wordpress.org/plugin/woocommerce.{WOOCOMMERCE_VERSION}.zip"
-WOOCOMMERCE_SHA256 = "d801efe9ffc3fdcf1495dc9662a08c9373ff1eee44b1838de649cf758ccbcd13"
+WOOCOMMERCE_SHA256 = "1502600c738840f7f9ebfa2f11e1aaff087221a5fc5a2006c51be2d874ae2a09"
 WOOCOMMERCE_CACHE = BIN_DIR / f"woocommerce-{WOOCOMMERCE_VERSION}"
 
 BTCPAY_WC_VERSION = "2.8.0"
@@ -88,6 +99,10 @@ class WordPressHandle:
     # Set when the install came from (or built) the WooCommerce golden
     # template: the pre-created virtual product's id. None on plain installs.
     woo_product_id: int | None = None
+    # Set by start_wordpress(debug_log=True): the WP_DEBUG_LOG file and the
+    # deprecation probe's JSON-lines file (see plugin_debug_findings).
+    debug_log_path: Path | None = None
+    debug_probe_path: Path | None = None
 
     @property
     def process(self) -> subprocess.Popen[bytes] | None:
@@ -133,6 +148,28 @@ class WordPressHandle:
         if outside.exists():
             return outside
         return self.barebits_dir / "data" / "cashupay.sqlite"
+
+    def plugin_debug_findings(self) -> list[str]:
+        """Every PHP error and WordPress deprecation / doing-it-wrong this
+        install recorded that is attributable to the barebits plugin — the
+        list a WordPress-compatibility test asserts empty. Requires
+        start_wordpress(debug_log=True); see classify_debug_findings for the
+        attribution rules."""
+        if self.debug_log_path is None or self.debug_probe_path is None:
+            raise RuntimeError("plugin_debug_findings needs start_wordpress(debug_log=True)")
+        log_lines = (
+            self.debug_log_path.read_text(errors="replace").splitlines()
+            if self.debug_log_path.is_file() else []
+        )
+        probe_entries: list[dict] = []
+        if self.debug_probe_path.is_file():
+            for raw in self.debug_probe_path.read_text(errors="replace").splitlines():
+                raw = raw.strip()
+                if raw:
+                    probe_entries.append(json.loads(raw))
+        return classify_debug_findings(
+            log_lines, probe_entries, plugin_dir=self.wp_root / "wp-content" / "plugins" / "barebits"
+        )
 
     @contextmanager
     def db(self) -> Iterator[sqlite3.Connection]:
@@ -326,6 +363,206 @@ def _assemble_plugin(plugin_dir: Path) -> None:
         shutil.copytree(assets_src, assets_dst)
 
 
+# ---------- PHP errors rendered into a page ----------
+
+_PHP_ERROR_IN_PAGE = re.compile(
+    r"(?:<b>)?(?:Fatal error|Parse error|Warning|Notice|Deprecated)(?:</b>)?:\s+.{0,400}?"
+    r" in (?:<b>)?\S+?(?:</b>)? on line (?:<b>)?\d+",
+    re.S,
+)
+
+
+def php_error_in_page(body: str) -> str | None:
+    """The first PHP error PHP itself rendered into an HTML response ("Warning:
+    ... in /path/file.php on line N", with or without html_errors markup), or
+    None. Use this instead of a bare `"Warning:" in body`: plugins print
+    the word in their own UI strings (the BTCPay gateway's order-states
+    warning rides every admin page as a localized script variable)."""
+    m = _PHP_ERROR_IN_PAGE.search(body)
+    return m.group(0) if m else None
+
+
+# ---------- WordPress-compatibility debug probe ----------
+
+# The plugin's wp.org text domain (wordpress/barebits.php header; pinned by
+# test_wp_plugin_check.py). WordPress names the domain, not the file, when it
+# reports a translation loaded too early (_load_textdomain_just_in_time).
+PLUGIN_TEXT_DOMAIN = "barebits-lightning-payments-via-bitcoin"
+
+_DEBUG_PROBE_PHP = r"""<?php
+/**
+ * Test-only probe (tests/fixtures/wordpress.py, start_wordpress(debug_log=True)).
+ *
+ * WP_DEBUG_LOG records a WordPress-level deprecation with the file that
+ * called trigger_error() — wp-includes/functions.php, never the plugin that
+ * made the deprecated call. This mu-plugin listens to the actions WordPress
+ * fires right before that and writes each report with the functions and
+ * files on its call stack, so the Python side can attribute it to the
+ * plugin under test (WordPressHandle.plugin_debug_findings).
+ */
+$barebits_probe_log = '%(probe_path)s';
+$barebits_probe_record = function (string $kind, array $fields) use ($barebits_probe_log): void {
+    $frames = [];
+    foreach (debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS, 60) as $frame) {
+        $function = $frame['function'] ?? '';
+        if (!empty($frame['class'])) {
+            $function = $frame['class'] . '::' . $function;
+        }
+        $frames[] = [
+            'file' => $frame['file'] ?? '',
+            'line' => $frame['line'] ?? 0,
+            'function' => $function,
+        ];
+    }
+    $fields['kind'] = $kind;
+    $fields['trace'] = $frames;
+    $fields['request'] = PHP_SAPI === 'cli' ? 'cli' : ($_SERVER['REQUEST_URI'] ?? '');
+    file_put_contents($barebits_probe_log, json_encode($fields) . "\n", FILE_APPEND | LOCK_EX);
+};
+add_action('deprecated_function_run', function ($function, $replacement, $version) use ($barebits_probe_record) {
+    $barebits_probe_record('deprecated_function', ['function' => (string) $function, 'replacement' => (string) $replacement, 'version' => (string) $version]);
+}, 10, 3);
+add_action('deprecated_constructor_run', function ($class, $version, $parent_class) use ($barebits_probe_record) {
+    $barebits_probe_record('deprecated_constructor', ['class' => (string) $class, 'version' => (string) $version, 'parent_class' => (string) $parent_class]);
+}, 10, 3);
+add_action('deprecated_class_run', function ($class, $replacement, $version) use ($barebits_probe_record) {
+    $barebits_probe_record('deprecated_class', ['class' => (string) $class, 'replacement' => (string) $replacement, 'version' => (string) $version]);
+}, 10, 3);
+add_action('deprecated_file_included', function ($file, $replacement, $version, $message) use ($barebits_probe_record) {
+    $barebits_probe_record('deprecated_file', ['file' => (string) $file, 'replacement' => (string) $replacement, 'version' => (string) $version, 'message' => (string) $message]);
+}, 10, 4);
+add_action('deprecated_argument_run', function ($function, $message, $version) use ($barebits_probe_record) {
+    $barebits_probe_record('deprecated_argument', ['function' => (string) $function, 'message' => (string) $message, 'version' => (string) $version]);
+}, 10, 3);
+add_action('deprecated_hook_run', function ($hook, $replacement, $version, $message) use ($barebits_probe_record) {
+    $barebits_probe_record('deprecated_hook', ['hook' => (string) $hook, 'replacement' => (string) $replacement, 'version' => (string) $version, 'message' => (string) $message]);
+}, 10, 4);
+add_action('doing_it_wrong_run', function ($function, $message, $version) use ($barebits_probe_record) {
+    $barebits_probe_record('doing_it_wrong', ['function' => (string) $function, 'message' => (string) $message, 'version' => (string) $version]);
+}, 10, 3);
+"""
+
+
+def _install_debug_probe(wp_root: Path, probe_path: Path) -> None:
+    """Drop the deprecation probe mu-plugin into the install (clones overwrite
+    the golden's wp-content, so this is per handle, like wp-config.php)."""
+    mu = wp_root / "wp-content" / "mu-plugins"
+    mu.mkdir(parents=True, exist_ok=True)
+    (mu / "barebits-test-debug-probe.php").write_text(
+        _DEBUG_PROBE_PHP % {"probe_path": str(probe_path).replace("\\", "\\\\").replace("'", "\\'")}
+    )
+
+
+_PHP_LOG_LINE = re.compile(
+    r"PHP (?P<level>Deprecated|Warning|Notice|Fatal error|Parse error|Recoverable fatal error):"
+    r"\s+(?P<message>.*?) in (?P<file>\S+?)(?::\d+)? on line (?P<line>\d+)\s*$"
+)
+
+
+def _is_plugin_path(path: str, plugin_dir: Path) -> bool:
+    path = path.replace("\\", "/")
+    return path.startswith(f"{plugin_dir.as_posix()}/") or "/wp-content/plugins/barebits/" in path
+
+
+def _is_core_path(path: str) -> bool:
+    """A frame WordPress itself (or the test infrastructure) owns: anything
+    outside wp-content — core files, the fixture's router wrapper, wp-cli's
+    phar, eval()'d code. Only wp-content frames can be culprits."""
+    return "/wp-content/" not in path.replace("\\", "/")
+
+
+def _plugin_source_mentions(plugin_dir: Path, needle: str) -> bool:
+    if not needle:
+        return False
+    for php in plugin_dir.glob("*.php"):
+        try:
+            if needle in php.read_text(errors="replace"):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _probe_entry_is_ours(entry: dict, plugin_dir: Path) -> bool:
+    """Attribute one probe record to the plugin under test.
+
+    The deprecated call's DIRECT caller is the frame whose `function` is the
+    deprecated function/class (PHP backtrace frames carry the call site's
+    file with the callee's name), so a deprecated WooCommerce helper called
+    from WooCommerce's own internals is not pinned on the plugin that merely
+    called WooCommerce. Deprecated hooks are fired by whoever runs the hook,
+    so those are ours when the plugin's source names the hook. A translation
+    loaded too early is reported by domain, so the plugin's text domain in
+    the message counts. Anything else falls back to the first wp-content
+    frame on the stack."""
+    kind = entry.get("kind", "")
+    trace = entry.get("trace") or []
+    message = str(entry.get("message", ""))
+
+    if kind == "deprecated_file" and _is_plugin_path(str(entry.get("file", "")), plugin_dir):
+        return True
+    if kind == "deprecated_hook":
+        return _plugin_source_mentions(plugin_dir, str(entry.get("hook", "")))
+    if PLUGIN_TEXT_DOMAIN in message:
+        return True
+
+    target = str(entry.get("function") or entry.get("class") or "").lower()
+    if target:
+        for frame in trace:
+            fn = str(frame.get("function", "")).lower()
+            if fn == target or (
+                kind in ("deprecated_constructor", "deprecated_class")
+                and fn == f"{target}::__construct"
+            ):
+                return _is_plugin_path(str(frame.get("file", "")), plugin_dir)
+    for frame in trace:
+        file = str(frame.get("file", ""))
+        if file and not _is_core_path(file) and "mu-plugins/barebits-test-" not in file:
+            return _is_plugin_path(file, plugin_dir)
+    return False
+
+
+def _format_probe_entry(entry: dict) -> str:
+    kind = entry.get("kind", "?")
+    subject = entry.get("function") or entry.get("class") or entry.get("hook") or entry.get("file") or ""
+    bits = [f"{kind}: {subject}"]
+    for key in ("version", "replacement", "message"):
+        if entry.get(key):
+            bits.append(f"{key}={entry[key]!s}")
+    culprit = next(
+        (f"{f.get('file')}:{f.get('line')}" for f in (entry.get("trace") or [])
+         if f.get("file") and not _is_core_path(str(f["file"]))
+         and "mu-plugins/barebits-test-" not in str(f["file"])),
+        "",
+    )
+    if culprit:
+        bits.append(f"at {culprit}")
+    if entry.get("request"):
+        bits.append(f"during {entry['request']}")
+    return " | ".join(bits)
+
+
+def classify_debug_findings(
+    log_lines: list[str], probe_entries: list[dict], *, plugin_dir: Path
+) -> list[str]:
+    """Reduce a WP_DEBUG_LOG and the probe's records to the findings that are
+    the barebits plugin's: PHP-engine errors raised in (or naming) a plugin
+    file, and WordPress deprecation / doing-it-wrong reports whose direct
+    caller is the plugin (see _probe_entry_is_ours). Third-party noise
+    (WooCommerce, the gateway, the SQLite drop-in, wp-cli) is dropped."""
+    findings: list[str] = []
+    for line in log_lines:
+        m = _PHP_LOG_LINE.search(line)
+        if not m:
+            continue
+        if _is_plugin_path(m.group("file"), plugin_dir) or _is_plugin_path(m.group("message"), plugin_dir):
+            findings.append(line.strip())
+    for entry in probe_entries:
+        if _probe_entry_is_ours(entry, plugin_dir):
+            findings.append(_format_probe_entry(entry))
+    return findings
+
+
 # ---------- built plugin zip (the shipped artifact) ----------
 
 def ensure_wp_plugin_zip() -> Path:
@@ -444,6 +681,7 @@ def start_wordpress(
     server_release_api_base: str | None = None,
     updater_enabled: bool = False,
     extra_env: dict[str, str] | None = None,
+    debug_log: bool = False,
     _from_template: bool = True,
 ) -> WordPressHandle:
     """Stand up a fresh SQLite-backed WordPress install.
@@ -482,6 +720,15 @@ def start_wordpress(
     server from), whether that updater may run at all (every other fixture
     leaves the kill switch to the environment; the upgrade tier needs it
     live), and further CASHUPAY_* environment for it.
+
+    debug_log=True runs the site with WP_DEBUG on, PHP errors logged to
+    <workdir>/wp-debug.log (never displayed), plus a test-only mu-plugin that
+    records every WordPress-level deprecation and _doing_it_wrong() with the
+    files on its call stack to <workdir>/wp-debug-probe.jsonl. Together they
+    feed `handle.plugin_debug_findings()`, the WordPress-compatibility check
+    (a new core's deprecations surface there before they become fatals).
+    Off by default: WP_DEBUG changes nothing functional, but the probe is
+    only read by the compatibility tests.
 
     Golden templates: the first install of each DB-affecting shape (bare /
     plugin / plugin+woocommerce / woocommerce-only) per pytest session is
@@ -575,14 +822,19 @@ def start_wordpress(
     #    constants are what make the golden's DB-stored URLs irrelevant.
     port = ports.allocate(1)[0]
     config = wp_root / "wp-config.php"
+    debug_log_path = workdir / "wp-debug.log" if debug_log else None
+    debug_probe_path = workdir / "wp-debug-probe.jsonl" if debug_log else None
     if use_template or not config.exists():
         config.write_text(
             _wp_config_php(
                 port=port,
                 release_api_base=release_api_base,
                 release_channel=release_channel,
+                debug_log_path=debug_log_path,
             )
         )
+    if debug_probe_path is not None:
+        _install_debug_probe(wp_root, debug_probe_path)
 
     # 5. Router wrapper.
     router_wrapper = workdir / "wp-router.php"
@@ -691,6 +943,8 @@ def start_wordpress(
         php_exe=php_exe,
         wp_cli_phar=wp_cli_phar,
         woo_product_id=woo_product_id,
+        debug_log_path=debug_log_path,
+        debug_probe_path=debug_probe_path,
     )
     try:
         handle.wait_ready()
@@ -978,6 +1232,7 @@ def _wp_config_php(
     port: int,
     release_api_base: str | None = None,
     release_channel: str | None = None,
+    debug_log_path: Path | None = None,
 ) -> str:
     release_defines = ""
     if release_api_base:
@@ -1027,6 +1282,17 @@ def _wp_config_php(
             "// empty-cart checkout flakes on the legacy translator driver).\n"
             "define('WP_SQLITE_AST_DRIVER', true);\n"
         )
+    if debug_log_path is None:
+        debug_defines = "define('WP_DEBUG', false);"
+    else:
+        debug_defines = (
+            "// Compatibility probe (start_wordpress(debug_log=True)): every PHP\n"
+            "// notice/deprecation is logged, never displayed, to a file outside\n"
+            "// the docroot; plugin_debug_findings() reads it back.\n"
+            "define('WP_DEBUG', true);\n"
+            f"define('WP_DEBUG_LOG', '{debug_log_path}');\n"
+            "define('WP_DEBUG_DISPLAY', false);"
+        )
     return f"""<?php
 {release_defines}{sqlite_defines}
 // SQLite drop-in expects these even though they're unused.
@@ -1054,7 +1320,7 @@ define('NONCE_SALT',       '{_rand_key()}');
 
 define('WP_HOME',    'http://127.0.0.1:{port}');
 define('WP_SITEURL', 'http://127.0.0.1:{port}');
-define('WP_DEBUG', false);
+{debug_defines}
 
 if (!defined('ABSPATH')) {{
     define('ABSPATH', __DIR__ . '/');

@@ -29,6 +29,7 @@ import pytest
 import requests
 
 from fixtures.lnd import LndHandle
+from fixtures.wc_checkout import woocommerce_order_total
 from wordpress.test_wp_woocommerce_checkout import (  # noqa: F401 — fixture
     _await_settled,
     _flush_rewrites,
@@ -268,9 +269,14 @@ def test_blocks_checkout_discount_updates_live_and_prices_the_invoice(
     BareBits gateway must add the discount row to the totals sidebar without
     a reload (the plugin's discount-blocks.js syncs the selection through the
     Store API), switching away must remove it, and the order placed with the
-    gateway must invoice the payserver for the DISCOUNTED amount.
+    gateway must carry the discount fee and invoice the payserver for exactly
+    the total WooCommerce stored on the order.
 
-    Product: 1500 sats; 2.5% -> 37.5 sats, rounded to 38 -> 1462-sat total.
+    Product: 1500 sats; 2.5% -> 37.5 sats, rounded to 38 -> 1462-sat cart
+    total, which is what the checkout shows. WooCommerce then stores the
+    ORDER total at its own precision (WC_ORDER_TOTAL_DECIMALS, 100-sat
+    steps: 0.00001500) and the gateway invoices that figure — BareBits
+    accepts WooCommerce's total as is.
     """
     wp, info = woocommerce
     page.set_default_timeout(60_000)
@@ -327,8 +333,8 @@ def test_blocks_checkout_discount_updates_live_and_prices_the_invoice(
         f"full total never came back after deselecting; footer: {footer.inner_text()!r}"
     )
 
-    # Back to BareBits, place the order: the payserver invoice must carry the
-    # discounted amount.
+    # Back to BareBits, place the order: the order carries the discount fee
+    # and the payserver invoice carries exactly WooCommerce's order total.
     barebits_radio.check()
     fee_row.wait_for(state="visible")
     _fill_billing_blocks(page)
@@ -351,8 +357,14 @@ def test_blocks_checkout_discount_updates_live_and_prices_the_invoice(
         timeout=15,
     )
     inv.raise_for_status()
-    assert float(inv.json()["amount"]) == pytest.approx(0.00001462), inv.json()
 
     order_id = int(inv.json()["metadata"]["orderId"])
     total = _order_field(wp, order_id, "get_total()")
-    assert float(total) == pytest.approx(0.00001462), total
+    assert float(total) == pytest.approx(float(woocommerce_order_total(1462))), total
+    fee_totals = _wp_eval(
+        wp,
+        f"$o = wc_get_order({order_id}); echo json_encode(array_values(array_map("
+        "fn($f) => $f->get_total(), $o->get_fees())));",
+    )
+    assert fee_totals == '["-0.00000038"]', fee_totals
+    assert float(inv.json()["amount"]) == pytest.approx(float(total)), inv.json()
